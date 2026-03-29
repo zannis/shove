@@ -2,6 +2,7 @@
 name = "shove"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [features]
 default = []
@@ -23,8 +24,8 @@ futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
-testcontainers = "0.25"
-testcontainers-modules = { version = "0.13", features = ["rabbitmq"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["rabbitmq"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [[bench]]
