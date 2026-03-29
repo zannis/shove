@@ -1,0 +1,33 @@
+[package]
+name = "shove"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
+sns = ["dep:aws-config", "dep:futures"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+lapin = { version = "4", features = ["rustls--ring"], optional = true }
+futures-lite = { version = "2", optional = true }
+reqwest = { version = "0.13", features = ["json"], optional = true }
+aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optional = true }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["async_tokio"] }
+testcontainers = "0.25"
+testcontainers-modules = { version = "0.13", features = ["rabbitmq"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[[bench]]
+name = "autoscaler"
+harness = false
+required-features = ["rabbitmq"]
