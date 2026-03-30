@@ -10,6 +10,10 @@ The first version of this was built for [Lens](https://lens.xyz) to handle milli
 
 shove is the do-over. RabbitMQ handles storage and routing. shove handles the rest: type-safe topics, retry topologies, ordered delivery, consumer groups that scale themselves.
 
+## Why "shove"
+
+We needed a name for "throw a job at something and stop thinking about it." Push was taken. Yeet was considered. shove stuck — it's what you do with messages: shove them in, let the broker deal with it.
+
 ## Features
 
 - **Compile-time topic binding** — each topic is a unit struct that associates a message type (`Serialize + DeserializeOwned`) with a queue topology. No stringly-typed queue names at call sites.
@@ -168,6 +172,7 @@ See the [`examples/`](examples/) directory:
 - **[`basic_pubsub`](examples/basic_pubsub.rs)** — all non-sequenced configurations, publish/consume lifecycle, DLQ handling, all outcome variants
 - **[`sequenced_pubsub`](examples/sequenced_pubsub.rs)** — ordered delivery with `Skip` and `FailAll` policies
 - **[`consumer_groups`](examples/consumer_groups.rs)** — dynamic scaling with the autoscaler
+- **[`audited_consumer`](examples/audited_consumer.rs)** — custom `AuditHandler` that logs every delivery attempt to stdout
 
 Start RabbitMQ with the included docker-compose (enables the management and consistent-hash exchange plugins):
 
@@ -181,6 +186,7 @@ Then run any example:
 cargo run --example basic_pubsub --features rabbitmq
 cargo run --example sequenced_pubsub --features rabbitmq
 cargo run --example consumer_groups --features rabbitmq
+cargo run --example audited_consumer --features rabbitmq
 ```
 
 ## Roadmap
@@ -190,6 +196,10 @@ cargo run --example consumer_groups --features rabbitmq
 - [ ] **Observability** — built-in metrics (publish latency, consume rate, retry/DLQ counts)
 - [ ] **Schema evolution** — pluggable serialization with versioned message envelopes
 - [ ] **Multi-backend topology declaration** — declare topics across backends in a single call
+
+## Disclaimer
+
+The architecture and design of this crate are human-made. The implementation is mostly written by [Claude](https://claude.ai).
 
 ## License
 
