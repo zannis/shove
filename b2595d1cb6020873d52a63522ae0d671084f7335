@@ -1,0 +1,45 @@
+docker-compose.yml
+  5181c77e70759d67 1-12
+examples/sequenced_pubsub.rs
+  5181c77e70759d67 6-19,21,23,26-27,33,77-80,83,96-97,100,116,118-119,123,133,176-177,182,184-187,195,197-200,213-239
+examples/consumer_groups.rs
+  5181c77e70759d67 7-8,10,63,113
+  2cfa771f23191d09 54,72,74-75,82,126-127,140-146,149
+README.md
+  5181c77e70759d67 165-172
+examples/basic_pubsub.rs
+  5181c77e70759d67 7,9,158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "b2595d1cb6020873d52a63522ae0d671084f7335",
+  "prompts": {
+    "2cfa771f23191d09": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b46ae27c-ba45-45f2-a3b5-de3305fcd015",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 15,
+      "total_deletions": 10,
+      "accepted_lines": 15,
+      "overriden_lines": 0
+    },
+    "5181c77e70759d67": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "86f8f637-ba08-4627-a7ff-7475031e1a22",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 101,
+      "total_deletions": 20,
+      "accepted_lines": 99,
+      "overriden_lines": 0
+    }
+  }
+}
