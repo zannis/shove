@@ -1,4 +1,5 @@
 /// What a handler instructs the consumer to do with a message after processing.
+#[derive(Debug)]
 pub enum Outcome {
     /// Processed successfully. Remove from queue.
     Ack,

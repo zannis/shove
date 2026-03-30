@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ShoveError;
@@ -5,7 +8,7 @@ use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
 
 /// Options for consumer behavior.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConsumerOptions {
     /// Maximum retries before automatically rejecting to DLQ.
     /// Only relevant if the topic has hold queues.
@@ -15,6 +18,9 @@ pub struct ConsumerOptions {
     /// Cancellation token for graceful shutdown. When triggered, the consumer
     /// finishes processing the current message, acks it, and returns `Ok(())`.
     pub shutdown: CancellationToken,
+    /// Flag that indicates the consumer is currently processing a message.
+    /// Used by the autoscaler to avoid scaling down busy consumers.
+    pub processing: Arc<AtomicBool>,
 }
 
 impl ConsumerOptions {
@@ -25,6 +31,7 @@ impl ConsumerOptions {
             max_retries: 10,
             prefetch_count: 10,
             shutdown,
+            processing: Arc::new(AtomicBool::new(false)),
         }
     }
 

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use tracing::{debug, info};
+
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 use crate::handler::MessageHandler;
@@ -41,6 +43,8 @@ impl ConsumerGroupRegistry {
         H: MessageHandler<T> + Clone + 'static,
     {
         let name: String = name.into();
+        let queue: String = queue.into();
+        info!(group = %name, queue = %queue, "registering consumer group");
         let group_token = self.client.shutdown_token().child_token();
         let group = ConsumerGroup::new::<T, H>(
             name.clone(),
@@ -55,6 +59,7 @@ impl ConsumerGroupRegistry {
 
     /// Call [`ConsumerGroup::start`] on every registered group.
     pub fn start_all(&mut self) {
+        info!(count = self.groups.len(), "starting all consumer groups");
         for group in self.groups.values_mut() {
             group.start();
         }
@@ -72,8 +77,10 @@ impl ConsumerGroupRegistry {
 
     /// Shut down every consumer group and wait for all tasks to complete.
     pub async fn shutdown_all(&mut self) {
+        info!(count = self.groups.len(), "shutting down all consumer groups");
         for group in self.groups.values_mut() {
             group.shutdown().await;
         }
+        debug!("all consumer groups shut down");
     }
 }
