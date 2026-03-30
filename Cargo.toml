@@ -1,7 +1,9 @@
 [package]
 name = "shove"
 version = "0.1.0"
+description = "Pubsub utilities on steroids. Supports various queuing configurations and autoscaling consumer groups."
 edition = "2024"
+authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
 license = "MIT"
 
 [features]
