@@ -1,0 +1,35 @@
+src/metadata.rs
+  c40e65ff96c4e9ae 2-3,5,13-14
+src/backends/rabbitmq/typed.rs
+  c40e65ff96c4e9ae 1,112,117,121-131,133,135-140
+Cargo.toml
+  c40e65ff96c4e9ae 16,25-26
+src/outcome.rs
+  c40e65ff96c4e9ae 1-2,4
+src/audit.rs
+  c40e65ff96c4e9ae 1-67,69-71,73-77,79-81,83-85,87-95,97-104,106-174
+src/lib.rs
+  c40e65ff96c4e9ae 1,15,28-29
+examples/audited_consumer.rs
+  c40e65ff96c4e9ae 1-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "8d4c9f5361782c5dbb70eb36ee467f097192956c",
+  "prompts": {
+    "c40e65ff96c4e9ae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00116b51-db65-4de1-aed1-472432d0e78f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 340,
+      "total_deletions": 3,
+      "accepted_lines": 329,
+      "overriden_lines": 4
+    }
+  }
+}
