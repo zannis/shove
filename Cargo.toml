@@ -5,6 +5,9 @@ description = "Pubsub utilities on steroids. Supports various queuing configurat
 edition = "2024"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
 license = "MIT"
+repository = "https://github.com/zannis/shove"
+keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
+categories = ["asynchronous"]
 
 [features]
 default = []

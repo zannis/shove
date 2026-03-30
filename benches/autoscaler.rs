@@ -23,8 +23,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
 use shove::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq;
@@ -101,13 +101,19 @@ impl Rabbit {
 
     async fn publish_n(&self, n: u64) {
         for id in 0..n {
-            self.publisher.publish::<BenchTopic>(&Msg { id }).await.unwrap();
+            self.publisher
+                .publish::<BenchTopic>(&Msg { id })
+                .await
+                .unwrap();
         }
     }
 
     async fn publish_batch(&self, n: u64) {
         let msgs: Vec<Msg> = (0..n).map(|id| Msg { id }).collect();
-        self.publisher.publish_batch::<BenchTopic>(&msgs).await.unwrap();
+        self.publisher
+            .publish_batch::<BenchTopic>(&msgs)
+            .await
+            .unwrap();
     }
 
     fn mgmt_client(&self) -> ManagementClient {
@@ -158,7 +164,10 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
                     "bench",
                     queue(),
                     ConsumerGroupConfig::default(),
-                    || LatencyHandler { processed: Arc::new(AtomicU64::new(0)), delay: Duration::ZERO },
+                    || LatencyHandler {
+                        processed: Arc::new(AtomicU64::new(0)),
+                        delay: Duration::ZERO,
+                    },
                 );
                 registry.start_all();
 
@@ -204,7 +213,7 @@ fn bench_throughput(c: &mut Criterion) {
         (500, 4, 10),
         (500, 8, 10),
         (500, 16, 10),
-        (100, 1, 175),  // avg of 50-300ms
+        (100, 1, 175), // avg of 50-300ms
         (100, 4, 175),
         (100, 8, 175),
     ] {
@@ -231,7 +240,10 @@ fn bench_throughput(c: &mut Criterion) {
                                 max_consumers: consumers,
                                 ..Default::default()
                             },
-                            move || LatencyHandler { processed: pc.clone(), delay },
+                            move || LatencyHandler {
+                                processed: pc.clone(),
+                                delay,
+                            },
                         );
 
                         let start = std::time::Instant::now();
@@ -261,7 +273,11 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
     let burst: u64 = 200;
     let delay = Duration::from_millis(20);
 
-    for &(label, min, max) in &[("fixed_1", 1u16, 1u16), ("scale_2_4", 2, 4), ("scale_4_8", 4, 8)] {
+    for &(label, min, max) in &[
+        ("fixed_1", 1u16, 1u16),
+        ("scale_2_4", 2, 4),
+        ("scale_4_8", 4, 8),
+    ] {
         let prefetch = (burst as u16 / max).max(1);
 
         g.bench_function(format!("{burst}burst_20ms_{label}"), |b| {
@@ -284,7 +300,10 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                                 max_consumers: max,
                                 ..Default::default()
                             },
-                            move || LatencyHandler { processed: pc.clone(), delay },
+                            move || LatencyHandler {
+                                processed: pc.clone(),
+                                delay,
+                            },
                         );
 
                         let start = std::time::Instant::now();
@@ -314,7 +333,9 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                         total += start.elapsed();
 
                         shutdown.cancel();
-                        if let Some(h) = handle { let _ = h.await; }
+                        if let Some(h) = handle {
+                            let _ = h.await;
+                        }
                         registry.lock().await.shutdown_all().await;
                     }
                     total

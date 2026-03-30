@@ -167,10 +167,7 @@ impl RabbitMqTopologyDeclarer {
 }
 
 impl TopologyDeclarer for RabbitMqTopologyDeclarer {
-    async fn declare(
-        &self,
-        topology: &QueueTopology,
-    ) -> Result<(), ShoveError> {
+    async fn declare(&self, topology: &QueueTopology) -> Result<(), ShoveError> {
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {

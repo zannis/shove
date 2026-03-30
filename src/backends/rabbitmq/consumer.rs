@@ -489,9 +489,7 @@ impl Consumer for RabbitMqConsumer {
                     let adapter = TypedAdapter::<_, T>::new(h);
                     let consumer = RabbitMqConsumer::new(inner_client);
                     consumer
-                        .run_internal_sequenced(
-                            adapter, &sub_queue, topology, opts, on_failure,
-                        )
+                        .run_internal_sequenced(adapter, &sub_queue, topology, opts, on_failure)
                         .await
                 }));
             }

@@ -258,7 +258,13 @@ async fn main() -> Result<(), ShoveError> {
     shutdown.cancel();
     client.shutdown().await;
 
-    let _ = tokio::join!(minimal_task, dlq_main_task, dlq_task, retry_task, defer_task);
+    let _ = tokio::join!(
+        minimal_task,
+        dlq_main_task,
+        dlq_task,
+        retry_task,
+        defer_task
+    );
     println!("done");
 
     Ok(())
