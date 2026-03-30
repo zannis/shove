@@ -129,7 +129,7 @@ consumer
 | Variant | Behavior |
 |---------|----------|
 | `Ack` | Message processed successfully, remove from queue |
-| `Retry` | Transient failure — route to hold queue with escalating backoff, increment retry counter |
+| `Retry` | Transient failure — route to hold queue with escalating backoff, increment retry counter. Also triggered automatically when `handler_timeout` is exceeded |
 | `Reject` | Permanent failure — route to DLQ (or discard if no DLQ) |
 | `Defer` | Re-deliver via hold queue without incrementing retry counter (e.g. scheduled messages) |
 
@@ -148,6 +148,7 @@ registry.register::<MyTopic, MyHandler>(
         min_consumers: 1,
         max_consumers: 8,
         max_retries: 5,
+        handler_timeout: Some(Duration::from_secs(30)),
     },
     || MyHandler::new(),
 );

@@ -39,7 +39,12 @@ impl RabbitMqPublisher {
     ) -> Result<(), ShoveError> {
         let mut channel_guard = self.channel.lock().await;
 
-        debug!(exchange, routing_key, bytes = payload.len(), "publishing message");
+        debug!(
+            exchange,
+            routing_key,
+            bytes = payload.len(),
+            "publishing message"
+        );
 
         let result = Self::do_publish(
             &channel_guard,
@@ -115,7 +120,11 @@ impl RabbitMqPublisher {
 
         match result {
             Ok(()) => {
-                debug!(exchange, count = items.len(), "batch published and confirmed");
+                debug!(
+                    exchange,
+                    count = items.len(),
+                    "batch published and confirmed"
+                );
                 Ok(())
             }
             Err(e) => {

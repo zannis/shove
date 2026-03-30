@@ -1,10 +1,10 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-
 use futures_lite::StreamExt;
 use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
 use lapin::types::{AMQPValue, FieldTable};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::RECONNECT_DELAY;
@@ -186,7 +186,7 @@ impl RabbitMqConsumer {
                     }
 
                     options.processing.store(true, Ordering::Release);
-                    let outcome = handler.handle(&delivery).await;
+                    let outcome = invoke_handler(handler.handle(&delivery), options.handler_timeout).await;
 
                     match outcome {
                         Outcome::Ack => {
@@ -281,7 +281,7 @@ impl RabbitMqConsumer {
                     }
 
                     options.processing.store(true, Ordering::Release);
-                    let outcome = handler.handle(&delivery).await;
+                    let outcome = invoke_handler(handler.handle(&delivery), options.handler_timeout).await;
 
                     debug!(queue, ?outcome, retry_count, "message handled");
 
@@ -305,6 +305,20 @@ impl RabbitMqConsumer {
                 }
             }
         }
+    }
+}
+
+/// Run the handler future with an optional timeout.
+/// Returns `Outcome::Retry` if the timeout is exceeded.
+async fn invoke_handler(fut: impl Future<Output = Outcome>, timeout: Option<Duration>) -> Outcome {
+    match timeout {
+        Some(duration) => tokio::time::timeout(duration, fut)
+            .await
+            .unwrap_or_else(|_elapsed| {
+                warn!("handler exceeded timeout ({duration:?}), retrying message");
+                Outcome::Retry
+            }),
+        None => fut.await,
     }
 }
 
@@ -529,5 +543,37 @@ impl Consumer for RabbitMqConsumer {
                 .run_internal(adapter, dlq, topology, options, true)
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invoke_handler_returns_outcome_without_timeout() {
+        let outcome = invoke_handler(async { Outcome::Ack }, None).await;
+        assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    #[tokio::test]
+    async fn invoke_handler_returns_outcome_within_timeout() {
+        let timeout = Some(Duration::from_secs(1));
+        let outcome = invoke_handler(async { Outcome::Reject }, timeout).await;
+        assert!(matches!(outcome, Outcome::Reject));
+    }
+
+    #[tokio::test]
+    async fn invoke_handler_returns_retry_on_timeout() {
+        let timeout = Some(Duration::from_millis(10));
+        let outcome = invoke_handler(
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Outcome::Ack
+            },
+            timeout,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Retry));
     }
 }

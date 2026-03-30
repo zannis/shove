@@ -77,7 +77,10 @@ impl ConsumerGroupRegistry {
 
     /// Shut down every consumer group and wait for all tasks to complete.
     pub async fn shutdown_all(&mut self) {
-        info!(count = self.groups.len(), "shutting down all consumer groups");
+        info!(
+            count = self.groups.len(),
+            "shutting down all consumer groups"
+        );
         for group in self.groups.values_mut() {
             group.shutdown().await;
         }
