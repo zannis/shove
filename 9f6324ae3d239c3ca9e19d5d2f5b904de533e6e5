@@ -1,0 +1,27 @@
+.github/workflows/publish.yml
+  9ed453778b77b271 1-56
+.github/workflows/ci.yml
+  9ed453778b77b271 1-23
+Cargo.toml
+  9ed453778b77b271 8-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "9f6324ae3d239c3ca9e19d5d2f5b904de533e6e5",
+  "prompts": {
+    "9ed453778b77b271": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f664c6c5-f7b1-4ad3-b66a-bf4d74d8d9c2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 82,
+      "total_deletions": 0,
+      "accepted_lines": 82,
+      "overriden_lines": 0
+    }
+  }
+}
