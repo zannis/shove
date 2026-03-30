@@ -1,0 +1,23 @@
+README.md
+  5181c77e70759d67 13-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "5b0c462dd7bd3eaea2e670a80285eb79afa87af4",
+  "prompts": {
+    "5181c77e70759d67": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "86f8f637-ba08-4627-a7ff-7475031e1a22",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 0,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    }
+  }
+}
