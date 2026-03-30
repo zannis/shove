@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
-use crate::error::ShoveError;
+use crate::error::{Result, ShoveError};
 use crate::publisher::Publisher;
 use crate::topic::Topic;
 
@@ -22,7 +22,7 @@ pub struct RabbitMqPublisher {
 }
 
 impl RabbitMqPublisher {
-    pub async fn new(client: RabbitMqClient) -> Result<Self, ShoveError> {
+    pub async fn new(client: RabbitMqClient) -> Result<Self> {
         let channel = client.create_confirm_channel().await?;
         Ok(Self {
             client,
@@ -36,7 +36,7 @@ impl RabbitMqPublisher {
         routing_key: &str,
         payload: &[u8],
         headers: Option<FieldTable>,
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()> {
         let mut channel_guard = self.channel.lock().await;
 
         debug!(
@@ -76,7 +76,7 @@ impl RabbitMqPublisher {
         routing_key: &str,
         payload: &[u8],
         headers: Option<FieldTable>,
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()> {
         let mut props = BasicProperties::default()
             .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
             .with_content_type("application/json".into());
@@ -107,11 +107,7 @@ impl RabbitMqPublisher {
         Ok(())
     }
 
-    async fn publish_batch_raw(
-        &self,
-        exchange: &str,
-        items: &[(&str, Vec<u8>)],
-    ) -> Result<(), ShoveError> {
+    async fn publish_batch_raw(&self, exchange: &str, items: &[(&str, Vec<u8>)]) -> Result<()> {
         let channel_guard = self.channel.lock().await;
 
         debug!(exchange, count = items.len(), "publishing batch");
@@ -143,7 +139,7 @@ impl RabbitMqPublisher {
         channel: &Channel,
         exchange: &str,
         items: &[(&str, Vec<u8>)],
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()> {
         // Phase 1: Send all messages, collecting confirmation futures.
         let mut confirms = Vec::with_capacity(items.len());
         for (routing_key, payload) in items {
@@ -186,7 +182,7 @@ impl Publisher for RabbitMqPublisher {
     fn publish<T: Topic>(
         &self,
         message: &T::Message,
-    ) -> impl std::future::Future<Output = Result<(), ShoveError>> + Send {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
 
         let topology = T::topology();
@@ -214,7 +210,7 @@ impl Publisher for RabbitMqPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl std::future::Future<Output = Result<(), ShoveError>> + Send {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
         let field_table = hashmap_to_field_table(headers);
 
@@ -245,13 +241,13 @@ impl Publisher for RabbitMqPublisher {
     fn publish_batch<T: Topic>(
         &self,
         messages: &[T::Message],
-    ) -> impl std::future::Future<Output = Result<(), ShoveError>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let topology = T::topology();
         let sequencing = topology.sequencing();
         let key_fn = T::SEQUENCE_KEY_FN;
 
         // Serialize all messages up front for fail-fast behaviour.
-        let serialized: Result<Vec<Vec<u8>>, ShoveError> = messages
+        let serialized: Result<Vec<Vec<u8>>> = messages
             .iter()
             .map(|m| serde_json::to_vec(m).map_err(ShoveError::Serialization))
             .collect();
@@ -307,7 +303,7 @@ impl ChannelPublisher {
         queue: &str,
         payload: &[u8],
         headers: FieldTable,
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()> {
         let props = BasicProperties::default()
             .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
             .with_content_type("application/json".into())

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::error::ShoveError;
+use crate::error::Result;
 use crate::topic::Topic;
 
 /// Publish messages to their topic's main queue.
@@ -14,17 +14,14 @@ use crate::topic::Topic;
 /// over `T: Topic`. Backends are always concrete types.
 pub trait Publisher: Send + Sync + Clone + 'static {
     /// Publish a single message to the topic's queue.
-    fn publish<T: Topic>(
-        &self,
-        message: &T::Message,
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
+    fn publish<T: Topic>(&self, message: &T::Message) -> impl Future<Output = Result<()>> + Send;
 
     /// Publish a single message with additional string headers/attributes.
     fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Publish a batch of messages to the topic's queue.
     ///
@@ -32,5 +29,5 @@ pub trait Publisher: Send + Sync + Clone + 'static {
     fn publish_batch<T: Topic>(
         &self,
         messages: &[T::Message],
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
+    ) -> impl Future<Output = Result<()>> + Send;
 }

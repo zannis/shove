@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::error::ShoveError;
+use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
 
@@ -61,6 +61,54 @@ impl ConsumerOptions {
     }
 }
 
+/// Consume messages from a topic's queues.
+///
+/// This trait is intentionally **not object-safe** — methods are generic over
+/// `T: Topic`. Backends are always concrete types (e.g., `RabbitMqConsumer`),
+/// not `dyn Consumer`. For test doubles, implement the trait on a mock struct
+/// or use an in-memory backend.
+pub trait Consumer: Send + Sync + 'static {
+    /// Run the main consumer loop. Blocks until shutdown signal.
+    ///
+    /// The consumer:
+    /// 1. Reads `T::topology()` to resolve queue names
+    /// 2. Consumes from the main queue
+    /// 3. Deserializes to `T::Message`
+    /// 4. Calls `handler.handle()`
+    /// 5. Routes based on `Outcome` (ack, retry → hold, reject → DLQ)
+    fn run<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T>,
+        options: ConsumerOptions,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Run the consumer loop with sequenced (ordered) delivery.
+    /// Blocks until shutdown signal.
+    ///
+    /// Messages sharing the same sequence key are delivered in strict order.
+    /// Different sequence keys are independent and may be processed concurrently.
+    ///
+    /// `ConsumerOptions::prefetch_count` is ignored — sequenced consumers
+    /// always use `prefetch_count = 1` per sub-queue to guarantee ordering.
+    ///
+    /// Returns `Err(ShoveError::Topology)` if `T::topology().sequencing` is `None`.
+    fn run_sequenced<T: SequencedTopic>(
+        &self,
+        handler: impl MessageHandler<T>,
+        options: ConsumerOptions,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Run a DLQ consumer loop for the topic. Blocks until shutdown signal.
+    ///
+    /// Calls `handler.handle_dead()` for each message, then always acks.
+    ///
+    /// Returns `Err(ShoveError::Topology)` if `T::topology().dlq` is `None`.
+    fn run_dlq<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T>,
+    ) -> impl Future<Output = Result<()>> + Send;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,8 +136,8 @@ mod tests {
 
     #[test]
     fn with_handler_timeout_sets_timeout() {
-        let opts =
-            ConsumerOptions::new(CancellationToken::new()).with_handler_timeout(Duration::from_secs(30));
+        let opts = ConsumerOptions::new(CancellationToken::new())
+            .with_handler_timeout(Duration::from_secs(30));
         assert_eq!(opts.handler_timeout, Some(Duration::from_secs(30)));
     }
 
@@ -112,52 +160,4 @@ mod tests {
         token.cancel();
         assert!(opts.shutdown.is_cancelled());
     }
-}
-
-/// Consume messages from a topic's queues.
-///
-/// This trait is intentionally **not object-safe** — methods are generic over
-/// `T: Topic`. Backends are always concrete types (e.g., `RabbitMqConsumer`),
-/// not `dyn Consumer`. For test doubles, implement the trait on a mock struct
-/// or use an in-memory backend.
-pub trait Consumer: Send + Sync + 'static {
-    /// Run the main consumer loop. Blocks until shutdown signal.
-    ///
-    /// The consumer:
-    /// 1. Reads `T::topology()` to resolve queue names
-    /// 2. Consumes from the main queue
-    /// 3. Deserializes to `T::Message`
-    /// 4. Calls `handler.handle()`
-    /// 5. Routes based on `Outcome` (ack, retry → hold, reject → DLQ)
-    fn run<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T>,
-        options: ConsumerOptions,
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
-
-    /// Run the consumer loop with sequenced (ordered) delivery.
-    /// Blocks until shutdown signal.
-    ///
-    /// Messages sharing the same sequence key are delivered in strict order.
-    /// Different sequence keys are independent and may be processed concurrently.
-    ///
-    /// `ConsumerOptions::prefetch_count` is ignored — sequenced consumers
-    /// always use `prefetch_count = 1` per sub-queue to guarantee ordering.
-    ///
-    /// Returns `Err(ShoveError::Topology)` if `T::topology().sequencing` is `None`.
-    fn run_sequenced<T: SequencedTopic>(
-        &self,
-        handler: impl MessageHandler<T>,
-        options: ConsumerOptions,
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
-
-    /// Run a DLQ consumer loop for the topic. Blocks until shutdown signal.
-    ///
-    /// Calls `handler.handle_dead()` for each message, then always acks.
-    ///
-    /// Returns `Err(ShoveError::Topology)` if `T::topology().dlq` is `None`.
-    fn run_dlq<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T>,
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
 }

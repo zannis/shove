@@ -19,5 +19,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -- --check
       - run: cargo clippy -q --all-features -- -D warnings
-      - run: cargo test -q --all-features
-      - run: cargo publish -q --dry-run --all-features
+      - run: cargo install -q cargo-nextest
+      - run: cargo nextest run --all-features
+      - run: cargo publish --dry-run --all-features
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install -q cargo-llvm-cov cargo-nextest
+      - run: cargo llvm-cov nextest -q --all-features --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: true

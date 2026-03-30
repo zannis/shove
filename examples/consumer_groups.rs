@@ -69,12 +69,6 @@ async fn main() -> Result<(), ShoveError> {
     let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
     let client = RabbitMqClient::connect(&config).await?;
 
-    // ── Declare topology ──
-    let channel = client.create_channel().await?;
-    let declarer = RabbitMqTopologyDeclarer::new(channel);
-    declare_topic::<WorkQueue>(&declarer).await?;
-    println!("topology declared\n");
-
     // ── Publish an initial burst of tasks ──
     let publisher = RabbitMqPublisher::new(client.clone()).await?;
     let burst_size = 100;
@@ -93,18 +87,14 @@ async fn main() -> Result<(), ShoveError> {
     // Each group reads from a single queue and can be scaled up/down.
     let mut registry = ConsumerGroupRegistry::new(client.clone());
 
-    registry.register::<WorkQueue, TaskHandler>(
-        "work-queue-group",            // group name
-        WorkQueue::topology().queue(), // queue to read from
-        ConsumerGroupConfig {
-            prefetch_count: 10, // messages per consumer
-            min_consumers: 1,   // floor
-            max_consumers: 5,   // ceiling
-            max_retries: 3,
-            handler_timeout: None,
-        },
-        || TaskHandler, // factory — called once per spawned consumer
-    );
+    registry
+        .register::<WorkQueue, TaskHandler>(
+            ConsumerGroupConfig::new(1..=5) // min..=max consumers
+                .with_prefetch_count(10) // messages per consumer
+                .with_max_retries(3),
+            || TaskHandler, // factory — called once per spawned consumer
+        )
+        .await?;
 
     // Start all groups at their minimum consumer count.
     registry.start_all();
@@ -118,10 +108,9 @@ async fn main() -> Result<(), ShoveError> {
     // and scales consumer groups up/down based on queue depth relative to
     // capacity (consumers × prefetch_count).
     let mgmt_config = ManagementConfig::new("http://localhost:15673", "guest", "guest");
-    let mgmt_client = ManagementClient::new(mgmt_config);
 
     let mut autoscaler = Autoscaler::new(
-        mgmt_client,
+        &mgmt_config,
         AutoscalerConfig {
             poll_interval: Duration::from_secs(2),
             // Scale up when messages_ready > capacity × 1.5
@@ -156,7 +145,8 @@ async fn main() -> Result<(), ShoveError> {
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let reg = registry.lock().await;
-        if let Some(group) = reg.groups().get("work-queue-group") {
+        // Group name is derived from the queue name in T::topology()
+        if let Some(group) = reg.groups().get(WorkQueue::topology().queue()) {
             println!(
                 "[monitor] active_consumers={} queue={}",
                 group.active_consumers(),

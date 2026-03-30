@@ -4,8 +4,11 @@ use tracing::{debug, info};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer_group::{ConsumerGroup, ConsumerGroupConfig};
+use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
+use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::topology::TopologyDeclarer;
 
 /// Registry of all [`ConsumerGroup`]s managed by the autoscaler.
 ///
@@ -27,23 +30,28 @@ impl ConsumerGroupRegistry {
 
     /// Register a new consumer group.
     ///
-    /// The group is created with the provided `config` and `handler_factory`
-    /// but is **not** started — call [`start_all`] (or the group's own
-    /// `start`) separately.
+    /// Automatically declares the topology for `T` via [`RabbitMqTopologyDeclarer`]
+    /// before creating the group.  The group is **not** started — call
+    /// [`start_all`] (or the group's own `start`) separately.
     ///
     /// [`start_all`]: Self::start_all
-    pub fn register<T, H>(
+    pub async fn register<T, H>(
         &mut self,
-        name: impl Into<String>,
-        queue: impl Into<String>,
         config: ConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
-    ) where
+    ) -> Result<()>
+    where
         T: Topic + 'static,
         H: MessageHandler<T> + Clone + 'static,
     {
-        let name: String = name.into();
-        let queue: String = queue.into();
+        let topology = T::topology();
+        let queue = topology.queue().to_string();
+        let name = queue.clone();
+
+        let channel = self.client.create_channel().await?;
+        let declarer = RabbitMqTopologyDeclarer::new(channel);
+        declarer.declare(topology).await?;
+
         info!(group = %name, queue = %queue, "registering consumer group");
         let group_token = self.client.shutdown_token().child_token();
         let group = ConsumerGroup::new::<T, H>(
@@ -55,6 +63,7 @@ impl ConsumerGroupRegistry {
             handler_factory,
         );
         self.groups.insert(name, group);
+        Ok(())
     }
 
     /// Call [`ConsumerGroup::start`] on every registered group.

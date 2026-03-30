@@ -2,7 +2,7 @@ use lapin::Channel;
 use lapin::options::{ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions};
 use lapin::types::{AMQPValue, FieldTable};
 
-use crate::error::ShoveError;
+use crate::error::{Result, ShoveError};
 use crate::topology::{QueueTopology, TopologyDeclarer};
 
 const X_DEAD_LETTER_EXCHANGE: &str = "x-dead-letter-exchange";
@@ -22,7 +22,7 @@ impl RabbitMqTopologyDeclarer {
         Self { channel }
     }
 
-    async fn declare_queue(&self, name: &str, args: FieldTable) -> Result<(), ShoveError> {
+    async fn declare_queue(&self, name: &str, args: FieldTable) -> Result<()> {
         self.channel
             .queue_declare(
                 name.into(),
@@ -37,7 +37,7 @@ impl RabbitMqTopologyDeclarer {
         Ok(())
     }
 
-    async fn declare_unsequenced(&self, topology: &QueueTopology) -> Result<(), ShoveError> {
+    async fn declare_unsequenced(&self, topology: &QueueTopology) -> Result<()> {
         // 1. Declare DLQ (if present) — plain durable queue
         if let Some(dlq) = topology.dlq() {
             self.declare_queue(dlq, FieldTable::default()).await?;
@@ -78,7 +78,7 @@ impl RabbitMqTopologyDeclarer {
         Ok(())
     }
 
-    async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<(), ShoveError> {
+    async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<()> {
         let seq = topology
             .sequencing()
             .expect("declare_sequenced called without sequencing config");
@@ -167,7 +167,7 @@ impl RabbitMqTopologyDeclarer {
 }
 
 impl TopologyDeclarer for RabbitMqTopologyDeclarer {
-    async fn declare(&self, topology: &QueueTopology) -> Result<(), ShoveError> {
+    async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {

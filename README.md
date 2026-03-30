@@ -1,5 +1,11 @@
 # shove
 
+[![Build Status](https://github.com/zannis/shove/workflows/Build/badge.svg)](https://github.com/zannis/shove/actions)
+[![Latest Version](https://img.shields.io/crates/v/shove.svg)](https://crates.io/crates/shove)
+[![Docs](https://docs.rs/shove/badge.svg)](https://docs.rs/shove)
+[![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
+
 Topic-typed pub/sub for Rust.
 
 **shove** is an async message publishing and consuming library that binds message types to their broker destinations at compile time. Define a topic once — the type system ensures publishers and consumers agree on message shape, queue names, retry policy, and ordering guarantees.

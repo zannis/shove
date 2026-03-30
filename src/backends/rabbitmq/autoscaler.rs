@@ -6,7 +6,9 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::backends::rabbitmq::management::QueueStatsProvider;
+use crate::backends::rabbitmq::management::{
+    ManagementClient, ManagementConfig, QueueStatsProvider,
+};
 use crate::backends::rabbitmq::registry::ConsumerGroupRegistry;
 
 /// Tuning knobs for the autoscaler's polling and scaling decisions.
@@ -68,14 +70,24 @@ impl GroupScalingState {
 
 /// Polls RabbitMQ queue statistics and adjusts the number of running consumers
 /// in each [`ConsumerGroup`] using hysteresis to prevent flapping.
-pub struct Autoscaler<S: QueueStatsProvider> {
+pub struct Autoscaler<S: QueueStatsProvider = ManagementClient> {
     stats_provider: S,
     config: AutoscalerConfig,
     state: HashMap<String, GroupScalingState>,
 }
 
+impl Autoscaler<ManagementClient> {
+    pub fn new(mgmt_config: &ManagementConfig, config: AutoscalerConfig) -> Self {
+        Self {
+            stats_provider: ManagementClient::new(mgmt_config.clone()),
+            config,
+            state: HashMap::new(),
+        }
+    }
+}
+
 impl<S: QueueStatsProvider> Autoscaler<S> {
-    pub fn new(stats_provider: S, config: AutoscalerConfig) -> Self {
+    pub fn with_stats_provider(stats_provider: S, config: AutoscalerConfig) -> Self {
         Self {
             stats_provider,
             config,
@@ -301,6 +313,7 @@ mod tests {
     /// scale_up when ready > capacity * scale_up_multiplier
     /// scale_down when ready < capacity * scale_down_multiplier
     #[test]
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     fn scale_thresholds_computed_correctly() {
         let config = AutoscalerConfig::default();
 
@@ -340,8 +353,8 @@ mod tests {
         assert_eq!(scale_down_threshold, 5.0);
 
         // Exactly at threshold: ready == threshold does NOT trigger
-        assert!(!(20.0_f64 > scale_up_threshold)); // equal, not greater
-        assert!(!(5.0_f64 < scale_down_threshold)); // equal, not less
+        assert_eq!(20.0_f64.partial_cmp(&scale_up_threshold), Some(std::cmp::Ordering::Equal));
+        assert_eq!(5.0_f64.partial_cmp(&scale_down_threshold), Some(std::cmp::Ordering::Equal));
     }
 
     #[test]
@@ -391,7 +404,8 @@ mod tests {
         async fn get_queue_stats(
             &self,
             queue: &str,
-        ) -> Result<crate::backends::rabbitmq::management::QueueStats, crate::error::ShoveError> {
+        ) -> Result<crate::backends::rabbitmq::management::QueueStats, crate::error::ShoveError>
+        {
             self.stats
                 .get(queue)
                 .cloned()
@@ -400,8 +414,39 @@ mod tests {
     }
 
     #[test]
+    fn state_scale_up_since_tracks_condition() {
+        let mut state = GroupScalingState::new();
+        let now = Instant::now();
+        state.scale_up_since = Some(now);
+        assert!(state.scale_up_since.unwrap().elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cooldown_prevents_rapid_scaling() {
+        let mut state = GroupScalingState::new();
+        state.last_scaled_at = Some(Instant::now());
+        // With 30s cooldown, should be in cooldown
+        assert!(state.in_cooldown(Duration::from_secs(30)));
+        // With 0s cooldown, should not be in cooldown
+        assert!(!state.in_cooldown(Duration::ZERO));
+    }
+
+    #[test]
+    fn with_stats_provider_creates_autoscaler() {
+        let autoscaler = Autoscaler::with_stats_provider(
+            MockStatsProvider::new(),
+            AutoscalerConfig {
+                poll_interval: Duration::from_secs(1),
+                ..AutoscalerConfig::default()
+            },
+        );
+        assert!(autoscaler.state.is_empty());
+    }
+
+    #[test]
     fn autoscaler_new_starts_with_empty_state() {
-        let autoscaler = Autoscaler::new(MockStatsProvider::new(), AutoscalerConfig::default());
+        let autoscaler =
+            Autoscaler::with_stats_provider(MockStatsProvider::new(), AutoscalerConfig::default());
         assert!(autoscaler.state.is_empty());
     }
 
