@@ -162,6 +162,14 @@ See the [`examples/`](examples/) directory:
 - **[`sequenced_pubsub`](examples/sequenced_pubsub.rs)** — ordered delivery with `Skip` and `FailAll` policies
 - **[`consumer_groups`](examples/consumer_groups.rs)** — dynamic scaling with the autoscaler
 
+Start RabbitMQ with the included docker-compose (enables the management and consistent-hash exchange plugins):
+
+```sh
+docker compose up -d
+```
+
+Then run any example:
+
 ```sh
 cargo run --example basic_pubsub --features rabbitmq
 cargo run --example sequenced_pubsub --features rabbitmq

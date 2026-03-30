@@ -3,17 +3,34 @@
 //! Demonstrates: `define_sequenced_topic!`, `SequenceFailure::Skip` vs
 //! `SequenceFailure::FailAll`, `run_sequenced`, and custom `routing_shards`.
 //!
-//! Requires a running RabbitMQ instance with the consistent-hash exchange
-//! plugin enabled:
+//! Each handler sums the `amount_cents` of successfully processed messages per
+//! account. After shutdown the totals are compared against expected values to
+//! verify that the failure policies work correctly.
 //!
-//!     rabbitmq-plugins enable rabbitmq_consistent_hash_exchange
+//! Published data:
+//!   ACC-A  seq 1..5  amounts 100, 200, 300, 400, 500  (seq 3 is poison)
+//!   ACC-B  seq 1..3  amounts  50, 100, 150             (no poison)
+//!
+//! Expected totals:
+//!   Skip:    ACC-A = 100+200+400+500 = 1200  (seq 3 DLQ'd, rest continues)
+//!            ACC-B = 50+100+150      = 300
+//!   FailAll: ACC-A = 100+200         = 300   (seq 3 + subsequent DLQ'd)
+//!            ACC-B = 50+100+150      = 300   (independent key, unaffected)
+//!
+//! Requires a running RabbitMQ instance with the consistent-hash exchange
+//! plugin enabled (see docker-compose.yml):
+//!
+//!     docker compose up -d
 //!     cargo run --example sequenced_pubsub --features rabbitmq
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
 use shove::*;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 // ─── Message type ───────────────────────────────────────────────────────────
@@ -57,9 +74,13 @@ define_sequenced_topic!(
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-// Rejects entry with sequence_num == 3 to demonstrate failure policies.
+type Totals = Arc<Mutex<HashMap<String, i64>>>;
+
+// Rejects ACC-A seq 3 to demonstrate failure policies.
+// Sums amount_cents per account for successfully acked messages.
 struct LedgerHandler {
     label: &'static str,
+    totals: Totals,
 }
 
 impl MessageHandler<SkipLedger> for LedgerHandler {
@@ -72,10 +93,11 @@ impl MessageHandler<SkipLedger> for LedgerHandler {
             msg.amount_cents,
             metadata.retry_count + 1,
         );
-        if msg.sequence_num == 3 {
-            println!("[{}]   → Reject (seq=3 is poison)", self.label);
+        if msg.account_id == "ACC-A" && msg.sequence_num == 3 {
+            println!("[{}]   → Reject (seq=3 is poison for ACC-A)", self.label);
             Outcome::Reject
         } else {
+            *self.totals.lock().await.entry(msg.account_id).or_default() += msg.amount_cents;
             Outcome::Ack
         }
     }
@@ -91,13 +113,14 @@ impl MessageHandler<StrictLedger> for LedgerHandler {
             msg.amount_cents,
             metadata.retry_count + 1,
         );
-        if msg.sequence_num == 3 {
+        if msg.account_id == "ACC-A" && msg.sequence_num == 3 {
             println!(
-                "[{}]   → Reject (FailAll: seq=3 + all subsequent for account={} will DLQ)",
-                self.label, msg.account_id,
+                "[{}]   → Reject (FailAll: seq=3 + all subsequent for ACC-A will DLQ)",
+                self.label,
             );
             Outcome::Reject
         } else {
+            *self.totals.lock().await.entry(msg.account_id).or_default() += msg.amount_cents;
             Outcome::Ack
         }
     }
@@ -107,7 +130,7 @@ impl MessageHandler<StrictLedger> for LedgerHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5672/%2f");
+    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
     let client = RabbitMqClient::connect(&config).await?;
 
     // ── Declare topologies ──
@@ -150,12 +173,18 @@ async fn main() -> Result<(), ShoveError> {
     //            ACC-B seq 1,2,3 all ack
     //   FailAll: ACC-A seq 1,2 ack → seq 3 reject (DLQ) → seq 4,5 auto-DLQ (poisoned)
     //            ACC-B seq 1,2,3 all ack (independent key, unaffected)
+    let skip_totals: Totals = Arc::new(Mutex::new(HashMap::new()));
+    let strict_totals: Totals = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = CancellationToken::new();
 
     let s = shutdown.clone();
     let c = client.clone();
+    let t = skip_totals.clone();
     let skip_task = tokio::spawn(async move {
-        let handler = LedgerHandler { label: "skip" };
+        let handler = LedgerHandler {
+            label: "skip error and continue",
+            totals: t,
+        };
         RabbitMqConsumer::new(c)
             .run_sequenced::<SkipLedger>(handler, ConsumerOptions::new(s).with_max_retries(2))
             .await
@@ -163,8 +192,12 @@ async fn main() -> Result<(), ShoveError> {
 
     let s = shutdown.clone();
     let c = client.clone();
+    let t = strict_totals.clone();
     let strict_task = tokio::spawn(async move {
-        let handler = LedgerHandler { label: "strict" };
+        let handler = LedgerHandler {
+            label: "fail all after error",
+            totals: t,
+        };
         RabbitMqConsumer::new(c)
             .run_sequenced::<StrictLedger>(handler, ConsumerOptions::new(s).with_max_retries(2))
             .await
@@ -177,7 +210,33 @@ async fn main() -> Result<(), ShoveError> {
     client.shutdown().await;
 
     let _ = tokio::join!(skip_task, strict_task);
-    println!("done");
+
+    // ── Verify totals ──
+    let skip = skip_totals.lock().await;
+    let strict = strict_totals.lock().await;
+
+    println!("\n── Results ──");
+    println!(
+        "skip   ACC-A = {} (expected 1200)",
+        skip.get("ACC-A").copied().unwrap_or(0)
+    );
+    println!(
+        "skip   ACC-B = {} (expected 300)",
+        skip.get("ACC-B").copied().unwrap_or(0)
+    );
+    println!(
+        "strict ACC-A = {} (expected 300)",
+        strict.get("ACC-A").copied().unwrap_or(0)
+    );
+    println!(
+        "strict ACC-B = {} (expected 300)",
+        strict.get("ACC-B").copied().unwrap_or(0)
+    );
+
+    assert_eq!(skip.get("ACC-A").copied().unwrap_or(0), 1200, "skip ACC-A");
+    assert_eq!(skip.get("ACC-B").copied().unwrap_or(0), 300, "skip ACC-B");
+    assert_eq!(strict.get("ACC-A").copied().unwrap_or(0), 300, "strict ACC-A");
+    assert_eq!(strict.get("ACC-B").copied().unwrap_or(0), 300, "strict ACC-B");
 
     Ok(())
 }

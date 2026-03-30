@@ -4,9 +4,10 @@
 //! `Autoscaler`, `AutoscalerConfig`, `ManagementClient`, and dynamic scaling
 //! based on queue depth.
 //!
-//! Requires a running RabbitMQ instance with the management plugin enabled:
+//! Requires a running RabbitMQ instance with the management plugin enabled
+//! (see docker-compose.yml):
 //!
-//!     rabbitmq-plugins enable rabbitmq_management
+//!     docker compose up -d
 //!     cargo run --example consumer_groups --features rabbitmq
 
 use std::sync::Arc;
@@ -50,7 +51,7 @@ impl MessageHandler<WorkQueue> for TaskHandler {
             metadata.retry_count + 1,
         );
         // Simulate work
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         Outcome::Ack
     }
 }
@@ -59,7 +60,7 @@ impl MessageHandler<WorkQueue> for TaskHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5672/%2f");
+    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
     let client = RabbitMqClient::connect(&config).await?;
 
     // ── Declare topology ──
@@ -68,16 +69,17 @@ async fn main() -> Result<(), ShoveError> {
     declare_topic::<WorkQueue>(&declarer).await?;
     println!("topology declared\n");
 
-    // ── Publish a burst of tasks ──
+    // ── Publish an initial burst of tasks ──
     let publisher = RabbitMqPublisher::new(client.clone()).await?;
-    for i in 0..50 {
+    let burst_size = 100;
+    for i in 0..burst_size {
         let event = TaskEvent {
             task_id: format!("TASK-{i:03}"),
             payload: format!("work item {i}"),
         };
         publisher.publish::<WorkQueue>(&event).await?;
     }
-    println!("published 50 tasks\n");
+    println!("published {burst_size} tasks\n");
 
     // ── Set up consumer group registry ──
     //
@@ -108,7 +110,7 @@ async fn main() -> Result<(), ShoveError> {
     // The autoscaler polls the RabbitMQ Management API for queue statistics
     // and scales consumer groups up/down based on queue depth relative to
     // capacity (consumers × prefetch_count).
-    let mgmt_config = ManagementConfig::new("http://localhost:15672", "guest", "guest");
+    let mgmt_config = ManagementConfig::new("http://localhost:15673", "guest", "guest");
     let mgmt_client = ManagementClient::new(mgmt_config);
 
     let mut autoscaler = Autoscaler::new(
@@ -121,8 +123,8 @@ async fn main() -> Result<(), ShoveError> {
             scale_down_multiplier: 0.3,
             // Condition must hold for 4 s before acting (prevents flapping).
             hysteresis_duration: Duration::from_secs(4),
-            // At least 10 s between consecutive scaling actions per group.
-            cooldown_duration: Duration::from_secs(10),
+            // At least 8 s between consecutive scaling actions per group.
+            cooldown_duration: Duration::from_secs(8),
         },
     );
 
@@ -135,12 +137,16 @@ async fn main() -> Result<(), ShoveError> {
 
     // ── Let the system process and scale ──
     //
-    // With 50 queued messages, prefetch=10, and 1 consumer:
-    //   capacity = 10, messages_ready = 50 → 50 > 10 × 1.5 → scale up
-    // The autoscaler will add consumers until the queue drains or max is hit.
+    // With 100 queued messages at 500 ms each, prefetch=10, and 1 consumer:
+    //   capacity = 10, messages_ready = 100 → 100 > 10 × 1.5 → scale up
+    //
+    // Phase 1 – burst processing: the autoscaler adds consumers as the queue
+    //   stays deep, up to max_consumers.
+    // Phase 2 – drain & settle: once the queue empties, messages_ready drops
+    //   below capacity × 0.3, triggering scale-down back to min_consumers.
     println!("autoscaler running — watch consumer count change\n");
 
-    for _ in 0..6 {
+    for _ in 0..20 {
         tokio::time::sleep(Duration::from_secs(3)).await;
         let reg = registry.lock().await;
         if let Some(group) = reg.groups().get("work-queue-group") {
