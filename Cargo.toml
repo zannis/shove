@@ -1,6 +1,6 @@
 [package]
 name = "shove"
-version = "0.2.0"
+version = "0.3.0"
 description = "Async tasks via pubsub on steroids. Comes with built-in support for complex queue configurations, audit logs, autoscaling consumer groups and more."
 edition = "2024"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
@@ -13,6 +13,7 @@ categories = ["asynchronous"]
 default = []
 rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
 sns = ["dep:aws-config", "dep:futures"]
+audit = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +22,8 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 tracing = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
 lapin = { version = "4", features = ["rustls--ring"], optional = true }
 futures-lite = { version = "2", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }

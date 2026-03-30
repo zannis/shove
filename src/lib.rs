@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod consumer;
 pub mod error;
 pub mod handler;
@@ -11,6 +12,7 @@ pub mod topology;
 
 mod backends;
 
+pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use consumer::{Consumer, ConsumerOptions};
 pub use error::ShoveError;
 pub use handler::MessageHandler;
@@ -22,6 +24,9 @@ pub use topology::{
     HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder, TopologyDeclarer,
     declare_topic,
 };
+
+#[cfg(feature = "audit")]
+pub use audit::{AuditLog, ShoveAuditHandler};
 
 use std::time::Duration;
 
