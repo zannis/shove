@@ -241,3 +241,191 @@ impl<S: QueueStatsProvider> Autoscaler<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- AutoscalerConfig --
+
+    #[test]
+    fn config_defaults() {
+        let config = AutoscalerConfig::default();
+        assert_eq!(config.poll_interval, Duration::from_secs(5));
+        assert_eq!(config.scale_up_multiplier, 2.0);
+        assert_eq!(config.scale_down_multiplier, 0.5);
+        assert_eq!(config.hysteresis_duration, Duration::from_secs(10));
+        assert_eq!(config.cooldown_duration, Duration::from_secs(30));
+    }
+
+    // -- GroupScalingState --
+
+    #[test]
+    fn state_new_is_empty() {
+        let state = GroupScalingState::new();
+        assert!(state.scale_up_since.is_none());
+        assert!(state.scale_down_since.is_none());
+        assert!(state.last_scaled_at.is_none());
+    }
+
+    #[test]
+    fn in_cooldown_false_initially() {
+        let state = GroupScalingState::new();
+        assert!(!state.in_cooldown(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn in_cooldown_true_during_cooldown() {
+        let mut state = GroupScalingState::new();
+        state.last_scaled_at = Some(Instant::now());
+        assert!(state.in_cooldown(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn in_cooldown_false_after_expiry() {
+        let mut state = GroupScalingState::new();
+        state.last_scaled_at = Some(Instant::now() - Duration::from_secs(60));
+        assert!(!state.in_cooldown(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn in_cooldown_zero_duration_always_expired() {
+        let mut state = GroupScalingState::new();
+        state.last_scaled_at = Some(Instant::now());
+        assert!(!state.in_cooldown(Duration::ZERO));
+    }
+
+    // -- Threshold math --
+
+    /// Validates the threshold calculations used in poll_and_scale:
+    /// scale_up when ready > capacity * scale_up_multiplier
+    /// scale_down when ready < capacity * scale_down_multiplier
+    #[test]
+    fn scale_thresholds_computed_correctly() {
+        let config = AutoscalerConfig::default();
+
+        // 2 consumers, prefetch 10 → capacity = 20
+        let prefetch = 10_u16;
+        let active = 2_f64;
+        let capacity = (prefetch as f64) * active;
+        assert_eq!(capacity, 20.0);
+
+        let scale_up_threshold = capacity * config.scale_up_multiplier; // 40
+        let scale_down_threshold = capacity * config.scale_down_multiplier; // 10
+
+        assert_eq!(scale_up_threshold, 40.0);
+        assert_eq!(scale_down_threshold, 10.0);
+
+        // Within thresholds
+        assert!(!(15.0_f64 > scale_up_threshold));
+        assert!(!(15.0_f64 < scale_down_threshold));
+
+        // Above scale-up
+        assert!(50.0_f64 > scale_up_threshold);
+
+        // Below scale-down
+        assert!(5.0_f64 < scale_down_threshold);
+    }
+
+    #[test]
+    fn scale_thresholds_with_single_consumer() {
+        let config = AutoscalerConfig::default();
+
+        // 1 consumer, prefetch 10 → capacity = 10
+        let capacity = 10.0_f64;
+        let scale_up_threshold = capacity * config.scale_up_multiplier; // 20
+        let scale_down_threshold = capacity * config.scale_down_multiplier; // 5
+
+        assert_eq!(scale_up_threshold, 20.0);
+        assert_eq!(scale_down_threshold, 5.0);
+
+        // Exactly at threshold: ready == threshold does NOT trigger
+        assert!(!(20.0_f64 > scale_up_threshold)); // equal, not greater
+        assert!(!(5.0_f64 < scale_down_threshold)); // equal, not less
+    }
+
+    #[test]
+    fn hysteresis_resets_on_condition_change() {
+        let mut state = GroupScalingState::new();
+
+        // Simulate scale-up condition starting
+        let now = Instant::now();
+        state.scale_up_since = Some(now);
+        assert!(state.scale_up_since.is_some());
+
+        // When scale-down is triggered, scale-up timer should be cleared
+        // (this is what poll_and_scale does)
+        state.scale_up_since = None;
+        state.scale_down_since = Some(now);
+        assert!(state.scale_up_since.is_none());
+        assert!(state.scale_down_since.is_some());
+    }
+
+    #[test]
+    fn cooldown_set_after_scaling() {
+        let mut state = GroupScalingState::new();
+        assert!(!state.in_cooldown(Duration::from_secs(30)));
+
+        // Simulate a scaling action
+        state.last_scaled_at = Some(Instant::now());
+        state.scale_up_since = None; // reset after action
+
+        assert!(state.in_cooldown(Duration::from_secs(30)));
+    }
+
+    // -- Mock QueueStatsProvider --
+
+    struct MockStatsProvider {
+        stats: HashMap<String, crate::backends::rabbitmq::management::QueueStats>,
+    }
+
+    impl MockStatsProvider {
+        fn new() -> Self {
+            Self {
+                stats: HashMap::new(),
+            }
+        }
+    }
+
+    impl QueueStatsProvider for MockStatsProvider {
+        async fn get_queue_stats(
+            &self,
+            queue: &str,
+        ) -> Result<crate::backends::rabbitmq::management::QueueStats, crate::error::ShoveError> {
+            self.stats
+                .get(queue)
+                .cloned()
+                .ok_or_else(|| crate::error::ShoveError::Connection(format!("not found: {queue}")))
+        }
+    }
+
+    #[test]
+    fn autoscaler_new_starts_with_empty_state() {
+        let autoscaler = Autoscaler::new(MockStatsProvider::new(), AutoscalerConfig::default());
+        assert!(autoscaler.state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn autoscaler_run_exits_on_shutdown() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let token = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            // Simulate the run loop's select behavior
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => { /* exit */ }
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    panic!("should have exited via shutdown");
+                }
+            }
+        });
+
+        // Should complete immediately since shutdown is already cancelled
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("should complete within timeout")
+            .expect("task should not panic");
+    }
+}

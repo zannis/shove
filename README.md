@@ -10,6 +10,12 @@ The first version of this was built for [Lens](https://lens.xyz) to handle milli
 
 shove is the do-over. RabbitMQ handles storage and routing. shove handles the rest: type-safe topics, retry topologies, ordered delivery, consumer groups that scale themselves.
 
+## Who is it for
+
+You have a distributed, event-driven application. You need to move messages between services reliably, at high throughput, without burning through resources. You want the compiler to catch mismatches between publishers and consumers before they hit production. And when load spikes, you want consumers to scale themselves instead of paging someone at 3 AM.
+
+If all of the above sounds relatable, then shove is for you.
+
 ## Why "shove"
 
 We needed a name for "throw a job at something and stop thinking about it." Push was taken. Yeet was considered. shove stuck — it's what you do with messages: shove them in, let the broker deal with it.
