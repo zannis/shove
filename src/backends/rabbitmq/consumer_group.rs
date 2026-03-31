@@ -159,9 +159,9 @@ impl ConsumerGroup {
         Self {
             name: name.into(),
             queue: queue.into(),
+            consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
             spawner,
-            consumers: Vec::new(),
             group_token,
         }
     }
@@ -289,9 +289,9 @@ mod tests {
         ConsumerGroup {
             name: "test-group".into(),
             queue: "test-queue".into(),
+            consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
             spawner,
-            consumers: Vec::new(),
             group_token,
         }
     }

@@ -474,7 +474,7 @@ impl Consumer for RabbitMqConsumer {
             let on_failure = seq.on_failure();
             let handler = Arc::new(handler);
             let shutdown = options.shutdown.clone();
-            let mut handles = Vec::new();
+            let mut handles = Vec::with_capacity(seq.routing_shards() as usize);
 
             for i in 0..seq.routing_shards() {
                 let sub_queue = format!("{}-seq-{i}", topology.queue());
