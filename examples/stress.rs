@@ -1,0 +1,715 @@
+//! Stress benchmarks for shove under heavy message loads.
+//!
+//! Measures throughput, latency percentiles (p50/p95/p99), scaling efficiency,
+//! and peak memory usage across three load tiers.
+//!
+//! Requires Docker. Run with:
+//!
+//!     cargo run -q --example stress --features rabbitmq
+//!     cargo run -q --example stress --features rabbitmq -- --tier moderate
+//!     cargo run -q --example stress --features rabbitmq -- --tier extreme --output json
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use clap::{Parser, ValueEnum};
+use rand::RngExt;
+use serde::{Deserialize, Serialize};
+use shove::rabbitmq::*;
+use shove::*;
+use testcontainers::core::ExecCommand;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+// ── CLI ─────────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "stress", about = "Stress benchmarks for shove")]
+struct Cli {
+    /// Which tier(s) to run.
+    #[arg(long, default_value = "all")]
+    tier: TierArg,
+
+    /// Which handler profile(s) to run.
+    #[arg(long, default_value = "all")]
+    handler: HandlerArg,
+
+    /// Output format for the final report.
+    #[arg(long, default_value = "table")]
+    output: OutputFormat,
+}
+
+#[derive(Clone, ValueEnum)]
+enum HandlerArg {
+    Zero,
+    Fast,
+    Slow,
+    All,
+}
+
+#[derive(Clone, ValueEnum)]
+enum TierArg {
+    Moderate,
+    High,
+    Extreme,
+    All,
+}
+
+#[derive(Clone, ValueEnum)]
+enum OutputFormat {
+    Table,
+    Json,
+}
+
+// ── Topic & message ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StressMsg {
+    id: u64,
+    published_at_ns: u64,
+}
+
+define_topic!(
+    StressTopic,
+    StressMsg,
+    TopologyBuilder::new("stress-bench")
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+
+// ── Scenario definition ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+enum HandlerProfile {
+    Zero,
+    Fast,
+    Slow,
+}
+
+impl std::fmt::Display for HandlerProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandlerProfile::Zero => write!(f, "zero (no-op)"),
+            HandlerProfile::Fast => write!(f, "fast (1-5ms)"),
+            HandlerProfile::Slow => write!(f, "slow (50-300ms)"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Scenario {
+    tier: &'static str,
+    messages: u64,
+    consumers: u16,
+    handler: HandlerProfile,
+    deadline: Duration,
+}
+
+fn build_scenarios(tier: &TierArg, handler: &HandlerArg) -> Vec<Scenario> {
+    let mut scenarios = Vec::new();
+
+    let moderate_msgs = [10_000u64];
+    let moderate_consumers = [1u16, 4, 8, 16, 32];
+    let high_msgs = [100_000u64];
+    let high_consumers = [8u16, 16, 32, 64];
+    let extreme_msgs = [1_000_000u64];
+    let extreme_consumers = [32u16, 64, 128, 256];
+
+    let handlers: Vec<HandlerProfile> = match handler {
+        HandlerArg::Zero => vec![HandlerProfile::Zero],
+        HandlerArg::Fast => vec![HandlerProfile::Fast],
+        HandlerArg::Slow => vec![HandlerProfile::Slow],
+        HandlerArg::All => vec![HandlerProfile::Zero, HandlerProfile::Fast, HandlerProfile::Slow],
+    };
+
+    let add = |scenarios: &mut Vec<Scenario>,
+               tier_name: &'static str,
+               msgs: &[u64],
+               consumers: &[u16],
+               deadline: Duration| {
+        for &m in msgs {
+            for &h in &handlers {
+                for &c in consumers {
+                    scenarios.push(Scenario {
+                        tier: tier_name,
+                        messages: m,
+                        consumers: c,
+                        handler: h,
+                        deadline,
+                    });
+                }
+            }
+        }
+    };
+
+    if matches!(tier, TierArg::Moderate | TierArg::All) {
+        add(
+            &mut scenarios,
+            "moderate",
+            &moderate_msgs,
+            &moderate_consumers,
+            Duration::from_secs(120),
+        );
+    }
+    if matches!(tier, TierArg::High | TierArg::All) {
+        add(
+            &mut scenarios,
+            "high",
+            &high_msgs,
+            &high_consumers,
+            Duration::from_secs(600),
+        );
+    }
+    if matches!(tier, TierArg::Extreme | TierArg::All) {
+        add(
+            &mut scenarios,
+            "extreme",
+            &extreme_msgs,
+            &extreme_consumers,
+            Duration::from_secs(1800),
+        );
+    }
+
+    scenarios
+}
+
+// ── Result types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct ScenarioResult {
+    tier: String,
+    messages: u64,
+    consumers: u16,
+    handler: String,
+    throughput_msg_per_sec: f64,
+    latency_p50_ms: f64,
+    latency_p95_ms: f64,
+    latency_p99_ms: f64,
+    scaling_efficiency: f64,
+    peak_rss_mb: f64,
+    duration_secs: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FailedResult {
+    tier: String,
+    messages: u64,
+    consumers: u16,
+    handler: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Report {
+    results: Vec<ScenarioResult>,
+    failures: Vec<FailedResult>,
+}
+
+// ── Infrastructure ──────────────────────────────────────────────────────────
+
+struct Broker {
+    client: RabbitMqClient,
+    publisher: RabbitMqPublisher,
+    mgmt_config: ManagementConfig,
+    _container: testcontainers::ContainerAsync<RabbitMq>,
+}
+
+impl Broker {
+    async fn start() -> Self {
+        Self::require_docker();
+
+        eprintln!("starting RabbitMQ container...");
+        let container = RabbitMq::default().start().await.unwrap();
+        let host = container.get_host().await.unwrap().to_string();
+        let amqp_port = container.get_host_port_ipv4(5672).await.unwrap();
+        let mgmt_port = container.get_host_port_ipv4(15672).await.unwrap();
+
+        // Enable consistent-hash exchange plugin.
+        let mut result = container
+            .exec(ExecCommand::new([
+                "rabbitmq-plugins",
+                "enable",
+                "rabbitmq_consistent_hash_exchange",
+            ]))
+            .await
+            .unwrap();
+        let _ = result.stdout_to_vec().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let uri = format!("amqp://guest:guest@{host}:{amqp_port}");
+        let client = RabbitMqClient::connect(&RabbitMqConfig::new(&uri))
+            .await
+            .unwrap();
+
+        // Declare topology.
+        let channel = client.create_channel().await.unwrap();
+        RabbitMqTopologyDeclarer::new(channel)
+            .declare(StressTopic::topology())
+            .await
+            .unwrap();
+
+        let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+
+        let mgmt_config =
+            ManagementConfig::new(format!("http://{host}:{mgmt_port}"), "guest", "guest");
+
+        eprintln!("RabbitMQ ready at {uri}");
+
+        Self {
+            client,
+            publisher,
+            mgmt_config,
+            _container: container,
+        }
+    }
+
+    fn require_docker() {
+        match std::process::Command::new("docker").arg("info").output() {
+            Ok(o) if o.status.success() => {}
+            _ => panic!(
+                "Docker is required to run stress benchmarks. \
+                 Install Docker Desktop, colima, or podman and ensure the daemon is running."
+            ),
+        }
+    }
+
+    /// Purge the main queue via the management API so scenarios start clean.
+    async fn purge_queue(&self) {
+        let http = reqwest::Client::new();
+        let url = format!(
+            "{}/api/queues/%2F/{}/contents",
+            self.mgmt_config.base_url,
+            StressTopic::topology().queue()
+        );
+        let _ = http
+            .delete(&url)
+            .basic_auth(&self.mgmt_config.username, Some(&self.mgmt_config.password))
+            .send()
+            .await;
+        // Brief pause for the purge to take effect.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    async fn publish_batch(&self, messages: &[StressMsg]) {
+        // Publish in chunks of 1000 to avoid overwhelming the channel.
+        for chunk in messages.chunks(1000) {
+            self.publisher
+                .publish_batch::<StressTopic>(chunk)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn shutdown(self) {
+        self.client.shutdown().await;
+    }
+}
+
+// ── Latency recording ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+struct LatencyRecord {
+    /// Time from publish to handler entry (includes broker transit + queue wait).
+    #[allow(dead_code)]
+    enqueue_to_receive_ns: u64,
+    /// Time from publish to handler completion (end-to-end).
+    enqueue_to_ack_ns: u64,
+}
+
+struct LatencyRecorder {
+    tx: tokio::sync::mpsc::UnboundedSender<LatencyRecord>,
+    rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<LatencyRecord>>,
+}
+
+impl LatencyRecorder {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            tx,
+            rx: Mutex::new(rx),
+        }
+    }
+
+    fn record(&self, record: LatencyRecord) {
+        let _ = self.tx.send(record);
+    }
+
+    async fn compute_percentiles(&self) -> (f64, f64, f64) {
+        let mut rx = self.rx.lock().await;
+        let mut records = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            records.push(r);
+        }
+        if records.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        records.sort_unstable_by_key(|r| r.enqueue_to_ack_ns);
+        let len = records.len();
+        let p50 = records[len * 50 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
+        let p95 = records[len * 95 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
+        let p99 = records[len * 99 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
+        (p50, p95, p99)
+    }
+}
+
+// ── Memory sampling ─────────────────────────────────────────────────────────
+
+fn current_rss_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        use mach2::task::task_info;
+        use mach2::task_info::{task_flavor_t, MACH_TASK_BASIC_INFO, mach_task_basic_info};
+        let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
+        let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
+        let kr = unsafe {
+            task_info(
+                mach2::traps::mach_task_self(),
+                MACH_TASK_BASIC_INFO as task_flavor_t,
+                &mut info as *mut _ as *mut i32,
+                &mut count,
+            )
+        };
+        if kr == 0 {
+            info.resident_size as u64
+        } else {
+            0
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(rss_pages) = content.split_whitespace().nth(1) {
+                if let Ok(pages) = rss_pages.parse::<u64>() {
+                    return pages * 4096; // assume 4K page size
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+struct MemorySampler {
+    peak_rss: Arc<AtomicU64>,
+    cancel: tokio_util::sync::CancellationToken,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl MemorySampler {
+    fn start() -> Self {
+        let peak_rss = Arc::new(AtomicU64::new(current_rss_bytes()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let peak = peak_rss.clone();
+        let token = cancel.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        let rss = current_rss_bytes();
+                        peak.fetch_max(rss, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+
+        Self {
+            peak_rss,
+            cancel,
+            handle: Some(handle),
+        }
+    }
+
+    fn baseline_mb(&self) -> f64 {
+        current_rss_bytes() as f64 / (1024.0 * 1024.0)
+    }
+
+    async fn stop(mut self) -> f64 {
+        self.cancel.cancel();
+        if let Some(h) = self.handle.take() {
+            let _ = h.await;
+        }
+        
+        self.peak_rss.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
+    }
+}
+
+// ── Handler ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct StressHandler {
+    epoch: Instant,
+    processed: Arc<AtomicU64>,
+    recorder: Arc<LatencyRecorder>,
+    profile: HandlerProfile,
+}
+
+impl MessageHandler<StressTopic> for StressHandler {
+    async fn handle(&self, msg: StressMsg, _meta: MessageMetadata) -> Outcome {
+        let received_at = self.epoch.elapsed().as_nanos() as u64;
+
+        // Simulate work based on handler profile.
+        match self.profile {
+            HandlerProfile::Zero => {}
+            HandlerProfile::Fast => {
+                let delay_ms = rand::rng().random_range(1..=5);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            HandlerProfile::Slow => {
+                let delay_ms = rand::rng().random_range(50..=300);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        let acked_at = self.epoch.elapsed().as_nanos() as u64;
+        self.recorder.record(LatencyRecord {
+            enqueue_to_receive_ns: received_at.saturating_sub(msg.published_at_ns),
+            enqueue_to_ack_ns: acked_at.saturating_sub(msg.published_at_ns),
+        });
+
+        self.processed.fetch_add(1, Ordering::Relaxed);
+        Outcome::Ack
+    }
+}
+
+// ── Scenario execution ──────────────────────────────────────────────────────
+
+async fn run_scenario(
+    broker: &Broker,
+    scenario: &Scenario,
+    cancel: &CancellationToken,
+) -> Result<(f64, f64, f64, f64, f64, f64), String> {
+    // Returns: (throughput, p50, p95, p99, peak_rss_mb, duration_secs)
+    broker.purge_queue().await;
+
+    let epoch = Instant::now();
+    let recorder = Arc::new(LatencyRecorder::new());
+    let processed = Arc::new(AtomicU64::new(0));
+
+    // Publish all messages.
+    let messages: Vec<StressMsg> = (0..scenario.messages)
+        .map(|id| {
+            let published_at_ns = epoch.elapsed().as_nanos() as u64;
+            StressMsg {
+                id,
+                published_at_ns,
+            }
+        })
+        .collect();
+    broker.publish_batch(&messages).await;
+
+    // Start memory sampler.
+    let sampler = MemorySampler::start();
+    let baseline_mb = sampler.baseline_mb();
+
+    // Start consumer group.
+    let mut registry = ConsumerGroupRegistry::new(broker.client.clone());
+    let pc = processed.clone();
+    let rec = recorder.clone();
+    let profile = scenario.handler;
+    let consumers = scenario.consumers;
+    registry
+        .register::<StressTopic, StressHandler>(
+            ConsumerGroupConfig::new(consumers..=consumers)
+                .with_prefetch_count((scenario.messages / consumers as u64).clamp(1, 100) as u16),
+            move || StressHandler {
+                epoch,
+                processed: pc.clone(),
+                recorder: rec.clone(),
+                profile,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let start = Instant::now();
+    registry.start_all();
+
+    // Wait for all messages to be processed, timeout, or cancellation.
+    let deadline = tokio::time::Instant::now() + scenario.deadline;
+    loop {
+        if processed.load(Ordering::Relaxed) >= scenario.messages {
+            break;
+        }
+        if cancel.is_cancelled() {
+            registry.shutdown_all().await;
+            let _ = sampler.stop().await;
+            return Err("interrupted".to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            registry.shutdown_all().await;
+            let _ = sampler.stop().await;
+            return Err(format!(
+                "timeout after {:?}: processed {} / {}",
+                scenario.deadline,
+                processed.load(Ordering::Relaxed),
+                scenario.messages
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let duration = start.elapsed();
+    let throughput = scenario.messages as f64 / duration.as_secs_f64();
+    let (p50, p95, p99) = recorder.compute_percentiles().await;
+    let peak_rss_mb = sampler.stop().await;
+    let rss_delta = (peak_rss_mb - baseline_mb).max(0.0);
+
+    registry.shutdown_all().await;
+
+    Ok((throughput, p50, p95, p99, rss_delta, duration.as_secs_f64()))
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    let scenarios = build_scenarios(&cli.tier, &cli.handler);
+
+    let broker = Broker::start().await;
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("\ninterrupted, shutting down gracefully...");
+        cancel_clone.cancel();
+    });
+
+    eprintln!("shove stress benchmarks");
+    eprintln!("scenarios: {}\n", scenarios.len());
+
+    let mut results: Vec<ScenarioResult> = Vec::new();
+    let mut failures: Vec<FailedResult> = Vec::new();
+
+    for (i, scenario) in scenarios.iter().enumerate() {
+        if cancel.is_cancelled() {
+            eprintln!("skipping remaining scenarios");
+            break;
+        }
+        eprintln!(
+            "[{}/{}] {} | {}msg | {}c | {} ...",
+            i + 1,
+            scenarios.len(),
+            scenario.tier,
+            scenario.messages,
+            scenario.consumers,
+            scenario.handler,
+        );
+
+        match run_scenario(&broker, scenario, &cancel).await {
+            Ok((throughput, p50, p95, p99, peak_rss_mb, duration_secs)) => {
+                eprintln!(
+                    "  -> {:.0} msg/s | p50={:.1}ms p95={:.1}ms p99={:.1}ms | {:.1}s",
+                    throughput, p50, p95, p99, duration_secs
+                );
+                results.push(ScenarioResult {
+                    tier: scenario.tier.to_string(),
+                    messages: scenario.messages,
+                    consumers: scenario.consumers,
+                    handler: scenario.handler.to_string(),
+                    throughput_msg_per_sec: throughput,
+                    latency_p50_ms: p50,
+                    latency_p95_ms: p95,
+                    latency_p99_ms: p99,
+                    scaling_efficiency: 0.0, // computed below
+                    peak_rss_mb,
+                    duration_secs,
+                });
+            }
+            Err(e) => {
+                eprintln!("  -> FAILED: {e}");
+                failures.push(FailedResult {
+                    tier: scenario.tier.to_string(),
+                    messages: scenario.messages,
+                    consumers: scenario.consumers,
+                    handler: scenario.handler.to_string(),
+                    error: e,
+                });
+            }
+        }
+    }
+
+    // Compute scaling efficiency: throughput(N) / throughput(min_consumers) for same (tier, messages, handler).
+    let mut baseline_throughputs: std::collections::HashMap<(String, u64, String), (u16, f64)> =
+        std::collections::HashMap::new();
+    for r in &results {
+        let key = (r.tier.clone(), r.messages, r.handler.clone());
+        let entry = baseline_throughputs.entry(key).or_insert((r.consumers, r.throughput_msg_per_sec));
+        if r.consumers < entry.0 {
+            *entry = (r.consumers, r.throughput_msg_per_sec);
+        }
+    }
+
+    for result in &mut results {
+        let key = (result.tier.clone(), result.messages, result.handler.clone());
+        if let Some(&(_, baseline)) = baseline_throughputs.get(&key)
+            && baseline > 0.0 {
+                result.scaling_efficiency = result.throughput_msg_per_sec / baseline;
+            }
+    }
+
+    let report = Report {
+        results,
+        failures,
+    };
+
+    // Write JSON to file always.
+    let json = serde_json::to_string_pretty(&report).unwrap();
+    std::fs::write("bench-results.json", &json).unwrap();
+    eprintln!("\nResults written to bench-results.json");
+
+    // Print report in requested format.
+    match cli.output {
+        OutputFormat::Json => {
+            println!("{json}");
+        }
+        OutputFormat::Table => {
+            print_table(&report);
+        }
+    }
+
+    broker.shutdown().await;
+}
+
+fn print_table(report: &Report) {
+    eprintln!();
+    eprintln!(
+        "{:<10} {:>8} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8} {:>7} {:>8}",
+        "TIER", "MSGS", "CONSUMERS", "HANDLER", "MSGS/SEC", "p50", "p95", "p99", "SCALE", "RSS(MB)"
+    );
+    eprintln!("{}", "-".repeat(96));
+    for r in &report.results {
+        eprintln!(
+            "{:<10} {:>8} {:>10} {:>8} {:>10.0} {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>6.1}x {:>8.1}",
+            r.tier,
+            r.messages,
+            r.consumers,
+            r.handler,
+            r.throughput_msg_per_sec,
+            r.latency_p50_ms,
+            r.latency_p95_ms,
+            r.latency_p99_ms,
+            r.scaling_efficiency,
+            r.peak_rss_mb,
+        );
+    }
+    if !report.failures.is_empty() {
+        eprintln!("\nFailed scenarios:");
+        for f in &report.failures {
+            eprintln!(
+                "  {} | {}msg | {}c | {} — {}",
+                f.tier, f.messages, f.consumers, f.handler, f.error
+            );
+        }
+    }
+}
