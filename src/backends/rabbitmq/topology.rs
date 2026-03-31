@@ -82,10 +82,6 @@ impl RabbitMqTopologyDeclarer {
         if let Some(dlq) = topology.dlq() {
             self.declare_queue(dlq, FieldTable::default()).await?;
         }
-        for hq in topology.hold_queues() {
-            let args = hold_queue_args(topology.queue(), hq.delay().as_millis() as i64);
-            self.declare_queue(hq.name(), args).await?;
-        }
 
         // 2. Declare consistent-hash exchange
         self.channel
@@ -109,6 +105,12 @@ impl RabbitMqTopologyDeclarer {
         // 3. Declare N sub-queues with single-active-consumer, bind to hash exchange
         for i in 0..seq.routing_shards() {
             let sub_queue = format!("{}-seq-{i}", topology.queue());
+
+            // Per-shard hold queues dead-letter back to this sub-queue
+            for hq in topology.shard_hold_queue_names(i) {
+                let args = hold_queue_args(&sub_queue, hq.delay().as_millis() as i64);
+                self.declare_queue(hq.name(), args).await?;
+            }
 
             let mut args = FieldTable::default();
             args.insert(X_SINGLE_ACTIVE_CONSUMER.into(), AMQPValue::Boolean(true));

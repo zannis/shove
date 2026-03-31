@@ -1,5 +1,6 @@
 #![cfg(feature = "rabbitmq")]
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -30,6 +31,11 @@ pub struct ConsumerGroupConfig {
     /// Maximum time a handler may spend processing a single message.
     /// If exceeded the message is retried. `None` means no limit.
     pub(crate) handler_timeout: Option<Duration>,
+    /// When `true`, each consumer in the group processes up to `prefetch_count`
+    /// messages concurrently while preserving in-order acknowledgement.
+    pub(crate) concurrent_processing: bool,
+    /// Maximum locally buffered messages per sequence key (sequenced consumers).
+    pub(crate) max_pending_per_key: Option<usize>,
 }
 
 impl ConsumerGroupConfig {
@@ -41,7 +47,7 @@ impl ConsumerGroupConfig {
     /// # Panics
     ///
     /// Panics if `*range.start() > *range.end()`.
-    pub fn new(range: std::ops::RangeInclusive<u16>) -> Self {
+    pub fn new(range: RangeInclusive<u16>) -> Self {
         let min = *range.start();
         let max = *range.end();
         assert!(
@@ -54,6 +60,8 @@ impl ConsumerGroupConfig {
             max_consumers: max,
             max_retries: 10,
             handler_timeout: None,
+            concurrent_processing: false,
+            max_pending_per_key: None,
         }
     }
 
@@ -99,6 +107,23 @@ impl ConsumerGroupConfig {
     pub fn handler_timeout(&self) -> Option<Duration> {
         self.handler_timeout
     }
+
+    /// Enable concurrent message processing within each consumer.
+    ///
+    /// When enabled, each consumer processes up to `prefetch_count` messages
+    /// concurrently while preserving in-order acknowledgement.
+    ///
+    /// Not available for sequenced consumers — consumer groups always use
+    /// non-sequenced consumption.
+    pub fn with_concurrent_processing(mut self, concurrent: bool) -> Self {
+        self.concurrent_processing = concurrent;
+        self
+    }
+
+    /// Returns whether concurrent processing is enabled.
+    pub fn concurrent_processing(&self) -> bool {
+        self.concurrent_processing
+    }
 }
 
 /// A named group of identical consumers all reading from the same queue.
@@ -142,14 +167,18 @@ impl ConsumerGroup {
         T: Topic + 'static,
         H: MessageHandler<T> + Clone + 'static,
     {
+        let concurrent = config.concurrent_processing;
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = RabbitMqConsumer::new(client.clone());
 
             tokio::spawn(async move {
-                // Errors are logged inside run; we swallow the Result here
-                // so the JoinHandle is `JoinHandle<()>`.
-                if let Err(e) = consumer.run::<T>(handler, options).await {
+                let result = if concurrent {
+                    consumer.run_concurrent::<T>(handler, options).await
+                } else {
+                    consumer.run::<T>(handler, options).await
+                };
+                if let Err(e) = result {
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -210,7 +239,7 @@ impl ConsumerGroup {
         let idle_index = self
             .consumers
             .iter()
-            .rposition(|(_, processing, _)| !processing.load(Ordering::Acquire));
+            .rposition(|(_, processing, _)| !processing.load(Ordering::Relaxed));
 
         let Some(index) = idle_index else {
             warn!(group = %self.name, "scale_down rejected: all consumers are busy");
@@ -264,6 +293,7 @@ impl ConsumerGroup {
             shutdown: child_token.clone(),
             processing: processing.clone(),
             handler_timeout: self.config.handler_timeout,
+            max_pending_per_key: self.config.max_pending_per_key,
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
@@ -579,6 +609,43 @@ mod tests {
         assert_eq!(config.prefetch_count(), 20);
         assert_eq!(config.max_retries(), 3);
         assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
+    }
+
+    // -- concurrent_processing --
+
+    #[test]
+    fn concurrent_processing_defaults_to_false() {
+        let config = ConsumerGroupConfig::new(1..=4);
+        assert!(!config.concurrent_processing());
+    }
+
+    #[test]
+    fn with_concurrent_processing_sets_value() {
+        let config = ConsumerGroupConfig::new(1..=4).with_concurrent_processing(true);
+        assert!(config.concurrent_processing());
+    }
+
+    #[test]
+    fn with_concurrent_processing_false_explicit() {
+        let config = ConsumerGroupConfig::new(1..=4)
+            .with_concurrent_processing(true)
+            .with_concurrent_processing(false);
+        assert!(!config.concurrent_processing());
+    }
+
+    #[test]
+    fn builder_chaining_with_concurrent_processing() {
+        let config = ConsumerGroupConfig::new(1..=8)
+            .with_prefetch_count(20)
+            .with_max_retries(3)
+            .with_handler_timeout(Duration::from_secs(30))
+            .with_concurrent_processing(true);
+        assert_eq!(config.min_consumers(), 1);
+        assert_eq!(config.max_consumers(), 8);
+        assert_eq!(config.prefetch_count(), 20);
+        assert_eq!(config.max_retries(), 3);
+        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
+        assert!(config.concurrent_processing());
     }
 
     // -- spawn_one wiring --

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shove::rabbitmq::*;
 use shove::*;
@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
-    _container: testcontainers::ContainerAsync<RabbitMq>,
+    container: testcontainers::ContainerAsync<RabbitMq>,
     amqp_url: String,
     mgmt_url: String,
 }
@@ -64,7 +64,7 @@ impl TestBroker {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         Self {
-            _container: container,
+            container,
             amqp_url,
             mgmt_url,
         }
@@ -78,6 +78,17 @@ impl TestBroker {
 
     fn mgmt_config(&self) -> ManagementConfig {
         ManagementConfig::new(&self.mgmt_url, "guest", "guest")
+    }
+
+    async fn stop(self) {
+        self.container
+            .stop_with_timeout(Some(0))
+            .await
+            .expect("failed to stop container");
+        self.container
+            .rm()
+            .await
+            .expect("failed to remove container");
     }
 }
 
@@ -164,6 +175,36 @@ define_topic!(
         .build()
 );
 
+// Topic for handler timeout tests
+define_topic!(
+    TimeoutWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-timeout")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+// Topic for concurrent consumer tests
+define_topic!(
+    ConcurrentWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-concurrent")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+// Topic for concurrent consumer DLQ/reject tests
+define_topic!(
+    ConcurrentRejectWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-concurrent-reject")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
 // Sequenced topic with FailAll — rejection poisons the sequence key
 define_sequenced_topic!(
     FailAllOrders,
@@ -184,6 +225,104 @@ define_sequenced_topic!(
     OrderMessage,
     |msg: &OrderMessage| msg.account.clone(),
     TopologyBuilder::new("test-skip-orders")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .sequenced(shove::topology::SequenceFailure::Skip)
+        .routing_shards(1)
+        .build()
+);
+
+// Topics for ungraceful shutdown recovery tests
+define_topic!(
+    UngracefulSeq1,
+    SimpleMessage,
+    TopologyBuilder::new("test-ungraceful-seq-1")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+define_topic!(
+    UngracefulSeq3,
+    SimpleMessage,
+    TopologyBuilder::new("test-ungraceful-seq-3")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+define_topic!(
+    UngracefulConc1,
+    SimpleMessage,
+    TopologyBuilder::new("test-ungraceful-conc-1")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+define_topic!(
+    UngracefulConc3,
+    SimpleMessage,
+    TopologyBuilder::new("test-ungraceful-conc-3")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+// Topic for concurrent consumer retry tests
+define_topic!(
+    ConcurrentRetryWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-concurrent-retry")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+// Topic for concurrent consumer max-retry / DLQ tests
+define_topic!(
+    ConcurrentMaxRetry,
+    SimpleMessage,
+    TopologyBuilder::new("test-concurrent-maxretry")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+// Message type and topic for deserialization-failure DLQ tests
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+struct StrictMessage {
+    value: u64,
+}
+
+define_topic!(
+    StrictWork,
+    StrictMessage,
+    TopologyBuilder::new("test-strict")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+// Topic for sequenced consumer retry via shard hold queues (Task 8)
+define_sequenced_topic!(
+    RetrySeqOrders,
+    OrderMessage,
+    |msg: &OrderMessage| msg.account.clone(),
+    TopologyBuilder::new("test-retry-seq-orders")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .sequenced(shove::topology::SequenceFailure::Skip)
+        .routing_shards(1)
+        .build()
+);
+
+// Topic for sequenced consumer defer via shard hold queues (Task 9)
+define_sequenced_topic!(
+    DeferSeqOrders,
+    OrderMessage,
+    |msg: &OrderMessage| msg.account.clone(),
+    TopologyBuilder::new("test-defer-seq-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
         .sequenced(shove::topology::SequenceFailure::Skip)
@@ -270,6 +409,272 @@ impl MessageHandler<FailAllOrders> for CountingHandler {
     async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+/// Handler that simulates slow work with configurable latency.
+/// Records completion timestamps to verify in-order acking.
+#[derive(Clone)]
+struct SlowCountingHandler {
+    count: Arc<AtomicU32>,
+    signal: Arc<tokio::sync::Notify>,
+    delay: Duration,
+}
+
+impl SlowCountingHandler {
+    fn new(delay: Duration) -> Self {
+        Self {
+            count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(tokio::sync::Notify::new()),
+            delay,
+        }
+    }
+
+    fn count(&self) -> u32 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    async fn wait_for_count(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.count() >= target {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.count() >= target;
+                }
+            }
+        }
+    }
+}
+
+impl MessageHandler<ConcurrentWork> for SlowCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<SimpleWork> for SlowCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulSeq1> for SlowCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulSeq3> for SlowCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulConc1> for SlowCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulConc3> for SlowCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<SkipOrders> for SlowCountingHandler {
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+/// Handler for concurrent consumer tests that returns mixed outcomes.
+/// Messages with body "reject-N" are rejected, others are acked.
+#[derive(Clone)]
+struct ConcurrentMixedHandler {
+    ack_count: Arc<AtomicU32>,
+    reject_count: Arc<AtomicU32>,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl ConcurrentMixedHandler {
+    fn new() -> Self {
+        Self {
+            ack_count: Arc::new(AtomicU32::new(0)),
+            reject_count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn ack_count(&self) -> u32 {
+        self.ack_count.load(Ordering::Relaxed)
+    }
+
+    fn reject_count(&self) -> u32 {
+        self.reject_count.load(Ordering::Relaxed)
+    }
+
+    fn total(&self) -> u32 {
+        self.ack_count() + self.reject_count()
+    }
+
+    async fn wait_for_total(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.total() >= target {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.total() >= target;
+                }
+            }
+        }
+    }
+}
+
+impl MessageHandler<ConcurrentRejectWork> for ConcurrentMixedHandler {
+    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        // Simulate some work
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if msg.body.starts_with("reject") {
+            self.reject_count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+            Outcome::Reject
+        } else {
+            self.ack_count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+            Outcome::Ack
+        }
+    }
+}
+
+impl MessageHandler<ConcurrentWork> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulSeq1> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulSeq3> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulConc1> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<UngracefulConc3> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<ConcurrentRejectWork> for DlqCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        Outcome::Ack
+    }
+
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+}
+
+/// Handler that sleeps longer than the timeout on first delivery, then acks on retry.
+/// Tracks total delivery count to verify the message was retried.
+#[derive(Clone)]
+struct TimeoutThenAckHandler {
+    delivery_count: Arc<AtomicU32>,
+    signal: Arc<tokio::sync::Notify>,
+    slow_duration: Duration,
+}
+
+impl TimeoutThenAckHandler {
+    fn new(slow_duration: Duration) -> Self {
+        Self {
+            delivery_count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(tokio::sync::Notify::new()),
+            slow_duration,
+        }
+    }
+
+    fn delivery_count(&self) -> u32 {
+        self.delivery_count.load(Ordering::Relaxed)
+    }
+
+    async fn wait_for_count(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.delivery_count() >= target {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.delivery_count() >= target;
+                }
+            }
+        }
+    }
+}
+
+impl MessageHandler<TimeoutWork> for TimeoutThenAckHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        let attempt = self.delivery_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.signal.notify_waiters();
+        if attempt == 1 {
+            // First delivery: sleep longer than the handler_timeout.
+            // The consumer will cancel this future and route to Retry.
+            tokio::time::sleep(self.slow_duration).await;
+        }
+        // Second+ delivery: return immediately with Ack.
         Outcome::Ack
     }
 }
@@ -494,6 +899,19 @@ impl MessageHandler<RetryWork> for RetryThenAckHandler {
     }
 }
 
+impl MessageHandler<ConcurrentRetryWork> for RetryThenAckHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        let attempt = self.attempt_count.fetch_add(1, Ordering::Relaxed);
+        if attempt < self.retry_until {
+            Outcome::Retry
+        } else {
+            self.ack_count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+            Outcome::Ack
+        }
+    }
+}
+
 /// Handler that returns Defer on the first call, then Ack on subsequent calls.
 #[derive(Clone)]
 struct DeferOnceHandler {
@@ -542,6 +960,188 @@ impl MessageHandler<DeferWithHold> for DeferOnceHandler {
     }
 }
 
+/// Handler that always returns Retry — used to exhaust max_retries and send to DLQ.
+#[derive(Clone)]
+struct AlwaysRetryHandler {
+    attempt_count: Arc<AtomicU32>,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl AlwaysRetryHandler {
+    fn new() -> Self {
+        Self {
+            attempt_count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn attempt_count(&self) -> u32 {
+        self.attempt_count.load(Ordering::Relaxed)
+    }
+}
+
+impl MessageHandler<ConcurrentMaxRetry> for AlwaysRetryHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.attempt_count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Retry
+    }
+}
+
+impl MessageHandler<RetryWork> for AlwaysRetryHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.attempt_count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Retry
+    }
+}
+
+impl MessageHandler<ConcurrentMaxRetry> for DlqCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+}
+
+impl MessageHandler<RetryWork> for DlqCountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+}
+
+impl MessageHandler<StrictWork> for CountingHandler {
+    async fn handle(&self, _msg: StrictMessage, _meta: MessageMetadata) -> Outcome {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<StrictWork> for DlqCountingHandler {
+    async fn handle(&self, _msg: StrictMessage, _meta: MessageMetadata) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, _msg: StrictMessage, _meta: DeadMessageMetadata) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+}
+
+impl MessageHandler<ConcurrentWork> for TimeoutThenAckHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        let attempt = self.delivery_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.signal.notify_waiters();
+        if attempt == 1 {
+            tokio::time::sleep(self.slow_duration).await;
+        }
+        Outcome::Ack
+    }
+}
+
+/// Handler that returns Retry on first delivery, then Ack.
+#[derive(Clone)]
+struct SeqRetryHandler {
+    ack_count: Arc<AtomicU32>,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl SeqRetryHandler {
+    fn new() -> Self {
+        Self {
+            ack_count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn ack_count(&self) -> u32 {
+        self.ack_count.load(Ordering::Relaxed)
+    }
+
+    async fn wait_for_ack(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.ack_count() >= target {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.ack_count() >= target;
+                }
+            }
+        }
+    }
+}
+
+impl MessageHandler<RetrySeqOrders> for SeqRetryHandler {
+    async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata) -> Outcome {
+        if meta.retry_count == 0 {
+            Outcome::Retry
+        } else {
+            self.ack_count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+            Outcome::Ack
+        }
+    }
+}
+
+/// Handler that returns Defer on first delivery, then Ack.
+#[derive(Clone)]
+struct SeqDeferHandler {
+    call_count: Arc<AtomicU32>,
+    ack_count: Arc<AtomicU32>,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl SeqDeferHandler {
+    fn new() -> Self {
+        Self {
+            call_count: Arc::new(AtomicU32::new(0)),
+            ack_count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn ack_count(&self) -> u32 {
+        self.ack_count.load(Ordering::Relaxed)
+    }
+
+    async fn wait_for_ack(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.ack_count() >= target {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.ack_count() >= target;
+                }
+            }
+        }
+    }
+}
+
+impl MessageHandler<DeferSeqOrders> for SeqDeferHandler {
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+        if call == 0 {
+            Outcome::Defer
+        } else {
+            self.ack_count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+            Outcome::Ack
+        }
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -560,6 +1160,7 @@ async fn client_connect_and_create_channel() {
 
     client.shutdown().await;
     // After shutdown the connection is closed
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -571,6 +1172,7 @@ async fn client_shutdown_cancels_token() {
     assert!(!token.is_cancelled());
     client.shutdown().await;
     assert!(token.is_cancelled());
+    broker.stop().await;
 }
 
 // --- Topology ---
@@ -622,6 +1224,7 @@ async fn topology_declare_creates_queues() {
     assert!(resp.status().is_success(), "hold queue should exist");
 
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -653,6 +1256,7 @@ async fn topology_declare_sequenced_creates_sub_queues() {
     }
 
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Publisher ---
@@ -693,6 +1297,7 @@ async fn publish_and_consume_simple_message() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -731,6 +1336,7 @@ async fn publish_with_headers() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -771,6 +1377,7 @@ async fn publish_batch() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Reject → DLQ ---
@@ -820,6 +1427,7 @@ async fn rejected_message_lands_in_dlq() {
 
     client.shutdown().await;
     dlq_handle.abort();
+    broker.stop().await;
 }
 
 // --- Management API ---
@@ -871,6 +1479,7 @@ async fn management_client_fetches_queue_stats() {
     );
 
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Consumer Group + Registry ---
@@ -906,6 +1515,7 @@ async fn registry_register_declares_topology_and_starts() {
 
     registry.shutdown_all().await;
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Sequenced consumer ---
@@ -948,6 +1558,7 @@ async fn sequenced_consume_preserves_order() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Retry via hold queue ---
@@ -1001,6 +1612,7 @@ async fn retry_via_hold_queue_then_ack() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Defer with hold queue ---
@@ -1053,6 +1665,7 @@ async fn defer_with_hold_queue_redelivers() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Defer without hold queue (nack+requeue fallback) ---
@@ -1105,6 +1718,7 @@ async fn defer_without_hold_queue_requeues() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Autoscaler scales up under load ---
@@ -1198,6 +1812,7 @@ async fn autoscaler_scales_up_under_load() {
     let mut reg = registry.lock().await;
     reg.shutdown_all().await;
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Autoscaler scales down when idle ---
@@ -1286,6 +1901,7 @@ async fn autoscaler_scales_down_when_idle() {
     let mut reg = registry.lock().await;
     reg.shutdown_all().await;
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Audit wrapper captures records ---
@@ -1381,6 +1997,7 @@ async fn audited_handler_captures_audit_records() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // --- Sequenced: Skip mode ---
@@ -1452,6 +2069,7 @@ async fn sequenced_skip_continues_after_rejection() {
 
     client.shutdown().await;
     dlq_handle.abort();
+    broker.stop().await;
 }
 
 // --- Sequenced: FailAll mode ---
@@ -1545,4 +2163,1520 @@ async fn sequenced_failall_poisons_key_after_rejection() {
 
     client.shutdown().await;
     dlq_handle.abort();
+    broker.stop().await;
+}
+
+// ===========================================================================
+// Concurrent consumer tests
+// ===========================================================================
+
+/// Basic concurrent consumption: all messages are processed and acked.
+#[tokio::test]
+async fn concurrent_consume_processes_all_messages() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(ConcurrentWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..20)
+        .map(|i| SimpleMessage {
+            body: format!("msg-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ConcurrentWork>(&messages)
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(10);
+        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+    });
+
+    assert!(
+        handler.wait_for_count(20, Duration::from_secs(15)).await,
+        "timed out: processed {} / 20",
+        handler.count()
+    );
+    assert_eq!(handler.count(), 20);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+/// Concurrent consumption with slow handlers is faster than sequential.
+#[tokio::test]
+async fn concurrent_consume_slow_handler_faster_than_sequential() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(SimpleWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let msg_count = 10u32;
+    let handler_delay = Duration::from_millis(100);
+
+    let messages: Vec<SimpleMessage> = (0..msg_count)
+        .map(|i| SimpleMessage {
+            body: format!("slow-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<SimpleWork>(&messages)
+        .await
+        .unwrap();
+
+    let handler = SlowCountingHandler::new(handler_delay);
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+
+    let start = Instant::now();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(msg_count as u16); // all in-flight at once
+        consumer.run_concurrent::<SimpleWork>(h, opts).await
+    });
+
+    assert!(
+        handler
+            .wait_for_count(msg_count, Duration::from_secs(15))
+            .await,
+        "timed out: processed {} / {msg_count}",
+        handler.count()
+    );
+    let concurrent_duration = start.elapsed();
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    // Sequential would take at least msg_count * handler_delay = 1000ms.
+    // Concurrent should finish significantly faster (all 10 overlap).
+    let sequential_min = handler_delay * msg_count;
+    assert!(
+        concurrent_duration < sequential_min,
+        "concurrent ({concurrent_duration:?}) should be faster than sequential minimum ({sequential_min:?})"
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+/// Concurrent consumption with prefetch_count=1 behaves like sequential.
+#[tokio::test]
+async fn concurrent_consume_prefetch_one_is_sequential() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(ConcurrentWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..5)
+        .map(|i| SimpleMessage {
+            body: format!("seq-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ConcurrentWork>(&messages)
+        .await
+        .unwrap();
+
+    let handler = SlowCountingHandler::new(Duration::from_millis(50));
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+
+    let start = Instant::now();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(1); // forces sequential
+        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+    });
+
+    assert!(
+        handler.wait_for_count(5, Duration::from_secs(15)).await,
+        "timed out: processed {} / 5",
+        handler.count()
+    );
+    let duration = start.elapsed();
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    // With prefetch=1, it should be sequential: at least 5 * 50ms = 250ms
+    assert!(
+        duration >= Duration::from_millis(200),
+        "prefetch=1 should be sequential, took only {duration:?}"
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+/// Concurrent consumption correctly routes rejected messages to DLQ.
+#[tokio::test]
+async fn concurrent_consume_mixed_outcomes_routes_correctly() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer
+        .declare(ConcurrentRejectWork::topology())
+        .await
+        .unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    // 7 ack, 3 reject
+    let mut messages = Vec::new();
+    for i in 0..10 {
+        let body = if i % 3 == 0 && i > 0 {
+            format!("reject-{i}")
+        } else {
+            format!("ok-{i}")
+        };
+        messages.push(SimpleMessage { body });
+    }
+    publisher
+        .publish_batch::<ConcurrentRejectWork>(&messages)
+        .await
+        .unwrap();
+
+    let handler = ConcurrentMixedHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(10);
+        consumer
+            .run_concurrent::<ConcurrentRejectWork>(h, opts)
+            .await
+    });
+
+    assert!(
+        handler.wait_for_total(10, Duration::from_secs(15)).await,
+        "timed out: total {} / 10",
+        handler.total()
+    );
+    assert_eq!(handler.ack_count(), 7, "expected 7 acks");
+    assert_eq!(handler.reject_count(), 3, "expected 3 rejects");
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    // Verify rejected messages are in DLQ
+    let dlq_handler = DlqCountingHandler::new();
+    let consumer2 = RabbitMqConsumer::new(client.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle =
+        tokio::spawn(async move { consumer2.run_dlq::<ConcurrentRejectWork>(dh).await });
+
+    assert!(
+        dlq_handler.wait_for_count(3, Duration::from_secs(10)).await,
+        "expected 3 DLQ messages, got {}",
+        dlq_handler.count()
+    );
+
+    client.shutdown().await;
+    dlq_handle.abort();
+    broker.stop().await;
+}
+
+/// Concurrent consumption via consumer group with concurrent_processing enabled.
+#[tokio::test]
+async fn consumer_group_concurrent_processing() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+
+    registry
+        .register::<ConcurrentWork, _>(
+            ConsumerGroupConfig::new(2..=2)
+                .with_prefetch_count(10)
+                .with_concurrent_processing(true),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+
+    registry.start_all();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..30)
+        .map(|i| SimpleMessage {
+            body: format!("group-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ConcurrentWork>(&messages)
+        .await
+        .unwrap();
+
+    assert!(
+        handler.wait_for_count(30, Duration::from_secs(15)).await,
+        "timed out: processed {} / 30",
+        handler.count()
+    );
+    assert_eq!(handler.count(), 30);
+
+    registry.shutdown_all().await;
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+/// Concurrent consumption gracefully drains in-flight messages on shutdown.
+#[tokio::test]
+async fn concurrent_consume_graceful_shutdown_drains() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(ConcurrentWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..5)
+        .map(|i| SimpleMessage {
+            body: format!("drain-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ConcurrentWork>(&messages)
+        .await
+        .unwrap();
+
+    // Handler with 200ms delay — messages will be in-flight when we cancel
+    let handler = SlowCountingHandler::new(Duration::from_millis(200));
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(5);
+        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+    });
+
+    // Wait briefly for messages to be dispatched to handler tasks
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Cancel while handlers are still in-flight
+    shutdown.cancel();
+
+    // Consumer should drain all in-flight before returning
+    let result = tokio::time::timeout(Duration::from_secs(5), consume_handle).await;
+    assert!(result.is_ok(), "consumer should complete after draining");
+    result.unwrap().unwrap().unwrap();
+
+    // All 5 messages should have been processed (drained on shutdown)
+    assert_eq!(
+        handler.count(),
+        5,
+        "all in-flight messages should be drained"
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Handler timeout ---
+
+/// When a handler exceeds handler_timeout, the message should be automatically
+/// retried via the hold queue. On the second delivery the handler returns Ack.
+#[tokio::test]
+async fn handler_timeout_triggers_retry() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(TimeoutWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<TimeoutWork>(&SimpleMessage {
+            body: "timeout-test".into(),
+        })
+        .await
+        .unwrap();
+
+    // Handler sleeps 500ms on first attempt; timeout is 100ms → Retry.
+    // On second attempt (after hold queue delay) it acks immediately.
+    let handler = TimeoutThenAckHandler::new(Duration::from_millis(500));
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(1)
+            .with_handler_timeout(Duration::from_millis(100));
+        consumer.run::<TimeoutWork>(h, opts).await
+    });
+
+    // Wait for at least 2 deliveries: first times out, second acks.
+    // Hold queue has a 1s delay, so allow plenty of time.
+    assert!(
+        handler.wait_for_count(2, Duration::from_secs(15)).await,
+        "expected 2 deliveries (timeout + retry), got {}",
+        handler.delivery_count()
+    );
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Ungraceful shutdown recovery ---
+
+/// When a sequential consumer (prefetch=1) is aborted mid-flight, unacked
+/// messages are returned to the queue and a new consumer picks them all up.
+#[tokio::test]
+async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(UngracefulSeq1::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..5)
+        .map(|i| SimpleMessage {
+            body: format!("msg-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<UngracefulSeq1>(&messages)
+        .await
+        .unwrap();
+
+    // Start a slow consumer — 500ms per message, so none will complete before abort
+    let slow_handler = SlowCountingHandler::new(Duration::from_millis(500));
+    let shutdown1 = CancellationToken::new();
+    let consumer1 = RabbitMqConsumer::new(client.clone());
+    let h1 = slow_handler.clone();
+    let s1 = shutdown1.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s1)
+            .with_max_retries(3)
+            .with_prefetch_count(1);
+        consumer1.run::<UngracefulSeq1>(h1, opts).await
+    });
+
+    // Let the consumer pick up messages
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Abort the consumer task (ungraceful shutdown — messages not acked)
+    consume_handle.abort();
+    let _ = consume_handle.await;
+
+    // No messages should have completed (500ms handler vs 100ms wait)
+    assert_eq!(slow_handler.count(), 0);
+
+    // Close the first connection so RabbitMQ releases unacked messages.
+    client.shutdown().await;
+
+    // Create a fresh client and consumer for recovery.
+    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let handler = CountingHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = RabbitMqConsumer::new(client2.clone());
+    let h2 = handler.clone();
+    let s2 = shutdown2.clone();
+    let consume_handle2 = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s2)
+            .with_max_retries(3)
+            .with_prefetch_count(1);
+        consumer2.run::<UngracefulSeq1>(h2, opts).await
+    });
+
+    assert!(
+        handler.wait_for_count(5, Duration::from_secs(10)).await,
+        "expected 5 recovered messages, got {}",
+        handler.count()
+    );
+    assert_eq!(handler.count(), 5);
+
+    shutdown2.cancel();
+    consume_handle2.await.unwrap().unwrap();
+    client2.shutdown().await;
+    broker.stop().await;
+}
+
+/// When a sequential consumer (prefetch=3) is aborted mid-flight, up to 3
+/// unacked messages are returned to the queue and all 5 are recovered.
+#[tokio::test]
+async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(UngracefulSeq3::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..5)
+        .map(|i| SimpleMessage {
+            body: format!("msg-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<UngracefulSeq3>(&messages)
+        .await
+        .unwrap();
+
+    let slow_handler = SlowCountingHandler::new(Duration::from_millis(500));
+    let shutdown1 = CancellationToken::new();
+    let consumer1 = RabbitMqConsumer::new(client.clone());
+    let h1 = slow_handler.clone();
+    let s1 = shutdown1.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s1)
+            .with_max_retries(3)
+            .with_prefetch_count(3);
+        consumer1.run::<UngracefulSeq3>(h1, opts).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    consume_handle.abort();
+    let _ = consume_handle.await;
+
+    assert_eq!(slow_handler.count(), 0);
+
+    // Close first connection so RabbitMQ releases unacked messages.
+    client.shutdown().await;
+
+    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let handler = CountingHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = RabbitMqConsumer::new(client2.clone());
+    let h2 = handler.clone();
+    let s2 = shutdown2.clone();
+    let consume_handle2 = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s2)
+            .with_max_retries(3)
+            .with_prefetch_count(3);
+        consumer2.run::<UngracefulSeq3>(h2, opts).await
+    });
+
+    assert!(
+        handler.wait_for_count(5, Duration::from_secs(10)).await,
+        "expected 5 recovered messages, got {}",
+        handler.count()
+    );
+    assert_eq!(handler.count(), 5);
+
+    shutdown2.cancel();
+    consume_handle2.await.unwrap().unwrap();
+    client2.shutdown().await;
+    broker.stop().await;
+}
+
+/// When a concurrent consumer (prefetch=1) is aborted mid-flight, unacked
+/// messages are returned to the queue and a new consumer picks them all up.
+#[tokio::test]
+async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(UngracefulConc1::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..5)
+        .map(|i| SimpleMessage {
+            body: format!("msg-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<UngracefulConc1>(&messages)
+        .await
+        .unwrap();
+
+    let slow_handler = SlowCountingHandler::new(Duration::from_millis(500));
+    let shutdown1 = CancellationToken::new();
+    let consumer1 = RabbitMqConsumer::new(client.clone());
+    let h1 = slow_handler.clone();
+    let s1 = shutdown1.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s1)
+            .with_max_retries(3)
+            .with_prefetch_count(1);
+        consumer1.run_concurrent::<UngracefulConc1>(h1, opts).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    consume_handle.abort();
+    let _ = consume_handle.await;
+
+    assert_eq!(slow_handler.count(), 0);
+
+    // Close first connection so RabbitMQ releases unacked messages.
+    client.shutdown().await;
+
+    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let handler = CountingHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = RabbitMqConsumer::new(client2.clone());
+    let h2 = handler.clone();
+    let s2 = shutdown2.clone();
+    let consume_handle2 = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s2)
+            .with_max_retries(3)
+            .with_prefetch_count(1);
+        consumer2.run_concurrent::<UngracefulConc1>(h2, opts).await
+    });
+
+    assert!(
+        handler.wait_for_count(5, Duration::from_secs(10)).await,
+        "expected 5 recovered messages, got {}",
+        handler.count()
+    );
+    assert_eq!(handler.count(), 5);
+
+    shutdown2.cancel();
+    consume_handle2.await.unwrap().unwrap();
+    client2.shutdown().await;
+}
+
+/// When a concurrent consumer (prefetch=3) is aborted mid-flight, up to 3
+/// unacked messages are returned to the queue and all 5 are recovered.
+#[tokio::test]
+async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(UngracefulConc3::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..5)
+        .map(|i| SimpleMessage {
+            body: format!("msg-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<UngracefulConc3>(&messages)
+        .await
+        .unwrap();
+
+    let slow_handler = SlowCountingHandler::new(Duration::from_millis(500));
+    let shutdown1 = CancellationToken::new();
+    let consumer1 = RabbitMqConsumer::new(client.clone());
+    let h1 = slow_handler.clone();
+    let s1 = shutdown1.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s1)
+            .with_max_retries(3)
+            .with_prefetch_count(3);
+        consumer1.run_concurrent::<UngracefulConc3>(h1, opts).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    consume_handle.abort();
+    let _ = consume_handle.await;
+
+    assert_eq!(slow_handler.count(), 0);
+
+    // Close first connection so RabbitMQ releases unacked messages.
+    client.shutdown().await;
+
+    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let handler = CountingHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = RabbitMqConsumer::new(client2.clone());
+    let h2 = handler.clone();
+    let s2 = shutdown2.clone();
+    let consume_handle2 = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s2)
+            .with_max_retries(3)
+            .with_prefetch_count(3);
+        consumer2.run_concurrent::<UngracefulConc3>(h2, opts).await
+    });
+
+    assert!(
+        handler.wait_for_count(5, Duration::from_secs(10)).await,
+        "expected 5 recovered messages, got {}",
+        handler.count()
+    );
+    assert_eq!(handler.count(), 5);
+
+    shutdown2.cancel();
+    consume_handle2.await.unwrap().unwrap();
+    client2.shutdown().await;
+}
+
+/// Concurrent consumer: message that retries twice then acks.
+#[tokio::test]
+async fn concurrent_consumer_retry_then_ack() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer
+        .declare(ConcurrentRetryWork::topology())
+        .await
+        .unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<ConcurrentRetryWork>(&SimpleMessage {
+            body: "retry-conc".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = RetryThenAckHandler::new(2);
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(5)
+            .with_prefetch_count(4);
+        consumer
+            .run_concurrent::<ConcurrentRetryWork>(h, opts)
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if handler.ack_count() >= 1 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for ack after retries in concurrent consumer");
+        }
+        tokio::select! {
+            _ = handler.signal.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+    assert_eq!(handler.ack_count(), 1);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Concurrent consumer — max retries sends to DLQ ---
+
+#[tokio::test]
+async fn concurrent_consumer_max_retries_sends_to_dlq() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer
+        .declare(ConcurrentMaxRetry::topology())
+        .await
+        .unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<ConcurrentMaxRetry>(&SimpleMessage {
+            body: "always-retry".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = AlwaysRetryHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(2)
+            .with_prefetch_count(4);
+        consumer.run_concurrent::<ConcurrentMaxRetry>(h, opts).await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if handler.attempt_count() >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for retry attempts");
+        }
+        tokio::select! {
+            _ = handler.signal.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    let dlq_handler = DlqCountingHandler::new();
+    let consumer2 = RabbitMqConsumer::new(client.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<ConcurrentMaxRetry>(dh).await });
+
+    assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
+    assert_eq!(dlq_handler.count(), 1);
+
+    client.shutdown().await;
+    dlq_handle.abort();
+    broker.stop().await;
+}
+
+// --- Concurrent consumer — graceful shutdown drains in-flight ---
+
+#[tokio::test]
+async fn concurrent_consumer_graceful_shutdown_drains_inflight() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(ConcurrentWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    for i in 0..4 {
+        publisher
+            .publish::<ConcurrentWork>(&SimpleMessage {
+                body: format!("drain-{i}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = SlowCountingHandler::new(Duration::from_millis(500));
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(4);
+        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    shutdown.cancel();
+
+    consume_handle.await.unwrap().unwrap();
+
+    assert_eq!(
+        handler.count(),
+        4,
+        "shutdown should drain all in-flight messages"
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Deserialization failure rejects to DLQ ---
+
+#[tokio::test]
+async fn deserialization_failure_rejects_to_dlq() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(StrictWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<StrictWork>(&StrictMessage { value: 42 })
+        .await
+        .unwrap();
+
+    let raw_channel = client.create_confirm_channel().await.unwrap();
+    let confirm = raw_channel
+        .basic_publish(
+            "".into(),
+            "test-strict".into(),
+            lapin::options::BasicPublishOptions::default(),
+            b"{\"wrong_field\": \"not a number\"}",
+            lapin::BasicProperties::default()
+                .with_delivery_mode(2)
+                .with_content_type("application/json".into()),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(!confirm.is_nack());
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(4);
+        consumer.run_concurrent::<StrictWork>(h, opts).await
+    });
+
+    assert!(handler.wait_for_count(1, Duration::from_secs(10)).await);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    assert_eq!(handler.count(), 1);
+
+    // Verify the malformed message landed in the DLQ via the management API.
+    // We can't use run_dlq here because the DLQ consumer also can't deserialize the malformed
+    // message — it logs and acks without calling handle_dead.
+    let http = reqwest::Client::new();
+    let mgmt = broker.mgmt_config();
+    let mut dlq_ready = 0u64;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let resp = http
+            .get(format!(
+                "{}/api/queues/%2F/test-strict-dlq",
+                broker.mgmt_url
+            ))
+            .basic_auth(&mgmt.username, Some(&mgmt.password))
+            .send()
+            .await
+            .unwrap();
+        let stats: QueueStats = resp.json().await.unwrap();
+        dlq_ready = stats.messages_ready;
+        if dlq_ready >= 1 {
+            break;
+        }
+    }
+    assert!(
+        dlq_ready >= 1,
+        "expected at least 1 message in DLQ, got {dlq_ready}"
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Concurrent consumer — mixed outcomes routes correctly ---
+
+#[tokio::test]
+async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer
+        .declare(ConcurrentRejectWork::topology())
+        .await
+        .unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages = vec![
+        SimpleMessage {
+            body: "ok-1".into(),
+        },
+        SimpleMessage {
+            body: "reject-1".into(),
+        },
+        SimpleMessage {
+            body: "ok-2".into(),
+        },
+        SimpleMessage {
+            body: "reject-2".into(),
+        },
+        SimpleMessage {
+            body: "ok-3".into(),
+        },
+    ];
+    publisher
+        .publish_batch::<ConcurrentRejectWork>(&messages)
+        .await
+        .unwrap();
+
+    let handler = ConcurrentMixedHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(8);
+        consumer
+            .run_concurrent::<ConcurrentRejectWork>(h, opts)
+            .await
+    });
+
+    assert!(handler.wait_for_total(5, Duration::from_secs(15)).await);
+    assert_eq!(handler.ack_count(), 3);
+    assert_eq!(handler.reject_count(), 2);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    let dlq_handler = DlqCountingHandler::new();
+    let consumer2 = RabbitMqConsumer::new(client.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle =
+        tokio::spawn(async move { consumer2.run_dlq::<ConcurrentRejectWork>(dh).await });
+
+    assert!(dlq_handler.wait_for_count(2, Duration::from_secs(10)).await);
+    assert_eq!(dlq_handler.count(), 2);
+
+    client.shutdown().await;
+    dlq_handle.abort();
+    broker.stop().await;
+}
+
+// --- Sequential consumer — max retries to DLQ ---
+
+#[tokio::test]
+async fn sequential_consumer_max_retries_sends_to_dlq() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(RetryWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<RetryWork>(&SimpleMessage {
+            body: "exhaust-retries".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = AlwaysRetryHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(2)
+            .with_prefetch_count(1);
+        consumer.run::<RetryWork>(h, opts).await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if handler.attempt_count() >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for retry attempts");
+        }
+        tokio::select! {
+            _ = handler.signal.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    let dlq_handler = DlqCountingHandler::new();
+    let consumer2 = RabbitMqConsumer::new(client.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<RetryWork>(dh).await });
+
+    assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
+    assert_eq!(dlq_handler.count(), 1);
+
+    client.shutdown().await;
+    dlq_handle.abort();
+    broker.stop().await;
+}
+
+// --- Concurrent consumer — handler timeout triggers retry ---
+
+#[tokio::test]
+async fn concurrent_consumer_handler_timeout_triggers_retry() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(ConcurrentWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<ConcurrentWork>(&SimpleMessage {
+            body: "timeout-conc".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = TimeoutThenAckHandler::new(Duration::from_secs(5));
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(5)
+            .with_prefetch_count(4)
+            .with_handler_timeout(Duration::from_millis(200));
+        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+    });
+
+    assert!(handler.wait_for_count(2, Duration::from_secs(30)).await);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Sequenced consumer — retry via shard hold queues ---
+
+#[tokio::test]
+async fn sequenced_consumer_retry_via_shard_hold_queues() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(RetrySeqOrders::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<RetrySeqOrders>(&OrderMessage {
+            account: "ACC-RETRY".into(),
+            seq: 1,
+        })
+        .await
+        .unwrap();
+
+    let handler = SeqRetryHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(5);
+        consumer.run_sequenced::<RetrySeqOrders>(h, opts).await
+    });
+
+    assert!(
+        handler.wait_for_ack(1, Duration::from_secs(30)).await,
+        "timed out waiting for ack after sequenced retry"
+    );
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Sequenced consumer — defer via shard hold queues ---
+
+#[tokio::test]
+async fn sequenced_consumer_defer_via_shard_hold_queues() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(DeferSeqOrders::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<DeferSeqOrders>(&OrderMessage {
+            account: "ACC-DEFER".into(),
+            seq: 1,
+        })
+        .await
+        .unwrap();
+
+    let handler = SeqDeferHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(5);
+        consumer.run_sequenced::<DeferSeqOrders>(h, opts).await
+    });
+
+    assert!(
+        handler.wait_for_ack(1, Duration::from_secs(30)).await,
+        "timed out waiting for ack after sequenced defer"
+    );
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Sequenced FailAll — max retries poisons key ---
+
+#[tokio::test]
+async fn sequenced_failall_max_retries_poisons_key() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(FailAllOrders::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+
+    for i in 0..3u32 {
+        publisher
+            .publish::<FailAllOrders>(&OrderMessage {
+                account: "ACC-POISON".into(),
+                seq: i,
+            })
+            .await
+            .unwrap();
+    }
+    for i in 0..2u32 {
+        publisher
+            .publish::<FailAllOrders>(&OrderMessage {
+                account: "ACC-SAFE".into(),
+                seq: 100 + i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = RejectSeqHandler::new(0);
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        consumer.run_sequenced::<FailAllOrders>(h, opts).await
+    });
+
+    assert!(
+        handler.wait_for_total(3, Duration::from_secs(15)).await,
+        "timed out: ack={} reject={}",
+        handler.ack_count(),
+        handler.reject_count()
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+
+    let dlq_handler = OrderDlqHandler::new();
+    let consumer2 = RabbitMqConsumer::new(client.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders>(dh).await });
+
+    assert!(
+        dlq_handler.wait_for_count(3, Duration::from_secs(10)).await,
+        "expected 3 DLQ messages, got {}",
+        dlq_handler.count()
+    );
+
+    client.shutdown().await;
+    dlq_handle.abort();
+    broker.stop().await;
+}
+
+// --- Sequenced consumer — graceful shutdown drain ---
+
+#[tokio::test]
+async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(SkipOrders::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    for i in 0..3u32 {
+        publisher
+            .publish::<SkipOrders>(&OrderMessage {
+                account: "ACC-DRAIN".into(),
+                seq: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = SlowCountingHandler::new(Duration::from_millis(300));
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        consumer.run_sequenced::<SkipOrders>(h, opts).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shutdown.cancel();
+
+    consume_handle.await.unwrap().unwrap();
+
+    assert!(
+        handler.count() >= 1,
+        "expected at least 1 message processed during shutdown drain, got {}",
+        handler.count()
+    );
+
+    // Pick up remaining messages with a fresh consumer
+    let remaining = 3 - handler.count();
+    if remaining > 0 {
+        let handler2 = CountingHandler::new();
+        let shutdown2 = CancellationToken::new();
+        let consumer2 = RabbitMqConsumer::new(client.clone());
+        let h2 = handler2.clone();
+        let s2 = shutdown2.clone();
+        let consume_handle2 = tokio::spawn(async move {
+            let opts = ConsumerOptions::new(s2).with_max_retries(3);
+            consumer2.run_sequenced::<SkipOrders>(h2, opts).await
+        });
+
+        assert!(
+            handler2
+                .wait_for_count(remaining, Duration::from_secs(15))
+                .await,
+            "expected {} requeued messages, got {}",
+            remaining,
+            handler2.count()
+        );
+
+        shutdown2.cancel();
+        consume_handle2.await.unwrap().unwrap();
+    }
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Publisher — sequenced batch via exchange ---
+
+#[tokio::test]
+async fn sequenced_publish_batch_routes_via_exchange() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(OrderTopic::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<OrderMessage> = (0..10)
+        .map(|i| OrderMessage {
+            account: format!("ACC-{}", i % 3),
+            seq: i,
+        })
+        .collect();
+    publisher
+        .publish_batch::<OrderTopic>(&messages)
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        consumer.run_sequenced::<OrderTopic>(h, opts).await
+    });
+
+    assert!(handler.wait_for_count(10, Duration::from_secs(15)).await);
+    assert_eq!(handler.count(), 10);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Publisher — sequenced publish with headers ---
+
+#[tokio::test]
+async fn sequenced_publish_with_headers() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(OrderTopic::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("x-trace-id".to_string(), "seq-trace-123".to_string());
+    publisher
+        .publish_with_headers::<OrderTopic>(
+            &OrderMessage {
+                account: "ACC-HDR".into(),
+                seq: 1,
+            },
+            headers,
+        )
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        consumer.run_sequenced::<OrderTopic>(h, opts).await
+    });
+
+    assert!(handler.wait_for_count(1, Duration::from_secs(15)).await);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- DLQ consumer — deserialization failure acked ---
+
+#[tokio::test]
+async fn dlq_consumer_handles_deserialization_failure() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(SimpleWork::topology()).await.unwrap();
+
+    let raw_channel = client.create_confirm_channel().await.unwrap();
+    let confirm = raw_channel
+        .basic_publish(
+            "".into(),
+            "test-simple-dlq".into(),
+            lapin::options::BasicPublishOptions::default(),
+            b"not valid json at all {{{",
+            lapin::BasicProperties::default()
+                .with_delivery_mode(2)
+                .with_content_type("application/json".into()),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(!confirm.is_nack());
+
+    let confirm = raw_channel
+        .basic_publish(
+            "".into(),
+            "test-simple-dlq".into(),
+            lapin::options::BasicPublishOptions::default(),
+            b"{\"body\": \"valid-dlq-msg\"}",
+            lapin::BasicProperties::default()
+                .with_delivery_mode(2)
+                .with_content_type("application/json".into()),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(!confirm.is_nack());
+
+    let dlq_handler = DlqCountingHandler::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle = tokio::spawn(async move { consumer.run_dlq::<SimpleWork>(dh).await });
+
+    assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(dlq_handler.count(), 1);
+
+    client.shutdown().await;
+    dlq_handle.abort();
+    broker.stop().await;
+}
+
+// --- Sequenced consumer — multiple keys concurrent ---
+
+#[tokio::test]
+async fn sequenced_consumer_multiple_keys_concurrent() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(SkipOrders::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    for account_idx in 0..5u32 {
+        for seq in 0..3u32 {
+            publisher
+                .publish::<SkipOrders>(&OrderMessage {
+                    account: format!("ACC-MULTI-{account_idx}"),
+                    seq: account_idx * 100 + seq,
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        consumer.run_sequenced::<SkipOrders>(h, opts).await
+    });
+
+    assert!(
+        handler.wait_for_count(15, Duration::from_secs(15)).await,
+        "expected 15 messages, got {}",
+        handler.count()
+    );
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
 }

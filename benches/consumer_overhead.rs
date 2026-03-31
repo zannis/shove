@@ -1,13 +1,14 @@
-//! Stress benchmarks for shove under heavy message loads.
+//! Consumer-count overhead benchmark for shove.
 //!
-//! Measures throughput, latency percentiles (p50/p95/p99), scaling efficiency,
-//! and peak memory usage across three load tiers.
+//! Measures how throughput and per-consumer efficiency degrade as
+//! the number of consumers increases from 128 to 4096.
 //!
 //! Requires Docker. Run with:
 //!
-//!     cargo run -q --example stress --features rabbitmq
-//!     cargo run -q --example stress --features rabbitmq -- --tier moderate
-//!     cargo run -q --example stress --features rabbitmq -- --tier extreme --output json
+//!     cargo bench -q --features rabbitmq --bench consumer_overhead
+//!     cargo bench -q --features rabbitmq --bench consumer_overhead -- --handler slow
+//!     cargo bench -q --features rabbitmq --bench consumer_overhead -- --concurrent
+//!     cargo bench -q --features rabbitmq --bench consumer_overhead -- --output json
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,35 +28,36 @@ use tokio_util::sync::CancellationToken;
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "stress", about = "Stress benchmarks for shove")]
+#[command(
+    name = "consumer_overhead",
+    about = "Benchmark overhead as consumer count increases (128..4096)"
+)]
 struct Cli {
-    /// Which tier(s) to run.
-    #[arg(long, default_value = "all")]
-    tier: TierArg,
-
-    /// Which handler profile(s) to run.
-    #[arg(long, default_value = "all")]
+    /// Which handler profile to run.
+    #[arg(long, default_value = "fast")]
     handler: HandlerArg,
 
     /// Output format for the final report.
     #[arg(long, default_value = "table")]
     output: OutputFormat,
+
+    /// Enable concurrent message processing within each consumer.
+    #[arg(long)]
+    concurrent: bool,
+
+    /// Number of iterations per consumer count (results are averaged).
+    #[arg(long, default_value = "3")]
+    iterations: u32,
+
+    /// Custom consumer counts (comma-separated). Overrides the default sweep.
+    #[arg(long, value_delimiter = ',')]
+    consumers: Option<Vec<u16>>,
 }
 
 #[derive(Clone, ValueEnum)]
 enum HandlerArg {
-    Zero,
     Fast,
     Slow,
-    All,
-}
-
-#[derive(Clone, ValueEnum)]
-enum TierArg {
-    Moderate,
-    High,
-    Extreme,
-    All,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -67,25 +69,24 @@ enum OutputFormat {
 // ── Topic & message ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StressMsg {
+struct BenchMsg {
     id: u64,
     published_at_ns: u64,
 }
 
 define_topic!(
-    StressTopic,
-    StressMsg,
-    TopologyBuilder::new("stress-bench")
+    OverheadTopic,
+    BenchMsg,
+    TopologyBuilder::new("overhead-bench")
         .hold_queue(Duration::from_secs(5))
         .dlq()
         .build()
 );
 
-// ── Scenario definition ─────────────────────────────────────────────────────
+// ── Handler profiles ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
 enum HandlerProfile {
-    Zero,
     Fast,
     Slow,
 }
@@ -93,135 +94,39 @@ enum HandlerProfile {
 impl std::fmt::Display for HandlerProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HandlerProfile::Zero => write!(f, "zero (no-op)"),
             HandlerProfile::Fast => write!(f, "fast (1-5ms)"),
             HandlerProfile::Slow => write!(f, "slow (50-300ms)"),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Scenario {
-    tier: &'static str,
-    messages: u64,
-    consumers: u16,
-    handler: HandlerProfile,
-    deadline: Duration,
-}
-
-/// Per-tier configuration with handler-specific message counts.
-struct TierConfig {
-    name: &'static str,
-    consumers: &'static [u16],
-    /// Message counts per handler: (zero, fast, slow).
-    messages: (u64, u64, u64),
-}
-
-const MODERATE: TierConfig = TierConfig {
-    name: "moderate",
-    consumers: &[1, 4, 8, 16, 32],
-    messages: (50_000, 10_000, 500),
-};
-
-const HIGH: TierConfig = TierConfig {
-    name: "high",
-    consumers: &[8, 16, 32, 64],
-    messages: (500_000, 100_000, 5_000),
-};
-
-const EXTREME: TierConfig = TierConfig {
-    name: "extreme",
-    consumers: &[32, 64, 128, 256],
-    messages: (1_000_000, 500_000, 25_000),
-};
-
-/// Compute a deadline from the expected runtime with 2x headroom, clamped to [30s, 5min].
-fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> Duration {
-    let expected_ms = match handler {
-        // Zero handler is broker-bound at ~40k msg/s regardless of consumer count.
-        HandlerProfile::Zero => messages as f64 / 40.0, // 40k msg/s = 40 msg/ms
-        // Handler-bound: scales with consumers.
-        HandlerProfile::Fast => (messages as f64 * 3.0) / consumers as f64,
-        HandlerProfile::Slow => (messages as f64 * 175.0) / consumers as f64,
-    };
-    let deadline_ms = (expected_ms * 2.0).clamp(30_000.0, 300_000.0);
-    Duration::from_millis(deadline_ms as u64)
-}
-
-fn build_scenarios(tier: &TierArg, handler: &HandlerArg) -> Vec<Scenario> {
-    let mut scenarios = Vec::new();
-
-    let handlers: Vec<HandlerProfile> = match handler {
-        HandlerArg::Zero => vec![HandlerProfile::Zero],
-        HandlerArg::Fast => vec![HandlerProfile::Fast],
-        HandlerArg::Slow => vec![HandlerProfile::Slow],
-        HandlerArg::All => vec![
-            HandlerProfile::Zero,
-            HandlerProfile::Fast,
-            HandlerProfile::Slow,
-        ],
-    };
-
-    let tiers: Vec<&TierConfig> = match tier {
-        TierArg::Moderate => vec![&MODERATE],
-        TierArg::High => vec![&HIGH],
-        TierArg::Extreme => vec![&EXTREME],
-        TierArg::All => vec![&MODERATE, &HIGH, &EXTREME],
-    };
-
-    for tier_cfg in &tiers {
-        for &h in &handlers {
-            let messages = match h {
-                HandlerProfile::Zero => tier_cfg.messages.0,
-                HandlerProfile::Fast => tier_cfg.messages.1,
-                HandlerProfile::Slow => tier_cfg.messages.2,
-            };
-            for &c in tier_cfg.consumers {
-                scenarios.push(Scenario {
-                    tier: tier_cfg.name,
-                    messages,
-                    consumers: c,
-                    handler: h,
-                    deadline: scenario_deadline(messages, c, h),
-                });
-            }
-        }
-    }
-
-    scenarios
-}
-
-// ── Result types ────────────────────────────────────────────────────────────
+// ── Results ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
-struct ScenarioResult {
-    tier: String,
-    messages: u64,
+struct RunResult {
     consumers: u16,
     handler: String,
-    throughput_msg_per_sec: f64,
-    latency_p50_ms: f64,
-    latency_p95_ms: f64,
-    latency_p99_ms: f64,
-    scaling_efficiency: f64,
-    peak_rss_mb: f64,
-    cpu_pct: f64,
-    duration_secs: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct FailedResult {
-    tier: String,
-    messages: u64,
-    consumers: u16,
-    handler: String,
-    error: String,
+    concurrent: bool,
+    iterations: u32,
+    messages_per_run: u64,
+    avg_throughput: f64,
+    per_consumer_throughput: f64,
+    avg_latency_p50_ms: f64,
+    avg_latency_p95_ms: f64,
+    avg_latency_p99_ms: f64,
+    avg_peak_rss_mb: f64,
+    avg_cpu_pct: f64,
+    /// Throughput relative to the first (lowest) consumer count.
+    scaling_factor: f64,
+    /// Ideal throughput if scaling were linear from the first consumer count.
+    ideal_throughput: f64,
+    /// Overhead percentage: how much throughput is lost vs ideal linear scaling.
+    overhead_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct Report {
-    results: Vec<ScenarioResult>,
-    failures: Vec<FailedResult>,
+    results: Vec<RunResult>,
 }
 
 // ── Infrastructure ──────────────────────────────────────────────────────────
@@ -260,10 +165,9 @@ impl Broker {
             .await
             .unwrap();
 
-        // Declare topology.
         let channel = client.create_channel().await.unwrap();
         RabbitMqTopologyDeclarer::new(channel)
-            .declare(StressTopic::topology())
+            .declare(OverheadTopic::topology())
             .await
             .unwrap();
 
@@ -286,34 +190,31 @@ impl Broker {
         match std::process::Command::new("docker").arg("info").output() {
             Ok(o) if o.status.success() => {}
             _ => panic!(
-                "Docker is required to run stress benchmarks. \
+                "Docker is required. \
                  Install Docker Desktop, colima, or podman and ensure the daemon is running."
             ),
         }
     }
 
-    /// Purge the main queue via the management API so scenarios start clean.
     async fn purge_queue(&self) {
         let http = reqwest::Client::new();
         let url = format!(
             "{}/api/queues/%2F/{}/contents",
             self.mgmt_config.base_url,
-            StressTopic::topology().queue()
+            OverheadTopic::topology().queue()
         );
         let _ = http
             .delete(&url)
             .basic_auth(&self.mgmt_config.username, Some(&self.mgmt_config.password))
             .send()
             .await;
-        // Brief pause for the purge to take effect.
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    async fn publish_batch(&self, messages: &[StressMsg]) {
-        // Publish in chunks of 1000 to avoid overwhelming the channel.
+    async fn publish_batch(&self, messages: &[BenchMsg]) {
         for chunk in messages.chunks(1000) {
             self.publisher
-                .publish_batch::<StressTopic>(chunk)
+                .publish_batch::<OverheadTopic>(chunk)
                 .await
                 .unwrap();
         }
@@ -326,18 +227,9 @@ impl Broker {
 
 // ── Latency recording ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
-struct LatencyRecord {
-    /// Time from publish to handler entry (includes broker transit + queue wait).
-    #[allow(dead_code)]
-    enqueue_to_receive_ns: u64,
-    /// Time from publish to handler completion (end-to-end).
-    enqueue_to_ack_ns: u64,
-}
-
 struct LatencyRecorder {
-    tx: tokio::sync::mpsc::UnboundedSender<LatencyRecord>,
-    rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<LatencyRecord>>,
+    tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    rx: Mutex<tokio::sync::mpsc::UnboundedReceiver<u64>>,
 }
 
 impl LatencyRecorder {
@@ -349,8 +241,8 @@ impl LatencyRecorder {
         }
     }
 
-    fn record(&self, record: LatencyRecord) {
-        let _ = self.tx.send(record);
+    fn record(&self, enqueue_to_ack_ns: u64) {
+        let _ = self.tx.send(enqueue_to_ack_ns);
     }
 
     async fn compute_percentiles(&self) -> (f64, f64, f64) {
@@ -362,16 +254,16 @@ impl LatencyRecorder {
         if records.is_empty() {
             return (0.0, 0.0, 0.0);
         }
-        records.sort_unstable_by_key(|r| r.enqueue_to_ack_ns);
+        records.sort_unstable();
         let len = records.len();
-        let p50 = records[len * 50 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
-        let p95 = records[len * 95 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
-        let p99 = records[len * 99 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
+        let p50 = records[len * 50 / 100] as f64 / 1_000_000.0;
+        let p95 = records[len * 95 / 100] as f64 / 1_000_000.0;
+        let p99 = records[len * 99 / 100] as f64 / 1_000_000.0;
         (p50, p95, p99)
     }
 }
 
-// ── Resource sampling ────────────────────────────────────────────────────────
+// ── Resource sampling ───────────────────────────────────────────────────────
 
 fn current_cpu_secs() -> f64 {
     #[cfg(target_os = "macos")]
@@ -389,8 +281,10 @@ fn current_cpu_secs() -> f64 {
             )
         };
         if kr == 0 {
-            let user = info.user_time.seconds as f64 + info.user_time.microseconds as f64 / 1_000_000.0;
-            let system = info.system_time.seconds as f64 + info.system_time.microseconds as f64 / 1_000_000.0;
+            let user =
+                info.user_time.seconds as f64 + info.user_time.microseconds as f64 / 1_000_000.0;
+            let system = info.system_time.seconds as f64
+                + info.system_time.microseconds as f64 / 1_000_000.0;
             user + system
         } else {
             0.0
@@ -400,9 +294,8 @@ fn current_cpu_secs() -> f64 {
     {
         if let Ok(content) = std::fs::read_to_string("/proc/self/stat") {
             let fields: Vec<&str> = content.split_whitespace().collect();
-            // fields[13] = utime, fields[14] = stime (in clock ticks)
             if fields.len() > 14 {
-                let ticks_per_sec = 100.0; // sysconf(_SC_CLK_TCK) is typically 100
+                let ticks_per_sec = 100.0;
                 let utime = fields[13].parse::<f64>().unwrap_or(0.0);
                 let stime = fields[14].parse::<f64>().unwrap_or(0.0);
                 return (utime + stime) / ticks_per_sec;
@@ -442,7 +335,7 @@ fn current_rss_bytes() -> u64 {
         if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
             if let Some(rss_pages) = content.split_whitespace().nth(1) {
                 if let Ok(pages) = rss_pages.parse::<u64>() {
-                    return pages * 4096; // assume 4K page size
+                    return pages * 4096;
                 }
             }
         }
@@ -464,7 +357,7 @@ struct ResourceSampler {
     baseline_rss: f64,
     baseline_cpu: f64,
     start: Instant,
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: CancellationToken,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -473,7 +366,7 @@ impl ResourceSampler {
         let baseline_rss = current_rss_bytes() as f64 / (1024.0 * 1024.0);
         let baseline_cpu = current_cpu_secs();
         let peak_rss = Arc::new(AtomicU64::new(current_rss_bytes()));
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = CancellationToken::new();
 
         let peak = peak_rss.clone();
         let token = cancel.clone();
@@ -510,29 +403,32 @@ impl ResourceSampler {
 
         let wall_secs = self.start.elapsed().as_secs_f64();
         let cpu_delta = current_cpu_secs() - self.baseline_cpu;
-        let cpu_pct = if wall_secs > 0.0 { (cpu_delta / wall_secs) * 100.0 } else { 0.0 };
+        let cpu_pct = if wall_secs > 0.0 {
+            (cpu_delta / wall_secs) * 100.0
+        } else {
+            0.0
+        };
 
-        ResourceSnapshot { peak_rss_mb: rss_delta, cpu_pct }
+        ResourceSnapshot {
+            peak_rss_mb: rss_delta,
+            cpu_pct,
+        }
     }
 }
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct StressHandler {
+struct BenchHandler {
     epoch: Instant,
     processed: Arc<AtomicU64>,
     recorder: Arc<LatencyRecorder>,
     profile: HandlerProfile,
 }
 
-impl MessageHandler<StressTopic> for StressHandler {
-    async fn handle(&self, msg: StressMsg, _meta: MessageMetadata) -> Outcome {
-        let received_at = self.epoch.elapsed().as_nanos() as u64;
-
-        // Simulate work based on handler profile.
+impl MessageHandler<OverheadTopic> for BenchHandler {
+    async fn handle(&self, msg: BenchMsg, _meta: MessageMetadata) -> Outcome {
         match self.profile {
-            HandlerProfile::Zero => {}
             HandlerProfile::Fast => {
                 let delay_ms = rand::rng().random_range(1..=5);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -544,56 +440,83 @@ impl MessageHandler<StressTopic> for StressHandler {
         }
 
         let acked_at = self.epoch.elapsed().as_nanos() as u64;
-        self.recorder.record(LatencyRecord {
-            enqueue_to_receive_ns: received_at.saturating_sub(msg.published_at_ns),
-            enqueue_to_ack_ns: acked_at.saturating_sub(msg.published_at_ns),
-        });
+        self.recorder
+            .record(acked_at.saturating_sub(msg.published_at_ns));
 
         self.processed.fetch_add(1, Ordering::Relaxed);
         Outcome::Ack
     }
 }
 
-// ── Scenario execution ──────────────────────────────────────────────────────
+// ── Single run ──────────────────────────────────────────────────────────────
 
-async fn run_scenario(
+struct IterationResult {
+    throughput: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    peak_rss_mb: f64,
+    cpu_pct: f64,
+}
+
+/// Message count scaled to consumer count so each run takes a reasonable time.
+fn messages_for(consumers: u16, profile: HandlerProfile) -> u64 {
+    match profile {
+        // For fast handlers: enough messages so each consumer processes ~200,
+        // giving a ~600ms minimum runtime per consumer.
+        HandlerProfile::Fast => (consumers as u64 * 200).max(25_000),
+        // For slow handlers: ~20 messages per consumer (mean 175ms each ≈ 3.5s per consumer).
+        HandlerProfile::Slow => (consumers as u64 * 20).max(2_500),
+    }
+}
+
+fn deadline_for(messages: u64, consumers: u16, profile: HandlerProfile) -> Duration {
+    let expected_ms = match profile {
+        HandlerProfile::Fast => (messages as f64 * 3.0) / consumers as f64,
+        HandlerProfile::Slow => (messages as f64 * 175.0) / consumers as f64,
+    };
+    let deadline_ms = (expected_ms * 3.0).clamp(30_000.0, 600_000.0);
+    Duration::from_millis(deadline_ms as u64)
+}
+
+async fn run_once(
     broker: &Broker,
-    scenario: &Scenario,
+    consumers: u16,
+    profile: HandlerProfile,
+    concurrent: bool,
     cancel: &CancellationToken,
-) -> Result<(f64, f64, f64, f64, f64, f64, f64), String> {
-    // Returns: (throughput, p50, p95, p99, peak_rss_mb, cpu_pct, duration_secs)
+) -> Result<IterationResult, String> {
     broker.purge_queue().await;
 
+    let messages = messages_for(consumers, profile);
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
 
     // Publish all messages.
-    let messages: Vec<StressMsg> = (0..scenario.messages)
+    let msgs: Vec<BenchMsg> = (0..messages)
         .map(|id| {
             let published_at_ns = epoch.elapsed().as_nanos() as u64;
-            StressMsg {
+            BenchMsg {
                 id,
                 published_at_ns,
             }
         })
         .collect();
-    broker.publish_batch(&messages).await;
+    broker.publish_batch(&msgs).await;
 
-    // Start resource sampler.
     let sampler = ResourceSampler::start();
 
     // Start consumer group.
     let mut registry = ConsumerGroupRegistry::new(broker.client.clone());
     let pc = processed.clone();
     let rec = recorder.clone();
-    let profile = scenario.handler;
-    let consumers = scenario.consumers;
     registry
-        .register::<StressTopic, StressHandler>(
+        .register::<OverheadTopic, BenchHandler>(
             ConsumerGroupConfig::new(consumers..=consumers)
-                .with_prefetch_count((scenario.messages / consumers as u64).clamp(1, 100) as u16),
-            move || StressHandler {
+                .with_prefetch_count((messages / consumers as u64).clamp(1, 100) as u16)
+                .with_concurrent_processing(concurrent),
+            move || BenchHandler {
                 epoch,
                 processed: pc.clone(),
                 recorder: rec.clone(),
@@ -606,10 +529,9 @@ async fn run_scenario(
     let start = Instant::now();
     registry.start_all();
 
-    // Wait for all messages to be processed, timeout, or cancellation.
-    let deadline = tokio::time::Instant::now() + scenario.deadline;
+    let deadline = tokio::time::Instant::now() + deadline_for(messages, consumers, profile);
     loop {
-        if processed.load(Ordering::Relaxed) >= scenario.messages {
+        if processed.load(Ordering::Relaxed) >= messages {
             break;
         }
         if cancel.is_cancelled() {
@@ -618,34 +540,49 @@ async fn run_scenario(
             return Err("interrupted".to_string());
         }
         if tokio::time::Instant::now() >= deadline {
+            let done = processed.load(Ordering::Relaxed);
             registry.shutdown_all().await;
             let _ = sampler.stop().await;
             return Err(format!(
-                "timeout after {:?}: processed {} / {}",
-                scenario.deadline,
-                processed.load(Ordering::Relaxed),
-                scenario.messages
+                "timeout: processed {done} / {messages} ({:.0}%)",
+                done as f64 / messages as f64 * 100.0
             ));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     let duration = start.elapsed();
-    let throughput = scenario.messages as f64 / duration.as_secs_f64();
+    let throughput = messages as f64 / duration.as_secs_f64();
     let (p50, p95, p99) = recorder.compute_percentiles().await;
     let resources = sampler.stop().await;
 
     registry.shutdown_all().await;
 
-    Ok((throughput, p50, p95, p99, resources.peak_rss_mb, resources.cpu_pct, duration.as_secs_f64()))
+    Ok(IterationResult {
+        throughput,
+        p50,
+        p95,
+        p99,
+        peak_rss_mb: resources.peak_rss_mb,
+        cpu_pct: resources.cpu_pct,
+    })
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+const DEFAULT_CONSUMER_COUNTS: &[u16] = &[128, 256, 512, 1024, 2048, 4096];
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let scenarios = build_scenarios(&cli.tier, &cli.handler);
+    let profile = match cli.handler {
+        HandlerArg::Fast => HandlerProfile::Fast,
+        HandlerArg::Slow => HandlerProfile::Slow,
+    };
+    let consumer_counts = cli
+        .consumers
+        .unwrap_or_else(|| DEFAULT_CONSUMER_COUNTS.to_vec());
+    let iterations = cli.iterations;
 
     let broker = Broker::start().await;
 
@@ -657,93 +594,116 @@ async fn main() {
         cancel_clone.cancel();
     });
 
-    eprintln!("shove stress benchmarks");
-    eprintln!("scenarios: {}\n", scenarios.len());
+    eprintln!(
+        "consumer overhead benchmark | {} | {}x iterations | {}",
+        profile,
+        iterations,
+        if cli.concurrent {
+            "concurrent"
+        } else {
+            "sequential"
+        }
+    );
+    eprintln!("consumer counts: {:?}\n", consumer_counts);
 
-    let mut results: Vec<ScenarioResult> = Vec::new();
-    let mut failures: Vec<FailedResult> = Vec::new();
+    let mut results: Vec<RunResult> = Vec::new();
 
-    for (i, scenario) in scenarios.iter().enumerate() {
+    for &count in &consumer_counts {
         if cancel.is_cancelled() {
-            eprintln!("skipping remaining scenarios");
+            eprintln!("skipping remaining counts");
             break;
         }
+
+        let messages = messages_for(count, profile);
         eprintln!(
-            "[{}/{}] {} | {}msg | {}c | {} ...",
-            i + 1,
-            scenarios.len(),
-            scenario.tier,
-            scenario.messages,
-            scenario.consumers,
-            scenario.handler,
+            "  {}c | {}msg x {} iterations ...",
+            count, messages, iterations
         );
 
-        match run_scenario(&broker, scenario, &cancel).await {
-            Ok((throughput, p50, p95, p99, peak_rss_mb, cpu_pct, duration_secs)) => {
-                eprintln!(
-                    "  -> {:.0} msg/s | p50={:.1}ms p95={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
-                    throughput, p50, p95, p99, cpu_pct, peak_rss_mb, duration_secs
-                );
-                results.push(ScenarioResult {
-                    tier: scenario.tier.to_string(),
-                    messages: scenario.messages,
-                    consumers: scenario.consumers,
-                    handler: scenario.handler.to_string(),
-                    throughput_msg_per_sec: throughput,
-                    latency_p50_ms: p50,
-                    latency_p95_ms: p95,
-                    latency_p99_ms: p99,
-                    scaling_efficiency: 0.0, // computed below
-                    peak_rss_mb,
-                    cpu_pct,
-                    duration_secs,
-                });
+        let mut throughputs = Vec::new();
+        let mut p50s = Vec::new();
+        let mut p95s = Vec::new();
+        let mut p99s = Vec::new();
+        let mut rss_mbs = Vec::new();
+        let mut cpu_pcts = Vec::new();
+        let mut failed = false;
+
+        for iter in 0..iterations {
+            match run_once(&broker, count, profile, cli.concurrent, &cancel).await {
+                Ok(r) => {
+                    eprintln!(
+                        "    [{}/{}] {:.0} msg/s | p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+                        iter + 1,
+                        iterations,
+                        r.throughput,
+                        r.p50,
+                        r.p95,
+                        r.p99
+                    );
+                    throughputs.push(r.throughput);
+                    p50s.push(r.p50);
+                    p95s.push(r.p95);
+                    p99s.push(r.p99);
+                    rss_mbs.push(r.peak_rss_mb);
+                    cpu_pcts.push(r.cpu_pct);
+                }
+                Err(e) => {
+                    eprintln!("    [{}/{}] FAILED: {e}", iter + 1, iterations);
+                    failed = true;
+                    break;
+                }
             }
-            Err(e) => {
-                eprintln!("  -> FAILED: {e}");
-                failures.push(FailedResult {
-                    tier: scenario.tier.to_string(),
-                    messages: scenario.messages,
-                    consumers: scenario.consumers,
-                    handler: scenario.handler.to_string(),
-                    error: e,
-                });
-            }
+        }
+
+        if failed || throughputs.is_empty() {
+            continue;
+        }
+
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let avg_throughput = avg(&throughputs);
+
+        results.push(RunResult {
+            consumers: count,
+            handler: profile.to_string(),
+            concurrent: cli.concurrent,
+            iterations,
+            messages_per_run: messages,
+            avg_throughput,
+            per_consumer_throughput: avg_throughput / count as f64,
+            avg_latency_p50_ms: avg(&p50s),
+            avg_latency_p95_ms: avg(&p95s),
+            avg_latency_p99_ms: avg(&p99s),
+            avg_peak_rss_mb: avg(&rss_mbs),
+            avg_cpu_pct: avg(&cpu_pcts),
+            // Filled in below.
+            scaling_factor: 0.0,
+            ideal_throughput: 0.0,
+            overhead_pct: 0.0,
+        });
+    }
+
+    // Compute scaling factors and overhead relative to the first consumer count.
+    if let Some(baseline) = results.first() {
+        let base_throughput = baseline.avg_throughput;
+        let base_consumers = baseline.consumers as f64;
+        let throughput_per_consumer = base_throughput / base_consumers;
+
+        for r in &mut results {
+            r.scaling_factor = r.avg_throughput / base_throughput;
+            r.ideal_throughput = throughput_per_consumer * r.consumers as f64;
+            r.overhead_pct = if r.ideal_throughput > 0.0 {
+                (1.0 - r.avg_throughput / r.ideal_throughput) * 100.0
+            } else {
+                0.0
+            };
         }
     }
 
-    // Compute scaling efficiency: throughput(N) / throughput(min_consumers) for same (tier, messages, handler).
-    let mut baseline_throughputs: std::collections::HashMap<(String, u64, String), (u16, f64)> =
-        std::collections::HashMap::new();
-    for r in &results {
-        let key = (r.tier.clone(), r.messages, r.handler.clone());
-        let entry = baseline_throughputs
-            .entry(key)
-            .or_insert((r.consumers, r.throughput_msg_per_sec));
-        if r.consumers < entry.0 {
-            *entry = (r.consumers, r.throughput_msg_per_sec);
-        }
-    }
+    let report = Report { results };
 
-    for result in &mut results {
-        let key = (result.tier.clone(), result.messages, result.handler.clone());
-        if let Some(&(_, baseline)) = baseline_throughputs.get(&key)
-            && baseline > 0.0
-        {
-            result.scaling_efficiency = result.throughput_msg_per_sec / baseline;
-        }
-    }
-
-    let report = Report { results, failures };
-
-    // Write JSON to file always.
-    let json = serde_json::to_string_pretty(&report).unwrap();
-    std::fs::write("bench-results.json", &json).unwrap();
-    eprintln!("\nResults written to bench-results.json");
-
-    // Print report in requested format.
     match cli.output {
         OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&report).unwrap();
             println!("{json}");
         }
         OutputFormat::Table => {
@@ -755,35 +715,43 @@ async fn main() {
 }
 
 fn print_table(report: &Report) {
-    eprintln!();
-    eprintln!(
-        "{:<10} {:>8} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8} {:>7} {:>8} {:>6}",
-        "TIER", "MSGS", "CONSUMERS", "HANDLER", "MSGS/SEC", "p50", "p95", "p99", "SCALE", "RSS(MB)", "CPU%"
+    println!();
+    println!(
+        "{:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}",
+        "CONSUMERS",
+        "MSGS",
+        "MSG/SEC",
+        "MSG/SEC/C",
+        "IDEAL",
+        "OVRHEAD",
+        "p50",
+        "p95",
+        "p99",
+        "RSS(MB)",
+        "CPU%"
     );
-    eprintln!("{}", "-".repeat(103));
+    println!("{}", "-".repeat(117));
     for r in &report.results {
-        eprintln!(
-            "{:<10} {:>8} {:>10} {:>8} {:>10.0} {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>6.1}x {:>8.1} {:>5.0}%",
-            r.tier,
-            r.messages,
+        println!(
+            "{:>10} {:>10} {:>10.0} {:>10.1} {:>10.0} {:>7.1}% {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>8.1} {:>5.0}%",
             r.consumers,
-            r.handler,
-            r.throughput_msg_per_sec,
-            r.latency_p50_ms,
-            r.latency_p95_ms,
-            r.latency_p99_ms,
-            r.scaling_efficiency,
-            r.peak_rss_mb,
-            r.cpu_pct,
+            r.messages_per_run,
+            r.avg_throughput,
+            r.per_consumer_throughput,
+            r.ideal_throughput,
+            r.overhead_pct,
+            r.avg_latency_p50_ms,
+            r.avg_latency_p95_ms,
+            r.avg_latency_p99_ms,
+            r.avg_peak_rss_mb,
+            r.avg_cpu_pct,
         );
     }
-    if !report.failures.is_empty() {
-        eprintln!("\nFailed scenarios:");
-        for f in &report.failures {
-            eprintln!(
-                "  {} | {}msg | {}c | {} — {}",
-                f.tier, f.messages, f.consumers, f.handler, f.error
-            );
-        }
-    }
+    println!();
+    println!(
+        "OVERHEAD = % throughput lost vs ideal linear scaling from the lowest consumer count."
+    );
+    println!(
+        "MSG/SEC/C = throughput per consumer (efficiency). Drops indicate coordination overhead."
+    );
 }

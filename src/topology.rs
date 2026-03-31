@@ -1,8 +1,8 @@
 use std::future::Future;
 use std::time::Duration;
 
+use crate::Topic;
 use crate::error::Result;
-
 // ---------------------------------------------------------------------------
 // HoldQueue
 // ---------------------------------------------------------------------------
@@ -131,6 +131,20 @@ impl QueueTopology {
 
     pub fn sequencing(&self) -> Option<&SequenceConfig> {
         self.sequencing.as_ref()
+    }
+
+    pub fn shard_hold_queue_names(&self, shard_index: u16) -> Vec<HoldQueue> {
+        self.hold_queues
+            .iter()
+            .map(|hq| HoldQueue {
+                name: format!(
+                    "{}-seq-{shard_index}-hold-{}s",
+                    self.queue,
+                    hq.delay.as_secs()
+                ),
+                delay: hq.delay,
+            })
+            .collect()
     }
 }
 
@@ -278,7 +292,7 @@ pub trait TopologyDeclarer: Send + Sync {
 // Free function — uncomment when topic.rs is wired into lib.rs
 // ---------------------------------------------------------------------------
 
-pub async fn declare_topic<T: crate::topic::Topic>(declarer: &impl TopologyDeclarer) -> Result<()> {
+pub async fn declare_topic<T: Topic>(declarer: &impl TopologyDeclarer) -> Result<()> {
     declarer.declare(T::topology()).await
 }
 
@@ -448,6 +462,24 @@ mod tests {
             .build();
         assert!(topology.hold_queues().is_empty());
         assert!(topology.sequencing().is_some());
+    }
+
+    #[test]
+    fn shard_hold_queue_names() {
+        let topology = TopologyBuilder::new("payments")
+            .sequenced(SequenceFailure::FailAll)
+            .routing_shards(4)
+            .hold_queue(Duration::from_secs(5))
+            .hold_queue(Duration::from_secs(60))
+            .dlq()
+            .build();
+
+        let names = topology.shard_hold_queue_names(2);
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].name(), "payments-seq-2-hold-5s");
+        assert_eq!(names[0].delay(), Duration::from_secs(5));
+        assert_eq!(names[1].name(), "payments-seq-2-hold-60s");
+        assert_eq!(names[1].delay(), Duration::from_secs(60));
     }
 
     #[test]

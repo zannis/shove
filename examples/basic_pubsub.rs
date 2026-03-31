@@ -153,8 +153,22 @@ impl MessageHandler<ScheduledOrder> for DeferHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+fn require_rabbitmq() {
+    let output = std::process::Command::new("docker")
+        .args(["compose", "ps", "--services", "--filter", "status=running"])
+        .output();
+    match output {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
+        _ => {
+            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
+    require_rabbitmq();
     let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
     let client = RabbitMqClient::connect(&config).await?;
 

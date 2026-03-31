@@ -104,7 +104,7 @@ pub(crate) async fn route_reject(delivery: &Delivery) {
     }
 }
 
-async fn nack_requeue(delivery: &Delivery) {
+pub(crate) async fn nack_requeue(delivery: &Delivery) {
     if let Err(e) = delivery
         .nack(BasicNackOptions {
             requeue: true,
@@ -116,17 +116,161 @@ async fn nack_requeue(delivery: &Delivery) {
     }
 }
 
-fn clone_headers_with_retry(delivery: &Delivery, retry_count: u32) -> FieldTable {
-    let mut table = clone_headers(delivery);
+pub(crate) fn clone_headers_with_retry(delivery: &Delivery, retry_count: u32) -> FieldTable {
+    let mut table = copy_preserved_headers(delivery);
     table.insert(RETRY_COUNT_KEY.into(), AMQPValue::LongUInt(retry_count));
     table
 }
 
-fn clone_headers(delivery: &Delivery) -> FieldTable {
-    delivery
-        .properties
-        .headers()
-        .as_ref()
-        .cloned()
-        .unwrap_or_default()
+pub(crate) fn clone_headers(delivery: &Delivery) -> FieldTable {
+    copy_preserved_headers(delivery)
+}
+
+/// Headers that must be preserved across retries and defers.
+const PRESERVED_HEADER_PREFIXES: &[&str] = &["x-trace-", "x-request-"];
+
+/// Build a minimal `FieldTable` by copying only headers that need to survive
+/// retries/defers, instead of deep-cloning the entire table.
+fn copy_preserved_headers(delivery: &Delivery) -> FieldTable {
+    let Some(orig) = delivery.properties.headers().as_ref() else {
+        return FieldTable::default();
+    };
+
+    let inner = orig.inner();
+    let mut table = FieldTable::default();
+
+    for (k, v) in inner.iter() {
+        let key_str = k.as_str();
+        // Always preserve retry count (will be overwritten by caller if needed).
+        if key_str == RETRY_COUNT_KEY {
+            table.insert(k.clone(), v.clone());
+            continue;
+        }
+        // Preserve headers matching known prefixes.
+        if PRESERVED_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| key_str.starts_with(prefix))
+        {
+            table.insert(k.clone(), v.clone());
+        }
+    }
+
+    table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lapin::BasicProperties;
+    use lapin::message::Delivery;
+    use lapin::types::{AMQPValue, FieldTable, ShortString};
+
+    fn make_delivery(headers: Option<FieldTable>) -> Delivery {
+        let mut delivery = Delivery::mock(
+            1,
+            ShortString::from(""),
+            ShortString::from(""),
+            false,
+            vec![],
+        );
+        if let Some(h) = headers {
+            delivery.properties = BasicProperties::default().with_headers(h);
+        }
+        delivery
+    }
+
+    #[test]
+    fn clone_headers_with_no_headers_returns_empty_table() {
+        let delivery = make_delivery(None);
+        let result = clone_headers(&delivery);
+        assert!(result.inner().is_empty());
+    }
+
+    #[test]
+    fn clone_headers_preserves_trace_headers() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from("x-trace-id"),
+            AMQPValue::LongString("abc123".into()),
+        );
+        let delivery = make_delivery(Some(table));
+        let result = clone_headers(&delivery);
+        assert!(result.inner().contains_key("x-trace-id"));
+        assert_eq!(result.inner().len(), 1);
+    }
+
+    #[test]
+    fn clone_headers_drops_non_preserved_headers() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from("x-custom"),
+            AMQPValue::LongString("value".into()),
+        );
+        table.insert(
+            ShortString::from("x-trace-id"),
+            AMQPValue::LongString("tid".into()),
+        );
+        let delivery = make_delivery(Some(table));
+        let result = clone_headers(&delivery);
+        assert!(!result.inner().contains_key("x-custom"));
+        assert!(result.inner().contains_key("x-trace-id"));
+        assert_eq!(result.inner().len(), 1);
+    }
+
+    #[test]
+    fn clone_headers_with_retry_no_existing_headers_inserts_retry_count() {
+        let delivery = make_delivery(None);
+        let result = clone_headers_with_retry(&delivery, 3);
+        assert_eq!(result.inner().len(), 1);
+        assert_eq!(
+            result.inner().get(RETRY_COUNT_KEY),
+            Some(&AMQPValue::LongUInt(3))
+        );
+    }
+
+    #[test]
+    fn clone_headers_with_retry_preserves_trace_headers_and_adds_retry_count() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from("x-trace-id"),
+            AMQPValue::LongString("tid".into()),
+        );
+        let delivery = make_delivery(Some(table));
+        let result = clone_headers_with_retry(&delivery, 2);
+        assert_eq!(result.inner().len(), 2);
+        assert!(result.inner().contains_key("x-trace-id"));
+        assert_eq!(
+            result.inner().get(RETRY_COUNT_KEY),
+            Some(&AMQPValue::LongUInt(2))
+        );
+    }
+
+    #[test]
+    fn clone_headers_with_retry_overwrites_existing_retry_count() {
+        let mut table = FieldTable::default();
+        table.insert(ShortString::from(RETRY_COUNT_KEY), AMQPValue::LongUInt(1));
+        let delivery = make_delivery(Some(table));
+        let result = clone_headers_with_retry(&delivery, 5);
+        assert_eq!(
+            result.inner().get(RETRY_COUNT_KEY),
+            Some(&AMQPValue::LongUInt(5))
+        );
+    }
+
+    #[test]
+    fn clone_headers_preserves_request_headers() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from("x-request-id"),
+            AMQPValue::LongString("req-1".into()),
+        );
+        table.insert(
+            ShortString::from("content-encoding"),
+            AMQPValue::LongString("gzip".into()),
+        );
+        let delivery = make_delivery(Some(table));
+        let result = clone_headers(&delivery);
+        assert!(result.inner().contains_key("x-request-id"));
+        assert!(!result.inner().contains_key("content-encoding"));
+    }
 }

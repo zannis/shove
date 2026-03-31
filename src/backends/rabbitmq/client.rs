@@ -1,16 +1,27 @@
+use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use lapin::options::ConfirmSelectOptions;
 use lapin::{Channel, Connection, ConnectionProperties};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::SHUTDOWN_GRACE;
 use crate::error::{Result, ShoveError};
 
 /// RabbitMQ connection configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RabbitMqConfig {
     /// AMQP connection string (e.g., "amqp://guest:guest@localhost:5672/%2f")
     pub uri: String,
+}
+
+impl Debug for RabbitMqConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RabbitMqConfig")
+            .field("uri", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RabbitMqConfig {
@@ -83,7 +94,7 @@ impl RabbitMqClient {
             .map_err(|e| ShoveError::Connection(e.to_string()))?;
 
         channel
-            .confirm_select(lapin::options::ConfirmSelectOptions::default())
+            .confirm_select(ConfirmSelectOptions::default())
             .await
             .map_err(|e| ShoveError::Connection(e.to_string()))?;
 
@@ -110,10 +121,24 @@ impl RabbitMqClient {
     /// complete, and then closes the underlying AMQP connection.
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
-        tokio::time::sleep(SHUTDOWN_GRACE).await;
+        sleep(SHUTDOWN_GRACE).await;
 
         if let Err(e) = self.connection.close(0, "shutdown".into()).await {
             tracing::warn!("error while closing RabbitMQ connection: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_debug_redacts_uri() {
+        let config = RabbitMqConfig::new("amqp://secret:password@host:5672/%2F");
+        let debug_output = format!("{config:?}");
+        assert!(!debug_output.contains("secret"));
+        assert!(!debug_output.contains("password"));
+        assert!(debug_output.contains("<redacted>"));
     }
 }

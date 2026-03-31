@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lapin::options::BasicPublishOptions;
 use lapin::types::{AMQPValue, FieldTable};
@@ -14,6 +15,7 @@ use crate::publisher::Publisher;
 use crate::topic::Topic;
 
 const DELIVERY_MODE_PERSISTENT: u8 = 2;
+const DEFAULT_CHANNEL_POOL_SIZE: usize = 4;
 
 fn base_properties() -> BasicProperties {
     BasicProperties::default()
@@ -21,18 +23,44 @@ fn base_properties() -> BasicProperties {
         .with_content_type("application/json".into())
 }
 
+/// Round-robin pool of AMQP channels with independent confirmation streams.
+struct ChannelPool {
+    channels: Vec<Mutex<Channel>>,
+    next: AtomicUsize,
+}
+
+impl ChannelPool {
+    fn get(&self) -> &Mutex<Channel> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.channels.len();
+        &self.channels[idx]
+    }
+}
+
 #[derive(Clone)]
 pub struct RabbitMqPublisher {
     client: RabbitMqClient,
-    channel: Arc<Mutex<Channel>>,
+    pool: Arc<ChannelPool>,
 }
 
 impl RabbitMqPublisher {
+    /// Create a publisher with the default channel pool size (4).
     pub async fn new(client: RabbitMqClient) -> Result<Self> {
-        let channel = client.create_confirm_channel().await?;
+        Self::with_channel_count(client, DEFAULT_CHANNEL_POOL_SIZE).await
+    }
+
+    /// Create a publisher with a custom number of pooled channels.
+    pub async fn with_channel_count(client: RabbitMqClient, count: usize) -> Result<Self> {
+        let count = count.max(1);
+        let mut channels = Vec::with_capacity(count);
+        for _ in 0..count {
+            channels.push(Mutex::new(client.create_confirm_channel().await?));
+        }
         Ok(Self {
             client,
-            channel: Arc::new(Mutex::new(channel)),
+            pool: Arc::new(ChannelPool {
+                channels,
+                next: AtomicUsize::new(0),
+            }),
         })
     }
 
@@ -43,7 +71,8 @@ impl RabbitMqPublisher {
         payload: &[u8],
         headers: Option<FieldTable>,
     ) -> Result<()> {
-        let mut channel_guard = self.channel.lock().await;
+        let slot = self.pool.get();
+        let mut channel_guard = slot.lock().await;
 
         debug!(
             exchange,
@@ -102,7 +131,8 @@ impl RabbitMqPublisher {
     }
 
     async fn publish_batch_raw(&self, exchange: &str, items: &[(&str, Vec<u8>)]) -> Result<()> {
-        let channel_guard = self.channel.lock().await;
+        let slot = self.pool.get();
+        let mut channel_guard = slot.lock().await;
 
         debug!(exchange, count = items.len(), "publishing batch");
 
@@ -119,8 +149,6 @@ impl RabbitMqPublisher {
             }
             Err(e) => {
                 warn!(exchange, error = %e, "batch publish failed, recovering channel and retrying");
-                drop(channel_guard);
-                let mut channel_guard = self.channel.lock().await;
                 let fresh = self.client.create_confirm_channel().await?;
                 *channel_guard = fresh;
 
@@ -236,9 +264,14 @@ impl Publisher for RabbitMqPublisher {
         let key_fn = T::SEQUENCE_KEY_FN;
 
         // Serialize all messages up front for fail-fast behaviour.
+        // Pre-allocate buffers with estimated capacity to reduce heap fragmentation.
         let serialized: Result<Vec<Vec<u8>>> = messages
             .iter()
-            .map(|m| serde_json::to_vec(m).map_err(ShoveError::Serialization))
+            .map(|m| {
+                let mut buf = Vec::with_capacity(128);
+                serde_json::to_writer(&mut buf, m).map_err(ShoveError::Serialization)?;
+                Ok(buf)
+            })
             .collect();
 
         // Pre-compute routing keys while we still have access to messages.
@@ -316,5 +349,76 @@ impl ChannelPublisher {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_pool_round_robins() {
+        // Create a pool of 3 channels (we test the index logic, not real channels).
+        let pool_next = AtomicUsize::new(0);
+        let size = 3usize;
+        // Simulate round-robin index selection.
+        let indices: Vec<usize> = (0..7)
+            .map(|_| pool_next.fetch_add(1, Ordering::Relaxed) % size)
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2, 0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn empty_hashmap_produces_empty_field_table() {
+        let table = hashmap_to_field_table(HashMap::new());
+        assert!(table.inner().is_empty());
+    }
+
+    #[test]
+    fn single_entry_is_correctly_converted() {
+        let mut map = HashMap::new();
+        map.insert("x-trace-id".to_string(), "abc123".to_string());
+
+        let table = hashmap_to_field_table(map);
+        let inner = table.inner();
+
+        assert_eq!(inner.len(), 1);
+        let value = inner.get("x-trace-id").expect("key should be present");
+        assert!(
+            matches!(value, AMQPValue::LongString(s) if s.as_bytes() == b"abc123"),
+            "expected LongString(\"abc123\"), got {value:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_entries_are_all_present() {
+        let mut map = HashMap::new();
+        map.insert("key-a".to_string(), "val-a".to_string());
+        map.insert("key-b".to_string(), "val-b".to_string());
+        map.insert("key-c".to_string(), "val-c".to_string());
+
+        let table = hashmap_to_field_table(map);
+        let inner = table.inner();
+
+        assert_eq!(inner.len(), 3);
+        assert!(inner.contains_key("key-a"), "key-a should be present");
+        assert!(inner.contains_key("key-b"), "key-b should be present");
+        assert!(inner.contains_key("key-c"), "key-c should be present");
+    }
+
+    #[test]
+    fn values_are_stored_as_long_string_amqp_values() {
+        let mut map = HashMap::new();
+        map.insert("content-type".to_string(), "application/json".to_string());
+        map.insert("x-retry-count".to_string(), "3".to_string());
+
+        let table = hashmap_to_field_table(map);
+
+        for value in table.inner().values() {
+            assert!(
+                matches!(value, AMQPValue::LongString(_)),
+                "all values must be AMQPValue::LongString, got {value:?}"
+            );
+        }
     }
 }

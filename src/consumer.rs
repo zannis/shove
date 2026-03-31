@@ -26,6 +26,11 @@ pub struct ConsumerOptions {
     /// If the handler exceeds this duration the message is retried.
     /// `None` means no timeout (the handler may run indefinitely).
     pub handler_timeout: Option<Duration>,
+    /// Maximum number of locally buffered messages per sequence key in
+    /// concurrent-sequenced consumers. When the limit is reached, new
+    /// deliveries for that key are rejected to the DLQ.
+    /// `None` means no limit (default).
+    pub max_pending_per_key: Option<usize>,
 }
 
 impl ConsumerOptions {
@@ -38,6 +43,7 @@ impl ConsumerOptions {
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
             handler_timeout: None,
+            max_pending_per_key: None,
         }
     }
 
@@ -59,6 +65,13 @@ impl ConsumerOptions {
         self.handler_timeout = Some(timeout);
         self
     }
+
+    /// Set the maximum number of locally buffered messages per sequence key.
+    /// When exceeded, new deliveries for that key are rejected to the DLQ.
+    pub fn with_max_pending_per_key(mut self, limit: usize) -> Self {
+        self.max_pending_per_key = Some(limit);
+        self
+    }
 }
 
 /// Consume messages from a topic's queues.
@@ -76,7 +89,27 @@ pub trait Consumer: Send + Sync + 'static {
     /// 3. Deserializes to `T::Message`
     /// 4. Calls `handler.handle()`
     /// 5. Routes based on `Outcome` (ack, retry → hold, reject → DLQ)
+    ///
+    /// Messages are processed one at a time. For concurrent processing within
+    /// a single consumer, use [`run_concurrent`](Consumer::run_concurrent).
     fn run<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T>,
+        options: ConsumerOptions,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Run the consumer loop with concurrent message processing.
+    /// Blocks until shutdown signal.
+    ///
+    /// Processes up to `prefetch_count` messages concurrently within the same
+    /// consumer task, while **always acknowledging messages in delivery order**.
+    /// This significantly improves throughput for handlers with I/O latency
+    /// (HTTP calls, database queries, etc.) without requiring additional
+    /// consumer instances.
+    ///
+    /// Not available for sequenced topics — use [`run_sequenced`](Consumer::run_sequenced)
+    /// instead, which always processes one message at a time to preserve ordering.
+    fn run_concurrent<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
@@ -86,10 +119,14 @@ pub trait Consumer: Send + Sync + 'static {
     /// Blocks until shutdown signal.
     ///
     /// Messages sharing the same sequence key are delivered in strict order.
-    /// Different sequence keys are independent and may be processed concurrently.
+    /// Different sequence keys are independent and may be processed concurrently
+    /// within the same shard.
     ///
-    /// `ConsumerOptions::prefetch_count` is ignored — sequenced consumers
-    /// always use `prefetch_count = 1` per sub-queue to guarantee ordering.
+    /// Each shard prefetches up to `ConsumerOptions::prefetch_count` messages.
+    /// Messages for idle keys are processed immediately; messages for busy keys
+    /// (in-flight handler or awaiting retry) are buffered locally and drained
+    /// sequentially when the key becomes free. This avoids redelivery storms
+    /// while consuming prefetch slots as natural back-pressure.
     ///
     /// Returns `Err(ShoveError::Topology)` if `T::topology().sequencing` is `None`.
     fn run_sequenced<T: SequencedTopic>(
@@ -119,6 +156,7 @@ mod tests {
         assert_eq!(opts.max_retries, 10);
         assert_eq!(opts.prefetch_count, 10);
         assert!(opts.handler_timeout.is_none());
+        assert!(opts.max_pending_per_key.is_none());
         assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -146,10 +184,12 @@ mod tests {
         let opts = ConsumerOptions::new(CancellationToken::new())
             .with_max_retries(3)
             .with_prefetch_count(20)
-            .with_handler_timeout(Duration::from_secs(5));
+            .with_handler_timeout(Duration::from_secs(5))
+            .with_max_pending_per_key(100);
         assert_eq!(opts.max_retries, 3);
         assert_eq!(opts.prefetch_count, 20);
         assert_eq!(opts.handler_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(opts.max_pending_per_key, Some(100));
     }
 
     #[test]

@@ -1,15 +1,16 @@
 use std::future::Future;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-
+use crate::error::Result;
 #[cfg(test)]
 use crate::error::ShoveError;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
 use crate::topic::Topic;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// A single audit record capturing one delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,10 +36,7 @@ pub struct AuditRecord<M: Serialize> {
 /// Integrators implement this for their chosen persistence backend.
 /// Returning `Err` causes the message to be retried (strict auditing).
 pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
-    fn audit(
-        &self,
-        record: &AuditRecord<T::Message>,
-    ) -> impl Future<Output = crate::error::Result<()>> + Send;
+    fn audit(&self, record: &AuditRecord<T::Message>) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Wraps a `MessageHandler` with audit logging.
@@ -48,6 +46,9 @@ pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
 pub struct Audited<H, A> {
     handler: H,
     audit_handler: A,
+    /// Maximum time the audit handler may take before the message is retried.
+    /// `None` means no timeout (default for backward compatibility).
+    audit_timeout: Option<Duration>,
 }
 
 impl<H, A> Audited<H, A> {
@@ -55,7 +56,15 @@ impl<H, A> Audited<H, A> {
         Self {
             handler,
             audit_handler,
+            audit_timeout: None,
         }
+    }
+
+    /// Set the maximum time the audit handler may take. If exceeded, the
+    /// original handler outcome is returned and the audit failure is logged.
+    pub fn with_audit_timeout(mut self, timeout: Duration) -> Self {
+        self.audit_timeout = Some(timeout);
+        self
     }
 }
 
@@ -70,7 +79,7 @@ where
         // Guard against infinite recursion: skip auditing on the audit-log topic itself.
         #[cfg(feature = "audit")]
         {
-            if T::topology().queue() == shove_backend::AuditLog::topology().queue() {
+            if T::topology().queue() == AuditLog::topology().queue() {
                 return self.handler.handle(message, metadata).await;
             }
         }
@@ -79,7 +88,7 @@ where
             .headers
             .get("x-trace-id")
             .cloned()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let topic = T::topology().queue().to_owned();
         let payload_clone = message.clone();
@@ -96,10 +105,27 @@ where
             metadata: metadata_clone,
             outcome: outcome.clone(),
             duration_ms,
-            timestamp: chrono::Utc::now(),
+            timestamp: Utc::now(),
         };
 
-        match self.audit_handler.audit(&record).await {
+        let audit_result = match self.audit_timeout {
+            Some(timeout) => {
+                match tokio::time::timeout(timeout, self.audit_handler.audit(&record)).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        tracing::error!(
+                            delivery_id = %record.metadata.delivery_id,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "audit handler timed out, returning original outcome"
+                        );
+                        return outcome;
+                    }
+                }
+            }
+            None => self.audit_handler.audit(&record).await,
+        };
+
+        match audit_result {
             Ok(()) => outcome,
             Err(err) => {
                 tracing::error!(
@@ -181,11 +207,11 @@ pub use shove_backend::{AuditLog, ShoveAuditHandler};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
+    use crate::QueueTopology;
     use crate::topology::TopologyBuilder;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, OnceLock};
 
     // -- test Topic --
 
@@ -197,9 +223,8 @@ mod tests {
     struct TestTopic;
     impl Topic for TestTopic {
         type Message = TestMessage;
-        fn topology() -> &'static crate::topology::QueueTopology {
-            static TOPOLOGY: std::sync::OnceLock<crate::topology::QueueTopology> =
-                std::sync::OnceLock::new();
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
             TOPOLOGY.get_or_init(|| TopologyBuilder::new("audit-test").dlq().build())
         }
     }
@@ -215,7 +240,7 @@ mod tests {
 
     struct OkAuditHandler;
     impl AuditHandler<TestTopic> for OkAuditHandler {
-        async fn audit(&self, _record: &AuditRecord<TestMessage>) -> Result<(), ShoveError> {
+        async fn audit(&self, _record: &AuditRecord<TestMessage>) -> Result<()> {
             Ok(())
         }
     }
@@ -234,7 +259,7 @@ mod tests {
         }
     }
     impl AuditHandler<TestTopic> for Arc<TrackingAuditHandler> {
-        async fn audit(&self, record: &AuditRecord<TestMessage>) -> Result<(), ShoveError> {
+        async fn audit(&self, record: &AuditRecord<TestMessage>) -> Result<()> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
             *self.trace_id.lock().await = Some(record.trace_id.clone());
             Ok(())
@@ -243,7 +268,7 @@ mod tests {
 
     struct FailingAuditHandler;
     impl AuditHandler<TestTopic> for FailingAuditHandler {
-        async fn audit(&self, _record: &AuditRecord<TestMessage>) -> Result<(), ShoveError> {
+        async fn audit(&self, _record: &AuditRecord<TestMessage>) -> Result<()> {
             Err(ShoveError::Connection("audit publish failed".into()))
         }
     }
@@ -260,6 +285,34 @@ mod tests {
     fn test_message() -> TestMessage {
         TestMessage {
             body: "hello".into(),
+        }
+    }
+
+    fn test_dead_metadata() -> DeadMessageMetadata {
+        DeadMessageMetadata {
+            message: test_metadata(),
+            reason: Some("rejected".into()),
+            original_queue: Some("audit-test".into()),
+            death_count: 1,
+        }
+    }
+
+    struct TrackingDeadHandler {
+        called: AtomicBool,
+    }
+    impl TrackingDeadHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                called: AtomicBool::new(false),
+            })
+        }
+    }
+    impl MessageHandler<TestTopic> for Arc<TrackingDeadHandler> {
+        async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata) -> Outcome {
+            Outcome::Ack
+        }
+        async fn handle_dead(&self, _msg: TestMessage, _meta: DeadMessageMetadata) {
+            self.called.store(true, Ordering::Relaxed);
         }
     }
 
@@ -333,7 +386,7 @@ mod tests {
         let trace_id = captured.as_ref().expect("trace_id should be set");
         // Should be a valid UUID v4
         assert_eq!(trace_id.len(), 36);
-        assert!(uuid::Uuid::parse_str(trace_id).is_ok());
+        assert!(Uuid::parse_str(trace_id).is_ok());
     }
 
     #[cfg(feature = "audit")]
@@ -357,7 +410,7 @@ mod tests {
             async fn audit(
                 &self,
                 _record: &AuditRecord<<AuditLog as Topic>::Message>,
-            ) -> Result<(), ShoveError> {
+            ) -> Result<()> {
                 panic!("audit handler should not be called for the audit topic");
             }
         }
@@ -385,5 +438,48 @@ mod tests {
 
         let outcome = audited.handle(msg, meta).await;
         assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    struct SlowAuditHandler;
+    impl AuditHandler<TestTopic> for SlowAuditHandler {
+        async fn audit(&self, _record: &AuditRecord<TestMessage>) -> Result<()> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn audited_returns_original_outcome_on_audit_timeout() {
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), SlowAuditHandler)
+            .with_audit_timeout(Duration::from_millis(10));
+        let outcome = audited.handle(test_message(), test_metadata()).await;
+        // Should return the original Ack, not Retry, because audit timed out.
+        assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    #[tokio::test]
+    async fn audited_no_timeout_blocks_on_slow_audit() {
+        // Without a timeout, a failing audit handler returns Retry.
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), FailingAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    #[tokio::test]
+    async fn audited_handle_dead_does_not_panic() {
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), OkAuditHandler);
+        audited
+            .handle_dead(test_message(), test_dead_metadata())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn audited_handle_dead_delegates_to_inner_handler() {
+        let tracker = TrackingDeadHandler::new();
+        let audited = Audited::new(tracker.clone(), OkAuditHandler);
+        audited
+            .handle_dead(test_message(), test_dead_metadata())
+            .await;
+        assert!(tracker.called.load(Ordering::Relaxed));
     }
 }
