@@ -28,7 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
-      - run: cargo llvm-cov nextest -q --all-features --lcov --output-path lcov.info
+      - run: cargo llvm-cov nextest --all-features --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
