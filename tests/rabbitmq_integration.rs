@@ -3635,6 +3635,254 @@ async fn dlq_consumer_handles_deserialization_failure() {
     broker.stop().await;
 }
 
+// --- Client shutdown guard ---
+
+/// Creating channels after shutdown returns an error.
+#[tokio::test]
+async fn client_create_channel_fails_after_shutdown() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    client.shutdown().await;
+
+    let result = client.create_channel().await;
+    assert!(result.is_err(), "create_channel should fail after shutdown");
+
+    let result = client.create_confirm_channel().await;
+    assert!(result.is_err(), "create_confirm_channel should fail after shutdown");
+
+    broker.stop().await;
+}
+
+// --- Publisher channel pool ---
+
+/// Publisher with custom channel count still publishes correctly.
+#[tokio::test]
+async fn publisher_with_channel_count_publishes() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(SimpleWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2).await.unwrap();
+
+    for i in 0..6 {
+        publisher
+            .publish::<SimpleWork>(&SimpleMessage { body: format!("pool-{i}") })
+            .await
+            .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(10);
+        consumer.run::<SimpleWork>(h, opts).await
+    });
+
+    assert!(handler.wait_for_count(6, Duration::from_secs(10)).await);
+    assert_eq!(handler.count(), 6);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+/// Publisher with channel_count=0 clamps to 1 and works.
+#[tokio::test]
+async fn publisher_with_zero_channels_clamps_to_one() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(SimpleWork::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 0).await.unwrap();
+    publisher
+        .publish::<SimpleWork>(&SimpleMessage { body: "clamped".into() })
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(3)
+            .with_prefetch_count(1);
+        consumer.run::<SimpleWork>(h, opts).await
+    });
+
+    assert!(handler.wait_for_count(1, Duration::from_secs(10)).await);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Sequenced batch with channel pool ---
+
+/// Batch publish on sequenced topic with channel pool.
+#[tokio::test]
+async fn sequenced_batch_publish_with_pool() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(OrderTopic::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2).await.unwrap();
+    let messages: Vec<OrderMessage> = (0..20)
+        .map(|i| OrderMessage {
+            account: format!("ACC-BATCH-{}", i % 5),
+            seq: i,
+        })
+        .collect();
+    publisher.publish_batch::<OrderTopic>(&messages).await.unwrap();
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        consumer.run_sequenced::<OrderTopic>(h, opts).await
+    });
+
+    assert!(handler.wait_for_count(20, Duration::from_secs(20)).await);
+    assert_eq!(handler.count(), 20);
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Consumer group concurrent processing ---
+
+/// Consumer group with concurrent_processing=true processes messages.
+#[tokio::test]
+async fn registry_concurrent_processing_consumes_messages() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+
+    registry
+        .register::<SimpleWork, _>(
+            ConsumerGroupConfig::new(1..=3)
+                .with_concurrent_processing(true)
+                .with_prefetch_count(5),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+
+    registry.start_all();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    for i in 0..5 {
+        publisher
+            .publish::<SimpleWork>(&SimpleMessage { body: format!("conc-group-{i}") })
+            .await
+            .unwrap();
+    }
+
+    assert!(handler.wait_for_count(5, Duration::from_secs(15)).await);
+    assert_eq!(handler.count(), 5);
+
+    registry.shutdown_all().await;
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Duplicate registration error ---
+
+/// Registering the same topic twice returns an error.
+#[tokio::test]
+async fn registry_duplicate_registration_fails() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+
+    registry
+        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h.clone())
+        .await
+        .unwrap();
+
+    let handler2 = CountingHandler::new();
+    let h2 = handler2.clone();
+    let result = registry
+        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h2.clone())
+        .await;
+
+    assert!(result.is_err(), "duplicate registration should fail");
+
+    registry.shutdown_all().await;
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Consumer group concurrent + handler timeout ---
+
+/// Consumer group with concurrent + handler timeout processes messages correctly.
+#[tokio::test]
+async fn registry_concurrent_with_timeout_processes_messages() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+
+    registry
+        .register::<SimpleWork, _>(
+            ConsumerGroupConfig::new(1..=2)
+                .with_concurrent_processing(true)
+                .with_prefetch_count(5)
+                .with_handler_timeout(Duration::from_secs(10)),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+
+    registry.start_all();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    for i in 0..3 {
+        publisher
+            .publish::<SimpleWork>(&SimpleMessage { body: format!("timeout-group-{i}") })
+            .await
+            .unwrap();
+    }
+
+    assert!(handler.wait_for_count(3, Duration::from_secs(15)).await);
+    assert_eq!(handler.count(), 3);
+
+    registry.shutdown_all().await;
+    client.shutdown().await;
+    broker.stop().await;
+}
+
 // --- Sequenced consumer — multiple keys concurrent ---
 
 #[tokio::test]

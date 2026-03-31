@@ -237,6 +237,28 @@ mod tests {
         assert_eq!(get_retry_count(&delivery), 0);
     }
 
+    #[test]
+    fn retry_count_short_uint() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(RETRY_COUNT_KEY),
+            AMQPValue::ShortUInt(12),
+        );
+        let delivery = make_delivery(Some(table), 1, false);
+        assert_eq!(get_retry_count(&delivery), 12);
+    }
+
+    #[test]
+    fn retry_count_short_short_uint() {
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(RETRY_COUNT_KEY),
+            AMQPValue::ShortShortUInt(7),
+        );
+        let delivery = make_delivery(Some(table), 1, false);
+        assert_eq!(get_retry_count(&delivery), 7);
+    }
+
     // ---- extract_string_headers ----
 
     #[test]
