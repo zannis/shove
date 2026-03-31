@@ -1,0 +1,25 @@
+examples/stress.rs
+  83e8be756fe9e414 1-257,259-439,441-521,523-655,657-715
+.gitignore
+  83e8be756fe9e414 2-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "04f467eaebf59be2d202a3069ab484302f2f18d9",
+  "prompts": {
+    "83e8be756fe9e414": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1f752485-725e-4685-93c0-0cbf43dcb0d1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 297,
+      "total_deletions": 66,
+      "accepted_lines": 1881,
+      "overriden_lines": 2
+    }
+  }
+}
