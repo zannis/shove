@@ -7,6 +7,10 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 
 pub(crate) const RETRY_COUNT_KEY: &str = "x-retry-count";
 
+fn long_string_to_owned(s: &lapin::types::LongString) -> String {
+    String::from_utf8_lossy(s.as_bytes()).into_owned()
+}
+
 pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
     let headers: &FieldTable = match delivery.properties.headers().as_ref() {
         Some(h) => h,
@@ -44,15 +48,12 @@ pub(crate) fn extract_string_headers(delivery: &Delivery) -> HashMap<String, Str
         .inner()
         .iter()
         .filter_map(|(k, v)| {
-            let key = k.to_string();
             let value = match v {
-                AMQPValue::LongString(s) => {
-                    Some(String::from_utf8_lossy(s.as_bytes()).into_owned())
-                }
+                AMQPValue::LongString(s) => Some(long_string_to_owned(s)),
                 AMQPValue::ShortString(s) => Some(s.to_string()),
                 _ => None,
             };
-            value.map(|v| (key, v))
+            value.map(|v| (k.to_string(), v))
         })
         .collect()
 }
@@ -93,20 +94,14 @@ fn extract_first_death_entry(array: &FieldArray) -> Option<(Option<String>, Opti
 
     let inner = table.inner();
 
-    let reason = inner.get("reason").and_then(|v| {
-        if let AMQPValue::LongString(s) = v {
-            Some(String::from_utf8_lossy(s.as_bytes()).into_owned())
-        } else {
-            None
-        }
+    let reason = inner.get("reason").and_then(|v| match v {
+        AMQPValue::LongString(s) => Some(long_string_to_owned(s)),
+        _ => None,
     });
 
-    let original_queue = inner.get("queue").and_then(|v| {
-        if let AMQPValue::LongString(s) = v {
-            Some(String::from_utf8_lossy(s.as_bytes()).into_owned())
-        } else {
-            None
-        }
+    let original_queue = inner.get("queue").and_then(|v| match v {
+        AMQPValue::LongString(s) => Some(long_string_to_owned(s)),
+        _ => None,
     });
 
     let death_count = inner

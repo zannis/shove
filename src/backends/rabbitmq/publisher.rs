@@ -15,6 +15,12 @@ use crate::topic::Topic;
 
 const DELIVERY_MODE_PERSISTENT: u8 = 2;
 
+fn base_properties() -> BasicProperties {
+    BasicProperties::default()
+        .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
+        .with_content_type("application/json".into())
+}
+
 #[derive(Clone)]
 pub struct RabbitMqPublisher {
     client: RabbitMqClient,
@@ -46,16 +52,7 @@ impl RabbitMqPublisher {
             "publishing message"
         );
 
-        let result = Self::do_publish(
-            &channel_guard,
-            exchange,
-            routing_key,
-            payload,
-            headers.clone(),
-        )
-        .await;
-
-        match result {
+        match Self::do_publish(&channel_guard, exchange, routing_key, payload, headers).await {
             Ok(()) => {
                 debug!(exchange, routing_key, "message published and confirmed");
                 Ok(())
@@ -65,7 +62,7 @@ impl RabbitMqPublisher {
                 let fresh = self.client.create_confirm_channel().await?;
                 *channel_guard = fresh;
 
-                Self::do_publish(&channel_guard, exchange, routing_key, payload, headers).await
+                Self::do_publish(&channel_guard, exchange, routing_key, payload, None).await
             }
         }
     }
@@ -77,13 +74,10 @@ impl RabbitMqPublisher {
         payload: &[u8],
         headers: Option<FieldTable>,
     ) -> Result<()> {
-        let mut props = BasicProperties::default()
-            .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
-            .with_content_type("application/json".into());
-
-        if let Some(h) = headers {
-            props = props.with_headers(h);
-        }
+        let props = match headers {
+            Some(h) => base_properties().with_headers(h),
+            None => base_properties(),
+        };
 
         let confirm = channel
             .basic_publish(
@@ -140,20 +134,16 @@ impl RabbitMqPublisher {
         exchange: &str,
         items: &[(&str, Vec<u8>)],
     ) -> Result<()> {
-        // Phase 1: Send all messages, collecting confirmation futures.
         let mut confirms = Vec::with_capacity(items.len());
+        let props = base_properties();
         for (routing_key, payload) in items {
-            let props = BasicProperties::default()
-                .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
-                .with_content_type("application/json".into());
-
             let confirm = channel
                 .basic_publish(
                     exchange.into(),
                     (*routing_key).into(),
                     BasicPublishOptions::default(),
                     payload,
-                    props,
+                    props.clone(),
                 )
                 .await
                 .map_err(|e| ShoveError::Connection(e.to_string()))?;
@@ -161,7 +151,6 @@ impl RabbitMqPublisher {
             confirms.push(confirm);
         }
 
-        // Phase 2: Await all confirmations.
         for confirm in confirms {
             let result = confirm
                 .await
@@ -304,10 +293,7 @@ impl ChannelPublisher {
         payload: &[u8],
         headers: FieldTable,
     ) -> Result<()> {
-        let props = BasicProperties::default()
-            .with_delivery_mode(DELIVERY_MODE_PERSISTENT)
-            .with_content_type("application/json".into())
-            .with_headers(headers);
+        let props = base_properties().with_headers(headers);
 
         let confirm = self
             .channel
