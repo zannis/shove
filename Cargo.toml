@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 rand = "0.10"
+[target.'cfg(target_os = "macos")'.dev-dependencies]
 mach2 = "0.6"
 
 [[bench]]
