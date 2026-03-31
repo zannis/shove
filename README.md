@@ -14,7 +14,7 @@ Topic-typed pub/sub for Rust.
 
 ## Background
 
-The first version of this crate was built for [Lens](https://lens.xyz) to handle millions of async events — ingestion, cross-chain migrations, backfills. It was a custom broker, and it worked, but lacked auditing and autoscaling.
+The first version of this crate was built for [Lens](https://lens.xyz) to handle millions of async events — ingestion, cross-chain migrations, backfills. It was a self-contained pubsub system including a bespoke message broker, and it worked, but lacked auditing and autoscaling.
 
 shove is the do-over. RabbitMQ handles storage and routing. shove handles the rest: type-safe topics, retry topologies, ordered delivery, consumer groups that scale themselves.
 
