@@ -1,0 +1,25 @@
+.github/workflows/ci.yml
+  bf94b9fb409ae938 15,27
+.github/workflows/publish.yml
+  bf94b9fb409ae938 26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.3",
+  "base_commit_sha": "676a3b0d06071a78027f5bb0c2d9718903538957",
+  "prompts": {
+    "bf94b9fb409ae938": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "50524dc8-fed0-4bc1-9ae8-3e86f24a6c93",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 3,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  }
+}
