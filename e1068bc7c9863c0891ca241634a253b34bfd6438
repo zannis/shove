@@ -1,0 +1,29 @@
+src/consumer.rs
+  b0fc60bf41119216 203-208
+src/backends/rabbitmq/headers.rs
+  b0fc60bf41119216 240-261
+tests/rabbitmq_integration.rs
+  b0fc60bf41119216 3638-3885
+src/backends/rabbitmq/client.rs
+  b0fc60bf41119216 144-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "e1068bc7c9863c0891ca241634a253b34bfd6438",
+  "prompts": {
+    "b0fc60bf41119216": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "159ae775-8c5a-41b8-9a57-5ca39b43e0fc",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 282,
+      "total_deletions": 0,
+      "accepted_lines": 282,
+      "overriden_lines": 0
+    }
+  }
+}
