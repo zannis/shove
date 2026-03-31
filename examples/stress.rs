@@ -123,7 +123,11 @@ fn build_scenarios(tier: &TierArg, handler: &HandlerArg) -> Vec<Scenario> {
         HandlerArg::Zero => vec![HandlerProfile::Zero],
         HandlerArg::Fast => vec![HandlerProfile::Fast],
         HandlerArg::Slow => vec![HandlerProfile::Slow],
-        HandlerArg::All => vec![HandlerProfile::Zero, HandlerProfile::Fast, HandlerProfile::Slow],
+        HandlerArg::All => vec![
+            HandlerProfile::Zero,
+            HandlerProfile::Fast,
+            HandlerProfile::Slow,
+        ],
     };
 
     let add = |scenarios: &mut Vec<Scenario>,
@@ -362,7 +366,7 @@ fn current_rss_bytes() -> u64 {
     #[cfg(target_os = "macos")]
     {
         use mach2::task::task_info;
-        use mach2::task_info::{task_flavor_t, MACH_TASK_BASIC_INFO, mach_task_basic_info};
+        use mach2::task_info::{MACH_TASK_BASIC_INFO, mach_task_basic_info, task_flavor_t};
         let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
         let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
         let kr = unsafe {
@@ -437,7 +441,7 @@ impl MemorySampler {
         if let Some(h) = self.handle.take() {
             let _ = h.await;
         }
-        
+
         self.peak_rss.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
     }
 }
@@ -644,7 +648,9 @@ async fn main() {
         std::collections::HashMap::new();
     for r in &results {
         let key = (r.tier.clone(), r.messages, r.handler.clone());
-        let entry = baseline_throughputs.entry(key).or_insert((r.consumers, r.throughput_msg_per_sec));
+        let entry = baseline_throughputs
+            .entry(key)
+            .or_insert((r.consumers, r.throughput_msg_per_sec));
         if r.consumers < entry.0 {
             *entry = (r.consumers, r.throughput_msg_per_sec);
         }
@@ -653,15 +659,13 @@ async fn main() {
     for result in &mut results {
         let key = (result.tier.clone(), result.messages, result.handler.clone());
         if let Some(&(_, baseline)) = baseline_throughputs.get(&key)
-            && baseline > 0.0 {
-                result.scaling_efficiency = result.throughput_msg_per_sec / baseline;
-            }
+            && baseline > 0.0
+        {
+            result.scaling_efficiency = result.throughput_msg_per_sec / baseline;
+        }
     }
 
-    let report = Report {
-        results,
-        failures,
-    };
+    let report = Report { results, failures };
 
     // Write JSON to file always.
     let json = serde_json::to_string_pretty(&report).unwrap();
