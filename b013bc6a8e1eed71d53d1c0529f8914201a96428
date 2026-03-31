@@ -1,0 +1,46 @@
+src/backends/rabbitmq/headers.rs
+  56c5fc5d7b5f1084 10-13,52,56,97-99,102-104
+Cargo.toml
+  83e8be756fe9e414 39,63-66
+src/backends/rabbitmq/registry.rs
+  56c5fc5d7b5f1084 48,56-60
+src/backends/rabbitmq/consumer.rs
+  56c5fc5d7b5f1084 2,6-12,29-54,56-73,75-105,127,130,166,190-191,201-202,207-208,211,228,232,264,268,294-296,306-307,372,382-383,498,501
+src/backends/rabbitmq/topology.rs
+  56c5fc5d7b5f1084 13-25,27-30,65,70,86,116
+src/backends/rabbitmq/publisher.rs
+  56c5fc5d7b5f1084 18-23,55,65,77-80,138,146,296
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "b013bc6a8e1eed71d53d1c0529f8914201a96428",
+  "prompts": {
+    "56c5fc5d7b5f1084": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a4e8138-595c-45a6-b406-7434810cf4a7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 212,
+      "total_deletions": 289,
+      "accepted_lines": 180,
+      "overriden_lines": 2
+    },
+    "83e8be756fe9e414": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1f752485-725e-4685-93c0-0cbf43dcb0d1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 494,
+      "total_deletions": 2,
+      "accepted_lines": 1656,
+      "overriden_lines": 5
+    }
+  }
+}
