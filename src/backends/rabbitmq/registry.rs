@@ -5,7 +5,7 @@ use tracing::{debug, info};
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 use crate::topology::TopologyDeclarer;
@@ -51,6 +51,12 @@ impl ConsumerGroupRegistry {
         let channel = self.client.create_channel().await?;
         let declarer = RabbitMqTopologyDeclarer::new(channel);
         declarer.declare(topology).await?;
+
+        if self.groups.contains_key(&name) {
+            return Err(ShoveError::Topology(format!(
+                "consumer group '{name}' is already registered"
+            )));
+        }
 
         info!(group = %name, queue = %queue, "registering consumer group");
         let group_token = self.client.shutdown_token().child_token();

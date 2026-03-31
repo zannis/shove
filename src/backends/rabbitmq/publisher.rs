@@ -309,7 +309,8 @@ impl ChannelPublisher {
             .with_content_type("application/json".into())
             .with_headers(headers);
 
-        self.channel
+        let confirm = self
+            .channel
             .basic_publish(
                 "".into(),
                 queue.into(),
@@ -318,7 +319,15 @@ impl ChannelPublisher {
                 props,
             )
             .await
+            .map_err(|e| ShoveError::Connection(e.to_string()))?
+            .await
             .map_err(|e| ShoveError::Connection(e.to_string()))?;
+
+        if confirm.is_nack() {
+            return Err(ShoveError::Connection(
+                "broker NACKed the published message".to_string(),
+            ));
+        }
 
         Ok(())
     }

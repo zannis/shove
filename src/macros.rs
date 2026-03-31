@@ -41,6 +41,7 @@ macro_rules! define_topic {
 /// define_sequenced_topic!(pub AccountLedger, LedgerEntry, |msg| msg.account_id.clone(),
 ///     TopologyBuilder::new("account-ledger")
 ///         .sequenced(SequenceFailure::FailAll)
+///         .hold_queue(Duration::from_secs(5))
 ///         .dlq()
 ///         .build()
 /// );
@@ -69,6 +70,8 @@ macro_rules! define_sequenced_topic {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::topology::{SequenceFailure, TopologyBuilder};
     use crate::{SequencedTopic, Topic};
 
@@ -151,6 +154,7 @@ mod tests {
         |msg| msg.account_id.clone(),
         TopologyBuilder::new("macro-seq")
             .sequenced(SequenceFailure::FailAll)
+            .hold_queue(Duration::from_secs(5))
             .dlq()
             .build()
     );

@@ -14,6 +14,9 @@ pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
     };
 
     match headers.inner().get(RETRY_COUNT_KEY) {
+        Some(AMQPValue::LongUInt(v)) => *v,
+        Some(AMQPValue::ShortUInt(v)) => u32::from(*v),
+        Some(AMQPValue::ShortShortUInt(v)) => u32::from(*v),
         Some(AMQPValue::LongLongInt(v)) => u32::try_from(*v).unwrap_or(0),
         Some(AMQPValue::LongInt(v)) => u32::try_from(*v).unwrap_or(0),
         Some(AMQPValue::ShortInt(v)) => u32::try_from(*v).unwrap_or(0),
@@ -208,6 +211,20 @@ mod tests {
         );
         let delivery = make_delivery(Some(table), 1, false);
         assert_eq!(get_retry_count(&delivery), 0);
+    }
+
+    /// Verifies that the type written by `clone_headers_with_retry` (LongUInt)
+    /// is correctly read back by `get_retry_count`.
+    #[test]
+    fn retry_count_round_trips_through_written_type() {
+        let retry_count: u32 = 5;
+        let mut table = FieldTable::default();
+        table.insert(
+            ShortString::from(RETRY_COUNT_KEY),
+            AMQPValue::LongUInt(retry_count),
+        );
+        let delivery = make_delivery(Some(table), 1, false);
+        assert_eq!(get_retry_count(&delivery), retry_count);
     }
 
     #[test]

@@ -27,11 +27,44 @@ impl HoldQueue {
 // SequenceFailure
 // ---------------------------------------------------------------------------
 
+/// Controls what happens to remaining messages in a sequence when one message
+/// fails permanently (exceeds max retries or returns [`Reject`](crate::Outcome::Reject)).
+///
+/// Both policies dead-letter the failed message itself. They differ in how
+/// they treat *subsequent* messages that share the same sequence key.
+///
+/// # Choosing a policy
+///
+/// - Use [`Skip`](Self::Skip) when messages are **independently valid** but
+///   happen to need ordered delivery (e.g. audit-log entries, analytics events).
+///   A single bad event should not block the rest of the stream.
+///
+/// - Use [`FailAll`](Self::FailAll) when messages are **causally dependent** —
+///   each message assumes every prior message in the sequence was processed
+///   successfully (e.g. financial ledger entries, state-machine transitions).
+///   Processing later messages after an earlier one failed would leave the
+///   system in an inconsistent state.
+///
+/// # Example
+///
+/// Given a sequence for key `ACC-A` with messages `[1, 2, 3, 4, 5]` where
+/// message 3 is permanently rejected:
+///
+/// | Policy   | DLQ'd messages | Ack'd messages |
+/// |----------|---------------|----------------|
+/// | `Skip`   | 3             | 1, 2, 4, 5    |
+/// | `FailAll`| 3, 4, 5       | 1, 2           |
+///
+/// Messages for *other* sequence keys (e.g. `ACC-B`) are unaffected by either
+/// policy — poisoning is scoped to the failing key only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceFailure {
-    /// Dead-letter the failed message, skip it, sequence continues.
+    /// Dead-letter the failed message, skip it, and continue processing
+    /// subsequent messages in the sequence as normal.
     Skip,
-    /// Dead-letter the failed message AND all remaining messages in the sequence.
+    /// Dead-letter the failed message and automatically dead-letter all
+    /// remaining messages for the same sequence key ("poison" the key).
+    /// The key stays poisoned for the lifetime of the consumer process.
     FailAll,
 }
 
@@ -39,6 +72,17 @@ pub enum SequenceFailure {
 // SequenceConfig
 // ---------------------------------------------------------------------------
 
+/// Configuration for sequenced (strictly ordered) delivery on a topic.
+///
+/// Created automatically by [`TopologyBuilder::sequenced`]. The config
+/// determines:
+///
+/// - **`on_failure`** — the [`SequenceFailure`] policy (`Skip` or `FailAll`).
+/// - **`routing_shards`** — how many sub-queues the consistent-hash exchange
+///   fans out to. More shards allow higher parallelism while preserving
+///   per-key ordering. Default: **8**.
+/// - **`exchange`** — the name of the consistent-hash exchange (derived from
+///   the queue name as `{queue}-seq-hash`).
 #[derive(Debug, Clone)]
 pub struct SequenceConfig {
     pub(crate) on_failure: SequenceFailure,
@@ -99,6 +143,7 @@ pub struct TopologyBuilder {
     dlq: bool,
     hold_queues: Vec<Duration>,
     sequencing: Option<SequenceConfig>,
+    allow_message_loss: bool,
 }
 
 impl TopologyBuilder {
@@ -108,11 +153,20 @@ impl TopologyBuilder {
             dlq: false,
             hold_queues: Vec::new(),
             sequencing: None,
+            allow_message_loss: false,
         }
     }
 
-    /// Enables sequencing with default 8 routing shards.
-    /// Pre-computes the exchange name as `{queue}-seq-hash`.
+    /// Enables strict per-key ordered delivery for this topic.
+    ///
+    /// Messages are routed through a consistent-hash exchange so that all
+    /// messages sharing the same sequence key land on the same sub-queue and
+    /// are processed in publish order.
+    ///
+    /// The `on_failure` policy determines what happens when a message is
+    /// permanently rejected — see [`SequenceFailure`] for details.
+    ///
+    /// Defaults to **8** routing shards (override with [`routing_shards`](Self::routing_shards)).
     pub fn sequenced(mut self, on_failure: SequenceFailure) -> Self {
         let exchange = format!("{}-seq-hash", self.queue);
         self.sequencing = Some(SequenceConfig {
@@ -146,14 +200,46 @@ impl TopologyBuilder {
         self
     }
 
+    /// Acknowledge that failed messages in this sequenced topic may be
+    /// permanently lost.
+    ///
+    /// By default, `build()` panics if a sequenced topic is missing a DLQ or
+    /// hold queues, because that means rejected messages are silently
+    /// discarded. Call this method to suppress those guards when message loss
+    /// is acceptable (e.g. ephemeral metrics, best-effort notifications).
+    ///
+    /// Has no effect on non-sequenced topics.
+    pub fn allow_message_loss(mut self) -> Self {
+        self.allow_message_loss = true;
+        self
+    }
+
     /// Builds the `QueueTopology`.
-    /// Panics if sequencing is enabled with `routing_shards = 0`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the configuration is invalid:
+    /// - Sequencing enabled with `routing_shards = 0`.
+    /// - Sequencing enabled without a DLQ (unless
+    ///   [`allow_message_loss`](Self::allow_message_loss) is set).
+    /// - Sequencing enabled without at least one hold queue (unless
+    ///   [`allow_message_loss`](Self::allow_message_loss) is set).
     pub fn build(self) -> QueueTopology {
         if let Some(ref seq) = self.sequencing {
             assert!(
                 seq.routing_shards > 0,
                 "routing_shards must be greater than 0 when sequencing is enabled"
             );
+            if !self.allow_message_loss {
+                assert!(
+                    self.dlq,
+                    "sequenced topics require a DLQ — call .dlq() or .allow_message_loss() before .build()"
+                );
+                assert!(
+                    !self.hold_queues.is_empty(),
+                    "sequenced topics require at least one hold queue — call .hold_queue() or .allow_message_loss() before .build()"
+                );
+            }
         }
 
         let dlq = if self.dlq {
@@ -250,6 +336,8 @@ mod tests {
     fn builder_sequenced_defaults() {
         let topology = TopologyBuilder::new("orders")
             .sequenced(SequenceFailure::Skip)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
             .build();
 
         let seq = topology.sequencing().expect("sequencing should be set");
@@ -263,6 +351,8 @@ mod tests {
         let topology = TopologyBuilder::new("orders")
             .sequenced(SequenceFailure::FailAll)
             .routing_shards(16)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
             .build();
 
         let seq = topology.sequencing().expect("sequencing should be set");
@@ -282,6 +372,8 @@ mod tests {
         let _ = TopologyBuilder::new("orders")
             .sequenced(SequenceFailure::Skip)
             .routing_shards(0)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
             .build();
     }
 
@@ -316,5 +408,56 @@ mod tests {
         assert_eq!(seq.on_failure(), SequenceFailure::FailAll);
         assert_eq!(seq.routing_shards(), 32);
         assert_eq!(seq.exchange(), "payments-seq-hash");
+    }
+
+    #[test]
+    #[should_panic(expected = "sequenced topics require a DLQ")]
+    fn builder_sequenced_without_dlq_panics() {
+        let _ = TopologyBuilder::new("orders")
+            .sequenced(SequenceFailure::Skip)
+            .hold_queue(Duration::from_secs(5))
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "sequenced topics require at least one hold queue")]
+    fn builder_sequenced_without_hold_queue_panics() {
+        let _ = TopologyBuilder::new("orders")
+            .sequenced(SequenceFailure::FailAll)
+            .dlq()
+            .build();
+    }
+
+    #[test]
+    fn builder_allow_message_loss_suppresses_dlq_guard() {
+        let topology = TopologyBuilder::new("ephemeral")
+            .sequenced(SequenceFailure::Skip)
+            .hold_queue(Duration::from_secs(5))
+            .allow_message_loss()
+            .build();
+        assert!(topology.dlq().is_none());
+        assert!(topology.sequencing().is_some());
+    }
+
+    #[test]
+    fn builder_allow_message_loss_suppresses_hold_queue_guard() {
+        let topology = TopologyBuilder::new("ephemeral")
+            .sequenced(SequenceFailure::FailAll)
+            .dlq()
+            .allow_message_loss()
+            .build();
+        assert!(topology.hold_queues().is_empty());
+        assert!(topology.sequencing().is_some());
+    }
+
+    #[test]
+    fn builder_allow_message_loss_suppresses_both_guards() {
+        let topology = TopologyBuilder::new("ephemeral")
+            .sequenced(SequenceFailure::Skip)
+            .allow_message_loss()
+            .build();
+        assert!(topology.dlq().is_none());
+        assert!(topology.hold_queues().is_empty());
+        assert!(topology.sequencing().is_some());
     }
 }

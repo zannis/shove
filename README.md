@@ -131,6 +131,23 @@ consumer
     .await?;
 ```
 
+### Sequence failure policies
+
+When a sequenced message fails permanently (exceeds max retries or returns `Outcome::Reject`), the failure policy controls what happens to the rest of the sequence:
+
+**`SequenceFailure::Skip`** — Dead-letter the failed message and continue processing subsequent messages for the same key. Use this when messages are independently valid but need ordered delivery (e.g. audit log entries, analytics events).
+
+**`SequenceFailure::FailAll`** — Dead-letter the failed message *and* automatically dead-letter all remaining messages for the same key. The key is "poisoned" for the lifetime of the consumer process. Use this when messages are causally dependent — processing later messages after an earlier failure would produce an inconsistent state (e.g. financial ledger entries, state-machine transitions).
+
+Messages for *other* sequence keys are unaffected by either policy.
+
+**Example:** given messages `[1, 2, 3, 4, 5]` for key `ACC-A` where message 3 is rejected:
+
+| Policy   | Ack'd   | DLQ'd     |
+|----------|---------|-----------|
+| `Skip`   | 1,2,4,5 | 3         |
+| `FailAll`| 1,2     | 3,4,5     |
+
 ## Topology configurations
 
 | Configuration | What it does |

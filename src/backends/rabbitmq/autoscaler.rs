@@ -353,8 +353,14 @@ mod tests {
         assert_eq!(scale_down_threshold, 5.0);
 
         // Exactly at threshold: ready == threshold does NOT trigger
-        assert_eq!(20.0_f64.partial_cmp(&scale_up_threshold), Some(std::cmp::Ordering::Equal));
-        assert_eq!(5.0_f64.partial_cmp(&scale_down_threshold), Some(std::cmp::Ordering::Equal));
+        assert_eq!(
+            20.0_f64.partial_cmp(&scale_up_threshold),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            5.0_f64.partial_cmp(&scale_down_threshold),
+            Some(std::cmp::Ordering::Equal)
+        );
     }
 
     #[test]
