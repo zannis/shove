@@ -240,10 +240,7 @@ mod tests {
     #[test]
     fn retry_count_short_uint() {
         let mut table = FieldTable::default();
-        table.insert(
-            ShortString::from(RETRY_COUNT_KEY),
-            AMQPValue::ShortUInt(12),
-        );
+        table.insert(ShortString::from(RETRY_COUNT_KEY), AMQPValue::ShortUInt(12));
         let delivery = make_delivery(Some(table), 1, false);
         assert_eq!(get_retry_count(&delivery), 12);
     }

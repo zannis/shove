@@ -3649,7 +3649,10 @@ async fn client_create_channel_fails_after_shutdown() {
     assert!(result.is_err(), "create_channel should fail after shutdown");
 
     let result = client.create_confirm_channel().await;
-    assert!(result.is_err(), "create_confirm_channel should fail after shutdown");
+    assert!(
+        result.is_err(),
+        "create_confirm_channel should fail after shutdown"
+    );
 
     broker.stop().await;
 }
@@ -3666,11 +3669,15 @@ async fn publisher_with_channel_count_publishes() {
     let declarer = RabbitMqTopologyDeclarer::new(channel);
     declarer.declare(SimpleWork::topology()).await.unwrap();
 
-    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2).await.unwrap();
+    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2)
+        .await
+        .unwrap();
 
     for i in 0..6 {
         publisher
-            .publish::<SimpleWork>(&SimpleMessage { body: format!("pool-{i}") })
+            .publish::<SimpleWork>(&SimpleMessage {
+                body: format!("pool-{i}"),
+            })
             .await
             .unwrap();
     }
@@ -3706,9 +3713,13 @@ async fn publisher_with_zero_channels_clamps_to_one() {
     let declarer = RabbitMqTopologyDeclarer::new(channel);
     declarer.declare(SimpleWork::topology()).await.unwrap();
 
-    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 0).await.unwrap();
+    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 0)
+        .await
+        .unwrap();
     publisher
-        .publish::<SimpleWork>(&SimpleMessage { body: "clamped".into() })
+        .publish::<SimpleWork>(&SimpleMessage {
+            body: "clamped".into(),
+        })
         .await
         .unwrap();
 
@@ -3744,14 +3755,19 @@ async fn sequenced_batch_publish_with_pool() {
     let declarer = RabbitMqTopologyDeclarer::new(channel);
     declarer.declare(OrderTopic::topology()).await.unwrap();
 
-    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2).await.unwrap();
+    let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2)
+        .await
+        .unwrap();
     let messages: Vec<OrderMessage> = (0..20)
         .map(|i| OrderMessage {
             account: format!("ACC-BATCH-{}", i % 5),
             seq: i,
         })
         .collect();
-    publisher.publish_batch::<OrderTopic>(&messages).await.unwrap();
+    publisher
+        .publish_batch::<OrderTopic>(&messages)
+        .await
+        .unwrap();
 
     let handler = CountingHandler::new();
     let shutdown = CancellationToken::new();
@@ -3799,7 +3815,9 @@ async fn registry_concurrent_processing_consumes_messages() {
     let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
     for i in 0..5 {
         publisher
-            .publish::<SimpleWork>(&SimpleMessage { body: format!("conc-group-{i}") })
+            .publish::<SimpleWork>(&SimpleMessage {
+                body: format!("conc-group-{i}"),
+            })
             .await
             .unwrap();
     }
@@ -3870,7 +3888,9 @@ async fn registry_concurrent_with_timeout_processes_messages() {
     let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
     for i in 0..3 {
         publisher
-            .publish::<SimpleWork>(&SimpleMessage { body: format!("timeout-group-{i}") })
+            .publish::<SimpleWork>(&SimpleMessage {
+                body: format!("timeout-group-{i}"),
+            })
             .await
             .unwrap();
     }
