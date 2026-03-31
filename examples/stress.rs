@@ -109,15 +109,47 @@ struct Scenario {
     deadline: Duration,
 }
 
+/// Per-tier configuration with handler-specific message counts.
+struct TierConfig {
+    name: &'static str,
+    consumers: &'static [u16],
+    /// Message counts per handler: (zero, fast, slow).
+    messages: (u64, u64, u64),
+}
+
+const MODERATE: TierConfig = TierConfig {
+    name: "moderate",
+    consumers: &[1, 4, 8, 16, 32],
+    messages: (50_000, 10_000, 500),
+};
+
+const HIGH: TierConfig = TierConfig {
+    name: "high",
+    consumers: &[8, 16, 32, 64],
+    messages: (500_000, 100_000, 5_000),
+};
+
+const EXTREME: TierConfig = TierConfig {
+    name: "extreme",
+    consumers: &[32, 64, 128, 256],
+    messages: (1_000_000, 500_000, 25_000),
+};
+
+/// Compute a deadline from the expected runtime with 2x headroom, clamped to [30s, 5min].
+fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> Duration {
+    let expected_ms = match handler {
+        // Zero handler is broker-bound at ~40k msg/s regardless of consumer count.
+        HandlerProfile::Zero => messages as f64 / 40.0, // 40k msg/s = 40 msg/ms
+        // Handler-bound: scales with consumers.
+        HandlerProfile::Fast => (messages as f64 * 3.0) / consumers as f64,
+        HandlerProfile::Slow => (messages as f64 * 175.0) / consumers as f64,
+    };
+    let deadline_ms = (expected_ms * 2.0).clamp(30_000.0, 300_000.0);
+    Duration::from_millis(deadline_ms as u64)
+}
+
 fn build_scenarios(tier: &TierArg, handler: &HandlerArg) -> Vec<Scenario> {
     let mut scenarios = Vec::new();
-
-    let moderate_msgs = [10_000u64];
-    let moderate_consumers = [1u16, 4, 8, 16, 32];
-    let high_msgs = [100_000u64];
-    let high_consumers = [8u16, 16, 32, 64];
-    let extreme_msgs = [1_000_000u64];
-    let extreme_consumers = [32u16, 64, 128, 256];
 
     let handlers: Vec<HandlerProfile> = match handler {
         HandlerArg::Zero => vec![HandlerProfile::Zero],
@@ -130,52 +162,30 @@ fn build_scenarios(tier: &TierArg, handler: &HandlerArg) -> Vec<Scenario> {
         ],
     };
 
-    let add = |scenarios: &mut Vec<Scenario>,
-               tier_name: &'static str,
-               msgs: &[u64],
-               consumers: &[u16],
-               deadline: Duration| {
-        for &m in msgs {
-            for &h in &handlers {
-                for &c in consumers {
-                    scenarios.push(Scenario {
-                        tier: tier_name,
-                        messages: m,
-                        consumers: c,
-                        handler: h,
-                        deadline,
-                    });
-                }
-            }
-        }
+    let tiers: Vec<&TierConfig> = match tier {
+        TierArg::Moderate => vec![&MODERATE],
+        TierArg::High => vec![&HIGH],
+        TierArg::Extreme => vec![&EXTREME],
+        TierArg::All => vec![&MODERATE, &HIGH, &EXTREME],
     };
 
-    if matches!(tier, TierArg::Moderate | TierArg::All) {
-        add(
-            &mut scenarios,
-            "moderate",
-            &moderate_msgs,
-            &moderate_consumers,
-            Duration::from_secs(120),
-        );
-    }
-    if matches!(tier, TierArg::High | TierArg::All) {
-        add(
-            &mut scenarios,
-            "high",
-            &high_msgs,
-            &high_consumers,
-            Duration::from_secs(600),
-        );
-    }
-    if matches!(tier, TierArg::Extreme | TierArg::All) {
-        add(
-            &mut scenarios,
-            "extreme",
-            &extreme_msgs,
-            &extreme_consumers,
-            Duration::from_secs(1800),
-        );
+    for tier_cfg in &tiers {
+        for &h in &handlers {
+            let messages = match h {
+                HandlerProfile::Zero => tier_cfg.messages.0,
+                HandlerProfile::Fast => tier_cfg.messages.1,
+                HandlerProfile::Slow => tier_cfg.messages.2,
+            };
+            for &c in tier_cfg.consumers {
+                scenarios.push(Scenario {
+                    tier: tier_cfg.name,
+                    messages,
+                    consumers: c,
+                    handler: h,
+                    deadline: scenario_deadline(messages, c, h),
+                });
+            }
+        }
     }
 
     scenarios
@@ -195,6 +205,7 @@ struct ScenarioResult {
     latency_p99_ms: f64,
     scaling_efficiency: f64,
     peak_rss_mb: f64,
+    cpu_pct: f64,
     duration_secs: f64,
 }
 
@@ -360,7 +371,50 @@ impl LatencyRecorder {
     }
 }
 
-// ── Memory sampling ─────────────────────────────────────────────────────────
+// ── Resource sampling ────────────────────────────────────────────────────────
+
+fn current_cpu_secs() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        use mach2::task::task_info;
+        use mach2::task_info::{MACH_TASK_BASIC_INFO, mach_task_basic_info, task_flavor_t};
+        let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
+        let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
+        let kr = unsafe {
+            task_info(
+                mach2::traps::mach_task_self(),
+                MACH_TASK_BASIC_INFO as task_flavor_t,
+                &mut info as *mut _ as *mut i32,
+                &mut count,
+            )
+        };
+        if kr == 0 {
+            let user = info.user_time.seconds as f64 + info.user_time.microseconds as f64 / 1_000_000.0;
+            let system = info.system_time.seconds as f64 + info.system_time.microseconds as f64 / 1_000_000.0;
+            user + system
+        } else {
+            0.0
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/self/stat") {
+            let fields: Vec<&str> = content.split_whitespace().collect();
+            // fields[13] = utime, fields[14] = stime (in clock ticks)
+            if fields.len() > 14 {
+                let ticks_per_sec = 100.0; // sysconf(_SC_CLK_TCK) is typically 100
+                let utime = fields[13].parse::<f64>().unwrap_or(0.0);
+                let stime = fields[14].parse::<f64>().unwrap_or(0.0);
+                return (utime + stime) / ticks_per_sec;
+            }
+        }
+        0.0
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0.0
+    }
+}
 
 fn current_rss_bytes() -> u64 {
     #[cfg(target_os = "macos")]
@@ -400,14 +454,24 @@ fn current_rss_bytes() -> u64 {
     }
 }
 
-struct MemorySampler {
+struct ResourceSnapshot {
+    peak_rss_mb: f64,
+    cpu_pct: f64,
+}
+
+struct ResourceSampler {
     peak_rss: Arc<AtomicU64>,
+    baseline_rss: f64,
+    baseline_cpu: f64,
+    start: Instant,
     cancel: tokio_util::sync::CancellationToken,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl MemorySampler {
+impl ResourceSampler {
     fn start() -> Self {
+        let baseline_rss = current_rss_bytes() as f64 / (1024.0 * 1024.0);
+        let baseline_cpu = current_cpu_secs();
         let peak_rss = Arc::new(AtomicU64::new(current_rss_bytes()));
         let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -427,22 +491,28 @@ impl MemorySampler {
 
         Self {
             peak_rss,
+            baseline_rss,
+            baseline_cpu,
+            start: Instant::now(),
             cancel,
             handle: Some(handle),
         }
     }
 
-    fn baseline_mb(&self) -> f64 {
-        current_rss_bytes() as f64 / (1024.0 * 1024.0)
-    }
-
-    async fn stop(mut self) -> f64 {
+    async fn stop(mut self) -> ResourceSnapshot {
         self.cancel.cancel();
         if let Some(h) = self.handle.take() {
             let _ = h.await;
         }
 
-        self.peak_rss.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
+        let peak_rss_mb = self.peak_rss.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+        let rss_delta = (peak_rss_mb - self.baseline_rss).max(0.0);
+
+        let wall_secs = self.start.elapsed().as_secs_f64();
+        let cpu_delta = current_cpu_secs() - self.baseline_cpu;
+        let cpu_pct = if wall_secs > 0.0 { (cpu_delta / wall_secs) * 100.0 } else { 0.0 };
+
+        ResourceSnapshot { peak_rss_mb: rss_delta, cpu_pct }
     }
 }
 
@@ -490,8 +560,8 @@ async fn run_scenario(
     broker: &Broker,
     scenario: &Scenario,
     cancel: &CancellationToken,
-) -> Result<(f64, f64, f64, f64, f64, f64), String> {
-    // Returns: (throughput, p50, p95, p99, peak_rss_mb, duration_secs)
+) -> Result<(f64, f64, f64, f64, f64, f64, f64), String> {
+    // Returns: (throughput, p50, p95, p99, peak_rss_mb, cpu_pct, duration_secs)
     broker.purge_queue().await;
 
     let epoch = Instant::now();
@@ -510,9 +580,8 @@ async fn run_scenario(
         .collect();
     broker.publish_batch(&messages).await;
 
-    // Start memory sampler.
-    let sampler = MemorySampler::start();
-    let baseline_mb = sampler.baseline_mb();
+    // Start resource sampler.
+    let sampler = ResourceSampler::start();
 
     // Start consumer group.
     let mut registry = ConsumerGroupRegistry::new(broker.client.clone());
@@ -564,12 +633,11 @@ async fn run_scenario(
     let duration = start.elapsed();
     let throughput = scenario.messages as f64 / duration.as_secs_f64();
     let (p50, p95, p99) = recorder.compute_percentiles().await;
-    let peak_rss_mb = sampler.stop().await;
-    let rss_delta = (peak_rss_mb - baseline_mb).max(0.0);
+    let resources = sampler.stop().await;
 
     registry.shutdown_all().await;
 
-    Ok((throughput, p50, p95, p99, rss_delta, duration.as_secs_f64()))
+    Ok((throughput, p50, p95, p99, resources.peak_rss_mb, resources.cpu_pct, duration.as_secs_f64()))
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -611,10 +679,10 @@ async fn main() {
         );
 
         match run_scenario(&broker, scenario, &cancel).await {
-            Ok((throughput, p50, p95, p99, peak_rss_mb, duration_secs)) => {
+            Ok((throughput, p50, p95, p99, peak_rss_mb, cpu_pct, duration_secs)) => {
                 eprintln!(
-                    "  -> {:.0} msg/s | p50={:.1}ms p95={:.1}ms p99={:.1}ms | {:.1}s",
-                    throughput, p50, p95, p99, duration_secs
+                    "  -> {:.0} msg/s | p50={:.1}ms p95={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
+                    throughput, p50, p95, p99, cpu_pct, peak_rss_mb, duration_secs
                 );
                 results.push(ScenarioResult {
                     tier: scenario.tier.to_string(),
@@ -627,6 +695,7 @@ async fn main() {
                     latency_p99_ms: p99,
                     scaling_efficiency: 0.0, // computed below
                     peak_rss_mb,
+                    cpu_pct,
                     duration_secs,
                 });
             }
@@ -688,13 +757,13 @@ async fn main() {
 fn print_table(report: &Report) {
     eprintln!();
     eprintln!(
-        "{:<10} {:>8} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8} {:>7} {:>8}",
-        "TIER", "MSGS", "CONSUMERS", "HANDLER", "MSGS/SEC", "p50", "p95", "p99", "SCALE", "RSS(MB)"
+        "{:<10} {:>8} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8} {:>7} {:>8} {:>6}",
+        "TIER", "MSGS", "CONSUMERS", "HANDLER", "MSGS/SEC", "p50", "p95", "p99", "SCALE", "RSS(MB)", "CPU%"
     );
-    eprintln!("{}", "-".repeat(96));
+    eprintln!("{}", "-".repeat(103));
     for r in &report.results {
         eprintln!(
-            "{:<10} {:>8} {:>10} {:>8} {:>10.0} {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>6.1}x {:>8.1}",
+            "{:<10} {:>8} {:>10} {:>8} {:>10.0} {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>6.1}x {:>8.1} {:>5.0}%",
             r.tier,
             r.messages,
             r.consumers,
@@ -705,6 +774,7 @@ fn print_table(report: &Report) {
             r.latency_p99_ms,
             r.scaling_efficiency,
             r.peak_rss_mb,
+            r.cpu_pct,
         );
     }
     if !report.failures.is_empty() {
