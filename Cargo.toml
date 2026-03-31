@@ -47,11 +47,6 @@ harness = false
 required-features = ["rabbitmq"]
 
 [[bench]]
-name = "stress"
-harness = false
-required-features = ["rabbitmq"]
-
-[[bench]]
 name = "consumer_overhead"
 harness = false
 required-features = ["rabbitmq"]
@@ -74,4 +69,8 @@ required-features = ["rabbitmq", "audit"]
 
 [[example]]
 name = "concurrent_pubsub"
+required-features = ["rabbitmq"]
+
+[[example]]
+name = "stress"
 required-features = ["rabbitmq"]
