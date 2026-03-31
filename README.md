@@ -10,7 +10,7 @@ Topic-typed pub/sub for Rust.
 
 **shove** is an async message publishing and consuming library that binds message types to their broker destinations at compile time. Define a topic once — the type system ensures publishers and consumers agree on message shape, queue names, retry policy, and ordering guarantees.
 
-> **Warning:** shove is under active development and is not considered production-ready. The API is subject to breaking changes and comes with no guarantees of stability, correctness, or backwards compatibility.
+> ⚠️ **Warning:** shove is under active development and is not considered production-ready. The API is subject to breaking changes and comes with no guarantees of stability, correctness, or backwards compatibility. 🚧
 
 ## Background
 
