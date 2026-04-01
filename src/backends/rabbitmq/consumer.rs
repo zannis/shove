@@ -132,24 +132,6 @@ impl RabbitMqConsumer {
         Self { client }
     }
 
-    async fn run_internal<T, H>(
-        &self,
-        handler: &H,
-        queue: &str,
-        topology: &'static QueueTopology,
-        options: ConsumerOptions,
-    ) -> Result<()>
-    where
-        T: Topic,
-        T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T>,
-    {
-        run_with_reconnect(&options.shutdown, queue, || {
-            self.consume_loop::<T, H>(handler, queue, topology, &options)
-        })
-        .await
-    }
-
     /// Runs the concurrent-sequenced consumer loop with reconnect handling.
     /// Processes multiple keys concurrently within a single shard, using local
     /// buffering for messages that arrive while their key is busy.
@@ -838,82 +820,6 @@ impl RabbitMqConsumer {
             }
         }
     }
-
-    async fn consume_loop<T, H>(
-        &self,
-        handler: &H,
-        queue: &str,
-        topology: &'static QueueTopology,
-        options: &ConsumerOptions,
-    ) -> Result<()>
-    where
-        T: Topic,
-        T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T>,
-    {
-        let (channel, mut stream) =
-            open_consumer(&self.client, queue, options.prefetch_count).await?;
-        let publisher = ChannelPublisher::new(channel);
-
-        info!("consumer started on queue {queue}");
-
-        loop {
-            tokio::select! {
-                _ = options.shutdown.cancelled() => {
-                    debug!("shutdown signal received, stopping consumer on {queue}");
-                    return Ok(());
-                }
-                item = stream.next() => {
-                    let delivery = unwrap_delivery(item, queue)?;
-
-                    let retry_count = get_retry_count(&delivery);
-
-                    if retry_count >= options.max_retries {
-                        warn!(
-                            "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
-                            retry_count, options.max_retries
-                        );
-                        router::route_reject(&delivery).await;
-                        continue;
-                    }
-
-                    let metadata = extract_message_metadata(&delivery);
-                    let outcome = match serde_json::from_slice::<T::Message>(&delivery.data) {
-                        Err(err) => {
-                            error!(
-                                error = %err,
-                                delivery_id = %metadata.delivery_id,
-                                "Failed to deserialize message from main queue"
-                            );
-                            Outcome::Reject
-                        }
-                        Ok(message) => {
-                            options.processing.store(true, Ordering::Relaxed);
-                            let outcome = invoke_handler(handler.handle(message, metadata), options.handler_timeout).await;
-                            debug!(queue, ?outcome, retry_count, "message handled");
-                            outcome
-                        }
-                    };
-
-                    match outcome {
-                        Outcome::Ack => {
-                            router::route_ack(&delivery).await;
-                        }
-                        Outcome::Retry => {
-                            router::route_retry(&delivery, topology, &publisher, retry_count).await;
-                        }
-                        Outcome::Reject => {
-                            router::route_reject(&delivery).await;
-                        }
-                        Outcome::Defer => {
-                            router::route_defer(&delivery, topology, &publisher).await;
-                        }
-                    }
-                    options.processing.store(false, Ordering::Relaxed);
-                }
-            }
-        }
-    }
 }
 
 /// Consume a DLQ, deserializing each message inline and calling `handler.handle_dead`.
@@ -1134,21 +1040,6 @@ where
 }
 
 impl Consumer for RabbitMqConsumer {
-    fn run<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T>,
-        options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
-        let client = self.client.clone();
-        async move {
-            let topology = T::topology();
-            let consumer = RabbitMqConsumer::new(client);
-            consumer
-                .run_internal::<T, _>(&handler, topology.queue(), topology, options)
-                .await
-        }
-    }
-
     fn run_concurrent<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
