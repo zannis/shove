@@ -134,7 +134,7 @@ struct TierConfig {
 const MODERATE: TierConfig = TierConfig {
     name: "moderate",
     consumers: &[1, 4, 8, 16, 32],
-    messages: (50_000, 10_000, 500, 200),
+    messages: (50_000, 20_000, 5_000, 1_000),
 };
 
 const HIGH: TierConfig = TierConfig {
@@ -778,9 +778,13 @@ async fn main() {
                 eprintln!(
                     "  -> {:.1} msg/s | dispatch p50={:.1}ms p99={:.1}ms | e2e p50={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
                     m.throughput,
-                    m.latencies.dispatch_p50, m.latencies.dispatch_p99,
-                    m.latencies.e2e_p50, m.latencies.e2e_p99,
-                    m.cpu_pct, m.peak_rss_mb, m.duration_secs
+                    m.latencies.dispatch_p50,
+                    m.latencies.dispatch_p99,
+                    m.latencies.e2e_p50,
+                    m.latencies.e2e_p99,
+                    m.cpu_pct,
+                    m.peak_rss_mb,
+                    m.duration_secs
                 );
                 results.push(ScenarioResult {
                     tier: scenario.tier.to_string(),
@@ -855,10 +859,20 @@ fn print_table(report: &Report) {
     println!();
     println!(
         "{:<10} {:>8} {:>5} {:>8} {:>8}  {:>9} {:>9} {:>9}  {:>9} {:>9} {:>9}  {:>6} {:>7} {:>5}",
-        "TIER", "MSGS", "C", "HANDLER", "MSG/SEC",
-        "disp p50", "disp p95", "disp p99",
-        "e2e p50", "e2e p95", "e2e p99",
-        "SCALE", "RSS(MB)", "CPU%"
+        "TIER",
+        "MSGS",
+        "C",
+        "HANDLER",
+        "MSG/SEC",
+        "disp p50",
+        "disp p95",
+        "disp p99",
+        "e2e p50",
+        "e2e p95",
+        "e2e p99",
+        "SCALE",
+        "RSS(MB)",
+        "CPU%"
     );
     println!("{}", "-".repeat(145));
     for r in &report.results {
