@@ -66,8 +66,7 @@ struct Rabbit {
     client: RabbitMqClient,
     publisher: RabbitMqPublisher,
     mgmt_url: String,
-    // Container is kept alive by this handle; dropped on Rabbit drop.
-    _container: testcontainers::ContainerAsync<RabbitMq>,
+    container: Option<testcontainers::ContainerAsync<RabbitMq>>,
 }
 
 impl Rabbit {
@@ -95,7 +94,7 @@ impl Rabbit {
             client,
             publisher,
             mgmt_url: format!("http://{host}:{mgmt_port}"),
-            _container: container,
+            container: Some(container),
         }
     }
 
@@ -122,6 +121,12 @@ impl Rabbit {
 
     fn new_registry(&self) -> ConsumerGroupRegistry {
         ConsumerGroupRegistry::new(self.client.clone())
+    }
+
+    /// Shut down the client and drop the container inside the runtime.
+    async fn shutdown(mut self) {
+        self.client.shutdown().await;
+        drop(self.container.take());
     }
 }
 
@@ -194,7 +199,7 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
         });
     });
 
-    rt.block_on(async { rabbit.client.shutdown().await });
+    rt.block_on(rabbit.shutdown());
     g.finish();
 }
 
@@ -253,7 +258,7 @@ fn bench_throughput(c: &mut Criterion) {
         });
     }
 
-    rt.block_on(async { rabbit.client.shutdown().await });
+    rt.block_on(rabbit.shutdown());
     g.finish();
 }
 
@@ -335,7 +340,7 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
         });
     }
 
-    rt.block_on(async { rabbit.client.shutdown().await });
+    rt.block_on(rabbit.shutdown());
     g.finish();
 }
 
