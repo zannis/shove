@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::time::Duration;
 
 use tracing::debug;
 
@@ -59,10 +60,12 @@ pub struct ManagementClient {
 
 impl ManagementClient {
     pub fn new(config: ManagementConfig) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            config,
-        }
+        let http = reqwest::ClientBuilder::new()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client");
+        Self { http, config }
     }
 }
 
