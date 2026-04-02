@@ -221,10 +221,11 @@ impl Broker {
                 .send()
                 .await
                 && let Ok(body) = resp.json::<serde_json::Value>().await
-                    && let Some(count) = body["consumers"].as_u64()
-                        && count >= expected as u64 {
-                            return Ok(());
-                        }
+                && let Some(count) = body["consumers"].as_u64()
+                && count >= expected as u64
+            {
+                return Ok(());
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
                     "timeout waiting for {expected} consumers to register"
