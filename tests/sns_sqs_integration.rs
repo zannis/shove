@@ -29,6 +29,15 @@ struct TestBroker {
 
 impl TestBroker {
     async fn start() -> Self {
+        // LocalStack accepts any non-empty credentials; set them so the AWS SDK
+        // credential chain succeeds without requiring real environment variables.
+        // SAFETY: tests run single-threaded (--test-threads=1) so mutating the
+        // environment does not cause data races.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        }
+
         let container = LocalStack::default()
             .start()
             .await
@@ -104,7 +113,7 @@ impl TestBroker {
 
 struct TestSetup {
     #[allow(dead_code)]
-    broker: TestBroker,
+    broker: Option<TestBroker>,
     #[allow(dead_code)]
     sns_client: SnsClient,
     topic_registry: Arc<TopicRegistry>,
@@ -114,7 +123,8 @@ struct TestSetup {
 }
 
 impl TestSetup {
-    async fn new() -> Self {
+    /// Create a fully wired setup with its own internal broker.
+    async fn create() -> Self {
         let broker = TestBroker::start().await;
         let sns_client = SnsClient::new(&broker.sns_config())
             .await
@@ -127,7 +137,30 @@ impl TestSetup {
         let consumer = SqsConsumer::new(sns_client.clone(), queue_registry.clone());
 
         Self {
-            broker,
+            broker: Some(broker),
+            sns_client,
+            topic_registry,
+            queue_registry,
+            publisher,
+            consumer,
+        }
+    }
+
+    /// Create a fully wired setup sharing an existing broker.
+    /// The caller's `broker` must outlive this setup.
+    async fn new(broker: &TestBroker) -> Self {
+        let sns_client = SnsClient::new(&broker.sns_config())
+            .await
+            .expect("failed to create SNS client");
+
+        let topic_registry = Arc::new(TopicRegistry::new());
+        let queue_registry = Arc::new(QueueRegistry::new());
+
+        let publisher = SnsPublisher::new(sns_client.clone(), topic_registry.clone());
+        let consumer = SqsConsumer::new(sns_client.clone(), queue_registry.clone());
+
+        Self {
+            broker: None,
             sns_client,
             topic_registry,
             queue_registry,
@@ -140,6 +173,14 @@ impl TestSetup {
     fn declarer(&self) -> SnsTopologyDeclarer {
         SnsTopologyDeclarer::new(self.sns_client.clone(), self.topic_registry.clone())
             .with_queue_registry(self.queue_registry.clone())
+    }
+
+    /// Declare the full topology for topic `T`.
+    async fn declare<T: shove::Topic>(&self) {
+        self.declarer()
+            .declare(T::topology())
+            .await
+            .expect("topology declaration should succeed");
     }
 }
 
@@ -536,4 +577,121 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Client lifecycle
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_connect_and_shutdown() {
+    let broker = TestBroker::start().await;
+    let client = SnsClient::new(&broker.sns_config())
+        .await
+        .expect("client should connect");
+
+    assert!(
+        !client.shutdown_token().is_cancelled(),
+        "shutdown token should not be cancelled before shutdown"
+    );
+
+    client.shutdown().await;
+
+    assert!(
+        client.shutdown_token().is_cancelled(),
+        "shutdown token should be cancelled after shutdown"
+    );
+}
+
+#[tokio::test]
+async fn client_shutdown_cancels_token() {
+    let broker = TestBroker::start().await;
+    let client = SnsClient::new(&broker.sns_config())
+        .await
+        .expect("client should connect");
+
+    let token = client.shutdown_token();
+    assert!(!token.is_cancelled());
+
+    client.shutdown().await;
+    assert!(token.is_cancelled());
+}
+
+// ---------------------------------------------------------------------------
+// Topology declaration (with SQS queues)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn topology_declares_standard_queue_and_dlq() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let main_url = setup
+        .queue_registry
+        .get("sqs-work")
+        .await
+        .expect("main queue URL should be registered");
+    assert!(!main_url.is_empty());
+
+    let dlq_url = setup
+        .queue_registry
+        .get("sqs-work-dlq")
+        .await
+        .expect("DLQ URL should be registered");
+    assert!(!dlq_url.is_empty());
+
+    let arn = setup
+        .topic_registry
+        .get("sqs-work")
+        .await
+        .expect("topic ARN should be registered");
+    assert!(arn.contains("sqs-work"));
+}
+
+#[tokio::test]
+async fn topology_declares_fifo_shard_queues() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    let arn = setup
+        .topic_registry
+        .get("sqs-seq-skip")
+        .await
+        .expect("FIFO topic ARN should be registered");
+    assert!(arn.contains("sqs-seq-skip.fifo"));
+
+    for i in 0..2 {
+        let shard_name = format!("sqs-seq-skip-seq-{i}");
+        let url = setup
+            .queue_registry
+            .get(&shard_name)
+            .await
+            .unwrap_or_else(|| panic!("shard queue '{shard_name}' should be registered"));
+        assert!(!url.is_empty());
+    }
+
+    let dlq_url = setup
+        .queue_registry
+        .get("sqs-seq-skip-dlq")
+        .await
+        .expect("DLQ for sequenced topic should be registered");
+    assert!(!dlq_url.is_empty());
+}
+
+#[tokio::test]
+async fn topology_idempotent_with_queues() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+
+    setup.declare::<WorkTopic>().await;
+    setup.declare::<WorkTopic>().await;
+
+    let url = setup
+        .queue_registry
+        .get("sqs-work")
+        .await
+        .expect("queue should still be registered");
+    assert!(!url.is_empty());
 }

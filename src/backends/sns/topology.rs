@@ -330,7 +330,11 @@ impl SnsTopologyDeclarer {
 
         // Create DLQ first if requested
         let dlq_arn = if let Some(dlq_name) = topology.dlq() {
-            let (_, arn) = self.create_sqs_queue(dlq_name, false, None, 0).await?;
+            let (dlq_url, arn) = self.create_sqs_queue(dlq_name, false, None, 0).await?;
+            // Register the DLQ URL
+            if let Some(ref reg) = self.queue_registry {
+                reg.insert(dlq_name.to_string(), dlq_url).await;
+            }
             Some(arn)
         } else {
             None
@@ -350,7 +354,7 @@ impl SnsTopologyDeclarer {
         self.subscribe_sqs_to_sns(topic_arn, &arn, &url, None)
             .await?;
 
-        // Register the queue URL
+        // Register the main queue URL
         if let Some(ref reg) = self.queue_registry {
             reg.insert(queue_name.to_string(), url).await;
         }
@@ -367,15 +371,27 @@ impl SnsTopologyDeclarer {
             .map(|s| s.routing_shards())
             .unwrap_or(8);
 
-        // Create FIFO DLQ
-        let dlq_name = format!("{queue_name}-dlq.fifo");
-        let (_, dlq_arn) = self.create_sqs_queue(&dlq_name, true, None, 0).await?;
+        // Derive the DLQ registry key (without .fifo suffix for registry lookups)
+        let dlq_registry_key = topology
+            .dlq()
+            .unwrap_or(&format!("{queue_name}-dlq"))
+            .to_string();
+
+        // Create FIFO DLQ (actual AWS name must have .fifo suffix)
+        let dlq_aws_name = format!("{dlq_registry_key}.fifo");
+        let (dlq_url, dlq_arn) = self.create_sqs_queue(&dlq_aws_name, true, None, 0).await?;
+
+        // Register DLQ URL using the key without .fifo
+        if let Some(ref reg) = self.queue_registry {
+            reg.insert(dlq_registry_key, dlq_url).await;
+        }
 
         // Create N FIFO shard queues
         for i in 0..shards {
-            let shard_name = format!("{queue_name}-seq-{i}.fifo");
+            let shard_registry_key = format!("{queue_name}-seq-{i}");
+            let shard_aws_name = format!("{shard_registry_key}.fifo");
             let (url, arn) = self
-                .create_sqs_queue(&shard_name, true, Some(&dlq_arn), DEFAULT_MAX_RECEIVE_COUNT)
+                .create_sqs_queue(&shard_aws_name, true, Some(&dlq_arn), DEFAULT_MAX_RECEIVE_COUNT)
                 .await?;
 
             // Filter policy: only receive messages for this shard
@@ -385,7 +401,7 @@ impl SnsTopologyDeclarer {
                 .await?;
 
             if let Some(ref reg) = self.queue_registry {
-                reg.insert(shard_name, url).await;
+                reg.insert(shard_registry_key, url).await;
             }
         }
 
