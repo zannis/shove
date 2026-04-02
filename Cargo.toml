@@ -85,3 +85,7 @@ required-features = ["rabbitmq"]
 [[test]]
 name = "sns_integration"
 required-features = ["pub-aws-sns"]
+
+[[test]]
+name = "sns_sqs_integration"
+required-features = ["aws-sns-sqs"]
