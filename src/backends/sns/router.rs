@@ -90,6 +90,10 @@ pub(crate) async fn route_defer(
     topology: &QueueTopology,
 ) {
     let delay = if topology.hold_queues().is_empty() {
+        warn!(
+            queue_url,
+            "deferring message but no hold queues configured — visibility timeout set to 0"
+        );
         Duration::ZERO
     } else {
         topology.hold_queues()[0].delay()

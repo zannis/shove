@@ -89,9 +89,9 @@ pub(crate) async fn route_defer(
             }
         }
     } else {
-        debug!(
-            "Defer outcome on queue {} but no hold queues configured, requeuing via nack",
-            topology.queue()
+        warn!(
+            queue = topology.queue(),
+            "deferring message but no hold queues configured — requeuing with no delay"
         );
         nack_requeue(delivery).await;
     }

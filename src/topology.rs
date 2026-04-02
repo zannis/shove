@@ -278,6 +278,22 @@ impl TopologyBuilder {
             }
         }
 
+        // Warn about non-sequenced topics with incomplete retry infrastructure.
+        if self.sequencing.is_none() && !self.allow_message_loss {
+            if !self.hold_queues.is_empty() && !self.dlq {
+                tracing::warn!(
+                    queue = self.queue,
+                    "topic has hold queues but no DLQ — messages exhausting max_retries will be silently discarded"
+                );
+            }
+            if self.dlq && self.hold_queues.is_empty() {
+                tracing::warn!(
+                    queue = self.queue,
+                    "topic has a DLQ but no hold queues — retries will use broker redelivery with no delay"
+                );
+            }
+        }
+
         let dlq = if self.dlq {
             Some(format!("{}-dlq", self.queue))
         } else {
