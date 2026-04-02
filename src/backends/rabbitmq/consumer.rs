@@ -487,11 +487,9 @@ impl Consumer for RabbitMqConsumer {
                 let sub_queue = format!("{}-seq-{i}", topology.queue());
                 let h = handler.clone();
                 let inner_client = client.clone();
-                let opts = ConsumerOptions {
-                    max_retries: options.max_retries,
-                    prefetch_count: 1,
-                    shutdown: shutdown.clone(),
-                };
+                let opts = ConsumerOptions::new(shutdown.clone())
+                    .with_max_retries(options.max_retries)
+                    .with_prefetch_count(1);
                 handles.push(tokio::spawn(async move {
                     let adapter = TypedAdapter::<_, T>::new(h);
                     let consumer = RabbitMqConsumer::new(inner_client);
