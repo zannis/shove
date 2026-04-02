@@ -60,6 +60,12 @@ impl MessageHandler<WorkQueue> for TaskHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "shove=debug,consumer_groups=debug".parse().unwrap()),
+        )
+        .init();
     let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
     let client = RabbitMqClient::connect(&config).await?;
 

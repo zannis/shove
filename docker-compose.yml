@@ -9,4 +9,4 @@ services:
       RABBITMQ_DEFAULT_PASS: guest
     command: >
       bash -c "rabbitmq-plugins enable rabbitmq_consistent_hash_exchange &&
-               rabbitmq-server"
+               rabbitmq-server "
