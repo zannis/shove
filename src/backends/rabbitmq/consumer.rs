@@ -298,6 +298,7 @@ impl RabbitMqConsumer {
                                 shard_hold_queues,
                                 &publisher,
                                 retry_count,
+                                queue,
                             )
                             .await;
                         } else {
@@ -373,6 +374,7 @@ impl RabbitMqConsumer {
                                         shard_hold_queues,
                                         &publisher,
                                         retry_count,
+                                        queue,
                                     )
                                     .await;
                                 }
@@ -896,6 +898,7 @@ async fn route_shard_retry(
     shard_hold_queues: &[HoldQueue],
     publisher: &ChannelPublisher,
     retry_count: u32,
+    queue: &str,
 ) {
     if !shard_hold_queues.is_empty() {
         let new_retry_count = retry_count + 1;
@@ -926,6 +929,11 @@ async fn route_shard_retry(
             }
         }
     } else {
+        warn!(
+            queue,
+            retry_count,
+            "retrying sequenced message but no shard hold queues configured — requeuing with no delay"
+        );
         router::nack_requeue(delivery).await;
     }
 }
