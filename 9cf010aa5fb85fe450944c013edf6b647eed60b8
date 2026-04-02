@@ -1,0 +1,53 @@
+src/backends/rabbitmq/router.rs
+  41a6c7d742fcf430 92-94
+src/topology.rs
+  41a6c7d742fcf430 281-296
+src/backends/sns/router.rs
+  41a6c7d742fcf430 93-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "9cf010aa5fb85fe450944c013edf6b647eed60b8",
+  "prompts": {
+    "21278ad40e2206c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdaea724-d258-41ba-83f7-a0d6d8d79c1a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 3298,
+      "overriden_lines": 0
+    },
+    "41a6c7d742fcf430": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b869496b-2f5d-4f23-aec0-221cc354f413",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 23,
+      "total_deletions": 3,
+      "accepted_lines": 533,
+      "overriden_lines": 0
+    },
+    "9a0c21f470569fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ca7456b-16eb-44d2-80fc-45a48b6b54f7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 2350,
+      "overriden_lines": 0
+    }
+  }
+}
