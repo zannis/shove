@@ -19,8 +19,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -- --check
       - run: cargo clippy -q --all-features -- -D warnings
-      - run: cargo install -q cargo-nextest --locked
-      - run: cargo nextest run --all-features
       - run: cargo publish --dry-run --all-features
 
   coverage:
@@ -29,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install -q cargo-llvm-cov cargo-nextest
+      - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
       - run: cargo llvm-cov nextest -q --all-features --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
