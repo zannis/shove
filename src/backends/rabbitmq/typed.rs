@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use lapin::message::Delivery;
@@ -108,11 +109,35 @@ pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
 }
 
 fn extract_message_metadata(delivery: &Delivery) -> MessageMetadata {
+    let headers = extract_string_headers(delivery);
     MessageMetadata {
         retry_count: get_retry_count(delivery),
         delivery_id: delivery.delivery_tag.to_string(),
         redelivered: delivery.redelivered,
+        headers,
     }
+}
+
+fn extract_string_headers(delivery: &Delivery) -> HashMap<String, String> {
+    let Some(table) = delivery.properties.headers().as_ref() else {
+        return HashMap::new();
+    };
+
+    table
+        .inner()
+        .iter()
+        .filter_map(|(k, v)| {
+            let key = k.to_string();
+            let value = match v {
+                AMQPValue::LongString(s) => {
+                    Some(String::from_utf8_lossy(s.as_bytes()).into_owned())
+                }
+                AMQPValue::ShortString(s) => Some(s.to_string()),
+                _ => None,
+            };
+            value.map(|v| (key, v))
+        })
+        .collect()
 }
 
 fn extract_dead_metadata(delivery: &Delivery) -> DeadMessageMetadata {

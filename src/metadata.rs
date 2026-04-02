@@ -1,5 +1,8 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
 /// Metadata about a consumed message, extracted from broker headers/properties.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageMetadata {
     /// How many times this message has been retried (0 on first delivery).
     pub retry_count: u32,
@@ -7,6 +10,8 @@ pub struct MessageMetadata {
     pub delivery_id: String,
     /// Whether the broker flagged this as a redelivery.
     pub redelivered: bool,
+    /// String-valued headers attached to the delivery (e.g. `x-trace-id`).
+    pub headers: HashMap<String, String>,
 }
 
 /// Metadata about a dead-lettered message.

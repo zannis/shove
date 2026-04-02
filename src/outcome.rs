@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// What a handler instructs the consumer to do with a message after processing.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Outcome {
     /// Processed successfully. Remove from queue.
     Ack,

@@ -101,6 +101,7 @@ async fn main() -> Result<(), ShoveError> {
             min_consumers: 1,   // floor
             max_consumers: 5,   // ceiling
             max_retries: 3,
+            handler_timeout: None,
         },
         || TaskHandler, // factory — called once per spawned consumer
     );
