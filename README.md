@@ -1,6 +1,6 @@
 # shove
 
-[![Build Status](https://github.com/zannis/shove/workflows/Build/badge.svg)](https://github.com/zannis/shove/actions)
+[![ci](https://github.com/zannis/shove/actions/workflows/ci.yml/badge.svg)](https://github.com/zannis/shove/actions/workflows/ci.yml)(https://github.com/zannis/shove/actions)
 [![Latest Version](https://img.shields.io/crates/v/shove.svg)](https://crates.io/crates/shove)
 [![Docs](https://docs.rs/shove/badge.svg)](https://docs.rs/shove)
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

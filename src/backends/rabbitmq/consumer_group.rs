@@ -106,7 +106,6 @@ impl ConsumerGroupConfig {
 /// The group owns the concrete consumers and is responsible for scaling them
 /// up and down.  It keeps a [`CancellationToken`] per consumer so that
 /// individual consumers can be stopped without affecting the rest of the group.
-#[allow(dead_code)]
 pub struct ConsumerGroup {
     name: String,
     /// The queue that every consumer in this group reads from (derived from
