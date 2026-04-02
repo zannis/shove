@@ -23,24 +23,81 @@ type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
 /// Configuration that governs the behaviour of a [`ConsumerGroup`].
 pub struct ConsumerGroupConfig {
-    pub prefetch_count: u16,
-    pub min_consumers: u16,
-    pub max_consumers: u16,
-    pub max_retries: u32,
+    pub(crate) prefetch_count: u16,
+    pub(crate) min_consumers: u16,
+    pub(crate) max_consumers: u16,
+    pub(crate) max_retries: u32,
     /// Maximum time a handler may spend processing a single message.
     /// If exceeded the message is retried. `None` means no limit.
-    pub handler_timeout: Option<Duration>,
+    pub(crate) handler_timeout: Option<Duration>,
 }
 
-impl Default for ConsumerGroupConfig {
-    fn default() -> Self {
+impl ConsumerGroupConfig {
+    /// Create a new config with the given consumer count range.
+    ///
+    /// `range` sets `min_consumers..=max_consumers`.
+    /// Defaults: `prefetch_count=10`, `max_retries=10`, `handler_timeout=None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `*range.start() > *range.end()`.
+    pub fn new(range: std::ops::RangeInclusive<u16>) -> Self {
+        let min = *range.start();
+        let max = *range.end();
+        assert!(
+            min <= max,
+            "min_consumers ({min}) must be <= max_consumers ({max})"
+        );
         Self {
             prefetch_count: 10,
-            min_consumers: 1,
-            max_consumers: 10,
+            min_consumers: min,
+            max_consumers: max,
             max_retries: 10,
             handler_timeout: None,
         }
+    }
+
+    /// Set the prefetch count (number of unacknowledged messages per consumer).
+    pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
+        self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Set the maximum number of retries before a message is dead-lettered.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Set the maximum time a handler may spend processing a single message.
+    pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
+        self.handler_timeout = Some(timeout);
+        self
+    }
+
+    /// Returns the configured prefetch count.
+    pub fn prefetch_count(&self) -> u16 {
+        self.prefetch_count
+    }
+
+    /// Returns the minimum number of consumers.
+    pub fn min_consumers(&self) -> u16 {
+        self.min_consumers
+    }
+
+    /// Returns the maximum number of consumers.
+    pub fn max_consumers(&self) -> u16 {
+        self.max_consumers
+    }
+
+    /// Returns the maximum number of retries.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
+    /// Returns the handler timeout, if any.
+    pub fn handler_timeout(&self) -> Option<Duration> {
+        self.handler_timeout
     }
 }
 
@@ -240,11 +297,7 @@ mod tests {
     }
 
     fn default_config() -> ConsumerGroupConfig {
-        ConsumerGroupConfig {
-            min_consumers: 1,
-            max_consumers: 4,
-            ..Default::default()
-        }
+        ConsumerGroupConfig::new(1..=4)
     }
 
     // -- start --
@@ -256,11 +309,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig {
-                min_consumers: 3,
-                max_consumers: 5,
-                ..Default::default()
-            });
+            let mut group = test_group(ConsumerGroupConfig::new(3..=5));
             group.start();
             assert_eq!(group.active_consumers(), 3);
             group.shutdown().await;
@@ -274,11 +323,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig {
-                min_consumers: 0,
-                max_consumers: 4,
-                ..Default::default()
-            });
+            let mut group = test_group(ConsumerGroupConfig::new(0..=4));
             group.start();
             assert_eq!(group.active_consumers(), 0);
             group.shutdown().await;
@@ -311,11 +356,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig {
-                min_consumers: 2,
-                max_consumers: 2,
-                ..Default::default()
-            });
+            let mut group = test_group(ConsumerGroupConfig::new(2..=2));
             group.start();
             assert_eq!(group.active_consumers(), 2);
 
@@ -369,11 +410,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig {
-                min_consumers: 0,
-                max_consumers: 3,
-                ..Default::default()
-            });
+            let mut group = test_group(ConsumerGroupConfig::new(0..=3));
             group.scale_up();
             group.scale_up();
             group.scale_up();
@@ -397,11 +434,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig {
-                min_consumers: 0,
-                max_consumers: 3,
-                ..Default::default()
-            });
+            let mut group = test_group(ConsumerGroupConfig::new(0..=3));
             group.scale_up();
             group.scale_up();
             group.scale_up();
@@ -432,11 +465,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig {
-                min_consumers: 0,
-                max_consumers: 2,
-                ..Default::default()
-            });
+            let mut group = test_group(ConsumerGroupConfig::new(0..=2));
             group.scale_up();
             group.scale_up();
 
@@ -475,19 +504,82 @@ mod tests {
 
     #[test]
     fn config_returns_reference() {
-        let group = test_group(ConsumerGroupConfig {
-            min_consumers: 2,
-            max_consumers: 8,
-            prefetch_count: 5,
-            max_retries: 3,
-            handler_timeout: Some(Duration::from_secs(30)),
-        });
+        let group = test_group(
+            ConsumerGroupConfig::new(2..=8)
+                .with_prefetch_count(5)
+                .with_max_retries(3)
+                .with_handler_timeout(Duration::from_secs(30)),
+        );
         let config = group.config();
-        assert_eq!(config.min_consumers, 2);
-        assert_eq!(config.max_consumers, 8);
-        assert_eq!(config.prefetch_count, 5);
-        assert_eq!(config.max_retries, 3);
-        assert_eq!(config.handler_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(config.min_consumers(), 2);
+        assert_eq!(config.max_consumers(), 8);
+        assert_eq!(config.prefetch_count(), 5);
+        assert_eq!(config.max_retries(), 3);
+        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
+    }
+
+    // -- ConsumerGroupConfig constructor validation --
+
+    #[test]
+    fn new_with_valid_range() {
+        let config = ConsumerGroupConfig::new(2..=8);
+        assert_eq!(config.min_consumers(), 2);
+        assert_eq!(config.max_consumers(), 8);
+    }
+
+    #[test]
+    fn new_sets_defaults() {
+        let config = ConsumerGroupConfig::new(1..=4);
+        assert_eq!(config.prefetch_count(), 10);
+        assert_eq!(config.max_retries(), 10);
+        assert!(config.handler_timeout().is_none());
+    }
+
+    #[test]
+    fn new_with_equal_min_max() {
+        let config = ConsumerGroupConfig::new(3..=3);
+        assert_eq!(config.min_consumers(), 3);
+        assert_eq!(config.max_consumers(), 3);
+    }
+
+    #[test]
+    #[should_panic]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn new_panics_if_min_greater_than_max() {
+        let _ = ConsumerGroupConfig::new(5..=2);
+    }
+
+    // -- ConsumerGroupConfig builder methods --
+
+    #[test]
+    fn with_prefetch_count_sets_value() {
+        let config = ConsumerGroupConfig::new(1..=4).with_prefetch_count(25);
+        assert_eq!(config.prefetch_count(), 25);
+    }
+
+    #[test]
+    fn with_max_retries_sets_value() {
+        let config = ConsumerGroupConfig::new(1..=4).with_max_retries(5);
+        assert_eq!(config.max_retries(), 5);
+    }
+
+    #[test]
+    fn with_handler_timeout_sets_value() {
+        let config = ConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(60));
+        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn builder_chaining_sets_all_values() {
+        let config = ConsumerGroupConfig::new(1..=5)
+            .with_prefetch_count(20)
+            .with_max_retries(3)
+            .with_handler_timeout(Duration::from_secs(30));
+        assert_eq!(config.min_consumers(), 1);
+        assert_eq!(config.max_consumers(), 5);
+        assert_eq!(config.prefetch_count(), 20);
+        assert_eq!(config.max_retries(), 3);
+        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
     }
 
     // -- spawn_one wiring --

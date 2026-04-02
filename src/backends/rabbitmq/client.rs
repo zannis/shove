@@ -4,7 +4,7 @@ use lapin::{Channel, Connection, ConnectionProperties};
 use tokio_util::sync::CancellationToken;
 
 use crate::SHUTDOWN_GRACE;
-use crate::error::ShoveError;
+use crate::error::{Result, ShoveError};
 
 /// RabbitMQ connection configuration.
 #[derive(Debug, Clone)]
@@ -31,7 +31,7 @@ impl RabbitMqClient {
     ///
     /// The connection is named `shove-rs-{pid}` and a fresh [`CancellationToken`]
     /// is created to coordinate shutdown across clones of this client.
-    pub async fn connect(config: &RabbitMqConfig) -> Result<Self, ShoveError> {
+    pub async fn connect(config: &RabbitMqConfig) -> Result<Self> {
         let pid = std::process::id();
         let connection_name = format!("shove-rs-{pid}");
 
@@ -52,7 +52,7 @@ impl RabbitMqClient {
     ///
     /// Returns [`ShoveError::Connection`] if shutdown has already been requested
     /// or if the channel cannot be created.
-    pub async fn create_channel(&self) -> Result<Channel, ShoveError> {
+    pub async fn create_channel(&self) -> Result<Channel> {
         if self.shutdown_token.is_cancelled() {
             return Err(ShoveError::Connection(
                 "cannot create channel: client is shutting down".into(),
@@ -69,7 +69,7 @@ impl RabbitMqClient {
     ///
     /// Returns [`ShoveError::Connection`] if shutdown has already been requested,
     /// if the channel cannot be created, or if confirms cannot be enabled.
-    pub async fn create_confirm_channel(&self) -> Result<Channel, ShoveError> {
+    pub async fn create_confirm_channel(&self) -> Result<Channel> {
         if self.shutdown_token.is_cancelled() {
             return Err(ShoveError::Connection(
                 "cannot create confirm channel: client is shutting down".into(),

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::error::ShoveError;
+use crate::error::Result;
 
 // ---------------------------------------------------------------------------
 // HoldQueue
@@ -185,19 +185,14 @@ impl TopologyBuilder {
 // ---------------------------------------------------------------------------
 
 pub trait TopologyDeclarer: Send + Sync {
-    fn declare(
-        &self,
-        topology: &QueueTopology,
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
+    fn declare(&self, topology: &QueueTopology) -> impl Future<Output = Result<()>> + Send;
 }
 
 // ---------------------------------------------------------------------------
 // Free function — uncomment when topic.rs is wired into lib.rs
 // ---------------------------------------------------------------------------
 
-pub async fn declare_topic<T: crate::topic::Topic>(
-    declarer: &impl TopologyDeclarer,
-) -> Result<(), ShoveError> {
+pub async fn declare_topic<T: crate::topic::Topic>(declarer: &impl TopologyDeclarer) -> Result<()> {
     declarer.declare(T::topology()).await
 }
 

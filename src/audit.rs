@@ -4,6 +4,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 use crate::error::ShoveError;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -37,7 +38,7 @@ pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
     fn audit(
         &self,
         record: &AuditRecord<T::Message>,
-    ) -> impl Future<Output = Result<(), ShoveError>> + Send;
+    ) -> impl Future<Output = crate::error::Result<()>> + Send;
 }
 
 /// Wraps a `MessageHandler` with audit logging.
@@ -65,11 +66,15 @@ where
     H: MessageHandler<T>,
     A: AuditHandler<T>,
 {
-    async fn handle(
-        &self,
-        message: T::Message,
-        metadata: MessageMetadata,
-    ) -> Outcome {
+    async fn handle(&self, message: T::Message, metadata: MessageMetadata) -> Outcome {
+        // Guard against infinite recursion: skip auditing on the audit-log topic itself.
+        #[cfg(feature = "audit")]
+        {
+            if T::topology().queue() == shove_backend::AuditLog::topology().queue() {
+                return self.handler.handle(message, metadata).await;
+            }
+        }
+
         let trace_id = metadata
             .headers
             .get("x-trace-id")
@@ -98,10 +103,10 @@ where
             Ok(()) => outcome,
             Err(err) => {
                 tracing::error!(
-                        error = %err,
-                        delivery_id = %record.metadata.delivery_id,
-                        "audit handler failed, retrying message"
-                    );
+                    error = %err,
+                    delivery_id = %record.metadata.delivery_id,
+                    "audit handler failed, retrying message"
+                );
                 Outcome::Retry
             }
         }
@@ -125,7 +130,7 @@ mod shove_backend {
 
     use crate::audit::{AuditHandler, AuditRecord};
     use crate::define_topic;
-    use crate::error::ShoveError;
+    use crate::error::{Result, ShoveError};
     use crate::publisher::Publisher;
     use crate::topic::Topic;
     use crate::topology::TopologyBuilder;
@@ -154,7 +159,7 @@ mod shove_backend {
         T::Message: Serialize,
         P: Publisher,
     {
-        async fn audit(&self, record: &AuditRecord<T::Message>) -> Result<(), ShoveError> {
+        async fn audit(&self, record: &AuditRecord<T::Message>) -> Result<()> {
             let value_record = AuditRecord {
                 trace_id: record.trace_id.clone(),
                 topic: record.topic.clone(),
@@ -253,7 +258,9 @@ mod tests {
     }
 
     fn test_message() -> TestMessage {
-        TestMessage { body: "hello".into() }
+        TestMessage {
+            body: "hello".into(),
+        }
     }
 
     // -- tests --
@@ -307,11 +314,11 @@ mod tests {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), tracker.clone());
 
         let mut meta = test_metadata();
-        meta.headers.insert("x-trace-id".into(), "my-trace-123".into());
+        meta.headers
+            .insert("x-trace-id".into(), "my-trace-123".into());
 
         audited.handle(test_message(), meta).await;
-        let captured: tokio::sync::MutexGuard<'_, Option<String>> =
-            tracker.trace_id.lock().await;
+        let captured: tokio::sync::MutexGuard<'_, Option<String>> = tracker.trace_id.lock().await;
         assert_eq!(captured.as_deref(), Some("my-trace-123"));
     }
 
@@ -322,11 +329,61 @@ mod tests {
 
         audited.handle(test_message(), test_metadata()).await;
 
-        let captured: tokio::sync::MutexGuard<'_, Option<String>> =
-            tracker.trace_id.lock().await;
+        let captured: tokio::sync::MutexGuard<'_, Option<String>> = tracker.trace_id.lock().await;
         let trace_id = captured.as_ref().expect("trace_id should be set");
         // Should be a valid UUID v4
         assert_eq!(trace_id.len(), 36);
         assert!(uuid::Uuid::parse_str(trace_id).is_ok());
+    }
+
+    #[cfg(feature = "audit")]
+    #[tokio::test]
+    async fn audited_skips_audit_for_audit_log_topic() {
+        use super::shove_backend::AuditLog;
+
+        struct AuditLogHandler;
+        impl MessageHandler<AuditLog> for AuditLogHandler {
+            async fn handle(
+                &self,
+                _msg: <AuditLog as Topic>::Message,
+                _meta: MessageMetadata,
+            ) -> Outcome {
+                Outcome::Ack
+            }
+        }
+
+        struct PanicAuditHandler;
+        impl AuditHandler<AuditLog> for PanicAuditHandler {
+            async fn audit(
+                &self,
+                _record: &AuditRecord<<AuditLog as Topic>::Message>,
+            ) -> Result<(), ShoveError> {
+                panic!("audit handler should not be called for the audit topic");
+            }
+        }
+
+        let audited = Audited::new(AuditLogHandler, PanicAuditHandler);
+        let meta = MessageMetadata {
+            retry_count: 0,
+            delivery_id: "d-1".into(),
+            redelivered: false,
+            headers: HashMap::new(),
+        };
+
+        let msg = serde_json::from_value::<<AuditLog as Topic>::Message>(
+            serde_json::json!({
+                "trace_id": "t1",
+                "topic": "test",
+                "payload": null,
+                "metadata": { "retry_count": 0, "delivery_id": "x", "redelivered": false, "headers": {} },
+                "outcome": "Ack",
+                "duration_ms": 0,
+                "timestamp": "2026-01-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
+
+        let outcome = audited.handle(msg, meta).await;
+        assert!(matches!(outcome, Outcome::Ack));
     }
 }

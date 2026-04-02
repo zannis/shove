@@ -2,7 +2,7 @@ use std::future::Future;
 
 use tracing::debug;
 
-use crate::error::ShoveError;
+use crate::error::{Result, ShoveError};
 
 #[derive(Debug, Clone)]
 pub struct ManagementConfig {
@@ -48,10 +48,7 @@ pub struct QueueStats {
 ///
 /// Using a trait here allows injecting a mock implementation in tests.
 pub trait QueueStatsProvider: Send + Sync {
-    fn get_queue_stats(
-        &self,
-        queue: &str,
-    ) -> impl Future<Output = Result<QueueStats, ShoveError>> + Send;
+    fn get_queue_stats(&self, queue: &str) -> impl Future<Output = Result<QueueStats>> + Send;
 }
 
 /// HTTP client that talks to the RabbitMQ Management Plugin REST API.
@@ -70,10 +67,7 @@ impl ManagementClient {
 }
 
 impl QueueStatsProvider for ManagementClient {
-    fn get_queue_stats(
-        &self,
-        queue: &str,
-    ) -> impl Future<Output = Result<QueueStats, ShoveError>> + Send {
+    fn get_queue_stats(&self, queue: &str) -> impl Future<Output = Result<QueueStats>> + Send {
         // URL-encode the queue name: replace `/` with `%2F`.
         let encoded_queue = queue.replace('/', "%2F");
         let url = format!(
@@ -138,8 +132,8 @@ mod tests {
 
     #[test]
     fn management_config_with_vhost() {
-        let config =
-            ManagementConfig::new("http://localhost:15672", "guest", "guest").with_vhost("my-vhost");
+        let config = ManagementConfig::new("http://localhost:15672", "guest", "guest")
+            .with_vhost("my-vhost");
         assert_eq!(config.vhost, "my-vhost");
     }
 

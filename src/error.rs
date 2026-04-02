@@ -14,6 +14,9 @@ pub enum ShoveError {
     Topology(String),
 }
 
+/// Convenience alias used throughout the crate.
+pub type Result<T> = std::result::Result<T, ShoveError>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

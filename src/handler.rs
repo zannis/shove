@@ -56,3 +56,101 @@ impl<T: Topic, H: MessageHandler<T>> MessageHandler<T> for Arc<H> {
         (**self).handle_dead(message, metadata)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+    use crate::outcome::Outcome;
+    use crate::topology::{QueueTopology, TopologyBuilder};
+
+    // -- test Topic --
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct TestMessage {
+        value: u32,
+    }
+
+    struct TestTopic;
+    impl crate::topic::Topic for TestTopic {
+        type Message = TestMessage;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("handler-test").build())
+        }
+    }
+
+    // -- test handlers --
+
+    struct FixedOutcomeHandler(Outcome);
+    impl MessageHandler<TestTopic> for FixedOutcomeHandler {
+        async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata) -> Outcome {
+            self.0.clone()
+        }
+    }
+
+    // -- helpers --
+
+    fn test_metadata() -> MessageMetadata {
+        MessageMetadata {
+            retry_count: 0,
+            delivery_id: "d-1".into(),
+            redelivered: false,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn test_dead_metadata() -> DeadMessageMetadata {
+        DeadMessageMetadata {
+            message: test_metadata(),
+            reason: Some("rejected".into()),
+            original_queue: Some("handler-test".into()),
+            death_count: 1,
+        }
+    }
+
+    fn test_message() -> TestMessage {
+        TestMessage { value: 42 }
+    }
+
+    // -- tests --
+
+    /// Default `handle_dead` returns `()` without panicking.
+    #[tokio::test]
+    async fn default_handle_dead_returns_unit() {
+        let handler = FixedOutcomeHandler(Outcome::Ack);
+        // The default impl just logs; calling it must not panic and must return ().
+        handler
+            .handle_dead(test_message(), test_dead_metadata())
+            .await;
+    }
+
+    /// `Arc<H>` delegates `handle` to the inner handler and returns the correct outcome.
+    #[tokio::test]
+    async fn arc_blanket_handle_delegates_correctly() {
+        let handler = Arc::new(FixedOutcomeHandler(Outcome::Ack));
+        let outcome = handler.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    /// `Arc<H>` delegates `handle` for all outcome variants.
+    #[tokio::test]
+    async fn arc_blanket_handle_retry_outcome() {
+        let handler = Arc::new(FixedOutcomeHandler(Outcome::Retry));
+        let outcome = handler.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    /// `Arc<H>` delegates `handle_dead` to the inner handler's default impl without panicking.
+    #[tokio::test]
+    async fn arc_blanket_handle_dead_delegates_correctly() {
+        let handler = Arc::new(FixedOutcomeHandler(Outcome::Ack));
+        // Calling through Arc must reach the same default impl and return ().
+        handler
+            .handle_dead(test_message(), test_dead_metadata())
+            .await;
+    }
+}

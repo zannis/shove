@@ -44,7 +44,7 @@ pub mod rabbitmq {
         client::{RabbitMqClient, RabbitMqConfig},
         consumer::RabbitMqConsumer,
         consumer_group::{ConsumerGroup, ConsumerGroupConfig},
-        management::{ManagementClient, ManagementConfig, QueueStats, QueueStatsProvider},
+        management::{ManagementConfig, QueueStats, QueueStatsProvider},
         publisher::RabbitMqPublisher,
         registry::ConsumerGroupRegistry,
         topology::RabbitMqTopologyDeclarer,

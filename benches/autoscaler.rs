@@ -116,17 +116,13 @@ impl Rabbit {
             .unwrap();
     }
 
-    fn mgmt_client(&self) -> ManagementClient {
-        ManagementClient::new(ManagementConfig::new(&self.mgmt_url, "guest", "guest"))
+    fn mgmt_config(&self) -> ManagementConfig {
+        ManagementConfig::new(&self.mgmt_url, "guest", "guest")
     }
 
     fn new_registry(&self) -> ConsumerGroupRegistry {
         ConsumerGroupRegistry::new(self.client.clone())
     }
-}
-
-fn queue() -> String {
-    BenchTopic::topology().queue().to_string()
 }
 
 async fn drain(counter: &AtomicU64, target: u64) {
@@ -160,20 +156,21 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let mut registry = rabbit.new_registry();
-                registry.register::<BenchTopic, LatencyHandler>(
-                    "bench",
-                    queue(),
-                    ConsumerGroupConfig::default(),
-                    || LatencyHandler {
-                        processed: Arc::new(AtomicU64::new(0)),
-                        delay: Duration::ZERO,
-                    },
-                );
+                registry
+                    .register::<BenchTopic, LatencyHandler>(ConsumerGroupConfig::new(1..=1), || {
+                        LatencyHandler {
+                            processed: Arc::new(AtomicU64::new(0)),
+                            delay: Duration::ZERO,
+                        }
+                    })
+                    .await
+                    .unwrap();
                 registry.start_all();
 
                 let registry = Arc::new(Mutex::new(registry));
+                let mgmt_config = rabbit.mgmt_config();
                 let mut autoscaler = Autoscaler::new(
-                    rabbit.mgmt_client(),
+                    &mgmt_config,
                     AutoscalerConfig {
                         poll_interval: Duration::from_millis(1),
                         hysteresis_duration: Duration::ZERO,
@@ -231,20 +228,17 @@ fn bench_throughput(c: &mut Criterion) {
                         let delay = Duration::from_millis(delay_ms);
 
                         let mut registry = rabbit.new_registry();
-                        registry.register::<BenchTopic, LatencyHandler>(
-                            "tp",
-                            queue(),
-                            ConsumerGroupConfig {
-                                prefetch_count: prefetch,
-                                min_consumers: consumers,
-                                max_consumers: consumers,
-                                ..Default::default()
-                            },
-                            move || LatencyHandler {
-                                processed: pc.clone(),
-                                delay,
-                            },
-                        );
+                        registry
+                            .register::<BenchTopic, LatencyHandler>(
+                                ConsumerGroupConfig::new(consumers..=consumers)
+                                    .with_prefetch_count(prefetch),
+                                move || LatencyHandler {
+                                    processed: pc.clone(),
+                                    delay,
+                                },
+                            )
+                            .await
+                            .unwrap();
 
                         let start = std::time::Instant::now();
                         registry.start_all();
@@ -291,20 +285,16 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                         let pc = processed.clone();
 
                         let mut registry = rabbit.new_registry();
-                        registry.register::<BenchTopic, LatencyHandler>(
-                            "burst",
-                            queue(),
-                            ConsumerGroupConfig {
-                                prefetch_count: prefetch,
-                                min_consumers: min,
-                                max_consumers: max,
-                                ..Default::default()
-                            },
-                            move || LatencyHandler {
-                                processed: pc.clone(),
-                                delay,
-                            },
-                        );
+                        registry
+                            .register::<BenchTopic, LatencyHandler>(
+                                ConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),
+                                move || LatencyHandler {
+                                    processed: pc.clone(),
+                                    delay,
+                                },
+                            )
+                            .await
+                            .unwrap();
 
                         let start = std::time::Instant::now();
                         registry.start_all();
@@ -312,8 +302,9 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                         let registry = Arc::new(Mutex::new(registry));
                         let shutdown = CancellationToken::new();
                         let handle = if max > min {
+                            let mgmt_config = rabbit.mgmt_config();
                             let mut autoscaler = Autoscaler::new(
-                                rabbit.mgmt_client(),
+                                &mgmt_config,
                                 AutoscalerConfig {
                                     poll_interval: Duration::from_secs(1),
                                     scale_up_multiplier: 1.5,

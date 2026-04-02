@@ -1,6 +1,6 @@
 use futures_lite::StreamExt;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
-use lapin::types::{AMQPValue, FieldTable};
+use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions};
+use lapin::types::FieldTable;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -9,12 +9,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::RECONNECT_DELAY;
 use crate::backends::rabbitmq::client::RabbitMqClient;
-use crate::backends::rabbitmq::publisher::ChannelPublisher;
-use crate::backends::rabbitmq::typed::{
-    DlqAdapter, RETRY_COUNT_KEY, RawHandler, TypedAdapter, get_retry_count,
+use crate::backends::rabbitmq::headers::{
+    extract_dead_metadata, extract_message_metadata, get_retry_count,
 };
+use crate::backends::rabbitmq::publisher::ChannelPublisher;
+use crate::backends::rabbitmq::router;
 use crate::consumer::{Consumer, ConsumerOptions};
-use crate::error::ShoveError;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
@@ -29,17 +30,21 @@ impl RabbitMqConsumer {
         Self { client }
     }
 
-    async fn run_internal(
+    async fn run_internal<T, H>(
         &self,
-        handler: impl RawHandler,
+        handler: &H,
         queue: &str,
         topology: &'static crate::topology::QueueTopology,
         options: ConsumerOptions,
-        is_dlq: bool,
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        T::Message: for<'de> serde::Deserialize<'de>,
+        H: MessageHandler<T>,
+    {
         loop {
             match self
-                .consume_loop(&handler, queue, topology, &options, is_dlq)
+                .consume_loop::<T, H>(handler, queue, topology, &options)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -61,19 +66,24 @@ impl RabbitMqConsumer {
 
     /// Like `run_internal` but maintains a per-sub-queue poisoned-key set
     /// across reconnections for `SequenceFailure::FailAll` enforcement.
-    async fn run_internal_sequenced(
+    async fn run_internal_sequenced<T, H>(
         &self,
-        handler: impl RawHandler,
+        handler: &H,
         queue: &str,
         topology: &'static crate::topology::QueueTopology,
         options: ConsumerOptions,
         on_failure: SequenceFailure,
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        T::Message: for<'de> serde::Deserialize<'de>,
+        H: MessageHandler<T>,
+    {
         let mut poisoned_keys = HashSet::new();
         loop {
             match self
-                .consume_loop_sequenced(
-                    &handler,
+                .consume_loop_sequenced::<T, H>(
+                    handler,
                     queue,
                     topology,
                     &options,
@@ -99,15 +109,20 @@ impl RabbitMqConsumer {
         }
     }
 
-    async fn consume_loop_sequenced(
+    async fn consume_loop_sequenced<T, H>(
         &self,
-        handler: &impl RawHandler,
+        handler: &H,
         queue: &str,
         topology: &'static crate::topology::QueueTopology,
         options: &ConsumerOptions,
         on_failure: SequenceFailure,
         poisoned_keys: &mut HashSet<String>,
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        T::Message: for<'de> serde::Deserialize<'de>,
+        H: MessageHandler<T>,
+    {
         let channel = self.client.create_confirm_channel().await?;
 
         channel
@@ -161,7 +176,7 @@ impl RabbitMqConsumer {
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
-                        nack_reject(&delivery).await;
+                        router::route_reject(&delivery).await;
                         continue;
                     }
 
@@ -181,21 +196,32 @@ impl RabbitMqConsumer {
                             );
                             poisoned_keys.insert(sequence_key);
                         }
-                        nack_reject(&delivery).await;
+                        router::route_reject(&delivery).await;
                         continue;
                     }
 
-                    options.processing.store(true, Ordering::Release);
-                    let outcome = invoke_handler(handler.handle(&delivery), options.handler_timeout).await;
+                    let metadata = extract_message_metadata(&delivery);
+                    let outcome = match serde_json::from_slice::<T::Message>(&delivery.data) {
+                        Err(err) => {
+                            error!(
+                                error = %err,
+                                delivery_id = %metadata.delivery_id,
+                                "Failed to deserialize message from sequenced queue"
+                            );
+                            Outcome::Reject
+                        }
+                        Ok(message) => {
+                            options.processing.store(true, Ordering::Release);
+                            invoke_handler(handler.handle(message, metadata), options.handler_timeout).await
+                        }
+                    };
 
                     match outcome {
                         Outcome::Ack => {
-                            if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                                error!("failed to ack delivery: {e}");
-                            }
+                            router::route_ack(&delivery).await;
                         }
                         Outcome::Retry => {
-                            handle_retry(&delivery, topology, &publisher, retry_count).await;
+                            router::route_retry(&delivery, topology, &publisher, retry_count).await;
                         }
                         Outcome::Reject => {
                             if on_failure == SequenceFailure::FailAll {
@@ -206,10 +232,10 @@ impl RabbitMqConsumer {
                                 );
                                 poisoned_keys.insert(sequence_key);
                             }
-                            nack_reject(&delivery).await;
+                            router::route_reject(&delivery).await;
                         }
                         Outcome::Defer => {
-                            handle_defer(&delivery, topology, &publisher, retry_count).await;
+                            router::route_defer(&delivery, topology, &publisher).await;
                         }
                     }
                     options.processing.store(false, Ordering::Release);
@@ -218,14 +244,18 @@ impl RabbitMqConsumer {
         }
     }
 
-    async fn consume_loop(
+    async fn consume_loop<T, H>(
         &self,
-        handler: &impl RawHandler,
+        handler: &H,
         queue: &str,
         topology: &'static crate::topology::QueueTopology,
         options: &ConsumerOptions,
-        is_dlq: bool,
-    ) -> Result<(), ShoveError> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        T::Message: for<'de> serde::Deserialize<'de>,
+        H: MessageHandler<T>,
+    {
         let channel = self.client.create_confirm_channel().await?;
 
         channel
@@ -271,37 +301,126 @@ impl RabbitMqConsumer {
 
                     let retry_count = get_retry_count(&delivery);
 
-                    if !is_dlq && retry_count >= options.max_retries {
+                    if retry_count >= options.max_retries {
                         warn!(
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
                         );
-                        nack_reject(&delivery).await;
+                        router::route_reject(&delivery).await;
                         continue;
                     }
 
-                    options.processing.store(true, Ordering::Release);
-                    let outcome = invoke_handler(handler.handle(&delivery), options.handler_timeout).await;
-
-                    debug!(queue, ?outcome, retry_count, "message handled");
+                    let metadata = extract_message_metadata(&delivery);
+                    let outcome = match serde_json::from_slice::<T::Message>(&delivery.data) {
+                        Err(err) => {
+                            error!(
+                                error = %err,
+                                delivery_id = %metadata.delivery_id,
+                                "Failed to deserialize message from main queue"
+                            );
+                            Outcome::Reject
+                        }
+                        Ok(message) => {
+                            options.processing.store(true, Ordering::Release);
+                            let outcome = invoke_handler(handler.handle(message, metadata), options.handler_timeout).await;
+                            debug!(queue, ?outcome, retry_count, "message handled");
+                            outcome
+                        }
+                    };
 
                     match outcome {
                         Outcome::Ack => {
-                            if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                                error!("failed to ack delivery: {e}");
-                            }
+                            router::route_ack(&delivery).await;
                         }
                         Outcome::Retry => {
-                            handle_retry(&delivery, topology, &publisher, retry_count).await;
+                            router::route_retry(&delivery, topology, &publisher, retry_count).await;
                         }
                         Outcome::Reject => {
-                            nack_reject(&delivery).await;
+                            router::route_reject(&delivery).await;
                         }
                         Outcome::Defer => {
-                            handle_defer(&delivery, topology, &publisher, retry_count).await;
+                            router::route_defer(&delivery, topology, &publisher).await;
                         }
                     }
                     options.processing.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
+/// Consume a DLQ, deserializing each message inline and calling `handler.handle_dead`.
+/// Always acks after handling (or on deserialization failure).
+async fn consume_dlq_loop<T, H>(
+    client: &RabbitMqClient,
+    handler: &H,
+    dlq: &str,
+    options: &ConsumerOptions,
+) -> Result<()>
+where
+    T: Topic,
+    T::Message: for<'de> serde::Deserialize<'de>,
+    H: MessageHandler<T>,
+{
+    let channel = client.create_confirm_channel().await?;
+
+    channel
+        .basic_qos(options.prefetch_count, BasicQosOptions::default())
+        .await
+        .map_err(|e| ShoveError::Connection(format!("failed to set QoS: {e}")))?;
+
+    let mut consumer = channel
+        .basic_consume(
+            lapin::types::ShortString::from(dlq),
+            lapin::types::ShortString::from(""),
+            BasicConsumeOptions {
+                no_ack: false,
+                ..BasicConsumeOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| {
+            ShoveError::Connection(format!("failed to start DLQ consumer on {dlq}: {e}"))
+        })?;
+
+    info!("DLQ consumer started on queue {dlq}");
+
+    loop {
+        tokio::select! {
+            _ = options.shutdown.cancelled() => {
+                debug!("shutdown signal received, stopping DLQ consumer on {dlq}");
+                return Ok(());
+            }
+            item = consumer.next() => {
+                let delivery = match item {
+                    Some(Ok(d)) => d,
+                    Some(Err(e)) => {
+                        return Err(ShoveError::Connection(format!("DLQ consumer stream error on {dlq}: {e}")));
+                    }
+                    None => {
+                        return Err(ShoveError::Connection(format!("DLQ consumer stream closed for {dlq}")));
+                    }
+                };
+
+                let metadata = extract_dead_metadata(&delivery);
+
+                match serde_json::from_slice::<T::Message>(&delivery.data) {
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            delivery_id = %metadata.message.delivery_id,
+                            "Failed to deserialize message from dead letter queue — discarding"
+                        );
+                    }
+                    Ok(message) => {
+                        handler.handle_dead(message, metadata).await;
+                    }
+                }
+
+                // Always ack DLQ messages.
+                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                    error!("failed to ack DLQ delivery: {e}");
                 }
             }
         }
@@ -322,158 +441,18 @@ async fn invoke_handler(fut: impl Future<Output = Outcome>, timeout: Option<Dura
     }
 }
 
-async fn handle_retry(
-    delivery: &lapin::message::Delivery,
-    topology: &'static crate::topology::QueueTopology,
-    publisher: &ChannelPublisher,
-    retry_count: u32,
-) {
-    let new_retry_count = retry_count + 1;
-    let hold_queues = topology.hold_queues();
-
-    if !hold_queues.is_empty() {
-        let index = (retry_count as usize).min(hold_queues.len() - 1);
-        let hold_queue = &hold_queues[index];
-        let headers = clone_headers_with_retry(delivery, new_retry_count);
-
-        match publisher
-            .publish_to_queue(hold_queue.name(), &delivery.data, headers)
-            .await
-        {
-            Ok(()) => {
-                debug!(
-                    "retrying message via hold queue {} (attempt {})",
-                    hold_queue.name(),
-                    new_retry_count
-                );
-                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                    error!("failed to ack delivery after publishing to hold queue: {e}");
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "failed to publish to hold queue {}, requeuing: {e}",
-                    hold_queue.name()
-                );
-                if let Err(ne) = delivery
-                    .nack(BasicNackOptions {
-                        requeue: true,
-                        ..BasicNackOptions::default()
-                    })
-                    .await
-                {
-                    error!("failed to nack delivery: {ne}");
-                }
-            }
-        }
-    } else {
-        if let Err(e) = delivery
-            .nack(BasicNackOptions {
-                requeue: true,
-                ..BasicNackOptions::default()
-            })
-            .await
-        {
-            error!("failed to nack delivery for requeue: {e}");
-        }
-    }
-}
-
-async fn handle_defer(
-    delivery: &lapin::message::Delivery,
-    topology: &'static crate::topology::QueueTopology,
-    publisher: &ChannelPublisher,
-    _retry_count: u32,
-) {
-    let hold_queues = topology.hold_queues();
-
-    if !hold_queues.is_empty() {
-        let hold_queue = &hold_queues[0];
-        let headers = clone_headers(delivery);
-
-        match publisher
-            .publish_to_queue(hold_queue.name(), &delivery.data, headers)
-            .await
-        {
-            Ok(()) => {
-                debug!("deferring message to hold queue {}", hold_queue.name());
-                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                    error!("failed to ack delivery after deferring to hold queue: {e}");
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "failed to publish to hold queue {} for defer, requeuing: {e}",
-                    hold_queue.name()
-                );
-                if let Err(ne) = delivery
-                    .nack(BasicNackOptions {
-                        requeue: true,
-                        ..BasicNackOptions::default()
-                    })
-                    .await
-                {
-                    error!("failed to nack delivery: {ne}");
-                }
-            }
-        }
-    } else {
-        warn!(
-            "Defer outcome on queue {} but no hold queues configured, requeuing",
-            topology.queue()
-        );
-        if let Err(e) = delivery
-            .nack(BasicNackOptions {
-                requeue: true,
-                ..BasicNackOptions::default()
-            })
-            .await
-        {
-            error!("failed to nack delivery for defer fallback: {e}");
-        }
-    }
-}
-
-fn clone_headers_with_retry(delivery: &lapin::message::Delivery, retry_count: u32) -> FieldTable {
-    let mut table = clone_headers(delivery);
-    table.insert(RETRY_COUNT_KEY.into(), AMQPValue::LongUInt(retry_count));
-    table
-}
-
-fn clone_headers(delivery: &lapin::message::Delivery) -> FieldTable {
-    delivery
-        .properties
-        .headers()
-        .as_ref()
-        .cloned()
-        .unwrap_or_default()
-}
-
-async fn nack_reject(delivery: &lapin::message::Delivery) {
-    if let Err(e) = delivery
-        .nack(BasicNackOptions {
-            requeue: false,
-            ..BasicNackOptions::default()
-        })
-        .await
-    {
-        error!("failed to nack-reject delivery: {e}");
-    }
-}
-
 impl Consumer for RabbitMqConsumer {
     fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl std::future::Future<Output = Result<(), ShoveError>> + Send {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
-            let adapter = TypedAdapter::<_, T>::new(handler);
             let consumer = RabbitMqConsumer::new(client);
             consumer
-                .run_internal(adapter, topology.queue(), topology, options, false)
+                .run_internal::<T, _>(&handler, topology.queue(), topology, options)
                 .await
         }
     }
@@ -482,7 +461,7 @@ impl Consumer for RabbitMqConsumer {
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl std::future::Future<Output = Result<(), ShoveError>> + Send {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
@@ -505,10 +484,9 @@ impl Consumer for RabbitMqConsumer {
                     .with_max_retries(options.max_retries)
                     .with_prefetch_count(1);
                 handles.push(tokio::spawn(async move {
-                    let adapter = TypedAdapter::<_, T>::new(h);
                     let consumer = RabbitMqConsumer::new(inner_client);
                     consumer
-                        .run_internal_sequenced(adapter, &sub_queue, topology, opts, on_failure)
+                        .run_internal_sequenced::<T, _>(&*h, &sub_queue, topology, opts, on_failure)
                         .await
                 }));
             }
@@ -528,20 +506,33 @@ impl Consumer for RabbitMqConsumer {
     fn run_dlq<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
-    ) -> impl std::future::Future<Output = Result<(), ShoveError>> + Send {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
             let dlq = topology.dlq().ok_or_else(|| {
                 ShoveError::Topology("run_dlq called on topic without DLQ".into())
             })?;
-            let adapter = DlqAdapter::<_, T>::new(handler);
             let shutdown = client.shutdown_token();
             let options = ConsumerOptions::new(shutdown);
-            let consumer = RabbitMqConsumer::new(client);
-            consumer
-                .run_internal(adapter, dlq, topology, options, true)
-                .await
+
+            loop {
+                match consume_dlq_loop::<T, _>(&client, &handler, dlq, &options).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if options.shutdown.is_cancelled() {
+                            return Ok(());
+                        }
+                        warn!(
+                            "DLQ consumer error on queue {dlq}: {e}. Reconnecting in {RECONNECT_DELAY:?}"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                            _ = options.shutdown.cancelled() => return Ok(()),
+                        }
+                    }
+                }
+            }
         }
     }
 }

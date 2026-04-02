@@ -62,12 +62,8 @@ impl MessageHandler<Payments> for PaymentHandler {
 struct StdoutAuditHandler;
 
 impl AuditHandler<Payments> for StdoutAuditHandler {
-    async fn audit(
-        &self,
-        record: &AuditRecord<PaymentEvent>,
-    ) -> Result<(), ShoveError> {
-        let json = serde_json::to_string_pretty(record)
-            .map_err(ShoveError::Serialization)?;
+    async fn audit(&self, record: &AuditRecord<PaymentEvent>) -> Result<(), ShoveError> {
+        let json = serde_json::to_string_pretty(record).map_err(ShoveError::Serialization)?;
         println!("[audit] {json}");
         Ok(())
     }
