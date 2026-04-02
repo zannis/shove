@@ -1,0 +1,47 @@
+src/backends/sns/client.rs
+  21278ad40e2206c9 27-29,32-34,56-58,61-63,70-76
+src/backends/sns/mod.rs
+  21278ad40e2206c9 4-14
+src/backends/sns/publisher.rs
+  21278ad40e2206c9 16-27,71,85-94,130-134,144,155,219-228,238,299-326
+src/lib.rs
+  21278ad40e2206c9 40,47-54
+README.md
+  21278ad40e2206c9 9,15,18-25,28,31,91-113,314-323,325,328,351,375
+src/backends/sns/router.rs
+  21278ad40e2206c9 1-212
+src/backends/sns/consumer_group.rs
+  21278ad40e2206c9 1-547
+src/backends/mod.rs
+  21278ad40e2206c9 4
+src/backends/sns/topology.rs
+  21278ad40e2206c9 11-15,52-81,100-102,107-119,148,185,191-363,367-404,411,429-438,443,445,447-461,463-464,524-546
+src/backends/sns/consumer.rs
+  21278ad40e2206c9 1-1097
+src/backends/sns/registry.rs
+  21278ad40e2206c9 1-115
+Cargo.toml
+  21278ad40e2206c9 17,20,37,87
+src/backends/sns/stats.rs
+  21278ad40e2206c9 1-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "1b588412935dcec4b7b21d9277ca83a14d6f0780",
+  "prompts": {
+    "21278ad40e2206c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdaea724-d258-41ba-83f7-a0d6d8d79c1a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 4204,
+      "total_deletions": 165,
+      "accepted_lines": 5832,
+      "overriden_lines": 0
+    }
+  }
+}
