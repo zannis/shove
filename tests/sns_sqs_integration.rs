@@ -1776,3 +1776,383 @@ async fn sequenced_multiple_keys_processed_concurrently() {
     assert_eq!(key_a, vec![1, 2, 3], "KEY-A messages should be in order");
     assert_eq!(key_b, vec![1, 2, 3], "KEY-B messages should be in order");
 }
+
+// ---------------------------------------------------------------------------
+// Task 11: Queue Stats Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stats_provider_fetches_queue_depth() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    // Publish 3 messages without consuming them.
+    for i in 1..=3 {
+        let msg = SimpleMessage {
+            id: format!("stats-{i}"),
+            content: format!("message {i}"),
+        };
+        setup
+            .publisher
+            .publish::<WorkTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+    }
+
+    // Give SQS time to propagate.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let provider =
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let stats = provider
+        .get_queue_stats("sqs-work")
+        .await
+        .expect("get_queue_stats should succeed");
+
+    assert!(
+        stats.messages_ready >= 3,
+        "expected at least 3 ready messages, got {}",
+        stats.messages_ready
+    );
+}
+
+#[tokio::test]
+async fn stats_provider_missing_queue_errors() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    // Do NOT declare any topology — queue_registry is empty.
+
+    let provider =
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let result = provider.get_queue_stats("nonexistent-queue").await;
+
+    assert!(
+        result.is_err(),
+        "expected Err for nonexistent queue, got Ok"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 12: Consumer Group & Registry Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn consumer_group_processes_messages() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    // Publish 5 messages.
+    for i in 1..=5 {
+        let msg = SimpleMessage {
+            id: format!("grp-{i}"),
+            content: format!("group message {i}"),
+        };
+        setup
+            .publisher
+            .publish::<WorkTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+    }
+
+    // Shared state across all consumer instances.
+    let template_handler = CountingHandler::new();
+    let handler_for_wait = template_handler.clone();
+
+    let config = SqsConsumerGroupConfig::new(2..=4)
+        .with_prefetch_count(5)
+        .with_max_retries(3);
+
+    let group_token = CancellationToken::new();
+
+    let mut group = SqsConsumerGroup::new::<WorkTopic, CountingHandler>(
+        "test-group",
+        "sqs-work",
+        config,
+        setup.sns_client.clone(),
+        setup.queue_registry.clone(),
+        group_token.clone(),
+        move || template_handler.clone(),
+    );
+
+    group.start();
+    assert_eq!(group.active_consumers(), 2, "group should start with 2 consumers");
+
+    let reached = handler_for_wait
+        .wait_for_count(5, Duration::from_secs(30))
+        .await;
+    assert!(reached, "handler should have processed all 5 messages");
+
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn consumer_group_scales_up_and_down() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let config = SqsConsumerGroupConfig::new(1..=4).with_prefetch_count(1);
+    let group_token = CancellationToken::new();
+
+    let mut group = SqsConsumerGroup::new::<WorkTopic, CountingHandler>(
+        "scale-test-group",
+        "sqs-work",
+        config,
+        setup.sns_client.clone(),
+        setup.queue_registry.clone(),
+        group_token.clone(),
+        CountingHandler::new,
+    );
+
+    group.start();
+    assert_eq!(group.active_consumers(), 1, "should start with 1 consumer");
+
+    assert!(group.scale_up(), "first scale_up should succeed");
+    assert_eq!(group.active_consumers(), 2, "should have 2 consumers after scale_up");
+
+    assert!(group.scale_up(), "second scale_up should succeed");
+    assert_eq!(group.active_consumers(), 3, "should have 3 consumers after second scale_up");
+
+    assert!(group.scale_down(), "first scale_down should succeed");
+    assert_eq!(group.active_consumers(), 2, "should have 2 consumers after scale_down");
+
+    assert!(group.scale_down(), "second scale_down should succeed");
+    assert_eq!(group.active_consumers(), 1, "should have 1 consumer after second scale_down");
+
+    let at_min = group.scale_down();
+    assert!(!at_min, "scale_down should return false when at minimum");
+    assert_eq!(group.active_consumers(), 1, "should still have 1 consumer at minimum");
+
+    group.shutdown().await;
+}
+
+#[tokio::test]
+async fn registry_register_declares_topology_and_starts() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+
+    let template_handler = CountingHandler::new();
+    let handler_for_wait = template_handler.clone();
+
+    let config = SqsConsumerGroupConfig::new(1..=2).with_prefetch_count(5);
+
+    let mut registry = SqsConsumerGroupRegistry::new(
+        setup.sns_client.clone(),
+        setup.topic_registry.clone(),
+        setup.queue_registry.clone(),
+    );
+
+    registry
+        .register::<WorkTopic, CountingHandler>(config, move || template_handler.clone())
+        .await
+        .expect("register should succeed");
+
+    // Topology should now be declared.
+    assert!(
+        setup.topic_registry.get("sqs-work").await.is_some(),
+        "topic_registry should have 'sqs-work' entry"
+    );
+    assert!(
+        setup.queue_registry.get("sqs-work").await.is_some(),
+        "queue_registry should have 'sqs-work' entry"
+    );
+
+    // Publish 1 message before starting.
+    let msg = SimpleMessage {
+        id: "reg-1".to_string(),
+        content: "registry message".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    registry.start_all();
+
+    let reached = handler_for_wait
+        .wait_for_count(1, Duration::from_secs(30))
+        .await;
+    assert!(reached, "registry consumer should have processed the message");
+
+    registry.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn registry_duplicate_registration_fails() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+
+    let config = SqsConsumerGroupConfig::new(1..=2);
+
+    let mut registry = SqsConsumerGroupRegistry::new(
+        setup.sns_client.clone(),
+        setup.topic_registry.clone(),
+        setup.queue_registry.clone(),
+    );
+
+    // First registration should succeed.
+    registry
+        .register::<WorkTopic, CountingHandler>(config, CountingHandler::new)
+        .await
+        .expect("first registration should succeed");
+
+    // Second registration for the same topic should fail.
+    let config2 = SqsConsumerGroupConfig::new(1..=2);
+    let result = registry
+        .register::<WorkTopic, CountingHandler>(config2, CountingHandler::new)
+        .await;
+
+    assert!(result.is_err(), "duplicate registration should return Err");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("already registered"),
+        "error message should mention 'already registered', got: {err_msg}"
+    );
+
+    registry.shutdown_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Task 13: Deserialization Failure Test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn deserialization_failure_rejects_to_dlq() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    // Send a malformed message directly via SQS (bypasses SNS publisher/serialization).
+    let sqs_client = broker.sqs_client().await;
+    let queue_url = setup
+        .queue_registry
+        .get("sqs-work")
+        .await
+        .expect("sqs-work queue URL should be registered");
+
+    sqs_client
+        .send_message()
+        .queue_url(&queue_url)
+        .message_body("not valid JSON")
+        .send()
+        .await
+        .expect("sending raw malformed message should succeed");
+
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc).with_max_retries(1).with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // Poll DLQ until message appears or timeout.
+    let dlq_url = setup
+        .queue_registry
+        .get("sqs-work-dlq")
+        .await
+        .expect("DLQ URL should be registered");
+
+    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let result = sqs_client
+                .receive_message()
+                .queue_url(&dlq_url)
+                .max_number_of_messages(10)
+                .wait_time_seconds(1)
+                .send()
+                .await
+                .expect("failed to poll DLQ");
+
+            let msgs = result.messages.unwrap_or_default();
+            if !msgs.is_empty() {
+                return msgs;
+            }
+        }
+    })
+    .await
+    .expect("malformed message should be routed to DLQ within 30 seconds");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert!(
+        !dlq_messages.is_empty(),
+        "malformed message should have been dead-lettered"
+    );
+    assert_eq!(
+        handler.count(),
+        0,
+        "handler should not have been invoked (deserialization failed before handler)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 14: Error Handling Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn consumer_run_on_undeclared_queue_fails() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    // Do NOT declare topology — queue_registry is empty.
+
+    let handler = CountingHandler::new();
+    let shutdown = CancellationToken::new();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let result = consumer
+        .run::<WorkTopic>(handler, ConsumerOptions::new(shutdown))
+        .await;
+
+    assert!(result.is_err(), "run should return Err for undeclared queue");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("no SQS queue URL registered"),
+        "error should mention 'no SQS queue URL registered', got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn run_dlq_on_topic_without_dlq_fails() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<NoDlqTopic>().await;
+
+    let handler = CountingHandler::new();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let result = consumer.run_dlq::<NoDlqTopic>(handler).await;
+
+    assert!(result.is_err(), "run_dlq should return Err for topic without DLQ");
+}
+
+#[tokio::test]
+async fn consumer_run_dlq_on_topic_without_dlq_name_fails() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<NoDlqTopic>().await;
+
+    let handler = CountingHandler::new();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let result = consumer.run_dlq::<NoDlqTopic>(handler).await;
+
+    assert!(result.is_err(), "run_dlq should Err when topic has no DLQ configured");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("no DLQ configured") || err_msg.contains("DLQ"),
+        "error should mention DLQ, got: {err_msg}"
+    );
+}
