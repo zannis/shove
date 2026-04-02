@@ -45,6 +45,10 @@ struct Cli {
     /// Processes up to prefetch_count messages concurrently per consumer.
     #[arg(long)]
     concurrent: bool,
+
+    /// Override prefetch count (default: computed from messages/consumers, clamped to [1, 100]).
+    #[arg(long)]
+    prefetch: Option<u16>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -116,6 +120,7 @@ struct Scenario {
     handler: HandlerProfile,
     deadline: Duration,
     concurrent: bool,
+    prefetch: Option<u16>,
 }
 
 /// Per-tier configuration with handler-specific message counts.
@@ -129,7 +134,7 @@ struct TierConfig {
 const MODERATE: TierConfig = TierConfig {
     name: "moderate",
     consumers: &[1, 4, 8, 16, 32],
-    messages: (50_000, 10_000, 500, 20),
+    messages: (50_000, 10_000, 500, 200),
 };
 
 const HIGH: TierConfig = TierConfig {
@@ -158,7 +163,12 @@ fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> 
     Duration::from_millis(deadline_ms as u64)
 }
 
-fn build_scenarios(tier: &TierArg, handler: &HandlerArg, concurrent: bool) -> Vec<Scenario> {
+fn build_scenarios(
+    tier: &TierArg,
+    handler: &HandlerArg,
+    concurrent: bool,
+    prefetch: Option<u16>,
+) -> Vec<Scenario> {
     let mut scenarios = Vec::new();
 
     let handlers: Vec<HandlerProfile> = match handler {
@@ -197,6 +207,7 @@ fn build_scenarios(tier: &TierArg, handler: &HandlerArg, concurrent: bool) -> Ve
                     handler: h,
                     deadline: scenario_deadline(messages, c, h),
                     concurrent,
+                    prefetch,
                 });
             }
         }
@@ -214,9 +225,14 @@ struct ScenarioResult {
     consumers: u16,
     handler: String,
     throughput_msg_per_sec: f64,
-    latency_p50_ms: f64,
-    latency_p95_ms: f64,
-    latency_p99_ms: f64,
+    /// Dispatch latency: publish → handler entry (queue wait + framework overhead).
+    dispatch_p50_ms: f64,
+    dispatch_p95_ms: f64,
+    dispatch_p99_ms: f64,
+    /// End-to-end latency: publish → handler completion (dispatch + handler work).
+    e2e_p50_ms: f64,
+    e2e_p95_ms: f64,
+    e2e_p99_ms: f64,
     scaling_efficiency: f64,
     peak_rss_mb: f64,
     cpu_pct: f64,
@@ -343,10 +359,19 @@ impl Broker {
 #[derive(Debug, Clone, Copy)]
 struct LatencyRecord {
     /// Time from publish to handler entry (includes broker transit + queue wait).
-    #[allow(dead_code)]
     enqueue_to_receive_ns: u64,
     /// Time from publish to handler completion (end-to-end).
     enqueue_to_ack_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LatencyPercentiles {
+    dispatch_p50: f64,
+    dispatch_p95: f64,
+    dispatch_p99: f64,
+    e2e_p50: f64,
+    e2e_p95: f64,
+    e2e_p99: f64,
 }
 
 struct LatencyRecorder {
@@ -367,21 +392,38 @@ impl LatencyRecorder {
         let _ = self.tx.send(record);
     }
 
-    async fn compute_percentiles(&self) -> (f64, f64, f64) {
+    /// Returns `(dispatch_p50, dispatch_p95, dispatch_p99, e2e_p50, e2e_p95, e2e_p99)`.
+    async fn compute_percentiles(&self) -> LatencyPercentiles {
         let mut rx = self.rx.lock().await;
         let mut records = Vec::new();
         while let Ok(r) = rx.try_recv() {
             records.push(r);
         }
         if records.is_empty() {
-            return (0.0, 0.0, 0.0);
+            return LatencyPercentiles::default();
         }
-        records.sort_unstable_by_key(|r| r.enqueue_to_ack_ns);
         let len = records.len();
-        let p50 = records[len * 50 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
-        let p95 = records[len * 95 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
-        let p99 = records[len * 99 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
-        (p50, p95, p99)
+
+        // Dispatch latency: publish → handler entry.
+        records.sort_unstable_by_key(|r| r.enqueue_to_receive_ns);
+        let dispatch_p50 = records[len * 50 / 100].enqueue_to_receive_ns as f64 / 1_000_000.0;
+        let dispatch_p95 = records[len * 95 / 100].enqueue_to_receive_ns as f64 / 1_000_000.0;
+        let dispatch_p99 = records[len * 99 / 100].enqueue_to_receive_ns as f64 / 1_000_000.0;
+
+        // End-to-end latency: publish → handler completion.
+        records.sort_unstable_by_key(|r| r.enqueue_to_ack_ns);
+        let e2e_p50 = records[len * 50 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
+        let e2e_p95 = records[len * 95 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
+        let e2e_p99 = records[len * 99 / 100].enqueue_to_ack_ns as f64 / 1_000_000.0;
+
+        LatencyPercentiles {
+            dispatch_p50,
+            dispatch_p95,
+            dispatch_p99,
+            e2e_p50,
+            e2e_p95,
+            e2e_p99,
+        }
     }
 }
 
@@ -583,12 +625,19 @@ impl MessageHandler<StressTopic> for StressHandler {
 
 // ── Scenario execution ──────────────────────────────────────────────────────
 
+struct ScenarioMetrics {
+    throughput: f64,
+    latencies: LatencyPercentiles,
+    peak_rss_mb: f64,
+    cpu_pct: f64,
+    duration_secs: f64,
+}
+
 async fn run_scenario(
     broker: &Broker,
     scenario: &Scenario,
     cancel: &CancellationToken,
-) -> Result<(f64, f64, f64, f64, f64, f64, f64), String> {
-    // Returns: (throughput, p50, p95, p99, peak_rss_mb, cpu_pct, duration_secs)
+) -> Result<ScenarioMetrics, String> {
     broker.purge_queue().await;
 
     let epoch = Instant::now();
@@ -619,7 +668,11 @@ async fn run_scenario(
     registry
         .register::<StressTopic, StressHandler>(
             ConsumerGroupConfig::new(consumers..=consumers)
-                .with_prefetch_count((scenario.messages / consumers as u64).clamp(1, 100) as u16)
+                .with_prefetch_count(
+                    scenario
+                        .prefetch
+                        .unwrap_or((scenario.messages / consumers as u64).clamp(1, 100) as u16),
+                )
                 .with_concurrent_processing(scenario.concurrent),
             move || StressHandler {
                 epoch,
@@ -660,20 +713,18 @@ async fn run_scenario(
 
     let duration = start.elapsed();
     let throughput = scenario.messages as f64 / duration.as_secs_f64();
-    let (p50, p95, p99) = recorder.compute_percentiles().await;
+    let latencies = recorder.compute_percentiles().await;
     let resources = sampler.stop().await;
 
     registry.shutdown_all().await;
 
-    Ok((
+    Ok(ScenarioMetrics {
         throughput,
-        p50,
-        p95,
-        p99,
-        resources.peak_rss_mb,
-        resources.cpu_pct,
-        duration.as_secs_f64(),
-    ))
+        latencies,
+        peak_rss_mb: resources.peak_rss_mb,
+        cpu_pct: resources.cpu_pct,
+        duration_secs: duration.as_secs_f64(),
+    })
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -681,7 +732,7 @@ async fn run_scenario(
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let scenarios = build_scenarios(&cli.tier, &cli.handler, cli.concurrent);
+    let scenarios = build_scenarios(&cli.tier, &cli.handler, cli.concurrent, cli.prefetch);
 
     let broker = Broker::start().await;
 
@@ -707,35 +758,46 @@ async fn main() {
             eprintln!("skipping remaining scenarios");
             break;
         }
+        let prefetch_str = scenario
+            .prefetch
+            .map(|p| format!(" | pf={p}"))
+            .unwrap_or_default();
         eprintln!(
-            "[{}/{}] {} | {}msg | {}c | {} ...",
+            "[{}/{}] {} | {}msg | {}c{} | {} ...",
             i + 1,
             scenarios.len(),
             scenario.tier,
             scenario.messages,
             scenario.consumers,
+            prefetch_str,
             scenario.handler,
         );
 
         match run_scenario(&broker, scenario, &cancel).await {
-            Ok((throughput, p50, p95, p99, peak_rss_mb, cpu_pct, duration_secs)) => {
+            Ok(m) => {
                 eprintln!(
-                    "  -> {:.1} msg/s | p50={:.1}ms p95={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
-                    throughput, p50, p95, p99, cpu_pct, peak_rss_mb, duration_secs
+                    "  -> {:.1} msg/s | dispatch p50={:.1}ms p99={:.1}ms | e2e p50={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
+                    m.throughput,
+                    m.latencies.dispatch_p50, m.latencies.dispatch_p99,
+                    m.latencies.e2e_p50, m.latencies.e2e_p99,
+                    m.cpu_pct, m.peak_rss_mb, m.duration_secs
                 );
                 results.push(ScenarioResult {
                     tier: scenario.tier.to_string(),
                     messages: scenario.messages,
                     consumers: scenario.consumers,
                     handler: scenario.handler.to_string(),
-                    throughput_msg_per_sec: throughput,
-                    latency_p50_ms: p50,
-                    latency_p95_ms: p95,
-                    latency_p99_ms: p99,
+                    throughput_msg_per_sec: m.throughput,
+                    dispatch_p50_ms: m.latencies.dispatch_p50,
+                    dispatch_p95_ms: m.latencies.dispatch_p95,
+                    dispatch_p99_ms: m.latencies.dispatch_p99,
+                    e2e_p50_ms: m.latencies.e2e_p50,
+                    e2e_p95_ms: m.latencies.e2e_p95,
+                    e2e_p99_ms: m.latencies.e2e_p99,
                     scaling_efficiency: 0.0, // computed below
-                    peak_rss_mb,
-                    cpu_pct,
-                    duration_secs,
+                    peak_rss_mb: m.peak_rss_mb,
+                    cpu_pct: m.cpu_pct,
+                    duration_secs: m.duration_secs,
                 });
             }
             Err(e) => {
@@ -792,36 +854,35 @@ async fn main() {
 fn print_table(report: &Report) {
     println!();
     println!(
-        "{:<10} {:>8} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8} {:>7} {:>8} {:>6}",
-        "TIER",
-        "MSGS",
-        "CONSUMERS",
-        "HANDLER",
-        "MSGS/SEC",
-        "p50",
-        "p95",
-        "p99",
-        "SCALE",
-        "RSS(MB)",
-        "CPU%"
+        "{:<10} {:>8} {:>5} {:>8} {:>8}  {:>9} {:>9} {:>9}  {:>9} {:>9} {:>9}  {:>6} {:>7} {:>5}",
+        "TIER", "MSGS", "C", "HANDLER", "MSG/SEC",
+        "disp p50", "disp p95", "disp p99",
+        "e2e p50", "e2e p95", "e2e p99",
+        "SCALE", "RSS(MB)", "CPU%"
     );
-    println!("{}", "-".repeat(103));
+    println!("{}", "-".repeat(145));
     for r in &report.results {
         println!(
-            "{:<10} {:>8} {:>10} {:>8} {:>10.0} {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>6.1}x {:>8.1} {:>5.0}%",
+            "{:<10} {:>8} {:>5} {:>8} {:>8.0}  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>8.1}ms {:>8.1}ms {:>8.1}ms  {:>5.1}x {:>7.1} {:>4.0}%",
             r.tier,
             r.messages,
             r.consumers,
             r.handler,
             r.throughput_msg_per_sec,
-            r.latency_p50_ms,
-            r.latency_p95_ms,
-            r.latency_p99_ms,
+            r.dispatch_p50_ms,
+            r.dispatch_p95_ms,
+            r.dispatch_p99_ms,
+            r.e2e_p50_ms,
+            r.e2e_p95_ms,
+            r.e2e_p99_ms,
             r.scaling_efficiency,
             r.peak_rss_mb,
             r.cpu_pct,
         );
     }
+    println!();
+    println!("dispatch = publish → handler entry (queue wait + framework overhead)");
+    println!("e2e      = publish → handler completion (dispatch + handler work)");
     if !report.failures.is_empty() {
         println!("\nFailed scenarios:");
         for f in &report.failures {

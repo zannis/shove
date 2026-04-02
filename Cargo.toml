@@ -1,6 +1,6 @@
 [package]
 name = "shove"
-version = "0.5.0"
+version = "0.5.1"
 description = "Async tasks via pubsub on steroids. Comes with built-in support for complex queue configurations, audit logs, autoscaling consumer groups and more."
 edition = "2024"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
