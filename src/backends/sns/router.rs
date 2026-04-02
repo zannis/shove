@@ -26,6 +26,10 @@ pub(crate) async fn route_retry(
     retry_count: u32,
 ) {
     let delay = if topology.hold_queues().is_empty() {
+        warn!(
+            queue_url,
+            "retrying message but no hold queues configured — visibility timeout set to 0"
+        );
         Duration::ZERO
     } else {
         let index = (retry_count as usize).min(topology.hold_queues().len() - 1);
@@ -54,7 +58,18 @@ pub(crate) async fn route_retry(
 /// Reject a message. Sets visibility to 0 so SQS redelivers it immediately,
 /// incrementing ApproximateReceiveCount. Once maxReceiveCount is exceeded,
 /// SQS native redrive moves it to the DLQ.
-pub(crate) async fn route_reject(sqs: &aws_sdk_sqs::Client, queue_url: &str, receipt_handle: &str) {
+pub(crate) async fn route_reject(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+    topology: &QueueTopology,
+) {
+    if topology.dlq().is_none() {
+        warn!(
+            queue_url,
+            "rejecting message on queue with no DLQ configured — message will cycle until SQS retention expires"
+        );
+    }
     if let Err(e) = sqs
         .change_message_visibility()
         .queue_url(queue_url)

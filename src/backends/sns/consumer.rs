@@ -18,7 +18,7 @@ use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
-use crate::topology::SequenceFailure;
+use crate::topology::{QueueTopology, SequenceFailure};
 
 pub struct SqsConsumer {
     client: SnsClient,
@@ -257,7 +257,7 @@ where
                     max_retries = options.max_retries,
                     "message exceeded max retries, rejecting"
                 );
-                router::route_reject(sqs, queue_url, &receipt_handle).await;
+                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
             }
 
@@ -271,7 +271,7 @@ where
                         queue_url,
                         "failed to deserialize SQS message, rejecting"
                     );
-                    router::route_reject(sqs, queue_url, &receipt_handle).await;
+                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     continue;
                 }
             };
@@ -317,7 +317,7 @@ async fn route_outcome(
         Outcome::Retry => {
             router::route_retry(sqs, queue_url, receipt_handle, topology, retry_count).await;
         }
-        Outcome::Reject => router::route_reject(sqs, queue_url, receipt_handle).await,
+        Outcome::Reject => router::route_reject(sqs, queue_url, receipt_handle, topology).await,
         Outcome::Defer => router::route_defer(sqs, queue_url, receipt_handle, topology).await,
     }
 }
@@ -416,7 +416,7 @@ where
                 for (_key, msgs) in pending_deliveries.drain() {
                     for msg in msgs {
                         let rh = msg.receipt_handle().unwrap_or_default();
-                        router::route_reject(sqs, queue_url, rh).await;
+                        router::route_reject(sqs, queue_url, rh, topology).await;
                     }
                 }
                 return Ok(());
@@ -511,6 +511,7 @@ where
                         handler,
                         options,
                         on_failure,
+                        topology,
                         poisoned_keys,
                         &completed_tx,
                         &mut key_states,
@@ -528,7 +529,7 @@ where
                         );
                         poisoned_keys.insert(key.clone());
                     }
-                    router::route_reject(sqs, queue_url, &receipt_handle).await;
+                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     in_flight_count -= 1;
                     drain_pending_for_key::<T, H>(
                         sqs,
@@ -537,6 +538,7 @@ where
                         handler,
                         options,
                         on_failure,
+                        topology,
                         poisoned_keys,
                         &completed_tx,
                         &mut key_states,
@@ -588,7 +590,7 @@ where
                                 router::route_ack(sqs, queue_url, &receipt_handle).await;
                             }
                             Outcome::Reject => {
-                                router::route_reject(sqs, queue_url, &receipt_handle).await;
+                                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                             }
                             Outcome::Retry => {
                                 router::route_retry(sqs, queue_url, &receipt_handle, topology, retry_count)
@@ -605,7 +607,7 @@ where
                 for (_key, msgs) in pending_deliveries.drain() {
                     for msg in msgs {
                         let rh = msg.receipt_handle().unwrap_or_default();
-                        router::route_reject(sqs, queue_url, rh).await;
+                        router::route_reject(sqs, queue_url, rh, topology).await;
                     }
                 }
                 return Ok(());
@@ -646,7 +648,7 @@ where
                                 queue_url,
                                 "message missing MessageGroupId, rejecting"
                             );
-                            router::route_reject(sqs, queue_url, &receipt_handle).await;
+                            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                             continue;
                         }
                     };
@@ -660,7 +662,7 @@ where
                             queue_url,
                             "message with poisoned sequence key, rejecting"
                         );
-                        router::route_reject(sqs, queue_url, &receipt_handle).await;
+                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                         continue;
                     }
 
@@ -683,11 +685,11 @@ where
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
                                     let rh = pd.receipt_handle().unwrap_or_default();
-                                    router::route_reject(sqs, queue_url, rh).await;
+                                    router::route_reject(sqs, queue_url, rh, topology).await;
                                 }
                             }
                         }
-                        router::route_reject(sqs, queue_url, &receipt_handle).await;
+                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                         continue;
                     }
 
@@ -706,7 +708,7 @@ where
                                         limit,
                                         "per-key pending buffer full, rejecting"
                                     );
-                                    router::route_reject(sqs, queue_url, &receipt_handle).await;
+                                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                     continue;
                                 }
                             }
@@ -745,7 +747,7 @@ where
                                             limit,
                                             "per-key pending buffer full, rejecting"
                                         );
-                                        router::route_reject(sqs, queue_url, &receipt_handle).await;
+                                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                         continue;
                                     }
                                 }
@@ -778,7 +780,7 @@ where
                             if on_failure == SequenceFailure::FailAll {
                                 poisoned_keys.insert(seq_key.clone());
                             }
-                            router::route_reject(sqs, queue_url, &receipt_handle).await;
+                            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                             continue;
                         }
                     };
@@ -820,6 +822,7 @@ async fn drain_pending_for_key<T, H>(
     handler: &Arc<H>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
+    topology: &'static QueueTopology,
     poisoned_keys: &mut HashSet<String>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key_states: &mut HashMap<String, KeyState>,
@@ -834,7 +837,7 @@ async fn drain_pending_for_key<T, H>(
         if let Some(pending) = pending_deliveries.remove(key) {
             for pd in pending {
                 let rh = pd.receipt_handle().unwrap_or_default();
-                router::route_reject(sqs, queue_url, rh).await;
+                router::route_reject(sqs, queue_url, rh, topology).await;
             }
         }
         return;
@@ -860,15 +863,15 @@ async fn drain_pending_for_key<T, H>(
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
                 // Reject remaining pending for this key too.
-                router::route_reject(sqs, queue_url, &receipt_handle).await;
+                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 while let Some(pd) = pending.pop_front() {
                     let rh = pd.receipt_handle().unwrap_or_default();
-                    router::route_reject(sqs, queue_url, rh).await;
+                    router::route_reject(sqs, queue_url, rh, topology).await;
                 }
                 pending_deliveries.remove(key);
                 return;
             }
-            router::route_reject(sqs, queue_url, &receipt_handle).await;
+            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
             continue;
         }
 
@@ -886,12 +889,12 @@ async fn drain_pending_for_key<T, H>(
                     poisoned_keys.insert(key.to_string());
                     while let Some(pd) = pending.pop_front() {
                         let rh = pd.receipt_handle().unwrap_or_default();
-                        router::route_reject(sqs, queue_url, rh).await;
+                        router::route_reject(sqs, queue_url, rh, topology).await;
                     }
                     pending_deliveries.remove(key);
                     return;
                 }
-                router::route_reject(sqs, queue_url, &receipt_handle).await;
+                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
             }
         };
