@@ -1,0 +1,41 @@
+src/backends/sns/consumer_group.rs
+  21278ad40e2206c9 168-175,178
+examples/sequenced_pubsub.rs
+  21278ad40e2206c9 4,206,224
+README.md
+  21278ad40e2206c9 110,138,178,182,202
+src/consumer.rs
+  21278ad40e2206c9 84,88-89,93,99,113
+src/backends/sns/consumer.rs
+  21278ad40e2206c9 997,1018,1028
+src/backends/rabbitmq/consumer_group.rs
+  21278ad40e2206c9 174-181,184
+src/backends/rabbitmq/consumer.rs
+  21278ad40e2206c9 1043,1059,1069
+benches/consumer_overhead.rs
+  21278ad40e2206c9 16
+examples/concurrent_pubsub.rs
+  21278ad40e2206c9 3,204,219
+tests/rabbitmq_integration.rs
+  21278ad40e2206c9 1552,2038,2121,2203,2254,2313,2375,2484,2736,2759,2805,2828,2874,2930,2994,3055,3144,3260,3298,3339,3392,3451,3475,3525,3569,3779,3937
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "f475ba77a8e356056ea71548a84f2689dc29078d",
+  "prompts": {
+    "21278ad40e2206c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdaea724-d258-41ba-83f7-a0d6d8d79c1a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 70,
+      "total_deletions": 78,
+      "accepted_lines": 3367,
+      "overriden_lines": 0
+    }
+  }
+}
