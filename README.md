@@ -10,9 +10,11 @@ Topic-typed pub/sub for Rust.
 
 **shove** is an async message publishing and consuming library that binds message types to their broker destinations at compile time. Define a topic once — the type system ensures publishers and consumers agree on message shape, queue names, retry policy, and ordering guarantees.
 
+> **Warning:** shove is under active development and is not considered production-ready. The API is subject to breaking changes and comes with no guarantees of stability, correctness, or backwards compatibility.
+
 ## Background
 
-The first version of this was built for [Lens](https://lens.xyz) to handle millions of async events — ingestion, cross-chain migrations, backfills. It was a custom broker, and it worked, but lacked auditing and autoscaling.
+The first version of this crate was built for [Lens](https://lens.xyz) to handle millions of async events — ingestion, cross-chain migrations, backfills. It was a custom broker, and it worked, but lacked auditing and autoscaling.
 
 shove is the do-over. RabbitMQ handles storage and routing. shove handles the rest: type-safe topics, retry topologies, ordered delivery, consumer groups that scale themselves.
 
@@ -33,6 +35,8 @@ We needed a name for "throw a job at something and stop thinking about it." Push
 - **Dead-letter queues** — opt-in per topic. Messages that exceed max retries or are explicitly rejected route to DLQ with full death metadata.
 - **Sequenced delivery** — strict per-key ordering via `SequencedTopic`. Messages sharing a sequence key are delivered in publish order. Two failure policies: `Skip` (continue the sequence) or `FailAll` (terminate it).
 - **Consumer groups & autoscaling** — dynamically scale consumers up and down based on queue depth, with hysteresis and cooldown to prevent flapping.
+- **Audit logging** — wrap any handler with `Audited<H, A>` to capture every delivery attempt as a structured `AuditRecord`. Implement the `AuditHandler` trait for your persistence backend, or enable the `audit` feature for a built-in handler that publishes records to a dedicated `shove-audit-log` topic.
+- **Handler timeout** — set a per-consumer `handler_timeout` in `ConsumerOptions` or `ConsumerGroupConfig`. Messages that exceed the deadline are automatically retried.
 - **Backend-agnostic core** — traits for `Publisher`, `Consumer`, `TopologyDeclarer`, and `MessageHandler` live in the core crate. Backends are feature-gated.
 
 ## Backends
@@ -42,13 +46,19 @@ We needed a name for "throw a job at something and stop thinking about it." Push
 | RabbitMQ | `rabbitmq` | Stable |
 | AWS SNS/SQS | `sns` | Planned |
 
+Both `rabbitmq` and `audit` are default features. To opt out of the built-in audit backend:
+
+```toml
+shove = { version = "0.4", default-features = false, features = ["rabbitmq"] }
+```
+
 ## Quick start
 
 Add shove to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-shove = { version = "0.1", features = ["rabbitmq"] }
+shove = { version = "0.4", features = ["rabbitmq"] }
 ```
 
 ### Define a topic
@@ -193,6 +203,51 @@ let mgmt = ManagementClient::new(ManagementConfig::new("http://localhost:15672",
 let mut autoscaler = Autoscaler::new(mgmt, AutoscalerConfig::default());
 autoscaler.run(Arc::new(Mutex::new(registry)), shutdown_token).await;
 ```
+
+## Audit logging
+
+Wrap any handler with `Audited` to record every delivery attempt as a structured `AuditRecord`:
+
+```rust,no_run
+use shove::*;
+
+struct MyAuditSink;
+
+impl<T: Topic> AuditHandler<T> for MyAuditSink
+where
+    T::Message: Clone + serde::Serialize,
+{
+    async fn audit(&self, record: &AuditRecord<T::Message>) -> error::Result<()> {
+        println!("{}", serde_json::to_string(record).unwrap());
+        Ok(())
+    }
+}
+
+let handler = Audited::new(SettlementHandler, MyAuditSink);
+
+// Use it anywhere a normal handler is accepted — consumers, consumer groups, etc.
+consumer
+    .run::<OrderSettlement>(handler, ConsumerOptions::new(shutdown_token))
+    .await?;
+```
+
+Each `AuditRecord` contains: `trace_id`, `topic`, `payload`, `metadata`, `outcome`, `duration_ms`, and `timestamp`.
+
+If the audit handler returns `Err`, the message is retried — audit failure is never silently dropped.
+
+### Built-in `ShoveAuditHandler`
+
+Enable the `audit` feature (on by default) for a handler that publishes records back to a dedicated `shove-audit-log` topic:
+
+```rust,no_run
+use shove::*;
+use shove::rabbitmq::*;
+
+let audit = ShoveAuditHandler::new(publisher.clone());
+let handler = Audited::new(SettlementHandler, audit);
+```
+
+This creates a self-contained audit trail inside your broker. The audit topic itself is not audited.
 
 ## Examples
 

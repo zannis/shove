@@ -19,7 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -- --check
       - run: cargo clippy -q --all-features -- -D warnings
-      - run: cargo install -q cargo-nextest
+      - run: cargo install -q cargo-nextest --locked
       - run: cargo nextest run --all-features
       - run: cargo publish --dry-run --all-features
 
