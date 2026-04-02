@@ -86,15 +86,15 @@ async fn main() -> Result<(), ShoveError> {
     let mut registry = ConsumerGroupRegistry::new(client.clone());
 
     registry.register::<WorkQueue, TaskHandler>(
-        "work-queue-group",             // group name
-        WorkQueue::topology().queue(),  // queue to read from
+        "work-queue-group",            // group name
+        WorkQueue::topology().queue(), // queue to read from
         ConsumerGroupConfig {
-            prefetch_count: 10,         // messages per consumer
-            min_consumers: 1,           // floor
-            max_consumers: 5,           // ceiling
+            prefetch_count: 10, // messages per consumer
+            min_consumers: 1,   // floor
+            max_consumers: 5,   // ceiling
             max_retries: 3,
         },
-        || TaskHandler,                 // factory — called once per spawned consumer
+        || TaskHandler, // factory — called once per spawned consumer
     );
 
     // Start all groups at their minimum consumer count.

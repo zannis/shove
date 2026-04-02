@@ -1,0 +1,56 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-edit
+        run: cargo install -q cargo-edit
+
+      - name: Bump version
+        id: bump
+        run: |
+          cargo set-version -q --bump ${{ inputs.bump }}
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run tests
+        run: cargo test -q --all-features
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: v${{ steps.bump.outputs.version }}"
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin main --tags
+
+      - name: Publish to crates.io
+        run: cargo publish -q --all-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
