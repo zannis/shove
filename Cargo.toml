@@ -12,7 +12,7 @@ categories = ["asynchronous"]
 [features]
 default = ["rabbitmq", "audit"]
 rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
-sns = ["dep:aws-config", "dep:futures"]
+sns = ["dep:aws-config", "dep:aws-sdk-sns"]
 audit = []
 
 [dependencies]
@@ -28,12 +28,14 @@ lapin = { version = "4", features = ["rustls--ring"], optional = true }
 futures-lite = { version = "2", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
 aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optional = true }
+aws-sdk-sns = { version = "1", optional = true }
 futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq"] }
+testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack"] }
+aws-sdk-sqs = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -74,3 +76,7 @@ required-features = ["rabbitmq"]
 [[example]]
 name = "stress"
 required-features = ["rabbitmq"]
+
+[[test]]
+name = "sns_integration"
+required-features = ["sns"]

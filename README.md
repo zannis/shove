@@ -62,6 +62,25 @@ let event = SettlementEvent { order_id: "ORD-1".into(), amount_cents: 5000 };
 publisher.publish::<OrderSettlement>(&event).await?;
 ```
 
+### Publish (SNS)
+
+```rust,no_run
+use shove::sns::*;
+use std::sync::Arc;
+
+let client = SnsClient::new(&SnsConfig {
+    region: None,          // uses AWS SDK default chain
+    endpoint_url: None,    // uses real AWS (set for LocalStack)
+}).await?;
+
+let registry = Arc::new(TopicRegistry::new());
+let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
+declare_topic::<OrderSettlement>(&declarer).await?;
+
+let publisher = SnsPublisher::new(client, registry);
+publisher.publish::<OrderSettlement>(&event).await?;
+```
+
 ### Consume
 
 ```rust,no_run
@@ -266,7 +285,7 @@ This creates a self-contained audit trail inside your broker. The audit topic it
 | Backend     | Feature flag | Status  |
 |-------------|-------------|---------|
 | RabbitMQ    | `rabbitmq`  | Stable  |
-| AWS SNS/SQS | `sns`       | Planned |
+| AWS SNS/SQS | `sns`       | In Progress (Publisher) |
 
 Both `rabbitmq` and `audit` are default features. To opt out of the built-in audit backend:
 
@@ -317,7 +336,8 @@ cargo bench -q --features rabbitmq --bench consumer_overhead -- --output json
 
 ## Roadmap
 
-- [ ] **SNS/SQS backend** — publish via SNS, consume via SQS FIFO queues with message group ID for sequenced delivery
+- [x] **SNS publisher** — publish via SNS standard and FIFO topics with batch support and auto-chunking
+- [ ] **SQS consumer** — consume via SQS queues with message group ID for sequenced delivery
 - [ ] **Observability** — built-in OpenTelemetry metrics (publish latency, consume rate, retry/DLQ counts)
 - [ ] **Multi-backend topology declaration** — declare topics across backends in a single call
 

@@ -37,6 +37,15 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 pub(crate) const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 // Backend re-exports
+#[cfg(feature = "sns")]
+pub mod sns {
+    pub use crate::backends::sns::{
+        client::{SnsClient, SnsConfig},
+        publisher::SnsPublisher,
+        topology::{SnsTopologyDeclarer, TopicRegistry},
+    };
+}
+
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq {
     pub use crate::backends::rabbitmq::{
