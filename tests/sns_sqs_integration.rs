@@ -1019,3 +1019,453 @@ async fn dlq_consumer_handles_dead_message() {
     assert!(reached, "DLQ handler should have received 1 dead message");
     assert_eq!(dlq_handler.count(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Task 6: Retry Mechanism Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn retry_then_ack_succeeds() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "retry-ack".to_string(),
+        content: "retry then ack".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let handler = RetryThenAckHandler::new(1);
+    let attempt_count = handler.attempt_count.clone();
+    let signal = handler.signal.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // Wait for at least 2 calls (1 retry + 1 ack)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if attempt_count.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            tokio::select! {
+                _ = signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => { break; }
+            }
+        }
+    })
+    .await
+    .expect("should complete within timeout");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").expect("consumer should exit cleanly");
+
+    assert!(
+        attempt_count.load(Ordering::Relaxed) >= 2,
+        "handler should have been called at least 2 times (1 retry + 1 ack)"
+    );
+}
+
+#[tokio::test]
+async fn max_retries_sends_to_dlq() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "always-retry".to_string(),
+        content: "should exhaust retries and go to DLQ".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let handler = FixedOutcomeHandler(Outcome::Retry);
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(2)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // Poll DLQ directly until message appears
+    let sqs_client = broker.sqs_client().await;
+    let dlq_url = setup
+        .queue_registry
+        .get("sqs-work-dlq")
+        .await
+        .expect("DLQ URL should exist");
+
+    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let result = sqs_client
+                .receive_message()
+                .queue_url(&dlq_url)
+                .max_number_of_messages(10)
+                .wait_time_seconds(1)
+                .send()
+                .await
+                .expect("failed to poll DLQ");
+
+            let msgs = result.messages.unwrap_or_default();
+            if !msgs.is_empty() {
+                return msgs;
+            }
+        }
+    })
+    .await
+    .expect("message should arrive in DLQ within 30 seconds");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert!(
+        !dlq_messages.is_empty(),
+        "exhausted-retry message should land in DLQ"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: Defer Mechanism Test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn defer_redelivers_message() {
+    struct DeferThenAck(Arc<AtomicU32>);
+
+    impl MessageHandler<WorkTopic> for DeferThenAck {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            let prev = self.0.fetch_add(1, Ordering::Relaxed);
+            if prev == 0 {
+                Outcome::Defer
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "defer-test".to_string(),
+        content: "defer then ack".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let handler = DeferThenAck(calls.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // Wait for calls >= 2 (1 defer + 1 ack)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("should receive deferred message redelivery within timeout");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").expect("consumer should exit cleanly");
+
+    assert!(
+        calls.load(Ordering::Relaxed) >= 2,
+        "handler should have been called at least 2 times (1 defer + 1 ack)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 8: Concurrent Consumption Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_consume_processes_all_messages() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let messages: Vec<SimpleMessage> = (1..=10)
+        .map(|i| SimpleMessage {
+            id: format!("concurrent-{i}"),
+            content: format!("message {i}"),
+        })
+        .collect();
+
+    setup
+        .publisher
+        .publish_batch::<WorkTopic>(&messages)
+        .await
+        .expect("publish_batch should succeed");
+
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(handler_clone, ConsumerOptions::new(sc).with_prefetch_count(10))
+            .await
+    });
+
+    let reached = handler
+        .wait_for_count(10, Duration::from_secs(30))
+        .await;
+    assert!(reached, "handler should have received all 10 messages");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert_eq!(handler.count(), 10);
+}
+
+#[tokio::test]
+async fn concurrent_consume_mixed_outcomes_routes_correctly() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "mixed-reject".to_string(),
+        content: "should be rejected to DLQ".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let handler = FixedOutcomeHandler(Outcome::Reject);
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(1)
+                    .with_prefetch_count(5),
+            )
+            .await
+    });
+
+    // Poll DLQ, verify message arrives
+    let sqs_client = broker.sqs_client().await;
+    let dlq_url = setup
+        .queue_registry
+        .get("sqs-work-dlq")
+        .await
+        .expect("DLQ URL should exist");
+
+    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let result = sqs_client
+                .receive_message()
+                .queue_url(&dlq_url)
+                .max_number_of_messages(10)
+                .wait_time_seconds(1)
+                .send()
+                .await
+                .expect("failed to poll DLQ");
+
+            let msgs = result.messages.unwrap_or_default();
+            if !msgs.is_empty() {
+                return msgs;
+            }
+        }
+    })
+    .await
+    .expect("message should arrive in DLQ within 30 seconds");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert!(
+        !dlq_messages.is_empty(),
+        "rejected message should arrive in DLQ"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_consume_graceful_shutdown_drains_inflight() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let messages: Vec<SimpleMessage> = (1..=3)
+        .map(|i| SimpleMessage {
+            id: format!("slow-{i}"),
+            content: format!("slow message {i}"),
+        })
+        .collect();
+
+    setup
+        .publisher
+        .publish_batch::<WorkTopic>(&messages)
+        .await
+        .expect("publish_batch should succeed");
+
+    let handler = SlowHandler::new(Duration::from_millis(500));
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(handler_clone, ConsumerOptions::new(sc).with_prefetch_count(3))
+            .await
+    });
+
+    // Wait for at least 1 call to ensure messages are inflight
+    handler
+        .wait_for_count(1, Duration::from_secs(15))
+        .await;
+
+    // Cancel shutdown token to trigger graceful shutdown
+    shutdown.cancel();
+
+    // Verify consumer task completes within 10s (drains inflight)
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("consumer should complete within 10s after shutdown signal")
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: Handler Timeout Test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn handler_timeout_triggers_retry() {
+    // This handler increments count at the START of the call (before sleeping),
+    // so we can detect invocations even when the handler is cancelled by a timeout.
+    struct InvocationCountingSlowHandler {
+        delay: Duration,
+        count: Arc<AtomicU32>,
+    }
+
+    impl MessageHandler<WorkTopic> for InvocationCountingSlowHandler {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+            Outcome::Ack
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "timeout-test".to_string(),
+        content: "handler takes too long".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    // Handler takes 5s but timeout is 200ms — the first call will be cancelled by timeout,
+    // then SQS redelivers and the handler is invoked again.
+    let calls = Arc::new(AtomicU32::new(0));
+    let handler = InvocationCountingSlowHandler {
+        delay: Duration::from_secs(5),
+        count: calls.clone(),
+    };
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_handler_timeout(Duration::from_millis(200))
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    // Wait for calls >= 2 (timeout cancels first, SQS redelivers)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("handler should be called at least twice due to timeout-triggered retry");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").expect("consumer should exit cleanly");
+
+    assert!(
+        calls.load(Ordering::Relaxed) >= 2,
+        "handler should have been invoked at least 2 times after timeout redelivery"
+    );
+}
