@@ -92,7 +92,13 @@ pub(crate) async fn route_defer(
     }
 }
 
-pub(crate) async fn route_reject(delivery: &Delivery) {
+pub(crate) async fn route_reject(delivery: &Delivery, topology: &QueueTopology) {
+    if topology.dlq().is_none() {
+        warn!(
+            queue = topology.queue(),
+            "rejecting message on queue with no DLQ configured — message will be discarded"
+        );
+    }
     if let Err(e) = delivery
         .nack(BasicNackOptions {
             requeue: false,

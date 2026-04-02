@@ -194,7 +194,7 @@ impl RabbitMqConsumer {
         &self,
         handler: Arc<H>,
         queue: &str,
-        _topology: &'static QueueTopology,
+        topology: &'static QueueTopology,
         options: &ConsumerOptions,
         on_failure: SequenceFailure,
         poisoned_keys: &mut HashSet<String>,
@@ -270,7 +270,7 @@ impl RabbitMqConsumer {
                                 );
                                 poisoned_keys.insert(key.clone());
                             }
-                            router::route_reject(&delivery).await;
+                            router::route_reject(&delivery, topology).await;
                         }
                         in_flight_count -= 1;
 
@@ -286,6 +286,7 @@ impl RabbitMqConsumer {
                             &mut in_flight_count,
                             pending_deliveries,
                             queue,
+                            topology,
                         )
                         .await;
                     }
@@ -375,7 +376,7 @@ impl RabbitMqConsumer {
                                     )
                                     .await;
                                 }
-                                Outcome::Reject => router::route_reject(&delivery).await,
+                                Outcome::Reject => router::route_reject(&delivery, topology).await,
                                 Outcome::Defer => {
                                     if !shard_hold_queues.is_empty() {
                                         let hold_queue = &shard_hold_queues[0];
@@ -433,7 +434,7 @@ impl RabbitMqConsumer {
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
-                        router::route_reject(&delivery).await;
+                        router::route_reject(&delivery, topology).await;
                         continue;
                     }
 
@@ -455,11 +456,11 @@ impl RabbitMqConsumer {
                             // Also reject all pending deliveries for this key.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
-                                    router::route_reject(&pd).await;
+                                    router::route_reject(&pd, topology).await;
                                 }
                             }
                         }
-                        router::route_reject(&delivery).await;
+                        router::route_reject(&delivery, topology).await;
                         continue;
                     }
 
@@ -478,7 +479,7 @@ impl RabbitMqConsumer {
                                         limit,
                                         "per-key pending buffer full, rejecting to DLQ"
                                     );
-                                    router::route_reject(&delivery).await;
+                                    router::route_reject(&delivery, topology).await;
                                     continue;
                                 }
                             }
@@ -517,7 +518,7 @@ impl RabbitMqConsumer {
                                             limit,
                                             "per-key pending buffer full, rejecting to DLQ"
                                         );
-                                        router::route_reject(&delivery).await;
+                                        router::route_reject(&delivery, topology).await;
                                         continue;
                                     }
                                 }
@@ -538,7 +539,7 @@ impl RabbitMqConsumer {
 
                     // ── Spawn handler for this key ──
                     let metadata = extract_message_metadata(&delivery);
-                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue).await {
+                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology).await {
                         None => {
                             // Reject undeserializable messages immediately.
                             if on_failure == SequenceFailure::FailAll {
@@ -586,6 +587,7 @@ impl RabbitMqConsumer {
         in_flight_count: &mut usize,
         pending_deliveries: &mut HashMap<String, VecDeque<Delivery>>,
         queue: &str,
+        topology: &'static QueueTopology,
     ) where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
@@ -595,7 +597,7 @@ impl RabbitMqConsumer {
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
-                    router::route_reject(&pd).await;
+                    router::route_reject(&pd, topology).await;
                 }
             }
             return;
@@ -620,25 +622,25 @@ impl RabbitMqConsumer {
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
                     // Reject remaining pending for this key too.
-                    router::route_reject(&delivery).await;
+                    router::route_reject(&delivery, topology).await;
                     while let Some(pd) = pending.pop_front() {
-                        router::route_reject(&pd).await;
+                        router::route_reject(&pd, topology).await;
                     }
                     pending_deliveries.remove(key);
                     return;
                 }
-                router::route_reject(&delivery).await;
+                router::route_reject(&delivery, topology).await;
                 continue;
             }
 
             let metadata = extract_message_metadata(&delivery);
-            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue).await {
+            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology).await {
                 None => {
                     // Extra FailAll poisoning on deserialization failure.
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {
-                            router::route_reject(&pd).await;
+                            router::route_reject(&pd, topology).await;
                         }
                         pending_deliveries.remove(key);
                         return;
@@ -795,13 +797,13 @@ impl RabbitMqConsumer {
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
                         );
-                        router::route_reject(&delivery).await;
+                        router::route_reject(&delivery, topology).await;
                         continue;
                     }
 
                     let metadata = extract_message_metadata(&delivery);
 
-                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue).await {
+                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology).await {
                         let rx = spawn_handler::<T, H>(
                             &handler,
                             message,
@@ -883,7 +885,7 @@ async fn route_outcome(
     match outcome {
         Outcome::Ack => router::route_ack(delivery).await,
         Outcome::Retry => router::route_retry(delivery, topology, publisher, retry_count).await,
-        Outcome::Reject => router::route_reject(delivery).await,
+        Outcome::Reject => router::route_reject(delivery, topology).await,
         Outcome::Defer => router::route_defer(delivery, topology, publisher).await,
     }
 }
@@ -1020,6 +1022,7 @@ async fn try_deserialize_or_reject<T: Topic>(
     delivery: &Delivery,
     metadata: &MessageMetadata,
     queue: &str,
+    topology: &'static QueueTopology,
 ) -> Option<T::Message>
 where
     T::Message: for<'de> serde::Deserialize<'de>,
@@ -1033,7 +1036,7 @@ where
                 queue = %queue,
                 "failed to deserialize message"
             );
-            router::route_reject(delivery).await;
+            router::route_reject(delivery, topology).await;
             None
         }
     }
