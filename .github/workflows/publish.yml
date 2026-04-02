@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: "Version bump type"
+        description: "Version bump type (none to skip)"
         required: true
         type: choice
         options:
           - patch
           - minor
           - major
+          - none
 
 permissions:
   contents: write
@@ -29,12 +30,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-edit
+        if: inputs.bump != 'none'
         run: cargo install -q cargo-edit
 
       - name: Bump version
-        id: bump
+        if: inputs.bump != 'none'
+        run: cargo set-version -q --bump ${{ inputs.bump }}
+
+      - name: Resolve version
+        id: version
         run: |
-          cargo set-version -q --bump ${{ inputs.bump }}
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -42,12 +47,13 @@ jobs:
         run: cargo test -q --all-features
 
       - name: Commit and tag
+        if: inputs.bump != 'none'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "release: v${{ steps.bump.outputs.version }}"
-          git tag "v${{ steps.bump.outputs.version }}"
+          git commit -m "release: v${{ steps.version.outputs.version }}"
+          git tag "v${{ steps.version.outputs.version }}"
           git push origin main --tags
 
       - name: Publish to crates.io
