@@ -9,9 +9,12 @@ pub enum Outcome {
     /// Transient failure. Route to a hold queue for delayed retry.
     /// Increments the retry counter.
     ///
-    /// The consumer picks the hold queue based on retry count:
-    /// `hold_queues[min(retry_count, len - 1)]` — this gives automatic
-    /// escalating backoff when multiple hold queues are defined.
+    /// The consumer picks the hold queue matching the current retry count,
+    /// giving automatic escalating backoff when multiple hold queues are
+    /// defined. Once the retry count exceeds the number of hold queues,
+    /// messages keep going to the last (longest-delay) hold queue until
+    /// [`ConsumerOptions::max_retries`](crate::ConsumerOptions::max_retries)
+    /// is exhausted, at which point the message is routed to the DLQ.
     ///
     /// If no hold queues are configured, the message is nacked with requeue
     /// (broker-level redelivery with no delay).

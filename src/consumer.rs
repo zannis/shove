@@ -12,7 +12,29 @@ use crate::topic::{SequencedTopic, Topic};
 #[derive(Clone)]
 pub struct ConsumerOptions {
     /// Maximum retries before automatically rejecting to DLQ.
-    /// Only relevant if the topic has hold queues.
+    ///
+    /// Each time a handler returns [`Outcome::Retry`](crate::Outcome::Retry),
+    /// the retry counter increments and the message is routed to a hold queue
+    /// selected by `hold_queues[min(retry_count, len - 1)]`. This gives
+    /// escalating backoff when multiple hold queues are defined — once the
+    /// counter exceeds the number of hold queues, retries keep using the
+    /// last (longest-delay) hold queue.
+    ///
+    /// When `retry_count >= max_retries`, the message is sent to the DLQ
+    /// instead of another hold queue.
+    ///
+    /// # Example
+    ///
+    /// With `max_retries = 5` and hold queues `[1s, 5s, 30s]`:
+    ///
+    /// | retry | hold queue | delay |
+    /// |-------|-----------|-------|
+    /// | 0     | `[0]`     | 1s    |
+    /// | 1     | `[1]`     | 5s    |
+    /// | 2     | `[2]`     | 30s   |
+    /// | 3     | `[2]`     | 30s   |
+    /// | 4     | `[2]`     | 30s   |
+    /// | 5     | — DLQ —   |       |
     pub max_retries: u32,
     /// Prefetch count (number of unacked messages the broker will deliver).
     pub prefetch_count: u16,
@@ -48,6 +70,10 @@ impl ConsumerOptions {
     }
 
     /// Set the maximum number of retries before rejecting to DLQ.
+    ///
+    /// This controls the total retry budget, independent of how many hold
+    /// queues are configured. See [`max_retries`](Self::max_retries) for
+    /// details on how retries escalate through hold queues.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self

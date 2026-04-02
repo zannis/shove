@@ -202,7 +202,29 @@ impl TopologyBuilder {
         self
     }
 
-    /// Adds a hold queue with the given delay.
+    /// Adds a hold queue with the given delay for retry backoff.
+    ///
+    /// Hold queues are selected in order by retry count. Define multiple hold 
+    /// queues with increasing delays to get escalating backoff. Once the retry 
+    /// count exceeds the number of hold queues, messages keep going to the last
+    /// (longest-delay) hold queue on every subsequent retry until
+    /// [`ConsumerOptions::max_retries`](crate::ConsumerOptions::max_retries) is exhausted, at which point the
+    /// message is routed to the DLQ.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // With max_retries = 5:
+    /// // retry 0 → hold-1s, retry 1 → hold-5s,
+    /// // retries 2..4 → hold-30s (clamped to last),
+    /// // retry 5 → DLQ
+    /// TopologyBuilder::new("orders")
+    ///     .hold_queue(Duration::from_secs(1))   // 1st retry: 1s
+    ///     .hold_queue(Duration::from_secs(5))   // 2nd retry: 5s
+    ///     .hold_queue(Duration::from_secs(30))  // 3rd+ retries: 30s until DLQ
+    ///     .dlq()
+    ///     .build();
+    /// ```
     pub fn hold_queue(mut self, delay: Duration) -> Self {
         self.hold_queues.push(delay);
         self
