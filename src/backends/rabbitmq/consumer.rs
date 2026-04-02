@@ -1,10 +1,15 @@
-use futures_lite::StreamExt;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions};
-use lapin::types::FieldTable;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+use futures_lite::StreamExt;
+use lapin::message::Delivery;
+use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions};
+use lapin::types::FieldTable;
+use lapin::{Channel, Error as LapinError};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::RECONNECT_DELAY;
@@ -20,6 +25,83 @@ use crate::handler::MessageHandler;
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::SequenceFailure;
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Opens a channel with QoS and starts consuming from `queue`.
+async fn open_consumer(
+    client: &RabbitMqClient,
+    queue: &str,
+    prefetch_count: u16,
+) -> Result<(Channel, lapin::Consumer)> {
+    let channel = client.create_confirm_channel().await?;
+    channel
+        .basic_qos(prefetch_count, BasicQosOptions::default())
+        .await
+        .map_err(|e| ShoveError::Connection(format!("failed to set QoS: {e}")))?;
+    let consumer = channel
+        .basic_consume(
+            lapin::types::ShortString::from(queue),
+            lapin::types::ShortString::from(""),
+            BasicConsumeOptions {
+                no_ack: false,
+                ..BasicConsumeOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| ShoveError::Connection(format!("failed to start consumer on {queue}: {e}")))?;
+    Ok((channel, consumer))
+}
+
+/// Unwrap a delivery from the consumer stream.
+fn unwrap_delivery(
+    item: Option<std::result::Result<Delivery, LapinError>>,
+    queue: &str,
+) -> Result<Delivery> {
+    match item {
+        Some(Ok(d)) => Ok(d),
+        Some(Err(e)) => Err(ShoveError::Connection(format!(
+            "consumer stream error on {queue}: {e}"
+        ))),
+        None => Err(ShoveError::Connection(format!(
+            "consumer stream closed for {queue}"
+        ))),
+    }
+}
+
+/// Run `f` in a reconnect loop, retrying on transient errors until shutdown.
+async fn run_with_reconnect<F, Fut>(
+    shutdown: &CancellationToken,
+    queue: &str,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    loop {
+        match f().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if shutdown.is_cancelled() {
+                    return Ok(());
+                }
+                warn!("consumer error on {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}");
+                tokio::select! {
+                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RabbitMqConsumer
+// ---------------------------------------------------------------------------
 
 pub struct RabbitMqConsumer {
     client: RabbitMqClient,
@@ -42,26 +124,10 @@ impl RabbitMqConsumer {
         T::Message: for<'de> serde::Deserialize<'de>,
         H: MessageHandler<T>,
     {
-        loop {
-            match self
-                .consume_loop::<T, H>(handler, queue, topology, &options)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if options.shutdown.is_cancelled() {
-                        return Ok(());
-                    }
-                    warn!(
-                        "consumer error on queue {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}"
-                    );
-                    tokio::select! {
-                        _ = tokio::time::sleep(RECONNECT_DELAY) => {}
-                        _ = options.shutdown.cancelled() => return Ok(()),
-                    }
-                }
-            }
-        }
+        run_with_reconnect(&options.shutdown, queue, || {
+            self.consume_loop::<T, H>(handler, queue, topology, &options)
+        })
+        .await
     }
 
     /// Like `run_internal` but maintains a per-sub-queue poisoned-key set
@@ -97,9 +163,7 @@ impl RabbitMqConsumer {
                     if options.shutdown.is_cancelled() {
                         return Ok(());
                     }
-                    warn!(
-                        "sequenced consumer error on queue {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}"
-                    );
+                    warn!("consumer error on {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}");
                     tokio::select! {
                         _ = tokio::time::sleep(RECONNECT_DELAY) => {}
                         _ = options.shutdown.cancelled() => return Ok(()),
@@ -123,29 +187,8 @@ impl RabbitMqConsumer {
         T::Message: for<'de> serde::Deserialize<'de>,
         H: MessageHandler<T>,
     {
-        let channel = self.client.create_confirm_channel().await?;
-
-        channel
-            .basic_qos(1, BasicQosOptions::default())
-            .await
-            .map_err(|e| ShoveError::Connection(format!("failed to set QoS: {e}")))?;
-
-        let publisher = ChannelPublisher::new(channel.clone());
-
-        let mut consumer = channel
-            .basic_consume(
-                lapin::types::ShortString::from(queue),
-                lapin::types::ShortString::from(""),
-                BasicConsumeOptions {
-                    no_ack: false,
-                    ..BasicConsumeOptions::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|e| {
-                ShoveError::Connection(format!("failed to start consumer on {queue}: {e}"))
-            })?;
+        let (channel, mut stream) = open_consumer(&self.client, queue, 1).await?;
+        let publisher = ChannelPublisher::new(channel);
 
         info!("sequenced consumer started on sub-queue {queue}");
 
@@ -155,24 +198,17 @@ impl RabbitMqConsumer {
                     debug!("shutdown signal received, stopping sequenced consumer on {queue}");
                     return Ok(());
                 }
-                item = consumer.next() => {
-                    let delivery = match item {
-                        Some(Ok(d)) => d,
-                        Some(Err(e)) => {
-                            return Err(ShoveError::Connection(format!("consumer stream error on {queue}: {e}")));
-                        }
-                        None => {
-                            return Err(ShoveError::Connection(format!("consumer stream closed for {queue}")));
-                        }
-                    };
+                item = stream.next() => {
+                    let delivery = unwrap_delivery(item, queue)?;
 
-                    let sequence_key = delivery.routing_key.to_string();
                     let retry_count = get_retry_count(&delivery);
 
                     // FailAll: skip messages whose sequence key has been poisoned.
-                    if poisoned_keys.contains(&sequence_key) {
+                    if on_failure == SequenceFailure::FailAll
+                        && poisoned_keys.contains(delivery.routing_key.as_str())
+                    {
                         warn!(
-                            sequence_key = %sequence_key,
+                            sequence_key = %delivery.routing_key,
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
@@ -180,7 +216,6 @@ impl RabbitMqConsumer {
                         continue;
                     }
 
-                    // Max retries exceeded → treat as permanent rejection.
                     if retry_count >= options.max_retries {
                         warn!(
                             queue = %queue,
@@ -190,11 +225,11 @@ impl RabbitMqConsumer {
                         );
                         if on_failure == SequenceFailure::FailAll {
                             info!(
-                                sequence_key = %sequence_key,
+                                sequence_key = %delivery.routing_key,
                                 queue = %queue,
                                 "poisoning sequence key (FailAll)"
                             );
-                            poisoned_keys.insert(sequence_key);
+                            poisoned_keys.insert(delivery.routing_key.to_string());
                         }
                         router::route_reject(&delivery).await;
                         continue;
@@ -226,11 +261,11 @@ impl RabbitMqConsumer {
                         Outcome::Reject => {
                             if on_failure == SequenceFailure::FailAll {
                                 info!(
-                                    sequence_key = %sequence_key,
+                                    sequence_key = %delivery.routing_key,
                                     queue = %queue,
                                     "poisoning sequence key (FailAll)"
                                 );
-                                poisoned_keys.insert(sequence_key);
+                                poisoned_keys.insert(delivery.routing_key.to_string());
                             }
                             router::route_reject(&delivery).await;
                         }
@@ -256,29 +291,9 @@ impl RabbitMqConsumer {
         T::Message: for<'de> serde::Deserialize<'de>,
         H: MessageHandler<T>,
     {
-        let channel = self.client.create_confirm_channel().await?;
-
-        channel
-            .basic_qos(options.prefetch_count, BasicQosOptions::default())
-            .await
-            .map_err(|e| ShoveError::Connection(format!("failed to set QoS: {e}")))?;
-
-        let publisher = ChannelPublisher::new(channel.clone());
-
-        let mut consumer = channel
-            .basic_consume(
-                lapin::types::ShortString::from(queue),
-                lapin::types::ShortString::from(""),
-                BasicConsumeOptions {
-                    no_ack: false,
-                    ..BasicConsumeOptions::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|e| {
-                ShoveError::Connection(format!("failed to start consumer on {queue}: {e}"))
-            })?;
+        let (channel, mut stream) =
+            open_consumer(&self.client, queue, options.prefetch_count).await?;
+        let publisher = ChannelPublisher::new(channel);
 
         info!("consumer started on queue {queue}");
 
@@ -288,16 +303,8 @@ impl RabbitMqConsumer {
                     debug!("shutdown signal received, stopping consumer on {queue}");
                     return Ok(());
                 }
-                item = consumer.next() => {
-                    let delivery = match item {
-                        Some(Ok(d)) => d,
-                        Some(Err(e)) => {
-                            return Err(ShoveError::Connection(format!("consumer stream error on {queue}: {e}")));
-                        }
-                        None => {
-                            return Err(ShoveError::Connection(format!("consumer stream closed for {queue}")));
-                        }
-                    };
+                item = stream.next() => {
+                    let delivery = unwrap_delivery(item, queue)?;
 
                     let retry_count = get_retry_count(&delivery);
 
@@ -362,27 +369,7 @@ where
     T::Message: for<'de> serde::Deserialize<'de>,
     H: MessageHandler<T>,
 {
-    let channel = client.create_confirm_channel().await?;
-
-    channel
-        .basic_qos(options.prefetch_count, BasicQosOptions::default())
-        .await
-        .map_err(|e| ShoveError::Connection(format!("failed to set QoS: {e}")))?;
-
-    let mut consumer = channel
-        .basic_consume(
-            lapin::types::ShortString::from(dlq),
-            lapin::types::ShortString::from(""),
-            BasicConsumeOptions {
-                no_ack: false,
-                ..BasicConsumeOptions::default()
-            },
-            FieldTable::default(),
-        )
-        .await
-        .map_err(|e| {
-            ShoveError::Connection(format!("failed to start DLQ consumer on {dlq}: {e}"))
-        })?;
+    let (_channel, mut stream) = open_consumer(client, dlq, options.prefetch_count).await?;
 
     info!("DLQ consumer started on queue {dlq}");
 
@@ -392,16 +379,8 @@ where
                 debug!("shutdown signal received, stopping DLQ consumer on {dlq}");
                 return Ok(());
             }
-            item = consumer.next() => {
-                let delivery = match item {
-                    Some(Ok(d)) => d,
-                    Some(Err(e)) => {
-                        return Err(ShoveError::Connection(format!("DLQ consumer stream error on {dlq}: {e}")));
-                    }
-                    None => {
-                        return Err(ShoveError::Connection(format!("DLQ consumer stream closed for {dlq}")));
-                    }
-                };
+            item = stream.next() => {
+                let delivery = unwrap_delivery(item, dlq)?;
 
                 let metadata = extract_dead_metadata(&delivery);
 
@@ -446,7 +425,7 @@ impl Consumer for RabbitMqConsumer {
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
@@ -461,7 +440,7 @@ impl Consumer for RabbitMqConsumer {
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
@@ -506,7 +485,7 @@ impl Consumer for RabbitMqConsumer {
     fn run_dlq<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         async move {
             let topology = T::topology();
@@ -516,23 +495,10 @@ impl Consumer for RabbitMqConsumer {
             let shutdown = client.shutdown_token();
             let options = ConsumerOptions::new(shutdown);
 
-            loop {
-                match consume_dlq_loop::<T, _>(&client, &handler, dlq, &options).await {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        if options.shutdown.is_cancelled() {
-                            return Ok(());
-                        }
-                        warn!(
-                            "DLQ consumer error on queue {dlq}: {e}. Reconnecting in {RECONNECT_DELAY:?}"
-                        );
-                        tokio::select! {
-                            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
-                            _ = options.shutdown.cancelled() => return Ok(()),
-                        }
-                    }
-                }
-            }
+            run_with_reconnect(&options.shutdown, dlq, || {
+                consume_dlq_loop::<T, _>(&client, &handler, dlq, &options)
+            })
+            .await
         }
     }
 }

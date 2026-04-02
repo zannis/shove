@@ -36,6 +36,9 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["rabbitmq"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+rand = "0.10"
+mach2 = "0.6"
 
 [[bench]]
 name = "autoscaler"
@@ -57,3 +60,7 @@ required-features = ["rabbitmq"]
 [[example]]
 name = "audited_consumer"
 required-features = ["rabbitmq", "audit"]
+
+[[example]]
+name = "stress"
+required-features = ["rabbitmq"]

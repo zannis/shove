@@ -10,6 +10,24 @@ const X_DEAD_LETTER_ROUTING_KEY: &str = "x-dead-letter-routing-key";
 const X_MESSAGE_TTL: &str = "x-message-ttl";
 const X_SINGLE_ACTIVE_CONSUMER: &str = "x-single-active-consumer";
 
+fn with_dlq_routing(args: &mut FieldTable, dlq: &str) {
+    args.insert(
+        X_DEAD_LETTER_EXCHANGE.into(),
+        AMQPValue::LongString("".into()),
+    );
+    args.insert(
+        X_DEAD_LETTER_ROUTING_KEY.into(),
+        AMQPValue::LongString(dlq.into()),
+    );
+}
+
+fn hold_queue_args(route_back_to: &str, ttl_ms: i64) -> FieldTable {
+    let mut args = FieldTable::default();
+    args.insert(X_MESSAGE_TTL.into(), AMQPValue::LongLongInt(ttl_ms));
+    with_dlq_routing(&mut args, route_back_to);
+    args
+}
+
 /// Declares RabbitMQ broker resources for a topic's topology.
 ///
 /// All declarations are idempotent — safe to call on every startup.
@@ -38,40 +56,18 @@ impl RabbitMqTopologyDeclarer {
     }
 
     async fn declare_unsequenced(&self, topology: &QueueTopology) -> Result<()> {
-        // 1. Declare DLQ (if present) — plain durable queue
         if let Some(dlq) = topology.dlq() {
             self.declare_queue(dlq, FieldTable::default()).await?;
         }
 
-        // 2. Declare main queue with dead-letter routing to DLQ
         let mut main_args = FieldTable::default();
         if let Some(dlq) = topology.dlq() {
-            main_args.insert(
-                X_DEAD_LETTER_EXCHANGE.into(),
-                AMQPValue::LongString("".into()),
-            );
-            main_args.insert(
-                X_DEAD_LETTER_ROUTING_KEY.into(),
-                AMQPValue::LongString(dlq.into()),
-            );
+            with_dlq_routing(&mut main_args, dlq);
         }
         self.declare_queue(topology.queue(), main_args).await?;
 
-        // 3. Declare hold queues with TTL → route back to main queue on expiry
         for hq in topology.hold_queues() {
-            let mut args = FieldTable::default();
-            args.insert(
-                X_MESSAGE_TTL.into(),
-                AMQPValue::LongLongInt(hq.delay().as_millis() as i64),
-            );
-            args.insert(
-                X_DEAD_LETTER_EXCHANGE.into(),
-                AMQPValue::LongString("".into()),
-            );
-            args.insert(
-                X_DEAD_LETTER_ROUTING_KEY.into(),
-                AMQPValue::LongString(topology.queue().into()),
-            );
+            let args = hold_queue_args(topology.queue(), hq.delay().as_millis() as i64);
             self.declare_queue(hq.name(), args).await?;
         }
 
@@ -83,27 +79,11 @@ impl RabbitMqTopologyDeclarer {
             .sequencing()
             .expect("declare_sequenced called without sequencing config");
 
-        // 1. Declare DLQ + hold queues (shared with unsequenced)
         if let Some(dlq) = topology.dlq() {
             self.declare_queue(dlq, FieldTable::default()).await?;
         }
         for hq in topology.hold_queues() {
-            let mut args = FieldTable::default();
-            args.insert(
-                X_MESSAGE_TTL.into(),
-                AMQPValue::LongLongInt(hq.delay().as_millis() as i64),
-            );
-            args.insert(
-                X_DEAD_LETTER_EXCHANGE.into(),
-                AMQPValue::LongString("".into()),
-            );
-            // Hold queues route back to main queue on expiry
-            // For sequenced topics, this goes to the main queue which is NOT consumed
-            // (consumers read sub-queues). The main queue acts as a staging area.
-            args.insert(
-                X_DEAD_LETTER_ROUTING_KEY.into(),
-                AMQPValue::LongString(topology.queue().into()),
-            );
+            let args = hold_queue_args(topology.queue(), hq.delay().as_millis() as i64);
             self.declare_queue(hq.name(), args).await?;
         }
 
@@ -133,14 +113,7 @@ impl RabbitMqTopologyDeclarer {
             let mut args = FieldTable::default();
             args.insert(X_SINGLE_ACTIVE_CONSUMER.into(), AMQPValue::Boolean(true));
             if let Some(dlq) = topology.dlq() {
-                args.insert(
-                    X_DEAD_LETTER_EXCHANGE.into(),
-                    AMQPValue::LongString("".into()),
-                );
-                args.insert(
-                    X_DEAD_LETTER_ROUTING_KEY.into(),
-                    AMQPValue::LongString(dlq.into()),
-                );
+                with_dlq_routing(&mut args, dlq);
             }
             self.declare_queue(&sub_queue, args).await?;
 

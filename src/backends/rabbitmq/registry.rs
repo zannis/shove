@@ -45,12 +45,7 @@ impl ConsumerGroupRegistry {
         H: MessageHandler<T> + Clone + 'static,
     {
         let topology = T::topology();
-        let queue = topology.queue().to_string();
-        let name = queue.clone();
-
-        let channel = self.client.create_channel().await?;
-        let declarer = RabbitMqTopologyDeclarer::new(channel);
-        declarer.declare(topology).await?;
+        let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
             return Err(ShoveError::Topology(format!(
@@ -58,11 +53,15 @@ impl ConsumerGroupRegistry {
             )));
         }
 
-        info!(group = %name, queue = %queue, "registering consumer group");
+        let channel = self.client.create_channel().await?;
+        let declarer = RabbitMqTopologyDeclarer::new(channel);
+        declarer.declare(topology).await?;
+
+        info!(group = %name, "registering consumer group");
         let group_token = self.client.shutdown_token().child_token();
         let group = ConsumerGroup::new::<T, H>(
             name.clone(),
-            queue,
+            name.clone(),
             config,
             self.client.clone(),
             group_token,
