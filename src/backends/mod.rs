@@ -1,5 +1,5 @@
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq;
 
-#[cfg(feature = "sns")]
+#[cfg(feature = "pub-aws-sns")]
 pub mod sns;

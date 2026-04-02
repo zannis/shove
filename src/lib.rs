@@ -37,12 +37,21 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 pub(crate) const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 // Backend re-exports
-#[cfg(feature = "sns")]
+#[cfg(feature = "pub-aws-sns")]
 pub mod sns {
     pub use crate::backends::sns::{
         client::{SnsClient, SnsConfig},
         publisher::SnsPublisher,
         topology::{SnsTopologyDeclarer, TopicRegistry},
+    };
+
+    #[cfg(feature = "aws-sns-sqs")]
+    pub use crate::backends::sns::{
+        consumer::SqsConsumer,
+        consumer_group::{SqsConsumerGroup, SqsConsumerGroupConfig},
+        registry::SqsConsumerGroupRegistry,
+        stats::{SqsQueueStats, SqsQueueStatsProvider},
+        topology::QueueRegistry,
     };
 }
 

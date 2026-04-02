@@ -1,6 +1,6 @@
 [package]
 name = "shove"
-version = "0.5.1"
+version = "0.6.0"
 description = "Async tasks via pubsub on steroids. Comes with built-in support for complex queue configurations, audit logs, autoscaling consumer groups and more."
 edition = "2024"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
@@ -10,9 +10,14 @@ keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
 categories = ["asynchronous"]
 
 [features]
-default = ["rabbitmq", "audit"]
+default = []
 rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
+
+# SNS Publisher
+pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
+
+# Complete pubsub with AWS SNS and AWS SQS
+aws-sns-sqs = ["pub-aws-sns", "dep:aws-sdk-sqs"]
 audit = []
 
 [dependencies]
@@ -29,13 +34,13 @@ futures-lite = { version = "2", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
 aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optional = true }
 aws-sdk-sns = { version = "1", optional = true }
+aws-sdk-sqs = { version = "1", optional = true }
 futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack"] }
-aws-sdk-sqs = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -79,4 +84,4 @@ required-features = ["rabbitmq"]
 
 [[test]]
 name = "sns_integration"
-required-features = ["sns"]
+required-features = ["pub-aws-sns"]

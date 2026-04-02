@@ -6,22 +6,29 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust, backed by RabbitMQ.
+Type-safe async pub/sub for Rust. Supports RabbitMQ and AWS SNS/SQS.
 
 Define a topic once — shove handles the plumbing: queue topology, retries, DLQ, ordered delivery, auditing and autoscaling consumer groups. A single consumer handles 10k+ msg/s out of the box.
 
 ## Quick start
 
-Requires a running RabbitMQ instance with the consistent-hash exchange plugin enabled. Start one with the included docker-compose:
+No features are enabled by default. Add the backend you need:
+
+```sh
+# RabbitMQ backend
+cargo add shove --features rabbitmq
+
+# SNS publisher only (publish to SNS, consume elsewhere)
+cargo add shove --features pub-aws-sns
+
+# Full AWS SNS+SQS backend (publisher + consumer)
+cargo add shove --features aws-sns-sqs
+```
+
+For RabbitMQ, you need a running instance with the consistent-hash exchange plugin enabled. Start one with the included docker-compose:
 
 ```sh
 docker compose up -d
-```
-
-Add to your project:
-
-```sh
-cargo add shove
 ```
 
 ### Define a topic
@@ -81,7 +88,29 @@ let publisher = SnsPublisher::new(client, registry);
 publisher.publish::<OrderSettlement>(&event).await?;
 ```
 
-### Consume
+### Consume (SQS)
+
+```rust,no_run
+use shove::sns::*;
+use std::sync::Arc;
+
+let client = SnsClient::new(&SnsConfig {
+    region: None,
+    endpoint_url: None,
+}).await?;
+
+let topic_registry = Arc::new(TopicRegistry::new());
+let queue_registry = Arc::new(QueueRegistry::new());
+let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
+    .with_queue_registry(queue_registry.clone());
+declare_topic::<OrderSettlement>(&declarer).await?;
+
+let consumer = SqsConsumer::new(client.clone(), queue_registry.clone());
+let options = ConsumerOptions::new(shutdown_token).with_prefetch_count(10);
+consumer.run_concurrent::<OrderSettlement>(handler, options).await?;
+```
+
+### Consume (RabbitMQ)
 
 ```rust,no_run
 use shove::rabbitmq::*;
@@ -282,15 +311,21 @@ This creates a self-contained audit trail inside your broker. The audit topic it
 
 ### Backends
 
-| Backend     | Feature flag | Status  |
-|-------------|-------------|---------|
-| RabbitMQ    | `rabbitmq`  | Stable  |
-| AWS SNS/SQS | `sns`       | In Progress (Publisher) |
+| Backend          | Feature flag   | Status  |
+|------------------|---------------|---------|
+| RabbitMQ         | `rabbitmq`    | Stable  |
+| AWS SNS (publish)| `pub-aws-sns` | In Progress |
+| AWS SNS+SQS      | `aws-sns-sqs` | In Progress |
 
-Both `rabbitmq` and `audit` are default features. To opt out of the built-in audit backend:
+`pub-aws-sns` enables SNS publisher only — useful when you publish to SNS but consume on a different stack.
+`aws-sns-sqs` enables the full SNS+SQS backend (publisher + consumer + consumer groups + autoscaling). It implies `pub-aws-sns`.
+
+Sequenced topics use **SNS FIFO topics** with `MessageGroupId` for per-key ordering and sharded FIFO SQS queues for parallel consumption.
+
+No features are enabled by default. Enable `audit` alongside your backend for the built-in `ShoveAuditHandler`:
 
 ```toml
-shove = { version = "0.5", default-features = false, features = ["rabbitmq"] }
+shove = { version = "0.6", features = ["rabbitmq", "audit"] }
 ```
 
 ### Minimum Rust version
@@ -313,7 +348,7 @@ cargo run --example basic_pubsub --features rabbitmq
 cargo run --example concurrent_pubsub --features rabbitmq
 cargo run --example sequenced_pubsub --features rabbitmq
 cargo run --example consumer_groups --features rabbitmq
-cargo run --example audited_consumer --features rabbitmq
+cargo run --example audited_consumer --features rabbitmq,audit
 ```
 
 ### Stress tests
@@ -337,9 +372,9 @@ cargo bench -q --features rabbitmq --bench consumer_overhead -- --output json
 ## Roadmap
 
 - [x] **SNS publisher** — publish via SNS standard and FIFO topics with batch support and auto-chunking
-- [ ] **SQS consumer** — consume via SQS queues with message group ID for sequenced delivery
+- [x] **SQS consumer** — consume via SQS queues with consumer groups, sequenced delivery via FIFO queues, and autoscaling
 - [ ] **Observability** — built-in OpenTelemetry metrics (publish latency, consume rate, retry/DLQ counts)
-- [ ] **Multi-backend topology declaration** — declare topics across backends in a single call
+- [ ] **Other pubsub providers** — looking at Cloudflare Queues, Firebase Pub/Sub and others
 
 ## Background
 

@@ -24,12 +24,14 @@ impl Debug for SnsConfig {
 
 /// AWS SNS client with shutdown coordination.
 ///
-/// Wraps the AWS SDK `sns::Client`. The SDK client is `Clone` and internally
-/// manages HTTP/2 connection pooling — a single client is sufficient for
-/// concurrent publishing.
+/// Wraps the AWS SDK `sns::Client` (and optionally `sqs::Client` when the
+/// `aws-sns-sqs` feature is enabled). Both clients are `Clone` and internally
+/// manage HTTP/2 connection pooling.
 #[derive(Clone)]
 pub struct SnsClient {
-    client: aws_sdk_sns::Client,
+    sns_client: aws_sdk_sns::Client,
+    #[cfg(feature = "aws-sns-sqs")]
+    sqs_client: aws_sdk_sqs::Client,
     shutdown_token: CancellationToken,
 }
 
@@ -51,17 +53,27 @@ impl SnsClient {
 
         let aws_config = aws_config.load().await;
 
-        let client = aws_sdk_sns::Client::new(&aws_config);
+        let sns_client = aws_sdk_sns::Client::new(&aws_config);
+        #[cfg(feature = "aws-sns-sqs")]
+        let sqs_client = aws_sdk_sqs::Client::new(&aws_config);
 
         Ok(Self {
-            client,
+            sns_client,
+            #[cfg(feature = "aws-sns-sqs")]
+            sqs_client,
             shutdown_token: CancellationToken::new(),
         })
     }
 
     /// Return a reference to the underlying AWS SDK SNS client.
     pub(crate) fn inner(&self) -> &aws_sdk_sns::Client {
-        &self.client
+        &self.sns_client
+    }
+
+    /// Return a reference to the underlying AWS SDK SQS client.
+    #[cfg(feature = "aws-sns-sqs")]
+    pub(crate) fn sqs(&self) -> &aws_sdk_sqs::Client {
+        &self.sqs_client
     }
 
     /// Return a clone of the shutdown [`CancellationToken`].

@@ -13,6 +13,18 @@ use crate::topic::Topic;
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
+/// Compute shard index using FNV-1a hash (stable across versions).
+fn compute_shard(key: &str, shards: u16) -> u16 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash % shards as u64) as u16
+}
+
 /// Convert a `HashMap<String, String>` into SNS message attributes.
 fn hashmap_to_message_attributes(
     headers: HashMap<String, String>,
@@ -28,11 +40,6 @@ fn hashmap_to_message_attributes(
             (k, attr)
         })
         .collect()
-}
-
-/// Split a slice into chunks of at most `SNS_BATCH_LIMIT`.
-fn chunk_batch<T>(items: &[T]) -> Vec<&[T]> {
-    items.chunks(SNS_BATCH_LIMIT).collect()
 }
 
 /// SNS publisher that implements the `Publisher` trait.
@@ -61,6 +68,7 @@ impl SnsPublisher {
         topic_arn: &str,
         payload: &str,
         group_id: Option<&str>,
+        routing_shards: Option<u16>,
         attributes: Option<HashMap<String, aws_sdk_sns::types::MessageAttributeValue>>,
     ) -> Result<()> {
         let mut req = self
@@ -74,6 +82,16 @@ impl SnsPublisher {
             req = req
                 .message_group_id(gid)
                 .message_deduplication_id(Uuid::new_v4().to_string());
+
+            if let Some(shards) = routing_shards {
+                let shard = compute_shard(gid, shards);
+                let shard_attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+                    .data_type("String")
+                    .string_value(shard.to_string())
+                    .build()
+                    .expect("building shard MessageAttributeValue should not fail");
+                req = req.message_attributes("shard", shard_attr);
+            }
         }
 
         if let Some(attrs) = attributes {
@@ -109,6 +127,11 @@ impl SnsPublisher {
             (None, _) => None,
         };
 
+        let routing_shards = match (topology.sequencing(), &group_id) {
+            (Some(seq), Some(_)) => Some(seq.routing_shards()),
+            _ => None,
+        };
+
         let attributes = headers.map(hashmap_to_message_attributes);
 
         debug!(queue_name, topic_arn, "publishing message to SNS");
@@ -118,6 +141,7 @@ impl SnsPublisher {
                 &topic_arn,
                 &payload,
                 group_id.as_deref(),
+                routing_shards,
                 attributes.clone(),
             )
             .await
@@ -128,8 +152,14 @@ impl SnsPublisher {
             }
             Err(e) => {
                 warn!(queue_name, error = %e, "SNS publish failed, retrying once");
-                self.publish_single(&topic_arn, &payload, group_id.as_deref(), None)
-                    .await
+                self.publish_single(
+                    &topic_arn,
+                    &payload,
+                    group_id.as_deref(),
+                    routing_shards,
+                    None,
+                )
+                .await
             }
         }
     }
@@ -192,6 +222,16 @@ impl Publisher for SnsPublisher {
                     entry = entry
                         .message_group_id(&keys[i])
                         .message_deduplication_id(Uuid::new_v4().to_string());
+
+                    if let Some(seq) = topology.sequencing() {
+                        let shard = compute_shard(&keys[i], seq.routing_shards());
+                        let shard_attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+                            .data_type("String")
+                            .string_value(shard.to_string())
+                            .build()
+                            .expect("building shard MessageAttributeValue should not fail");
+                        entry = entry.message_attributes("shard", shard_attr);
+                    }
                 }
 
                 entry
@@ -201,7 +241,7 @@ impl Publisher for SnsPublisher {
             .collect();
 
         // Chunk into groups of 10 and send
-        for chunk in chunk_batch(&entries) {
+        for chunk in entries.chunks(SNS_BATCH_LIMIT) {
             let result = self
                 .client
                 .inner()
@@ -234,48 +274,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_batch_empty() {
-        let items: Vec<u8> = vec![];
-        let chunks = chunk_batch(&items);
-        assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn chunk_batch_under_limit() {
-        let items: Vec<u8> = vec![1, 2, 3];
-        let chunks = chunk_batch(&items);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 3);
-    }
-
-    #[test]
-    fn chunk_batch_exact_limit() {
-        let items: Vec<u8> = (0..10).collect();
-        let chunks = chunk_batch(&items);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 10);
-    }
-
-    #[test]
-    fn chunk_batch_over_limit() {
-        let items: Vec<u8> = (0..25).collect();
-        let chunks = chunk_batch(&items);
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].len(), 10);
-        assert_eq!(chunks[1].len(), 10);
-        assert_eq!(chunks[2].len(), 5);
-    }
-
-    #[test]
-    fn chunk_batch_one_over_limit() {
-        let items: Vec<u8> = (0..11).collect();
-        let chunks = chunk_batch(&items);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 10);
-        assert_eq!(chunks[1].len(), 1);
-    }
-
-    #[test]
     fn hashmap_to_message_attributes_empty() {
         let attrs = hashmap_to_message_attributes(HashMap::new());
         assert!(attrs.is_empty());
@@ -303,5 +301,36 @@ mod tests {
         assert!(attrs.contains_key("key-a"));
         assert!(attrs.contains_key("key-b"));
         assert!(attrs.contains_key("key-c"));
+    }
+
+    #[test]
+    fn compute_shard_deterministic() {
+        let a = compute_shard("order-123", 8);
+        let b = compute_shard("order-123", 8);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_shard_within_range() {
+        for i in 0..100 {
+            let key = format!("key-{i}");
+            let shard = compute_shard(&key, 4);
+            assert!(shard < 4, "shard {shard} out of range for 4 shards");
+        }
+    }
+
+    #[test]
+    fn compute_shard_distributes() {
+        let mut counts = [0u32; 8];
+        for i in 0..1000 {
+            let shard = compute_shard(&format!("key-{i}"), 8) as usize;
+            counts[shard] += 1;
+        }
+        for (i, count) in counts.iter().enumerate() {
+            assert!(
+                *count > 50,
+                "shard {i} only got {count} messages out of 1000"
+            );
+        }
     }
 }
