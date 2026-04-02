@@ -107,7 +107,7 @@ declare_topic::<OrderSettlement>(&declarer).await?;
 
 let consumer = SqsConsumer::new(client.clone(), queue_registry.clone());
 let options = ConsumerOptions::new(shutdown_token).with_prefetch_count(10);
-consumer.run_concurrent::<OrderSettlement>(handler, options).await?;
+consumer.run::<OrderSettlement>(handler, options).await?;
 ```
 
 ### Consume (RabbitMQ)
@@ -135,7 +135,7 @@ let options = ConsumerOptions::new(shutdown_token)
 
 // Processes up to 20 messages concurrently, acks always in delivery order
 consumer
-    .run_concurrent::<OrderSettlement>(SettlementHandler, options)
+    .run::<OrderSettlement>(SettlementHandler, options)
     .await?;
 ```
 
@@ -164,7 +164,7 @@ The framework itself adds minimal overhead: sub-millisecond dispatch latency per
 ## Features
 
 - **Compile-time topic binding** — each topic is a unit struct that associates a message type (`Serialize + DeserializeOwned`) with a queue topology. No stringly-typed queue names at call sites.
-- **Concurrent consumption** — process up to `prefetch_count` messages concurrently within a single consumer via `run_concurrent`, while always acknowledging in delivery order. This should be your default.
+- **Concurrent consumption** — process up to `prefetch_count` messages concurrently within a single consumer, while always acknowledging in delivery order.
 - **Escalating retry backoff** — configure multiple hold queues with increasing delays. The consumer picks the right one automatically based on retry count.
 - **Dead-letter queues** — opt-in per topic. Messages that exceed max retries or are explicitly rejected route to DLQ with full death metadata.
 - **Sequenced delivery** — strict per-key ordering via `SequencedTopic`. Messages sharing a sequence key are delivered in publish order. Different keys are processed concurrently within each shard. Two failure policies: `Skip` (continue the sequence) or `FailAll` (terminate it).
@@ -175,11 +175,11 @@ The framework itself adds minimal overhead: sub-millisecond dispatch latency per
 
 ## Concurrent consumption
 
-By default, `run_concurrent` processes up to `prefetch_count` messages concurrently within a single consumer. Messages are dispatched to handler tasks as they arrive, but **acknowledgements are always sent in delivery order** — if messages 1, 2, 3 are in-flight and message 3 finishes first, it waits for 1 and 2 to complete before any are acked.
+By default, `run` processes up to `prefetch_count` messages concurrently within a single consumer. Messages are dispatched to handler tasks as they arrive, but **acknowledgements are always sent in delivery order** — if messages 1, 2, 3 are in-flight and message 3 finishes first, it waits for 1 and 2 to complete before any are acked.
 
 Consumer groups support this via `ConsumerGroupConfig::with_concurrent_processing(true)`.
 
-The only reason to use sequential consumption (`run`) is if your handler has process-level side effects that cannot tolerate concurrency (e.g. writing to a shared file or holding a global lock). If your handler is `async` and talks to external services, use `run_concurrent`.
+Set `prefetch_count = 1` for sequential processing if your handler has process-level side effects that cannot tolerate concurrency (e.g. writing to a shared file or holding a global lock). If your handler is `async` and talks to external services, use the default prefetch count.
 
 ## Sequenced topics
 
@@ -199,7 +199,7 @@ define_sequenced_topic!(AccountLedger, LedgerEntry, |msg| msg.account_id.clone()
 
 // Compiler enforces AccountLedger: SequencedTopic
 consumer
-    .run_sequenced::<AccountLedger>(handler, options)
+    .run_fifo::<AccountLedger>(handler, options)
     .await?;
 ```
 

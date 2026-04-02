@@ -165,13 +165,17 @@ impl SqsConsumerGroup {
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = SqsConsumer::new(client.clone(), queue_registry.clone());
+            let options = if concurrent {
+                options
+            } else {
+                ConsumerOptions {
+                    prefetch_count: 1,
+                    ..options
+                }
+            };
 
             tokio::spawn(async move {
-                let result = if concurrent {
-                    consumer.run_concurrent::<T>(handler, options).await
-                } else {
-                    consumer.run::<T>(handler, options).await
-                };
+                let result = consumer.run::<T>(handler, options).await;
                 if let Err(e) = result {
                     tracing::error!("consumer task exited with error: {e}");
                 }

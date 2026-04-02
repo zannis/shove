@@ -13,7 +13,7 @@
 //!   - **RSS per consumer**: incremental memory cost of each additional consumer.
 //!   - **Idle CPU**: CPU usage with consumers running but no messages flowing.
 //!
-//! Uses the default prefetch mode (`run_concurrent` with `prefetch_count=10`).
+//! Uses the default prefetch mode (`run` with `prefetch_count=10`).
 //!
 //! Requires Docker. Run with:
 //!

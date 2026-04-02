@@ -1,7 +1,7 @@
 //! Sequenced topic examples demonstrating strict per-key ordering.
 //!
 //! Demonstrates: `define_sequenced_topic!`, `SequenceFailure::Skip` vs
-//! `SequenceFailure::FailAll`, `run_sequenced`, and custom `routing_shards`.
+//! `SequenceFailure::FailAll`, `run_fifo`, and custom `routing_shards`.
 //!
 //! Each handler sums the `amount_cents` of successfully processed messages per
 //! account. After shutdown the totals are compared against expected values to
@@ -203,7 +203,7 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         RabbitMqConsumer::new(c)
-            .run_sequenced::<SkipLedger>(
+            .run_fifo::<SkipLedger>(
                 handler,
                 ConsumerOptions::new(s)
                     .with_max_retries(2)
@@ -221,7 +221,7 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         RabbitMqConsumer::new(c)
-            .run_sequenced::<StrictLedger>(
+            .run_fifo::<StrictLedger>(
                 handler,
                 ConsumerOptions::new(s)
                     .with_max_retries(2)

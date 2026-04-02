@@ -1549,7 +1549,7 @@ async fn sequenced_consume_preserves_order() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
     assert!(handler.wait_for_count(5, Duration::from_secs(15)).await);
@@ -2035,7 +2035,7 @@ async fn sequenced_skip_continues_after_rejection() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<SkipOrders>(h, opts).await
+        consumer.run_fifo::<SkipOrders>(h, opts).await
     });
 
     // With Skip: 4 messages should be acked (0,1,3,4), 1 rejected (2)
@@ -2118,7 +2118,7 @@ async fn sequenced_failall_poisons_key_after_rejection() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<FailAllOrders>(h, opts).await
+        consumer.run_fifo::<FailAllOrders>(h, opts).await
     });
 
     // Wait for the handler to process messages.
@@ -2200,7 +2200,7 @@ async fn concurrent_consume_processes_all_messages() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
-        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork>(h, opts).await
     });
 
     assert!(
@@ -2251,7 +2251,7 @@ async fn concurrent_consume_slow_handler_faster_than_sequential() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(msg_count as u16); // all in-flight at once
-        consumer.run_concurrent::<SimpleWork>(h, opts).await
+        consumer.run::<SimpleWork>(h, opts).await
     });
 
     assert!(
@@ -2310,7 +2310,7 @@ async fn concurrent_consume_prefetch_one_is_sequential() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(1); // forces sequential
-        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork>(h, opts).await
     });
 
     assert!(
@@ -2372,7 +2372,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
             .with_max_retries(3)
             .with_prefetch_count(10);
         consumer
-            .run_concurrent::<ConcurrentRejectWork>(h, opts)
+            .run::<ConcurrentRejectWork>(h, opts)
             .await
     });
 
@@ -2481,7 +2481,7 @@ async fn concurrent_consume_graceful_shutdown_drains() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(5);
-        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork>(h, opts).await
     });
 
     // Wait briefly for messages to be dispatched to handler tasks
@@ -2733,7 +2733,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
         let opts = ConsumerOptions::new(s1)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer1.run_concurrent::<UngracefulConc1>(h1, opts).await
+        consumer1.run::<UngracefulConc1>(h1, opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2756,7 +2756,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
         let opts = ConsumerOptions::new(s2)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer2.run_concurrent::<UngracefulConc1>(h2, opts).await
+        consumer2.run::<UngracefulConc1>(h2, opts).await
     });
 
     assert!(
@@ -2802,7 +2802,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
         let opts = ConsumerOptions::new(s1)
             .with_max_retries(3)
             .with_prefetch_count(3);
-        consumer1.run_concurrent::<UngracefulConc3>(h1, opts).await
+        consumer1.run::<UngracefulConc3>(h1, opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2825,7 +2825,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
         let opts = ConsumerOptions::new(s2)
             .with_max_retries(3)
             .with_prefetch_count(3);
-        consumer2.run_concurrent::<UngracefulConc3>(h2, opts).await
+        consumer2.run::<UngracefulConc3>(h2, opts).await
     });
 
     assert!(
@@ -2871,7 +2871,7 @@ async fn concurrent_consumer_retry_then_ack() {
             .with_max_retries(5)
             .with_prefetch_count(4);
         consumer
-            .run_concurrent::<ConcurrentRetryWork>(h, opts)
+            .run::<ConcurrentRetryWork>(h, opts)
             .await
     });
 
@@ -2927,7 +2927,7 @@ async fn concurrent_consumer_max_retries_sends_to_dlq() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(2)
             .with_prefetch_count(4);
-        consumer.run_concurrent::<ConcurrentMaxRetry>(h, opts).await
+        consumer.run::<ConcurrentMaxRetry>(h, opts).await
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -2991,7 +2991,7 @@ async fn concurrent_consumer_graceful_shutdown_drains_inflight() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(4);
-        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork>(h, opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3052,7 +3052,7 @@ async fn deserialization_failure_rejects_to_dlq() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(4);
-        consumer.run_concurrent::<StrictWork>(h, opts).await
+        consumer.run::<StrictWork>(h, opts).await
     });
 
     assert!(handler.wait_for_count(1, Duration::from_secs(10)).await);
@@ -3141,7 +3141,7 @@ async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
             .with_max_retries(3)
             .with_prefetch_count(8);
         consumer
-            .run_concurrent::<ConcurrentRejectWork>(h, opts)
+            .run::<ConcurrentRejectWork>(h, opts)
             .await
     });
 
@@ -3257,7 +3257,7 @@ async fn concurrent_consumer_handler_timeout_triggers_retry() {
             .with_max_retries(5)
             .with_prefetch_count(4)
             .with_handler_timeout(Duration::from_millis(200));
-        consumer.run_concurrent::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork>(h, opts).await
     });
 
     assert!(handler.wait_for_count(2, Duration::from_secs(30)).await);
@@ -3295,7 +3295,7 @@ async fn sequenced_consumer_retry_via_shard_hold_queues() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(5);
-        consumer.run_sequenced::<RetrySeqOrders>(h, opts).await
+        consumer.run_fifo::<RetrySeqOrders>(h, opts).await
     });
 
     assert!(
@@ -3336,7 +3336,7 @@ async fn sequenced_consumer_defer_via_shard_hold_queues() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(5);
-        consumer.run_sequenced::<DeferSeqOrders>(h, opts).await
+        consumer.run_fifo::<DeferSeqOrders>(h, opts).await
     });
 
     assert!(
@@ -3389,7 +3389,7 @@ async fn sequenced_failall_max_retries_poisons_key() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<FailAllOrders>(h, opts).await
+        consumer.run_fifo::<FailAllOrders>(h, opts).await
     });
 
     assert!(
@@ -3448,7 +3448,7 @@ async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<SkipOrders>(h, opts).await
+        consumer.run_fifo::<SkipOrders>(h, opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3472,7 +3472,7 @@ async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
         let s2 = shutdown2.clone();
         let consume_handle2 = tokio::spawn(async move {
             let opts = ConsumerOptions::new(s2).with_max_retries(3);
-            consumer2.run_sequenced::<SkipOrders>(h2, opts).await
+            consumer2.run_fifo::<SkipOrders>(h2, opts).await
         });
 
         assert!(
@@ -3522,7 +3522,7 @@ async fn sequenced_publish_batch_routes_via_exchange() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
     assert!(handler.wait_for_count(10, Duration::from_secs(15)).await);
@@ -3566,7 +3566,7 @@ async fn sequenced_publish_with_headers() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
     assert!(handler.wait_for_count(1, Duration::from_secs(15)).await);
@@ -3776,7 +3776,7 @@ async fn sequenced_batch_publish_with_pool() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
     assert!(handler.wait_for_count(20, Duration::from_secs(20)).await);
@@ -3934,7 +3934,7 @@ async fn sequenced_consumer_multiple_keys_concurrent() {
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_max_retries(3);
-        consumer.run_sequenced::<SkipOrders>(h, opts).await
+        consumer.run_fifo::<SkipOrders>(h, opts).await
     });
 
     assert!(

@@ -1,6 +1,6 @@
 //! Concurrent consumption example.
 //!
-//! Demonstrates `run_concurrent` for non-blocking message processing with
+//! Demonstrates `run` for non-blocking message processing with
 //! in-order acknowledgement. Compares sequential vs concurrent throughput
 //! with a slow handler.
 //!
@@ -201,7 +201,7 @@ async fn main() {
 
     // ── Concurrent run ──────────────────────────────────────────────────
 
-    eprintln!("--- Concurrent (run_concurrent) ---");
+    eprintln!("--- Concurrent (run) ---");
     eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch={prefetch}");
 
     purge_queue(&client).await;
@@ -216,7 +216,7 @@ async fn main() {
     let start = Instant::now();
     let handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(s).with_prefetch_count(prefetch);
-        consumer.run_concurrent::<SlowTasks>(h, opts).await
+        consumer.run::<SlowTasks>(h, opts).await
     });
 
     handler.wait_for(msg_count, Duration::from_secs(60)).await;

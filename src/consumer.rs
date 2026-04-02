@@ -81,38 +81,22 @@ impl ConsumerOptions {
 /// not `dyn Consumer`. For test doubles, implement the trait on a mock struct
 /// or use an in-memory backend.
 pub trait Consumer: Send + Sync + 'static {
-    /// Run the main consumer loop sequentially. Blocks until shutdown signal.
-    ///
-    /// Equivalent to [`run_concurrent`](Consumer::run_concurrent) with
-    /// `prefetch_count = 1`. Prefer `run_concurrent` for most workloads —
-    /// it provides much higher throughput for I/O-bound handlers.
-    fn run<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T>,
-        options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
-        let options = ConsumerOptions {
-            prefetch_count: 1,
-            ..options
-        };
-        self.run_concurrent(handler, options)
-    }
-
-    /// Run the consumer loop with concurrent message processing.
-    /// Blocks until shutdown signal.
+    /// Run the consumer loop — the default mode. Blocks until shutdown signal.
     ///
     /// Processes up to `prefetch_count` messages concurrently within the same
     /// consumer task, while **always acknowledging messages in delivery order**.
+    /// Set `prefetch_count = 1` for sequential processing.
+    ///
     /// This significantly improves throughput for handlers with I/O latency
     /// (HTTP calls, database queries, etc.) without requiring additional
     /// consumer instances.
-    fn run_concurrent<T: Topic>(
+    fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Run the consumer loop with sequenced (ordered) delivery.
+    /// Run the consumer loop with FIFO (per-key ordered) delivery.
     /// Blocks until shutdown signal.
     ///
     /// Messages sharing the same sequence key are delivered in strict order.
@@ -126,7 +110,7 @@ pub trait Consumer: Send + Sync + 'static {
     /// while consuming prefetch slots as natural back-pressure.
     ///
     /// Returns `Err(ShoveError::Topology)` if `T::topology().sequencing` is `None`.
-    fn run_sequenced<T: SequencedTopic>(
+    fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,

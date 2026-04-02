@@ -994,7 +994,7 @@ where
 // ---------------------------------------------------------------------------
 
 impl Consumer for SqsConsumer {
-    fn run_concurrent<T: Topic>(
+    fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
@@ -1015,7 +1015,7 @@ impl Consumer for SqsConsumer {
         }
     }
 
-    fn run_sequenced<T: SequencedTopic>(
+    fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
@@ -1025,7 +1025,7 @@ impl Consumer for SqsConsumer {
         async move {
             let topology = T::topology();
             let seq = topology.sequencing().ok_or_else(|| {
-                ShoveError::Topology("run_sequenced requires a sequenced topic".into())
+                ShoveError::Topology("run_fifo requires a sequenced topic".into())
             })?;
 
             let handler = Arc::new(handler);

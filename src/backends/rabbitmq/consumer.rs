@@ -1040,7 +1040,7 @@ where
 }
 
 impl Consumer for RabbitMqConsumer {
-    fn run_concurrent<T: Topic>(
+    fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
@@ -1056,7 +1056,7 @@ impl Consumer for RabbitMqConsumer {
         }
     }
 
-    fn run_sequenced<T: SequencedTopic>(
+    fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
@@ -1066,7 +1066,7 @@ impl Consumer for RabbitMqConsumer {
             let topology = T::topology();
             let seq = topology.sequencing().ok_or_else(|| {
                 ShoveError::Topology(
-                    "run_sequenced called on topic without sequencing config".into(),
+                    "run_fifo called on topic without sequencing config".into(),
                 )
             })?;
 
