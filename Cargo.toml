@@ -1,6 +1,6 @@
 [package]
 name = "shove"
-version = "0.4.2"
+version = "0.5.0"
 description = "Async tasks via pubsub on steroids. Comes with built-in support for complex queue configurations, audit logs, autoscaling consumer groups and more."
 edition = "2024"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
@@ -46,6 +46,16 @@ name = "autoscaler"
 harness = false
 required-features = ["rabbitmq"]
 
+[[bench]]
+name = "stress"
+harness = false
+required-features = ["rabbitmq"]
+
+[[bench]]
+name = "consumer_overhead"
+harness = false
+required-features = ["rabbitmq"]
+
 [[example]]
 name = "basic_pubsub"
 required-features = ["rabbitmq"]
@@ -63,5 +73,5 @@ name = "audited_consumer"
 required-features = ["rabbitmq", "audit"]
 
 [[example]]
-name = "stress"
+name = "concurrent_pubsub"
 required-features = ["rabbitmq"]

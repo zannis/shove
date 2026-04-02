@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
@@ -85,6 +85,7 @@ struct LedgerHandler {
 
 impl MessageHandler<SkipLedger> for LedgerHandler {
     async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+        tokio::time::sleep(Duration::from_millis(50)).await;
         println!(
             "[{}] account={} seq={} amount={} attempt={}",
             self.label,
@@ -105,6 +106,7 @@ impl MessageHandler<SkipLedger> for LedgerHandler {
 
 impl MessageHandler<StrictLedger> for LedgerHandler {
     async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+        tokio::time::sleep(Duration::from_millis(50)).await;
         println!(
             "[{}] account={} seq={} amount={} attempt={}",
             self.label,
@@ -128,8 +130,22 @@ impl MessageHandler<StrictLedger> for LedgerHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+fn require_rabbitmq() {
+    let output = std::process::Command::new("docker")
+        .args(["compose", "ps", "--services", "--filter", "status=running"])
+        .output();
+    match output {
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
+        _ => {
+            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
+    require_rabbitmq();
     let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
     let client = RabbitMqClient::connect(&config).await?;
 
@@ -176,6 +192,7 @@ async fn main() -> Result<(), ShoveError> {
     let skip_totals: Totals = Arc::new(Mutex::new(HashMap::new()));
     let strict_totals: Totals = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = CancellationToken::new();
+    let start = Instant::now();
 
     let s = shutdown.clone();
     let c = client.clone();
@@ -186,7 +203,12 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         RabbitMqConsumer::new(c)
-            .run_sequenced::<SkipLedger>(handler, ConsumerOptions::new(s).with_max_retries(2))
+            .run_sequenced::<SkipLedger>(
+                handler,
+                ConsumerOptions::new(s)
+                    .with_max_retries(2)
+                    .with_prefetch_count(8),
+            )
             .await
     });
 
@@ -199,7 +221,12 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         RabbitMqConsumer::new(c)
-            .run_sequenced::<StrictLedger>(handler, ConsumerOptions::new(s).with_max_retries(2))
+            .run_sequenced::<StrictLedger>(
+                handler,
+                ConsumerOptions::new(s)
+                    .with_max_retries(2)
+                    .with_prefetch_count(8),
+            )
             .await
     });
 
@@ -215,7 +242,10 @@ async fn main() -> Result<(), ShoveError> {
     let skip = skip_totals.lock().await;
     let strict = strict_totals.lock().await;
 
-    println!("\n── Results ──");
+    println!(
+        "\n── Results (elapsed: {:.1}s) ──",
+        start.elapsed().as_secs_f64()
+    );
     println!(
         "skip   ACC-A = {} (expected 1200)",
         skip.get("ACC-A").copied().unwrap_or(0)

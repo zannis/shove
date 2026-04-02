@@ -1,14 +1,19 @@
 use std::collections::HashMap;
 
 use lapin::message::Delivery;
-use lapin::types::{AMQPValue, FieldArray, FieldTable};
+use lapin::types::{AMQPValue, FieldArray, FieldTable, LongString};
 
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 
 pub(crate) const RETRY_COUNT_KEY: &str = "x-retry-count";
 
-fn long_string_to_owned(s: &lapin::types::LongString) -> String {
-    String::from_utf8_lossy(s.as_bytes()).into_owned()
+fn long_string_to_owned(s: &LongString) -> String {
+    // Fast path for valid UTF-8 (common case) avoids the extra allocation
+    // that from_utf8_lossy().into_owned() always incurs.
+    match std::str::from_utf8(s.as_bytes()) {
+        Ok(valid) => valid.to_owned(),
+        Err(_) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+    }
 }
 
 pub(crate) fn get_retry_count(delivery: &Delivery) -> u32 {
@@ -44,18 +49,17 @@ pub(crate) fn extract_string_headers(delivery: &Delivery) -> HashMap<String, Str
         return HashMap::new();
     };
 
-    table
-        .inner()
-        .iter()
-        .filter_map(|(k, v)| {
-            let value = match v {
-                AMQPValue::LongString(s) => Some(long_string_to_owned(s)),
-                AMQPValue::ShortString(s) => Some(s.to_string()),
-                _ => None,
-            };
-            value.map(|v| (k.to_string(), v))
-        })
-        .collect()
+    let inner = table.inner();
+    let mut headers = HashMap::with_capacity(inner.len());
+    for (k, v) in inner.iter() {
+        let value = match v {
+            AMQPValue::LongString(s) => long_string_to_owned(s),
+            AMQPValue::ShortString(s) => s.to_string(),
+            _ => continue,
+        };
+        headers.insert(k.to_string(), value);
+    }
+    headers
 }
 
 pub(crate) fn extract_dead_metadata(delivery: &Delivery) -> DeadMessageMetadata {

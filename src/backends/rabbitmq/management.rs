@@ -5,13 +5,24 @@ use tracing::debug;
 
 use crate::error::{Result, ShoveError};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ManagementConfig {
     pub base_url: String,
     pub username: String,
     pub password: String,
     /// URL-encoded vhost, default `"%2F"` for `"/"`
     pub vhost: String,
+}
+
+impl std::fmt::Debug for ManagementConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagementConfig")
+            .field("base_url", &self.base_url)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("vhost", &self.vhost)
+            .finish()
+    }
 }
 
 impl ManagementConfig {
@@ -123,6 +134,16 @@ impl QueueStatsProvider for ManagementClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_config_debug_redacts_password() {
+        let config = ManagementConfig::new("http://localhost:15672", "admin", "s3cret!");
+        let debug_output = format!("{config:?}");
+        assert!(!debug_output.contains("s3cret!"));
+        assert!(debug_output.contains("<redacted>"));
+        assert!(debug_output.contains("admin"));
+        assert!(debug_output.contains("localhost"));
+    }
 
     #[test]
     fn management_config_defaults() {
