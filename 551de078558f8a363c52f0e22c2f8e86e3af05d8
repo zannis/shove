@@ -1,0 +1,38 @@
+tests/sns_sqs_integration.rs
+  9a0c21f470569fd8 32-40,116,126-127,140-151,163,177-183,580-696
+src/backends/sns/topology.rs
+  9a0c21f470569fd8 333-337,357,374-387,391-392,394,404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "551de078558f8a363c52f0e22c2f8e86e3af05d8",
+  "prompts": {
+    "21278ad40e2206c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdaea724-d258-41ba-83f7-a0d6d8d79c1a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 3298,
+      "overriden_lines": 0
+    },
+    "9a0c21f470569fd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8ca7456b-16eb-44d2-80fc-45a48b6b54f7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 208,
+      "total_deletions": 34,
+      "accepted_lines": 2535,
+      "overriden_lines": 0
+    }
+  }
+}
