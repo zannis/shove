@@ -81,22 +81,22 @@ impl ConsumerOptions {
 /// not `dyn Consumer`. For test doubles, implement the trait on a mock struct
 /// or use an in-memory backend.
 pub trait Consumer: Send + Sync + 'static {
-    /// Run the main consumer loop. Blocks until shutdown signal.
+    /// Run the main consumer loop sequentially. Blocks until shutdown signal.
     ///
-    /// The consumer:
-    /// 1. Reads `T::topology()` to resolve queue names
-    /// 2. Consumes from the main queue
-    /// 3. Deserializes to `T::Message`
-    /// 4. Calls `handler.handle()`
-    /// 5. Routes based on `Outcome` (ack, retry → hold, reject → DLQ)
-    ///
-    /// Messages are processed one at a time. For concurrent processing within
-    /// a single consumer, use [`run_concurrent`](Consumer::run_concurrent).
+    /// Equivalent to [`run_concurrent`](Consumer::run_concurrent) with
+    /// `prefetch_count = 1`. Prefer `run_concurrent` for most workloads —
+    /// it provides much higher throughput for I/O-bound handlers.
     fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<()>> + Send {
+        let options = ConsumerOptions {
+            prefetch_count: 1,
+            ..options
+        };
+        self.run_concurrent(handler, options)
+    }
 
     /// Run the consumer loop with concurrent message processing.
     /// Blocks until shutdown signal.
@@ -106,9 +106,6 @@ pub trait Consumer: Send + Sync + 'static {
     /// This significantly improves throughput for handlers with I/O latency
     /// (HTTP calls, database queries, etc.) without requiring additional
     /// consumer instances.
-    ///
-    /// Not available for sequenced topics — use [`run_sequenced`](Consumer::run_sequenced)
-    /// instead, which always processes one message at a time to preserve ordering.
     fn run_concurrent<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
