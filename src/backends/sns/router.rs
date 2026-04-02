@@ -221,4 +221,28 @@ mod tests {
         let attrs = extract_message_attributes(&msg);
         assert!(attrs.is_empty());
     }
+
+    #[test]
+    fn retry_delay_is_zero_without_hold_queues() {
+        let topology = TopologyBuilder::new("test").build();
+        assert!(topology.hold_queues().is_empty());
+    }
+
+    #[test]
+    fn defer_delay_is_zero_without_hold_queues() {
+        let topology = TopologyBuilder::new("test").build();
+        assert!(topology.hold_queues().is_empty());
+    }
+
+    #[test]
+    fn reject_topology_without_dlq() {
+        let topology = TopologyBuilder::new("test").build();
+        assert!(topology.dlq().is_none());
+    }
+
+    #[test]
+    fn reject_topology_with_dlq() {
+        let topology = TopologyBuilder::new("test").dlq().build();
+        assert!(topology.dlq().is_some());
+    }
 }

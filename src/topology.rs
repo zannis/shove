@@ -204,8 +204,8 @@ impl TopologyBuilder {
 
     /// Adds a hold queue with the given delay for retry backoff.
     ///
-    /// Hold queues are selected in order by retry count. Define multiple hold 
-    /// queues with increasing delays to get escalating backoff. Once the retry 
+    /// Hold queues are selected in order by retry count. Define multiple hold
+    /// queues with increasing delays to get escalating backoff. Once the retry
     /// count exceeds the number of hold queues, messages keep going to the last
     /// (longest-delay) hold queue on every subsequent retry until
     /// [`ConsumerOptions::max_retries`](crate::ConsumerOptions::max_retries) is exhausted, at which point the

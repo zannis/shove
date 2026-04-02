@@ -6,8 +6,8 @@
 //! Run with: `cargo test --features aws-sns-sqs --test sns_sqs_integration`
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use shove::sns::*;
@@ -733,9 +733,7 @@ async fn publish_and_consume_simple_message() {
             .await
     });
 
-    let reached = handler
-        .wait_for_count(1, Duration::from_secs(15))
-        .await;
+    let reached = handler.wait_for_count(1, Duration::from_secs(15)).await;
     assert!(reached, "handler should have received 1 message");
 
     shutdown.cancel();
@@ -850,9 +848,7 @@ async fn publish_and_consume_batch() {
             .await
     });
 
-    let reached = handler
-        .wait_for_count(5, Duration::from_secs(15))
-        .await;
+    let reached = handler.wait_for_count(5, Duration::from_secs(15)).await;
     assert!(reached, "handler should have received all 5 messages");
 
     shutdown.cancel();
@@ -1000,7 +996,10 @@ async fn dlq_consumer_handles_dead_message() {
     .expect("message should arrive in DLQ within 30 seconds");
 
     shutdown1.cancel();
-    handle1.await.expect("reject consumer task should not panic").ok();
+    handle1
+        .await
+        .expect("reject consumer task should not panic")
+        .ok();
 
     // Step 2: start a DLQ consumer and verify it receives the dead message
     let dlq_handler = DlqRecordingHandler::new();
@@ -1009,9 +1008,7 @@ async fn dlq_consumer_handles_dead_message() {
     let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let h2 = tokio::spawn(async move { consumer2.run_dlq::<WorkTopic>(dlq_handler_clone).await });
 
-    let reached = dlq_handler
-        .wait_for_count(1, Duration::from_secs(15))
-        .await;
+    let reached = dlq_handler.wait_for_count(1, Duration::from_secs(15)).await;
 
     setup.sns_client.shutdown().await;
     h2.await.expect("DLQ consumer task should not panic").ok();
@@ -1076,7 +1073,10 @@ async fn retry_then_ack_succeeds() {
     .expect("should complete within timeout");
 
     shutdown.cancel();
-    handle.await.expect("consumer task should not panic").expect("consumer should exit cleanly");
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
 
     assert!(
         attempt_count.load(Ordering::Relaxed) >= 2,
@@ -1218,7 +1218,10 @@ async fn defer_redelivers_message() {
     .expect("should receive deferred message redelivery within timeout");
 
     shutdown.cancel();
-    handle.await.expect("consumer task should not panic").expect("consumer should exit cleanly");
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
 
     assert!(
         calls.load(Ordering::Relaxed) >= 2,
@@ -1258,13 +1261,14 @@ async fn concurrent_consume_processes_all_messages() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(handler_clone, ConsumerOptions::new(sc).with_prefetch_count(10))
+            .run::<WorkTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc).with_prefetch_count(10),
+            )
             .await
     });
 
-    let reached = handler
-        .wait_for_count(10, Duration::from_secs(30))
-        .await;
+    let reached = handler.wait_for_count(10, Duration::from_secs(30)).await;
     assert!(reached, "handler should have received all 10 messages");
 
     shutdown.cancel();
@@ -1371,14 +1375,15 @@ async fn concurrent_consume_graceful_shutdown_drains_inflight() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(handler_clone, ConsumerOptions::new(sc).with_prefetch_count(3))
+            .run::<WorkTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc).with_prefetch_count(3),
+            )
             .await
     });
 
     // Wait for at least 1 call to ensure messages are inflight
-    handler
-        .wait_for_count(1, Duration::from_secs(15))
-        .await;
+    handler.wait_for_count(1, Duration::from_secs(15)).await;
 
     // Cancel shutdown token to trigger graceful shutdown
     shutdown.cancel();
@@ -1462,7 +1467,10 @@ async fn handler_timeout_triggers_retry() {
     .expect("handler should be called at least twice due to timeout-triggered retry");
 
     shutdown.cancel();
-    handle.await.expect("consumer task should not panic").expect("consumer should exit cleanly");
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
 
     assert!(
         calls.load(Ordering::Relaxed) >= 2,
@@ -1509,9 +1517,7 @@ async fn sequenced_consume_preserves_order() {
             .await
     });
 
-    let reached = handler
-        .wait_for_count(5, Duration::from_secs(30))
-        .await;
+    let reached = handler.wait_for_count(5, Duration::from_secs(30)).await;
     assert!(reached, "handler should have received all 5 messages");
 
     shutdown.cancel();
@@ -1519,7 +1525,11 @@ async fn sequenced_consume_preserves_order() {
 
     let records = handler.records().await;
     let amounts: Vec<u64> = records.iter().map(|(_, a)| *a).collect();
-    assert_eq!(amounts, vec![1, 2, 3, 4, 5], "messages should arrive in order");
+    assert_eq!(
+        amounts,
+        vec![1, 2, 3, 4, 5],
+        "messages should arrive in order"
+    );
 }
 
 #[tokio::test]
@@ -1753,9 +1763,7 @@ async fn sequenced_multiple_keys_processed_concurrently() {
             .await
     });
 
-    let reached = handler
-        .wait_for_count(6, Duration::from_secs(30))
-        .await;
+    let reached = handler.wait_for_count(6, Duration::from_secs(30)).await;
     assert!(reached, "handler should have received all 6 messages");
 
     shutdown.cancel();
@@ -1877,7 +1885,11 @@ async fn consumer_group_processes_messages() {
     );
 
     group.start();
-    assert_eq!(group.active_consumers(), 2, "group should start with 2 consumers");
+    assert_eq!(
+        group.active_consumers(),
+        2,
+        "group should start with 2 consumers"
+    );
 
     let reached = handler_for_wait
         .wait_for_count(5, Duration::from_secs(30))
@@ -1910,20 +1922,40 @@ async fn consumer_group_scales_up_and_down() {
     assert_eq!(group.active_consumers(), 1, "should start with 1 consumer");
 
     assert!(group.scale_up(), "first scale_up should succeed");
-    assert_eq!(group.active_consumers(), 2, "should have 2 consumers after scale_up");
+    assert_eq!(
+        group.active_consumers(),
+        2,
+        "should have 2 consumers after scale_up"
+    );
 
     assert!(group.scale_up(), "second scale_up should succeed");
-    assert_eq!(group.active_consumers(), 3, "should have 3 consumers after second scale_up");
+    assert_eq!(
+        group.active_consumers(),
+        3,
+        "should have 3 consumers after second scale_up"
+    );
 
     assert!(group.scale_down(), "first scale_down should succeed");
-    assert_eq!(group.active_consumers(), 2, "should have 2 consumers after scale_down");
+    assert_eq!(
+        group.active_consumers(),
+        2,
+        "should have 2 consumers after scale_down"
+    );
 
     assert!(group.scale_down(), "second scale_down should succeed");
-    assert_eq!(group.active_consumers(), 1, "should have 1 consumer after second scale_down");
+    assert_eq!(
+        group.active_consumers(),
+        1,
+        "should have 1 consumer after second scale_down"
+    );
 
     let at_min = group.scale_down();
     assert!(!at_min, "scale_down should return false when at minimum");
-    assert_eq!(group.active_consumers(), 1, "should still have 1 consumer at minimum");
+    assert_eq!(
+        group.active_consumers(),
+        1,
+        "should still have 1 consumer at minimum"
+    );
 
     group.shutdown().await;
 }
@@ -1975,7 +2007,10 @@ async fn registry_register_declares_topology_and_starts() {
     let reached = handler_for_wait
         .wait_for_count(1, Duration::from_secs(30))
         .await;
-    assert!(reached, "registry consumer should have processed the message");
+    assert!(
+        reached,
+        "registry consumer should have processed the message"
+    );
 
     registry.shutdown_all().await;
 }
@@ -2052,7 +2087,9 @@ async fn deserialization_failure_rejects_to_dlq() {
         consumer
             .run::<WorkTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_max_retries(1).with_prefetch_count(1),
+                ConsumerOptions::new(sc)
+                    .with_max_retries(1)
+                    .with_prefetch_count(1),
             )
             .await
     });
@@ -2116,7 +2153,10 @@ async fn consumer_run_on_undeclared_queue_fails() {
         .run::<WorkTopic>(handler, ConsumerOptions::new(shutdown))
         .await;
 
-    assert!(result.is_err(), "run should return Err for undeclared queue");
+    assert!(
+        result.is_err(),
+        "run should return Err for undeclared queue"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("no SQS queue URL registered"),
@@ -2135,7 +2175,10 @@ async fn run_dlq_on_topic_without_dlq_fails() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let result = consumer.run_dlq::<NoDlqTopic>(handler).await;
 
-    assert!(result.is_err(), "run_dlq should return Err for topic without DLQ");
+    assert!(
+        result.is_err(),
+        "run_dlq should return Err for topic without DLQ"
+    );
 }
 
 #[tokio::test]
@@ -2149,7 +2192,10 @@ async fn consumer_run_dlq_on_topic_without_dlq_name_fails() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let result = consumer.run_dlq::<NoDlqTopic>(handler).await;
 
-    assert!(result.is_err(), "run_dlq should Err when topic has no DLQ configured");
+    assert!(
+        result.is_err(),
+        "run_dlq should Err when topic has no DLQ configured"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("no DLQ configured") || err_msg.contains("DLQ"),

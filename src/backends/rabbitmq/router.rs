@@ -52,8 +52,7 @@ pub(crate) async fn route_retry(
     } else {
         warn!(
             queue = topology.queue(),
-            retry_count,
-            "retrying message but no hold queues configured — requeuing with no delay"
+            retry_count, "retrying message but no hold queues configured — requeuing with no delay"
         );
         nack_requeue(delivery).await;
     }

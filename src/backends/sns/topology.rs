@@ -391,7 +391,12 @@ impl SnsTopologyDeclarer {
             let shard_registry_key = format!("{queue_name}-seq-{i}");
             let shard_aws_name = format!("{shard_registry_key}.fifo");
             let (url, arn) = self
-                .create_sqs_queue(&shard_aws_name, true, Some(&dlq_arn), DEFAULT_MAX_RECEIVE_COUNT)
+                .create_sqs_queue(
+                    &shard_aws_name,
+                    true,
+                    Some(&dlq_arn),
+                    DEFAULT_MAX_RECEIVE_COUNT,
+                )
                 .await?;
 
             // Filter policy: only receive messages for this shard
