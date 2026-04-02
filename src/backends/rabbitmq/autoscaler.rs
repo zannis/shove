@@ -148,10 +148,26 @@ impl<S: QueueStatsProvider> Autoscaler<S> {
             };
 
             let ready = stats.messages_ready as f64;
+            let unacked = stats.messages_unacknowledged;
             let capacity = (prefetch as f64) * active_f64;
 
-            let wants_scale_up = ready > capacity * self.config.scale_up_multiplier;
-            let wants_scale_down = ready < capacity * self.config.scale_down_multiplier;
+            let scale_up_threshold = capacity * self.config.scale_up_multiplier;
+            let scale_down_threshold = capacity * self.config.scale_down_multiplier;
+            let wants_scale_up = ready > scale_up_threshold;
+            let wants_scale_down = ready < scale_down_threshold;
+
+            debug!(
+                group = %name,
+                messages_ready = stats.messages_ready,
+                messages_unacked = unacked,
+                active_consumers = _active,
+                capacity,
+                scale_up_threshold,
+                scale_down_threshold,
+                wants_scale_up,
+                wants_scale_down,
+                "poll cycle"
+            );
 
             let now = Instant::now();
 
@@ -161,7 +177,14 @@ impl<S: QueueStatsProvider> Autoscaler<S> {
                 state.scale_down_since = None;
 
                 let since = state.scale_up_since.get_or_insert(now);
-                if since.elapsed() >= self.config.hysteresis_duration {
+                let elapsed = since.elapsed();
+                debug!(
+                    group = %name,
+                    elapsed_ms = elapsed.as_millis(),
+                    hysteresis_ms = self.config.hysteresis_duration.as_millis(),
+                    "scale-up hysteresis check"
+                );
+                if elapsed >= self.config.hysteresis_duration {
                     let mut reg = registry.lock().await;
                     if let Some(group) = reg.groups_mut().get_mut(&name) {
                         if group.scale_up() {
@@ -188,7 +211,14 @@ impl<S: QueueStatsProvider> Autoscaler<S> {
                 state.scale_up_since = None;
 
                 let since = state.scale_down_since.get_or_insert(now);
-                if since.elapsed() >= self.config.hysteresis_duration {
+                let elapsed = since.elapsed();
+                debug!(
+                    group = %name,
+                    elapsed_ms = elapsed.as_millis(),
+                    hysteresis_ms = self.config.hysteresis_duration.as_millis(),
+                    "scale-down hysteresis check"
+                );
+                if elapsed >= self.config.hysteresis_duration {
                     let mut reg = registry.lock().await;
                     if let Some(group) = reg.groups_mut().get_mut(&name) {
                         if group.scale_down() {

@@ -1,9 +1,12 @@
 #![cfg(feature = "rabbitmq")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use tracing::{debug, info, warn};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
@@ -13,9 +16,9 @@ use crate::topic::Topic;
 
 /// Type-erased factory that spawns a single consumer task.
 ///
-/// The closure receives a client and a per-consumer cancellation token and
+/// The closure receives a client and fully-configured consumer options, and
 /// returns the `JoinHandle` of the spawned task.
-type Spawner = Arc<dyn Fn(&RabbitMqClient, CancellationToken) -> JoinHandle<()> + Send + Sync>;
+type Spawner = Arc<dyn Fn(&RabbitMqClient, ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
 /// Configuration that governs the behaviour of a [`ConsumerGroup`].
 pub struct ConsumerGroupConfig {
@@ -50,8 +53,8 @@ pub struct ConsumerGroup {
     config: ConsumerGroupConfig,
     client: RabbitMqClient,
     spawner: Spawner,
-    /// One entry per active consumer: (per-consumer token, task handle).
-    consumers: Vec<(CancellationToken, JoinHandle<()>)>,
+    /// One entry per active consumer: (per-consumer token, processing flag, task handle).
+    consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
     /// Cancelling this token stops every consumer in the group at once.
     group_token: CancellationToken,
 }
@@ -79,16 +82,10 @@ impl ConsumerGroup {
         T: Topic + 'static,
         H: MessageHandler<T> + Clone + 'static,
     {
-        let prefetch = config.prefetch_count;
-        let max_retries = config.max_retries;
-
         let spawner: Spawner = Arc::new(
-            move |client: &RabbitMqClient, child_token: CancellationToken| {
+            move |client: &RabbitMqClient, options: ConsumerOptions| {
                 let handler = handler_factory();
                 let consumer = RabbitMqConsumer::new(client.clone());
-                let options = ConsumerOptions::new(child_token)
-                    .with_prefetch_count(prefetch)
-                    .with_max_retries(max_retries);
 
                 tokio::spawn(async move {
                     // Errors are logged inside run; we swallow the Result here
@@ -114,6 +111,12 @@ impl ConsumerGroup {
     /// Spawn `min_consumers` consumers to get the group to its minimum size.
     pub fn start(&mut self) {
         let target = self.config.min_consumers as usize;
+        info!(
+            group = %self.name,
+            queue = %self.queue,
+            initial_consumers = target,
+            "starting consumer group"
+        );
         for _ in 0..target {
             self.spawn_one();
         }
@@ -124,24 +127,47 @@ impl ConsumerGroup {
     /// Returns `false` when the group is already at maximum capacity.
     pub fn scale_up(&mut self) -> bool {
         if self.consumers.len() >= self.config.max_consumers as usize {
+            debug!(group = %self.name, max = self.config.max_consumers, "scale_up rejected: at max capacity");
             return false;
         }
         self.spawn_one();
+        info!(
+            group = %self.name,
+            consumers = self.consumers.len(),
+            "scaled up: spawned new consumer"
+        );
         true
     }
 
-    /// Cancel the most-recently-spawned consumer, respecting `min_consumers`.
+    /// Cancel an idle consumer, respecting `min_consumers`.
     ///
-    /// Returns `false` when the group is already at minimum capacity.
+    /// Returns `false` when the group is already at minimum capacity or all
+    /// consumers are currently processing a message.
     pub fn scale_down(&mut self) -> bool {
         if self.consumers.len() <= self.config.min_consumers as usize {
+            debug!(group = %self.name, min = self.config.min_consumers, "scale_down rejected: at min capacity");
             return false;
         }
-        if let Some((token, _handle)) = self.consumers.pop() {
-            token.cancel();
-            // The handle is dropped here; the task will finish on its own
-            // because its cancellation token has been signalled.
-        }
+
+        // Find the last idle consumer (prefer removing recently-spawned ones).
+        let idle_index = self
+            .consumers
+            .iter()
+            .rposition(|(_, processing, _)| !processing.load(Ordering::Acquire));
+
+        let Some(index) = idle_index else {
+            warn!(group = %self.name, "scale_down rejected: all consumers are busy");
+            return false;
+        };
+
+        let (token, _, _handle) = self.consumers.swap_remove(index);
+        token.cancel();
+
+        info!(
+            group = %self.name,
+            consumers = self.consumers.len(),
+            "scaled down: cancelled an idle consumer"
+        );
         true
     }
 
@@ -162,19 +188,27 @@ impl ConsumerGroup {
 
     /// Cancel every consumer in the group and wait for all tasks to finish.
     pub async fn shutdown(&mut self) {
+        info!(group = %self.name, consumers = self.consumers.len(), "shutting down consumer group");
         self.group_token.cancel();
-        for (_token, handle) in self.consumers.drain(..) {
-            // Ignore join errors — the task may have panicked but we still
-            // want to proceed with a clean shutdown.
+        for (_token, _processing, handle) in self.consumers.drain(..) {
             let _ = handle.await;
         }
+        debug!(group = %self.name, "consumer group shutdown complete");
     }
 
     // ---- private helpers ----
 
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
-        let handle = (self.spawner)(&self.client, child_token.clone());
-        self.consumers.push((child_token, handle));
+        let processing = Arc::new(AtomicBool::new(false));
+        let options = ConsumerOptions {
+            max_retries: self.config.max_retries,
+            prefetch_count: self.config.prefetch_count,
+            shutdown: child_token.clone(),
+            processing: processing.clone(),
+        };
+        let handle = (self.spawner)(&self.client, options);
+        self.consumers.push((child_token, processing, handle));
+        debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned consumer");
     }
 }

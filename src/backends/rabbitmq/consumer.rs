@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use futures_lite::StreamExt;
 use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
@@ -184,6 +185,7 @@ impl RabbitMqConsumer {
                         continue;
                     }
 
+                    options.processing.store(true, Ordering::Release);
                     let outcome = handler.handle(&delivery).await;
 
                     match outcome {
@@ -210,6 +212,7 @@ impl RabbitMqConsumer {
                             handle_defer(&delivery, topology, &publisher, retry_count).await;
                         }
                     }
+                    options.processing.store(false, Ordering::Release);
                 }
             }
         }
@@ -277,7 +280,10 @@ impl RabbitMqConsumer {
                         continue;
                     }
 
+                    options.processing.store(true, Ordering::Release);
                     let outcome = handler.handle(&delivery).await;
+
+                    debug!(queue, ?outcome, retry_count, "message handled");
 
                     match outcome {
                         Outcome::Ack => {
@@ -295,6 +301,7 @@ impl RabbitMqConsumer {
                             handle_defer(&delivery, topology, &publisher, retry_count).await;
                         }
                     }
+                    options.processing.store(false, Ordering::Release);
                 }
             }
         }

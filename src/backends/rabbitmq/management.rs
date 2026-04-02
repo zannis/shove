@@ -1,5 +1,7 @@
 use std::future::Future;
 
+use tracing::debug;
+
 use crate::error::ShoveError;
 
 #[derive(Debug, Clone)]
@@ -107,6 +109,14 @@ impl QueueStatsProvider for ManagementClient {
                     "failed to deserialize management API response for queue {queue}: {e}"
                 ))
             })?;
+
+            debug!(
+                queue,
+                messages_ready = stats.messages_ready,
+                messages_unacknowledged = stats.messages_unacknowledged,
+                consumers = stats.consumers,
+                "fetched queue stats"
+            );
 
             Ok(stats)
         }

@@ -6,6 +6,8 @@ use lapin::types::{AMQPValue, FieldTable};
 use lapin::{BasicProperties, Channel};
 use tokio::sync::Mutex;
 
+use tracing::{debug, warn};
+
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::error::ShoveError;
 use crate::publisher::Publisher;
@@ -37,6 +39,8 @@ impl RabbitMqPublisher {
     ) -> Result<(), ShoveError> {
         let mut channel_guard = self.channel.lock().await;
 
+        debug!(exchange, routing_key, bytes = payload.len(), "publishing message");
+
         let result = Self::do_publish(
             &channel_guard,
             exchange,
@@ -47,9 +51,12 @@ impl RabbitMqPublisher {
         .await;
 
         match result {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // Channel failed; recover and retry once
+            Ok(()) => {
+                debug!(exchange, routing_key, "message published and confirmed");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(exchange, routing_key, error = %e, "publish failed, recovering channel and retrying");
                 let fresh = self.client.create_confirm_channel().await?;
                 *channel_guard = fresh;
 
@@ -102,11 +109,17 @@ impl RabbitMqPublisher {
     ) -> Result<(), ShoveError> {
         let channel_guard = self.channel.lock().await;
 
+        debug!(exchange, count = items.len(), "publishing batch");
+
         let result = Self::do_publish_batch(&channel_guard, exchange, items).await;
 
         match result {
-            Ok(()) => Ok(()),
-            Err(_) => {
+            Ok(()) => {
+                debug!(exchange, count = items.len(), "batch published and confirmed");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(exchange, error = %e, "batch publish failed, recovering channel and retrying");
                 drop(channel_guard);
                 let mut channel_guard = self.channel.lock().await;
                 let fresh = self.client.create_confirm_channel().await?;
