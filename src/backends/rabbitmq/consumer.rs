@@ -1065,9 +1065,7 @@ impl Consumer for RabbitMqConsumer {
         async move {
             let topology = T::topology();
             let seq = topology.sequencing().ok_or_else(|| {
-                ShoveError::Topology(
-                    "run_fifo called on topic without sequencing config".into(),
-                )
+                ShoveError::Topology("run_fifo called on topic without sequencing config".into())
             })?;
 
             let on_failure = seq.on_failure();

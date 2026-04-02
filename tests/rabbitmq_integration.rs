@@ -2371,9 +2371,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
-        consumer
-            .run::<ConcurrentRejectWork>(h, opts)
-            .await
+        consumer.run::<ConcurrentRejectWork>(h, opts).await
     });
 
     assert!(
@@ -2870,9 +2868,7 @@ async fn concurrent_consumer_retry_then_ack() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(5)
             .with_prefetch_count(4);
-        consumer
-            .run::<ConcurrentRetryWork>(h, opts)
-            .await
+        consumer.run::<ConcurrentRetryWork>(h, opts).await
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -3140,9 +3136,7 @@ async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
         let opts = ConsumerOptions::new(s)
             .with_max_retries(3)
             .with_prefetch_count(8);
-        consumer
-            .run::<ConcurrentRejectWork>(h, opts)
-            .await
+        consumer.run::<ConcurrentRejectWork>(h, opts).await
     });
 
     assert!(handler.wait_for_total(5, Duration::from_secs(15)).await);
