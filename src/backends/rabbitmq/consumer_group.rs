@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +27,9 @@ pub struct ConsumerGroupConfig {
     pub min_consumers: u16,
     pub max_consumers: u16,
     pub max_retries: u32,
+    /// Maximum time a handler may spend processing a single message.
+    /// If exceeded the message is retried. `None` means no limit.
+    pub handler_timeout: Option<Duration>,
 }
 
 impl Default for ConsumerGroupConfig {
@@ -35,6 +39,7 @@ impl Default for ConsumerGroupConfig {
             min_consumers: 1,
             max_consumers: 10,
             max_retries: 10,
+            handler_timeout: None,
         }
     }
 }
@@ -202,6 +207,7 @@ impl ConsumerGroup {
             prefetch_count: self.config.prefetch_count,
             shutdown: child_token.clone(),
             processing: processing.clone(),
+            handler_timeout: self.config.handler_timeout,
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
@@ -474,12 +480,14 @@ mod tests {
             max_consumers: 8,
             prefetch_count: 5,
             max_retries: 3,
+            handler_timeout: Some(Duration::from_secs(30)),
         });
         let config = group.config();
         assert_eq!(config.min_consumers, 2);
         assert_eq!(config.max_consumers, 8);
         assert_eq!(config.prefetch_count, 5);
         assert_eq!(config.max_retries, 3);
+        assert_eq!(config.handler_timeout, Some(Duration::from_secs(30)));
     }
 
     // -- spawn_one wiring --

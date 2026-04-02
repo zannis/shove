@@ -235,8 +235,16 @@ async fn main() -> Result<(), ShoveError> {
 
     assert_eq!(skip.get("ACC-A").copied().unwrap_or(0), 1200, "skip ACC-A");
     assert_eq!(skip.get("ACC-B").copied().unwrap_or(0), 300, "skip ACC-B");
-    assert_eq!(strict.get("ACC-A").copied().unwrap_or(0), 300, "strict ACC-A");
-    assert_eq!(strict.get("ACC-B").copied().unwrap_or(0), 300, "strict ACC-B");
+    assert_eq!(
+        strict.get("ACC-A").copied().unwrap_or(0),
+        300,
+        "strict ACC-A"
+    );
+    assert_eq!(
+        strict.get("ACC-B").copied().unwrap_or(0),
+        300,
+        "strict ACC-B"
+    );
 
     Ok(())
 }

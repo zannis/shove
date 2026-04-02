@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +22,10 @@ pub struct ConsumerOptions {
     /// Flag that indicates the consumer is currently processing a message.
     /// Used by the autoscaler to avoid scaling down busy consumers.
     pub processing: Arc<AtomicBool>,
+    /// Maximum time a handler may spend processing a single message.
+    /// If the handler exceeds this duration the message is retried.
+    /// `None` means no timeout (the handler may run indefinitely).
+    pub handler_timeout: Option<Duration>,
 }
 
 impl ConsumerOptions {
@@ -32,6 +37,7 @@ impl ConsumerOptions {
             prefetch_count: 10,
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
+            handler_timeout: None,
         }
     }
 
@@ -44,6 +50,13 @@ impl ConsumerOptions {
     /// Set the prefetch count (number of unacked messages the broker will deliver).
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Set the handler timeout. If a handler exceeds this duration the message
+    /// is retried automatically.
+    pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
+        self.handler_timeout = Some(timeout);
         self
     }
 }
