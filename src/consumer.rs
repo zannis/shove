@@ -200,4 +200,10 @@ mod tests {
         token.cancel();
         assert!(opts.shutdown.is_cancelled());
     }
+
+    #[test]
+    fn with_max_pending_per_key_sets_value() {
+        let opts = ConsumerOptions::new(CancellationToken::new()).with_max_pending_per_key(50);
+        assert_eq!(opts.max_pending_per_key, Some(50));
+    }
 }

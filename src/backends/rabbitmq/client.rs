@@ -141,4 +141,10 @@ mod tests {
         assert!(!debug_output.contains("password"));
         assert!(debug_output.contains("<redacted>"));
     }
+
+    #[test]
+    fn config_new_stores_uri() {
+        let config = RabbitMqConfig::new("amqp://host:1234/%2F");
+        assert_eq!(config.uri, "amqp://host:1234/%2F");
+    }
 }
