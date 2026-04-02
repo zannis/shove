@@ -5,6 +5,7 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs --test sns_sqs_integration`
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -694,4 +695,327 @@ async fn topology_idempotent_with_queues() {
         .await
         .expect("queue should still be registered");
     assert!(!url.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: Basic publish & consume tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_and_consume_simple_message() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "test-1".to_string(),
+        content: "hello world".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler_clone,
+                ConsumerOptions::new(shutdown_clone).with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let reached = handler
+        .wait_for_count(1, Duration::from_secs(15))
+        .await;
+    assert!(reached, "handler should have received 1 message");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert_eq!(handler.count(), 1);
+}
+
+#[tokio::test]
+async fn publish_and_consume_with_headers() {
+    #[derive(Clone)]
+    struct HeaderCapture(Arc<tokio::sync::Mutex<HashMap<String, String>>>);
+
+    impl MessageHandler<WorkTopic> for HeaderCapture {
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+            *self.0.lock().await = meta.headers;
+            Outcome::Ack
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "header-test".to_string(),
+        content: "with headers".to_string(),
+    };
+
+    let mut headers = HashMap::new();
+    headers.insert("x-trace-id".to_string(), "trace-abc-123".to_string());
+
+    setup
+        .publisher
+        .publish_with_headers::<WorkTopic>(&msg, headers)
+        .await
+        .expect("publish_with_headers should succeed");
+
+    let captured = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handler = HeaderCapture(captured.clone());
+
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(shutdown_clone).with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // Wait until headers are captured (non-empty map)
+    let timeout_result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            {
+                let map = captured.lock().await;
+                if !map.is_empty() {
+                    return map.clone();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    let headers_received = timeout_result.expect("should receive headers within timeout");
+    assert_eq!(
+        headers_received.get("x-trace-id").map(|s| s.as_str()),
+        Some("trace-abc-123"),
+        "x-trace-id header should be preserved"
+    );
+}
+
+#[tokio::test]
+async fn publish_and_consume_batch() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage {
+            id: format!("batch-{i}"),
+            content: format!("message {i}"),
+        })
+        .collect();
+
+    setup
+        .publisher
+        .publish_batch::<WorkTopic>(&messages)
+        .await
+        .expect("publish_batch should succeed");
+
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler_clone,
+                ConsumerOptions::new(shutdown_clone).with_prefetch_count(10),
+            )
+            .await
+    });
+
+    let reached = handler
+        .wait_for_count(5, Duration::from_secs(15))
+        .await;
+    assert!(reached, "handler should have received all 5 messages");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert_eq!(handler.count(), 5);
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: Rejection & DLQ tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejected_message_lands_in_dlq() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "reject-me".to_string(),
+        content: "should be rejected".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let handler = FixedOutcomeHandler(Outcome::Reject);
+
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(shutdown_clone)
+                    .with_prefetch_count(1)
+                    .with_max_retries(1),
+            )
+            .await
+    });
+
+    // Poll the DLQ directly until the message arrives (SQS native redrive)
+    let sqs_client = broker.sqs_client().await;
+    let dlq_url = setup
+        .queue_registry
+        .get("sqs-work-dlq")
+        .await
+        .expect("DLQ URL should exist");
+
+    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let result = sqs_client
+                .receive_message()
+                .queue_url(&dlq_url)
+                .max_number_of_messages(10)
+                .wait_time_seconds(1)
+                .send()
+                .await
+                .expect("failed to poll DLQ");
+
+            let msgs = result.messages.unwrap_or_default();
+            if !msgs.is_empty() {
+                return msgs;
+            }
+        }
+    })
+    .await
+    .expect("message should arrive in DLQ within 30 seconds");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    assert!(
+        !dlq_messages.is_empty(),
+        "at least 1 message should be in the DLQ"
+    );
+}
+
+#[tokio::test]
+async fn dlq_consumer_handles_dead_message() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    // Step 1: publish & reject to get a message into the DLQ
+    let msg = SimpleMessage {
+        id: "dlq-consumer-test".to_string(),
+        content: "dead message".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let reject_handler = FixedOutcomeHandler(Outcome::Reject);
+
+    let shutdown1 = CancellationToken::new();
+    let shutdown1_clone = shutdown1.clone();
+
+    let consumer1 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle1 = tokio::spawn(async move {
+        consumer1
+            .run::<WorkTopic>(
+                reject_handler,
+                ConsumerOptions::new(shutdown1_clone)
+                    .with_prefetch_count(1)
+                    .with_max_retries(1),
+            )
+            .await
+    });
+
+    // Wait for message to reach DLQ
+    let sqs_client = broker.sqs_client().await;
+    let dlq_url = setup
+        .queue_registry
+        .get("sqs-work-dlq")
+        .await
+        .expect("DLQ URL should exist");
+
+    // Poll with visibility_timeout=0 so the message becomes visible again immediately,
+    // allowing the DLQ consumer started below to pick it up without delay.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let result = sqs_client
+                .receive_message()
+                .queue_url(&dlq_url)
+                .max_number_of_messages(1)
+                .wait_time_seconds(1)
+                .visibility_timeout(0)
+                .send()
+                .await
+                .expect("failed to poll DLQ");
+
+            if !result.messages.unwrap_or_default().is_empty() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("message should arrive in DLQ within 30 seconds");
+
+    shutdown1.cancel();
+    handle1.await.expect("reject consumer task should not panic").ok();
+
+    // Step 2: start a DLQ consumer and verify it receives the dead message
+    let dlq_handler = DlqRecordingHandler::new();
+    let dlq_handler_clone = dlq_handler.clone();
+
+    let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let h2 = tokio::spawn(async move { consumer2.run_dlq::<WorkTopic>(dlq_handler_clone).await });
+
+    let reached = dlq_handler
+        .wait_for_count(1, Duration::from_secs(15))
+        .await;
+
+    setup.sns_client.shutdown().await;
+    h2.await.expect("DLQ consumer task should not panic").ok();
+
+    assert!(reached, "DLQ handler should have received 1 dead message");
+    assert_eq!(dlq_handler.count(), 1);
 }

@@ -235,6 +235,7 @@ where
                 .wait_time_seconds(5)
                 .max_number_of_messages(max_messages)
                 .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
+                .message_attribute_names("All")
                 .send() => {
                 result.map_err(|e| {
                     ShoveError::Connection(format!("SQS ReceiveMessage failed on {queue_url}: {e}"))
@@ -622,6 +623,7 @@ where
                     .max_number_of_messages((prefetch.saturating_sub(in_flight_count)).min(10) as i32)
                     .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
                     .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::MessageGroupId)
+                    .message_attribute_names("All")
                     .send()
                     .await
             }, if can_accept => {
@@ -956,6 +958,7 @@ where
                 .wait_time_seconds(5)
                 .max_number_of_messages(10)
                 .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
+                .message_attribute_names("All")
                 .send() => {
                 let output = result.map_err(|e| {
                     ShoveError::Connection(format!("SQS ReceiveMessage failed on DLQ {queue_url}: {e}"))
