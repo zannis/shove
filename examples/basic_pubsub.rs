@@ -4,8 +4,9 @@
 //! `publish`, `publish_with_headers`, `publish_batch`, `run`, `run_dlq`,
 //! and `handle_dead`.
 //!
-//! Requires a running RabbitMQ instance:
+//! Requires a running RabbitMQ instance (see docker-compose.yml):
 //!
+//!     docker compose up -d
 //!     cargo run --example basic_pubsub --features rabbitmq
 
 use std::collections::HashMap;
@@ -154,7 +155,7 @@ impl MessageHandler<ScheduledOrder> for DeferHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5672/%2f");
+    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
     let client = RabbitMqClient::connect(&config).await?;
 
     // ── Declare all topologies ──
