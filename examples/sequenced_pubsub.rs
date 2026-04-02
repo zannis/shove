@@ -1,0 +1,183 @@
+//! Sequenced topic examples demonstrating strict per-key ordering.
+//!
+//! Demonstrates: `define_sequenced_topic!`, `SequenceFailure::Skip` vs
+//! `SequenceFailure::FailAll`, `run_sequenced`, and custom `routing_shards`.
+//!
+//! Requires a running RabbitMQ instance with the consistent-hash exchange
+//! plugin enabled:
+//!
+//!     rabbitmq-plugins enable rabbitmq_consistent_hash_exchange
+//!     cargo run --example sequenced_pubsub --features rabbitmq
+
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use shove::rabbitmq::*;
+use shove::*;
+use tokio_util::sync::CancellationToken;
+
+// ─── Message type ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LedgerEntry {
+    account_id: String,
+    sequence_num: u64,
+    amount_cents: i64,
+}
+
+// ─── Topic definitions ──────────────────────────────────────────────────────
+
+// Skip policy: if one entry fails, DLQ it and continue the sequence.
+// Good for independent events that happen to need ordering (e.g. audit logs).
+define_sequenced_topic!(
+    SkipLedger,
+    LedgerEntry,
+    |msg| msg.account_id.clone(),
+    TopologyBuilder::new("ex-skip-ledger")
+        .sequenced(SequenceFailure::Skip)
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+
+// FailAll policy: if one entry fails, DLQ it AND all subsequent entries for
+// the same key. Good for causally dependent sequences (e.g. financial ledger).
+// Uses 4 routing shards instead of the default 8.
+define_sequenced_topic!(
+    StrictLedger,
+    LedgerEntry,
+    |msg| msg.account_id.clone(),
+    TopologyBuilder::new("ex-strict-ledger")
+        .sequenced(SequenceFailure::FailAll)
+        .routing_shards(4)
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+
+// ─── Handlers ───────────────────────────────────────────────────────────────
+
+// Rejects entry with sequence_num == 3 to demonstrate failure policies.
+struct LedgerHandler {
+    label: &'static str,
+}
+
+impl MessageHandler<SkipLedger> for LedgerHandler {
+    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+        println!(
+            "[{}] account={} seq={} amount={} attempt={}",
+            self.label,
+            msg.account_id,
+            msg.sequence_num,
+            msg.amount_cents,
+            metadata.retry_count + 1,
+        );
+        if msg.sequence_num == 3 {
+            println!("[{}]   → Reject (seq=3 is poison)", self.label);
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+impl MessageHandler<StrictLedger> for LedgerHandler {
+    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+        println!(
+            "[{}] account={} seq={} amount={} attempt={}",
+            self.label,
+            msg.account_id,
+            msg.sequence_num,
+            msg.amount_cents,
+            metadata.retry_count + 1,
+        );
+        if msg.sequence_num == 3 {
+            println!(
+                "[{}]   → Reject (FailAll: seq=3 + all subsequent for account={} will DLQ)",
+                self.label, msg.account_id,
+            );
+            Outcome::Reject
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<(), ShoveError> {
+    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5672/%2f");
+    let client = RabbitMqClient::connect(&config).await?;
+
+    // ── Declare topologies ──
+    let channel = client.create_channel().await?;
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declare_topic::<SkipLedger>(&declarer).await?;
+    declare_topic::<StrictLedger>(&declarer).await?;
+    println!("sequenced topologies declared\n");
+
+    // ── Publish ordered entries for account ACC-A ──
+    let publisher = RabbitMqPublisher::new(client.clone()).await?;
+
+    for seq in 1..=5 {
+        let entry = LedgerEntry {
+            account_id: "ACC-A".into(),
+            sequence_num: seq,
+            amount_cents: (seq as i64) * 100,
+        };
+        publisher.publish::<SkipLedger>(&entry).await?;
+        publisher.publish::<StrictLedger>(&entry).await?;
+    }
+    println!("published 5 entries per topic for ACC-A");
+
+    // Also publish for an independent account to show cross-key concurrency.
+    for seq in 1..=3 {
+        let entry = LedgerEntry {
+            account_id: "ACC-B".into(),
+            sequence_num: seq,
+            amount_cents: (seq as i64) * 50,
+        };
+        publisher.publish::<SkipLedger>(&entry).await?;
+        publisher.publish::<StrictLedger>(&entry).await?;
+    }
+    println!("published 3 entries per topic for ACC-B\n");
+
+    // ── Start sequenced consumers ──
+    //
+    // Expected behavior:
+    //   Skip:    ACC-A seq 1,2 ack → seq 3 reject (DLQ) → seq 4,5 ack
+    //            ACC-B seq 1,2,3 all ack
+    //   FailAll: ACC-A seq 1,2 ack → seq 3 reject (DLQ) → seq 4,5 auto-DLQ (poisoned)
+    //            ACC-B seq 1,2,3 all ack (independent key, unaffected)
+    let shutdown = CancellationToken::new();
+
+    let s = shutdown.clone();
+    let c = client.clone();
+    let skip_task = tokio::spawn(async move {
+        let handler = LedgerHandler { label: "skip" };
+        RabbitMqConsumer::new(c)
+            .run_sequenced::<SkipLedger>(handler, ConsumerOptions::new(s).with_max_retries(2))
+            .await
+    });
+
+    let s = shutdown.clone();
+    let c = client.clone();
+    let strict_task = tokio::spawn(async move {
+        let handler = LedgerHandler { label: "strict" };
+        RabbitMqConsumer::new(c)
+            .run_sequenced::<StrictLedger>(handler, ConsumerOptions::new(s).with_max_retries(2))
+            .await
+    });
+
+    // ── Let consumers process, then shut down ──
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("\nshutting down...");
+    shutdown.cancel();
+    client.shutdown().await;
+
+    let _ = tokio::join!(skip_task, strict_task);
+    println!("done");
+
+    Ok(())
+}

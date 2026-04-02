@@ -31,3 +31,15 @@ tokio = { version = "1", features = ["full", "test-util"] }
 name = "autoscaler"
 harness = false
 required-features = ["rabbitmq"]
+
+[[example]]
+name = "basic_pubsub"
+required-features = ["rabbitmq"]
+
+[[example]]
+name = "sequenced_pubsub"
+required-features = ["rabbitmq"]
+
+[[example]]
+name = "consumer_groups"
+required-features = ["rabbitmq"]
