@@ -1469,3 +1469,310 @@ async fn handler_timeout_triggers_retry() {
         "handler should have been invoked at least 2 times after timeout redelivery"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 10: Sequenced FIFO Consumption Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sequenced_consume_preserves_order() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    for amount in 1..=5 {
+        let msg = OrderMessage {
+            order_id: "ORD-A".to_string(),
+            amount,
+        };
+        setup
+            .publisher
+            .publish::<SeqSkipTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let handler = OrderRecordingHandler::new();
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc).with_prefetch_count(10),
+            )
+            .await
+    });
+
+    let reached = handler
+        .wait_for_count(5, Duration::from_secs(30))
+        .await;
+    assert!(reached, "handler should have received all 5 messages");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    let records = handler.records().await;
+    let amounts: Vec<u64> = records.iter().map(|(_, a)| *a).collect();
+    assert_eq!(amounts, vec![1, 2, 3, 4, 5], "messages should arrive in order");
+}
+
+#[tokio::test]
+async fn sequenced_skip_continues_after_rejection() {
+    #[derive(Clone)]
+    struct SkipRejectHandler {
+        records: Arc<Mutex<Vec<u64>>>,
+        count: Arc<AtomicU32>,
+        signal: Arc<tokio::sync::Notify>,
+    }
+
+    impl MessageHandler<SeqSkipTopic> for SkipRejectHandler {
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+            if msg.amount == 2 {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.signal.notify_waiters();
+                Outcome::Reject
+            } else {
+                self.records.lock().await.push(msg.amount);
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.signal.notify_waiters();
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    for amount in [1, 2, 3] {
+        let msg = OrderMessage {
+            order_id: "ORD-SKIP".to_string(),
+            amount,
+        };
+        setup
+            .publisher
+            .publish::<SeqSkipTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let handler = SkipRejectHandler {
+        records: records.clone(),
+        count: Arc::new(AtomicU32::new(0)),
+        signal: Arc::new(tokio::sync::Notify::new()),
+    };
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(1),
+            )
+            .await
+    });
+
+    // Wait for at least 2 acked records (amounts 1 and 3)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if records.lock().await.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("should receive at least 2 acked messages within timeout");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    let recorded = records.lock().await.clone();
+    assert!(
+        recorded.contains(&1) && recorded.contains(&3),
+        "amounts 1 and 3 should be processed, got: {recorded:?}"
+    );
+    assert!(
+        !recorded.contains(&2),
+        "amount 2 should have been rejected, not recorded"
+    );
+}
+
+#[tokio::test]
+async fn sequenced_failall_poisons_key() {
+    #[derive(Clone)]
+    struct FailAllRejectHandler {
+        records: Arc<Mutex<Vec<u64>>>,
+        count: Arc<AtomicU32>,
+        signal: Arc<tokio::sync::Notify>,
+    }
+
+    impl MessageHandler<SeqFailAllTopic> for FailAllRejectHandler {
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+            if msg.amount == 2 {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.signal.notify_waiters();
+                Outcome::Reject
+            } else {
+                self.records.lock().await.push(msg.amount);
+                self.count.fetch_add(1, Ordering::Relaxed);
+                self.signal.notify_waiters();
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqFailAllTopic>().await;
+
+    for amount in [1, 2, 3] {
+        let msg = OrderMessage {
+            order_id: "ORD-FAIL".to_string(),
+            amount,
+        };
+        setup
+            .publisher
+            .publish::<SeqFailAllTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let handler = FailAllRejectHandler {
+        records: records.clone(),
+        count: Arc::new(AtomicU32::new(0)),
+        signal: Arc::new(tokio::sync::Notify::new()),
+    };
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqFailAllTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc)
+                    .with_prefetch_count(10)
+                    .with_max_retries(1),
+            )
+            .await
+    });
+
+    // Wait for message 1 to be processed
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !records.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("message 1 should be processed within timeout");
+
+    // Wait additional 5s for poisoning to take effect
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    let recorded = records.lock().await.clone();
+    assert!(
+        recorded.contains(&1),
+        "amount 1 should have been processed, got: {recorded:?}"
+    );
+    assert!(
+        !recorded.contains(&3),
+        "amount 3 should NOT have been processed (key poisoned by amount 2 rejection), got: {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn sequenced_multiple_keys_processed_concurrently() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    for amount in [1, 2, 3] {
+        let msg = OrderMessage {
+            order_id: "KEY-A".to_string(),
+            amount,
+        };
+        setup
+            .publisher
+            .publish::<SeqSkipTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for amount in [1, 2, 3] {
+        let msg = OrderMessage {
+            order_id: "KEY-B".to_string(),
+            amount,
+        };
+        setup
+            .publisher
+            .publish::<SeqSkipTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let handler = OrderRecordingHandler::new();
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc).with_prefetch_count(10),
+            )
+            .await
+    });
+
+    let reached = handler
+        .wait_for_count(6, Duration::from_secs(30))
+        .await;
+    assert!(reached, "handler should have received all 6 messages");
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    let records = handler.records().await;
+    let key_a: Vec<u64> = records
+        .iter()
+        .filter(|(k, _)| k == "KEY-A")
+        .map(|(_, a)| *a)
+        .collect();
+    let key_b: Vec<u64> = records
+        .iter()
+        .filter(|(k, _)| k == "KEY-B")
+        .map(|(_, a)| *a)
+        .collect();
+
+    assert_eq!(key_a, vec![1, 2, 3], "KEY-A messages should be in order");
+    assert_eq!(key_b, vec![1, 2, 3], "KEY-B messages should be in order");
+}
