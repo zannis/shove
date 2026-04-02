@@ -122,3 +122,66 @@ impl QueueStatsProvider for ManagementClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn management_config_defaults() {
+        let config = ManagementConfig::new("http://localhost:15672", "guest", "guest");
+        assert_eq!(config.base_url, "http://localhost:15672");
+        assert_eq!(config.username, "guest");
+        assert_eq!(config.password, "guest");
+        assert_eq!(config.vhost, "%2F");
+    }
+
+    #[test]
+    fn management_config_with_vhost() {
+        let config =
+            ManagementConfig::new("http://localhost:15672", "guest", "guest").with_vhost("my-vhost");
+        assert_eq!(config.vhost, "my-vhost");
+    }
+
+    #[test]
+    fn queue_stats_defaults() {
+        let stats = QueueStats::default();
+        assert_eq!(stats.messages_ready, 0);
+        assert_eq!(stats.messages_unacknowledged, 0);
+        assert_eq!(stats.consumers, 0);
+    }
+
+    #[test]
+    fn queue_stats_deserialize_full() {
+        let json = r#"{"messages_ready": 42, "messages_unacknowledged": 7, "consumers": 3}"#;
+        let stats: QueueStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.messages_ready, 42);
+        assert_eq!(stats.messages_unacknowledged, 7);
+        assert_eq!(stats.consumers, 3);
+    }
+
+    #[test]
+    fn queue_stats_deserialize_partial() {
+        let json = r#"{"messages_ready": 10}"#;
+        let stats: QueueStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.messages_ready, 10);
+        assert_eq!(stats.messages_unacknowledged, 0);
+        assert_eq!(stats.consumers, 0);
+    }
+
+    #[test]
+    fn queue_stats_deserialize_empty_object() {
+        let json = r#"{}"#;
+        let stats: QueueStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.messages_ready, 0);
+        assert_eq!(stats.messages_unacknowledged, 0);
+        assert_eq!(stats.consumers, 0);
+    }
+
+    #[test]
+    fn queue_stats_deserialize_extra_fields_ignored() {
+        let json = r#"{"messages_ready": 5, "node": "rabbit@host", "state": "running"}"#;
+        let stats: QueueStats = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.messages_ready, 5);
+    }
+}

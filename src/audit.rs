@@ -172,3 +172,161 @@ mod shove_backend {
 
 #[cfg(feature = "audit")]
 pub use shove_backend::{AuditLog, ShoveAuditHandler};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::topology::TopologyBuilder;
+
+    // -- test Topic --
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct TestMessage {
+        body: String,
+    }
+
+    struct TestTopic;
+    impl Topic for TestTopic {
+        type Message = TestMessage;
+        fn topology() -> &'static crate::topology::QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<crate::topology::QueueTopology> =
+                std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| TopologyBuilder::new("audit-test").dlq().build())
+        }
+    }
+
+    // -- mock handlers --
+
+    struct FixedOutcomeHandler(Outcome);
+    impl MessageHandler<TestTopic> for FixedOutcomeHandler {
+        async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata) -> Outcome {
+            self.0.clone()
+        }
+    }
+
+    struct OkAuditHandler;
+    impl AuditHandler<TestTopic> for OkAuditHandler {
+        async fn audit(&self, _record: &AuditRecord<TestMessage>) -> Result<(), ShoveError> {
+            Ok(())
+        }
+    }
+
+    /// Counts calls and captures the last trace_id.
+    struct TrackingAuditHandler {
+        call_count: AtomicU32,
+        trace_id: tokio::sync::Mutex<Option<String>>,
+    }
+    impl TrackingAuditHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                call_count: AtomicU32::new(0),
+                trace_id: tokio::sync::Mutex::new(None),
+            })
+        }
+    }
+    impl AuditHandler<TestTopic> for Arc<TrackingAuditHandler> {
+        async fn audit(&self, record: &AuditRecord<TestMessage>) -> Result<(), ShoveError> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            *self.trace_id.lock().await = Some(record.trace_id.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingAuditHandler;
+    impl AuditHandler<TestTopic> for FailingAuditHandler {
+        async fn audit(&self, _record: &AuditRecord<TestMessage>) -> Result<(), ShoveError> {
+            Err(ShoveError::Connection("audit publish failed".into()))
+        }
+    }
+
+    fn test_metadata() -> MessageMetadata {
+        MessageMetadata {
+            retry_count: 0,
+            delivery_id: "d-1".into(),
+            redelivered: false,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn test_message() -> TestMessage {
+        TestMessage { body: "hello".into() }
+    }
+
+    // -- tests --
+
+    #[tokio::test]
+    async fn audited_propagates_ack_outcome() {
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), OkAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    #[tokio::test]
+    async fn audited_propagates_reject_outcome() {
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Reject), OkAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Reject));
+    }
+
+    #[tokio::test]
+    async fn audited_propagates_retry_outcome() {
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Retry), OkAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    #[tokio::test]
+    async fn audited_propagates_defer_outcome() {
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Defer), OkAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Defer));
+    }
+
+    #[tokio::test]
+    async fn audited_returns_retry_when_audit_fails() {
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), FailingAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata()).await;
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    #[tokio::test]
+    async fn audited_calls_audit_handler() {
+        let tracker = TrackingAuditHandler::new();
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), tracker.clone());
+        audited.handle(test_message(), test_metadata()).await;
+        assert_eq!(tracker.call_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn audited_uses_trace_id_from_header() {
+        let tracker = TrackingAuditHandler::new();
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), tracker.clone());
+
+        let mut meta = test_metadata();
+        meta.headers.insert("x-trace-id".into(), "my-trace-123".into());
+
+        audited.handle(test_message(), meta).await;
+        let captured: tokio::sync::MutexGuard<'_, Option<String>> =
+            tracker.trace_id.lock().await;
+        assert_eq!(captured.as_deref(), Some("my-trace-123"));
+    }
+
+    #[tokio::test]
+    async fn audited_generates_trace_id_when_missing() {
+        let tracker = TrackingAuditHandler::new();
+        let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), tracker.clone());
+
+        audited.handle(test_message(), test_metadata()).await;
+
+        let captured: tokio::sync::MutexGuard<'_, Option<String>> =
+            tracker.trace_id.lock().await;
+        let trace_id = captured.as_ref().expect("trace_id should be set");
+        // Should be a valid UUID v4
+        assert_eq!(trace_id.len(), 36);
+        assert!(uuid::Uuid::parse_str(trace_id).is_ok());
+    }
+}

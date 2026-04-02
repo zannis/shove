@@ -13,3 +13,35 @@ pub enum ShoveError {
     #[error("topology error: {0}")]
     Topology(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_serialization_error() {
+        let json_err = serde_json::from_str::<String>("not json").unwrap_err();
+        let err = ShoveError::Serialization(json_err);
+        let msg = err.to_string();
+        assert!(msg.starts_with("serialization error:"), "got: {msg}");
+    }
+
+    #[test]
+    fn display_connection_error() {
+        let err = ShoveError::Connection("channel closed".into());
+        assert_eq!(err.to_string(), "connection error: channel closed");
+    }
+
+    #[test]
+    fn display_topology_error() {
+        let err = ShoveError::Topology("missing exchange".into());
+        assert_eq!(err.to_string(), "topology error: missing exchange");
+    }
+
+    #[test]
+    fn from_serde_json_error() {
+        let json_err = serde_json::from_str::<String>("{}").unwrap_err();
+        let err: ShoveError = json_err.into();
+        assert!(matches!(err, ShoveError::Serialization(_)));
+    }
+}

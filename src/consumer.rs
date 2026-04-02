@@ -61,6 +61,59 @@ impl ConsumerOptions {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_correct() {
+        let opts = ConsumerOptions::new(CancellationToken::new());
+        assert_eq!(opts.max_retries, 10);
+        assert_eq!(opts.prefetch_count, 10);
+        assert!(opts.handler_timeout.is_none());
+        assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn with_max_retries_overrides() {
+        let opts = ConsumerOptions::new(CancellationToken::new()).with_max_retries(5);
+        assert_eq!(opts.max_retries, 5);
+    }
+
+    #[test]
+    fn with_prefetch_count_overrides() {
+        let opts = ConsumerOptions::new(CancellationToken::new()).with_prefetch_count(50);
+        assert_eq!(opts.prefetch_count, 50);
+    }
+
+    #[test]
+    fn with_handler_timeout_sets_timeout() {
+        let opts =
+            ConsumerOptions::new(CancellationToken::new()).with_handler_timeout(Duration::from_secs(30));
+        assert_eq!(opts.handler_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn builder_chains() {
+        let opts = ConsumerOptions::new(CancellationToken::new())
+            .with_max_retries(3)
+            .with_prefetch_count(20)
+            .with_handler_timeout(Duration::from_secs(5));
+        assert_eq!(opts.max_retries, 3);
+        assert_eq!(opts.prefetch_count, 20);
+        assert_eq!(opts.handler_timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn shutdown_token_propagated() {
+        let token = CancellationToken::new();
+        let opts = ConsumerOptions::new(token.clone());
+        assert!(!opts.shutdown.is_cancelled());
+        token.cancel();
+        assert!(opts.shutdown.is_cancelled());
+    }
+}
+
 /// Consume messages from a topic's queues.
 ///
 /// This trait is intentionally **not object-safe** — methods are generic over
