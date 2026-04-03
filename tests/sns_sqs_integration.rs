@@ -6,6 +6,7 @@
 //! Run with: `cargo test --features aws-sns-sqs --test sns_sqs_integration`
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -17,6 +18,51 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+// ---------------------------------------------------------------------------
+// Shared wait-for-count utility
+// ---------------------------------------------------------------------------
+
+/// A thread-safe counter with async notification, used by test handlers to
+/// signal progress and allow tests to wait for a target count.
+#[derive(Clone)]
+struct WaitableCounter {
+    count: Arc<AtomicU32>,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl WaitableCounter {
+    fn new() -> Self {
+        Self {
+            count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn increment(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+
+    fn get(&self) -> u32 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    async fn wait_for(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.get() >= target {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.get() >= target;
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -113,40 +159,13 @@ impl TestBroker {
 // ---------------------------------------------------------------------------
 
 struct TestSetup {
-    #[allow(dead_code)]
-    broker: Option<TestBroker>,
-    #[allow(dead_code)]
     sns_client: SnsClient,
     topic_registry: Arc<TopicRegistry>,
     queue_registry: Arc<QueueRegistry>,
     publisher: SnsPublisher,
-    consumer: SqsConsumer,
 }
 
 impl TestSetup {
-    /// Create a fully wired setup with its own internal broker.
-    async fn create() -> Self {
-        let broker = TestBroker::start().await;
-        let sns_client = SnsClient::new(&broker.sns_config())
-            .await
-            .expect("failed to create SNS client");
-
-        let topic_registry = Arc::new(TopicRegistry::new());
-        let queue_registry = Arc::new(QueueRegistry::new());
-
-        let publisher = SnsPublisher::new(sns_client.clone(), topic_registry.clone());
-        let consumer = SqsConsumer::new(sns_client.clone(), queue_registry.clone());
-
-        Self {
-            broker: Some(broker),
-            sns_client,
-            topic_registry,
-            queue_registry,
-            publisher,
-            consumer,
-        }
-    }
-
     /// Create a fully wired setup sharing an existing broker.
     /// The caller's `broker` must outlive this setup.
     async fn new(broker: &TestBroker) -> Self {
@@ -158,15 +177,12 @@ impl TestSetup {
         let queue_registry = Arc::new(QueueRegistry::new());
 
         let publisher = SnsPublisher::new(sns_client.clone(), topic_registry.clone());
-        let consumer = SqsConsumer::new(sns_client.clone(), queue_registry.clone());
 
         Self {
-            broker: None,
             sns_client,
             topic_registry,
             queue_registry,
             publisher,
-            consumer,
         }
     }
 
@@ -261,50 +277,35 @@ impl MessageHandler<WorkTopic> for FixedOutcomeHandler {
 /// Handler that counts invocations and returns Ack.
 #[derive(Clone)]
 struct CountingHandler {
-    count: Arc<AtomicU32>,
-    signal: Arc<tokio::sync::Notify>,
+    counter: WaitableCounter,
 }
 
 impl CountingHandler {
     fn new() -> Self {
         Self {
-            count: Arc::new(AtomicU32::new(0)),
-            signal: Arc::new(tokio::sync::Notify::new()),
+            counter: WaitableCounter::new(),
         }
     }
 
     fn count(&self) -> u32 {
-        self.count.load(Ordering::Relaxed)
+        self.counter.get()
     }
 
     async fn wait_for_count(&self, target: u32, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.count() >= target {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.count() >= target;
-                }
-            }
-        }
+        self.counter.wait_for(target, timeout).await
     }
 }
 
 impl MessageHandler<WorkTopic> for CountingHandler {
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.signal.notify_waiters();
+        self.counter.increment();
         Outcome::Ack
     }
 }
 
 impl MessageHandler<NoDlqTopic> for CountingHandler {
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.signal.notify_waiters();
+        self.counter.increment();
         Outcome::Ack
     }
 }
@@ -313,35 +314,25 @@ impl MessageHandler<NoDlqTopic> for CountingHandler {
 #[derive(Clone)]
 struct RetryThenAckHandler {
     retry_until: u32,
-    attempt_count: Arc<AtomicU32>,
-    ack_count: Arc<AtomicU32>,
-    signal: Arc<tokio::sync::Notify>,
+    attempt_counter: WaitableCounter,
 }
 
 impl RetryThenAckHandler {
     fn new(retry_until: u32) -> Self {
         Self {
             retry_until,
-            attempt_count: Arc::new(AtomicU32::new(0)),
-            ack_count: Arc::new(AtomicU32::new(0)),
-            signal: Arc::new(tokio::sync::Notify::new()),
+            attempt_counter: WaitableCounter::new(),
         }
-    }
-
-    #[allow(dead_code)]
-    fn ack_count(&self) -> u32 {
-        self.ack_count.load(Ordering::Relaxed)
     }
 }
 
 impl MessageHandler<WorkTopic> for RetryThenAckHandler {
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
-        let attempt = self.attempt_count.fetch_add(1, Ordering::Relaxed);
+        let attempt = self.attempt_counter.get();
+        self.attempt_counter.increment();
         if attempt < self.retry_until {
             Outcome::Retry
         } else {
-            self.ack_count.fetch_add(1, Ordering::Relaxed);
-            self.signal.notify_waiters();
             Outcome::Ack
         }
     }
@@ -351,46 +342,26 @@ impl MessageHandler<WorkTopic> for RetryThenAckHandler {
 #[derive(Clone)]
 struct SlowHandler {
     delay: Duration,
-    count: Arc<AtomicU32>,
-    signal: Arc<tokio::sync::Notify>,
+    counter: WaitableCounter,
 }
 
 impl SlowHandler {
     fn new(delay: Duration) -> Self {
         Self {
             delay,
-            count: Arc::new(AtomicU32::new(0)),
-            signal: Arc::new(tokio::sync::Notify::new()),
+            counter: WaitableCounter::new(),
         }
     }
 
-    #[allow(dead_code)]
-    fn count(&self) -> u32 {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    async fn wait_for_count(&self, target: u32, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.count() >= target {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.count() >= target;
-                }
-            }
-        }
+    fn wait_for_count(&self, target: u32, timeout: Duration) -> impl Future<Output = bool> + '_ {
+        self.counter.wait_for(target, timeout)
     }
 }
 
 impl MessageHandler<WorkTopic> for SlowHandler {
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
         tokio::time::sleep(self.delay).await;
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.signal.notify_waiters();
+        self.counter.increment();
         Outcome::Ack
     }
 }
@@ -399,51 +370,30 @@ impl MessageHandler<WorkTopic> for SlowHandler {
 #[derive(Clone)]
 struct OrderRecordingHandler {
     records: Arc<Mutex<Vec<(String, u64)>>>,
-    count: Arc<AtomicU32>,
-    signal: Arc<tokio::sync::Notify>,
+    counter: WaitableCounter,
 }
 
 impl OrderRecordingHandler {
     fn new() -> Self {
         Self {
             records: Arc::new(Mutex::new(Vec::new())),
-            count: Arc::new(AtomicU32::new(0)),
-            signal: Arc::new(tokio::sync::Notify::new()),
+            counter: WaitableCounter::new(),
         }
     }
 
-    #[allow(dead_code)]
-    fn count(&self) -> u32 {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
     async fn records(&self) -> Vec<(String, u64)> {
         self.records.lock().await.clone()
     }
 
-    #[allow(dead_code)]
     async fn wait_for_count(&self, target: u32, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.count() >= target {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.count() >= target;
-                }
-            }
-        }
+        self.counter.wait_for(target, timeout).await
     }
 }
 
 impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
     async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
         self.records.lock().await.push((msg.order_id, msg.amount));
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.signal.notify_waiters();
+        self.counter.increment();
         Outcome::Ack
     }
 }
@@ -451,121 +401,30 @@ impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
 impl MessageHandler<SeqFailAllTopic> for OrderRecordingHandler {
     async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
         self.records.lock().await.push((msg.order_id, msg.amount));
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.signal.notify_waiters();
+        self.counter.increment();
         Outcome::Ack
-    }
-}
-
-/// Handler that rejects a specific order_id and acks the rest.
-#[derive(Clone)]
-struct RejectOrderHandler {
-    reject_order_id: String,
-    ack_count: Arc<AtomicU32>,
-    reject_count: Arc<AtomicU32>,
-    signal: Arc<tokio::sync::Notify>,
-}
-
-impl RejectOrderHandler {
-    fn new(reject_order_id: impl Into<String>) -> Self {
-        Self {
-            reject_order_id: reject_order_id.into(),
-            ack_count: Arc::new(AtomicU32::new(0)),
-            reject_count: Arc::new(AtomicU32::new(0)),
-            signal: Arc::new(tokio::sync::Notify::new()),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn ack_count(&self) -> u32 {
-        self.ack_count.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    fn reject_count(&self) -> u32 {
-        self.reject_count.load(Ordering::Relaxed)
-    }
-
-    #[allow(dead_code)]
-    async fn wait_for_total(&self, target: u32, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let total = self.ack_count() + self.reject_count();
-            if total >= target {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return (self.ack_count() + self.reject_count()) >= target;
-                }
-            }
-        }
-    }
-}
-
-impl MessageHandler<SeqSkipTopic> for RejectOrderHandler {
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
-        if msg.order_id == self.reject_order_id {
-            self.reject_count.fetch_add(1, Ordering::Relaxed);
-            self.signal.notify_waiters();
-            Outcome::Reject
-        } else {
-            self.ack_count.fetch_add(1, Ordering::Relaxed);
-            self.signal.notify_waiters();
-            Outcome::Ack
-        }
-    }
-}
-
-impl MessageHandler<SeqFailAllTopic> for RejectOrderHandler {
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
-        if msg.order_id == self.reject_order_id {
-            self.reject_count.fetch_add(1, Ordering::Relaxed);
-            self.signal.notify_waiters();
-            Outcome::Reject
-        } else {
-            self.ack_count.fetch_add(1, Ordering::Relaxed);
-            self.signal.notify_waiters();
-            Outcome::Ack
-        }
     }
 }
 
 /// Handler that records dead messages for verification.
 #[derive(Clone)]
 struct DlqRecordingHandler {
-    count: Arc<AtomicU32>,
-    signal: Arc<tokio::sync::Notify>,
+    counter: WaitableCounter,
 }
 
 impl DlqRecordingHandler {
     fn new() -> Self {
         Self {
-            count: Arc::new(AtomicU32::new(0)),
-            signal: Arc::new(tokio::sync::Notify::new()),
+            counter: WaitableCounter::new(),
         }
     }
 
-    #[allow(dead_code)]
     fn count(&self) -> u32 {
-        self.count.load(Ordering::Relaxed)
+        self.counter.get()
     }
 
-    #[allow(dead_code)]
     async fn wait_for_count(&self, target: u32, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.count() >= target {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.count() >= target;
-                }
-            }
-        }
+        self.counter.wait_for(target, timeout).await
     }
 }
 
@@ -575,8 +434,7 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
     }
 
     async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.signal.notify_waiters();
+        self.counter.increment();
     }
 }
 
@@ -894,7 +752,6 @@ async fn rejected_message_lands_in_dlq() {
             .await
     });
 
-    // Poll the DLQ directly until the message arrives (SQS native redrive)
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
         .queue_registry
@@ -902,25 +759,9 @@ async fn rejected_message_lands_in_dlq() {
         .await
         .expect("DLQ URL should exist");
 
-    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let result = sqs_client
-                .receive_message()
-                .queue_url(&dlq_url)
-                .max_number_of_messages(10)
-                .wait_time_seconds(1)
-                .send()
-                .await
-                .expect("failed to poll DLQ");
-
-            let msgs = result.messages.unwrap_or_default();
-            if !msgs.is_empty() {
-                return msgs;
-            }
-        }
-    })
-    .await
-    .expect("message should arrive in DLQ within 30 seconds");
+    let dlq_messages = broker
+        .receive_messages(&sqs_client, &dlq_url, 1, Duration::from_secs(30))
+        .await;
 
     shutdown.cancel();
     handle.await.expect("consumer task should not panic").ok();
@@ -1038,8 +879,7 @@ async fn retry_then_ack_succeeds() {
         .expect("publish should succeed");
 
     let handler = RetryThenAckHandler::new(1);
-    let attempt_count = handler.attempt_count.clone();
-    let signal = handler.signal.clone();
+    let attempts = handler.attempt_counter.clone();
 
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
@@ -1057,31 +897,17 @@ async fn retry_then_ack_succeeds() {
     });
 
     // Wait for at least 2 calls (1 retry + 1 ack)
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if attempt_count.load(Ordering::Relaxed) >= 2 {
-                break;
-            }
-            tokio::select! {
-                _ = signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => { break; }
-            }
-        }
-    })
-    .await
-    .expect("should complete within timeout");
+    let reached = attempts.wait_for(2, Duration::from_secs(30)).await;
+    assert!(
+        reached,
+        "handler should have been called at least 2 times (1 retry + 1 ack)"
+    );
 
     shutdown.cancel();
     handle
         .await
         .expect("consumer task should not panic")
         .expect("consumer should exit cleanly");
-
-    assert!(
-        attempt_count.load(Ordering::Relaxed) >= 2,
-        "handler should have been called at least 2 times (1 retry + 1 ack)"
-    );
 }
 
 #[tokio::test]
@@ -1117,7 +943,6 @@ async fn max_retries_sends_to_dlq() {
             .await
     });
 
-    // Poll DLQ directly until message appears
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
         .queue_registry
@@ -1125,25 +950,9 @@ async fn max_retries_sends_to_dlq() {
         .await
         .expect("DLQ URL should exist");
 
-    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let result = sqs_client
-                .receive_message()
-                .queue_url(&dlq_url)
-                .max_number_of_messages(10)
-                .wait_time_seconds(1)
-                .send()
-                .await
-                .expect("failed to poll DLQ");
-
-            let msgs = result.messages.unwrap_or_default();
-            if !msgs.is_empty() {
-                return msgs;
-            }
-        }
-    })
-    .await
-    .expect("message should arrive in DLQ within 30 seconds");
+    let dlq_messages = broker
+        .receive_messages(&sqs_client, &dlq_url, 1, Duration::from_secs(30))
+        .await;
 
     shutdown.cancel();
     handle.await.expect("consumer task should not panic").ok();
@@ -1310,7 +1119,6 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
             .await
     });
 
-    // Poll DLQ, verify message arrives
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
         .queue_registry
@@ -1318,25 +1126,9 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
         .await
         .expect("DLQ URL should exist");
 
-    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let result = sqs_client
-                .receive_message()
-                .queue_url(&dlq_url)
-                .max_number_of_messages(10)
-                .wait_time_seconds(1)
-                .send()
-                .await
-                .expect("failed to poll DLQ");
-
-            let msgs = result.messages.unwrap_or_default();
-            if !msgs.is_empty() {
-                return msgs;
-            }
-        }
-    })
-    .await
-    .expect("message should arrive in DLQ within 30 seconds");
+    let dlq_messages = broker
+        .receive_messages(&sqs_client, &dlq_url, 1, Duration::from_secs(30))
+        .await;
 
     shutdown.cancel();
     handle.await.expect("consumer task should not panic").ok();
@@ -2094,32 +1886,15 @@ async fn deserialization_failure_rejects_to_dlq() {
             .await
     });
 
-    // Poll DLQ until message appears or timeout.
     let dlq_url = setup
         .queue_registry
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should be registered");
 
-    let dlq_messages = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let result = sqs_client
-                .receive_message()
-                .queue_url(&dlq_url)
-                .max_number_of_messages(10)
-                .wait_time_seconds(1)
-                .send()
-                .await
-                .expect("failed to poll DLQ");
-
-            let msgs = result.messages.unwrap_or_default();
-            if !msgs.is_empty() {
-                return msgs;
-            }
-        }
-    })
-    .await
-    .expect("malformed message should be routed to DLQ within 30 seconds");
+    let dlq_messages = broker
+        .receive_messages(&sqs_client, &dlq_url, 1, Duration::from_secs(30))
+        .await;
 
     shutdown.cancel();
     handle.await.expect("consumer task should not panic").ok();
@@ -2178,23 +1953,6 @@ async fn run_dlq_on_topic_without_dlq_fails() {
     assert!(
         result.is_err(),
         "run_dlq should return Err for topic without DLQ"
-    );
-}
-
-#[tokio::test]
-async fn consumer_run_dlq_on_topic_without_dlq_name_fails() {
-    let broker = TestBroker::start().await;
-    let setup = TestSetup::new(&broker).await;
-    setup.declare::<NoDlqTopic>().await;
-
-    let handler = CountingHandler::new();
-
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
-    let result = consumer.run_dlq::<NoDlqTopic>(handler).await;
-
-    assert!(
-        result.is_err(),
-        "run_dlq should Err when topic has no DLQ configured"
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(

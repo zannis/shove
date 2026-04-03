@@ -169,8 +169,8 @@ async fn main() {
 
     // ── Sequential run ──────────────────────────────────────────────────
 
-    eprintln!("--- Sequential (run) ---");
-    eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch={prefetch}");
+    eprintln!("--- Sequential (prefetch_count=1) ---");
+    eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch=1");
 
     purge_queue(&client).await;
     publish_tasks(&publisher, msg_count).await;
@@ -183,7 +183,7 @@ async fn main() {
 
     let start = Instant::now();
     let handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_prefetch_count(prefetch);
+        let opts = ConsumerOptions::new(s).with_prefetch_count(1);
         consumer.run::<SlowTasks>(h, opts).await
     });
 
@@ -201,7 +201,7 @@ async fn main() {
 
     // ── Concurrent run ──────────────────────────────────────────────────
 
-    eprintln!("--- Concurrent (run) ---");
+    eprintln!("--- Concurrent (prefetch_count={prefetch}) ---");
     eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch={prefetch}");
 
     purge_queue(&client).await;
