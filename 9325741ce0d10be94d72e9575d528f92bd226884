@@ -1,0 +1,25 @@
+tests/sns_sqs_integration.rs
+  e5cf616e84039223 9,23-66,280,286,291,295,301,308,317,324,331-332,345,352,356-357,364,373,380,389,396,404,412,418,423,427,437,762-764,882,900-904,953-955,1129-1131,1895-1897
+examples/concurrent_pubsub.rs
+  e5cf616e84039223 172-173,186,204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "9325741ce0d10be94d72e9575d528f92bd226884",
+  "prompts": {
+    "e5cf616e84039223": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "db9f2671-c2af-405b-ac23-af7522f38cbe",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 256,
+      "total_deletions": 498,
+      "accepted_lines": 97,
+      "overriden_lines": 0
+    }
+  }
+}
