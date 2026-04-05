@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use shove::sns::*;
+use shove::sns::{SqsQueueStatsProviderTrait, *};
 use shove::*;
 
 use testcontainers::runners::AsyncRunner;
@@ -1978,6 +1978,170 @@ async fn deserialization_failure_rejects_to_dlq() {
         0,
         "handler should not have been invoked (deserialization failed before handler)"
     );
+}
+
+#[derive(Clone)]
+struct StickyHandler {
+    signal: Arc<tokio::sync::Notify>,
+}
+impl StickyHandler {
+    fn new() -> Self {
+        Self {
+            signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+impl<T: Topic> MessageHandler<T> for StickyHandler {
+    async fn handle(&self, _: T::Message, _: MessageMetadata) -> Outcome {
+        self.signal.notified().await;
+        Outcome::Ack
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autoscaler Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sqs_autoscaler_scales_group_on_load() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    // 1. Publish enough messages to trigger a scale-up.
+    // Prefetch is 1, min_consumers is 1.
+    // We'll publish 5 messages.
+    for i in 1..=5 {
+        let msg = SimpleMessage {
+            id: format!("auto-{i}"),
+            content: format!("message {i}"),
+        };
+        setup
+            .publisher
+            .publish::<WorkTopic>(&msg)
+            .await
+            .expect("publish should succeed");
+    }
+
+    // Give SQS a moment to reflect the count.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // 2. Setup Registry and Group.
+    let mut registry = SqsConsumerGroupRegistry::new(
+        setup.sns_client.clone(),
+        setup.topic_registry.clone(),
+        setup.queue_registry.clone(),
+    );
+
+    let sticky = StickyHandler::new();
+    let s2 = sticky.clone();
+
+    let config = SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1);
+
+    registry
+        .register::<WorkTopic, _>(config, move || s2.clone())
+        .await
+        .expect("register should succeed");
+
+    registry.start_all();
+
+    let registry_arc = Arc::new(Mutex::new(registry));
+
+    // 3. Setup Autoscaler.
+    let stats_provider =
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+
+    let auto_config = AutoscalerConfig {
+        poll_interval: Duration::from_millis(100),
+        scale_up_multiplier: 0.5,
+        scale_down_multiplier: 0.9,
+        hysteresis_duration: Duration::ZERO,
+        cooldown_duration: Duration::ZERO,
+    };
+
+    let mut autoscaler = SqsAutoscaler::new(stats_provider, auto_config);
+    let shutdown = CancellationToken::new();
+
+    // 4. Run autoscaler for a few cycles.
+    let r_clone = registry_arc.clone();
+    let s_clone = shutdown.clone();
+    let auto_handle = tokio::spawn(async move {
+        autoscaler.run(r_clone, s_clone).await;
+    });
+
+    // Wait for scale up.
+    let mut scaled_up = false;
+    let stats_provider =
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    for i in 0..50 {
+        let stats = stats_provider.get_queue_stats("sqs-work").await.unwrap();
+        let reg = registry_arc.lock().await;
+        let group = reg
+            .groups()
+            .values()
+            .next()
+            .expect("Registry should have at least one group");
+        let active = group.active_consumers();
+
+        if i % 10 == 0 {
+            println!(
+                "Iteration {i}: Ready={}, InFlight={}, Consumers={}",
+                stats.messages_ready, stats.messages_not_visible, active
+            );
+        }
+
+        if active > 1 {
+            scaled_up = true;
+            break;
+        }
+        drop(reg);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(scaled_up, "Autoscaler should have increased consumer count");
+
+    // 5. Clear the load and wait for scale down.
+    println!("Releasing messages for scale-down test...");
+    sticky.signal.notify_waiters();
+
+    // Give some time for messages to be deleted and for SQS stats to update.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut scaled_down = false;
+    for i in 0..50 {
+        let stats = stats_provider.get_queue_stats("sqs-work").await.unwrap();
+        let reg = registry_arc.lock().await;
+        let group = reg
+            .groups()
+            .values()
+            .next()
+            .expect("Registry should have at least one group");
+        let active = group.active_consumers();
+
+        if i % 10 == 0 {
+            println!(
+                "Iteration {i} (Scale Down): Ready={}, InFlight={}, Consumers={}",
+                stats.messages_ready, stats.messages_not_visible, active
+            );
+        }
+
+        if active == 1 {
+            scaled_down = true;
+            break;
+        }
+        drop(reg);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        scaled_down,
+        "Autoscaler should have decreased consumer count back to minimum"
+    );
+
+    // Cleanup
+    shutdown.cancel();
+    let _ = auto_handle.await;
+    registry_arc.lock().await.shutdown_all().await;
 }
 
 // ---------------------------------------------------------------------------

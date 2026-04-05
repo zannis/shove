@@ -16,7 +16,7 @@ rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
 # Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.
 # Makes publish-to-hold-queue + ack atomic (tx_select/tx_commit), eliminating
 # the publish-then-ack race at the cost of ~10-15× lower throughput per channel.
-rabbitmq-exactly-once = ["rabbitmq"]
+rabbitmq-transactional = ["rabbitmq"]
 
 # SNS Publisher
 pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]

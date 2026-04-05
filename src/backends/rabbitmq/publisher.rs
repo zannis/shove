@@ -344,7 +344,7 @@ impl ChannelPublisher {
     /// In tx mode every `basic_publish` and `basic_ack`/`nack` is buffered
     /// until [`commit_if_tx`](Self::commit_if_tx) is called, making routing
     /// decisions atomic.
-    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[cfg(feature = "rabbitmq-transactional")]
     pub(crate) fn new_tx(channel: Channel) -> Self {
         Self {
             channel,
@@ -358,7 +358,7 @@ impl ChannelPublisher {
     /// operations atomic. On error the broker automatically rolls back the tx;
     /// the original delivery remains unacked and will be redelivered.
     pub(crate) async fn commit_if_tx(&self) -> Result<()> {
-        #[cfg(feature = "rabbitmq-exactly-once")]
+        #[cfg(feature = "rabbitmq-transactional")]
         if self.tx_mode {
             self.channel
                 .tx_commit()
@@ -373,7 +373,7 @@ impl ChannelPublisher {
     /// Call when a publish succeeded (was buffered) but the subsequent ack
     /// failed, to undo the buffered publish before requeuing.
     pub(crate) async fn rollback_if_tx(&self) {
-        #[cfg(feature = "rabbitmq-exactly-once")]
+        #[cfg(feature = "rabbitmq-transactional")]
         if self.tx_mode
             && let Err(e) = self.channel.tx_rollback().await
         {

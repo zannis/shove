@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod autoscaler;
 pub mod consumer;
 pub mod error;
 pub mod handler;
@@ -47,12 +48,14 @@ pub mod sns {
         topology::{SnsTopologyDeclarer, TopicRegistry},
     };
 
+    pub use crate::autoscaler::AutoscalerConfig;
     #[cfg(feature = "aws-sns-sqs")]
     pub use crate::backends::sns::{
+        autoscaler::SqsAutoscaler,
         consumer::SqsConsumer,
         consumer_group::{SqsConsumerGroup, SqsConsumerGroupConfig},
         registry::SqsConsumerGroupRegistry,
-        stats::{SqsQueueStats, SqsQueueStatsProvider},
+        stats::{SqsQueueStats, SqsQueueStatsProvider, SqsQueueStatsProviderTrait},
         topology::QueueRegistry,
     };
 }

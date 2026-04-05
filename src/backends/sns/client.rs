@@ -65,6 +65,33 @@ impl SnsClient {
         })
     }
 
+    /// Create a mock SNS client with default configuration.
+    #[cfg(test)]
+    pub(crate) fn mock() -> Self {
+        let behavior_version = aws_config::BehaviorVersion::latest();
+        let sns_conf = aws_sdk_sns::config::Config::builder()
+            .behavior_version(behavior_version)
+            .region(aws_config::Region::new("us-east-1"))
+            .build();
+        let sns_client = aws_sdk_sns::Client::from_conf(sns_conf);
+
+        #[cfg(feature = "aws-sns-sqs")]
+        let sqs_client = {
+            let sqs_conf = aws_sdk_sqs::config::Config::builder()
+                .behavior_version(behavior_version)
+                .region(aws_config::Region::new("us-east-1"))
+                .build();
+            aws_sdk_sqs::Client::from_conf(sqs_conf)
+        };
+
+        Self {
+            sns_client,
+            #[cfg(feature = "aws-sns-sqs")]
+            sqs_client,
+            shutdown_token: CancellationToken::new(),
+        }
+    }
+
     /// Return a reference to the underlying AWS SDK SNS client.
     pub(crate) fn inner(&self) -> &aws_sdk_sns::Client {
         &self.sns_client

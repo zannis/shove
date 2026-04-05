@@ -3951,9 +3951,9 @@ async fn sequenced_consumer_multiple_keys_concurrent() {
 // same observable behavior as the default confirm-mode consumers (ack, retry,
 // reject/DLQ) while using AMQP transaction mode under the hood.
 //
-// Run with: `cargo test --features rabbitmq-exactly-once --test rabbitmq_integration`
+// Run with: `cargo test --features rabbitmq-transactional --test rabbitmq_integration`
 
-#[cfg(feature = "rabbitmq-exactly-once")]
+#[cfg(feature = "rabbitmq-transactional")]
 mod exactly_once {
     use super::*;
 

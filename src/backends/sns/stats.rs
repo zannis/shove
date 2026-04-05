@@ -13,6 +13,14 @@ pub struct SqsQueueStats {
     pub messages_not_visible: u64,
 }
 
+/// Abstraction over SQS queue attributes for fetching stats.
+pub trait SqsQueueStatsProviderTrait: Send + Sync {
+    fn get_queue_stats(
+        &self,
+        queue_name: &str,
+    ) -> impl Future<Output = Result<SqsQueueStats>> + Send;
+}
+
 /// Fetches SQS queue statistics for autoscaling decisions.
 pub struct SqsQueueStatsProvider {
     client: SnsClient,
@@ -26,8 +34,10 @@ impl SqsQueueStatsProvider {
             queue_registry,
         }
     }
+}
 
-    pub async fn get_queue_stats(&self, queue_name: &str) -> Result<SqsQueueStats> {
+impl SqsQueueStatsProviderTrait for SqsQueueStatsProvider {
+    async fn get_queue_stats(&self, queue_name: &str) -> Result<SqsQueueStats> {
         let queue_url = self.queue_registry.get(queue_name).await.ok_or_else(|| {
             ShoveError::Connection(format!("no SQS queue URL for '{queue_name}'"))
         })?;

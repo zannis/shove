@@ -35,7 +35,7 @@ use crate::{QueueTopology, RECONNECT_DELAY};
 
 /// Opens a channel with QoS and starts consuming from `queue`.
 ///
-/// When `exactly_once` is `true` (requires the `rabbitmq-exactly-once` feature)
+/// When `exactly_once` is `true` (requires the `rabbitmq-transactional` feature)
 /// the channel is put into AMQP transaction mode (`tx_select`). Otherwise a
 /// confirm-mode channel is created.
 async fn open_consumer(
@@ -44,13 +44,13 @@ async fn open_consumer(
     prefetch_count: u16,
     exactly_once: bool,
 ) -> Result<(Channel, lapin::Consumer)> {
-    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[cfg(feature = "rabbitmq-transactional")]
     let channel = if exactly_once {
         client.create_tx_channel().await?
     } else {
         client.create_confirm_channel().await?
     };
-    #[cfg(not(feature = "rabbitmq-exactly-once"))]
+    #[cfg(not(feature = "rabbitmq-transactional"))]
     let channel = {
         let _ = exactly_once;
         client.create_confirm_channel().await?
@@ -226,13 +226,13 @@ impl RabbitMqConsumer {
         let exactly_once = options.exactly_once;
         let (channel, mut stream) =
             open_consumer(&self.client, queue, prefetch, exactly_once).await?;
-        #[cfg(feature = "rabbitmq-exactly-once")]
+        #[cfg(feature = "rabbitmq-transactional")]
         let publisher = if exactly_once {
             ChannelPublisher::new_tx(channel)
         } else {
             ChannelPublisher::new(channel)
         };
-        #[cfg(not(feature = "rabbitmq-exactly-once"))]
+        #[cfg(not(feature = "rabbitmq-transactional"))]
         let publisher = ChannelPublisher::new(channel);
         // Channel for handlers to signal completion by sending their sequence key.
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<String>();
@@ -757,13 +757,13 @@ impl RabbitMqConsumer {
         let exactly_once = options.exactly_once;
         let (channel, mut stream) =
             open_consumer(&self.client, queue, options.prefetch_count, exactly_once).await?;
-        #[cfg(feature = "rabbitmq-exactly-once")]
+        #[cfg(feature = "rabbitmq-transactional")]
         let publisher = if exactly_once {
             ChannelPublisher::new_tx(channel)
         } else {
             ChannelPublisher::new(channel)
         };
-        #[cfg(not(feature = "rabbitmq-exactly-once"))]
+        #[cfg(not(feature = "rabbitmq-transactional"))]
         let publisher = ChannelPublisher::new(channel);
         let notify = Arc::new(Notify::new());
         let max_in_flight = options.prefetch_count as usize;

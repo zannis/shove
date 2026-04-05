@@ -6,7 +6,7 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust with **at-least-once delivery guarantees**. Supports RabbitMQ and AWS SNS/SQS.
+Type-safe async pub/sub for Rust with **strong delivery guarantees**. Supports RabbitMQ and AWS SNS/SQS.
 
 Built for services that cannot afford to lose messages: retry topologies, DLQ routing, ordered delivery, audit trails, and autoscaling consumer groups — derived from a single topic definition. A single consumer handles 10k+ msg/s out of the box.
 
@@ -18,7 +18,6 @@ Built for services that cannot afford to lose messages: retry topologies, DLQ ro
 
 **shove is _not_ for you if:**
 - You have a single service with one queue and no retry requirements — use [lapin](https://github.com/amqp-rs/lapin) (RabbitMQ) or the AWS SDK directly
-- You need exactly-once delivery — shove guarantees at-least-once; your handlers must be idempotent
 
 ## Contents
 
@@ -29,6 +28,7 @@ Built for services that cannot afford to lose messages: retry topologies, DLQ ro
   - [Consume (SQS)](#consume-sqs)
   - [Consume (RabbitMQ)](#consume-rabbitmq)
 - [At-least-once delivery](#at-least-once-delivery)
+- [Exactly-once delivery (RabbitMQ)](#exactly-once-delivery-rabbitmq)
 - [Why not roll your own?](#why-not-roll-your-own)
 - [Performance](#performance)
 - [Features](#features)
@@ -206,6 +206,21 @@ For SNS FIFO topics (sequenced topics), shove derives `MessageDeduplicationId` f
 
 The `redelivered` flag in `MessageMetadata` is also set by the broker when it knows a delivery is a repeat.
 
+## Exactly-once delivery (RabbitMQ)
+
+The default RabbitMQ consumer uses publisher confirms, but there is a narrow race: if the channel closes between publishing a retry to a hold queue and acking the original, both copies land in the broker. Enable `rabbitmq-transactional` to eliminate this — routing decisions are wrapped in AMQP transactions so publish + ack are atomic.
+
+```toml
+shove = { version = "0.6", features = ["rabbitmq-transactional"] }
+```
+
+```rust,no_run
+let options = ConsumerOptions::new(shutdown).with_exactly_once();
+consumer.run::<OrderSettlement>(handler, options).await?;
+```
+
+The cost is significant: AMQP transactions add a broker round-trip per message, reducing per-channel throughput significantly. Enable it when you cannot tolerate routing duplicates and your handler has irreversible side effects.
+
 ## Why not roll your own?
 
 Raw broker clients (lapin for RabbitMQ, the AWS SDK for SQS) give you the primitives. If you have one service with one queue and no retry requirements, that's all you need.
@@ -230,7 +245,7 @@ The framework itself adds minimal overhead: sub-millisecond dispatch latency per
 
 ## Features
 
-- **At-least-once delivery** — panics, timeouts, and reconnects all trigger automatic retry. Messages are never silently dropped. Stable `x-message-id` headers (RabbitMQ) support handler-level deduplication.
+- **Delivery guarantees** — at-least-once by default (panics, timeouts, and reconnects all trigger automatic retry; messages are never silently dropped). Opt-in exactly-once routing for RabbitMQ via AMQP transactions (`rabbitmq-transactional` feature). Stable `x-message-id` headers support handler-level deduplication on RabbitMQ.
 - **Compile-time topic binding** — each topic is a unit struct that associates a message type (`Serialize + DeserializeOwned`) with a queue topology. No stringly-typed queue names at call sites.
 - **Concurrent consumption** — process up to `prefetch_count` messages concurrently within a single consumer, while always acknowledging in delivery order.
 - **Escalating retry backoff** — configure multiple hold queues with increasing delays. The consumer picks the right one automatically based on retry count.
@@ -379,11 +394,12 @@ This creates a self-contained audit trail inside your broker. The audit topic it
 
 ### Backends
 
-| Backend           | Feature flag   | Status |
-|-------------------|----------------|--------|
-| RabbitMQ          | `rabbitmq`     | Stable |
-| AWS SNS (publish) | `pub-aws-sns`  | Stable |
-| AWS SNS+SQS       | `aws-sns-sqs`  | Stable |
+| Backend                         | Feature flag              | Status |
+|---------------------------------|---------------------------|--------|
+| RabbitMQ                        | `rabbitmq`                | Stable |
+| RabbitMQ (exactly-once routing) | `rabbitmq-transactional`   | Stable |
+| AWS SNS (publisher only)        | `pub-aws-sns`             | Stable |
+| AWS SNS+SQS                     | `aws-sns-sqs`             | Stable |
 
 `pub-aws-sns` enables SNS publisher only — useful when you publish to SNS but consume on a different stack.
 `aws-sns-sqs` enables the full SNS+SQS backend (publisher + consumer + consumer groups + autoscaling). It implies `pub-aws-sns`.

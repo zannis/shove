@@ -55,7 +55,7 @@ pub struct ConsumerOptions {
     pub max_pending_per_key: Option<usize>,
     /// Enable exactly-once delivery via AMQP transactions (RabbitMQ only).
     ///
-    /// Requires the `rabbitmq-exactly-once` Cargo feature. When enabled, the
+    /// Requires the `rabbitmq-transactional` Cargo feature. When enabled, the
     /// consumer channel is put in AMQP transaction mode (`tx_select`). Every
     /// routing decision (retry, defer, ack, reject) is wrapped in a `tx_commit`,
     /// making publish-to-hold-queue and ack/nack of the original delivery
@@ -68,7 +68,7 @@ pub struct ConsumerOptions {
     /// to opt in.
     ///
     /// Has no effect on SQS consumers (SQS `ChangeMessageVisibility` is already
-    /// atomic) or when the `rabbitmq-exactly-once` feature is not enabled.
+    /// atomic) or when the `rabbitmq-transactional` feature is not enabled.
     pub exactly_once: bool,
 }
 
@@ -119,7 +119,7 @@ impl ConsumerOptions {
 
     /// Enable exactly-once delivery via AMQP transactions.
     ///
-    /// Requires the `rabbitmq-exactly-once` Cargo feature. See
+    /// Requires the `rabbitmq-transactional` Cargo feature. See
     /// [`ConsumerOptions::exactly_once`] for the full trade-off description.
     ///
     /// # Example
@@ -127,7 +127,7 @@ impl ConsumerOptions {
     /// let options = ConsumerOptions::new(shutdown)
     ///     .with_exactly_once();
     /// ```
-    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[cfg(feature = "rabbitmq-transactional")]
     pub fn with_exactly_once(mut self) -> Self {
         self.exactly_once = true;
         self
@@ -254,14 +254,14 @@ mod tests {
         assert!(!opts.exactly_once);
     }
 
-    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn with_exactly_once_sets_flag() {
         let opts = ConsumerOptions::new(CancellationToken::new()).with_exactly_once();
         assert!(opts.exactly_once);
     }
 
-    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn exactly_once_chains_with_other_builders() {
         let opts = ConsumerOptions::new(CancellationToken::new())

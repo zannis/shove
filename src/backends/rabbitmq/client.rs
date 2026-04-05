@@ -130,7 +130,7 @@ impl RabbitMqClient {
     ///
     /// Returns [`ShoveError::Connection`] if shutdown has already been requested,
     /// if the channel cannot be created, or if `tx_select` cannot be enabled.
-    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[cfg(feature = "rabbitmq-transactional")]
     pub async fn create_tx_channel(&self) -> Result<Channel> {
         if self.shutdown_token.is_cancelled() {
             return Err(ShoveError::Connection(
