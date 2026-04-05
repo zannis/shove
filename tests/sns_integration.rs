@@ -12,8 +12,8 @@ use std::time::Duration;
 use shove::sns::*;
 use shove::*;
 
+use testcontainers::GenericImage;
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::localstack::LocalStack;
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -21,26 +21,35 @@ use testcontainers_modules::localstack::LocalStack;
 
 struct TestBroker {
     #[allow(dead_code)]
-    container: testcontainers::ContainerAsync<LocalStack>,
+    container: testcontainers::ContainerAsync<GenericImage>,
     endpoint_url: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
-        let container = LocalStack::default()
+        // Set dummy credentials for LocalStack/floci (LocalStack-compatible).
+        // SAFETY: tests run single-threaded (--test-threads=1) so mutating the
+        // environment does not cause data races.
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+            std::env::set_var("AWS_REGION", "us-east-1");
+        }
+
+        let container = GenericImage::new("hectorvent/floci", "latest")
+            .with_exposed_port(4566u16.into())
             .start()
             .await
-            .expect("failed to start LocalStack container");
+            .expect("failed to start floci container");
 
-        let host = container.get_host().await.expect("failed to get host");
         let port = container
             .get_host_port_ipv4(4566)
             .await
-            .expect("failed to get LocalStack port");
+            .expect("failed to get floci port");
 
-        let endpoint_url = format!("http://{host}:{port}");
+        let endpoint_url = format!("http://localhost:{port}");
 
-        // Give LocalStack a moment to initialize SNS/SQS
+        // Give floci a moment to initialize
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         Self {

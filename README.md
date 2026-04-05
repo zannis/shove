@@ -6,7 +6,7 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust with **strong delivery guarantees**. Supports RabbitMQ and AWS SNS/SQS.
+Type-safe async pub/sub for Rust with strong delivery guarantees. Supports RabbitMQ and AWS SNS/SQS.
 
 Built for services that cannot afford to lose messages: retry topologies, DLQ routing, ordered delivery, audit trails, and autoscaling consumer groups — derived from a single topic definition. A single consumer handles 10k+ msg/s out of the box.
 

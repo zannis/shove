@@ -56,6 +56,35 @@ fn extract_metadata(msg: &aws_sdk_sqs::types::Message) -> MessageMetadata {
     }
 }
 
+/// SNS notification envelope that wraps message payloads when `RawMessageDelivery`
+/// is not enabled (or is ignored by the broker emulator).
+///
+/// Real AWS with `RawMessageDelivery=true`: body is the raw payload → this struct
+/// is never used.  Emulators that ignore the attribute (e.g. floci) always wrap
+/// messages; we unwrap them here so the consumer can deserialize normally.
+#[derive(serde::Deserialize)]
+struct SnsEnvelope {
+    #[serde(rename = "Type")]
+    notification_type: String,
+    /// The actual message payload, serialized as a JSON string inside the envelope.
+    #[serde(rename = "Message")]
+    message: String,
+}
+
+/// Return the raw payload string from an SQS message body.
+///
+/// Tries to parse the body as an [`SnsEnvelope`]. If the `Type` field is
+/// `"Notification"` the inner `Message` string is returned (owned); otherwise
+/// the original body is returned as a borrow (no allocation).
+fn extract_payload(body: &str) -> std::borrow::Cow<'_, str> {
+    if let Ok(envelope) = serde_json::from_str::<SnsEnvelope>(body) {
+        if envelope.notification_type == "Notification" {
+            return std::borrow::Cow::Owned(envelope.message);
+        }
+    }
+    std::borrow::Cow::Borrowed(body)
+}
+
 fn extract_dead_metadata(
     msg: &aws_sdk_sqs::types::Message,
     queue_name: &str,
@@ -262,8 +291,8 @@ where
             }
 
             // ── Deserialize ──
-            let body = msg.body().unwrap_or_default();
-            let message: T::Message = match serde_json::from_str(body) {
+            let body = extract_payload(msg.body().unwrap_or_default());
+            let message: T::Message = match serde_json::from_str(&body) {
                 Ok(m) => m,
                 Err(err) => {
                     error!(
@@ -768,8 +797,8 @@ where
                     }
 
                     // ── Spawn handler for this key ──
-                    let body = msg.body().unwrap_or_default();
-                    let message: T::Message = match serde_json::from_str(body) {
+                    let body = extract_payload(msg.body().unwrap_or_default());
+                    let message: T::Message = match serde_json::from_str(&body) {
                         Ok(m) => m,
                         Err(err) => {
                             error!(
@@ -876,8 +905,8 @@ async fn drain_pending_for_key<T, H>(
             continue;
         }
 
-        let body = msg.body().unwrap_or_default();
-        let message: T::Message = match serde_json::from_str(body) {
+        let body = extract_payload(msg.body().unwrap_or_default());
+        let message: T::Message = match serde_json::from_str(&body) {
             Ok(m) => m,
             Err(err) => {
                 error!(
@@ -972,10 +1001,10 @@ where
 
                 for msg in messages {
                     let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
-                    let body = msg.body().unwrap_or_default();
+                    let body = extract_payload(msg.body().unwrap_or_default());
                     let metadata = extract_dead_metadata(&msg, original_queue);
 
-                    match serde_json::from_str::<T::Message>(body) {
+                    match serde_json::from_str::<T::Message>(&body) {
                         Err(err) => {
                             error!(
                                 error = %err,

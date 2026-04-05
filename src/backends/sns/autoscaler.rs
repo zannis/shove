@@ -602,4 +602,331 @@ mod tests {
             3
         );
     }
+
+    // Shared boilerplate for single-group registry setup used by edge-case tests.
+    async fn make_single_group_registry(
+        min: u16,
+        max: u16,
+        prefetch: u16,
+        started: bool,
+    ) -> (Arc<Mutex<SqsConsumerGroupRegistry>>, CancellationToken) {
+        use crate::backends::sns::client::SnsClient;
+        use crate::backends::sns::consumer_group::SqsConsumerGroupConfig;
+        use crate::backends::sns::topology::{QueueRegistry, TopicRegistry};
+        use crate::handler::MessageHandler;
+        use crate::topic::Topic;
+        use crate::topology::QueueTopology;
+        use std::sync::OnceLock;
+
+        let client = SnsClient::mock();
+        let topic_reg = Arc::new(TopicRegistry::new());
+        let queue_reg = Arc::new(QueueRegistry::new());
+        let mut registry =
+            SqsConsumerGroupRegistry::new(client.clone(), topic_reg, queue_reg.clone());
+
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        struct Msg;
+        struct T;
+        impl Topic for T {
+            type Message = Msg;
+            fn topology() -> &'static QueueTopology {
+                static TOPO: OnceLock<QueueTopology> = OnceLock::new();
+                TOPO.get_or_init(|| crate::topology::TopologyBuilder::new("edge-queue").build())
+            }
+        }
+        #[derive(Clone)]
+        struct H;
+        impl MessageHandler<T> for H {
+            async fn handle(
+                &self,
+                _: Msg,
+                _: crate::metadata::MessageMetadata,
+            ) -> crate::outcome::Outcome {
+                crate::outcome::Outcome::Ack
+            }
+        }
+
+        let token = client.shutdown_token().child_token();
+        let mut group = crate::backends::sns::consumer_group::SqsConsumerGroup::new::<T, H>(
+            "edge-group",
+            "edge-queue",
+            SqsConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),
+            client.clone(),
+            Arc::new(QueueRegistry::new()),
+            token.clone(),
+            || H,
+        );
+        if started {
+            group.start();
+        }
+        registry.groups_mut().insert("edge-group".into(), group);
+        (Arc::new(Mutex::new(registry)), token)
+    }
+
+    /// When the stats provider returns an error the autoscaler logs and skips
+    /// that group — consumer count must not change.
+    #[tokio::test]
+    async fn poll_and_scale_stats_error_skips_group() {
+        let (registry, _token) = make_single_group_registry(1, 5, 10, true).await;
+
+        // Provider has no entry for "edge-queue" → returns Err.
+        let stats_provider = MockSqsStatsProvider::new();
+        let config = AutoscalerConfig {
+            hysteresis_duration: Duration::ZERO,
+            cooldown_duration: Duration::ZERO,
+            ..AutoscalerConfig::default()
+        };
+        let mut autoscaler = SqsAutoscaler::with_stats_provider(stats_provider, config);
+
+        let before = registry
+            .lock()
+            .await
+            .groups()
+            .get("edge-group")
+            .unwrap()
+            .active_consumers();
+
+        autoscaler.poll_and_scale(&registry).await;
+
+        let after = registry
+            .lock()
+            .await
+            .groups()
+            .get("edge-group")
+            .unwrap()
+            .active_consumers();
+
+        assert_eq!(
+            before, after,
+            "consumer count must not change on stats error"
+        );
+    }
+
+    /// scale_up at max_consumers is a no-op — autoscaler must not exceed the
+    /// configured ceiling.
+    #[tokio::test]
+    async fn poll_and_scale_at_max_does_not_exceed() {
+        // min=max=2 so the group is already at capacity after start().
+        let (registry, _token) = make_single_group_registry(2, 2, 10, true).await;
+
+        let mut stats_provider = MockSqsStatsProvider::new();
+        // High load → wants scale-up, but max is already reached.
+        stats_provider.stats.insert(
+            "edge-queue".into(),
+            SqsQueueStats {
+                messages_ready: 1000,
+                messages_not_visible: 0,
+            },
+        );
+
+        let config = AutoscalerConfig {
+            hysteresis_duration: Duration::ZERO,
+            cooldown_duration: Duration::ZERO,
+            ..AutoscalerConfig::default()
+        };
+        let mut autoscaler = SqsAutoscaler::with_stats_provider(stats_provider, config);
+
+        autoscaler.poll_and_scale(&registry).await;
+
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .groups()
+                .get("edge-group")
+                .unwrap()
+                .active_consumers(),
+            2,
+            "must not exceed max_consumers"
+        );
+    }
+
+    /// scale_down at min_consumers is a no-op — autoscaler must not go below
+    /// the configured floor.
+    #[tokio::test]
+    async fn poll_and_scale_at_min_does_not_go_below() {
+        // min=max=1 — already at the floor after start().
+        let (registry, _token) = make_single_group_registry(1, 5, 10, true).await;
+
+        let mut stats_provider = MockSqsStatsProvider::new();
+        // Empty queue → wants scale-down, but min is already reached.
+        stats_provider.stats.insert(
+            "edge-queue".into(),
+            SqsQueueStats {
+                messages_ready: 0,
+                messages_not_visible: 0,
+            },
+        );
+
+        let config = AutoscalerConfig {
+            hysteresis_duration: Duration::ZERO,
+            cooldown_duration: Duration::ZERO,
+            ..AutoscalerConfig::default()
+        };
+        let mut autoscaler = SqsAutoscaler::with_stats_provider(stats_provider, config);
+
+        // Active = 1 = min_consumers.  scale_down returns false.
+        autoscaler.poll_and_scale(&registry).await;
+
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .groups()
+                .get("edge-group")
+                .unwrap()
+                .active_consumers(),
+            1,
+            "must not go below min_consumers"
+        );
+    }
+
+    /// When the scale-up condition was accumulating hysteresis but the load
+    /// then drops below the threshold, `scale_up_since` must be cleared so
+    /// a subsequent low-load poll does not trigger a spurious scale-up.
+    #[tokio::test]
+    async fn poll_and_scale_scale_up_hysteresis_resets_when_load_drops() {
+        let (registry, _token) = make_single_group_registry(1, 5, 10, true).await;
+
+        let mut stats_provider = MockSqsStatsProvider::new();
+        // First: high load → starts hysteresis.
+        stats_provider.stats.insert(
+            "edge-queue".into(),
+            SqsQueueStats {
+                messages_ready: 1000,
+                messages_not_visible: 0,
+            },
+        );
+
+        let config = AutoscalerConfig {
+            hysteresis_duration: Duration::from_secs(60), // very long, won't fire naturally
+            cooldown_duration: Duration::ZERO,
+            ..AutoscalerConfig::default()
+        };
+        let mut autoscaler = SqsAutoscaler::with_stats_provider(stats_provider, config);
+
+        autoscaler.poll_and_scale(&registry).await;
+        assert!(
+            autoscaler
+                .state
+                .get("edge-group")
+                .unwrap()
+                .scale_up_since
+                .is_some(),
+            "hysteresis should have started"
+        );
+
+        // Load drops below threshold.
+        autoscaler.stats_provider.stats.insert(
+            "edge-queue".into(),
+            SqsQueueStats {
+                messages_ready: 0,
+                messages_not_visible: 0,
+            },
+        );
+        autoscaler.poll_and_scale(&registry).await;
+
+        assert!(
+            autoscaler
+                .state
+                .get("edge-group")
+                .unwrap()
+                .scale_up_since
+                .is_none(),
+            "scale_up_since must be cleared when load drops"
+        );
+        // Consumer count unchanged — hysteresis never fired.
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .groups()
+                .get("edge-group")
+                .unwrap()
+                .active_consumers(),
+            1
+        );
+    }
+
+    /// Symmetric: scale-down hysteresis resets when load rises back above
+    /// the scale-down threshold before the duration elapses.
+    #[tokio::test]
+    async fn poll_and_scale_scale_down_hysteresis_resets_when_load_rises() {
+        let (registry, _token) = make_single_group_registry(1, 5, 10, true).await;
+
+        // Scale up to 2 first so there is room to scale back down.
+        {
+            let mut reg = registry.lock().await;
+            reg.groups_mut().get_mut("edge-group").unwrap().scale_up();
+        }
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .groups()
+                .get("edge-group")
+                .unwrap()
+                .active_consumers(),
+            2
+        );
+
+        let mut stats_provider = MockSqsStatsProvider::new();
+        // First: low load → starts scale-down hysteresis.
+        stats_provider.stats.insert(
+            "edge-queue".into(),
+            SqsQueueStats {
+                messages_ready: 0,
+                messages_not_visible: 0,
+            },
+        );
+
+        let config = AutoscalerConfig {
+            hysteresis_duration: Duration::from_secs(60),
+            cooldown_duration: Duration::ZERO,
+            ..AutoscalerConfig::default()
+        };
+        let mut autoscaler = SqsAutoscaler::with_stats_provider(stats_provider, config);
+
+        autoscaler.poll_and_scale(&registry).await;
+        assert!(
+            autoscaler
+                .state
+                .get("edge-group")
+                .unwrap()
+                .scale_down_since
+                .is_some(),
+            "hysteresis should have started"
+        );
+
+        // Load rises — scale-down condition no longer true.
+        autoscaler.stats_provider.stats.insert(
+            "edge-queue".into(),
+            SqsQueueStats {
+                messages_ready: 1000,
+                messages_not_visible: 0,
+            },
+        );
+        autoscaler.poll_and_scale(&registry).await;
+
+        assert!(
+            autoscaler
+                .state
+                .get("edge-group")
+                .unwrap()
+                .scale_down_since
+                .is_none(),
+            "scale_down_since must be cleared when load rises"
+        );
+        // Still 2 consumers — hysteresis never fired.
+        assert_eq!(
+            registry
+                .lock()
+                .await
+                .groups()
+                .get("edge-group")
+                .unwrap()
+                .active_consumers(),
+            2
+        );
+    }
 }

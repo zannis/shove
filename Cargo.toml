@@ -118,6 +118,16 @@ name = "sqs_audited_consumer"
 path = "examples/sqs/audited_consumer.rs"
 required-features = ["aws-sns-sqs", "audit"]
 
+[[example]]
+name = "sqs_autoscaler"
+path = "examples/sqs/autoscaler.rs"
+required-features = ["aws-sns-sqs"]
+
+[[example]]
+name = "rabbitmq_exactly_once"
+path = "examples/rabbitmq/exactly_once.rs"
+required-features = ["rabbitmq-transactional"]
+
 [[test]]
 name = "rabbitmq_integration"
 required-features = ["rabbitmq"]

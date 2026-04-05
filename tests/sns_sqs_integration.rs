@@ -14,8 +14,8 @@ use std::time::Duration;
 use shove::sns::{SqsQueueStatsProviderTrait, *};
 use shove::*;
 
+use testcontainers::GenericImage;
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -70,35 +70,35 @@ impl WaitableCounter {
 
 struct TestBroker {
     #[allow(dead_code)]
-    container: testcontainers::ContainerAsync<LocalStack>,
+    container: testcontainers::ContainerAsync<GenericImage>,
     endpoint_url: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
-        // LocalStack accepts any non-empty credentials; set them so the AWS SDK
-        // credential chain succeeds without requiring real environment variables.
+        // Set dummy credentials for floci (LocalStack-compatible).
         // SAFETY: tests run single-threaded (--test-threads=1) so mutating the
         // environment does not cause data races.
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+            std::env::set_var("AWS_REGION", "us-east-1");
         }
 
-        let container = LocalStack::default()
+        let container = GenericImage::new("hectorvent/floci", "latest")
+            .with_exposed_port(4566u16.into())
             .start()
             .await
-            .expect("failed to start LocalStack container");
+            .expect("failed to start floci container");
 
-        let host = container.get_host().await.expect("failed to get host");
         let port = container
             .get_host_port_ipv4(4566)
             .await
-            .expect("failed to get LocalStack port");
+            .expect("failed to get floci port");
 
-        let endpoint_url = format!("http://{host}:{port}");
+        let endpoint_url = format!("http://localhost:{port}");
 
-        // Give LocalStack a moment to initialize SNS/SQS
+        // Give floci a moment to initialize SNS/SQS
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         Self {
@@ -2139,6 +2139,146 @@ async fn sqs_autoscaler_scales_group_on_load() {
     );
 
     // Cleanup
+    shutdown.cancel();
+    let _ = auto_handle.await;
+    registry_arc.lock().await.shutdown_all().await;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-group Autoscaler Tests
+// ---------------------------------------------------------------------------
+
+/// Two independent consumer groups are each scaled up by the autoscaler when
+/// both queues are under load. This verifies that `poll_and_scale` iterates
+/// over all registered groups, not just the first one.
+#[tokio::test]
+async fn sqs_autoscaler_scales_multiple_groups_independently() {
+    define_topic!(
+        WorkTopicA,
+        SimpleMessage,
+        TopologyBuilder::new("sqs-autoscale-a").dlq().build()
+    );
+
+    define_topic!(
+        WorkTopicB,
+        SimpleMessage,
+        TopologyBuilder::new("sqs-autoscale-b").dlq().build()
+    );
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopicA>().await;
+    setup.declare::<WorkTopicB>().await;
+
+    // Publish enough messages to both queues to trigger scale-up.
+    for i in 0..5u32 {
+        setup
+            .publisher
+            .publish::<WorkTopicA>(&SimpleMessage {
+                id: format!("a-{i}"),
+                content: "payload".into(),
+            })
+            .await
+            .expect("publish A should succeed");
+        setup
+            .publisher
+            .publish::<WorkTopicB>(&SimpleMessage {
+                id: format!("b-{i}"),
+                content: "payload".into(),
+            })
+            .await
+            .expect("publish B should succeed");
+    }
+
+    // Give SQS a moment to reflect the counts.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Build a registry with two groups — one per topic.
+    let mut registry = SqsConsumerGroupRegistry::new(
+        setup.sns_client.clone(),
+        setup.topic_registry.clone(),
+        setup.queue_registry.clone(),
+    );
+
+    let sticky_a = StickyHandler::new();
+    let sticky_b = StickyHandler::new();
+
+    registry
+        .register::<WorkTopicA, _>(SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1), {
+            let h = sticky_a.clone();
+            move || h.clone()
+        })
+        .await
+        .expect("register A should succeed");
+
+    registry
+        .register::<WorkTopicB, _>(SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1), {
+            let h = sticky_b.clone();
+            move || h.clone()
+        })
+        .await
+        .expect("register B should succeed");
+
+    registry.start_all();
+
+    let registry_arc = Arc::new(Mutex::new(registry));
+
+    // Autoscaler with fast polling and no hysteresis/cooldown.
+    let stats_provider =
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let auto_config = AutoscalerConfig {
+        poll_interval: Duration::from_millis(100),
+        scale_up_multiplier: 0.5,
+        scale_down_multiplier: 0.9,
+        hysteresis_duration: Duration::ZERO,
+        cooldown_duration: Duration::ZERO,
+    };
+    let mut autoscaler = SqsAutoscaler::new(stats_provider, auto_config);
+    let shutdown = CancellationToken::new();
+
+    let r = registry_arc.clone();
+    let s = shutdown.clone();
+    let auto_handle = tokio::spawn(async move {
+        autoscaler.run(r, s).await;
+    });
+
+    // Wait for both groups to scale above 1 consumer.
+    let mut a_scaled = false;
+    let mut b_scaled = false;
+
+    for _ in 0..50 {
+        let reg = registry_arc.lock().await;
+        let a = reg
+            .groups()
+            .get(WorkTopicA::topology().queue())
+            .map(|g| g.active_consumers())
+            .unwrap_or(0);
+        let b = reg
+            .groups()
+            .get(WorkTopicB::topology().queue())
+            .map(|g| g.active_consumers())
+            .unwrap_or(0);
+        drop(reg);
+
+        if a > 1 {
+            a_scaled = true;
+        }
+        if b > 1 {
+            b_scaled = true;
+        }
+        if a_scaled && b_scaled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(a_scaled, "autoscaler should have scaled up group A");
+    assert!(b_scaled, "autoscaler should have scaled up group B");
+
+    // Unblock sticky handlers so all messages get acked before shutdown.
+    sticky_a.signal.notify_waiters();
+    sticky_b.signal.notify_waiters();
+
     shutdown.cancel();
     let _ = auto_handle.await;
     registry_arc.lock().await.shutdown_all().await;
