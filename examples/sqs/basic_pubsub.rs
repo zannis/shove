@@ -4,7 +4,7 @@
 //! `publish`, `publish_with_headers`, `publish_batch`, `run`, `run_dlq`,
 //! and `handle_dead`.
 //!
-//! Requires a running floci instance (see docker-compose.yml):
+//! Requires a running LocalStack instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
 //!     cargo run --example sqs_basic_pubsub --features aws-sns-sqs
@@ -114,15 +114,15 @@ impl MessageHandler<RetryOrder> for RetryHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_floci() {
+fn require_localstack() {
     let output = std::process::Command::new("docker")
         .args(["compose", "ps", "--services", "--filter", "status=running"])
         .output();
     match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("floci") => {}
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
         _ => {
             eprintln!(
-                "floci is not running. Start it with:\n\n    docker compose up -d\n\n\
+                "LocalStack is not running. Start it with:\n\n    docker compose up -d\n\n\
                  Also ensure AWS credentials are set:\n\
                  export AWS_ACCESS_KEY_ID=test\n\
                  export AWS_SECRET_ACCESS_KEY=test\n"
@@ -134,9 +134,9 @@ fn require_floci() {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
-    require_floci();
+    require_localstack();
 
-    // Set dummy credentials for floci (LocalStack-compatible).
+    // Set dummy credentials for LocalStack.
     // SAFETY: called before any concurrent env access in this process.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");

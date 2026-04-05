@@ -70,6 +70,18 @@ pub struct ConsumerOptions {
     /// Has no effect on SQS consumers (SQS `ChangeMessageVisibility` is already
     /// atomic) or when the `rabbitmq-transactional` feature is not enabled.
     pub exactly_once: bool,
+    /// Number of messages to request per SQS `ReceiveMessage` poll, independent
+    /// of how many handlers may run concurrently (`prefetch_count`).
+    ///
+    /// When non-zero, the SQS consumer fetches this many messages per API call
+    /// and buffers them locally, dispatching them to handlers one-by-one (serial
+    /// mode) or in parallel (concurrent mode) up to `prefetch_count` at a time.
+    /// This allows batching SQS receives even in non-concurrent mode, reducing
+    /// API call overhead significantly when multiple consumers share the same queue.
+    ///
+    /// Zero means "use `prefetch_count`" (the default).
+    /// Only meaningful for SQS backends; ignored by RabbitMQ.
+    pub(crate) receive_batch_size: u16,
 }
 
 impl ConsumerOptions {
@@ -84,6 +96,7 @@ impl ConsumerOptions {
             handler_timeout: None,
             max_pending_per_key: None,
             exactly_once: false,
+            receive_batch_size: 0,
         }
     }
 

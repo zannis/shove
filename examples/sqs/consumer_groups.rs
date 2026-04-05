@@ -3,7 +3,7 @@
 //! Demonstrates: `SqsConsumerGroupRegistry`, `SqsConsumerGroupConfig`,
 //! `SqsQueueStatsProvider`, and dynamic queue depth monitoring.
 //!
-//! Requires a running floci instance (see docker-compose.yml):
+//! Requires a running LocalStack instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
 //!     cargo run --example sqs_consumer_groups --features aws-sns-sqs
@@ -53,14 +53,14 @@ impl MessageHandler<WorkQueue> for TaskHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_floci() {
+fn require_localstack() {
     let output = std::process::Command::new("docker")
         .args(["compose", "ps", "--services", "--filter", "status=running"])
         .output();
     match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("floci") => {}
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
         _ => {
-            eprintln!("floci is not running. Start it with:\n\n    docker compose up -d\n");
+            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
             std::process::exit(1);
         }
     }
@@ -68,7 +68,7 @@ fn require_floci() {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
-    require_floci();
+    require_localstack();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

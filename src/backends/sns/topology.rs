@@ -436,9 +436,11 @@ impl TopologyDeclarer for SnsTopologyDeclarer {
                     ))
                 })?;
 
-            // Still declare SQS if queue_registry is set
+            // Still declare SQS if queue_registry is set and queue not yet registered
             #[cfg(feature = "aws-sns-sqs")]
-            if self.queue_registry.is_some() {
+            if let Some(ref qr) = self.queue_registry
+                && qr.get(topology.queue()).await.is_none()
+            {
                 if topology.sequencing().is_some() {
                     self.declare_sqs_sequenced(topology, &arn).await?;
                 } else {
@@ -455,9 +457,11 @@ impl TopologyDeclarer for SnsTopologyDeclarer {
             self.declare_standard(topology).await?;
         }
 
-        // Declare SQS queues if a queue_registry is configured
+        // Declare SQS queues if a queue_registry is configured and queue not yet registered
         #[cfg(feature = "aws-sns-sqs")]
-        if self.queue_registry.is_some() {
+        if let Some(ref qr) = self.queue_registry
+            && qr.get(topology.queue()).await.is_none()
+        {
             let topic_arn = self
                 .topic_registry
                 .get(topology.queue())

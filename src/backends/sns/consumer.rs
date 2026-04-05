@@ -60,7 +60,7 @@ fn extract_metadata(msg: &aws_sdk_sqs::types::Message) -> MessageMetadata {
 /// is not enabled (or is ignored by the broker emulator).
 ///
 /// Real AWS with `RawMessageDelivery=true`: body is the raw payload → this struct
-/// is never used.  Emulators that ignore the attribute (e.g. floci) always wrap
+/// is never used. Emulators that ignore the attribute always wrap
 /// messages; we unwrap them here so the consumer can deserialize normally.
 #[derive(serde::Deserialize)]
 struct SnsEnvelope {
@@ -78,9 +78,10 @@ struct SnsEnvelope {
 /// the original body is returned as a borrow (no allocation).
 fn extract_payload(body: &str) -> std::borrow::Cow<'_, str> {
     if let Ok(envelope) = serde_json::from_str::<SnsEnvelope>(body)
-        && envelope.notification_type == "Notification" {
-            return std::borrow::Cow::Owned(envelope.message);
-        }
+        && envelope.notification_type == "Notification"
+    {
+        return std::borrow::Cow::Owned(envelope.message);
+    }
     std::borrow::Cow::Borrowed(body)
 }
 
@@ -106,7 +107,7 @@ async fn run_with_reconnect<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
 {
     loop {
         match f().await {
@@ -178,7 +179,7 @@ struct PendingMessage {
 async fn consume_loop_concurrent<T, H>(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
-    topology: &'static crate::topology::QueueTopology,
+    topology: &'static QueueTopology,
     handler: &Arc<H>,
     options: &ConsumerOptions,
 ) -> Result<()>
@@ -187,23 +188,100 @@ where
     H: MessageHandler<T>,
 {
     let notify = Arc::new(Notify::new());
-    let max_in_flight = options.prefetch_count as usize;
-    let mut in_flight: VecDeque<PendingMessage> = VecDeque::with_capacity(max_in_flight);
 
-    info!(queue_url, max_in_flight, "concurrent SQS consumer started");
+    // Max number of handlers running concurrently (1 = serial / non-concurrent mode).
+    let max_in_flight = options.prefetch_count as usize;
+
+    // How many messages to request per SQS poll.  When `receive_batch_size` is
+    // set (non-concurrent mode), we fetch a full batch even though we only run
+    // one handler at a time.  This amortises the `ReceiveMessage` API call
+    // overhead across multiple messages, which is critical for throughput when
+    // several consumers share the same queue.
+    let receive_batch: usize = {
+        let configured = if options.receive_batch_size > 0 {
+            options.receive_batch_size as usize
+        } else {
+            max_in_flight
+        };
+        configured.min(10)
+    };
+
+    let mut in_flight: VecDeque<PendingMessage> = VecDeque::with_capacity(max_in_flight);
+    // Received from SQS but not yet dispatched to a handler.  Populated when
+    // the receive batch is larger than `max_in_flight`.
+    let mut local_buffer: VecDeque<aws_sdk_sqs::types::Message> =
+        VecDeque::with_capacity(receive_batch);
+
+    // Ack receipt handles accumulated across loop iterations.
+    //
+    // Rather than flushing a DeleteMessageBatch after every drained handler
+    // (which would produce 1-item batches in serial / non-concurrent mode),
+    // we collect receipt handles here and only send the batch when:
+    //   (a) we have a full batch of 10, or
+    //   (b) we are about to call ReceiveMessage, or
+    //   (c) we are shutting down.
+    //
+    // In concurrent mode (max_in_flight > 1) the drain loop typically fills
+    // the batch in a single iteration, so behaviour is unchanged.  In serial
+    // mode (max_in_flight = 1) this collapses N individual DeleteMessageBatch
+    // calls into a single call per receive batch, reducing API pressure by ~5×.
+    let mut pending_acks: Vec<String> = Vec::with_capacity(10);
+
+    info!(
+        queue_url,
+        max_in_flight, receive_batch, "SQS consumer started"
+    );
 
     loop {
         // ── Drain completed messages from the front, preserving order ──
+        //
+        // Accumulate consecutive Ack receipts in `pending_acks`.  They will be
+        // flushed as a single DeleteMessageBatch call before the next
+        // ReceiveMessage poll.  Non-Ack outcomes (Retry/Reject/Defer) are
+        // routed individually because they need separate SQS operations.
         while let Some(front) = in_flight.front_mut() {
             match front.outcome_rx.try_recv() {
-                Ok(outcome) => {
+                Ok(Outcome::Ack) => {
                     let msg = in_flight.pop_front().unwrap();
-                    debug!(queue_url, ?outcome, "message handled (concurrent)");
+                    debug!(queue_url, receipt_handle = %msg.receipt_handle, "message acked (pending flush)");
+                    pending_acks.push(msg.receipt_handle);
+                    // Flush immediately once we have a full batch.
+                    if pending_acks.len() >= 10 {
+                        let batch_size = pending_acks.len();
+                        debug!(queue_url, batch_size, "flushing full ack batch");
+                        router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
+                            .await;
+                    }
+                }
+                Ok(outcome) => {
+                    // Flush accumulated acks before routing a non-ack outcome.
+                    if !pending_acks.is_empty() {
+                        let batch_size = pending_acks.len();
+                        debug!(
+                            queue_url,
+                            batch_size,
+                            ?outcome,
+                            "flushing ack batch before non-ack outcome"
+                        );
+                        router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
+                            .await;
+                    }
+                    let msg = in_flight.pop_front().unwrap();
+                    debug!(queue_url, ?outcome, "message handled");
                     route_outcome(sqs, queue_url, &msg.receipt_handle, outcome, topology, 0).await;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
                     // Handler task panicked — treat as retry.
+                    if !pending_acks.is_empty() {
+                        let batch_size = pending_acks.len();
+                        debug!(
+                            queue_url,
+                            batch_size, "flushing ack batch after handler panic"
+                        );
+                        router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
+                            .await;
+                    }
                     let msg = in_flight.pop_front().unwrap();
                     warn!(queue_url, "handler task panicked, retrying message");
                     route_outcome(
@@ -218,17 +296,34 @@ where
                 }
             }
         }
+        // Do NOT flush pending_acks here — let them accumulate across
+        // iterations until the pre-poll flush or a full-batch flush above.
 
-        options
-            .processing
-            .store(!in_flight.is_empty(), Ordering::Release);
+        options.processing.store(
+            !in_flight.is_empty() || !local_buffer.is_empty(),
+            Ordering::Release,
+        );
 
-        // ── Shutdown: drain all in-flight handlers ──
+        // ── Shutdown: requeue buffered messages, drain in-flight handlers ──
         if options.shutdown.is_cancelled() {
             debug!(
-                "shutdown signal, draining {} in-flight messages on {queue_url}",
+                "shutdown signal, requeueing {} buffered, draining {} in-flight on {queue_url}",
+                local_buffer.len(),
                 in_flight.len()
             );
+            // Flush any deferred acks before requeuing.
+            if !pending_acks.is_empty() {
+                let batch_size = pending_acks.len();
+                debug!(queue_url, batch_size, "flushing ack batch on shutdown");
+                router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks)).await;
+            }
+            // Messages in the local buffer were received (invisible in SQS) but
+            // never dispatched.  Make them visible again so they can be redelivered.
+            for msg in local_buffer.drain(..) {
+                if let Some(rh) = msg.receipt_handle() {
+                    router::route_requeue(sqs, queue_url, rh).await;
+                }
+            }
             for pending in in_flight {
                 let outcome = pending.outcome_rx.await.unwrap_or(Outcome::Retry);
                 route_outcome(
@@ -244,40 +339,19 @@ where
             return Ok(());
         }
 
-        let available_slots = max_in_flight.saturating_sub(in_flight.len());
-        if available_slots == 0 {
-            // All slots full — wait for a handler to complete.
-            notify.notified().await;
-            continue;
-        }
+        // ── Dispatch buffered messages to handlers ──
+        //
+        // Move messages from the local buffer into in-flight handler slots.
+        // In concurrent mode (max_in_flight > 1) this fills all available slots.
+        // In serial mode (max_in_flight = 1) this dispatches one message at a time.
+        while in_flight.len() < max_in_flight {
+            let Some(msg) = local_buffer.pop_front() else {
+                break;
+            };
 
-        // ── Poll SQS for new messages ──
-        let max_messages = available_slots.min(10) as i32;
-
-        let receive_result = tokio::select! {
-            biased;
-            _ = options.shutdown.cancelled() => continue,
-            result = sqs
-                .receive_message()
-                .queue_url(queue_url)
-                .wait_time_seconds(5)
-                .max_number_of_messages(max_messages)
-                .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
-                .message_attribute_names("All")
-                .send() => {
-                result.map_err(|e| {
-                    ShoveError::Connection(format!("SQS ReceiveMessage failed on {queue_url}: {e}"))
-                })?
-            }
-        };
-
-        let messages = receive_result.messages.unwrap_or_default();
-
-        for msg in messages {
             let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
             let retry_count = router::get_retry_count(&msg);
 
-            // ── Max retries check ──
             if retry_count >= options.max_retries {
                 warn!(
                     queue_url,
@@ -289,26 +363,25 @@ where
                 continue;
             }
 
-            // ── Deserialize ──
             let body = extract_payload(msg.body().unwrap_or_default());
             let message: T::Message = match serde_json::from_str(&body) {
                 Ok(m) => m,
                 Err(err) => {
-                    error!(
-                        error = %err,
-                        queue_url,
-                        "failed to deserialize SQS message, rejecting"
-                    );
+                    error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting");
                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     continue;
                 }
             };
 
             let metadata = extract_metadata(&msg);
-
+            debug!(
+                queue_url,
+                message_id = %metadata.delivery_id,
+                retry_count = metadata.retry_count,
+                "dispatching message to handler"
+            );
             let rx =
                 spawn_handler::<T, H>(handler, message, metadata, options.handler_timeout, &notify);
-
             in_flight.push_back(PendingMessage {
                 receipt_handle,
                 outcome_rx: rx,
@@ -316,18 +389,82 @@ where
             options.processing.store(true, Ordering::Relaxed);
         }
 
-        // If no messages received and slots are available, briefly wait for
-        // handler completions or the next poll cycle to avoid a tight loop.
-        if in_flight.is_empty() {
+        // ── Poll SQS when the buffer needs refilling ──
+        //
+        // Fetch a full batch whenever the buffer is empty AND we have handler
+        // slots available.  This keeps the pipeline full while preventing us
+        // from pulling messages we cannot process for a long time (which would
+        // exhaust SQS visibility timeouts).
+        if local_buffer.is_empty() && in_flight.len() < max_in_flight {
+            // Flush deferred acks before blocking on ReceiveMessage.
+            // In serial mode this is the point where all N messages from the
+            // previous receive batch have been processed — send their receipt
+            // handles in a single DeleteMessageBatch instead of N individual calls.
+            if !pending_acks.is_empty() {
+                let batch_size = pending_acks.len();
+                debug!(queue_url, batch_size, "flushing ack batch before poll");
+                router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks)).await;
+            }
+
+            let max_messages = receive_batch as i32;
+
+            // Always use wait_time_seconds=0 (short poll, returns immediately).
+            //
+            // Server-side long polling (wait_time_seconds > 0) holds an open
+            // HTTP connection inside the broker for the full wait duration.  On
+            // LocalStack — which handles ReceiveMessage requests serially — N
+            // consumers all sleeping in a long poll stacks up to N × wait_time
+            // of blocking (e.g. 4 consumers × 5 s = 20 s stall).
+            //
+            // Instead we return immediately and do client-side backoff: if the
+            // queue is empty we yield for 500 ms via tokio::time::sleep, which
+            // is async and does not hold any broker connection.  All N consumers
+            // sleep concurrently so the total stall is ≈ 500 ms regardless of N.
+            let receive_result = sqs
+                .receive_message()
+                .queue_url(queue_url)
+                .wait_time_seconds(0)
+                .max_number_of_messages(max_messages)
+                .message_system_attribute_names(
+                    aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
+                )
+                .message_attribute_names("All")
+                .send()
+                .await
+                .map_err(|e| {
+                    ShoveError::Connection(format!("SQS ReceiveMessage failed on {queue_url}: {e}"))
+                })?;
+
+            let msgs = receive_result.messages.unwrap_or_default();
+            if msgs.is_empty() {
+                debug!(queue_url, "queue empty, backing off 500ms");
+                // Queue appears empty — sleep briefly before re-polling so we
+                // don't spin and so multiple consumers naturally stagger.
+                tokio::select! {
+                    biased;
+                    _ = options.shutdown.cancelled() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            } else {
+                debug!(
+                    queue_url,
+                    received = msgs.len(),
+                    "received messages from SQS"
+                );
+            }
+            local_buffer.extend(msgs);
+
+            // Loop immediately to dispatch newly buffered messages.
             continue;
         }
 
-        // Give completed handlers a chance to be drained before next poll.
-        tokio::select! {
-            biased;
-            _ = options.shutdown.cancelled() => {}
-            _ = notify.notified() => {}
+        // ── Wait for progress ──
+        if in_flight.len() >= max_in_flight {
+            // All handler slots occupied — wait for the next completion.
+            notify.notified().await;
         }
+        // If in_flight is empty and local_buffer is also empty, the outer loop
+        // will fall through to the poll branch on the next iteration.
     }
 }
 
@@ -337,7 +474,7 @@ async fn route_outcome(
     queue_url: &str,
     receipt_handle: &str,
     outcome: Outcome,
-    topology: &'static crate::topology::QueueTopology,
+    topology: &'static QueueTopology,
     retry_count: u32,
 ) {
     match outcome {
@@ -413,7 +550,7 @@ async fn run_sequenced_shard<T, H>(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     queue_name: &str,
-    topology: &'static crate::topology::QueueTopology,
+    topology: &'static QueueTopology,
     handler: &Arc<H>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
@@ -472,7 +609,7 @@ where
 async fn consume_loop_sequenced<T, H>(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
-    topology: &'static crate::topology::QueueTopology,
+    topology: &'static QueueTopology,
     handler: &Arc<H>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
@@ -651,7 +788,7 @@ where
                 sqs.receive_message()
                     .queue_url(queue_url)
                     .wait_time_seconds(5)
-                    .max_number_of_messages((prefetch.saturating_sub(in_flight_count)).min(10) as i32)
+                    .max_number_of_messages(prefetch.saturating_sub(in_flight_count).min(10) as i32)
                     .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
                     .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::MessageGroupId)
                     .message_attribute_names("All")
@@ -666,6 +803,8 @@ where
                     })?
                     .messages
                     .unwrap_or_default();
+
+                debug!(queue_url, received = messages.len(), "received messages from SQS (sequenced)");
 
                 for msg in messages {
                     let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
@@ -816,6 +955,12 @@ where
 
                     let metadata = extract_metadata(&msg);
 
+                    debug!(
+                        queue_url,
+                        sequence_key = %seq_key,
+                        retry_count,
+                        "dispatching sequenced message to handler"
+                    );
                     let rx = spawn_handler_keyed::<T, H>(
                         handler,
                         message,
@@ -997,6 +1142,7 @@ where
                 })?;
 
                 let messages = output.messages.unwrap_or_default();
+                debug!(queue_url, received = messages.len(), "received messages from DLQ");
 
                 for msg in messages {
                     let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
@@ -1012,11 +1158,18 @@ where
                             );
                         }
                         Ok(message) => {
+                            debug!(
+                                queue_url,
+                                delivery_id = %metadata.message.delivery_id,
+                                death_count = metadata.death_count,
+                                "dispatching DLQ message to handle_dead"
+                            );
                             handler.handle_dead(message, metadata).await;
                         }
                     }
 
                     // Always ack DLQ messages.
+                    debug!(queue_url, "acking DLQ message");
                     router::route_ack(sqs, queue_url, &receipt_handle).await;
                 }
             }
@@ -1033,7 +1186,7 @@ impl Consumer for SqsConsumer {
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1054,7 +1207,7 @@ impl Consumer for SqsConsumer {
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1104,7 +1257,7 @@ impl Consumer for SqsConsumer {
     fn run_dlq<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {

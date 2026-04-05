@@ -165,10 +165,16 @@ impl SqsConsumerGroup {
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = SqsConsumer::new(client.clone(), queue_registry.clone());
+            // In non-concurrent mode, limit in-flight handlers to 1 (serial processing)
+            // while keeping the SQS receive batch size at the configured prefetch_count.
+            // This lets each consumer fetch up to prefetch_count messages per poll while
+            // still processing them one-at-a-time, reducing per-message API call overhead
+            // and improving throughput when multiple consumers share the same queue.
             let options = if concurrent {
                 options
             } else {
                 ConsumerOptions {
+                    receive_batch_size: options.prefetch_count,
                     prefetch_count: 1,
                     ..options
                 }
@@ -293,6 +299,7 @@ impl SqsConsumerGroup {
             handler_timeout: self.config.handler_timeout,
             max_pending_per_key: self.config.max_pending_per_key,
             exactly_once: false,
+            receive_batch_size: 0,
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));

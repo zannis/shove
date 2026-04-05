@@ -124,6 +124,11 @@ path = "examples/sqs/autoscaler.rs"
 required-features = ["aws-sns-sqs"]
 
 [[example]]
+name = "sqs_stress"
+path = "examples/sqs/stress.rs"
+required-features = ["aws-sns-sqs"]
+
+[[example]]
 name = "rabbitmq_exactly_once"
 path = "examples/rabbitmq/exactly_once.rs"
 required-features = ["rabbitmq-transactional"]

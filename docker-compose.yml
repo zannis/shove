@@ -11,7 +11,10 @@ services:
       bash -c "rabbitmq-plugins enable rabbitmq_consistent_hash_exchange &&
                rabbitmq-server "
 
-  floci:
-    image: hectorvent/floci:latest
+  localstack:
+    image: localstack/localstack:latest
     ports:
       - "4566:4566"
+    environment:
+      SERVICES: sns,sqs
+      AWS_DEFAULT_REGION: us-east-1

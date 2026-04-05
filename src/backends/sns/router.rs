@@ -17,6 +17,60 @@ pub(crate) async fn route_ack(sqs: &aws_sdk_sqs::Client, queue_url: &str, receip
     }
 }
 
+/// Delete up to 10 messages from SQS in a single `DeleteMessageBatch` call.
+///
+/// Using this instead of 10 individual `DeleteMessage` calls reduces API
+/// round-trips by 10× for a full batch, which is critical for throughput when
+/// multiple consumers are competing on the same queue.
+pub(crate) async fn route_ack_batch(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handles: Vec<String>,
+) {
+    debug!(
+        queue_url,
+        batch_size = receipt_handles.len(),
+        "acking message batch (DeleteMessageBatch)"
+    );
+    for chunk in receipt_handles.chunks(10) {
+        let entries: Vec<_> = chunk
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rh)| {
+                aws_sdk_sqs::types::DeleteMessageBatchRequestEntry::builder()
+                    .id(i.to_string())
+                    .receipt_handle(rh)
+                    .build()
+                    .ok()
+            })
+            .collect();
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        match sqs
+            .delete_message_batch()
+            .queue_url(queue_url)
+            .set_entries(Some(entries))
+            .send()
+            .await
+        {
+            Err(e) => error!(queue_url, error = %e, "failed to batch delete (ack) SQS messages"),
+            Ok(out) => {
+                for failure in out.failed() {
+                    error!(
+                        queue_url,
+                        id = failure.id(),
+                        code = failure.code(),
+                        "batch ack: individual message delete failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Change message visibility timeout for retry with escalating delay.
 pub(crate) async fn route_retry(
     sqs: &aws_sdk_sqs::Client,

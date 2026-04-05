@@ -17,7 +17,7 @@
 //!   FailAll: ACC-A = 100+200         = 300   (seq 3 + subsequent DLQ'd)
 //!            ACC-B = 50+100+150      = 300   (independent key, unaffected)
 //!
-//! Requires a running floci instance (see docker-compose.yml):
+//! Requires a running LocalStack instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
 //!     cargo run --example sqs_sequenced_pubsub --features aws-sns-sqs
@@ -129,14 +129,14 @@ impl MessageHandler<StrictLedger> for LedgerHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_floci() {
+fn require_localstack() {
     let output = std::process::Command::new("docker")
         .args(["compose", "ps", "--services", "--filter", "status=running"])
         .output();
     match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("floci") => {}
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
         _ => {
-            eprintln!("floci is not running. Start it with:\n\n    docker compose up -d\n");
+            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
             std::process::exit(1);
         }
     }
@@ -144,7 +144,7 @@ fn require_floci() {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
-    require_floci();
+    require_localstack();
 
     // SAFETY: called before any concurrent env access in this process.
     unsafe {

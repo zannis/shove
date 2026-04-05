@@ -4,7 +4,7 @@
 //! acknowledgement. Compares sequential vs concurrent throughput with a
 //! slow handler.
 //!
-//! Requires a running floci instance (see docker-compose.yml):
+//! Requires a running LocalStack instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
 //!     cargo run --example sqs_concurrent_pubsub --features aws-sns-sqs
@@ -85,14 +85,14 @@ impl MessageHandler<SlowTasks> for SlowTaskHandler {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn require_floci() {
+fn require_localstack() {
     let output = std::process::Command::new("docker")
         .args(["compose", "ps", "--services", "--filter", "status=running"])
         .output();
     match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("floci") => {}
+        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
         _ => {
-            eprintln!("floci is not running. Start it with:\n\n    docker compose up -d\n");
+            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
             std::process::exit(1);
         }
     }
@@ -111,7 +111,7 @@ async fn setup() -> (SnsClient, SnsPublisher, Arc<QueueRegistry>) {
     };
     let client = SnsClient::new(&config)
         .await
-        .expect("failed to connect to floci");
+        .expect("failed to connect to LocalStack");
 
     let topic_registry = Arc::new(TopicRegistry::new());
     let queue_registry = Arc::new(QueueRegistry::new());
@@ -144,7 +144,7 @@ async fn publish_tasks(publisher: &SnsPublisher, count: u32) {
 
 #[tokio::main]
 async fn main() {
-    require_floci();
+    require_localstack();
     let msg_count = 20u32;
     let handler_delay = Duration::from_millis(100);
     let prefetch = 20u16;
