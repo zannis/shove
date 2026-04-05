@@ -77,11 +77,10 @@ struct SnsEnvelope {
 /// `"Notification"` the inner `Message` string is returned (owned); otherwise
 /// the original body is returned as a borrow (no allocation).
 fn extract_payload(body: &str) -> std::borrow::Cow<'_, str> {
-    if let Ok(envelope) = serde_json::from_str::<SnsEnvelope>(body) {
-        if envelope.notification_type == "Notification" {
+    if let Ok(envelope) = serde_json::from_str::<SnsEnvelope>(body)
+        && envelope.notification_type == "Notification" {
             return std::borrow::Cow::Owned(envelope.message);
         }
-    }
     std::borrow::Cow::Borrowed(body)
 }
 

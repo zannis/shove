@@ -5,52 +5,50 @@
 //!
 //! Run with: `cargo test --features sns --test sns_integration`
 
+use shove::sns::*;
+use shove::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use testcontainers::ImageExt;
 
-use shove::sns::*;
-use shove::*;
-
-use testcontainers::GenericImage;
 use testcontainers::runners::AsyncRunner;
-
+use testcontainers_modules::localstack::LocalStack;
+use tokio::time::Instant;
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
     #[allow(dead_code)]
-    container: testcontainers::ContainerAsync<GenericImage>,
+    container: testcontainers::ContainerAsync<LocalStack>,
     endpoint_url: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
-        // Set dummy credentials for LocalStack/floci (LocalStack-compatible).
-        // SAFETY: tests run single-threaded (--test-threads=1) so mutating the
-        // environment does not cause data races.
+        // Set dummy credentials for LocalStack.
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
             std::env::set_var("AWS_REGION", "us-east-1");
         }
 
-        let container = GenericImage::new("hectorvent/floci", "latest")
-            .with_exposed_port(4566u16.into())
+        let auth_token = std::env::var("LOCALSTACK_AUTH_TOKEN")
+            .expect("LOCALSTACK_AUTH_TOKEN must be set to run SNS/SQS integration tests");
+
+        let container = LocalStack::default()
+            .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
             .start()
             .await
-            .expect("failed to start floci container");
+            .expect("failed to start LocalStack container");
 
         let port = container
             .get_host_port_ipv4(4566)
             .await
-            .expect("failed to get floci port");
+            .expect("failed to get LocalStack port");
 
         let endpoint_url = format!("http://localhost:{port}");
-
-        // Give floci a moment to initialize
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
         Self {
             container,
@@ -159,10 +157,10 @@ impl TestBroker {
         expected_count: usize,
         timeout: Duration,
     ) -> Vec<aws_sdk_sqs::types::Message> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let mut all_messages = Vec::new();
 
-        while all_messages.len() < expected_count && tokio::time::Instant::now() < deadline {
+        while all_messages.len() < expected_count && Instant::now() < deadline {
             let result = sqs_client
                 .receive_message()
                 .queue_url(queue_url)

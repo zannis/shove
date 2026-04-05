@@ -5,18 +5,19 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
+use shove::sns::{SqsQueueStatsProviderTrait, *};
+use shove::*;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+use testcontainers::ImageExt;
 
-use shove::sns::{SqsQueueStatsProviderTrait, *};
-use shove::*;
-
-use testcontainers::GenericImage;
 use testcontainers::runners::AsyncRunner;
-use tokio::sync::Mutex;
+use testcontainers_modules::localstack::LocalStack;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -28,14 +29,14 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 struct WaitableCounter {
     count: Arc<AtomicU32>,
-    signal: Arc<tokio::sync::Notify>,
+    signal: Arc<Notify>,
 }
 
 impl WaitableCounter {
     fn new() -> Self {
         Self {
             count: Arc::new(AtomicU32::new(0)),
-            signal: Arc::new(tokio::sync::Notify::new()),
+            signal: Arc::new(Notify::new()),
         }
     }
 
@@ -49,7 +50,7 @@ impl WaitableCounter {
     }
 
     async fn wait_for(&self, target: u32, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             if self.get() >= target {
                 return true;
@@ -70,36 +71,37 @@ impl WaitableCounter {
 
 struct TestBroker {
     #[allow(dead_code)]
-    container: testcontainers::ContainerAsync<GenericImage>,
+    container: testcontainers::ContainerAsync<LocalStack>,
     endpoint_url: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
-        // Set dummy credentials for floci (LocalStack-compatible).
-        // SAFETY: tests run single-threaded (--test-threads=1) so mutating the
-        // environment does not cause data races.
+        // Set dummy credentials for LocalStack.
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
             std::env::set_var("AWS_REGION", "us-east-1");
         }
 
-        let container = GenericImage::new("hectorvent/floci", "latest")
-            .with_exposed_port(4566u16.into())
+        let auth_token = std::env::var("LOCALSTACK_AUTH_TOKEN")
+            .expect("LOCALSTACK_AUTH_TOKEN must be set to run SNS/SQS integration tests");
+
+        let container = LocalStack::default()
+            .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
             .start()
             .await
-            .expect("failed to start floci container");
+            .expect("failed to start LocalStack container");
 
         let port = container
             .get_host_port_ipv4(4566)
             .await
-            .expect("failed to get floci port");
+            .expect("failed to get LocalStack port");
 
         let endpoint_url = format!("http://localhost:{port}");
 
-        // Give floci a moment to initialize SNS/SQS
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Give LocalStack a moment to finish initializing SNS/SQS services
+        sleep(Duration::from_secs(1)).await;
 
         Self {
             container,
@@ -132,10 +134,10 @@ impl TestBroker {
         expected_count: usize,
         timeout: Duration,
     ) -> Vec<aws_sdk_sqs::types::Message> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let mut all_messages = Vec::new();
 
-        while all_messages.len() < expected_count && tokio::time::Instant::now() < deadline {
+        while all_messages.len() < expected_count && Instant::now() < deadline {
             let result = sqs_client
                 .receive_message()
                 .queue_url(queue_url)
@@ -193,7 +195,7 @@ impl TestSetup {
     }
 
     /// Declare the full topology for topic `T`.
-    async fn declare<T: shove::Topic>(&self) {
+    async fn declare<T: Topic>(&self) {
         self.declarer()
             .declare(T::topology())
             .await
@@ -603,7 +605,7 @@ async fn publish_and_consume_simple_message() {
 #[tokio::test]
 async fn publish_and_consume_with_headers() {
     #[derive(Clone)]
-    struct HeaderCapture(Arc<tokio::sync::Mutex<HashMap<String, String>>>);
+    struct HeaderCapture(Arc<Mutex<HashMap<String, String>>>);
 
     impl MessageHandler<WorkTopic> for HeaderCapture {
         async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
@@ -630,7 +632,7 @@ async fn publish_and_consume_with_headers() {
         .await
         .expect("publish_with_headers should succeed");
 
-    let captured = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let captured = Arc::new(Mutex::new(HashMap::new()));
     let handler = HeaderCapture(captured.clone());
 
     let shutdown = CancellationToken::new();
@@ -1330,7 +1332,7 @@ async fn sequenced_skip_continues_after_rejection() {
     struct SkipRejectHandler {
         records: Arc<Mutex<Vec<u64>>>,
         count: Arc<AtomicU32>,
-        signal: Arc<tokio::sync::Notify>,
+        signal: Arc<Notify>,
     }
 
     impl MessageHandler<SeqSkipTopic> for SkipRejectHandler {
@@ -1369,7 +1371,7 @@ async fn sequenced_skip_continues_after_rejection() {
     let handler = SkipRejectHandler {
         records: records.clone(),
         count: Arc::new(AtomicU32::new(0)),
-        signal: Arc::new(tokio::sync::Notify::new()),
+        signal: Arc::new(Notify::new()),
     };
     let handler_clone = handler.clone();
 
@@ -1420,7 +1422,7 @@ async fn sequenced_failall_poisons_key() {
     struct FailAllRejectHandler {
         records: Arc<Mutex<Vec<u64>>>,
         count: Arc<AtomicU32>,
-        signal: Arc<tokio::sync::Notify>,
+        signal: Arc<Notify>,
     }
 
     impl MessageHandler<SeqFailAllTopic> for FailAllRejectHandler {
@@ -1459,7 +1461,7 @@ async fn sequenced_failall_poisons_key() {
     let handler = FailAllRejectHandler {
         records: records.clone(),
         count: Arc::new(AtomicU32::new(0)),
-        signal: Arc::new(tokio::sync::Notify::new()),
+        signal: Arc::new(Notify::new()),
     };
     let handler_clone = handler.clone();
 
@@ -1980,20 +1982,31 @@ async fn deserialization_failure_rejects_to_dlq() {
     );
 }
 
+/// A handler that blocks until a watch signal is set to `true`.
+///
+/// Unlike `Notify`, a `watch` channel retains its value, so handlers that
+/// call `wait_for` after the sender fires `true` will return immediately
+/// instead of blocking forever.
 #[derive(Clone)]
 struct StickyHandler {
-    signal: Arc<tokio::sync::Notify>,
+    rx: tokio::sync::watch::Receiver<bool>,
 }
+struct StickySignal(tokio::sync::watch::Sender<bool>);
 impl StickyHandler {
-    fn new() -> Self {
-        Self {
-            signal: Arc::new(tokio::sync::Notify::new()),
-        }
+    fn new() -> (Self, StickySignal) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (Self { rx }, StickySignal(tx))
+    }
+}
+impl StickySignal {
+    fn release(&self) {
+        let _ = self.0.send(true);
     }
 }
 impl<T: Topic> MessageHandler<T> for StickyHandler {
     async fn handle(&self, _: T::Message, _: MessageMetadata) -> Outcome {
-        self.signal.notified().await;
+        let mut rx = self.rx.clone();
+        rx.wait_for(|&v| v).await.ok();
         Outcome::Ack
     }
 }
@@ -2033,13 +2046,15 @@ async fn sqs_autoscaler_scales_group_on_load() {
         setup.queue_registry.clone(),
     );
 
-    let sticky = StickyHandler::new();
-    let s2 = sticky.clone();
+    let (sticky, sticky_signal) = StickyHandler::new();
 
     let config = SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1);
 
     registry
-        .register::<WorkTopic, _>(config, move || s2.clone())
+        .register::<WorkTopic, _>(config, {
+            let h = sticky.clone();
+            move || h.clone()
+        })
         .await
         .expect("register should succeed");
 
@@ -2102,7 +2117,7 @@ async fn sqs_autoscaler_scales_group_on_load() {
 
     // 5. Clear the load and wait for scale down.
     println!("Releasing messages for scale-down test...");
-    sticky.signal.notify_waiters();
+    sticky_signal.release();
 
     // Give some time for messages to be deleted and for SQS stats to update.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2200,8 +2215,8 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
         setup.queue_registry.clone(),
     );
 
-    let sticky_a = StickyHandler::new();
-    let sticky_b = StickyHandler::new();
+    let (sticky_a, signal_a) = StickyHandler::new();
+    let (sticky_b, signal_b) = StickyHandler::new();
 
     registry
         .register::<WorkTopicA, _>(SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1), {
@@ -2276,8 +2291,8 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
     assert!(b_scaled, "autoscaler should have scaled up group B");
 
     // Unblock sticky handlers so all messages get acked before shutdown.
-    sticky_a.signal.notify_waiters();
-    sticky_b.signal.notify_waiters();
+    signal_a.release();
+    signal_b.release();
 
     shutdown.cancel();
     let _ = auto_handle.await;
