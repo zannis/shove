@@ -1,72 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+pub use crate::autoscaler::AutoscalerConfig;
+use crate::autoscaler::GroupScalingState;
 use crate::backends::rabbitmq::management::{
     ManagementClient, ManagementConfig, QueueStatsProvider,
 };
 use crate::backends::rabbitmq::registry::ConsumerGroupRegistry;
-
-/// Tuning knobs for the autoscaler's polling and scaling decisions.
-pub struct AutoscalerConfig {
-    /// How often the autoscaler checks queue depths.  Default: 5 s.
-    pub poll_interval: Duration,
-    /// Trigger a scale-up when `messages_ready > capacity × scale_up_multiplier`.
-    /// Default: 2.0
-    pub scale_up_multiplier: f64,
-    /// Trigger a scale-down when `messages_ready < capacity × scale_down_multiplier`.
-    /// Default: 0.5
-    pub scale_down_multiplier: f64,
-    /// A scaling condition must be sustained for this long before action is
-    /// taken, preventing flapping.  Default: 10 s.
-    pub hysteresis_duration: Duration,
-    /// Minimum time between two scaling actions for the same group.
-    /// Default: 30 s.
-    pub cooldown_duration: Duration,
-}
-
-impl Default for AutoscalerConfig {
-    fn default() -> Self {
-        Self {
-            poll_interval: Duration::from_secs(5),
-            scale_up_multiplier: 2.0,
-            scale_down_multiplier: 0.5,
-            hysteresis_duration: Duration::from_secs(10),
-            cooldown_duration: Duration::from_secs(30),
-        }
-    }
-}
-
-/// Per-group mutable state tracked between polling iterations.
-struct GroupScalingState {
-    /// When the scale-up condition first became true (reset when it becomes false).
-    scale_up_since: Option<Instant>,
-    /// When the scale-down condition first became true (reset when it becomes false).
-    scale_down_since: Option<Instant>,
-    /// When the last actual scaling action was taken (used for cooldown).
-    last_scaled_at: Option<Instant>,
-}
-
-impl GroupScalingState {
-    fn new() -> Self {
-        Self {
-            scale_up_since: None,
-            scale_down_since: None,
-            last_scaled_at: None,
-        }
-    }
-
-    /// Returns `true` when the group is still within the cooldown window.
-    fn in_cooldown(&self, cooldown: Duration) -> bool {
-        self.last_scaled_at
-            .map(|t| t.elapsed() < cooldown)
-            .unwrap_or(false)
-    }
-}
 
 /// Polls RabbitMQ queue statistics and adjusts the number of running consumers
 /// in each [`ConsumerGroup`] using hysteresis to prevent flapping.
@@ -140,10 +85,7 @@ impl<S: QueueStatsProvider> Autoscaler<S> {
 
         for (name, queue, prefetch, active_f64, _active) in group_snapshots {
             // --- cooldown check (no lock needed) ---
-            let state = self
-                .state
-                .entry(name.clone())
-                .or_insert_with(GroupScalingState::new);
+            let state = self.state.entry(name.clone()).or_default();
 
             if state.in_cooldown(self.config.cooldown_duration) {
                 debug!(group = %name, "skipping: in cooldown");
@@ -257,6 +199,7 @@ impl<S: QueueStatsProvider> Autoscaler<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // -- AutoscalerConfig --
 
@@ -274,7 +217,7 @@ mod tests {
 
     #[test]
     fn state_new_is_empty() {
-        let state = GroupScalingState::new();
+        let state = GroupScalingState::default();
         assert!(state.scale_up_since.is_none());
         assert!(state.scale_down_since.is_none());
         assert!(state.last_scaled_at.is_none());
@@ -282,28 +225,34 @@ mod tests {
 
     #[test]
     fn in_cooldown_false_initially() {
-        let state = GroupScalingState::new();
+        let state = GroupScalingState::default();
         assert!(!state.in_cooldown(Duration::from_secs(30)));
     }
 
     #[test]
     fn in_cooldown_true_during_cooldown() {
-        let mut state = GroupScalingState::new();
-        state.last_scaled_at = Some(Instant::now());
+        let state = GroupScalingState {
+            last_scaled_at: Some(Instant::now()),
+            ..GroupScalingState::default()
+        };
         assert!(state.in_cooldown(Duration::from_secs(30)));
     }
 
     #[test]
     fn in_cooldown_false_after_expiry() {
-        let mut state = GroupScalingState::new();
-        state.last_scaled_at = Some(Instant::now() - Duration::from_secs(60));
+        let state = GroupScalingState {
+            last_scaled_at: Some(Instant::now() - Duration::from_secs(60)),
+            ..GroupScalingState::default()
+        };
         assert!(!state.in_cooldown(Duration::from_secs(30)));
     }
 
     #[test]
     fn in_cooldown_zero_duration_always_expired() {
-        let mut state = GroupScalingState::new();
-        state.last_scaled_at = Some(Instant::now());
+        let state = GroupScalingState {
+            last_scaled_at: Some(Instant::now()),
+            ..GroupScalingState::default()
+        };
         assert!(!state.in_cooldown(Duration::ZERO));
     }
 
@@ -365,7 +314,7 @@ mod tests {
 
     #[test]
     fn hysteresis_resets_on_condition_change() {
-        let mut state = GroupScalingState::new();
+        let mut state = GroupScalingState::default();
 
         // Simulate scale-up condition starting
         let now = Instant::now();
@@ -382,7 +331,7 @@ mod tests {
 
     #[test]
     fn cooldown_set_after_scaling() {
-        let mut state = GroupScalingState::new();
+        let mut state = GroupScalingState::default();
         assert!(!state.in_cooldown(Duration::from_secs(30)));
 
         // Simulate a scaling action
@@ -421,7 +370,7 @@ mod tests {
 
     #[test]
     fn state_scale_up_since_tracks_condition() {
-        let mut state = GroupScalingState::new();
+        let mut state = GroupScalingState::default();
         let now = Instant::now();
         state.scale_up_since = Some(now);
         assert!(state.scale_up_since.unwrap().elapsed() < Duration::from_secs(1));
@@ -429,8 +378,10 @@ mod tests {
 
     #[test]
     fn cooldown_prevents_rapid_scaling() {
-        let mut state = GroupScalingState::new();
-        state.last_scaled_at = Some(Instant::now());
+        let state = GroupScalingState {
+            last_scaled_at: Some(Instant::now()),
+            ..GroupScalingState::default()
+        };
         // With 30s cooldown, should be in cooldown
         assert!(state.in_cooldown(Duration::from_secs(30)));
         // With 0s cooldown, should not be in cooldown

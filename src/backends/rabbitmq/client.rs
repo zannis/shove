@@ -2,8 +2,6 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use lapin::options::ConfirmSelectOptions;
-#[cfg(feature = "rabbitmq-exactly-once")]
-use lapin::options::TxSelectOptions;
 use lapin::{Channel, Connection, ConnectionProperties};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -147,7 +145,7 @@ impl RabbitMqClient {
             .map_err(|e| ShoveError::Connection(e.to_string()))?;
 
         channel
-            .tx_select(TxSelectOptions::default())
+            .tx_select()
             .await
             .map_err(|e| ShoveError::Connection(e.to_string()))?;
 

@@ -13,6 +13,11 @@ categories = ["asynchronous"]
 default = []
 rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
 
+# Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.
+# Makes publish-to-hold-queue + ack atomic (tx_select/tx_commit), eliminating
+# the publish-then-ack race at the cost of ~10-15× lower throughput per channel.
+rabbitmq-exactly-once = ["rabbitmq"]
+
 # SNS Publisher
 pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
 
@@ -112,6 +117,10 @@ required-features = ["aws-sns-sqs"]
 name = "sqs_audited_consumer"
 path = "examples/sqs/audited_consumer.rs"
 required-features = ["aws-sns-sqs", "audit"]
+
+[[test]]
+name = "rabbitmq_integration"
+required-features = ["rabbitmq"]
 
 [[test]]
 name = "sns_integration"

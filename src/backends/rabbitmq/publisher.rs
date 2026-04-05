@@ -326,11 +326,59 @@ fn hashmap_to_field_table(headers: HashMap<String, String>) -> FieldTable {
 
 pub(crate) struct ChannelPublisher {
     channel: Channel,
+    /// True when the channel is in AMQP transaction mode (`tx_select`).
+    /// Set via [`ChannelPublisher::new_tx`]; always `false` in non-tx channels.
+    tx_mode: bool,
 }
 
 impl ChannelPublisher {
     pub(crate) fn new(channel: Channel) -> Self {
-        Self { channel }
+        Self {
+            channel,
+            tx_mode: false,
+        }
+    }
+
+    /// Create a publisher wrapping a channel that has `tx_select` enabled.
+    ///
+    /// In tx mode every `basic_publish` and `basic_ack`/`nack` is buffered
+    /// until [`commit_if_tx`](Self::commit_if_tx) is called, making routing
+    /// decisions atomic.
+    #[cfg(feature = "rabbitmq-exactly-once")]
+    pub(crate) fn new_tx(channel: Channel) -> Self {
+        Self {
+            channel,
+            tx_mode: true,
+        }
+    }
+
+    /// Commit the current AMQP transaction if in tx mode; otherwise no-op.
+    ///
+    /// Call after every routing decision (publish + ack/nack) to make the
+    /// operations atomic. On error the broker automatically rolls back the tx;
+    /// the original delivery remains unacked and will be redelivered.
+    pub(crate) async fn commit_if_tx(&self) -> Result<()> {
+        #[cfg(feature = "rabbitmq-exactly-once")]
+        if self.tx_mode {
+            self.channel
+                .tx_commit()
+                .await
+                .map_err(|e| ShoveError::Connection(format!("tx_commit failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Roll back the current AMQP transaction if in tx mode; otherwise no-op.
+    ///
+    /// Call when a publish succeeded (was buffered) but the subsequent ack
+    /// failed, to undo the buffered publish before requeuing.
+    pub(crate) async fn rollback_if_tx(&self) {
+        #[cfg(feature = "rabbitmq-exactly-once")]
+        if self.tx_mode
+            && let Err(e) = self.channel.tx_rollback().await
+        {
+            warn!("tx_rollback failed: {e}");
+        }
     }
 
     pub(crate) async fn publish_to_queue(
@@ -341,6 +389,9 @@ impl ChannelPublisher {
     ) -> Result<()> {
         let props = base_properties().with_headers(headers);
 
+        // In tx mode the channel has no confirm mode; the second `.await` on
+        // the publisher-confirm future resolves immediately with a dummy ack.
+        // Real atomicity is provided by `tx_commit` called by the router.
         let confirm = self
             .channel
             .basic_publish(
@@ -355,7 +406,7 @@ impl ChannelPublisher {
             .await
             .map_err(|e| ShoveError::Connection(e.to_string()))?;
 
-        if confirm.is_nack() {
+        if !self.tx_mode && confirm.is_nack() {
             return Err(ShoveError::Connection(
                 "broker NACKed the published message".to_string(),
             ));

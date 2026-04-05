@@ -298,6 +298,7 @@ impl ConsumerGroup {
             processing: processing.clone(),
             handler_timeout: self.config.handler_timeout,
             max_pending_per_key: self.config.max_pending_per_key,
+            exactly_once: false,
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));

@@ -3942,3 +3942,258 @@ async fn sequenced_consumer_multiple_keys_concurrent() {
     client.shutdown().await;
     broker.stop().await;
 }
+
+// ===========================================================================
+// Exactly-once delivery (AMQP transactions)
+// ===========================================================================
+//
+// These tests verify that consumers using `with_exactly_once()` produce the
+// same observable behavior as the default confirm-mode consumers (ack, retry,
+// reject/DLQ) while using AMQP transaction mode under the hood.
+//
+// Run with: `cargo test --features rabbitmq-exactly-once --test rabbitmq_integration`
+
+#[cfg(feature = "rabbitmq-exactly-once")]
+mod exactly_once {
+    use super::*;
+
+    // ── Topics ──────────────────────────────────────────────────────────────
+
+    define_topic!(
+        ExactlyOnceWork,
+        SimpleMessage,
+        TopologyBuilder::new("test-exactly-once")
+            .dlq()
+            .hold_queue(Duration::from_secs(1))
+            .build()
+    );
+
+    define_topic!(
+        ExactlyOnceRetry,
+        SimpleMessage,
+        TopologyBuilder::new("test-exactly-once-retry")
+            .dlq()
+            .hold_queue(Duration::from_secs(1))
+            .build()
+    );
+
+    define_topic!(
+        ExactlyOnceReject,
+        SimpleMessage,
+        TopologyBuilder::new("test-exactly-once-reject")
+            .dlq()
+            .hold_queue(Duration::from_secs(1))
+            .build()
+    );
+
+    // ── Handler impls ────────────────────────────────────────────────────────
+
+    impl MessageHandler<ExactlyOnceWork> for CountingHandler {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+            Outcome::Ack
+        }
+    }
+
+    impl MessageHandler<ExactlyOnceRetry> for RetryThenAckHandler {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            let attempt = self.attempt_count.fetch_add(1, Ordering::Relaxed);
+            if attempt < self.retry_until {
+                Outcome::Retry
+            } else {
+                self.ack_count.fetch_add(1, Ordering::Relaxed);
+                self.signal.notify_waiters();
+                Outcome::Ack
+            }
+        }
+    }
+
+    impl MessageHandler<ExactlyOnceReject> for DlqCountingHandler {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            Outcome::Reject
+        }
+        async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+        }
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────────────
+
+    /// `create_tx_channel` succeeds and returns a usable channel.
+    #[tokio::test]
+    async fn client_create_tx_channel() {
+        let broker = TestBroker::start().await;
+        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+        let _channel = client.create_tx_channel().await.unwrap();
+
+        client.shutdown().await;
+        broker.stop().await;
+    }
+
+    /// A consumer with exactly-once enabled processes messages and acks them
+    /// exactly once — same observable result as the default confirm-mode path.
+    #[tokio::test]
+    async fn exactly_once_consumer_basic_ack() {
+        let broker = TestBroker::start().await;
+        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+        let channel = client.create_channel().await.unwrap();
+        RabbitMqTopologyDeclarer::new(channel)
+            .declare(ExactlyOnceWork::topology())
+            .await
+            .unwrap();
+
+        let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+        for i in 0..5 {
+            publisher
+                .publish::<ExactlyOnceWork>(&SimpleMessage {
+                    body: format!("msg-{i}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let handler = CountingHandler::new();
+        let shutdown = CancellationToken::new();
+        let consumer = RabbitMqConsumer::new(client.clone());
+        let h = handler.clone();
+        let s = shutdown.clone();
+        let consume_handle = tokio::spawn(async move {
+            let opts = ConsumerOptions::new(s).with_exactly_once();
+            consumer.run::<ExactlyOnceWork>(h, opts).await
+        });
+
+        assert!(
+            handler.wait_for_count(5, Duration::from_secs(15)).await,
+            "expected 5 messages processed, got {}",
+            handler.count()
+        );
+        // Brief settle period — verify no duplicate deliveries.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(handler.count(), 5, "unexpected extra deliveries");
+
+        shutdown.cancel();
+        consume_handle.await.unwrap().unwrap();
+        client.shutdown().await;
+        broker.stop().await;
+    }
+
+    /// Retry-then-ack works correctly under exactly-once: the message visits the
+    /// hold queue the expected number of times and is ultimately acked once.
+    #[tokio::test]
+    async fn exactly_once_consumer_retry_then_ack() {
+        let broker = TestBroker::start().await;
+        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+        let channel = client.create_channel().await.unwrap();
+        RabbitMqTopologyDeclarer::new(channel)
+            .declare(ExactlyOnceRetry::topology())
+            .await
+            .unwrap();
+
+        let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+        publisher
+            .publish::<ExactlyOnceRetry>(&SimpleMessage {
+                body: "retry-me".into(),
+            })
+            .await
+            .unwrap();
+
+        // Handler retries twice (attempts 0 and 1), then acks on attempt 2.
+        let handler = RetryThenAckHandler::new(2);
+        let shutdown = CancellationToken::new();
+        let consumer = RabbitMqConsumer::new(client.clone());
+        let h = handler.clone();
+        let s = shutdown.clone();
+        let consume_handle = tokio::spawn(async move {
+            let opts = ConsumerOptions::new(s)
+                .with_max_retries(5)
+                .with_exactly_once();
+            consumer.run::<ExactlyOnceRetry>(h, opts).await
+        });
+
+        // Hold queue TTL is 1 s per retry; allow generous timeout.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if handler.ack_count() >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for ack; ack_count={}",
+                    handler.ack_count()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Exactly one final ack, no duplicates.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(handler.ack_count(), 1, "unexpected extra acks");
+
+        shutdown.cancel();
+        consume_handle.await.unwrap().unwrap();
+        client.shutdown().await;
+        broker.stop().await;
+    }
+
+    /// Messages rejected by the handler are routed to the DLQ exactly once
+    /// under exactly-once mode — no duplicate DLQ entries.
+    #[tokio::test]
+    async fn exactly_once_consumer_reject_to_dlq() {
+        let broker = TestBroker::start().await;
+        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+        let channel = client.create_channel().await.unwrap();
+        RabbitMqTopologyDeclarer::new(channel)
+            .declare(ExactlyOnceReject::topology())
+            .await
+            .unwrap();
+
+        let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+        for i in 0..3 {
+            publisher
+                .publish::<ExactlyOnceReject>(&SimpleMessage {
+                    body: format!("reject-{i}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let dlq_handler = DlqCountingHandler::new();
+        let shutdown = CancellationToken::new();
+        let consumer = RabbitMqConsumer::new(client.clone());
+        let dlq_consumer = RabbitMqConsumer::new(client.clone());
+
+        // Main consumer — rejects everything to DLQ.
+        let main_h = dlq_handler.clone();
+        let main_s = shutdown.clone();
+        let main_handle = tokio::spawn(async move {
+            let opts = ConsumerOptions::new(main_s).with_exactly_once();
+            consumer.run::<ExactlyOnceReject>(main_h, opts).await
+        });
+
+        // DLQ consumer — counts dead messages.
+        let dlq_h = dlq_handler.clone();
+        let dlq_s = shutdown.clone();
+        let dlq_handle = tokio::spawn(async move {
+            let _s = dlq_s;
+            dlq_consumer.run_dlq::<ExactlyOnceReject>(dlq_h).await
+        });
+
+        assert!(
+            dlq_handler.wait_for_count(3, Duration::from_secs(15)).await,
+            "expected 3 DLQ messages, got {}",
+            dlq_handler.count()
+        );
+        // Brief settle — verify no duplicates in DLQ.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(dlq_handler.count(), 3, "unexpected extra DLQ messages");
+
+        shutdown.cancel();
+        main_handle.await.unwrap().unwrap();
+        dlq_handle.await.unwrap().unwrap();
+        client.shutdown().await;
+        broker.stop().await;
+    }
+}

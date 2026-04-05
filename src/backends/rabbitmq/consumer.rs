@@ -34,12 +34,27 @@ use crate::{QueueTopology, RECONNECT_DELAY};
 // ---------------------------------------------------------------------------
 
 /// Opens a channel with QoS and starts consuming from `queue`.
+///
+/// When `exactly_once` is `true` (requires the `rabbitmq-exactly-once` feature)
+/// the channel is put into AMQP transaction mode (`tx_select`). Otherwise a
+/// confirm-mode channel is created.
 async fn open_consumer(
     client: &RabbitMqClient,
     queue: &str,
     prefetch_count: u16,
+    exactly_once: bool,
 ) -> Result<(Channel, lapin::Consumer)> {
-    let channel = client.create_confirm_channel().await?;
+    #[cfg(feature = "rabbitmq-exactly-once")]
+    let channel = if exactly_once {
+        client.create_tx_channel().await?
+    } else {
+        client.create_confirm_channel().await?
+    };
+    #[cfg(not(feature = "rabbitmq-exactly-once"))]
+    let channel = {
+        let _ = exactly_once;
+        client.create_confirm_channel().await?
+    };
     channel
         .basic_qos(prefetch_count, BasicQosOptions::default())
         .await
@@ -165,19 +180,20 @@ impl RabbitMqConsumer {
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(publisher) => {
                     // Graceful shutdown — nack-requeue all pending buffered deliveries.
-                    nack_requeue_all_pending(&mut pending_deliveries).await;
+                    nack_requeue_all_pending(&mut pending_deliveries, Some(&publisher)).await;
                     return Ok(());
                 }
                 Err(e) => {
                     if options.shutdown.is_cancelled() {
-                        nack_requeue_all_pending(&mut pending_deliveries).await;
+                        // Channel may be in a bad state; just clear.
+                        // Unacked messages return to the queue when the channel closes.
+                        pending_deliveries.clear();
                         return Ok(());
                     }
-                    // On reconnect, nack-requeue pending deliveries since the
-                    // channel is dead and we cannot ack/nack them anymore.
-                    // They will be redelivered by the broker after reconnect.
+                    // On reconnect, the channel is dead — we cannot ack/nack.
+                    // Clear pending; the broker will redeliver after reconnect.
                     pending_deliveries.clear();
                     warn!("consumer error on {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}");
                     tokio::select! {
@@ -200,14 +216,23 @@ impl RabbitMqConsumer {
         poisoned_keys: &mut HashSet<String>,
         shard_hold_queues: &[HoldQueue],
         pending_deliveries: &mut HashMap<String, VecDeque<Delivery>>,
-    ) -> Result<()>
+    ) -> Result<ChannelPublisher>
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let prefetch = options.prefetch_count;
-        let (channel, mut stream) = open_consumer(&self.client, queue, prefetch).await?;
+        let exactly_once = options.exactly_once;
+        let (channel, mut stream) =
+            open_consumer(&self.client, queue, prefetch, exactly_once).await?;
+        #[cfg(feature = "rabbitmq-exactly-once")]
+        let publisher = if exactly_once {
+            ChannelPublisher::new_tx(channel)
+        } else {
+            ChannelPublisher::new(channel)
+        };
+        #[cfg(not(feature = "rabbitmq-exactly-once"))]
         let publisher = ChannelPublisher::new(channel);
         // Channel for handlers to signal completion by sending their sequence key.
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<String>();
@@ -260,7 +285,7 @@ impl RabbitMqConsumer {
                     Outcome::Ack | Outcome::Reject => {
                         // Terminal outcomes — process, then drain pending.
                         if matches!(outcome, Outcome::Ack) {
-                            router::route_ack(&delivery).await;
+                            router::route_ack(&delivery, &publisher).await;
                         } else {
                             if on_failure == SequenceFailure::FailAll {
                                 info!(
@@ -270,7 +295,7 @@ impl RabbitMqConsumer {
                                 );
                                 poisoned_keys.insert(key.clone());
                             }
-                            router::route_reject(&delivery, topology).await;
+                            router::route_reject(&delivery, topology, &publisher).await;
                         }
                         in_flight_count -= 1;
 
@@ -287,6 +312,7 @@ impl RabbitMqConsumer {
                             pending_deliveries,
                             queue,
                             topology,
+                            &publisher,
                         )
                         .await;
                     }
@@ -311,16 +337,23 @@ impl RabbitMqConsumer {
                                     .await
                                 {
                                     Ok(()) => {
-                                        debug!(
-                                            "deferring message to shard hold queue {}",
-                                            hold_queue.name()
-                                        );
                                         if let Err(e) =
                                             delivery.ack(BasicAckOptions::default()).await
                                         {
                                             error!(
                                                 "failed to ack delivery after deferring to shard hold queue: {e}"
                                             );
+                                            publisher.rollback_if_tx().await;
+                                            router::nack_requeue(&delivery, &publisher).await;
+                                        } else {
+                                            if let Err(e) = publisher.commit_if_tx().await {
+                                                error!("tx_commit failed for shard defer: {e}");
+                                            } else {
+                                                debug!(
+                                                    "deferring message to shard hold queue {}",
+                                                    hold_queue.name()
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -328,11 +361,11 @@ impl RabbitMqConsumer {
                                             "failed to publish to shard hold queue {} for defer, requeuing: {e}",
                                             hold_queue.name()
                                         );
-                                        router::nack_requeue(&delivery).await;
+                                        router::nack_requeue(&delivery, &publisher).await;
                                     }
                                 }
                             } else {
-                                router::nack_requeue(&delivery).await;
+                                router::nack_requeue(&delivery, &publisher).await;
                             }
                         }
                         in_flight_count -= 1;
@@ -367,7 +400,7 @@ impl RabbitMqConsumer {
                                 "draining in-flight message on shutdown"
                             );
                             match outcome {
-                                Outcome::Ack => router::route_ack(&delivery).await,
+                                Outcome::Ack => router::route_ack(&delivery, &publisher).await,
                                 Outcome::Retry => {
                                     route_shard_retry(
                                         &delivery,
@@ -378,7 +411,9 @@ impl RabbitMqConsumer {
                                     )
                                     .await;
                                 }
-                                Outcome::Reject => router::route_reject(&delivery, topology).await,
+                                Outcome::Reject => {
+                                    router::route_reject(&delivery, topology, &publisher).await;
+                                }
                                 Outcome::Defer => {
                                     if !shard_hold_queues.is_empty() {
                                         let hold_queue = &shard_hold_queues[0];
@@ -396,15 +431,19 @@ impl RabbitMqConsumer {
                                                     delivery.ack(BasicAckOptions::default()).await
                                                 {
                                                     error!("failed to ack delivery after defer on shutdown: {e}");
+                                                    publisher.rollback_if_tx().await;
+                                                    router::nack_requeue(&delivery, &publisher).await;
+                                                } else if let Err(e) = publisher.commit_if_tx().await {
+                                                    error!("tx_commit failed for defer on shutdown: {e}");
                                                 }
                                             }
                                             Err(e) => {
                                                 warn!("failed to defer on shutdown: {e}");
-                                                router::nack_requeue(&delivery).await;
+                                                router::nack_requeue(&delivery, &publisher).await;
                                             }
                                         }
                                     } else {
-                                        router::nack_requeue(&delivery).await;
+                                        router::nack_requeue(&delivery, &publisher).await;
                                     }
                                 }
                             }
@@ -413,7 +452,7 @@ impl RabbitMqConsumer {
                         // already in a hold queue and will be redelivered.
                     }
                     // Pending deliveries are nack-requeued by the caller.
-                    return Ok(());
+                    return Ok(publisher);
                 }
 
                 Some(key) = completed_rx.recv() => {
@@ -436,7 +475,7 @@ impl RabbitMqConsumer {
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
-                        router::route_reject(&delivery, topology).await;
+                        router::route_reject(&delivery, topology, &publisher).await;
                         continue;
                     }
 
@@ -458,11 +497,11 @@ impl RabbitMqConsumer {
                             // Also reject all pending deliveries for this key.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
-                                    router::route_reject(&pd, topology).await;
+                                    router::route_reject(&pd, topology, &publisher).await;
                                 }
                             }
                         }
-                        router::route_reject(&delivery, topology).await;
+                        router::route_reject(&delivery, topology, &publisher).await;
                         continue;
                     }
 
@@ -481,7 +520,7 @@ impl RabbitMqConsumer {
                                         limit,
                                         "per-key pending buffer full, rejecting to DLQ"
                                     );
-                                    router::route_reject(&delivery, topology).await;
+                                    router::route_reject(&delivery, topology, &publisher).await;
                                     continue;
                                 }
                             }
@@ -520,7 +559,7 @@ impl RabbitMqConsumer {
                                             limit,
                                             "per-key pending buffer full, rejecting to DLQ"
                                         );
-                                        router::route_reject(&delivery, topology).await;
+                                        router::route_reject(&delivery, topology, &publisher).await;
                                         continue;
                                     }
                                 }
@@ -541,7 +580,7 @@ impl RabbitMqConsumer {
 
                     // ── Spawn handler for this key ──
                     let metadata = extract_message_metadata(&delivery);
-                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology).await {
+                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher).await {
                         None => {
                             // Reject undeserializable messages immediately.
                             if on_failure == SequenceFailure::FailAll {
@@ -590,6 +629,7 @@ impl RabbitMqConsumer {
         pending_deliveries: &mut HashMap<String, VecDeque<Delivery>>,
         queue: &str,
         topology: &'static QueueTopology,
+        publisher: &ChannelPublisher,
     ) where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
@@ -599,7 +639,7 @@ impl RabbitMqConsumer {
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
-                    router::route_reject(&pd, topology).await;
+                    router::route_reject(&pd, topology, publisher).await;
                 }
             }
             return;
@@ -624,25 +664,27 @@ impl RabbitMqConsumer {
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
                     // Reject remaining pending for this key too.
-                    router::route_reject(&delivery, topology).await;
+                    router::route_reject(&delivery, topology, publisher).await;
                     while let Some(pd) = pending.pop_front() {
-                        router::route_reject(&pd, topology).await;
+                        router::route_reject(&pd, topology, publisher).await;
                     }
                     pending_deliveries.remove(key);
                     return;
                 }
-                router::route_reject(&delivery, topology).await;
+                router::route_reject(&delivery, topology, publisher).await;
                 continue;
             }
 
             let metadata = extract_message_metadata(&delivery);
-            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology).await {
+            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, publisher)
+                .await
+            {
                 None => {
                     // Extra FailAll poisoning on deserialization failure.
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {
-                            router::route_reject(&pd, topology).await;
+                            router::route_reject(&pd, topology, publisher).await;
                         }
                         pending_deliveries.remove(key);
                         return;
@@ -712,8 +754,16 @@ impl RabbitMqConsumer {
         T::Message: for<'de> serde::Deserialize<'de>,
         H: MessageHandler<T>,
     {
+        let exactly_once = options.exactly_once;
         let (channel, mut stream) =
-            open_consumer(&self.client, queue, options.prefetch_count).await?;
+            open_consumer(&self.client, queue, options.prefetch_count, exactly_once).await?;
+        #[cfg(feature = "rabbitmq-exactly-once")]
+        let publisher = if exactly_once {
+            ChannelPublisher::new_tx(channel)
+        } else {
+            ChannelPublisher::new(channel)
+        };
+        #[cfg(not(feature = "rabbitmq-exactly-once"))]
         let publisher = ChannelPublisher::new(channel);
         let notify = Arc::new(Notify::new());
         let max_in_flight = options.prefetch_count as usize;
@@ -799,13 +849,13 @@ impl RabbitMqConsumer {
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
                         );
-                        router::route_reject(&delivery, topology).await;
+                        router::route_reject(&delivery, topology, &publisher).await;
                         continue;
                     }
 
                     let metadata = extract_message_metadata(&delivery);
 
-                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology).await {
+                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher).await {
                         let rx = spawn_handler::<T, H>(
                             &handler,
                             message,
@@ -839,7 +889,8 @@ where
     T::Message: for<'de> serde::Deserialize<'de>,
     H: MessageHandler<T>,
 {
-    let (_channel, mut stream) = open_consumer(client, dlq, options.prefetch_count).await?;
+    // DLQ consumer never uses exactly-once mode (always acks, no hold-queue routing).
+    let (_channel, mut stream) = open_consumer(client, dlq, options.prefetch_count, false).await?;
 
     info!("DLQ consumer started on queue {dlq}");
 
@@ -885,9 +936,9 @@ async fn route_outcome(
     retry_count: u32,
 ) {
     match outcome {
-        Outcome::Ack => router::route_ack(delivery).await,
+        Outcome::Ack => router::route_ack(delivery, publisher).await,
         Outcome::Retry => router::route_retry(delivery, topology, publisher, retry_count).await,
-        Outcome::Reject => router::route_reject(delivery, topology).await,
+        Outcome::Reject => router::route_reject(delivery, topology, publisher).await,
         Outcome::Defer => router::route_defer(delivery, topology, publisher).await,
     }
 }
@@ -911,21 +962,28 @@ async fn route_shard_retry(
             .await
         {
             Ok(()) => {
+                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                    error!("failed to ack delivery after publishing to shard hold queue: {e}");
+                    publisher.rollback_if_tx().await;
+                    router::nack_requeue(delivery, publisher).await;
+                    return;
+                }
+                if let Err(e) = publisher.commit_if_tx().await {
+                    error!("tx_commit failed for shard retry (attempt {new_retry_count}): {e}");
+                    return;
+                }
                 debug!(
                     "retrying message via shard hold queue {} (attempt {})",
                     hold_queue.name(),
                     new_retry_count
                 );
-                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                    error!("failed to ack delivery after publishing to shard hold queue: {e}");
-                }
             }
             Err(e) => {
                 warn!(
                     "failed to publish to shard hold queue {}, requeuing: {e}",
                     hold_queue.name()
                 );
-                router::nack_requeue(delivery).await;
+                router::nack_requeue(delivery, publisher).await;
             }
         }
     } else {
@@ -934,12 +992,19 @@ async fn route_shard_retry(
             retry_count,
             "retrying sequenced message but no shard hold queues configured — requeuing with no delay"
         );
-        router::nack_requeue(delivery).await;
+        router::nack_requeue(delivery, publisher).await;
     }
 }
 
-/// Nack-requeue all locally buffered deliveries (used on shutdown/reconnect).
-async fn nack_requeue_all_pending(pending_deliveries: &mut HashMap<String, VecDeque<Delivery>>) {
+/// Nack-requeue all locally buffered deliveries (used on graceful shutdown).
+///
+/// In tx mode the channel is still open; we nack each delivery and commit to
+/// make it immediately visible in the queue. In non-tx mode a plain nack is
+/// sufficient (confirms are per-publish, not per-nack).
+async fn nack_requeue_all_pending(
+    pending_deliveries: &mut HashMap<String, VecDeque<Delivery>>,
+    publisher: Option<&ChannelPublisher>,
+) {
     for (key, deliveries) in pending_deliveries.drain() {
         for delivery in deliveries {
             debug!(
@@ -954,6 +1019,11 @@ async fn nack_requeue_all_pending(pending_deliveries: &mut HashMap<String, VecDe
                 .await
             {
                 error!("failed to nack-requeue buffered delivery: {e}");
+            }
+            if let Some(pub_) = publisher
+                && let Err(e) = pub_.commit_if_tx().await
+            {
+                error!("tx_commit failed after nack-requeue on shutdown: {e}");
             }
         }
     }
@@ -1031,6 +1101,7 @@ async fn try_deserialize_or_reject<T: Topic>(
     metadata: &MessageMetadata,
     queue: &str,
     topology: &'static QueueTopology,
+    publisher: &ChannelPublisher,
 ) -> Option<T::Message>
 where
     T::Message: for<'de> serde::Deserialize<'de>,
@@ -1044,7 +1115,7 @@ where
                 queue = %queue,
                 "failed to deserialize message"
             );
-            router::route_reject(delivery, topology).await;
+            router::route_reject(delivery, topology, publisher).await;
             None
         }
     }
@@ -1241,7 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn nack_requeue_all_pending_handles_empty_map() {
         let mut pending: HashMap<String, VecDeque<Delivery>> = HashMap::new();
-        nack_requeue_all_pending(&mut pending).await;
+        nack_requeue_all_pending(&mut pending, None).await;
         assert!(pending.is_empty());
     }
 }

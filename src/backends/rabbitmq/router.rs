@@ -9,9 +9,12 @@ use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY};
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::topology::QueueTopology;
 
-pub(crate) async fn route_ack(delivery: &Delivery) {
+pub(crate) async fn route_ack(delivery: &Delivery, publisher: &ChannelPublisher) {
     if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
         error!("failed to ack delivery: {e}");
+    }
+    if let Err(e) = publisher.commit_if_tx().await {
+        error!("tx_commit failed after ack: {e}");
     }
 }
 
@@ -34,21 +37,32 @@ pub(crate) async fn route_retry(
             .await
         {
             Ok(()) => {
+                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
+                    error!("failed to ack delivery after publishing to hold queue: {e}");
+                    // Ack failed while publish is buffered in tx — roll back the
+                    // buffered publish so no duplicate ends up in the hold queue.
+                    publisher.rollback_if_tx().await;
+                    nack_requeue(delivery, publisher).await;
+                    return;
+                }
+                if let Err(e) = publisher.commit_if_tx().await {
+                    error!("tx_commit failed for retry (attempt {new_retry_count}): {e}");
+                    // tx_commit failure means neither publish nor ack happened;
+                    // delivery remains unacked and will be redelivered by the broker.
+                    return;
+                }
                 debug!(
                     "retrying message via hold queue {} (attempt {})",
                     hold_queue.name(),
                     new_retry_count
                 );
-                if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
-                    error!("failed to ack delivery after publishing to hold queue: {e}");
-                }
             }
             Err(e) => {
                 warn!(
                     "failed to publish to hold queue {}, requeuing: {e}",
                     hold_queue.name()
                 );
-                nack_requeue(delivery).await;
+                nack_requeue(delivery, publisher).await;
             }
         }
     } else {
@@ -56,7 +70,7 @@ pub(crate) async fn route_retry(
             queue = topology.queue(),
             retry_count, "retrying message but no hold queues configured — requeuing with no delay"
         );
-        nack_requeue(delivery).await;
+        nack_requeue(delivery, publisher).await;
     }
 }
 
@@ -76,17 +90,24 @@ pub(crate) async fn route_defer(
             .await
         {
             Ok(()) => {
-                debug!("deferring message to hold queue {}", hold_queue.name());
                 if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
                     error!("failed to ack delivery after deferring to hold queue: {e}");
+                    publisher.rollback_if_tx().await;
+                    nack_requeue(delivery, publisher).await;
+                    return;
                 }
+                if let Err(e) = publisher.commit_if_tx().await {
+                    error!("tx_commit failed for defer: {e}");
+                    return;
+                }
+                debug!("deferring message to hold queue {}", hold_queue.name());
             }
             Err(e) => {
                 warn!(
                     "failed to publish to hold queue {} for defer, requeuing: {e}",
                     hold_queue.name()
                 );
-                nack_requeue(delivery).await;
+                nack_requeue(delivery, publisher).await;
             }
         }
     } else {
@@ -94,11 +115,15 @@ pub(crate) async fn route_defer(
             queue = topology.queue(),
             "deferring message but no hold queues configured — requeuing with no delay"
         );
-        nack_requeue(delivery).await;
+        nack_requeue(delivery, publisher).await;
     }
 }
 
-pub(crate) async fn route_reject(delivery: &Delivery, topology: &QueueTopology) {
+pub(crate) async fn route_reject(
+    delivery: &Delivery,
+    topology: &QueueTopology,
+    publisher: &ChannelPublisher,
+) {
     if topology.dlq().is_none() {
         warn!(
             queue = topology.queue(),
@@ -114,9 +139,12 @@ pub(crate) async fn route_reject(delivery: &Delivery, topology: &QueueTopology) 
     {
         error!("failed to nack-reject delivery: {e}");
     }
+    if let Err(e) = publisher.commit_if_tx().await {
+        error!("tx_commit failed after reject: {e}");
+    }
 }
 
-pub(crate) async fn nack_requeue(delivery: &Delivery) {
+pub(crate) async fn nack_requeue(delivery: &Delivery, publisher: &ChannelPublisher) {
     if let Err(e) = delivery
         .nack(BasicNackOptions {
             requeue: true,
@@ -125,6 +153,9 @@ pub(crate) async fn nack_requeue(delivery: &Delivery) {
         .await
     {
         error!("failed to nack delivery for requeue: {e}");
+    }
+    if let Err(e) = publisher.commit_if_tx().await {
+        error!("tx_commit failed after nack-requeue: {e}");
     }
 }
 
@@ -211,10 +242,11 @@ mod tests {
     }
 
     #[test]
-    fn clone_headers_with_no_headers_returns_empty_table() {
+    fn clone_headers_with_no_headers_adds_message_id() {
         let delivery = make_delivery(None);
         let result = clone_headers(&delivery);
-        assert!(result.inner().is_empty());
+        assert!(result.inner().contains_key(MESSAGE_ID_KEY));
+        assert_eq!(result.inner().len(), 1);
     }
 
     #[test]
@@ -227,7 +259,8 @@ mod tests {
         let delivery = make_delivery(Some(table));
         let result = clone_headers(&delivery);
         assert!(result.inner().contains_key("x-trace-id"));
-        assert_eq!(result.inner().len(), 1);
+        assert!(result.inner().contains_key(MESSAGE_ID_KEY));
+        assert_eq!(result.inner().len(), 2);
     }
 
     #[test]
@@ -245,14 +278,16 @@ mod tests {
         let result = clone_headers(&delivery);
         assert!(!result.inner().contains_key("x-custom"));
         assert!(result.inner().contains_key("x-trace-id"));
-        assert_eq!(result.inner().len(), 1);
+        assert!(result.inner().contains_key(MESSAGE_ID_KEY));
+        assert_eq!(result.inner().len(), 2);
     }
 
     #[test]
     fn clone_headers_with_retry_no_existing_headers_inserts_retry_count() {
         let delivery = make_delivery(None);
         let result = clone_headers_with_retry(&delivery, 3);
-        assert_eq!(result.inner().len(), 1);
+        assert!(result.inner().contains_key(MESSAGE_ID_KEY));
+        assert_eq!(result.inner().len(), 2);
         assert_eq!(
             result.inner().get(RETRY_COUNT_KEY),
             Some(&AMQPValue::LongUInt(3))
@@ -268,7 +303,8 @@ mod tests {
         );
         let delivery = make_delivery(Some(table));
         let result = clone_headers_with_retry(&delivery, 2);
-        assert_eq!(result.inner().len(), 2);
+        assert!(result.inner().contains_key(MESSAGE_ID_KEY));
+        assert_eq!(result.inner().len(), 3);
         assert!(result.inner().contains_key("x-trace-id"));
         assert_eq!(
             result.inner().get(RETRY_COUNT_KEY),

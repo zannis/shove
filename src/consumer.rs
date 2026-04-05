@@ -53,6 +53,23 @@ pub struct ConsumerOptions {
     /// deliveries for that key are rejected to the DLQ.
     /// `None` means no limit (default).
     pub max_pending_per_key: Option<usize>,
+    /// Enable exactly-once delivery via AMQP transactions (RabbitMQ only).
+    ///
+    /// Requires the `rabbitmq-exactly-once` Cargo feature. When enabled, the
+    /// consumer channel is put in AMQP transaction mode (`tx_select`). Every
+    /// routing decision (retry, defer, ack, reject) is wrapped in a `tx_commit`,
+    /// making publish-to-hold-queue and ack/nack of the original delivery
+    /// **atomic**. This eliminates the publish-then-ack race that can produce a
+    /// duplicate delivery under at-least-once semantics.
+    ///
+    /// **Trade-off**: AMQP transactions disable publisher confirms and add a
+    /// round-trip per message. Expect roughly 10–15× lower throughput per channel
+    /// compared to the default confirm mode. Use [`ConsumerOptions::with_exactly_once`]
+    /// to opt in.
+    ///
+    /// Has no effect on SQS consumers (SQS `ChangeMessageVisibility` is already
+    /// atomic) or when the `rabbitmq-exactly-once` feature is not enabled.
+    pub exactly_once: bool,
 }
 
 impl ConsumerOptions {
@@ -66,6 +83,7 @@ impl ConsumerOptions {
             processing: Arc::new(AtomicBool::new(false)),
             handler_timeout: None,
             max_pending_per_key: None,
+            exactly_once: false,
         }
     }
 
@@ -96,6 +114,22 @@ impl ConsumerOptions {
     /// When exceeded, new deliveries for that key are rejected to the DLQ.
     pub fn with_max_pending_per_key(mut self, limit: usize) -> Self {
         self.max_pending_per_key = Some(limit);
+        self
+    }
+
+    /// Enable exactly-once delivery via AMQP transactions.
+    ///
+    /// Requires the `rabbitmq-exactly-once` Cargo feature. See
+    /// [`ConsumerOptions::exactly_once`] for the full trade-off description.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let options = ConsumerOptions::new(shutdown)
+    ///     .with_exactly_once();
+    /// ```
+    #[cfg(feature = "rabbitmq-exactly-once")]
+    pub fn with_exactly_once(mut self) -> Self {
+        self.exactly_once = true;
         self
     }
 }
@@ -212,5 +246,30 @@ mod tests {
     fn with_max_pending_per_key_sets_value() {
         let opts = ConsumerOptions::new(CancellationToken::new()).with_max_pending_per_key(50);
         assert_eq!(opts.max_pending_per_key, Some(50));
+    }
+
+    #[test]
+    fn exactly_once_defaults_to_false() {
+        let opts = ConsumerOptions::new(CancellationToken::new());
+        assert!(!opts.exactly_once);
+    }
+
+    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[test]
+    fn with_exactly_once_sets_flag() {
+        let opts = ConsumerOptions::new(CancellationToken::new()).with_exactly_once();
+        assert!(opts.exactly_once);
+    }
+
+    #[cfg(feature = "rabbitmq-exactly-once")]
+    #[test]
+    fn exactly_once_chains_with_other_builders() {
+        let opts = ConsumerOptions::new(CancellationToken::new())
+            .with_max_retries(5)
+            .with_exactly_once()
+            .with_prefetch_count(1);
+        assert!(opts.exactly_once);
+        assert_eq!(opts.max_retries, 5);
+        assert_eq!(opts.prefetch_count, 1);
     }
 }
