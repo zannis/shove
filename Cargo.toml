@@ -59,28 +59,59 @@ harness = false
 required-features = ["rabbitmq"]
 
 [[example]]
-name = "basic_pubsub"
+name = "rabbitmq_basic_pubsub"
+path = "examples/rabbitmq/basic_pubsub.rs"
 required-features = ["rabbitmq"]
 
 [[example]]
-name = "sequenced_pubsub"
+name = "rabbitmq_sequenced_pubsub"
+path = "examples/rabbitmq/sequenced_pubsub.rs"
 required-features = ["rabbitmq"]
 
 [[example]]
-name = "consumer_groups"
+name = "rabbitmq_consumer_groups"
+path = "examples/rabbitmq/consumer_groups.rs"
 required-features = ["rabbitmq"]
 
 [[example]]
-name = "audited_consumer"
+name = "rabbitmq_audited_consumer"
+path = "examples/rabbitmq/audited_consumer.rs"
 required-features = ["rabbitmq", "audit"]
 
 [[example]]
-name = "concurrent_pubsub"
+name = "rabbitmq_concurrent_pubsub"
+path = "examples/rabbitmq/concurrent_pubsub.rs"
 required-features = ["rabbitmq"]
 
 [[example]]
-name = "stress"
+name = "rabbitmq_stress"
+path = "examples/rabbitmq/stress.rs"
 required-features = ["rabbitmq"]
+
+[[example]]
+name = "sqs_basic_pubsub"
+path = "examples/sqs/basic_pubsub.rs"
+required-features = ["aws-sns-sqs"]
+
+[[example]]
+name = "sqs_sequenced_pubsub"
+path = "examples/sqs/sequenced_pubsub.rs"
+required-features = ["aws-sns-sqs"]
+
+[[example]]
+name = "sqs_concurrent_pubsub"
+path = "examples/sqs/concurrent_pubsub.rs"
+required-features = ["aws-sns-sqs"]
+
+[[example]]
+name = "sqs_consumer_groups"
+path = "examples/sqs/consumer_groups.rs"
+required-features = ["aws-sns-sqs"]
+
+[[example]]
+name = "sqs_audited_consumer"
+path = "examples/sqs/audited_consumer.rs"
+required-features = ["aws-sns-sqs", "audit"]
 
 [[test]]
 name = "sns_integration"

@@ -5,9 +5,9 @@
 //!
 //! Requires Docker. Run with:
 //!
-//!     cargo run -q --example stress --features rabbitmq
-//!     cargo run -q --example stress --features rabbitmq -- --tier moderate
-//!     cargo run -q --example stress --features rabbitmq -- --tier extreme
+//!     cargo run -q --example rabbitmq_stress --features rabbitmq
+//!     cargo run -q --example rabbitmq_stress --features rabbitmq -- --tier moderate
+//!     cargo run -q --example rabbitmq_stress --features rabbitmq -- --tier extreme
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

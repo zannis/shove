@@ -10,3 +10,8 @@ services:
     command: >
       bash -c "rabbitmq-plugins enable rabbitmq_consistent_hash_exchange &&
                rabbitmq-server "
+
+  floci:
+    image: hectorvent/floci:latest
+    ports:
+      - "4566:4566"

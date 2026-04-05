@@ -6,7 +6,7 @@
 //! Requires a running RabbitMQ instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
-//!     cargo run --example audited_consumer --features rabbitmq
+//!     cargo run --example rabbitmq_audited_consumer --features rabbitmq
 
 use std::time::Duration;
 

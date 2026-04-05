@@ -21,7 +21,7 @@
 //! plugin enabled (see docker-compose.yml):
 //!
 //!     docker compose up -d
-//!     cargo run --example sequenced_pubsub --features rabbitmq
+//!     cargo run --example rabbitmq_sequenced_pubsub --features rabbitmq
 
 use std::collections::HashMap;
 use std::sync::Arc;

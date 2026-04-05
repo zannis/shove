@@ -7,7 +7,7 @@
 //! Requires a running RabbitMQ instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
-//!     cargo run --example concurrent_pubsub --features rabbitmq
+//!     cargo run --example rabbitmq_concurrent_pubsub --features rabbitmq
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

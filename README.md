@@ -6,9 +6,49 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust. Supports RabbitMQ and AWS SNS/SQS.
+Type-safe async pub/sub for Rust with **at-least-once delivery guarantees**. Supports RabbitMQ and AWS SNS/SQS.
 
-Define a topic once — shove handles the plumbing: queue topology, retries, DLQ, ordered delivery, auditing and autoscaling consumer groups. A single consumer handles 10k+ msg/s out of the box.
+Built for services that cannot afford to lose messages: retry topologies, DLQ routing, ordered delivery, audit trails, and autoscaling consumer groups — derived from a single topic definition. A single consumer handles 10k+ msg/s out of the box.
+
+**shove is for you if:**
+- You have multiple services exchanging messages and need guaranteed delivery
+- You need retry backoff, dead-letter queues, or audit trails without building them yourself
+- You want message ordering guarantees per entity (financial events, state machines)
+- You are running RabbitMQ or AWS SNS/SQS (or both)
+
+**shove is _not_ for you if:**
+- You have a single service with one queue and no retry requirements — use [lapin](https://github.com/amqp-rs/lapin) (RabbitMQ) or the AWS SDK directly
+- You need exactly-once delivery — shove guarantees at-least-once; your handlers must be idempotent
+
+## Contents
+
+- [Quick start](#quick-start)
+  - [Define a topic](#define-a-topic)
+  - [Publish (RabbitMQ)](#publish)
+  - [Publish (SNS)](#publish-sns)
+  - [Consume (SQS)](#consume-sqs)
+  - [Consume (RabbitMQ)](#consume-rabbitmq)
+- [At-least-once delivery](#at-least-once-delivery)
+- [Why not roll your own?](#why-not-roll-your-own)
+- [Performance](#performance)
+- [Features](#features)
+- [Concurrent consumption](#concurrent-consumption)
+- [Sequenced topics](#sequenced-topics)
+  - [Sequence failure policies](#sequence-failure-policies)
+- [Consumer groups & autoscaling](#consumer-groups--autoscaling)
+- [Audit logging](#audit-logging)
+  - [Built-in ShoveAuditHandler](#built-in-shoveaudithandler)
+- [Reference](#reference)
+  - [Outcome variants](#outcome-variants)
+  - [Topology configurations](#topology-configurations)
+  - [Backends](#backends)
+  - [Minimum Rust version](#minimum-rust-version)
+- [Examples](#examples)
+  - [RabbitMQ](#rabbitmq-examplesrabbitmq)
+  - [SQS](#sqs-examplessqs)
+  - [Stress tests](#stress-tests)
+- [Roadmap](#roadmap)
+- [Background](#background)
 
 ## Quick start
 
@@ -25,7 +65,7 @@ cargo add shove --features pub-aws-sns
 cargo add shove --features aws-sns-sqs
 ```
 
-For RabbitMQ, you need a running instance with the consistent-hash exchange plugin enabled. Start one with the included docker-compose:
+For RabbitMQ, you need a running instance with the consistent-hash exchange plugin enabled. For the SQS backend, you need a running [floci](https://github.com/hectorvent/floci) instance (LocalStack-compatible). Start both with the included docker-compose:
 
 ```sh
 docker compose up -d
@@ -139,11 +179,38 @@ consumer
     .await?;
 ```
 
-## Why not just use lapin?
+## At-least-once delivery
 
-lapin gives you raw AMQP primitives — channels, queues, exchanges, bindings. If you have one service with one queue, that's all you need.
+shove guarantees every message is delivered **at least once**. Under normal conditions each message is processed exactly once, but the following scenarios can cause redelivery:
 
-shove is for when you have dozens of topics across multiple services and you don't want to hand-roll retry topologies, DLQ routing, consumer groups, autoscaling, and audit trails for each one. It's a higher-level abstraction: topics are Rust types, the topology is derived from them, and the framework manages the lifecycle.
+- **Handler panic or timeout** — the message is automatically retried
+- **Consumer restart** — unacked in-flight messages are redelivered by the broker
+- **Retry routing race** (RabbitMQ only) — if the channel dies between publishing a retry and acking the original, both copies will be delivered
+
+**Your handlers must be idempotent.** For RabbitMQ, shove stamps a stable `x-message-id` header on every outgoing message and preserves it through hold-queue hops. Use it as a deduplication key:
+
+```rust,no_run
+use shove::rabbitmq::MESSAGE_ID_KEY;
+
+async fn handle(&self, msg: MyMessage, metadata: MessageMetadata) -> Outcome {
+    if let Some(mid) = metadata.headers.get(MESSAGE_ID_KEY) {
+        if self.store.already_processed(mid).await? {
+            return Outcome::Ack;
+        }
+    }
+    // ... business logic ...
+}
+```
+
+For SNS FIFO topics (sequenced topics), shove derives `MessageDeduplicationId` from a stable hash of the serialised payload. If a publish is retried after a network error where the first attempt silently landed at the broker, both attempts produce the same dedup ID and SNS deduplicates within its 5-minute window — preventing a duplicate from reaching the queue.
+
+The `redelivered` flag in `MessageMetadata` is also set by the broker when it knows a delivery is a repeat.
+
+## Why not roll your own?
+
+Raw broker clients (lapin for RabbitMQ, the AWS SDK for SQS) give you the primitives. If you have one service with one queue and no retry requirements, that's all you need.
+
+The complexity compounds quickly as soon as you add: escalating retry backoff, dead-letter queues, per-key ordering, consumer groups that scale with queue depth, and audit trails across every delivery attempt — and you need all of it to be correct under reconnects, crashes, and handler panics. That's what shove is for. Topics are Rust types; the topology is derived from them; the framework manages the lifecycle and the edge cases.
 
 ## Performance
 
@@ -163,6 +230,7 @@ The framework itself adds minimal overhead: sub-millisecond dispatch latency per
 
 ## Features
 
+- **At-least-once delivery** — panics, timeouts, and reconnects all trigger automatic retry. Messages are never silently dropped. Stable `x-message-id` headers (RabbitMQ) support handler-level deduplication.
 - **Compile-time topic binding** — each topic is a unit struct that associates a message type (`Serialize + DeserializeOwned`) with a queue topology. No stringly-typed queue names at call sites.
 - **Concurrent consumption** — process up to `prefetch_count` messages concurrently within a single consumer, while always acknowledging in delivery order.
 - **Escalating retry backoff** — configure multiple hold queues with increasing delays. The consumer picks the right one automatically based on retry count.
@@ -277,7 +345,7 @@ If the audit handler returns `Err`, the message is retried — audit failure is 
 
 ### Built-in `ShoveAuditHandler`
 
-Enable the `audit` feature (on by default) for a handler that publishes records back to a dedicated `shove-audit-log` topic:
+Enable the `audit` feature for a handler that publishes records back to a dedicated `shove-audit-log` topic:
 
 ```rust,no_run
 use shove::*;
@@ -311,11 +379,11 @@ This creates a self-contained audit trail inside your broker. The audit topic it
 
 ### Backends
 
-| Backend          | Feature flag   | Status  |
-|------------------|---------------|---------|
-| RabbitMQ         | `rabbitmq`    | Stable  |
-| AWS SNS (publish)| `pub-aws-sns` | In Progress |
-| AWS SNS+SQS      | `aws-sns-sqs` | In Progress |
+| Backend           | Feature flag   | Status |
+|-------------------|----------------|--------|
+| RabbitMQ          | `rabbitmq`     | Stable |
+| AWS SNS (publish) | `pub-aws-sns`  | Stable |
+| AWS SNS+SQS       | `aws-sns-sqs`  | Stable |
 
 `pub-aws-sns` enables SNS publisher only — useful when you publish to SNS but consume on a different stack.
 `aws-sns-sqs` enables the full SNS+SQS backend (publisher + consumer + consumer groups + autoscaling). It implies `pub-aws-sns`.
@@ -334,21 +402,43 @@ shove uses `edition = "2024"`, which requires **Rust 1.85 or later**.
 
 ## Examples
 
-See the [`examples/`](examples/) directory:
+See the [`examples/`](examples/) directory, organized by backend.
 
-- **[`basic_pubsub`](examples/basic_pubsub.rs)** — publish/consume lifecycle, DLQ handling, all outcome variants
-- **[`concurrent_pubsub`](examples/concurrent_pubsub.rs)** — concurrent consumption with in-order acking, sequential vs concurrent comparison
-- **[`sequenced_pubsub`](examples/sequenced_pubsub.rs)** — ordered delivery with `Skip` and `FailAll` policies
-- **[`consumer_groups`](examples/consumer_groups.rs)** — dynamic scaling with the autoscaler
-- **[`audited_consumer`](examples/audited_consumer.rs)** — custom `AuditHandler` that logs every delivery attempt to stdout
-- **[`stress`](examples/stress.rs)** — tiered stress benchmarks measuring throughput, latency percentiles, scaling efficiency, and resource usage
+### RabbitMQ (`examples/rabbitmq/`)
+
+- **[`rabbitmq_basic_pubsub`](examples/rabbitmq/basic_pubsub.rs)** — publish/consume lifecycle, DLQ handling, all outcome variants
+- **[`rabbitmq_concurrent_pubsub`](examples/rabbitmq/concurrent_pubsub.rs)** — concurrent consumption with in-order acking, sequential vs concurrent comparison
+- **[`rabbitmq_sequenced_pubsub`](examples/rabbitmq/sequenced_pubsub.rs)** — ordered delivery with `Skip` and `FailAll` policies
+- **[`rabbitmq_consumer_groups`](examples/rabbitmq/consumer_groups.rs)** — dynamic scaling with the autoscaler
+- **[`rabbitmq_audited_consumer`](examples/rabbitmq/audited_consumer.rs)** — custom `AuditHandler` that logs every delivery attempt to stdout
+- **[`rabbitmq_stress`](examples/rabbitmq/stress.rs)** — tiered stress benchmarks measuring throughput, latency percentiles, scaling efficiency, and resource usage
 
 ```sh
-cargo run --example basic_pubsub --features rabbitmq
-cargo run --example concurrent_pubsub --features rabbitmq
-cargo run --example sequenced_pubsub --features rabbitmq
-cargo run --example consumer_groups --features rabbitmq
-cargo run --example audited_consumer --features rabbitmq,audit
+docker compose up -d   # starts RabbitMQ
+
+cargo run --example rabbitmq_basic_pubsub --features rabbitmq
+cargo run --example rabbitmq_concurrent_pubsub --features rabbitmq
+cargo run --example rabbitmq_sequenced_pubsub --features rabbitmq
+cargo run --example rabbitmq_consumer_groups --features rabbitmq
+cargo run --example rabbitmq_audited_consumer --features rabbitmq,audit
+```
+
+### SQS (`examples/sqs/`)
+
+- **[`sqs_basic_pubsub`](examples/sqs/basic_pubsub.rs)** — publish/consume lifecycle, DLQ handling, all outcome variants
+- **[`sqs_concurrent_pubsub`](examples/sqs/concurrent_pubsub.rs)** — concurrent consumption with in-order acking, sequential vs concurrent comparison
+- **[`sqs_sequenced_pubsub`](examples/sqs/sequenced_pubsub.rs)** — ordered delivery with `Skip` and `FailAll` policies via SNS FIFO + SQS FIFO
+- **[`sqs_consumer_groups`](examples/sqs/consumer_groups.rs)** — consumer group registry with queue depth monitoring
+- **[`sqs_audited_consumer`](examples/sqs/audited_consumer.rs)** — custom `AuditHandler` that logs every delivery attempt to stdout
+
+```sh
+docker compose up -d   # starts floci (LocalStack-compatible SNS/SQS)
+
+cargo run --example sqs_basic_pubsub --features aws-sns-sqs
+cargo run --example sqs_concurrent_pubsub --features aws-sns-sqs
+cargo run --example sqs_sequenced_pubsub --features aws-sns-sqs
+cargo run --example sqs_consumer_groups --features aws-sns-sqs
+cargo run --example sqs_audited_consumer --features aws-sns-sqs,audit
 ```
 
 ### Stress tests
@@ -356,10 +446,10 @@ cargo run --example audited_consumer --features rabbitmq,audit
 The stress suite runs tiered benchmarks against a RabbitMQ container (started automatically via testcontainers):
 
 ```sh
-cargo run -q --example stress --features rabbitmq                                          # all tiers, all handlers
-cargo run -q --example stress --features rabbitmq -- --tier moderate                       # moderate tier only
-cargo run -q --example stress --features rabbitmq -- --handler fast                        # fast handler only
-cargo run -q --example stress --features rabbitmq -- --tier high --handler zero --output json
+cargo run -q --example rabbitmq_stress --features rabbitmq                                          # all tiers, all handlers
+cargo run -q --example rabbitmq_stress --features rabbitmq -- --tier moderate                       # moderate tier only
+cargo run -q --example rabbitmq_stress --features rabbitmq -- --handler fast                        # fast handler only
+cargo run -q --example rabbitmq_stress --features rabbitmq -- --tier high --handler zero --output json
 ```
 
 The bench suite also includes consumer-overhead analysis:
@@ -380,7 +470,7 @@ cargo bench -q --features rabbitmq --bench consumer_overhead -- --output json
 
 The first version of this crate was built for [Lens](https://lens.xyz) to handle millions of async events — media ingestion, cross-chain migrations, backfills. It was a self-contained pubsub system including a bespoke message broker, and it worked well, but lacked auditing and autoscaling.
 
-shove is the do-over. RabbitMQ handles storage and routing. shove handles the rest: type-safe topics, retry topologies, ordered delivery, consumer groups that scale themselves.
+shove is the do-over: RabbitMQ or SNS/SQS handles storage and routing; shove handles the rest.
 
 We needed a name for "throw a job at something and stop thinking about it." Push was taken. Yeet was considered. shove stuck — it's what you do with messages: shove them in, let the broker deal with it.
 

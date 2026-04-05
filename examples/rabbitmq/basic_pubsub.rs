@@ -7,7 +7,7 @@
 //! Requires a running RabbitMQ instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
-//!     cargo run --example basic_pubsub --features rabbitmq
+//!     cargo run --example rabbitmq_basic_pubsub --features rabbitmq
 
 use std::collections::HashMap;
 use std::time::Duration;

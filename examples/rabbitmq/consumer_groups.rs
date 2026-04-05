@@ -8,7 +8,7 @@
 //! (see docker-compose.yml):
 //!
 //!     docker compose up -d
-//!     cargo run --example consumer_groups --features rabbitmq
+//!     cargo run --example rabbitmq_consumer_groups --features rabbitmq
 
 use std::sync::Arc;
 use std::time::Duration;
