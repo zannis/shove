@@ -12,6 +12,8 @@ pub mod topology;
 
 mod backends;
 
+#[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
+use std::time::Duration;
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use consumer::{Consumer, ConsumerOptions};
 pub use error::ShoveError;
