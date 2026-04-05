@@ -3,7 +3,7 @@
 //! Each test spins up a fresh LocalStack container via testcontainers, runs
 //! the test, and drops the container on completion (automatic cleanup).
 //!
-//! Run with: `cargo test --features aws-sns-sqs --test sns_sqs_integration`
+//! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -556,7 +556,7 @@ async fn topology_idempotent_with_queues() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 4: Basic publish & consume tests
+// Basic publish & consume tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -716,7 +716,7 @@ async fn publish_and_consume_batch() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 5: Rejection & DLQ tests
+// Rejection & DLQ tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -859,7 +859,7 @@ async fn dlq_consumer_handles_dead_message() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 6: Retry Mechanism Tests
+// Retry Mechanism Tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -964,7 +964,7 @@ async fn max_retries_sends_to_dlq() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 7: Defer Mechanism Test
+// Defer Mechanism Test
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1039,7 +1039,7 @@ async fn defer_redelivers_message() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 8: Concurrent Consumption Tests
+// Concurrent Consumption Tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1189,7 +1189,7 @@ async fn concurrent_consume_graceful_shutdown_drains_inflight() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 9: Handler Timeout Test
+// Handler Timeout Test
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1271,7 +1271,7 @@ async fn handler_timeout_triggers_retry() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 10: Sequenced FIFO Consumption Tests
+// Sequenced FIFO Consumption Tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1578,7 +1578,77 @@ async fn sequenced_multiple_keys_processed_concurrently() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 11: Queue Stats Tests
+// FIFO Deduplication Test
+// ---------------------------------------------------------------------------
+
+/// Publishing the same payload twice to a FIFO topic should result in exactly
+/// one delivery. shove derives `MessageDeduplicationId` from a stable hash of
+/// the serialised payload, so both attempts share the same dedup ID and SNS
+/// deduplicates within its 5-minute window.
+#[tokio::test]
+async fn fifo_topic_deduplicates_identical_payloads() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    let msg = OrderMessage {
+        order_id: "DEDUP-ORD".to_string(),
+        amount: 100,
+    };
+
+    // Publish the same message twice — same payload → same dedup ID.
+    setup
+        .publisher
+        .publish::<SeqSkipTopic>(&msg)
+        .await
+        .expect("first publish should succeed");
+    setup
+        .publisher
+        .publish::<SeqSkipTopic>(&msg)
+        .await
+        .expect("second publish should succeed");
+
+    let handler = OrderRecordingHandler::new();
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(
+                handler_clone,
+                ConsumerOptions::new(sc).with_prefetch_count(5),
+            )
+            .await
+    });
+
+    // Wait for at least one delivery.
+    let reached = handler.wait_for_count(1, Duration::from_secs(15)).await;
+    assert!(reached, "handler should have received at least 1 message");
+
+    // Give extra time for a second delivery to appear (it shouldn't).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    shutdown.cancel();
+    handle.await.expect("consumer task should not panic").ok();
+
+    let records = handler.records().await;
+    assert_eq!(
+        records.len(),
+        1,
+        "SNS FIFO should deduplicate identical payloads: expected 1 delivery, got {}",
+        records.len()
+    );
+    assert_eq!(
+        records[0].1, 100,
+        "the delivered message should have amount=100"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Queue Stats Tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1634,7 +1704,7 @@ async fn stats_provider_missing_queue_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 12: Consumer Group & Registry Tests
+// Consumer Group & Registry Tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1843,7 +1913,7 @@ async fn registry_duplicate_registration_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 13: Deserialization Failure Test
+// Deserialization Failure Test
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1911,7 +1981,7 @@ async fn deserialization_failure_rejects_to_dlq() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 14: Error Handling Tests
+// Error Handling Tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

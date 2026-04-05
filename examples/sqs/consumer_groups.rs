@@ -115,13 +115,16 @@ async fn main() -> Result<(), ShoveError> {
     // It automatically declares the topology and starts consumers at their
     // minimum count. Each group reads from a single SQS queue and can be
     // scaled up/down manually or via a custom autoscaler.
-    let mut registry =
-        SqsConsumerGroupRegistry::new(client.clone(), topic_registry.clone(), queue_registry.clone());
+    let mut registry = SqsConsumerGroupRegistry::new(
+        client.clone(),
+        topic_registry.clone(),
+        queue_registry.clone(),
+    );
 
     registry
         .register::<WorkQueue, TaskHandler>(
             SqsConsumerGroupConfig::new(1..=5) // min..=max consumers
-                .with_prefetch_count(10)       // messages per consumer
+                .with_prefetch_count(10) // messages per consumer
                 .with_max_retries(3),
             || TaskHandler, // factory — called once per spawned consumer
         )
@@ -136,15 +139,17 @@ async fn main() -> Result<(), ShoveError> {
     // ── Monitor queue depth using SqsQueueStatsProvider ──
     //
     // Poll queue attributes to observe the backlog draining.
-    let stats_provider =
-        SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
+    let stats_provider = SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
 
     println!("monitoring queue depth — watching backlog drain\n");
 
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        match stats_provider.get_queue_stats(WorkQueue::topology().queue()).await {
+        match stats_provider
+            .get_queue_stats(WorkQueue::topology().queue())
+            .await
+        {
             Ok(stats) => println!(
                 "[monitor] messages_ready={} in_flight={}",
                 stats.messages_ready, stats.messages_not_visible,

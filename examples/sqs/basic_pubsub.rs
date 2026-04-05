@@ -229,7 +229,9 @@ async fn main() -> Result<(), ShoveError> {
     let c = client.clone();
     let qr = queue_registry.clone();
     let dlq_task = tokio::spawn(async move {
-        SqsConsumer::new(c, qr).run_dlq::<DlqOrder>(RejectHandler).await
+        SqsConsumer::new(c, qr)
+            .run_dlq::<DlqOrder>(RejectHandler)
+            .await
     });
 
     let s = shutdown.clone();

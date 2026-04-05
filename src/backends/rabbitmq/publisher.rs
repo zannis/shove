@@ -8,8 +8,10 @@ use lapin::{BasicProperties, Channel};
 use tokio::sync::Mutex;
 
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
+use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::error::{Result, ShoveError};
 use crate::publisher::Publisher;
 use crate::topic::Topic;
@@ -73,6 +75,17 @@ impl RabbitMqPublisher {
     ) -> Result<()> {
         let slot = self.pool.get();
         let mut channel_guard = slot.lock().await;
+
+        // Stamp a stable x-message-id so consumers can deduplicate if the
+        // publish-then-ack race produces a second delivery of this message.
+        let mut headers = headers.unwrap_or_default();
+        if !headers.inner().contains_key(MESSAGE_ID_KEY) {
+            headers.insert(
+                MESSAGE_ID_KEY.into(),
+                AMQPValue::LongString(Uuid::new_v4().to_string().into()),
+            );
+        }
+        let headers = Some(headers);
 
         debug!(
             exchange,

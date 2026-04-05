@@ -109,7 +109,9 @@ async fn setup() -> (SnsClient, SnsPublisher, Arc<QueueRegistry>) {
         region: Some("us-east-1".into()),
         endpoint_url: Some("http://localhost:4566".into()),
     };
-    let client = SnsClient::new(&config).await.expect("failed to connect to floci");
+    let client = SnsClient::new(&config)
+        .await
+        .expect("failed to connect to floci");
 
     let topic_registry = Arc::new(TopicRegistry::new());
     let queue_registry = Arc::new(QueueRegistry::new());

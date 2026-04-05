@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
@@ -13,16 +12,30 @@ use crate::topic::Topic;
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
-/// Compute shard index using FNV-1a hash (stable across versions).
-fn compute_shard(key: &str, shards: u16) -> u16 {
+/// FNV-1a 64-bit hash over arbitrary bytes (stable across versions).
+fn fnv1a_64(data: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 14695981039346656037;
     const FNV_PRIME: u64 = 1099511628211;
     let mut hash = FNV_OFFSET;
-    for byte in key.as_bytes() {
+    for byte in data {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    (hash % shards as u64) as u16
+    hash
+}
+
+/// Compute shard index using FNV-1a hash (stable across versions).
+fn compute_shard(key: &str, shards: u16) -> u16 {
+    (fnv1a_64(key.as_bytes()) % shards as u64) as u16
+}
+
+/// Derive a deterministic SNS `MessageDeduplicationId` from the serialised
+/// payload.  Using the same ID for every attempt of the same payload means
+/// SNS FIFO can deduplicate within its 5-minute window even when a publish
+/// is retried after a network error (where the first attempt may have
+/// already landed at the broker).
+fn content_dedup_id(payload: &str) -> String {
+    format!("{:016x}", fnv1a_64(payload.as_bytes()))
 }
 
 /// Convert a `HashMap<String, String>` into SNS message attributes.
@@ -81,7 +94,7 @@ impl SnsPublisher {
         if let Some(gid) = group_id {
             req = req
                 .message_group_id(gid)
-                .message_deduplication_id(Uuid::new_v4().to_string());
+                .message_deduplication_id(content_dedup_id(payload));
 
             if let Some(shards) = routing_shards {
                 let shard = compute_shard(gid, shards);
@@ -221,7 +234,7 @@ impl Publisher for SnsPublisher {
                 if let Some(ref keys) = routing_keys {
                     entry = entry
                         .message_group_id(&keys[i])
-                        .message_deduplication_id(Uuid::new_v4().to_string());
+                        .message_deduplication_id(content_dedup_id(payload));
 
                     if let Some(seq) = topology.sequencing() {
                         let shard = compute_shard(&keys[i], seq.routing_shards());
@@ -301,6 +314,37 @@ mod tests {
         assert!(attrs.contains_key("key-a"));
         assert!(attrs.contains_key("key-b"));
         assert!(attrs.contains_key("key-c"));
+    }
+
+    #[test]
+    fn fnv1a_64_deterministic() {
+        assert_eq!(fnv1a_64(b"hello"), fnv1a_64(b"hello"));
+    }
+
+    #[test]
+    fn fnv1a_64_different_inputs_differ() {
+        assert_ne!(fnv1a_64(b"hello"), fnv1a_64(b"world"));
+    }
+
+    #[test]
+    fn content_dedup_id_deterministic() {
+        let a = content_dedup_id(r#"{"id":1}"#);
+        let b = content_dedup_id(r#"{"id":1}"#);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn content_dedup_id_different_payloads_differ() {
+        let a = content_dedup_id(r#"{"id":1}"#);
+        let b = content_dedup_id(r#"{"id":2}"#);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_dedup_id_is_16_hex_chars() {
+        let id = content_dedup_id(r#"{"foo":"bar"}"#);
+        assert_eq!(id.len(), 16);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

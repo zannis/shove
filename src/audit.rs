@@ -34,7 +34,9 @@ pub struct AuditRecord<M: Serialize> {
 /// Trait for persisting audit records.
 ///
 /// Integrators implement this for their chosen persistence backend.
-/// Returning `Err` causes the message to be retried (strict auditing).
+/// Returning `Err` causes the message to be retried (strict auditing): the
+/// message will be reprocessed even if the business handler already succeeded.
+/// Handlers wrapped with [`Audited`] must therefore be **idempotent**.
 pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
     fn audit(&self, record: &AuditRecord<T::Message>) -> impl Future<Output = Result<()>> + Send;
 }
@@ -43,6 +45,14 @@ pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
 ///
 /// `Audited<H, A>` implements `MessageHandler<T>`, so it is fully transparent
 /// to consumers and consumer groups — no changes required at the call site.
+///
+/// **Idempotency requirement:** if the audit handler returns `Err`, the message
+/// is retried regardless of what the business handler returned — including
+/// `Ack`. The business handler may therefore run more than once for the same
+/// message. Ensure your handler is idempotent (e.g. upsert by `delivery_id`).
+///
+/// Use [`Audited::with_audit_timeout`] to bound how long the audit handler may
+/// block; on timeout the original outcome is preserved and no retry is forced.
 pub struct Audited<H, A> {
     handler: H,
     audit_handler: A,

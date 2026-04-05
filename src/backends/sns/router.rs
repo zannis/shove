@@ -82,6 +82,28 @@ pub(crate) async fn route_reject(
     }
 }
 
+/// Requeue an unprocessed message by making it immediately visible again.
+///
+/// Used during graceful shutdown to release buffered-but-never-dispatched
+/// messages back to the queue without the DLQ semantics of `route_reject`.
+/// Does not imply the message was processed or rejected.
+pub(crate) async fn route_requeue(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+) {
+    if let Err(e) = sqs
+        .change_message_visibility()
+        .queue_url(queue_url)
+        .receipt_handle(receipt_handle)
+        .visibility_timeout(0)
+        .send()
+        .await
+    {
+        warn!(queue_url, error = %e, "failed to change visibility for requeue");
+    }
+}
+
 /// Change visibility timeout for defer (uses hold_queues[0] delay).
 pub(crate) async fn route_defer(
     sqs: &aws_sdk_sqs::Client,

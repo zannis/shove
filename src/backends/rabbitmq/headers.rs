@@ -7,6 +7,16 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 
 pub(crate) const RETRY_COUNT_KEY: &str = "x-retry-count";
 
+/// Header key for the stable per-message deduplication ID.
+///
+/// Stamped by [`RabbitMqPublisher`] on every outgoing message and preserved
+/// through all hold-queue hops. Handlers can use this value to detect the
+/// duplicate delivery that arises when the publish-then-ack race fires (the
+/// broker requeues the original while the hold-queue copy is also in flight).
+///
+/// See [`MessageMetadata::headers`] for access from a handler.
+pub const MESSAGE_ID_KEY: &str = "x-message-id";
+
 fn long_string_to_owned(s: &LongString) -> String {
     // Fast path for valid UTF-8 (common case) avoids the extra allocation
     // that from_utf8_lossy().into_owned() always incurs.

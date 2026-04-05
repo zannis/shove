@@ -412,11 +412,12 @@ where
         .await
         {
             Ok(()) => {
-                // Graceful shutdown — reject-requeue all pending buffered deliveries.
+                // Graceful shutdown — release buffered-but-unprocessed messages
+                // back to the queue so another consumer can pick them up.
                 for (_key, msgs) in pending_deliveries.drain() {
                     for msg in msgs {
                         let rh = msg.receipt_handle().unwrap_or_default();
-                        router::route_reject(sqs, queue_url, rh, topology).await;
+                        router::route_requeue(sqs, queue_url, rh).await;
                     }
                 }
                 return Ok(());

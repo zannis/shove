@@ -28,12 +28,12 @@ pub use topology::{
 #[cfg(feature = "audit")]
 pub use audit::{AuditLog, ShoveAuditHandler};
 
-use std::time::Duration;
-
 /// Grace period for in-flight operations before closing connections.
+#[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 /// Backoff delay before reconnecting after a consumer disconnect.
+#[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 pub(crate) const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 // Backend re-exports
@@ -62,6 +62,7 @@ pub mod rabbitmq {
         client::{RabbitMqClient, RabbitMqConfig},
         consumer::RabbitMqConsumer,
         consumer_group::{ConsumerGroup, ConsumerGroupConfig},
+        headers::MESSAGE_ID_KEY,
         management::{ManagementConfig, QueueStats, QueueStatsProvider},
         publisher::RabbitMqPublisher,
         registry::ConsumerGroupRegistry,

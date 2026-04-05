@@ -3,7 +3,7 @@
 //! Each test spins up a fresh RabbitMQ container via testcontainers, runs
 //! the test, and drops the container on completion (automatic cleanup).
 //!
-//! Run with: `cargo test --test rabbitmq_integration`
+//! Run with: `cargo test --features rabbitmq,audit --test rabbitmq_integration`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -304,7 +304,7 @@ define_topic!(
         .build()
 );
 
-// Topic for sequenced consumer retry via shard hold queues (Task 8)
+// Topic for sequenced consumer retry via shard hold queues
 define_sequenced_topic!(
     RetrySeqOrders,
     OrderMessage,
@@ -317,7 +317,7 @@ define_sequenced_topic!(
         .build()
 );
 
-// Topic for sequenced consumer defer via shard hold queues (Task 9)
+// Topic for sequenced consumer defer via shard hold queues
 define_sequenced_topic!(
     DeferSeqOrders,
     OrderMessage,

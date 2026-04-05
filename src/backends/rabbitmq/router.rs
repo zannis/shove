@@ -3,7 +3,9 @@ use lapin::options::{BasicAckOptions, BasicNackOptions};
 use lapin::types::{AMQPValue, FieldTable};
 use tracing::{debug, error, warn};
 
-use crate::backends::rabbitmq::headers::RETRY_COUNT_KEY;
+use uuid::Uuid;
+
+use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY};
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::topology::QueueTopology;
 
@@ -129,11 +131,29 @@ pub(crate) async fn nack_requeue(delivery: &Delivery) {
 pub(crate) fn clone_headers_with_retry(delivery: &Delivery, retry_count: u32) -> FieldTable {
     let mut table = copy_preserved_headers(delivery);
     table.insert(RETRY_COUNT_KEY.into(), AMQPValue::LongUInt(retry_count));
+    ensure_message_id(&mut table);
     table
 }
 
 pub(crate) fn clone_headers(delivery: &Delivery) -> FieldTable {
-    copy_preserved_headers(delivery)
+    let mut table = copy_preserved_headers(delivery);
+    ensure_message_id(&mut table);
+    table
+}
+
+/// Insert a fresh `x-message-id` if one is not already present.
+///
+/// Called when routing a message to a hold queue so that the hold-queue copy
+/// and any broker-requeued original share the same stable identifier. Handlers
+/// can compare `metadata.headers["x-message-id"]` across deliveries to detect
+/// the duplicate introduced by the publish-then-ack race.
+fn ensure_message_id(table: &mut FieldTable) {
+    if !table.inner().contains_key(MESSAGE_ID_KEY) {
+        table.insert(
+            MESSAGE_ID_KEY.into(),
+            AMQPValue::LongString(Uuid::new_v4().to_string().into()),
+        );
+    }
 }
 
 /// Headers that must be preserved across retries and defers.
@@ -151,8 +171,9 @@ fn copy_preserved_headers(delivery: &Delivery) -> FieldTable {
 
     for (k, v) in inner.iter() {
         let key_str = k.as_str();
-        // Always preserve retry count (will be overwritten by caller if needed).
-        if key_str == RETRY_COUNT_KEY {
+        // Always preserve retry count (will be overwritten by caller if needed)
+        // and message ID (stable deduplication key across hold-queue hops).
+        if key_str == RETRY_COUNT_KEY || key_str == MESSAGE_ID_KEY {
             table.insert(k.clone(), v.clone());
             continue;
         }
