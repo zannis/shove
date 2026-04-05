@@ -2,6 +2,8 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use lapin::options::ConfirmSelectOptions;
+#[cfg(feature = "rabbitmq-exactly-once")]
+use lapin::options::TxSelectOptions;
 use lapin::{Channel, Connection, ConnectionProperties};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -18,8 +20,27 @@ pub struct RabbitMqConfig {
 
 impl Debug for RabbitMqConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let redacted_uri = if let Some(at_idx) = self.uri.find('@') {
+            if let Some(proto_idx) = self.uri.find("://") {
+                let prefix = &self.uri[..proto_idx + 3];
+                let creds = &self.uri[proto_idx + 3..at_idx];
+                let suffix = &self.uri[at_idx..];
+
+                if let Some(colon_idx) = creds.find(':') {
+                    let user = &creds[..colon_idx];
+                    format!("{prefix}{user}:<redacted>{suffix}")
+                } else {
+                    format!("{prefix}<redacted>{suffix}")
+                }
+            } else {
+                "<redacted>".to_string()
+            }
+        } else {
+            self.uri.clone()
+        };
+
         f.debug_struct("RabbitMqConfig")
-            .field("uri", &"<redacted>")
+            .field("uri", &redacted_uri)
             .finish()
     }
 }
@@ -101,6 +122,38 @@ impl RabbitMqClient {
         Ok(channel)
     }
 
+    /// Open a channel with AMQP transaction mode enabled (`tx_select`).
+    ///
+    /// Used by consumers with [`ConsumerOptions::with_exactly_once`] to make
+    /// publish-to-hold-queue and ack/nack of the original delivery atomic.
+    /// Transaction mode is mutually exclusive with publisher confirms — do not
+    /// mix with [`create_confirm_channel`](Self::create_confirm_channel) on the
+    /// same connection.
+    ///
+    /// Returns [`ShoveError::Connection`] if shutdown has already been requested,
+    /// if the channel cannot be created, or if `tx_select` cannot be enabled.
+    #[cfg(feature = "rabbitmq-exactly-once")]
+    pub async fn create_tx_channel(&self) -> Result<Channel> {
+        if self.shutdown_token.is_cancelled() {
+            return Err(ShoveError::Connection(
+                "cannot create tx channel: client is shutting down".into(),
+            ));
+        }
+
+        let channel = self
+            .connection
+            .create_channel()
+            .await
+            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+
+        channel
+            .tx_select(TxSelectOptions::default())
+            .await
+            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+
+        Ok(channel)
+    }
+
     /// Return a clone of the shutdown [`CancellationToken`].
     ///
     /// Callers can use this token to coordinate their own teardown with the
@@ -134,12 +187,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_debug_redacts_uri() {
-        let config = RabbitMqConfig::new("amqp://secret:password@host:5672/%2F");
+    fn config_debug_redacts_password_only() {
+        let config = RabbitMqConfig::new("amqp://admin:s3cret!@localhost:5672/%2F");
         let debug_output = format!("{config:?}");
-        assert!(!debug_output.contains("secret"));
-        assert!(!debug_output.contains("password"));
-        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains("s3cret!"));
+        assert!(debug_output.contains("amqp://admin:<redacted>@localhost:5672/%2F"));
+    }
+
+    #[test]
+    fn config_debug_no_creds_remains_clear() {
+        let config = RabbitMqConfig::new("amqp://localhost:5672/%2F");
+        let debug_output = format!("{config:?}");
+        assert!(debug_output.contains("amqp://localhost:5672/%2F"));
     }
 
     #[test]
