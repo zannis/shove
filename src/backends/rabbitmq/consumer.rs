@@ -18,6 +18,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
     extract_dead_metadata, extract_message_metadata, get_retry_count,
 };
+use crate::retry::Backoff;
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
 use crate::consumer::{Consumer, ConsumerOptions};
@@ -27,7 +28,7 @@ use crate::metadata::MessageMetadata;
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
-use crate::{QueueTopology, RECONNECT_DELAY};
+use crate::QueueTopology;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -100,6 +101,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
 {
+    let mut backoff = Backoff::default();
     loop {
         match f().await {
             Ok(()) => return Ok(()),
@@ -107,9 +109,10 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
-                warn!("consumer error on {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}");
+                let delay = backoff.next().expect("backoff is infinite");
+                warn!("consumer error on {queue}: {e}. Reconnecting in {delay:?}");
                 tokio::select! {
-                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    _ = tokio::time::sleep(delay) => {}
                     _ = shutdown.cancelled() => return Ok(()),
                 }
             }
@@ -166,6 +169,7 @@ impl RabbitMqConsumer {
     {
         let mut poisoned_keys = HashSet::new();
         let mut pending_deliveries: HashMap<String, VecDeque<Delivery>> = HashMap::new();
+        let mut backoff = Backoff::default();
         loop {
             match self
                 .consume_loop_concurrent_sequenced::<T, H>(
@@ -195,9 +199,10 @@ impl RabbitMqConsumer {
                     // On reconnect, the channel is dead — we cannot ack/nack.
                     // Clear pending; the broker will redeliver after reconnect.
                     pending_deliveries.clear();
-                    warn!("consumer error on {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}");
+                    let delay = backoff.next().expect("backoff is infinite");
+                    warn!("consumer error on {queue}: {e}. Reconnecting in {delay:?}");
                     tokio::select! {
-                        _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                        _ = tokio::time::sleep(delay) => {}
                         _ = options.shutdown.cancelled() => return Ok(()),
                     }
                 }
