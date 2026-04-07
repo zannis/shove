@@ -83,10 +83,7 @@ impl RabbitMqClient {
     ///
     /// Useful for services that start alongside their broker (e.g. in Docker
     /// Compose or Kubernetes) where the broker may not be ready immediately.
-    pub async fn connect_with_retry(
-        config: &RabbitMqConfig,
-        max_attempts: u32,
-    ) -> Result<Self> {
+    pub async fn connect_with_retry(config: &RabbitMqConfig, max_attempts: u32) -> Result<Self> {
         let mut backoff = crate::retry::Backoff::default();
         let mut last_err = None;
 

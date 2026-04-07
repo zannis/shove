@@ -150,10 +150,7 @@ impl SnsPublisher {
 
         debug!(queue_name, topic_arn, "publishing message to SNS");
 
-        let mut backoff = Backoff::new(
-            Duration::from_millis(100),
-            Duration::from_secs(2),
-        );
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
         let mut last_err = None;
 
         for attempt in 0..3u32 {
@@ -263,10 +260,7 @@ impl Publisher for SnsPublisher {
 
         // Chunk into groups of 10 and send
         for chunk in entries.chunks(SNS_BATCH_LIMIT) {
-            let mut backoff = Backoff::new(
-                std::time::Duration::from_millis(100),
-                std::time::Duration::from_secs(2),
-            );
+            let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
             let mut last_err = None;
 
             for attempt in 0..3u32 {

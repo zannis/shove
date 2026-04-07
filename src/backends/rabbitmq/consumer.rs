@@ -14,11 +14,11 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::QueueTopology;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
     extract_dead_metadata, extract_message_metadata, get_retry_count,
 };
-use crate::retry::Backoff;
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
 use crate::consumer::{Consumer, ConsumerOptions};
@@ -26,9 +26,9 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
-use crate::QueueTopology;
 
 // ---------------------------------------------------------------------------
 // Shared helpers

@@ -96,15 +96,18 @@ impl RabbitMqPublisher {
             "publishing message"
         );
 
-        let mut backoff = Backoff::new(
-            Duration::from_millis(100),
-            Duration::from_secs(2),
-        );
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
         let mut last_err = None;
 
         for attempt in 0..3u32 {
-            match Self::do_publish(&channel_guard, exchange, routing_key, payload, headers.clone())
-                .await
+            match Self::do_publish(
+                &channel_guard,
+                exchange,
+                routing_key,
+                payload,
+                headers.clone(),
+            )
+            .await
             {
                 Ok(()) => {
                     debug!(exchange, routing_key, "message published and confirmed");
@@ -169,16 +172,17 @@ impl RabbitMqPublisher {
 
         debug!(exchange, count = items.len(), "publishing batch");
 
-        let mut backoff = Backoff::new(
-            Duration::from_millis(100),
-            Duration::from_secs(2),
-        );
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
         let mut last_err = None;
 
         for attempt in 0..3u32 {
             match Self::do_publish_batch(&channel_guard, exchange, items).await {
                 Ok(()) => {
-                    debug!(exchange, count = items.len(), "batch published and confirmed");
+                    debug!(
+                        exchange,
+                        count = items.len(),
+                        "batch published and confirmed"
+                    );
                     return Ok(());
                 }
                 Err(e) => {
@@ -236,10 +240,7 @@ impl RabbitMqPublisher {
 }
 
 impl Publisher for RabbitMqPublisher {
-    fn publish<T: Topic>(
-        &self,
-        message: &T::Message,
-    ) -> impl Future<Output = Result<()>> + Send {
+    fn publish<T: Topic>(&self, message: &T::Message) -> impl Future<Output = Result<()>> + Send {
         let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
 
         let topology = T::topology();
