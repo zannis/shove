@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use lapin::options::BasicPublishOptions;
 use lapin::types::{AMQPValue, FieldTable};
@@ -14,6 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::error::{Result, ShoveError};
 use crate::publisher::Publisher;
+use crate::retry::Backoff;
 use crate::topic::Topic;
 
 const DELIVERY_MODE_PERSISTENT: u8 = 2;
@@ -94,19 +96,37 @@ impl RabbitMqPublisher {
             "publishing message"
         );
 
-        match Self::do_publish(&channel_guard, exchange, routing_key, payload, headers).await {
-            Ok(()) => {
-                debug!(exchange, routing_key, "message published and confirmed");
-                Ok(())
-            }
-            Err(e) => {
-                warn!(exchange, routing_key, error = %e, "publish failed, recovering channel and retrying");
-                let fresh = self.client.create_confirm_channel().await?;
-                *channel_guard = fresh;
+        let mut backoff = Backoff::new(
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        );
+        let mut last_err = None;
 
-                Self::do_publish(&channel_guard, exchange, routing_key, payload, None).await
+        for attempt in 0..3u32 {
+            match Self::do_publish(&channel_guard, exchange, routing_key, payload, headers.clone())
+                .await
+            {
+                Ok(()) => {
+                    debug!(exchange, routing_key, "message published and confirmed");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        exchange, routing_key, attempt, error = %e,
+                        "publish failed, recovering channel"
+                    );
+                    last_err = Some(e);
+                    if attempt < 2 {
+                        let delay = backoff.next().expect("backoff is infinite");
+                        tokio::time::sleep(delay).await;
+                        let fresh = self.client.create_confirm_channel().await?;
+                        *channel_guard = fresh;
+                    }
+                }
             }
         }
+
+        Err(last_err.expect("loop ran at least once"))
     }
 
     async fn do_publish(
@@ -149,25 +169,32 @@ impl RabbitMqPublisher {
 
         debug!(exchange, count = items.len(), "publishing batch");
 
-        let result = Self::do_publish_batch(&channel_guard, exchange, items).await;
+        let mut backoff = Backoff::new(
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        );
+        let mut last_err = None;
 
-        match result {
-            Ok(()) => {
-                debug!(
-                    exchange,
-                    count = items.len(),
-                    "batch published and confirmed"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                warn!(exchange, error = %e, "batch publish failed, recovering channel and retrying");
-                let fresh = self.client.create_confirm_channel().await?;
-                *channel_guard = fresh;
-
-                Self::do_publish_batch(&channel_guard, exchange, items).await
+        for attempt in 0..3u32 {
+            match Self::do_publish_batch(&channel_guard, exchange, items).await {
+                Ok(()) => {
+                    debug!(exchange, count = items.len(), "batch published and confirmed");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(exchange, attempt, error = %e, "batch publish failed, recovering channel");
+                    last_err = Some(e);
+                    if attempt < 2 {
+                        let delay = backoff.next().expect("backoff is infinite");
+                        tokio::time::sleep(delay).await;
+                        let fresh = self.client.create_confirm_channel().await?;
+                        *channel_guard = fresh;
+                    }
+                }
             }
         }
+
+        Err(last_err.expect("loop ran at least once"))
     }
 
     async fn do_publish_batch(
@@ -212,7 +239,7 @@ impl Publisher for RabbitMqPublisher {
     fn publish<T: Topic>(
         &self,
         message: &T::Message,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
 
         let topology = T::topology();
@@ -240,7 +267,7 @@ impl Publisher for RabbitMqPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
         let field_table = hashmap_to_field_table(headers);
 
