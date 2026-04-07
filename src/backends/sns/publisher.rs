@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
 use crate::publisher::Publisher;
+use crate::retry::Backoff;
 use crate::topic::Topic;
 
 /// Maximum number of messages in a single SNS PublishBatch call.
@@ -149,32 +150,39 @@ impl SnsPublisher {
 
         debug!(queue_name, topic_arn, "publishing message to SNS");
 
-        match self
-            .publish_single(
-                &topic_arn,
-                &payload,
-                group_id.as_deref(),
-                routing_shards,
-                attributes.clone(),
-            )
-            .await
-        {
-            Ok(()) => {
-                debug!(queue_name, "message published to SNS");
-                Ok(())
-            }
-            Err(e) => {
-                warn!(queue_name, error = %e, "SNS publish failed, retrying once");
-                self.publish_single(
+        let mut backoff = Backoff::new(
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        );
+        let mut last_err = None;
+
+        for attempt in 0..3u32 {
+            match self
+                .publish_single(
                     &topic_arn,
                     &payload,
                     group_id.as_deref(),
                     routing_shards,
-                    None,
+                    attributes.clone(),
                 )
                 .await
+            {
+                Ok(()) => {
+                    debug!(queue_name, "message published to SNS");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(queue_name, attempt, error = %e, "SNS publish failed, retrying");
+                    last_err = Some(e);
+                    if attempt < 2 {
+                        let delay = backoff.next().expect("backoff is infinite");
+                        tokio::time::sleep(delay).await;
+                    }
+                }
             }
         }
+
+        Err(last_err.expect("loop ran at least once"))
     }
 }
 
@@ -255,25 +263,52 @@ impl Publisher for SnsPublisher {
 
         // Chunk into groups of 10 and send
         for chunk in entries.chunks(SNS_BATCH_LIMIT) {
-            let result = self
-                .client
-                .inner()
-                .publish_batch()
-                .topic_arn(&topic_arn)
-                .set_publish_batch_request_entries(Some(chunk.to_vec()))
-                .send()
-                .await
-                .map_err(|e| ShoveError::Connection(format!("SNS batch publish failed: {e}")))?;
+            let mut backoff = Backoff::new(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(2),
+            );
+            let mut last_err = None;
 
-            let failed = result.failed();
-            if !failed.is_empty() {
-                return Err(ShoveError::Connection(format!(
-                    "SNS batch publish: {} of {} messages failed. First error: {} (code: {})",
-                    failed.len(),
-                    chunk.len(),
-                    failed[0].message().unwrap_or("unknown"),
-                    failed[0].code(),
-                )));
+            for attempt in 0..3u32 {
+                match self
+                    .client
+                    .inner()
+                    .publish_batch()
+                    .topic_arn(&topic_arn)
+                    .set_publish_batch_request_entries(Some(chunk.to_vec()))
+                    .send()
+                    .await
+                {
+                    Ok(result) => {
+                        let failed = result.failed();
+                        if !failed.is_empty() {
+                            last_err = Some(ShoveError::Connection(format!(
+                                "SNS batch publish: {} of {} messages failed. First error: {} (code: {})",
+                                failed.len(),
+                                chunk.len(),
+                                failed[0].message().unwrap_or("unknown"),
+                                failed[0].code(),
+                            )));
+                            // Partial failures are not transient — don't retry
+                            break;
+                        }
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        let err = ShoveError::Connection(format!("SNS batch publish failed: {e}"));
+                        warn!(queue_name, attempt, error = %err, "SNS batch chunk failed, retrying");
+                        last_err = Some(err);
+                        if attempt < 2 {
+                            let delay = backoff.next().expect("backoff is infinite");
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = last_err {
+                return Err(err);
             }
         }
 
