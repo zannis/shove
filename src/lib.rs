@@ -12,6 +12,7 @@ pub mod topic;
 pub mod topology;
 
 mod backends;
+pub(crate) mod retry;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use consumer::{Consumer, ConsumerOptions};
@@ -34,10 +35,6 @@ pub use audit::{AuditLog, ShoveAuditHandler};
 /// Grace period for in-flight operations before closing connections.
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
-
-/// Backoff delay before reconnecting after a consumer disconnect.
-#[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
-pub(crate) const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 // Backend re-exports
 #[cfg(feature = "pub-aws-sns")]

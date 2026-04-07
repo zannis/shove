@@ -41,6 +41,7 @@ aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optio
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 futures = { version = "0.3", optional = true }
+rand = "0.10"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
