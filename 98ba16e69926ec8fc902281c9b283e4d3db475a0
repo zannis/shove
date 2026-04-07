@@ -1,0 +1,27 @@
+src/retry.rs
+  f24298483bede394 1-158
+src/lib.rs
+  f24298483bede394 15
+Cargo.toml
+  f24298483bede394 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "98ba16e69926ec8fc902281c9b283e4d3db475a0",
+  "prompts": {
+    "f24298483bede394": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48b0893f-38e6-4fb6-9ed5-448c1187a826",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 774,
+      "total_deletions": 5,
+      "accepted_lines": 774,
+      "overriden_lines": 0
+    }
+  }
+}
