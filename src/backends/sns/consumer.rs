@@ -8,7 +8,6 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::RECONNECT_DELAY;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
@@ -17,6 +16,7 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 
@@ -109,6 +109,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
 {
+    let mut backoff = Backoff::default();
     loop {
         match f().await {
             Ok(()) => return Ok(()),
@@ -116,9 +117,10 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
-                warn!("consumer error on {queue}: {e}. Reconnecting in {RECONNECT_DELAY:?}");
+                let delay = backoff.next().expect("backoff is infinite");
+                warn!("consumer error on {queue}: {e}. Reconnecting in {delay:?}");
                 tokio::select! {
-                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    _ = tokio::time::sleep(delay) => {}
                     _ = shutdown.cancelled() => return Ok(()),
                 }
             }
@@ -562,6 +564,7 @@ where
     let mut poisoned_keys = HashSet::new();
     let mut pending_deliveries: HashMap<String, VecDeque<aws_sdk_sqs::types::Message>> =
         HashMap::new();
+    let mut backoff = Backoff::default();
 
     loop {
         match consume_loop_sequenced::<T, H>(
@@ -595,9 +598,10 @@ where
                 // On reconnect, clear pending — visibility will expire and SQS
                 // will redeliver them.
                 pending_deliveries.clear();
-                warn!("consumer error on {queue_name}: {e}. Reconnecting in {RECONNECT_DELAY:?}");
+                let delay = backoff.next().expect("backoff is infinite");
+                warn!("consumer error on {queue_name}: {e}. Reconnecting in {delay:?}");
                 tokio::select! {
-                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                    _ = tokio::time::sleep(delay) => {}
                     _ = options.shutdown.cancelled() => return Ok(()),
                 }
             }
