@@ -78,6 +78,40 @@ impl RabbitMqClient {
         })
     }
 
+    /// Like [`connect`](Self::connect), but retries up to `max_attempts` times
+    /// with exponential backoff on connection failure.
+    ///
+    /// Useful for services that start alongside their broker (e.g. in Docker
+    /// Compose or Kubernetes) where the broker may not be ready immediately.
+    pub async fn connect_with_retry(
+        config: &RabbitMqConfig,
+        max_attempts: u32,
+    ) -> Result<Self> {
+        let mut backoff = crate::retry::Backoff::default();
+        let mut last_err = None;
+
+        for attempt in 0..max_attempts {
+            match Self::connect(config).await {
+                Ok(client) => return Ok(client),
+                Err(e) => {
+                    if attempt + 1 < max_attempts {
+                        let delay = backoff.next().expect("backoff is infinite");
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_attempts,
+                            error = %e,
+                            "RabbitMQ connection failed, retrying in {delay:?}"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.expect("loop ran at least once"))
+    }
+
     /// Open a basic channel on the underlying connection.
     ///
     /// Returns [`ShoveError::Connection`] if shutdown has already been requested
