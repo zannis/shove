@@ -154,7 +154,7 @@ impl QueueTopology {
 
 pub struct TopologyBuilder {
     queue: String,
-    dlq: bool,
+    dlq: Option<String>,
     hold_queues: Vec<Duration>,
     sequencing: Option<SequenceConfig>,
     allow_message_loss: bool,
@@ -164,7 +164,7 @@ impl TopologyBuilder {
     pub fn new(queue: impl Into<String>) -> Self {
         Self {
             queue: queue.into(),
-            dlq: false,
+            dlq: None,
             hold_queues: Vec::new(),
             sequencing: None,
             allow_message_loss: false,
@@ -230,9 +230,26 @@ impl TopologyBuilder {
         self
     }
 
-    /// Enables a dead-letter queue.
+    /// Enables a dead-letter queue with the default name `{queue}-dlq`.
     pub fn dlq(mut self) -> Self {
-        self.dlq = true;
+        self.dlq = Some(format!("{}-dlq", self.queue));
+        self
+    }
+
+    /// Enables a dead-letter queue with a custom name.
+    ///
+    /// Use this when the default `{queue}-dlq` suffix doesn't match your
+    /// naming convention or when the DLQ is shared across topics.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// TopologyBuilder::new("orders")
+    ///     .dlq_named("orders-dead-letters")
+    ///     .build();
+    /// ```
+    pub fn dlq_named(mut self, name: impl Into<String>) -> Self {
+        self.dlq = Some(name.into());
         self
     }
 
@@ -268,8 +285,8 @@ impl TopologyBuilder {
             );
             if !self.allow_message_loss {
                 assert!(
-                    self.dlq,
-                    "sequenced topics require a DLQ — call .dlq() or .allow_message_loss() before .build()"
+                    self.dlq.is_some(),
+                    "sequenced topics require a DLQ — call .dlq() or .dlq_named() or .allow_message_loss() before .build()"
                 );
                 assert!(
                     !self.hold_queues.is_empty(),
@@ -280,13 +297,13 @@ impl TopologyBuilder {
 
         // Warn about non-sequenced topics with incomplete retry infrastructure.
         if self.sequencing.is_none() && !self.allow_message_loss {
-            if !self.hold_queues.is_empty() && !self.dlq {
+            if !self.hold_queues.is_empty() && self.dlq.is_none() {
                 tracing::warn!(
                     queue = self.queue,
                     "topic has hold queues but no DLQ — messages exhausting max_retries will be silently discarded"
                 );
             }
-            if self.dlq && self.hold_queues.is_empty() {
+            if self.dlq.is_some() && self.hold_queues.is_empty() {
                 tracing::warn!(
                     queue = self.queue,
                     "topic has a DLQ but no hold queues — retries will use broker redelivery with no delay"
@@ -294,11 +311,7 @@ impl TopologyBuilder {
             }
         }
 
-        let dlq = if self.dlq {
-            Some(format!("{}-dlq", self.queue))
-        } else {
-            None
-        };
+        let dlq = self.dlq;
 
         let hold_queues = self
             .hold_queues
@@ -350,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_dlq_name() {
+    fn builder_dlq_named() {
         let topology = TopologyBuilder::new("orders").dlq().build();
         assert_eq!(topology.dlq(), Some("orders-dlq"));
     }
@@ -528,6 +541,50 @@ mod tests {
             .build();
         assert!(topology.dlq().is_none());
         assert!(topology.hold_queues().is_empty());
+        assert!(topology.sequencing().is_some());
+    }
+
+    #[test]
+    fn builder_dlq_custom_name() {
+        let topology = TopologyBuilder::new("orders")
+            .dlq_named("orders-dead-letters")
+            .build();
+        assert_eq!(topology.dlq(), Some("orders-dead-letters"));
+    }
+
+    #[test]
+    fn builder_dlq_default_suffix_unchanged() {
+        let topology = TopologyBuilder::new("orders").dlq().build();
+        assert_eq!(topology.dlq(), Some("orders-dlq"));
+    }
+
+    #[test]
+    fn builder_dlq_name_overrides_dlq() {
+        let topology = TopologyBuilder::new("orders")
+            .dlq()
+            .dlq_named("custom-dead")
+            .build();
+        assert_eq!(topology.dlq(), Some("custom-dead"));
+    }
+
+    #[test]
+    fn builder_dlq_after_dlq_name_uses_default() {
+        let topology = TopologyBuilder::new("orders")
+            .dlq_named("custom-dead")
+            .dlq()
+            .build();
+        assert_eq!(topology.dlq(), Some("orders-dlq"));
+    }
+
+    #[test]
+    fn builder_dlq_name_with_sequenced() {
+        let topology = TopologyBuilder::new("events")
+            .sequenced(SequenceFailure::Skip)
+            .routing_shards(4)
+            .hold_queue(Duration::from_secs(5))
+            .dlq_named("events-failed")
+            .build();
+        assert_eq!(topology.dlq(), Some("events-failed"));
         assert!(topology.sequencing().is_some());
     }
 }

@@ -38,6 +38,7 @@ impl Backoff {
     }
 
     /// Reset the iterator to the initial delay (call after a successful operation).
+    #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.current = self.initial;
     }
