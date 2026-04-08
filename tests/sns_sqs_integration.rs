@@ -2663,7 +2663,8 @@ async fn autoscaler_custom_strategy_with_sqs() {
     let stats_provider =
         SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let backend = SqsAutoscalerBackend::new(stats_provider, registry_arc.clone());
-    let mut autoscaler = Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(200));
+    let mut autoscaler =
+        Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(200));
 
     let shutdown = CancellationToken::new();
     let s_clone = shutdown.clone();

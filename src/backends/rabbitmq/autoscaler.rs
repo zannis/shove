@@ -7,7 +7,9 @@ use crate::autoscaler::{
     AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics, Stabilized,
     ThresholdStrategy,
 };
-use crate::backends::rabbitmq::management::{ManagementClient, ManagementConfig, QueueStatsProvider};
+use crate::backends::rabbitmq::management::{
+    ManagementClient, ManagementConfig, QueueStatsProvider,
+};
 use crate::backends::rabbitmq::registry::ConsumerGroupRegistry;
 
 /// Backend that adapts a [`ConsumerGroupRegistry`] to the generic [`AutoscalerBackend`] trait.
@@ -200,5 +202,4 @@ mod tests {
         };
         assert!(!state.in_cooldown(Duration::ZERO));
     }
-
 }

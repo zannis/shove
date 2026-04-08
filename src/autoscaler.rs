@@ -295,14 +295,20 @@ mod tests {
             Ok(self.groups.clone())
         }
 
-        async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
-            self.metrics
-                .get(group)
-                .cloned()
-                .ok_or_else(|| crate::error::ShoveError::Connection(format!("no metrics for {group}")))
+        async fn fetch_metrics(
+            &self,
+            group: &Self::GroupId,
+        ) -> crate::error::Result<ScalingMetrics> {
+            self.metrics.get(group).cloned().ok_or_else(|| {
+                crate::error::ShoveError::Connection(format!("no metrics for {group}"))
+            })
         }
 
-        async fn scale(&self, group: &Self::GroupId, decision: ScalingDecision) -> crate::error::Result<()> {
+        async fn scale(
+            &self,
+            group: &Self::GroupId,
+            decision: ScalingDecision,
+        ) -> crate::error::Result<()> {
             self.scale_log.lock().await.push((group.clone(), decision));
             Ok(())
         }
@@ -332,8 +338,12 @@ mod tests {
 
         let log = scale_log.lock().await;
         assert_eq!(log.len(), 2);
-        let has_a = log.iter().any(|(g, d)| g == "group-a" && matches!(d, ScalingDecision::ScaleUp(_)));
-        let has_b = log.iter().any(|(g, d)| g == "group-b" && matches!(d, ScalingDecision::ScaleDown(_)));
+        let has_a = log
+            .iter()
+            .any(|(g, d)| g == "group-a" && matches!(d, ScalingDecision::ScaleUp(_)));
+        let has_b = log
+            .iter()
+            .any(|(g, d)| g == "group-b" && matches!(d, ScalingDecision::ScaleDown(_)));
         assert!(has_a, "expected ScaleUp for group-a, log: {log:?}");
         assert!(has_b, "expected ScaleDown for group-b, log: {log:?}");
     }
@@ -383,7 +393,11 @@ mod tests {
         autoscaler.poll_and_scale().await;
 
         let log = scale_log.lock().await;
-        assert_eq!(log.len(), 1, "expected only group-b to be scaled, log: {log:?}");
+        assert_eq!(
+            log.len(),
+            1,
+            "expected only group-b to be scaled, log: {log:?}"
+        );
         assert_eq!(log[0].0, "group-b");
         assert!(matches!(log[0].1, ScalingDecision::ScaleUp(_)));
     }
@@ -404,12 +418,9 @@ mod tests {
         token.cancel();
 
         let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(60));
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            autoscaler.run(token),
-        )
-        .await
-        .expect("run() should return promptly after shutdown token is cancelled");
+        tokio::time::timeout(Duration::from_secs(1), autoscaler.run(token))
+            .await
+            .expect("run() should return promptly after shutdown token is cancelled");
     }
 
     #[test]
@@ -586,7 +597,10 @@ mod tests {
             Duration::from_secs(60),
         );
         // hysteresis = 0 → passes through immediately
-        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::ScaleUp(1));
+        assert_eq!(
+            s.evaluate("g", &test_metrics()),
+            ScalingDecision::ScaleUp(1)
+        );
     }
 
     #[test]
@@ -597,7 +611,10 @@ mod tests {
             Duration::from_secs(60),
         );
         // First call fires (hysteresis=0)
-        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::ScaleUp(1));
+        assert_eq!(
+            s.evaluate("g", &test_metrics()),
+            ScalingDecision::ScaleUp(1)
+        );
         // Second call is in cooldown
         assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
     }
@@ -636,11 +653,17 @@ mod tests {
             Duration::from_secs(60),
         );
         // group "a" fires
-        assert_eq!(s.evaluate("a", &test_metrics()), ScalingDecision::ScaleUp(1));
+        assert_eq!(
+            s.evaluate("a", &test_metrics()),
+            ScalingDecision::ScaleUp(1)
+        );
         // group "a" is in cooldown
         assert_eq!(s.evaluate("a", &test_metrics()), ScalingDecision::Hold);
         // group "b" is independent and fires
-        assert_eq!(s.evaluate("b", &test_metrics()), ScalingDecision::ScaleUp(1));
+        assert_eq!(
+            s.evaluate("b", &test_metrics()),
+            ScalingDecision::ScaleUp(1)
+        );
     }
 
     #[test]

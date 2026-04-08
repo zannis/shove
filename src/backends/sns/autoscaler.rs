@@ -231,7 +231,8 @@ mod tests {
     #[tokio::test]
     async fn sqs_backend_list_groups() {
         let registry = make_single_group_registry(1, 5, 10, false).await;
-        let backend = SqsAutoscalerBackend::with_stats_provider(MockSqsStatsProvider::new(), registry);
+        let backend =
+            SqsAutoscalerBackend::with_stats_provider(MockSqsStatsProvider::new(), registry);
         let groups = backend.list_groups().await.unwrap();
         assert_eq!(groups, vec!["test-group".to_string()]);
     }
@@ -249,7 +250,10 @@ mod tests {
         );
 
         let backend = SqsAutoscalerBackend::with_stats_provider(stats_provider, registry);
-        let metrics = backend.fetch_metrics(&"test-group".to_string()).await.unwrap();
+        let metrics = backend
+            .fetch_metrics(&"test-group".to_string())
+            .await
+            .unwrap();
 
         assert_eq!(metrics.messages_ready, 42);
         assert_eq!(metrics.messages_in_flight, 7);
@@ -260,7 +264,10 @@ mod tests {
     #[tokio::test]
     async fn sqs_backend_scale_up() {
         let registry = make_single_group_registry(1, 5, 10, true).await;
-        let backend = SqsAutoscalerBackend::with_stats_provider(MockSqsStatsProvider::new(), registry.clone());
+        let backend = SqsAutoscalerBackend::with_stats_provider(
+            MockSqsStatsProvider::new(),
+            registry.clone(),
+        );
 
         backend
             .scale(&"test-group".to_string(), ScalingDecision::ScaleUp(1))
@@ -286,11 +293,20 @@ mod tests {
             reg.groups_mut().get_mut("test-group").unwrap().scale_up();
         }
         assert_eq!(
-            registry.lock().await.groups().get("test-group").unwrap().active_consumers(),
+            registry
+                .lock()
+                .await
+                .groups()
+                .get("test-group")
+                .unwrap()
+                .active_consumers(),
             2
         );
 
-        let backend = SqsAutoscalerBackend::with_stats_provider(MockSqsStatsProvider::new(), registry.clone());
+        let backend = SqsAutoscalerBackend::with_stats_provider(
+            MockSqsStatsProvider::new(),
+            registry.clone(),
+        );
         backend
             .scale(&"test-group".to_string(), ScalingDecision::ScaleDown(1))
             .await
@@ -310,7 +326,10 @@ mod tests {
     async fn sqs_backend_scale_up_clamped_at_max() {
         // max=2, start at 1, request 10 scale-ups → should stop at 2
         let registry = make_single_group_registry(1, 2, 10, true).await;
-        let backend = SqsAutoscalerBackend::with_stats_provider(MockSqsStatsProvider::new(), registry.clone());
+        let backend = SqsAutoscalerBackend::with_stats_provider(
+            MockSqsStatsProvider::new(),
+            registry.clone(),
+        );
 
         backend
             .scale(&"test-group".to_string(), ScalingDecision::ScaleUp(10))

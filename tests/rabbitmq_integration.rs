@@ -2216,8 +2216,7 @@ async fn autoscaler_scale_up_magnitude() {
     let registry = Arc::new(Mutex::new(registry));
     let mgmt_config = broker.mgmt_config();
     let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
-    let mut autoscaler =
-        Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(500));
+    let mut autoscaler = Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(500));
 
     let autoscaler_token = CancellationToken::new();
     let token_clone = autoscaler_token.clone();

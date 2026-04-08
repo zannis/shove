@@ -177,7 +177,7 @@ struct PendingMessage {
     receipt_handle: String,
     body: String,
     message_attributes:
-        std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+        HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
     retry_count: u32,
     outcome_rx: oneshot::Receiver<Outcome>,
 }
@@ -492,12 +492,13 @@ where
 }
 
 /// Route a completed message based on its outcome.
+#[allow(clippy::too_many_arguments)]
 async fn route_outcome(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     receipt_handle: &str,
     body: &str,
-    message_attributes: &std::collections::HashMap<
+    message_attributes: &HashMap<
         String,
         aws_sdk_sqs::types::MessageAttributeValue,
     >,
@@ -547,7 +548,7 @@ enum KeyState {
         receipt_handle: String,
         body: String,
         message_attributes:
-            std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+            HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
         retry_count: u32,
         outcome_rx: oneshot::Receiver<Outcome>,
     },
