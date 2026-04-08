@@ -50,3 +50,93 @@ impl GroupScalingState {
             .unwrap_or(false)
     }
 }
+
+/// A snapshot of queue and consumer metrics used to drive scaling decisions.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ScalingMetrics {
+    pub messages_ready: u64,
+    pub messages_in_flight: u64,
+    pub active_consumers: u16,
+    pub prefetch_count: u16,
+}
+
+impl ScalingMetrics {
+    pub fn new(
+        messages_ready: u64,
+        messages_in_flight: u64,
+        active_consumers: u16,
+        prefetch_count: u16,
+    ) -> Self {
+        Self {
+            messages_ready,
+            messages_in_flight,
+            active_consumers,
+            prefetch_count,
+        }
+    }
+
+    /// Total message capacity across all active consumers.
+    pub fn capacity(&self) -> u64 {
+        self.active_consumers as u64 * self.prefetch_count as u64
+    }
+}
+
+/// The outcome of a single scaling evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalingDecision {
+    ScaleUp(u16),
+    ScaleDown(u16),
+    Hold,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaling_metrics_new() {
+        let m = ScalingMetrics::new(100, 20, 4, 10);
+        assert_eq!(m.messages_ready, 100);
+        assert_eq!(m.messages_in_flight, 20);
+        assert_eq!(m.active_consumers, 4);
+        assert_eq!(m.prefetch_count, 10);
+    }
+
+    #[test]
+    fn scaling_metrics_capacity() {
+        let m = ScalingMetrics::new(0, 0, 4, 10);
+        assert_eq!(m.capacity(), 40);
+    }
+
+    #[test]
+    fn scaling_metrics_capacity_zero_consumers() {
+        let m = ScalingMetrics::new(0, 0, 0, 10);
+        assert_eq!(m.capacity(), 0);
+    }
+
+    #[test]
+    fn scaling_decision_hold_is_default() {
+        let d = ScalingDecision::Hold;
+        assert_eq!(d, ScalingDecision::Hold);
+    }
+
+    #[test]
+    fn scaling_decision_scale_up_carries_magnitude() {
+        let d = ScalingDecision::ScaleUp(3);
+        assert_eq!(d, ScalingDecision::ScaleUp(3));
+    }
+
+    #[test]
+    fn scaling_decision_scale_down_carries_magnitude() {
+        let d = ScalingDecision::ScaleDown(2);
+        assert_eq!(d, ScalingDecision::ScaleDown(2));
+    }
+
+    #[test]
+    fn scaling_decision_equality() {
+        assert_eq!(ScalingDecision::ScaleUp(1), ScalingDecision::ScaleUp(1));
+        assert_ne!(ScalingDecision::ScaleUp(1), ScalingDecision::ScaleDown(1));
+        assert_ne!(ScalingDecision::ScaleUp(1), ScalingDecision::Hold);
+    }
+}
