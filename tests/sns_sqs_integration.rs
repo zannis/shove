@@ -2621,9 +2621,11 @@ async fn autoscaler_custom_strategy_with_sqs() {
     let setup = TestSetup::new(&broker).await;
     setup.declare::<WorkTopic>().await;
 
-    // Publish 3 messages — below what ThresholdStrategy would trigger on (threshold=10),
-    // but AlwaysScaleUpStrategy will fire on any > 0.
-    for i in 1..=3 {
+    // Publish 8 messages. With prefetch=5 and 1 consumer, the consumer takes 5
+    // in-flight, leaving 3 as messages_ready. This is below the default
+    // ThresholdStrategy scale-up threshold (capacity=5, threshold=5*2.0=10),
+    // but AlwaysScaleUpStrategy fires for any messages_ready > 0.
+    for i in 1..=8 {
         setup
             .publisher
             .publish::<WorkTopic>(&SimpleMessage {
@@ -2637,7 +2639,7 @@ async fn autoscaler_custom_strategy_with_sqs() {
     // Give SQS a moment to reflect the count.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Set up registry with prefetch=5 so threshold would be 10 (3 < 10).
+    // Set up registry with prefetch=5 so threshold would be 10 (3 remaining < 10).
     let mut registry = SqsConsumerGroupRegistry::new(
         setup.sns_client.clone(),
         setup.topic_registry.clone(),
