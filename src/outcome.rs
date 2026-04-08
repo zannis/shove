@@ -59,5 +59,11 @@ pub enum Outcome {
     ///
     /// If no hold queues are configured, falls back to nack-with-requeue
     /// (broker-level redelivery with no delay) and a warning is logged.
+    ///
+    /// # Sequenced (FIFO) consumers
+    ///
+    /// `Defer` is not supported on sequenced consumers because it violates
+    /// ordering guarantees. If a handler returns `Defer` on a sequenced
+    /// consumer, it is treated as [`Retry`] and a warning is logged.
     Defer,
 }
