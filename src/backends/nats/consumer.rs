@@ -10,6 +10,7 @@ use async_nats::jetstream::message::AckKind;
 use async_nats::HeaderMap;
 use futures_util::StreamExt;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::consumer::{Consumer, ConsumerOptions};
 use crate::error::Result;
@@ -320,6 +321,45 @@ async fn invoke_handler<T: Topic>(
 }
 
 // ---------------------------------------------------------------------------
+// Reconnect loop
+// ---------------------------------------------------------------------------
+
+/// Runs `f` in a reconnect loop, retrying on transient errors until shutdown.
+/// Matches the pattern used by RabbitMqConsumer.
+async fn run_with_reconnect<F, Fut>(
+    shutdown: &CancellationToken,
+    label: &str,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut backoff = crate::retry::Backoff::default();
+    loop {
+        match f().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if shutdown.is_cancelled() {
+                    return Ok(());
+                }
+                let delay = backoff.next().expect("backoff is infinite");
+                tracing::warn!(
+                    error = %e,
+                    label,
+                    delay_ms = delay.as_millis() as u64,
+                    "consumer error, reconnecting"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NatsConsumer
 // ---------------------------------------------------------------------------
 
@@ -343,37 +383,7 @@ impl Consumer for NatsConsumer {
         let queue = topology.queue();
         let consumer_name = format!("{queue}-consumer");
 
-        // Get the stream
-        let stream = self
-            .client
-            .jetstream()
-            .get_stream(queue)
-            .await
-            .map_err(|e| ShoveError::Connection(format!("failed to get stream {queue}: {e}")))?;
-
-        // Create durable pull consumer
-        let pull_consumer = stream
-            .get_or_create_consumer(
-                &consumer_name,
-                PullConsumerConfig {
-                    durable_name: Some(consumer_name.clone()),
-                    ack_policy: AckPolicy::Explicit,
-                    max_ack_pending: options.prefetch_count as i64,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| {
-                ShoveError::Connection(format!("failed to create consumer {consumer_name}: {e}"))
-            })?;
-
-        // Get continuous message stream
-        let mut messages = pull_consumer
-            .messages()
-            .await
-            .map_err(|e| ShoveError::Connection(format!("failed to get message stream: {e}")))?;
-
-        // Extract needed values from options before moving into spawned tasks.
+        // Extract needed values from options before moving into the reconnect closure.
         // ConsumerOptions does not implement Clone in all configurations.
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -384,7 +394,6 @@ impl Consumer for NatsConsumer {
 
         // Wrap handler in Arc for sharing across tasks
         let handler = Arc::new(handler);
-        let semaphore = Arc::new(Semaphore::new(prefetch_count as usize));
         let client = self.client.clone();
 
         tracing::info!(
@@ -395,96 +404,140 @@ impl Consumer for NatsConsumer {
             "NATS consumer started"
         );
 
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    tracing::info!(queue, "shutdown signal received, stopping consumer");
-                    return Ok(());
-                }
-                item = messages.next() => {
-                    let msg = match item {
-                        Some(Ok(msg)) => msg,
-                        Some(Err(e)) => {
-                            tracing::error!(error = %e, queue, "consumer stream error");
-                            return Err(ShoveError::Connection(
-                                format!("consumer stream error on {queue}: {e}"),
-                            ));
-                        }
-                        None => {
-                            tracing::warn!(queue, "consumer stream closed");
-                            return Err(ShoveError::Connection(
-                                format!("consumer stream closed for {queue}"),
-                            ));
-                        }
-                    };
-
-                    // Deserialize payload; reject to DLQ on failure
-                    let payload: T::Message = match serde_json::from_slice(&msg.payload) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                queue,
-                                "failed to deserialize message, sending to DLQ"
-                            );
-                            if let Err(dlq_err) = publish_to_dlq(
-                                &client,
-                                topology,
-                                &msg,
-                                &format!("deserialization_error: {e}"),
-                            ).await {
-                                tracing::error!(
-                                    error = %dlq_err,
-                                    "failed to publish bad message to DLQ, nak-ing"
-                                );
-                                let _ = msg.ack_with(AckKind::Nak(None)).await;
-                                continue;
-                            }
-                            let _ = msg.ack().await;
-                            continue;
-                        }
-                    };
-
-                    let metadata = extract_message_metadata(&msg);
-                    let retry_count = metadata.retry_count;
-
-                    // Acquire semaphore permit to limit concurrency
-                    let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
-                        ShoveError::Connection("semaphore closed".to_string())
+        run_with_reconnect(&shutdown, queue, || {
+            let handler = handler.clone();
+            let client = client.clone();
+            let processing = processing.clone();
+            let shutdown = shutdown.clone();
+            let consumer_name = consumer_name.clone();
+            async move {
+                // Get the stream
+                let stream = client
+                    .jetstream()
+                    .get_stream(queue)
+                    .await
+                    .map_err(|e| {
+                        ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
                     })?;
 
-                    let task_handler = handler.clone();
-                    let task_client = client.clone();
-                    let task_processing = processing.clone();
+                // Create durable pull consumer
+                let pull_consumer = stream
+                    .get_or_create_consumer(
+                        &consumer_name,
+                        PullConsumerConfig {
+                            durable_name: Some(consumer_name.clone()),
+                            ack_policy: AckPolicy::Explicit,
+                            max_ack_pending: prefetch_count as i64,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ShoveError::Connection(format!(
+                            "failed to create consumer {consumer_name}: {e}"
+                        ))
+                    })?;
 
-                    tokio::spawn(async move {
-                        task_processing.store(true, Ordering::Release);
+                // Get continuous message stream
+                let mut messages = pull_consumer.messages().await.map_err(|e| {
+                    ShoveError::Connection(format!("failed to get message stream: {e}"))
+                })?;
 
-                        let outcome = invoke_handler(
-                            task_handler.as_ref(),
-                            payload,
-                            metadata,
-                            handler_timeout,
-                        )
-                        .await;
+                let semaphore = Arc::new(Semaphore::new(prefetch_count as usize));
 
-                        route_outcome(
-                            &task_client,
-                            &msg,
-                            outcome,
-                            topology,
-                            retry_count,
-                            max_retries,
-                            hold_queues,
-                        )
-                        .await;
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            tracing::info!(queue, "shutdown signal received, stopping consumer");
+                            return Ok(());
+                        }
+                        item = messages.next() => {
+                            let msg = match item {
+                                Some(Ok(msg)) => msg,
+                                Some(Err(e)) => {
+                                    tracing::error!(error = %e, queue, "consumer stream error");
+                                    return Err(ShoveError::Connection(
+                                        format!("consumer stream error on {queue}: {e}"),
+                                    ));
+                                }
+                                None => {
+                                    tracing::warn!(queue, "consumer stream closed");
+                                    return Err(ShoveError::Connection(
+                                        format!("consumer stream closed for {queue}"),
+                                    ));
+                                }
+                            };
 
-                        task_processing.store(false, Ordering::Release);
-                        drop(permit);
-                    });
+                            // Deserialize payload; reject to DLQ on failure
+                            let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        queue,
+                                        "failed to deserialize message, sending to DLQ"
+                                    );
+                                    if let Err(dlq_err) = publish_to_dlq(
+                                        &client,
+                                        topology,
+                                        &msg,
+                                        &format!("deserialization_error: {e}"),
+                                    ).await {
+                                        tracing::error!(
+                                            error = %dlq_err,
+                                            "failed to publish bad message to DLQ, nak-ing"
+                                        );
+                                        let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                        continue;
+                                    }
+                                    let _ = msg.ack().await;
+                                    continue;
+                                }
+                            };
+
+                            let metadata = extract_message_metadata(&msg);
+                            let retry_count = metadata.retry_count;
+
+                            // Acquire semaphore permit to limit concurrency
+                            let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
+                                ShoveError::Connection("semaphore closed".to_string())
+                            })?;
+
+                            let task_handler = handler.clone();
+                            let task_client = client.clone();
+                            let task_processing = processing.clone();
+
+                            tokio::spawn(async move {
+                                task_processing.store(true, Ordering::Release);
+
+                                let outcome = invoke_handler(
+                                    task_handler.as_ref(),
+                                    payload,
+                                    metadata,
+                                    handler_timeout,
+                                )
+                                .await;
+
+                                route_outcome(
+                                    &task_client,
+                                    &msg,
+                                    outcome,
+                                    topology,
+                                    retry_count,
+                                    max_retries,
+                                    hold_queues,
+                                )
+                                .await;
+
+                                task_processing.store(false, Ordering::Release);
+                                drop(permit);
+                            });
+                        }
+                    }
                 }
             }
-        }
+        })
+        .await
     }
 
     async fn run_fifo<T: SequencedTopic>(
@@ -664,38 +717,9 @@ impl Consumer for NatsConsumer {
             .ok_or_else(|| ShoveError::Topology("run_dlq requires a DLQ to be configured".into()))?;
 
         let dlq_consumer_name = format!("{dlq}-consumer");
-
-        // Get the DLQ stream
-        let stream = self
-            .client
-            .jetstream()
-            .get_stream(dlq)
-            .await
-            .map_err(|e| ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}")))?;
-
-        // Create durable pull consumer for the DLQ
-        let pull_consumer = stream
-            .get_or_create_consumer(
-                &dlq_consumer_name,
-                PullConsumerConfig {
-                    durable_name: Some(dlq_consumer_name.clone()),
-                    ack_policy: AckPolicy::Explicit,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| {
-                ShoveError::Connection(format!(
-                    "failed to create DLQ consumer {dlq_consumer_name}: {e}"
-                ))
-            })?;
-
-        let mut messages = pull_consumer
-            .messages()
-            .await
-            .map_err(|e| ShoveError::Connection(format!("failed to get DLQ message stream: {e}")))?;
-
         let shutdown = self.client.shutdown_token();
+        let handler = Arc::new(handler);
+        let client = self.client.clone();
 
         tracing::info!(
             dlq,
@@ -703,51 +727,92 @@ impl Consumer for NatsConsumer {
             "NATS DLQ consumer started"
         );
 
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    tracing::info!(dlq, "shutdown signal received, stopping DLQ consumer");
-                    return Ok(());
-                }
-                item = messages.next() => {
-                    let msg = match item {
-                        Some(Ok(msg)) => msg,
-                        Some(Err(e)) => {
-                            tracing::error!(error = %e, dlq, "DLQ consumer stream error");
-                            return Err(ShoveError::Connection(
-                                format!("DLQ consumer stream error on {dlq}: {e}"),
-                            ));
-                        }
-                        None => {
-                            tracing::warn!(dlq, "DLQ consumer stream closed");
+        run_with_reconnect(&shutdown, dlq, || {
+            let handler = handler.clone();
+            let client = client.clone();
+            let shutdown = shutdown.clone();
+            let dlq_consumer_name = dlq_consumer_name.clone();
+            async move {
+                // Get the DLQ stream
+                let stream = client
+                    .jetstream()
+                    .get_stream(dlq)
+                    .await
+                    .map_err(|e| {
+                        ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
+                    })?;
+
+                // Create durable pull consumer for the DLQ
+                let pull_consumer = stream
+                    .get_or_create_consumer(
+                        &dlq_consumer_name,
+                        PullConsumerConfig {
+                            durable_name: Some(dlq_consumer_name.clone()),
+                            ack_policy: AckPolicy::Explicit,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ShoveError::Connection(format!(
+                            "failed to create DLQ consumer {dlq_consumer_name}: {e}"
+                        ))
+                    })?;
+
+                let mut messages = pull_consumer.messages().await.map_err(|e| {
+                    ShoveError::Connection(format!("failed to get DLQ message stream: {e}"))
+                })?;
+
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            tracing::info!(dlq, "shutdown signal received, stopping DLQ consumer");
                             return Ok(());
                         }
-                    };
+                        item = messages.next() => {
+                            let msg = match item {
+                                Some(Ok(msg)) => msg,
+                                Some(Err(e)) => {
+                                    tracing::error!(error = %e, dlq, "DLQ consumer stream error");
+                                    return Err(ShoveError::Connection(
+                                        format!("DLQ consumer stream error on {dlq}: {e}"),
+                                    ));
+                                }
+                                None => {
+                                    tracing::warn!(dlq, "DLQ consumer stream closed");
+                                    return Err(ShoveError::Connection(
+                                        format!("DLQ consumer stream closed for {dlq}"),
+                                    ));
+                                }
+                            };
 
-                    // Deserialize payload; on failure, log and ack anyway
-                    let payload: T::Message = match serde_json::from_slice(&msg.payload) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                dlq,
-                                "failed to deserialize DLQ message, acking anyway"
-                            );
-                            let _ = msg.ack().await;
-                            continue;
+                            // Deserialize payload; on failure, log and ack anyway
+                            let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        dlq,
+                                        "failed to deserialize DLQ message, acking anyway"
+                                    );
+                                    let _ = msg.ack().await;
+                                    continue;
+                                }
+                            };
+
+                            let metadata = extract_dead_metadata(&msg);
+
+                            handler.handle_dead(payload, metadata).await;
+
+                            // Always ack after handle_dead completes
+                            if let Err(e) = msg.ack().await {
+                                tracing::error!(error = %e, dlq, "failed to ack DLQ message");
+                            }
                         }
-                    };
-
-                    let metadata = extract_dead_metadata(&msg);
-
-                    handler.handle_dead(payload, metadata).await;
-
-                    // Always ack after handle_dead completes
-                    if let Err(e) = msg.ack().await {
-                        tracing::error!(error = %e, dlq, "failed to ack DLQ message");
                     }
                 }
             }
-        }
+        })
+        .await
     }
 }
