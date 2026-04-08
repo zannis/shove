@@ -2081,14 +2081,14 @@ async fn sqs_autoscaler_scales_group_on_load() {
         cooldown_duration: Duration::ZERO,
     };
 
-    let mut autoscaler = SqsAutoscaler::new(stats_provider, auto_config);
+    let mut autoscaler =
+        SqsAutoscalerBackend::autoscaler(stats_provider, registry_arc.clone(), auto_config);
     let shutdown = CancellationToken::new();
 
     // 4. Run autoscaler for a few cycles.
-    let r_clone = registry_arc.clone();
     let s_clone = shutdown.clone();
     let auto_handle = tokio::spawn(async move {
-        autoscaler.run(r_clone, s_clone).await;
+        autoscaler.run(s_clone).await;
     });
 
     // Wait for scale up.
@@ -2255,13 +2255,13 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
         hysteresis_duration: Duration::ZERO,
         cooldown_duration: Duration::ZERO,
     };
-    let mut autoscaler = SqsAutoscaler::new(stats_provider, auto_config);
+    let mut autoscaler =
+        SqsAutoscalerBackend::autoscaler(stats_provider, registry_arc.clone(), auto_config);
     let shutdown = CancellationToken::new();
 
-    let r = registry_arc.clone();
     let s = shutdown.clone();
     let auto_handle = tokio::spawn(async move {
-        autoscaler.run(r, s).await;
+        autoscaler.run(s).await;
     });
 
     // Wait for both groups to scale above 1 consumer.

@@ -142,11 +142,9 @@ impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     use crate::autoscaler::GroupScalingState;
-    use crate::backends::rabbitmq::management::QueueStats;
 
     // -- AutoscalerConfig --
 
@@ -201,29 +199,6 @@ mod tests {
             ..GroupScalingState::default()
         };
         assert!(!state.in_cooldown(Duration::ZERO));
-    }
-
-    // -- MockStatsProvider --
-
-    struct MockStatsProvider {
-        stats: HashMap<String, QueueStats>,
-    }
-
-    impl MockStatsProvider {
-        fn new() -> Self {
-            Self {
-                stats: HashMap::new(),
-            }
-        }
-    }
-
-    impl QueueStatsProvider for MockStatsProvider {
-        async fn get_queue_stats(&self, queue: &str) -> crate::error::Result<QueueStats> {
-            self.stats
-                .get(queue)
-                .cloned()
-                .ok_or_else(|| crate::error::ShoveError::Connection(format!("not found: {queue}")))
-        }
     }
 
 }

@@ -1832,20 +1832,23 @@ async fn autoscaler_scales_up_under_load() {
 
     let registry = Arc::new(Mutex::new(registry));
     let autoscaler_token = CancellationToken::new();
-    let reg_arc = registry.clone();
     let token_clone = autoscaler_token.clone();
     let mgmt_config = broker.mgmt_config();
-    let autoscaler_handle = tokio::spawn(async move {
-        let mut autoscaler = Autoscaler::new(
-            &mgmt_config,
-            AutoscalerConfig {
-                poll_interval: Duration::from_secs(1),
-                hysteresis_duration: Duration::from_secs(1),
-                cooldown_duration: Duration::from_secs(1),
-                ..AutoscalerConfig::default()
-            },
-        );
-        autoscaler.run(reg_arc, token_clone).await;
+    let autoscaler_handle = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
+                &mgmt_config,
+                registry,
+                AutoscalerConfig {
+                    poll_interval: Duration::from_secs(1),
+                    hysteresis_duration: Duration::from_secs(1),
+                    cooldown_duration: Duration::from_secs(1),
+                    ..AutoscalerConfig::default()
+                },
+            );
+            autoscaler.run(token_clone).await;
+        }
     });
 
     // Wait up to 30s for at least one scale-up to occur
@@ -1921,20 +1924,23 @@ async fn autoscaler_scales_down_when_idle() {
     // No messages published — queue is empty → scale_down_threshold = 5 * 3 * 0.5 = 7.5, ready=0 < 7.5
     let registry = Arc::new(Mutex::new(registry));
     let autoscaler_token = CancellationToken::new();
-    let reg_arc = registry.clone();
     let token_clone = autoscaler_token.clone();
     let mgmt_config = broker.mgmt_config();
-    let autoscaler_handle = tokio::spawn(async move {
-        let mut autoscaler = Autoscaler::new(
-            &mgmt_config,
-            AutoscalerConfig {
-                poll_interval: Duration::from_secs(1),
-                hysteresis_duration: Duration::from_secs(1),
-                cooldown_duration: Duration::from_secs(1),
-                ..AutoscalerConfig::default()
-            },
-        );
-        autoscaler.run(reg_arc, token_clone).await;
+    let autoscaler_handle = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
+                &mgmt_config,
+                registry,
+                AutoscalerConfig {
+                    poll_interval: Duration::from_secs(1),
+                    hysteresis_duration: Duration::from_secs(1),
+                    cooldown_duration: Duration::from_secs(1),
+                    ..AutoscalerConfig::default()
+                },
+            );
+            autoscaler.run(token_clone).await;
+        }
     });
 
     // Wait up to 20s for scale-down below 3
