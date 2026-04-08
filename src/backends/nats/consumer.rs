@@ -198,43 +198,6 @@ async fn publish_to_dlq(
     unreachable!()
 }
 
-/// Sleeps for the delay duration, then publishes a new message to the same
-/// subject with an incremented retry count and a new message ID.
-async fn republish_with_retry(
-    client: &NatsClient,
-    subject: String,
-    msg: &async_nats::jetstream::Message,
-    new_retry_count: u32,
-    delay: Duration,
-) -> Result<()> {
-    tokio::time::sleep(delay).await;
-
-    let mut headers = msg.headers.clone().unwrap_or_default();
-    headers.insert(RETRY_COUNT_HEADER, new_retry_count.to_string().as_str());
-
-    // Generate a new Nats-Msg-Id to avoid dedup rejection
-    let original_id = msg
-        .headers
-        .as_ref()
-        .and_then(|hm| hm.get(NATS_MESSAGE_ID))
-        .map(|v| v.as_str().to_string())
-        .unwrap_or_default();
-    headers.insert(
-        NATS_MESSAGE_ID,
-        format!("{original_id}-r{new_retry_count}").as_str(),
-    );
-
-    client
-        .jetstream()
-        .publish_with_headers(subject, headers, msg.payload.clone())
-        .await
-        .map_err(|e| ShoveError::Connection(format!("retry republish failed: {e}")))?
-        .await
-        .map_err(|e| ShoveError::Connection(format!("retry republish ack failed: {e}")))?;
-
-    Ok(())
-}
-
 /// Dispatches message routing based on the handler's outcome.
 async fn route_outcome(
     client: &NatsClient,
@@ -272,23 +235,43 @@ async fn route_outcome(
                     let idx = (retry_count as usize).min(hold_queues.len() - 1);
                     hold_queues[idx].delay()
                 };
-                match republish_with_retry(
-                    client,
-                    msg.subject.to_string(),
-                    msg,
-                    new_count,
-                    delay,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        if let Err(e) = msg.ack().await {
-                            tracing::error!(error = %e, "failed to ack after retry republish");
-                        }
-                        return;
-                    }
-                    Err(e) => Err(e),
+
+                // Ack first, then spawn delayed republish independently
+                // so the semaphore permit is not held during sleep.
+                if let Err(e) = msg.ack().await {
+                    tracing::error!(error = %e, "failed to ack before retry republish");
+                    return;
                 }
+
+                let client = client.clone();
+                let subject = msg.subject.to_string();
+                let headers = msg.headers.clone();
+                let payload = msg.payload.clone();
+
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+
+                    let mut hdrs = headers.unwrap_or_default();
+                    hdrs.insert(RETRY_COUNT_HEADER, new_count.to_string().as_str());
+
+                    let original_id = hdrs
+                        .get(NATS_MESSAGE_ID)
+                        .map(|v| v.as_str().to_string())
+                        .unwrap_or_default();
+                    hdrs.insert(
+                        NATS_MESSAGE_ID,
+                        format!("{original_id}-r{new_count}").as_str(),
+                    );
+
+                    if let Err(e) = client
+                        .jetstream()
+                        .publish_with_headers(subject, hdrs, payload)
+                        .await
+                    {
+                        tracing::error!(error = %e, "delayed retry republish send failed");
+                    }
+                });
+                return;
             }
         }
         Outcome::Reject => {
