@@ -4,7 +4,7 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 {% for commit in commits %}
-- {{ commit.message | split(pat="\n") | first | trim }}\
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | trim }}\
 {% endfor %}
 {% endfor %}
 """
@@ -15,14 +15,14 @@ conventional_commits = true
 filter_unconventional = true
 split_commits = false
 commit_parsers = [
-    { message = "^feat", group = "Features" },
-    { message = "^fix", group = "Bug Fixes" },
-    { message = "^refactor", group = "Refactor" },
-    { message = "^perf", group = "Performance" },
-    { message = "^test", group = "Testing" },
-    { message = "^doc", group = "Documentation" },
-    { message = "^chore", group = "Miscellaneous" },
-    { message = "^ci", skip = true },
+    { message = "^feat(\\(.+\\))?!?:", group = "Features" },
+    { message = "^fix(\\(.+\\))?!?:", group = "Bug Fixes" },
+    { message = "^refactor(\\(.+\\))?!?:", group = "Refactor" },
+    { message = "^perf(\\(.+\\))?!?:", group = "Performance" },
+    { message = "^test(\\(.+\\))?!?:", group = "Testing" },
+    { message = "^docs?(\\(.+\\))?!?:", group = "Documentation" },
+    { message = "^chore(\\(.+\\))?!?:", group = "Miscellaneous" },
+    { message = "^ci(\\(.+\\))?!?:", skip = true },
     { message = "^release", skip = true },
 ]
 filter_commits = false
