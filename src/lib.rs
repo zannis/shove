@@ -29,6 +29,11 @@ pub use topology::{
     declare_topic,
 };
 
+pub use autoscaler::{
+    Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics,
+    ScalingStrategy, Stabilized, ThresholdStrategy,
+};
+
 #[cfg(feature = "audit")]
 pub use audit::{AuditLog, ShoveAuditHandler};
 
@@ -45,7 +50,6 @@ pub mod sns {
         topology::{SnsTopologyDeclarer, TopicRegistry},
     };
 
-    pub use crate::autoscaler::AutoscalerConfig;
     #[cfg(feature = "aws-sns-sqs")]
     pub use crate::backends::sns::{
         autoscaler::SqsAutoscaler,
@@ -60,7 +64,7 @@ pub mod sns {
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq {
     pub use crate::backends::rabbitmq::{
-        autoscaler::{Autoscaler, AutoscalerConfig},
+        autoscaler::RabbitMqAutoscalerBackend,
         client::{RabbitMqClient, RabbitMqConfig},
         consumer::RabbitMqConsumer,
         consumer_group::{ConsumerGroup, ConsumerGroupConfig},
