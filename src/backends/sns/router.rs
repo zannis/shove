@@ -75,18 +75,23 @@ pub(crate) async fn route_ack_batch(
     }
 }
 
-/// Change message visibility timeout for retry with escalating delay.
+/// Delete + re-send the message with an incremented `x-retry-count`
+/// attribute and a delay based on the hold queue configuration.
 pub(crate) async fn route_retry(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     receipt_handle: &str,
+    body: &str,
+    message_attributes: &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
     topology: &QueueTopology,
     retry_count: u32,
 ) {
+    let new_retry_count = retry_count + 1;
+
     let delay = if topology.hold_queues().is_empty() {
         warn!(
             queue_url,
-            "retrying message but no hold queues configured — visibility timeout set to 0"
+            "retrying message but no hold queues configured — re-sending with no delay"
         );
         Duration::ZERO
     } else {
@@ -94,23 +99,25 @@ pub(crate) async fn route_retry(
         topology.hold_queues()[index].delay()
     };
 
-    let timeout_secs = delay.as_secs() as i32;
+    let delay_seconds = delay.as_secs().min(900) as i32;
 
     debug!(
         queue_url,
-        retry_count, timeout_secs, "changing visibility for retry"
+        retry_count = new_retry_count,
+        delay_seconds,
+        "re-sending message for retry"
     );
 
-    if let Err(e) = sqs
-        .change_message_visibility()
-        .queue_url(queue_url)
-        .receipt_handle(receipt_handle)
-        .visibility_timeout(timeout_secs)
-        .send()
-        .await
-    {
-        warn!(queue_url, error = %e, "failed to change visibility for retry");
-    }
+    resend_to_queue(
+        sqs,
+        queue_url,
+        receipt_handle,
+        body,
+        message_attributes,
+        new_retry_count,
+        delay_seconds,
+    )
+    .await;
 }
 
 /// Reject a message. Sets visibility to 0 so SQS redelivers it immediately,
@@ -162,37 +169,110 @@ pub(crate) async fn route_requeue(
     }
 }
 
-/// Change visibility timeout for defer (uses hold_queues[0] delay).
+/// Delete the original message and re-send it to the same queue with
+/// updated message attributes and an optional delay.
+///
+/// On send failure the original is NOT deleted — it will return via
+/// its visibility timeout.
+async fn resend_to_queue(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+    body: &str,
+    existing_attrs: &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    retry_count: u32,
+    delay_seconds: i32,
+) {
+    // Clone existing attributes and set/overwrite x-retry-count.
+    let retry_attr = aws_sdk_sqs::types::MessageAttributeValue::builder()
+        .data_type("String")
+        .string_value(retry_count.to_string())
+        .build()
+        .expect("building MessageAttributeValue should not fail");
+
+    let mut req = sqs
+        .send_message()
+        .queue_url(queue_url)
+        .message_body(body)
+        .delay_seconds(delay_seconds)
+        .message_attributes(RETRY_COUNT_ATTR, retry_attr);
+
+    for (k, v) in existing_attrs {
+        if k != RETRY_COUNT_ATTR {
+            req = req.message_attributes(k, v.clone());
+        }
+    }
+
+    match req.send().await {
+        Ok(_) => {
+            // Send succeeded — delete the original.
+            if let Err(e) = sqs
+                .delete_message()
+                .queue_url(queue_url)
+                .receipt_handle(receipt_handle)
+                .send()
+                .await
+            {
+                error!(
+                    queue_url,
+                    error = %e,
+                    "failed to delete original after re-send (possible duplicate)"
+                );
+            }
+        }
+        Err(e) => {
+            // Send failed — do NOT delete, original returns via visibility timeout.
+            error!(
+                queue_url,
+                error = %e,
+                retry_count,
+                delay_seconds,
+                "failed to re-send message to queue"
+            );
+        }
+    }
+}
+
+/// Delete + re-send the message with the SAME `x-retry-count` attribute
+/// (no increment) and a delay based on `hold_queues[0]`.
 pub(crate) async fn route_defer(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     receipt_handle: &str,
+    body: &str,
+    message_attributes: &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
     topology: &QueueTopology,
+    retry_count: u32,
 ) {
     let delay = if topology.hold_queues().is_empty() {
         warn!(
             queue_url,
-            "deferring message but no hold queues configured — visibility timeout set to 0"
+            "deferring message but no hold queues configured — re-sending with no delay"
         );
         Duration::ZERO
     } else {
         topology.hold_queues()[0].delay()
     };
 
-    let timeout_secs = delay.as_secs() as i32;
+    let delay_seconds = delay.as_secs().min(900) as i32;
 
-    debug!(queue_url, timeout_secs, "changing visibility for defer");
+    debug!(
+        queue_url,
+        retry_count,
+        delay_seconds,
+        "re-sending message for defer"
+    );
 
-    if let Err(e) = sqs
-        .change_message_visibility()
-        .queue_url(queue_url)
-        .receipt_handle(receipt_handle)
-        .visibility_timeout(timeout_secs)
-        .send()
-        .await
-    {
-        warn!(queue_url, error = %e, "failed to change visibility for defer");
-    }
+    resend_to_queue(
+        sqs,
+        queue_url,
+        receipt_handle,
+        body,
+        message_attributes,
+        retry_count,
+        delay_seconds,
+    )
+    .await;
 }
 
 /// Extract retry count from SQS message attributes.
