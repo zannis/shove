@@ -160,15 +160,42 @@ async fn publish_to_dlq(
         .unwrap_or_default();
     headers.insert(NATS_MESSAGE_ID, format!("{original_id}-dlq").as_str());
 
-    client
-        .jetstream()
-        .publish_with_headers(dlq_subject, headers, msg.payload.clone())
-        .await
-        .map_err(|e| ShoveError::Connection(format!("DLQ publish failed: {e}")))?
-        .await
-        .map_err(|e| ShoveError::Connection(format!("DLQ publish ack failed: {e}")))?;
+    let mut backoff = crate::retry::Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
+    let max_attempts = 3u32;
 
-    Ok(())
+    for attempt in 1..=max_attempts {
+        match client
+            .jetstream()
+            .publish_with_headers(dlq_subject.clone(), headers.clone(), msg.payload.clone())
+            .await
+        {
+            Ok(ack_future) => match ack_future.await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if attempt == max_attempts {
+                        return Err(ShoveError::Connection(format!(
+                            "DLQ publish ack failed after {max_attempts} attempts: {e}"
+                        )));
+                    }
+                    let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                    tracing::warn!(attempt, error = %e, "DLQ publish ack failed, retrying");
+                    tokio::time::sleep(delay).await;
+                }
+            },
+            Err(e) => {
+                if attempt == max_attempts {
+                    return Err(ShoveError::Connection(format!(
+                        "DLQ publish failed after {max_attempts} attempts: {e}"
+                    )));
+                }
+                let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                tracing::warn!(attempt, error = %e, "DLQ publish failed, retrying");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
+    unreachable!()
 }
 
 /// Sleeps for the delay duration, then publishes a new message to the same
