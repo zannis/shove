@@ -502,3 +502,370 @@ async fn publish_and_consume_batch() {
     assert_eq!(handler.counter.get(), 5);
     client.shutdown().await;
 }
+
+// ===========================================================================
+// Rejection & DLQ
+// ===========================================================================
+
+#[tokio::test]
+async fn rejected_message_lands_in_dlq() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage { id: "reject-1".into(), content: "reject me".into() })
+        .await
+        .unwrap();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                FixedOutcomeHandler(Outcome::Reject),
+                ConsumerOptions::new(sc).with_prefetch_count(1).with_max_retries(1),
+            )
+            .await
+    });
+
+    // Verify message arrives in DLQ via a DLQ consumer
+    let dlq_handler = DlqRecordingHandler::new();
+    let dhc = dlq_handler.clone();
+    let dlq_consumer = NatsConsumer::new(client.clone());
+    let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic>(dhc).await });
+
+    assert!(dlq_handler.counter.wait_for(1, TIMEOUT).await, "DLQ should receive rejected message");
+
+    shutdown.cancel();
+    client.shutdown().await;
+    handle.await.unwrap().ok();
+    dlq_handle.await.unwrap().ok();
+}
+
+#[tokio::test]
+async fn dlq_consumer_handles_dead_message() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage { id: "dlq-test".into(), content: "dead".into() })
+        .await
+        .unwrap();
+
+    // Step 1: reject to get message into DLQ
+    let shutdown1 = CancellationToken::new();
+    let sc1 = shutdown1.clone();
+    let c1 = NatsConsumer::new(client.clone());
+    let h1 = tokio::spawn(async move {
+        c1.run::<WorkTopic>(
+            FixedOutcomeHandler(Outcome::Reject),
+            ConsumerOptions::new(sc1).with_prefetch_count(1),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    shutdown1.cancel();
+    h1.await.unwrap().ok();
+
+    // Step 2: consume from DLQ
+    let dlq_handler = DlqRecordingHandler::new();
+    let dhc = dlq_handler.clone();
+    let c2 = NatsConsumer::new(client.clone());
+    let h2 = tokio::spawn(async move { c2.run_dlq::<WorkTopic>(dhc).await });
+
+    assert!(dlq_handler.counter.wait_for(1, TIMEOUT).await, "DLQ handler should receive 1 dead message");
+    assert_eq!(dlq_handler.counter.get(), 1);
+
+    client.shutdown().await;
+    h2.await.unwrap().ok();
+}
+
+// ===========================================================================
+// Retry mechanism
+// ===========================================================================
+
+#[tokio::test]
+async fn retry_then_ack_succeeds() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage { id: "retry-ack".into(), content: "retry then ack".into() })
+        .await
+        .unwrap();
+
+    let handler = RetryThenAckHandler::new(1);
+    let counter = handler.counter.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_max_retries(5).with_prefetch_count(1))
+            .await
+    });
+
+    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should have at least 2 handler calls");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn max_retries_sends_to_dlq() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "always-retry".into(),
+            content: "exhaust retries".into(),
+        })
+        .await
+        .unwrap();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                FixedOutcomeHandler(Outcome::Retry),
+                ConsumerOptions::new(sc).with_max_retries(2).with_prefetch_count(1),
+            )
+            .await
+    });
+
+    let dlq_handler = DlqRecordingHandler::new();
+    let dhc = dlq_handler.clone();
+    let dlq_consumer = NatsConsumer::new(client.clone());
+    let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic>(dhc).await });
+
+    assert!(
+        dlq_handler.counter.wait_for(1, Duration::from_secs(30)).await,
+        "exhausted-retry message should land in DLQ"
+    );
+
+    shutdown.cancel();
+    client.shutdown().await;
+    handle.await.unwrap().ok();
+    dlq_handle.await.unwrap().ok();
+}
+
+// ===========================================================================
+// Defer mechanism
+// ===========================================================================
+
+#[tokio::test]
+async fn defer_redelivers_message() {
+    struct DeferThenAck(WaitableCounter);
+
+    impl MessageHandler<WorkTopic> for DeferThenAck {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            let prev = self.0.get();
+            self.0.increment();
+            if prev == 0 { Outcome::Defer } else { Outcome::Ack }
+        }
+    }
+
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage { id: "defer-1".into(), content: "defer then ack".into() })
+        .await
+        .unwrap();
+
+    let counter = WaitableCounter::new();
+    let handler = DeferThenAck(counter.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_max_retries(5).with_prefetch_count(1))
+            .await
+    });
+
+    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should be called at least 2 times (1 defer + 1 ack)");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Concurrent consumption
+// ===========================================================================
+
+#[tokio::test]
+async fn concurrent_consume_processes_all_messages() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    let messages: Vec<SimpleMessage> = (1..=10)
+        .map(|i| SimpleMessage { id: format!("cc-{i}"), content: format!("msg {i}") })
+        .collect();
+    pub_.publish_batch::<WorkTopic>(&messages).await.unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10)).await
+    });
+
+    assert!(handler.counter.wait_for(10, Duration::from_secs(30)).await, "should receive all 10 messages");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert_eq!(handler.counter.get(), 10);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_consume_mixed_outcomes() {
+    struct MixedHandler(WaitableCounter, WaitableCounter);
+
+    impl MessageHandler<WorkTopic> for MixedHandler {
+        async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            if msg.id.ends_with("-reject") {
+                self.1.increment();
+                Outcome::Reject
+            } else {
+                self.0.increment();
+                Outcome::Ack
+            }
+        }
+    }
+
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..3 {
+        pub_.publish::<WorkTopic>(&SimpleMessage { id: format!("ack-{i}"), content: "ack".into() }).await.unwrap();
+    }
+    for i in 0..2 {
+        pub_.publish::<WorkTopic>(&SimpleMessage { id: format!("{i}-reject"), content: "reject".into() }).await.unwrap();
+    }
+
+    let ack_counter = WaitableCounter::new();
+    let reject_counter = WaitableCounter::new();
+    let handler = MixedHandler(ack_counter.clone(), reject_counter.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_prefetch_count(10)).await
+    });
+
+    assert!(ack_counter.wait_for(3, TIMEOUT).await, "should ack 3 messages");
+    assert!(reject_counter.wait_for(2, TIMEOUT).await, "should reject 2 messages");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drains_inflight() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_.publish::<WorkTopic>(&SimpleMessage { id: "drain-1".into(), content: "slow".into() }).await.unwrap();
+
+    let handler = SlowHandler::new(Duration::from_millis(500));
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    shutdown.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "consumer should exit within timeout after shutdown");
+
+    assert!(handler.counter.get() >= 1, "in-flight handler should have completed");
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Handler timeout
+// ===========================================================================
+
+#[tokio::test]
+async fn handler_timeout_triggers_retry() {
+    struct TimeoutThenAck(WaitableCounter);
+
+    impl MessageHandler<WorkTopic> for TimeoutThenAck {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            let attempt = self.0.get();
+            self.0.increment();
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Outcome::Ack
+        }
+    }
+
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage { id: "timeout-1".into(), content: "timeout".into() })
+        .await
+        .unwrap();
+
+    let counter = WaitableCounter::new();
+    let handler = TimeoutThenAck(counter.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1)
+                    .with_handler_timeout(Duration::from_millis(500)),
+            )
+            .await
+    });
+
+    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should retry after timeout");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
