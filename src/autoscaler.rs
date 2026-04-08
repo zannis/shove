@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Tuning knobs for the autoscaler's polling and scaling decisions.
@@ -131,6 +132,67 @@ impl ScalingStrategy for ThresholdStrategy {
     }
 }
 
+/// A composable decorator that wraps any `ScalingStrategy` and adds
+/// per-group hysteresis (a condition must be sustained before acting)
+/// and cooldown (minimum time between consecutive scaling actions).
+pub struct Stabilized<S: ScalingStrategy> {
+    inner: S,
+    hysteresis_duration: Duration,
+    cooldown_duration: Duration,
+    pub(crate) state: HashMap<String, GroupScalingState>,
+}
+
+impl<S: ScalingStrategy> Stabilized<S> {
+    pub fn new(inner: S, hysteresis_duration: Duration, cooldown_duration: Duration) -> Self {
+        Self {
+            inner,
+            hysteresis_duration,
+            cooldown_duration,
+            state: HashMap::new(),
+        }
+    }
+}
+
+impl<S: ScalingStrategy> ScalingStrategy for Stabilized<S> {
+    fn evaluate(&mut self, group: &str, metrics: &ScalingMetrics) -> ScalingDecision {
+        let raw = self.inner.evaluate(group, metrics);
+
+        let state = self.state.entry(group.to_string()).or_default();
+
+        if state.in_cooldown(self.cooldown_duration) {
+            return ScalingDecision::Hold;
+        }
+
+        match raw {
+            ScalingDecision::ScaleUp(n) => {
+                state.scale_down_since = None;
+                let since = state.scale_up_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= self.hysteresis_duration {
+                    state.last_scaled_at = Some(Instant::now());
+                    ScalingDecision::ScaleUp(n)
+                } else {
+                    ScalingDecision::Hold
+                }
+            }
+            ScalingDecision::ScaleDown(n) => {
+                state.scale_up_since = None;
+                let since = state.scale_down_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= self.hysteresis_duration {
+                    state.last_scaled_at = Some(Instant::now());
+                    ScalingDecision::ScaleDown(n)
+                } else {
+                    ScalingDecision::Hold
+                }
+            }
+            ScalingDecision::Hold => {
+                state.scale_up_since = None;
+                state.scale_down_since = None;
+                ScalingDecision::Hold
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +318,147 @@ mod tests {
         let r1 = s.evaluate("group-a", &m);
         let r2 = s.evaluate("group-b", &m);
         assert_eq!(r1, r2);
+    }
+
+    // --- Stabilized tests ---
+
+    struct FixedStrategy(ScalingDecision);
+    impl ScalingStrategy for FixedStrategy {
+        fn evaluate(&mut self, _group: &str, _metrics: &ScalingMetrics) -> ScalingDecision {
+            self.0.clone()
+        }
+    }
+
+    struct SequentialStrategy(Vec<ScalingDecision>);
+    impl ScalingStrategy for SequentialStrategy {
+        fn evaluate(&mut self, _group: &str, _metrics: &ScalingMetrics) -> ScalingDecision {
+            self.0.remove(0)
+        }
+    }
+
+    fn test_metrics() -> ScalingMetrics {
+        ScalingMetrics::new(100, 0, 2, 10)
+    }
+
+    #[test]
+    fn stabilized_passes_through_hold() {
+        let mut s = Stabilized::new(
+            FixedStrategy(ScalingDecision::Hold),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+    }
+
+    #[test]
+    fn stabilized_blocks_during_hysteresis() {
+        let mut s = Stabilized::new(
+            FixedStrategy(ScalingDecision::ScaleUp(1)),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        // hysteresis not elapsed yet → Hold
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+        // timer should have been set
+        assert!(s.state["g"].scale_up_since.is_some());
+    }
+
+    #[test]
+    fn stabilized_fires_after_hysteresis() {
+        let mut s = Stabilized::new(
+            FixedStrategy(ScalingDecision::ScaleUp(1)),
+            Duration::from_secs(0),
+            Duration::from_secs(60),
+        );
+        // hysteresis = 0 → passes through immediately
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::ScaleUp(1));
+    }
+
+    #[test]
+    fn stabilized_blocks_during_cooldown() {
+        let mut s = Stabilized::new(
+            FixedStrategy(ScalingDecision::ScaleUp(1)),
+            Duration::from_secs(0),
+            Duration::from_secs(60),
+        );
+        // First call fires (hysteresis=0)
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::ScaleUp(1));
+        // Second call is in cooldown
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+    }
+
+    #[test]
+    fn stabilized_resets_hysteresis_on_hold() {
+        // ScaleUp → Hold → ScaleUp: the second ScaleUp should start a fresh timer
+        let mut s = Stabilized::new(
+            SequentialStrategy(vec![
+                ScalingDecision::ScaleUp(1),
+                ScalingDecision::Hold,
+                ScalingDecision::ScaleUp(1),
+            ]),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        // First ScaleUp: starts timer, returns Hold (not elapsed)
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+        let first_timer = s.state["g"].scale_up_since;
+        assert!(first_timer.is_some());
+
+        // Hold: clears timer
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+        assert!(s.state["g"].scale_up_since.is_none());
+
+        // ScaleUp again: fresh timer started, returns Hold (60s not elapsed)
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+        assert!(s.state["g"].scale_up_since.is_some());
+    }
+
+    #[test]
+    fn stabilized_per_group_isolation() {
+        let mut s = Stabilized::new(
+            FixedStrategy(ScalingDecision::ScaleUp(1)),
+            Duration::from_secs(0),
+            Duration::from_secs(60),
+        );
+        // group "a" fires
+        assert_eq!(s.evaluate("a", &test_metrics()), ScalingDecision::ScaleUp(1));
+        // group "a" is in cooldown
+        assert_eq!(s.evaluate("a", &test_metrics()), ScalingDecision::Hold);
+        // group "b" is independent and fires
+        assert_eq!(s.evaluate("b", &test_metrics()), ScalingDecision::ScaleUp(1));
+    }
+
+    #[test]
+    fn stabilized_scale_down_hysteresis() {
+        let mut s = Stabilized::new(
+            FixedStrategy(ScalingDecision::ScaleDown(1)),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        // hysteresis not elapsed → Hold, but timer is set
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+        assert!(s.state["g"].scale_down_since.is_some());
+    }
+
+    #[test]
+    fn stabilized_clears_opposite_timer_on_scale_up() {
+        // ScaleDown starts scale_down_since, then ScaleUp clears it and sets scale_up_since
+        let mut s = Stabilized::new(
+            SequentialStrategy(vec![
+                ScalingDecision::ScaleDown(1),
+                ScalingDecision::ScaleUp(1),
+            ]),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        // ScaleDown: starts scale_down_since, returns Hold
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+        assert!(s.state["g"].scale_down_since.is_some());
+        assert!(s.state["g"].scale_up_since.is_none());
+
+        // ScaleUp: clears scale_down_since, starts scale_up_since, returns Hold
+        assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
+        assert!(s.state["g"].scale_down_since.is_none());
+        assert!(s.state["g"].scale_up_since.is_some());
     }
 }
