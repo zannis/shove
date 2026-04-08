@@ -52,7 +52,7 @@ pub mod sns {
 
     #[cfg(feature = "aws-sns-sqs")]
     pub use crate::backends::sns::{
-        autoscaler::SqsAutoscaler,
+        autoscaler::SqsAutoscalerBackend,
         consumer::SqsConsumer,
         consumer_group::{SqsConsumerGroup, SqsConsumerGroupConfig},
         registry::SqsConsumerGroupRegistry,
