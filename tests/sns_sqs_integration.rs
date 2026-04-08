@@ -2590,3 +2590,215 @@ async fn sequenced_defer_redelivers() {
         .expect("consumer task should not panic")
         .expect("consumer should exit cleanly");
 }
+
+// ---------------------------------------------------------------------------
+// Pluggable Strategy Integration Tests
+// ---------------------------------------------------------------------------
+
+/// A custom strategy that scales up by 1 whenever there are any ready messages,
+/// regardless of capacity or thresholds.
+struct AlwaysScaleUpStrategy;
+
+impl ScalingStrategy for AlwaysScaleUpStrategy {
+    fn evaluate(&mut self, _group: &str, metrics: &ScalingMetrics) -> ScalingDecision {
+        if metrics.messages_ready > 0 {
+            ScalingDecision::ScaleUp(1)
+        } else {
+            ScalingDecision::Hold
+        }
+    }
+}
+
+/// Tests that a custom (non-Threshold) strategy works with the generic autoscaler.
+///
+/// We use prefetch=5, min=1, max=4. With 3 messages ready:
+/// - `ThresholdStrategy` with default multiplier 2.0 would require >10 messages to scale up
+///   (capacity = 1 * 5 = 5, threshold = 5 * 2.0 = 10).
+/// - `AlwaysScaleUpStrategy` fires immediately on any ready message.
+#[tokio::test]
+async fn autoscaler_custom_strategy_with_sqs() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    // Publish 3 messages — below what ThresholdStrategy would trigger on (threshold=10),
+    // but AlwaysScaleUpStrategy will fire on any > 0.
+    for i in 1..=3 {
+        setup
+            .publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("custom-{i}"),
+                content: format!("message {i}"),
+            })
+            .await
+            .expect("publish should succeed");
+    }
+
+    // Give SQS a moment to reflect the count.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Set up registry with prefetch=5 so threshold would be 10 (3 < 10).
+    let mut registry = SqsConsumerGroupRegistry::new(
+        setup.sns_client.clone(),
+        setup.topic_registry.clone(),
+        setup.queue_registry.clone(),
+    );
+
+    let (sticky, sticky_signal) = StickyHandler::new();
+    let config = SqsConsumerGroupConfig::new(1..=4).with_prefetch_count(5);
+
+    registry
+        .register::<WorkTopic, _>(config, {
+            let h = sticky.clone();
+            move || h.clone()
+        })
+        .await
+        .expect("register should succeed");
+
+    registry.start_all();
+
+    let registry_arc = Arc::new(Mutex::new(registry));
+
+    // Build autoscaler with custom strategy — NO Stabilized wrapper.
+    let stats_provider =
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let backend = SqsAutoscalerBackend::new(stats_provider, registry_arc.clone());
+    let mut autoscaler = Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(200));
+
+    let shutdown = CancellationToken::new();
+    let s_clone = shutdown.clone();
+    let auto_handle = tokio::spawn(async move {
+        autoscaler.run(s_clone).await;
+    });
+
+    // Wait up to 20s for scale-up triggered by the custom strategy.
+    let mut scaled_up = false;
+    for _ in 0..100 {
+        let reg = registry_arc.lock().await;
+        let active = reg
+            .groups()
+            .values()
+            .next()
+            .expect("registry should have at least one group")
+            .active_consumers();
+        drop(reg);
+
+        if active >= 2 {
+            scaled_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        scaled_up,
+        "custom strategy should have scaled up despite low message count"
+    );
+
+    // Cleanup
+    sticky_signal.release();
+    shutdown.cancel();
+    let _ = auto_handle.await;
+    registry_arc.lock().await.shutdown_all().await;
+}
+
+/// A strategy that always requests scale-up by 2 at once when there are ready messages.
+struct ScaleByTwoStrategy;
+
+impl ScalingStrategy for ScaleByTwoStrategy {
+    fn evaluate(&mut self, _group: &str, metrics: &ScalingMetrics) -> ScalingDecision {
+        if metrics.messages_ready > 0 {
+            ScalingDecision::ScaleUp(2)
+        } else {
+            ScalingDecision::Hold
+        }
+    }
+}
+
+/// Tests that `ScaleUp(2)` actually adds 2 consumers at once, so after the
+/// first scaling action we go from 1 (initial) to 3 consumers.
+#[tokio::test]
+async fn autoscaler_scale_magnitude_with_sqs() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    // Publish 10 messages.
+    for i in 1..=10 {
+        setup
+            .publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("scale2-{i}"),
+                content: format!("message {i}"),
+            })
+            .await
+            .expect("publish should succeed");
+    }
+
+    // Give SQS a moment to reflect the count.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Set up registry: min=1, max=5, prefetch=5. Starts with 1 consumer.
+    let mut registry = SqsConsumerGroupRegistry::new(
+        setup.sns_client.clone(),
+        setup.topic_registry.clone(),
+        setup.queue_registry.clone(),
+    );
+
+    let (sticky, sticky_signal) = StickyHandler::new();
+    let config = SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5);
+
+    registry
+        .register::<WorkTopic, _>(config, {
+            let h = sticky.clone();
+            move || h.clone()
+        })
+        .await
+        .expect("register should succeed");
+
+    registry.start_all();
+
+    let registry_arc = Arc::new(Mutex::new(registry));
+
+    // Build autoscaler with ScaleByTwoStrategy — NO Stabilized wrapper.
+    let stats_provider =
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let backend = SqsAutoscalerBackend::new(stats_provider, registry_arc.clone());
+    let mut autoscaler = Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(200));
+
+    let shutdown = CancellationToken::new();
+    let s_clone = shutdown.clone();
+    let auto_handle = tokio::spawn(async move {
+        autoscaler.run(s_clone).await;
+    });
+
+    // Wait up to 20s for 3 active consumers (1 initial + 2 from ScaleUp(2)).
+    let mut reached_three = false;
+    for _ in 0..100 {
+        let reg = registry_arc.lock().await;
+        let active = reg
+            .groups()
+            .values()
+            .next()
+            .expect("registry should have at least one group")
+            .active_consumers();
+        drop(reg);
+
+        if active >= 3 {
+            reached_three = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(
+        reached_three,
+        "ScaleUp(2) should have brought active consumers from 1 to at least 3"
+    );
+
+    // Cleanup
+    sticky_signal.release();
+    shutdown.cancel();
+    let _ = auto_handle.await;
+    registry_arc.lock().await.shutdown_all().await;
+}
