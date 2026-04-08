@@ -1,0 +1,37 @@
+tests/nats_integration.rs
+  19e308383ce264d2 20-22,125,128-158,316-317,334-335,349-350,366-367,397-398,415-416,458-459,508-509,549-550,588-589,633-634,665-666,723-724,759-760,803-804,837-838,883-884,925-926,978-979,1015-1016,1054-1055,1097-1098,1161-1162,1181-1182,1202-1203,1252-1253
+  98039bddec9cc648 1065,1068-1076,1078-1079,1081,1086
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "8fd18f92544079346e380f850bc012adf7e19aaf",
+  "prompts": {
+    "19e308383ce264d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d828ff25-e74c-42b0-8d2d-f6cd6db34844",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 87,
+      "overriden_lines": 0
+    },
+    "98039bddec9cc648": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15d3d33d-9ab0-4f69-a92d-8d6d157ea0b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 13,
+      "accepted_lines": 980,
+      "overriden_lines": 0
+    }
+  }
+}
