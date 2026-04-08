@@ -24,6 +24,7 @@ pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
 # Complete pubsub with AWS SNS and AWS SQS
 aws-sns-sqs = ["pub-aws-sns", "dep:aws-sdk-sqs"]
 audit = []
+nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -41,6 +42,9 @@ aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optio
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 rand = "0.10"
+async-nats = { version = "0.39", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }

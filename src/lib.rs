@@ -61,6 +61,14 @@ pub mod sns {
     };
 }
 
+#[cfg(feature = "nats")]
+pub mod nats {
+    pub use crate::backends::nats::{
+        NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroup, NatsConsumerGroupConfig,
+        NatsPublisher, NatsTopologyDeclarer,
+    };
+}
+
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq {
     pub use crate::backends::rabbitmq::{
