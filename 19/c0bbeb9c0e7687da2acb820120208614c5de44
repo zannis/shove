@@ -1,0 +1,23 @@
+src/backends/nats/consumer.rs
+  98039bddec9cc648 13,324-361,386,407-421,423-452,454-469,471-496,498-499,501-504,506-508,510-511,513-519,521-536,539-540,721-722,730-769,772-787,789-801,803,805-810,815-816
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "19c0bbeb9c0e7687da2acb820120208614c5de44",
+  "prompts": {
+    "98039bddec9cc648": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15d3d33d-9ab0-4f69-a92d-8d6d157ea0b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 989,
+      "total_deletions": 182,
+      "accepted_lines": 989,
+      "overriden_lines": 0
+    }
+  }
+}
