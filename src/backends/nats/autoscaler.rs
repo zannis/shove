@@ -3,12 +3,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::ShoveError;
 use crate::autoscaler::{
     Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics, Stabilized,
     ThresholdStrategy,
 };
 use crate::error::Result;
-use crate::ShoveError;
 
 use super::client::NatsClient;
 use super::consumer_group::NatsConsumerGroupRegistry;
@@ -22,10 +22,7 @@ pub struct NatsQueueStats {
 
 /// Abstraction over JetStream consumer info for fetching queue stats.
 pub trait NatsQueueStatsProvider: Send + Sync {
-    fn get_queue_stats(
-        &self,
-        queue: &str,
-    ) -> impl Future<Output = Result<NatsQueueStats>> + Send;
+    fn get_queue_stats(&self, queue: &str) -> impl Future<Output = Result<NatsQueueStats>> + Send;
 }
 
 /// Default stats provider that queries JetStream consumer info.
@@ -53,9 +50,7 @@ impl NatsQueueStatsProvider for JetStreamStatsProvider {
             .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
             .await
             .map_err(|e| {
-                ShoveError::Connection(format!(
-                    "failed to get consumer {consumer_name}: {e}"
-                ))
+                ShoveError::Connection(format!("failed to get consumer {consumer_name}: {e}"))
             })?;
 
         let info = consumer.info().await.map_err(|e| {
@@ -81,10 +76,7 @@ pub struct NatsAutoscalerBackend<S: NatsQueueStatsProvider = JetStreamStatsProvi
 
 impl NatsAutoscalerBackend<JetStreamStatsProvider> {
     /// Create a backend that talks to JetStream for queue stats.
-    pub fn new(
-        client: NatsClient,
-        registry: Arc<Mutex<NatsConsumerGroupRegistry>>,
-    ) -> Self {
+    pub fn new(client: NatsClient, registry: Arc<Mutex<NatsConsumerGroupRegistry>>) -> Self {
         Self {
             stats_provider: JetStreamStatsProvider::new(client),
             registry,
@@ -135,9 +127,10 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
     async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
         let (queue, prefetch, active) = {
             let reg = self.registry.lock().await;
-            let g = reg.groups().get(group).ok_or_else(|| {
-                ShoveError::Connection(format!("group not found: {group}"))
-            })?;
+            let g = reg
+                .groups()
+                .get(group)
+                .ok_or_else(|| ShoveError::Connection(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
                 g.config().prefetch_count(),
@@ -170,9 +163,10 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
         decision: ScalingDecision,
     ) -> crate::error::Result<()> {
         let mut reg = self.registry.lock().await;
-        let g = reg.groups_mut().get_mut(group).ok_or_else(|| {
-            ShoveError::Connection(format!("group not found: {group}"))
-        })?;
+        let g = reg
+            .groups_mut()
+            .get_mut(group)
+            .ok_or_else(|| ShoveError::Connection(format!("group not found: {group}")))?;
 
         match decision {
             ScalingDecision::ScaleUp(n) => {

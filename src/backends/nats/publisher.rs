@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use async_nats::header::NATS_MESSAGE_ID;
 use async_nats::HeaderMap;
+use async_nats::header::NATS_MESSAGE_ID;
 use bytes::Bytes;
 use uuid::Uuid;
 
+use crate::ShoveError;
 use crate::error::Result;
 use crate::publisher::Publisher;
 use crate::retry::Backoff;
 use crate::topic::Topic;
-use crate::ShoveError;
 
 use super::client::NatsClient;
 
@@ -27,7 +27,10 @@ impl NatsPublisher {
         Ok(Self { client })
     }
 
-    fn resolve_subject<T: Topic>(topology: &'static crate::topology::QueueTopology, message: &T::Message) -> String {
+    fn resolve_subject<T: Topic>(
+        topology: &'static crate::topology::QueueTopology,
+        message: &T::Message,
+    ) -> String {
         if let Some(seq) = topology.sequencing()
             && let Some(key_fn) = T::SEQUENCE_KEY_FN
         {
@@ -107,7 +110,8 @@ impl Publisher for NatsPublisher {
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
         let headers = Self::build_headers(None);
-        self.publish_raw(subject, headers, Bytes::from(payload)).await
+        self.publish_raw(subject, headers, Bytes::from(payload))
+            .await
     }
 
     async fn publish_with_headers<T: Topic>(
@@ -119,7 +123,8 @@ impl Publisher for NatsPublisher {
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
         let headers = Self::build_headers(Some(&extra_headers));
-        self.publish_raw(subject, headers, Bytes::from(payload)).await
+        self.publish_raw(subject, headers, Bytes::from(payload))
+            .await
     }
 
     async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {

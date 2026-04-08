@@ -3,15 +3,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use async_nats::header::NATS_MESSAGE_ID;
-use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
-use async_nats::jetstream::consumer::AckPolicy;
-use async_nats::jetstream::message::AckKind;
 use async_nats::HeaderMap;
+use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::jetstream::consumer::AckPolicy;
+use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+use async_nats::jetstream::message::AckKind;
 use futures_util::StreamExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::ShoveError;
 use crate::consumer::{Consumer, ConsumerOptions};
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -19,7 +20,6 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::ShoveError;
 
 use super::client::NatsClient;
 
@@ -70,10 +70,7 @@ fn extract_message_metadata(msg: &async_nats::jetstream::Message) -> MessageMeta
         .map(|v| v.as_str().to_string())
         .unwrap_or_default();
 
-    let redelivered = msg
-        .info()
-        .map(|info| info.delivered > 1)
-        .unwrap_or(false);
+    let redelivered = msg.info().map(|info| info.delivered > 1).unwrap_or(false);
 
     let headers = extract_string_headers(&msg.headers);
 
@@ -125,9 +122,7 @@ fn extract_dead_metadata(msg: &async_nats::jetstream::Message) -> DeadMessageMet
 fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
     match outcome {
         Outcome::Defer => {
-            tracing::warn!(
-                "Defer is not supported on sequenced consumers — treating as Retry"
-            );
+            tracing::warn!("Defer is not supported on sequenced consumers — treating as Retry");
             Outcome::Retry
         }
         other => other,
@@ -163,7 +158,10 @@ async fn publish_to_dlq(
         .and_then(|hm| hm.get(DEATH_COUNT_HEADER))
         .and_then(|v| v.as_str().parse::<u32>().ok())
         .unwrap_or(0);
-    headers.insert(DEATH_COUNT_HEADER, (current_death_count + 1).to_string().as_str());
+    headers.insert(
+        DEATH_COUNT_HEADER,
+        (current_death_count + 1).to_string().as_str(),
+    );
 
     // Generate a new message ID for the DLQ publish to avoid dedup rejection
     let original_id = msg
@@ -174,7 +172,8 @@ async fn publish_to_dlq(
         .unwrap_or_default();
     headers.insert(NATS_MESSAGE_ID, format!("{original_id}-dlq").as_str());
 
-    let mut backoff = crate::retry::Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
+    let mut backoff =
+        crate::retry::Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
     let max_attempts = 3u32;
 
     for attempt in 1..=max_attempts {
@@ -288,17 +287,15 @@ async fn route_outcome(
                 return;
             }
         }
-        Outcome::Reject => {
-            match publish_to_dlq(client, topology, msg, "rejected").await {
-                Ok(()) => {
-                    if let Err(e) = msg.ack().await {
-                        tracing::error!(error = %e, "failed to ack after reject DLQ publish");
-                    }
-                    return;
+        Outcome::Reject => match publish_to_dlq(client, topology, msg, "rejected").await {
+            Ok(()) => {
+                if let Err(e) = msg.ack().await {
+                    tracing::error!(error = %e, "failed to ack after reject DLQ publish");
                 }
-                Err(e) => Err(e),
+                return;
             }
-        }
+            Err(e) => Err(e),
+        },
         Outcome::Defer => {
             let delay = if hold_queues.is_empty() {
                 Duration::from_secs(1)
@@ -333,13 +330,15 @@ async fn invoke_handler<T: Topic>(
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => match tokio::time::timeout(duration, handler.handle(message, metadata)).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                tracing::warn!("handler timed out after {duration:?}, retrying");
-                Outcome::Retry
+        Some(duration) => {
+            match tokio::time::timeout(duration, handler.handle(message, metadata)).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    tracing::warn!("handler timed out after {duration:?}, retrying");
+                    Outcome::Retry
+                }
             }
-        },
+        }
         None => handler.handle(message, metadata).await,
     }
 }
@@ -438,11 +437,8 @@ impl Consumer for NatsConsumer {
 
         // Verify the stream exists before entering the reconnect loop.
         // A missing stream is a permanent error, not a transient one.
-        let stream = client
-            .jetstream()
-            .get_stream(queue)
-            .await
-            .map_err(|e| {
+        let stream =
+            client.jetstream().get_stream(queue).await.map_err(|e| {
                 ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
             })?;
         drop(stream);
@@ -755,14 +751,11 @@ impl Consumer for NatsConsumer {
         Ok(())
     }
 
-    async fn run_dlq<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T>,
-    ) -> Result<()> {
+    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T>) -> Result<()> {
         let topology = T::topology();
-        let dlq = topology
-            .dlq()
-            .ok_or_else(|| ShoveError::Topology("run_dlq requires a DLQ to be configured".into()))?;
+        let dlq = topology.dlq().ok_or_else(|| {
+            ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
+        })?;
 
         let dlq_consumer_name = format!("{dlq}-consumer");
         let shutdown = self.client.shutdown_token();
@@ -776,11 +769,8 @@ impl Consumer for NatsConsumer {
         );
 
         // Verify the DLQ stream exists before entering the reconnect loop.
-        let stream = client
-            .jetstream()
-            .get_stream(dlq)
-            .await
-            .map_err(|e| {
+        let stream =
+            client.jetstream().get_stream(dlq).await.map_err(|e| {
                 ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
             })?;
         drop(stream);
@@ -792,13 +782,9 @@ impl Consumer for NatsConsumer {
             let dlq_consumer_name = dlq_consumer_name.clone();
             async move {
                 // Get the DLQ stream
-                let stream = client
-                    .jetstream()
-                    .get_stream(dlq)
-                    .await
-                    .map_err(|e| {
-                        ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
-                    })?;
+                let stream = client.jetstream().get_stream(dlq).await.map_err(|e| {
+                    ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
+                })?;
 
                 // Create durable pull consumer for the DLQ
                 let pull_consumer = stream

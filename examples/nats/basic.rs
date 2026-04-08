@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use shove::Topic;
 use shove::consumer::{Consumer, ConsumerOptions};
 use shove::handler::MessageHandler;
 use shove::metadata::MessageMetadata;
@@ -13,7 +14,6 @@ use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsPublisher, NatsTopol
 use shove::outcome::Outcome;
 use shove::publisher::Publisher;
 use shove::topology::{TopologyBuilder, TopologyDeclarer};
-use shove::Topic;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

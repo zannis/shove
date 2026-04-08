@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use shove::SequencedTopic as _;
 use shove::consumer::{Consumer, ConsumerOptions};
 use shove::handler::MessageHandler;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -16,9 +17,8 @@ use shove::nats::{
 use shove::outcome::Outcome;
 use shove::publisher::Publisher;
 use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
-use shove::SequencedTopic as _;
-use testcontainers::runners::AsyncRunner;
 use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
@@ -166,7 +166,9 @@ async fn declare<T: shove::topic::Topic>(client: &NatsClient) {
 }
 
 async fn make_publisher(client: &NatsClient) -> NatsPublisher {
-    NatsPublisher::new(client.clone()).await.expect("publisher creation should succeed")
+    NatsPublisher::new(client.clone())
+        .await
+        .expect("publisher creation should succeed")
 }
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -182,7 +184,9 @@ struct CountingHandler {
 
 impl CountingHandler {
     fn new() -> Self {
-        Self { counter: WaitableCounter::new() }
+        Self {
+            counter: WaitableCounter::new(),
+        }
     }
 }
 
@@ -223,7 +227,10 @@ struct RetryThenAckHandler {
 
 impl RetryThenAckHandler {
     fn new(retry_until: u32) -> Self {
-        Self { retry_until, counter: WaitableCounter::new() }
+        Self {
+            retry_until,
+            counter: WaitableCounter::new(),
+        }
     }
 }
 
@@ -247,7 +254,10 @@ struct SlowHandler {
 
 impl SlowHandler {
     fn new(delay: Duration) -> Self {
-        Self { delay, counter: WaitableCounter::new() }
+        Self {
+            delay,
+            counter: WaitableCounter::new(),
+        }
     }
 }
 
@@ -266,7 +276,9 @@ struct DlqRecordingHandler {
 
 impl DlqRecordingHandler {
     fn new() -> Self {
-        Self { counter: WaitableCounter::new() }
+        Self {
+            counter: WaitableCounter::new(),
+        }
     }
 }
 
@@ -401,7 +413,10 @@ async fn topology_idempotent() {
     declare::<WorkTopic>(&client).await; // second call should not fail
 
     let stream = client.jetstream().get_stream("nats-work").await;
-    assert!(stream.is_ok(), "stream should still exist after double declare");
+    assert!(
+        stream.is_ok(),
+        "stream should still exist after double declare"
+    );
 
     client.shutdown().await;
 }
@@ -417,13 +432,12 @@ async fn publish_and_consume_simple_message() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage {
-            id: "simple-1".into(),
-            content: "hello".into(),
-        })
-        .await
-        .expect("publish should succeed");
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "simple-1".into(),
+        content: "hello".into(),
+    })
+    .await
+    .expect("publish should succeed");
 
     let handler = CountingHandler::new();
     let hc = handler.clone();
@@ -432,10 +446,15 @@ async fn publish_and_consume_simple_message() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+        consumer
+            .run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1))
+            .await
     });
 
-    assert!(handler.counter.wait_for(1, TIMEOUT).await, "should receive 1 message");
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "should receive 1 message"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -463,13 +482,15 @@ async fn publish_and_consume_with_headers() {
     let mut headers = HashMap::new();
     headers.insert("x-trace-id".to_string(), "trace-abc-123".to_string());
 
-    pub_
-        .publish_with_headers::<WorkTopic>(
-            &SimpleMessage { id: "hdr-1".into(), content: "with headers".into() },
-            headers,
-        )
-        .await
-        .expect("publish_with_headers should succeed");
+    pub_.publish_with_headers::<WorkTopic>(
+        &SimpleMessage {
+            id: "hdr-1".into(),
+            content: "with headers".into(),
+        },
+        headers,
+    )
+    .await
+    .expect("publish_with_headers should succeed");
 
     let captured = Arc::new(Mutex::new(HashMap::new()));
     let handler = HeaderCapture(captured.clone());
@@ -479,13 +500,17 @@ async fn publish_and_consume_with_headers() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+        consumer
+            .run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_prefetch_count(1))
+            .await
     });
 
     let result = tokio::time::timeout(TIMEOUT, async {
         loop {
             let map = captured.lock().await;
-            if !map.is_empty() { return map.clone(); }
+            if !map.is_empty() {
+                return map.clone();
+            }
             drop(map);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -517,8 +542,7 @@ async fn publish_and_consume_batch() {
         })
         .collect();
 
-    pub_
-        .publish_batch::<WorkTopic>(&messages)
+    pub_.publish_batch::<WorkTopic>(&messages)
         .await
         .expect("publish_batch should succeed");
 
@@ -529,10 +553,15 @@ async fn publish_and_consume_batch() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10)).await
+        consumer
+            .run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10))
+            .await
     });
 
-    assert!(handler.counter.wait_for(5, TIMEOUT).await, "should receive all 5 messages");
+    assert!(
+        handler.counter.wait_for(5, TIMEOUT).await,
+        "should receive all 5 messages"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -551,10 +580,12 @@ async fn rejected_message_lands_in_dlq() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage { id: "reject-1".into(), content: "reject me".into() })
-        .await
-        .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "reject-1".into(),
+        content: "reject me".into(),
+    })
+    .await
+    .unwrap();
 
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
@@ -564,7 +595,9 @@ async fn rejected_message_lands_in_dlq() {
         consumer
             .run::<WorkTopic>(
                 FixedOutcomeHandler(Outcome::Reject),
-                ConsumerOptions::new(sc).with_prefetch_count(1).with_max_retries(1),
+                ConsumerOptions::new(sc)
+                    .with_prefetch_count(1)
+                    .with_max_retries(1),
             )
             .await
     });
@@ -575,7 +608,10 @@ async fn rejected_message_lands_in_dlq() {
     let dlq_consumer = NatsConsumer::new(client.clone());
     let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic>(dhc).await });
 
-    assert!(dlq_handler.counter.wait_for(1, TIMEOUT).await, "DLQ should receive rejected message");
+    assert!(
+        dlq_handler.counter.wait_for(1, TIMEOUT).await,
+        "DLQ should receive rejected message"
+    );
 
     shutdown.cancel();
     client.shutdown().await;
@@ -590,10 +626,12 @@ async fn dlq_consumer_handles_dead_message() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage { id: "dlq-test".into(), content: "dead".into() })
-        .await
-        .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "dlq-test".into(),
+        content: "dead".into(),
+    })
+    .await
+    .unwrap();
 
     // Step 1: reject to get message into DLQ
     let shutdown1 = CancellationToken::new();
@@ -617,7 +655,10 @@ async fn dlq_consumer_handles_dead_message() {
     let c2 = NatsConsumer::new(client.clone());
     let h2 = tokio::spawn(async move { c2.run_dlq::<WorkTopic>(dhc).await });
 
-    assert!(dlq_handler.counter.wait_for(1, TIMEOUT).await, "DLQ handler should receive 1 dead message");
+    assert!(
+        dlq_handler.counter.wait_for(1, TIMEOUT).await,
+        "DLQ handler should receive 1 dead message"
+    );
     assert_eq!(dlq_handler.counter.get(), 1);
 
     client.shutdown().await;
@@ -635,10 +676,12 @@ async fn retry_then_ack_succeeds() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage { id: "retry-ack".into(), content: "retry then ack".into() })
-        .await
-        .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "retry-ack".into(),
+        content: "retry then ack".into(),
+    })
+    .await
+    .unwrap();
 
     let handler = RetryThenAckHandler::new(1);
     let counter = handler.counter.clone();
@@ -649,11 +692,19 @@ async fn retry_then_ack_succeeds() {
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_max_retries(5).with_prefetch_count(1))
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
             .await
     });
 
-    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should have at least 2 handler calls");
+    assert!(
+        counter.wait_for(2, Duration::from_secs(30)).await,
+        "should have at least 2 handler calls"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -667,13 +718,12 @@ async fn max_retries_sends_to_dlq() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage {
-            id: "always-retry".into(),
-            content: "exhaust retries".into(),
-        })
-        .await
-        .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "always-retry".into(),
+        content: "exhaust retries".into(),
+    })
+    .await
+    .unwrap();
 
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
@@ -683,7 +733,9 @@ async fn max_retries_sends_to_dlq() {
         consumer
             .run::<WorkTopic>(
                 FixedOutcomeHandler(Outcome::Retry),
-                ConsumerOptions::new(sc).with_max_retries(2).with_prefetch_count(1),
+                ConsumerOptions::new(sc)
+                    .with_max_retries(2)
+                    .with_prefetch_count(1),
             )
             .await
     });
@@ -694,7 +746,10 @@ async fn max_retries_sends_to_dlq() {
     let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic>(dhc).await });
 
     assert!(
-        dlq_handler.counter.wait_for(1, Duration::from_secs(30)).await,
+        dlq_handler
+            .counter
+            .wait_for(1, Duration::from_secs(30))
+            .await,
         "exhausted-retry message should land in DLQ"
     );
 
@@ -716,7 +771,11 @@ async fn defer_redelivers_message() {
         async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
             let prev = self.0.get();
             self.0.increment();
-            if prev == 0 { Outcome::Defer } else { Outcome::Ack }
+            if prev == 0 {
+                Outcome::Defer
+            } else {
+                Outcome::Ack
+            }
         }
     }
 
@@ -725,10 +784,12 @@ async fn defer_redelivers_message() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage { id: "defer-1".into(), content: "defer then ack".into() })
-        .await
-        .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "defer-1".into(),
+        content: "defer then ack".into(),
+    })
+    .await
+    .unwrap();
 
     let counter = WaitableCounter::new();
     let handler = DeferThenAck(counter.clone());
@@ -739,11 +800,19 @@ async fn defer_redelivers_message() {
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_max_retries(5).with_prefetch_count(1))
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
             .await
     });
 
-    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should be called at least 2 times (1 defer + 1 ack)");
+    assert!(
+        counter.wait_for(2, Duration::from_secs(30)).await,
+        "should be called at least 2 times (1 defer + 1 ack)"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -762,7 +831,10 @@ async fn concurrent_consume_processes_all_messages() {
 
     let pub_ = make_publisher(&client).await;
     let messages: Vec<SimpleMessage> = (1..=10)
-        .map(|i| SimpleMessage { id: format!("cc-{i}"), content: format!("msg {i}") })
+        .map(|i| SimpleMessage {
+            id: format!("cc-{i}"),
+            content: format!("msg {i}"),
+        })
         .collect();
     pub_.publish_batch::<WorkTopic>(&messages).await.unwrap();
 
@@ -773,10 +845,15 @@ async fn concurrent_consume_processes_all_messages() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10)).await
+        consumer
+            .run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10))
+            .await
     });
 
-    assert!(handler.counter.wait_for(10, Duration::from_secs(30)).await, "should receive all 10 messages");
+    assert!(
+        handler.counter.wait_for(10, Duration::from_secs(30)).await,
+        "should receive all 10 messages"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -806,10 +883,20 @@ async fn concurrent_consume_mixed_outcomes() {
 
     let pub_ = make_publisher(&client).await;
     for i in 0..3 {
-        pub_.publish::<WorkTopic>(&SimpleMessage { id: format!("ack-{i}"), content: "ack".into() }).await.unwrap();
+        pub_.publish::<WorkTopic>(&SimpleMessage {
+            id: format!("ack-{i}"),
+            content: "ack".into(),
+        })
+        .await
+        .unwrap();
     }
     for i in 0..2 {
-        pub_.publish::<WorkTopic>(&SimpleMessage { id: format!("{i}-reject"), content: "reject".into() }).await.unwrap();
+        pub_.publish::<WorkTopic>(&SimpleMessage {
+            id: format!("{i}-reject"),
+            content: "reject".into(),
+        })
+        .await
+        .unwrap();
     }
 
     let ack_counter = WaitableCounter::new();
@@ -821,11 +908,19 @@ async fn concurrent_consume_mixed_outcomes() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_prefetch_count(10)).await
+        consumer
+            .run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_prefetch_count(10))
+            .await
     });
 
-    assert!(ack_counter.wait_for(3, TIMEOUT).await, "should ack 3 messages");
-    assert!(reject_counter.wait_for(2, TIMEOUT).await, "should reject 2 messages");
+    assert!(
+        ack_counter.wait_for(3, TIMEOUT).await,
+        "should ack 3 messages"
+    );
+    assert!(
+        reject_counter.wait_for(2, TIMEOUT).await,
+        "should reject 2 messages"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -839,7 +934,12 @@ async fn graceful_shutdown_drains_inflight() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage { id: "drain-1".into(), content: "slow".into() }).await.unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "drain-1".into(),
+        content: "slow".into(),
+    })
+    .await
+    .unwrap();
 
     let handler = SlowHandler::new(Duration::from_millis(500));
     let hc = handler.clone();
@@ -848,16 +948,24 @@ async fn graceful_shutdown_drains_inflight() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+        consumer
+            .run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1))
+            .await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     shutdown.cancel();
 
     let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "consumer should exit within timeout after shutdown");
+    assert!(
+        result.is_ok(),
+        "consumer should exit within timeout after shutdown"
+    );
 
-    assert!(handler.counter.get() >= 1, "in-flight handler should have completed");
+    assert!(
+        handler.counter.get() >= 1,
+        "in-flight handler should have completed"
+    );
     client.shutdown().await;
 }
 
@@ -885,10 +993,12 @@ async fn handler_timeout_triggers_retry() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage { id: "timeout-1".into(), content: "timeout".into() })
-        .await
-        .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "timeout-1".into(),
+        content: "timeout".into(),
+    })
+    .await
+    .unwrap();
 
     let counter = WaitableCounter::new();
     let handler = TimeoutThenAck(counter.clone());
@@ -909,7 +1019,10 @@ async fn handler_timeout_triggers_retry() {
             .await
     });
 
-    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should retry after timeout");
+    assert!(
+        counter.wait_for(2, Duration::from_secs(30)).await,
+        "should retry after timeout"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -928,13 +1041,12 @@ async fn sequenced_consume_preserves_order() {
 
     let pub_ = make_publisher(&client).await;
     for i in 0..5u64 {
-        pub_
-            .publish::<SeqSkipTopic>(&OrderMessage {
-                order_id: "key-A".into(),
-                amount: i,
-            })
-            .await
-            .unwrap();
+        pub_.publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "key-A".into(),
+            amount: i,
+        })
+        .await
+        .unwrap();
     }
 
     let handler = OrderRecordingHandler::new();
@@ -944,10 +1056,15 @@ async fn sequenced_consume_preserves_order() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::new(sc).with_max_retries(5)).await
+        consumer
+            .run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::new(sc).with_max_retries(5))
+            .await
     });
 
-    assert!(handler.counter.wait_for(5, Duration::from_secs(30)).await, "should receive all 5 messages");
+    assert!(
+        handler.counter.wait_for(5, Duration::from_secs(30)).await,
+        "should receive all 5 messages"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -981,17 +1098,18 @@ async fn sequenced_skip_continues_after_rejection() {
 
     let pub_ = make_publisher(&client).await;
     for i in 0..3u64 {
-        pub_
-            .publish::<SeqSkipTopic>(&OrderMessage {
-                order_id: "key-B".into(),
-                amount: i,
-            })
-            .await
-            .unwrap();
+        pub_.publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "key-B".into(),
+            amount: i,
+        })
+        .await
+        .unwrap();
     }
 
     let counter = WaitableCounter::new();
-    let handler = RejectFirstHandler { counter: counter.clone() };
+    let handler = RejectFirstHandler {
+        counter: counter.clone(),
+    };
 
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
@@ -1003,7 +1121,10 @@ async fn sequenced_skip_continues_after_rejection() {
             .await
     });
 
-    assert!(counter.wait_for(3, Duration::from_secs(30)).await, "should process all 3 messages");
+    assert!(
+        counter.wait_for(3, Duration::from_secs(30)).await,
+        "should process all 3 messages"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -1018,8 +1139,18 @@ async fn sequenced_multiple_keys_concurrent() {
 
     let pub_ = make_publisher(&client).await;
     for i in 0..3u64 {
-        pub_.publish::<SeqSkipTopic>(&OrderMessage { order_id: "alice".into(), amount: i }).await.unwrap();
-        pub_.publish::<SeqSkipTopic>(&OrderMessage { order_id: "bob".into(), amount: i + 100 }).await.unwrap();
+        pub_.publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "alice".into(),
+            amount: i,
+        })
+        .await
+        .unwrap();
+        pub_.publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "bob".into(),
+            amount: i + 100,
+        })
+        .await
+        .unwrap();
     }
 
     let handler = OrderRecordingHandler::new();
@@ -1029,17 +1160,30 @@ async fn sequenced_multiple_keys_concurrent() {
 
     let consumer = NatsConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
-        consumer.run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::new(sc).with_max_retries(5)).await
+        consumer
+            .run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::new(sc).with_max_retries(5))
+            .await
     });
 
-    assert!(handler.counter.wait_for(6, Duration::from_secs(30)).await, "should receive all 6 messages");
+    assert!(
+        handler.counter.wait_for(6, Duration::from_secs(30)).await,
+        "should receive all 6 messages"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
 
     let records = handler.records().await;
-    let alice: Vec<u64> = records.iter().filter(|(k, _)| k == "alice").map(|(_, a)| *a).collect();
-    let bob: Vec<u64> = records.iter().filter(|(k, _)| k == "bob").map(|(_, a)| *a).collect();
+    let alice: Vec<u64> = records
+        .iter()
+        .filter(|(k, _)| k == "alice")
+        .map(|(_, a)| *a)
+        .collect();
+    let bob: Vec<u64> = records
+        .iter()
+        .filter(|(k, _)| k == "bob")
+        .map(|(_, a)| *a)
+        .collect();
     assert_eq!(alice, vec![0, 1, 2], "alice messages should be in order");
     assert_eq!(bob, vec![100, 101, 102], "bob messages should be in order");
     client.shutdown().await;
@@ -1057,7 +1201,10 @@ async fn consumer_group_processes_messages() {
 
     let pub_ = make_publisher(&client).await;
     let messages: Vec<SimpleMessage> = (1..=5)
-        .map(|i| SimpleMessage { id: format!("cg-{i}"), content: format!("msg {i}") })
+        .map(|i| SimpleMessage {
+            id: format!("cg-{i}"),
+            content: format!("msg {i}"),
+        })
         .collect();
     pub_.publish_batch::<WorkTopic>(&messages).await.unwrap();
 
@@ -1080,7 +1227,10 @@ async fn consumer_group_processes_messages() {
     );
     group.start();
 
-    assert!(handler.counter.wait_for(5, Duration::from_secs(30)).await, "consumer group should process all 5 messages");
+    assert!(
+        handler.counter.wait_for(5, Duration::from_secs(30)).await,
+        "consumer group should process all 5 messages"
+    );
 
     shutdown.cancel();
     group.shutdown().await;
@@ -1124,7 +1274,9 @@ async fn deserialization_failure_rejects_to_dlq() {
 
     let consumer = NatsConsumer::new(client.clone());
     let _handle = tokio::spawn(async move {
-        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+        consumer
+            .run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1))
+            .await
     });
 
     // Verify it lands in the DLQ stream directly (the payload is not valid
@@ -1155,7 +1307,11 @@ async fn deserialization_failure_rejects_to_dlq() {
     assert_eq!(dlq_msg.payload.as_ref(), b"not valid json");
     dlq_msg.ack().await.unwrap();
 
-    assert_eq!(handler.counter.get(), 0, "handler should not be called for bad JSON");
+    assert_eq!(
+        handler.counter.get(),
+        0,
+        "handler should not be called for bad JSON"
+    );
 
     shutdown.cancel();
     client.shutdown().await;
@@ -1175,7 +1331,9 @@ async fn consumer_run_on_undeclared_stream_fails() {
 
     struct Noop;
     impl MessageHandler<UndeclaredTopic> for Noop {
-        async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome { Outcome::Ack }
+        async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome {
+            Outcome::Ack
+        }
     }
 
     let broker = TestBroker::start().await;
@@ -1195,7 +1353,9 @@ async fn consumer_run_on_undeclared_stream_fails() {
 async fn run_dlq_on_topic_without_dlq_fails() {
     struct Noop;
     impl MessageHandler<NoDlqTopic> for Noop {
-        async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome { Outcome::Ack }
+        async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome {
+            Outcome::Ack
+        }
     }
 
     let broker = TestBroker::start().await;
@@ -1215,7 +1375,11 @@ async fn defer_without_hold_queues_redelivers() {
         async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
             let prev = self.0.get();
             self.0.increment();
-            if prev == 0 { Outcome::Defer } else { Outcome::Ack }
+            if prev == 0 {
+                Outcome::Defer
+            } else {
+                Outcome::Ack
+            }
         }
     }
 
@@ -1224,10 +1388,12 @@ async fn defer_without_hold_queues_redelivers() {
     declare::<DeferNoHoldTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<DeferNoHoldTopic>(&SimpleMessage { id: "defer-nohold".into(), content: "test".into() })
-        .await
-        .unwrap();
+    pub_.publish::<DeferNoHoldTopic>(&SimpleMessage {
+        id: "defer-nohold".into(),
+        content: "test".into(),
+    })
+    .await
+    .unwrap();
 
     let counter = WaitableCounter::new();
     let handler = DeferThenAck(counter.clone());
@@ -1242,7 +1408,10 @@ async fn defer_without_hold_queues_redelivers() {
             .await
     });
 
-    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should be called at least 2 times");
+    assert!(
+        counter.wait_for(2, Duration::from_secs(30)).await,
+        "should be called at least 2 times"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -1262,8 +1431,8 @@ async fn defer_preserves_retry_count() {
             let call = self.counter.get();
             self.counter.increment();
             match call {
-                0 => Outcome::Retry,  // retry_count becomes 1
-                1 => Outcome::Defer,  // retry_count should still be 1
+                0 => Outcome::Retry, // retry_count becomes 1
+                1 => Outcome::Defer, // retry_count should still be 1
                 _ => Outcome::Ack,
             }
         }
@@ -1274,10 +1443,12 @@ async fn defer_preserves_retry_count() {
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
-    pub_
-        .publish::<WorkTopic>(&SimpleMessage { id: "defer-retry".into(), content: "test".into() })
-        .await
-        .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "defer-retry".into(),
+        content: "test".into(),
+    })
+    .await
+    .unwrap();
 
     let counter = WaitableCounter::new();
     let retry_counts = Arc::new(Mutex::new(Vec::new()));
@@ -1294,20 +1465,31 @@ async fn defer_preserves_retry_count() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(sc).with_max_retries(10).with_prefetch_count(1),
+                ConsumerOptions::new(sc)
+                    .with_max_retries(10)
+                    .with_prefetch_count(1),
             )
             .await
     });
 
-    assert!(counter.wait_for(3, Duration::from_secs(30)).await, "should be called 3 times");
+    assert!(
+        counter.wait_for(3, Duration::from_secs(30)).await,
+        "should be called 3 times"
+    );
 
     shutdown.cancel();
     handle.await.unwrap().ok();
 
     let counts = retry_counts.lock().await;
     assert_eq!(counts[0], 0, "first call: retry_count should be 0");
-    assert_eq!(counts[1], 1, "second call (after Retry): retry_count should be 1");
-    assert_eq!(counts[2], 1, "third call (after Defer): retry_count should still be 1");
+    assert_eq!(
+        counts[1], 1,
+        "second call (after Retry): retry_count should be 1"
+    );
+    assert_eq!(
+        counts[2], 1,
+        "third call (after Defer): retry_count should still be 1"
+    );
 
     client.shutdown().await;
 }

@@ -343,7 +343,10 @@ impl NatsConsumerGroupRegistry {
     }
 
     pub async fn shutdown_all(&mut self) {
-        info!(count = self.groups.len(), "shutting down all consumer groups");
+        info!(
+            count = self.groups.len(),
+            "shutting down all consumer groups"
+        );
         for group in self.groups.values_mut() {
             group.shutdown().await;
         }

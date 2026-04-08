@@ -1,10 +1,12 @@
 use std::time::Duration;
 
-use async_nats::jetstream::stream::{Config as StreamConfig, DiscardPolicy, RetentionPolicy, StorageType};
+use async_nats::jetstream::stream::{
+    Config as StreamConfig, DiscardPolicy, RetentionPolicy, StorageType,
+};
 
+use crate::ShoveError;
 use crate::error::Result;
 use crate::topology::{QueueTopology, TopologyDeclarer};
-use crate::ShoveError;
 
 use super::client::NatsClient;
 
@@ -51,7 +53,9 @@ impl NatsTopologyDeclarer {
 
     async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
-        let seq = topology.sequencing().expect("sequenced topology must have sequencing config");
+        let seq = topology
+            .sequencing()
+            .expect("sequenced topology must have sequencing config");
 
         // Main stream with shard subjects
         let subjects: Vec<String> = (0..seq.routing_shards())

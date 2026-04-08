@@ -5,9 +5,9 @@ use std::time::Duration;
 use async_nats::jetstream;
 use tokio_util::sync::CancellationToken;
 
+use crate::ShoveError;
 use crate::error::Result;
 use crate::retry::Backoff;
-use crate::ShoveError;
 
 pub struct NatsConfig {
     pub url: String,
@@ -24,7 +24,11 @@ impl fmt::Debug for NatsConfig {
         // Redact credentials: nats://user:pass@host → nats://***@host
         let redacted = if let Some(at_pos) = self.url.find('@') {
             if let Some(scheme_end) = self.url.find("://") {
-                format!("{}://***@{}", &self.url[..scheme_end], &self.url[at_pos + 1..])
+                format!(
+                    "{}://***@{}",
+                    &self.url[..scheme_end],
+                    &self.url[at_pos + 1..]
+                )
             } else {
                 "***".to_string()
             }
