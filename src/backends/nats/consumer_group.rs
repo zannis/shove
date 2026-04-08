@@ -18,7 +18,7 @@ use crate::topic::Topic;
 use crate::topology::TopologyDeclarer;
 
 /// Type-erased factory that spawns a single consumer task.
-type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
+pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // NatsConsumerGroupConfig
@@ -112,12 +112,12 @@ impl NatsConsumerGroupConfig {
 // ---------------------------------------------------------------------------
 
 pub struct NatsConsumerGroup {
-    name: String,
-    queue: String,
-    config: NatsConsumerGroupConfig,
-    spawner: Spawner,
-    consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
-    group_token: CancellationToken,
+    pub(crate) name: String,
+    pub(crate) queue: String,
+    pub(crate) config: NatsConsumerGroupConfig,
+    pub(crate) spawner: Spawner,
+    pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
+    pub(crate) group_token: CancellationToken,
 }
 
 impl NatsConsumerGroup {
@@ -266,15 +266,25 @@ impl NatsConsumerGroup {
 // ---------------------------------------------------------------------------
 
 pub struct NatsConsumerGroupRegistry {
-    groups: HashMap<String, NatsConsumerGroup>,
-    client: NatsClient,
+    pub(crate) groups: HashMap<String, NatsConsumerGroup>,
+    client: Option<NatsClient>,
 }
 
 impl NatsConsumerGroupRegistry {
     pub fn new(client: NatsClient) -> Self {
         Self {
             groups: HashMap::new(),
-            client,
+            client: Some(client),
+        }
+    }
+
+    /// Create a registry from a pre-populated map of groups (for testing).
+    /// The resulting registry cannot be used to call `register()`.
+    #[cfg(test)]
+    pub(crate) fn from_groups(groups: HashMap<String, NatsConsumerGroup>) -> Self {
+        Self {
+            groups,
+            client: None,
         }
     }
 
@@ -296,16 +306,20 @@ impl NatsConsumerGroupRegistry {
             )));
         }
 
-        let declarer = NatsTopologyDeclarer::new(self.client.clone());
+        let client = self.client.as_ref().ok_or_else(|| {
+            ShoveError::Connection("registry has no client (test-only registry)".into())
+        })?;
+
+        let declarer = NatsTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
         info!(group = %name, "registering consumer group");
-        let group_token = self.client.shutdown_token().child_token();
+        let group_token = client.shutdown_token().child_token();
         let group = NatsConsumerGroup::new::<T, H>(
             name.clone(),
             name.clone(),
             config,
-            self.client.clone(),
+            client.clone(),
             group_token,
             handler_factory,
         );
