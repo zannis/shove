@@ -176,8 +176,7 @@ where
 struct PendingMessage {
     receipt_handle: String,
     body: String,
-    message_attributes:
-        HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
     retry_count: u32,
     outcome_rx: oneshot::Receiver<Outcome>,
 }
@@ -498,10 +497,7 @@ async fn route_outcome(
     queue_url: &str,
     receipt_handle: &str,
     body: &str,
-    message_attributes: &HashMap<
-        String,
-        aws_sdk_sqs::types::MessageAttributeValue,
-    >,
+    message_attributes: &HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
@@ -547,8 +543,7 @@ enum KeyState {
     InFlight {
         receipt_handle: String,
         body: String,
-        message_attributes:
-            HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+        message_attributes: HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
         retry_count: u32,
         outcome_rx: oneshot::Receiver<Outcome>,
     },
