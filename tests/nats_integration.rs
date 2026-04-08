@@ -869,3 +869,369 @@ async fn handler_timeout_triggers_retry() {
     handle.await.unwrap().ok();
     client.shutdown().await;
 }
+
+// ===========================================================================
+// Sequenced (FIFO) consumption
+// ===========================================================================
+
+#[tokio::test]
+async fn sequenced_consume_preserves_order() {
+    let client = connect().await;
+    declare::<SeqSkipTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..5u64 {
+        pub_
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "key-A".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = OrderRecordingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::new(sc).with_max_retries(5)).await
+    });
+
+    assert!(handler.counter.wait_for(5, Duration::from_secs(30)).await, "should receive all 5 messages");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let records = handler.records().await;
+    let amounts: Vec<u64> = records.iter().map(|(_, a)| *a).collect();
+    assert_eq!(amounts, vec![0, 1, 2, 3, 4], "messages should be in order");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn sequenced_skip_continues_after_rejection() {
+    struct RejectFirstHandler {
+        counter: WaitableCounter,
+    }
+
+    impl MessageHandler<SeqSkipTopic> for RejectFirstHandler {
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+            self.counter.increment();
+            if msg.amount == 0 {
+                Outcome::Reject
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let client = connect().await;
+    declare::<SeqSkipTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..3u64 {
+        pub_
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "key-B".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let counter = WaitableCounter::new();
+    let handler = RejectFirstHandler { counter: counter.clone() };
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(handler, ConsumerOptions::new(sc).with_max_retries(5))
+            .await
+    });
+
+    assert!(counter.wait_for(3, Duration::from_secs(30)).await, "should process all 3 messages");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn sequenced_multiple_keys_concurrent() {
+    let client = connect().await;
+    declare::<SeqSkipTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..3u64 {
+        pub_.publish::<SeqSkipTopic>(&OrderMessage { order_id: "alice".into(), amount: i }).await.unwrap();
+        pub_.publish::<SeqSkipTopic>(&OrderMessage { order_id: "bob".into(), amount: i + 100 }).await.unwrap();
+    }
+
+    let handler = OrderRecordingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::new(sc).with_max_retries(5)).await
+    });
+
+    assert!(handler.counter.wait_for(6, Duration::from_secs(30)).await, "should receive all 6 messages");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let records = handler.records().await;
+    let alice: Vec<u64> = records.iter().filter(|(k, _)| k == "alice").map(|(_, a)| *a).collect();
+    let bob: Vec<u64> = records.iter().filter(|(k, _)| k == "bob").map(|(_, a)| *a).collect();
+    assert_eq!(alice, vec![0, 1, 2], "alice messages should be in order");
+    assert_eq!(bob, vec![100, 101, 102], "bob messages should be in order");
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Consumer group
+// ===========================================================================
+
+#[tokio::test]
+async fn consumer_group_processes_messages() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage { id: format!("cg-{i}"), content: format!("msg {i}") })
+        .collect();
+    pub_.publish_batch::<WorkTopic>(&messages).await.unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let group = NatsConsumerGroup::new(
+        client.clone(),
+        NatsConsumerGroupConfig {
+            prefetch_count: 5,
+            min_consumers: 2,
+            max_consumers: 2,
+            max_retries: 5,
+            ..Default::default()
+        },
+    );
+
+    let handle = tokio::spawn(async move { group.run::<WorkTopic>(hc, sc).await });
+
+    assert!(handler.counter.wait_for(5, Duration::from_secs(30)).await, "consumer group should process all 5 messages");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert_eq!(handler.counter.get(), 5);
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Deserialization failure
+// ===========================================================================
+
+#[tokio::test]
+async fn deserialization_failure_rejects_to_dlq() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    // Publish raw invalid JSON directly to the stream
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(async_nats::header::NATS_MESSAGE_ID, "bad-json-1");
+    client
+        .jetstream()
+        .publish_with_headers(
+            "nats-work".to_string(),
+            headers,
+            bytes::Bytes::from(b"not valid json".as_slice()),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    // Start consumer — should reject the bad message to DLQ
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let _handle = tokio::spawn(async move {
+        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+    });
+
+    // Verify it lands in DLQ
+    let dlq_handler = DlqRecordingHandler::new();
+    let dhc = dlq_handler.clone();
+    let dlq_consumer = NatsConsumer::new(client.clone());
+    let _dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic>(dhc).await });
+
+    assert!(
+        dlq_handler.counter.wait_for(1, TIMEOUT).await,
+        "bad JSON message should land in DLQ"
+    );
+
+    assert_eq!(handler.counter.get(), 0, "handler should not be called for bad JSON");
+
+    shutdown.cancel();
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Edge cases
+// ===========================================================================
+
+#[tokio::test]
+async fn consumer_run_on_undeclared_stream_fails() {
+    shove::define_topic!(
+        UndeclaredTopic,
+        SimpleMessage,
+        TopologyBuilder::new("nats-undeclared-xyz").build()
+    );
+
+    struct Noop;
+    impl MessageHandler<UndeclaredTopic> for Noop {
+        async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome { Outcome::Ack }
+    }
+
+    let client = connect().await;
+    let consumer = NatsConsumer::new(client.clone());
+    let shutdown = CancellationToken::new();
+
+    let result = consumer
+        .run::<UndeclaredTopic>(Noop, ConsumerOptions::new(shutdown))
+        .await;
+
+    assert!(result.is_err(), "run on undeclared stream should fail");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn run_dlq_on_topic_without_dlq_fails() {
+    struct Noop;
+    impl MessageHandler<NoDlqTopic> for Noop {
+        async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome { Outcome::Ack }
+    }
+
+    let client = connect().await;
+    let consumer = NatsConsumer::new(client.clone());
+
+    let result = consumer.run_dlq::<NoDlqTopic>(Noop).await;
+    assert!(result.is_err(), "run_dlq on topic without DLQ should fail");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn defer_without_hold_queues_redelivers() {
+    struct DeferThenAck(WaitableCounter);
+
+    impl MessageHandler<DeferNoHoldTopic> for DeferThenAck {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            let prev = self.0.get();
+            self.0.increment();
+            if prev == 0 { Outcome::Defer } else { Outcome::Ack }
+        }
+    }
+
+    let client = connect().await;
+    declare::<DeferNoHoldTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<DeferNoHoldTopic>(&SimpleMessage { id: "defer-nohold".into(), content: "test".into() })
+        .await
+        .unwrap();
+
+    let counter = WaitableCounter::new();
+    let handler = DeferThenAck(counter.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<DeferNoHoldTopic>(handler, ConsumerOptions::new(sc).with_prefetch_count(1))
+            .await
+    });
+
+    assert!(counter.wait_for(2, Duration::from_secs(30)).await, "should be called at least 2 times");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn defer_preserves_retry_count() {
+    struct DeferCheckRetry {
+        counter: WaitableCounter,
+        retry_counts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl MessageHandler<WorkTopic> for DeferCheckRetry {
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+            self.retry_counts.lock().await.push(meta.retry_count);
+            let call = self.counter.get();
+            self.counter.increment();
+            match call {
+                0 => Outcome::Retry,  // retry_count becomes 1
+                1 => Outcome::Defer,  // retry_count should still be 1
+                _ => Outcome::Ack,
+            }
+        }
+    }
+
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage { id: "defer-retry".into(), content: "test".into() })
+        .await
+        .unwrap();
+
+    let counter = WaitableCounter::new();
+    let retry_counts = Arc::new(Mutex::new(Vec::new()));
+    let handler = DeferCheckRetry {
+        counter: counter.clone(),
+        retry_counts: retry_counts.clone(),
+    };
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc).with_max_retries(10).with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert!(counter.wait_for(3, Duration::from_secs(30)).await, "should be called 3 times");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let counts = retry_counts.lock().await;
+    assert_eq!(counts[0], 0, "first call: retry_count should be 0");
+    assert_eq!(counts[1], 1, "second call (after Retry): retry_count should be 1");
+    assert_eq!(counts[2], 1, "third call (after Defer): retry_count should still be 1");
+
+    client.shutdown().await;
+}
