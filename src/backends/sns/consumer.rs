@@ -175,6 +175,10 @@ where
 
 struct PendingMessage {
     receipt_handle: String,
+    body: String,
+    message_attributes:
+        std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    retry_count: u32,
     outcome_rx: oneshot::Receiver<Outcome>,
 }
 
@@ -270,7 +274,17 @@ where
                     }
                     let msg = in_flight.pop_front().unwrap();
                     debug!(queue_url, ?outcome, "message handled");
-                    route_outcome(sqs, queue_url, &msg.receipt_handle, outcome, topology, 0).await;
+                    route_outcome(
+                        sqs,
+                        queue_url,
+                        &msg.receipt_handle,
+                        &msg.body,
+                        &msg.message_attributes,
+                        outcome,
+                        topology,
+                        msg.retry_count,
+                    )
+                    .await;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
@@ -290,9 +304,11 @@ where
                         sqs,
                         queue_url,
                         &msg.receipt_handle,
+                        &msg.body,
+                        &msg.message_attributes,
                         Outcome::Retry,
                         topology,
-                        0,
+                        msg.retry_count,
                     )
                     .await;
                 }
@@ -332,9 +348,11 @@ where
                     sqs,
                     queue_url,
                     &pending.receipt_handle,
+                    &pending.body,
+                    &pending.message_attributes,
                     outcome,
                     topology,
-                    0,
+                    pending.retry_count,
                 )
                 .await;
             }
@@ -386,6 +404,12 @@ where
                 spawn_handler::<T, H>(handler, message, metadata, options.handler_timeout, &notify);
             in_flight.push_back(PendingMessage {
                 receipt_handle,
+                body: msg.body().unwrap_or_default().to_string(),
+                message_attributes: msg
+                    .message_attributes()
+                    .cloned()
+                    .unwrap_or_default(),
+                retry_count,
                 outcome_rx: rx,
             });
             options.processing.store(true, Ordering::Relaxed);
@@ -475,6 +499,8 @@ async fn route_outcome(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     receipt_handle: &str,
+    body: &str,
+    message_attributes: &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
@@ -482,10 +508,30 @@ async fn route_outcome(
     match outcome {
         Outcome::Ack => router::route_ack(sqs, queue_url, receipt_handle).await,
         Outcome::Retry => {
-            router::route_retry(sqs, queue_url, receipt_handle, topology, retry_count).await;
+            router::route_retry(
+                sqs,
+                queue_url,
+                receipt_handle,
+                body,
+                message_attributes,
+                topology,
+                retry_count,
+            )
+            .await;
         }
         Outcome::Reject => router::route_reject(sqs, queue_url, receipt_handle, topology).await,
-        Outcome::Defer => router::route_defer(sqs, queue_url, receipt_handle, topology).await,
+        Outcome::Defer => {
+            router::route_defer(
+                sqs,
+                queue_url,
+                receipt_handle,
+                body,
+                message_attributes,
+                topology,
+                retry_count,
+            )
+            .await;
+        }
     }
 }
 
@@ -499,6 +545,9 @@ enum KeyState {
     /// A handler is currently running for this key.
     InFlight {
         receipt_handle: String,
+        body: String,
+        message_attributes:
+            std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
         retry_count: u32,
         outcome_rx: oneshot::Receiver<Outcome>,
     },
@@ -640,6 +689,8 @@ where
             };
             let KeyState::InFlight {
                 receipt_handle,
+                body,
+                message_attributes,
                 retry_count,
                 mut outcome_rx,
             } = state
@@ -656,11 +707,12 @@ where
                     Outcome::Retry
                 }
                 Err(TryRecvError::Empty) => {
-                    // Notified but not ready yet (shouldn't happen in practice).
                     key_states.insert(
                         key,
                         KeyState::InFlight {
                             receipt_handle,
+                            body,
+                            message_attributes,
                             retry_count,
                             outcome_rx,
                         },
@@ -718,13 +770,35 @@ where
                     .await;
                 }
                 Outcome::Retry => {
-                    router::route_retry(sqs, queue_url, &receipt_handle, topology, retry_count)
-                        .await;
+                    router::route_retry(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        &body,
+                        &message_attributes,
+                        topology,
+                        retry_count,
+                    )
+                    .await;
                     in_flight_count -= 1;
                     key_states.insert(key, KeyState::AwaitingRetry);
                 }
                 Outcome::Defer => {
-                    router::route_defer(sqs, queue_url, &receipt_handle, topology).await;
+                    warn!(
+                        queue_url,
+                        sequence_key = %key,
+                        "Defer is not supported on sequenced (FIFO) consumers, treating as Retry"
+                    );
+                    router::route_retry(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        &body,
+                        &message_attributes,
+                        topology,
+                        retry_count,
+                    )
+                    .await;
                     in_flight_count -= 1;
                     key_states.insert(key, KeyState::AwaitingRetry);
                 }
@@ -747,7 +821,7 @@ where
                 );
                 // Wait for all in-flight handlers to complete.
                 for (key, state) in key_states.drain() {
-                    if let KeyState::InFlight { receipt_handle, retry_count, outcome_rx } = state {
+                    if let KeyState::InFlight { receipt_handle, body, message_attributes, retry_count, outcome_rx } = state {
                         let outcome = outcome_rx.await.unwrap_or(Outcome::Retry);
                         debug!(
                             queue_url,
@@ -763,12 +837,33 @@ where
                                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                             }
                             Outcome::Retry => {
-                                router::route_retry(sqs, queue_url, &receipt_handle, topology, retry_count)
-                                    .await;
+                                router::route_retry(
+                                    sqs,
+                                    queue_url,
+                                    &receipt_handle,
+                                    &body,
+                                    &message_attributes,
+                                    topology,
+                                    retry_count,
+                                )
+                                .await;
                             }
                             Outcome::Defer => {
-                                router::route_defer(sqs, queue_url, &receipt_handle, topology)
-                                    .await;
+                                warn!(
+                                    queue_url,
+                                    sequence_key = %key,
+                                    "Defer is not supported on sequenced (FIFO) consumers, treating as Retry"
+                                );
+                                router::route_retry(
+                                    sqs,
+                                    queue_url,
+                                    &receipt_handle,
+                                    &body,
+                                    &message_attributes,
+                                    topology,
+                                    retry_count,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -978,6 +1073,11 @@ where
                         seq_key,
                         KeyState::InFlight {
                             receipt_handle,
+                            body: msg.body().unwrap_or_default().to_string(),
+                            message_attributes: msg
+                                .message_attributes()
+                                .cloned()
+                                .unwrap_or_default(),
                             retry_count,
                             outcome_rx: rx,
                         },
@@ -1092,6 +1192,11 @@ async fn drain_pending_for_key<T, H>(
             key.to_string(),
             KeyState::InFlight {
                 receipt_handle,
+                body: msg.body().unwrap_or_default().to_string(),
+                message_attributes: msg
+                    .message_attributes()
+                    .cloned()
+                    .unwrap_or_default(),
                 retry_count,
                 outcome_rx: rx,
             },
