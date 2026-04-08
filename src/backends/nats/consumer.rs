@@ -246,7 +246,7 @@ async fn route_outcome(
                 };
                 match republish_with_retry(
                     client,
-                    topology.queue().to_string(),
+                    msg.subject.to_string(),
                     msg,
                     new_count,
                     delay,
