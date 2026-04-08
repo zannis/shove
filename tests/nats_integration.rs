@@ -17,6 +17,9 @@ use shove::outcome::Outcome;
 use shove::publisher::Publisher;
 use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
 use shove::SequencedTopic as _;
+use testcontainers::runners::AsyncRunner;
+use testcontainers::ImageExt;
+use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -119,14 +122,40 @@ shove::define_sequenced_topic!(
 );
 
 // ---------------------------------------------------------------------------
-// Test helpers
+// Test harness: shared setup
 // ---------------------------------------------------------------------------
 
-async fn connect() -> NatsClient {
-    let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-    NatsClient::connect(&NatsConfig::new(url))
-        .await
-        .expect("failed to connect to NATS")
+struct TestBroker {
+    _container: testcontainers::ContainerAsync<Nats>,
+    nats_url: String,
+}
+
+impl TestBroker {
+    async fn start() -> Self {
+        let cmd = NatsServerCmd::default().with_jetstream();
+        let container = Nats::default()
+            .with_cmd(&cmd)
+            .start()
+            .await
+            .expect("failed to start NATS container");
+        let host = container.get_host().await.expect("failed to get host");
+        let port = container
+            .get_host_port_ipv4(4222)
+            .await
+            .expect("failed to get NATS port");
+        let nats_url = format!("nats://{host}:{port}");
+
+        Self {
+            _container: container,
+            nats_url,
+        }
+    }
+
+    async fn connect(&self) -> NatsClient {
+        NatsClient::connect_with_retry(&NatsConfig::new(&self.nats_url), 10)
+            .await
+            .expect("failed to connect to NATS")
+    }
 }
 
 async fn declare<T: shove::topic::Topic>(client: &NatsClient) {
@@ -284,7 +313,8 @@ impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
 
 #[tokio::test]
 async fn client_connect_and_shutdown() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
 
     assert!(
         !client.shutdown_token().is_cancelled(),
@@ -301,7 +331,8 @@ async fn client_connect_and_shutdown() {
 
 #[tokio::test]
 async fn client_shutdown_cancels_token() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     let token = client.shutdown_token();
     assert!(!token.is_cancelled());
 
@@ -315,7 +346,8 @@ async fn client_shutdown_cancels_token() {
 
 #[tokio::test]
 async fn topology_declares_standard_stream_and_dlq() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     // Verify main stream exists
@@ -331,7 +363,8 @@ async fn topology_declares_standard_stream_and_dlq() {
 
 #[tokio::test]
 async fn topology_declares_sequenced_stream_with_shards() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<SeqSkipTopic>(&client).await;
 
     // Verify main stream exists with shard subjects
@@ -361,7 +394,8 @@ async fn topology_declares_sequenced_stream_with_shards() {
 
 #[tokio::test]
 async fn topology_idempotent() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
 
     declare::<WorkTopic>(&client).await;
     declare::<WorkTopic>(&client).await; // second call should not fail
@@ -378,7 +412,8 @@ async fn topology_idempotent() {
 
 #[tokio::test]
 async fn publish_and_consume_simple_message() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -420,7 +455,8 @@ async fn publish_and_consume_with_headers() {
         }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -469,7 +505,8 @@ async fn publish_and_consume_with_headers() {
 
 #[tokio::test]
 async fn publish_and_consume_batch() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -509,7 +546,8 @@ async fn publish_and_consume_batch() {
 
 #[tokio::test]
 async fn rejected_message_lands_in_dlq() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -547,7 +585,8 @@ async fn rejected_message_lands_in_dlq() {
 
 #[tokio::test]
 async fn dlq_consumer_handles_dead_message() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -591,7 +630,8 @@ async fn dlq_consumer_handles_dead_message() {
 
 #[tokio::test]
 async fn retry_then_ack_succeeds() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -622,7 +662,8 @@ async fn retry_then_ack_succeeds() {
 
 #[tokio::test]
 async fn max_retries_sends_to_dlq() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -679,7 +720,8 @@ async fn defer_redelivers_message() {
         }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -714,7 +756,8 @@ async fn defer_redelivers_message() {
 
 #[tokio::test]
 async fn concurrent_consume_processes_all_messages() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -757,7 +800,8 @@ async fn concurrent_consume_mixed_outcomes() {
         }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -790,7 +834,8 @@ async fn concurrent_consume_mixed_outcomes() {
 
 #[tokio::test]
 async fn graceful_shutdown_drains_inflight() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -835,7 +880,8 @@ async fn handler_timeout_triggers_retry() {
         }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -876,7 +922,8 @@ async fn handler_timeout_triggers_retry() {
 
 #[tokio::test]
 async fn sequenced_consume_preserves_order() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<SeqSkipTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -928,7 +975,8 @@ async fn sequenced_skip_continues_after_rejection() {
         }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<SeqSkipTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -964,7 +1012,8 @@ async fn sequenced_skip_continues_after_rejection() {
 
 #[tokio::test]
 async fn sequenced_multiple_keys_concurrent() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<SeqSkipTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -1002,7 +1051,8 @@ async fn sequenced_multiple_keys_concurrent() {
 
 #[tokio::test]
 async fn consumer_group_processes_messages() {
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -1012,27 +1062,28 @@ async fn consumer_group_processes_messages() {
     pub_.publish_batch::<WorkTopic>(&messages).await.unwrap();
 
     let handler = CountingHandler::new();
-    let hc = handler.clone();
+    let handler_clone = handler.clone();
     let shutdown = CancellationToken::new();
-    let sc = shutdown.clone();
 
-    let group = NatsConsumerGroup::new(
+    let config = NatsConsumerGroupConfig::new(2..=2)
+        .with_prefetch_count(5)
+        .with_max_retries(5);
+
+    let group_token = shutdown.child_token();
+    let mut group = NatsConsumerGroup::new::<WorkTopic, CountingHandler>(
+        "test-cg",
+        "nats-work",
+        config,
         client.clone(),
-        NatsConsumerGroupConfig {
-            prefetch_count: 5,
-            min_consumers: 2,
-            max_consumers: 2,
-            max_retries: 5,
-            ..Default::default()
-        },
+        group_token,
+        move || handler_clone.clone(),
     );
-
-    let handle = tokio::spawn(async move { group.run::<WorkTopic>(hc, sc).await });
+    group.start();
 
     assert!(handler.counter.wait_for(5, Duration::from_secs(30)).await, "consumer group should process all 5 messages");
 
     shutdown.cancel();
-    handle.await.unwrap().ok();
+    group.shutdown().await;
     assert_eq!(handler.counter.get(), 5);
     client.shutdown().await;
 }
@@ -1043,7 +1094,11 @@ async fn consumer_group_processes_messages() {
 
 #[tokio::test]
 async fn deserialization_failure_rejects_to_dlq() {
-    let client = connect().await;
+    use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+    use futures_util::StreamExt;
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     // Publish raw invalid JSON directly to the stream
@@ -1072,16 +1127,33 @@ async fn deserialization_failure_rejects_to_dlq() {
         consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1)).await
     });
 
-    // Verify it lands in DLQ
-    let dlq_handler = DlqRecordingHandler::new();
-    let dhc = dlq_handler.clone();
-    let dlq_consumer = NatsConsumer::new(client.clone());
-    let _dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic>(dhc).await });
+    // Verify it lands in the DLQ stream directly (the payload is not valid
+    // T::Message, so run_dlq's handle_dead cannot be used here).
+    let dlq_stream = client
+        .jetstream()
+        .get_stream("nats-work-dlq")
+        .await
+        .expect("DLQ stream should exist");
+    let dlq_pull = dlq_stream
+        .get_or_create_consumer(
+            "test-dlq-reader",
+            PullConsumerConfig {
+                durable_name: Some("test-dlq-reader".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("DLQ consumer should be created");
+    let mut msgs = dlq_pull.messages().await.unwrap();
 
-    assert!(
-        dlq_handler.counter.wait_for(1, TIMEOUT).await,
-        "bad JSON message should land in DLQ"
-    );
+    let dlq_msg = tokio::time::timeout(TIMEOUT, msgs.next())
+        .await
+        .expect("should receive DLQ message before timeout")
+        .expect("stream should not be closed")
+        .expect("message should be valid");
+
+    assert_eq!(dlq_msg.payload.as_ref(), b"not valid json");
+    dlq_msg.ack().await.unwrap();
 
     assert_eq!(handler.counter.get(), 0, "handler should not be called for bad JSON");
 
@@ -1106,7 +1178,8 @@ async fn consumer_run_on_undeclared_stream_fails() {
         async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome { Outcome::Ack }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     let consumer = NatsConsumer::new(client.clone());
     let shutdown = CancellationToken::new();
 
@@ -1125,7 +1198,8 @@ async fn run_dlq_on_topic_without_dlq_fails() {
         async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome { Outcome::Ack }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     let consumer = NatsConsumer::new(client.clone());
 
     let result = consumer.run_dlq::<NoDlqTopic>(Noop).await;
@@ -1145,7 +1219,8 @@ async fn defer_without_hold_queues_redelivers() {
         }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<DeferNoHoldTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;
@@ -1194,7 +1269,8 @@ async fn defer_preserves_retry_count() {
         }
     }
 
-    let client = connect().await;
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
     declare::<WorkTopic>(&client).await;
 
     let pub_ = make_publisher(&client).await;

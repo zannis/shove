@@ -49,7 +49,7 @@ futures-util = { version = "0.3", optional = true }
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack"] }
+testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }

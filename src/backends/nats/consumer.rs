@@ -348,11 +348,12 @@ async fn invoke_handler<T: Topic>(
 // Reconnect loop
 // ---------------------------------------------------------------------------
 
-/// Runs `f` in a reconnect loop, retrying on transient errors until shutdown.
-/// Matches the pattern used by RabbitMqConsumer.
+/// Runs `f` in a reconnect loop, retrying on transient errors until shutdown
+/// or `max_retries` consecutive failures.
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
+    max_retries: u32,
     mut f: F,
 ) -> Result<()>
 where
@@ -360,6 +361,7 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     let mut backoff = crate::retry::Backoff::default();
+    let mut attempts = 0u32;
     loop {
         match f().await {
             Ok(()) => return Ok(()),
@@ -367,10 +369,16 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
+                attempts += 1;
+                if attempts >= max_retries {
+                    return Err(e);
+                }
                 let delay = backoff.next().expect("backoff is infinite");
                 tracing::warn!(
                     error = %e,
                     label,
+                    attempt = attempts,
+                    max_retries,
                     delay_ms = delay.as_millis() as u64,
                     "consumer error, reconnecting"
                 );
@@ -428,14 +436,24 @@ impl Consumer for NatsConsumer {
             "NATS consumer started"
         );
 
-        run_with_reconnect(&shutdown, queue, || {
+        // Verify the stream exists before entering the reconnect loop.
+        // A missing stream is a permanent error, not a transient one.
+        let stream = client
+            .jetstream()
+            .get_stream(queue)
+            .await
+            .map_err(|e| {
+                ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
+            })?;
+        drop(stream);
+
+        run_with_reconnect(&shutdown, queue, max_retries, || {
             let handler = handler.clone();
             let client = client.clone();
             let processing = processing.clone();
             let shutdown = shutdown.clone();
             let consumer_name = consumer_name.clone();
             async move {
-                // Get the stream
                 let stream = client
                     .jetstream()
                     .get_stream(queue)
@@ -472,7 +490,9 @@ impl Consumer for NatsConsumer {
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => {
-                            tracing::info!(queue, "shutdown signal received, stopping consumer");
+                            tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
+                            // Wait for all in-flight tasks to finish
+                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             return Ok(());
                         }
                         item = messages.next() => {
@@ -755,7 +775,17 @@ impl Consumer for NatsConsumer {
             "NATS DLQ consumer started"
         );
 
-        run_with_reconnect(&shutdown, dlq, || {
+        // Verify the DLQ stream exists before entering the reconnect loop.
+        let stream = client
+            .jetstream()
+            .get_stream(dlq)
+            .await
+            .map_err(|e| {
+                ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
+            })?;
+        drop(stream);
+
+        run_with_reconnect(&shutdown, dlq, 10, || {
             let handler = handler.clone();
             let client = client.clone();
             let shutdown = shutdown.clone();
