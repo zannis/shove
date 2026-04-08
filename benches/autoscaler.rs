@@ -174,8 +174,9 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
 
                 let registry = Arc::new(Mutex::new(registry));
                 let mgmt_config = rabbit.mgmt_config();
-                let mut autoscaler = Autoscaler::new(
+                let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
                     &mgmt_config,
+                    registry.clone(),
                     AutoscalerConfig {
                         poll_interval: Duration::from_millis(1),
                         hysteresis_duration: Duration::ZERO,
@@ -186,9 +187,8 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
 
                 let shutdown = CancellationToken::new();
                 let handle = tokio::spawn({
-                    let reg = registry.clone();
                     let s = shutdown.clone();
-                    async move { autoscaler.run(reg, s).await }
+                    async move { autoscaler.run(s).await }
                 });
 
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -308,8 +308,9 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                         let shutdown = CancellationToken::new();
                         let handle = if max > min {
                             let mgmt_config = rabbit.mgmt_config();
-                            let mut autoscaler = Autoscaler::new(
+                            let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
                                 &mgmt_config,
+                                registry.clone(),
                                 AutoscalerConfig {
                                     poll_interval: Duration::from_secs(1),
                                     scale_up_multiplier: 1.5,
@@ -318,9 +319,8 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                                     ..Default::default()
                                 },
                             );
-                            let reg = registry.clone();
                             let s = shutdown.clone();
-                            Some(tokio::spawn(async move { autoscaler.run(reg, s).await }))
+                            Some(tokio::spawn(async move { autoscaler.run(s).await }))
                         } else {
                             None
                         };
