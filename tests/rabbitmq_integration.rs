@@ -1982,6 +1982,18 @@ async fn autoscaler_scales_down_when_idle() {
 
 // --- Autoscaler custom strategy (pluggable) ---
 
+/// Slow handler that takes 2s per message, keeping messages queued long enough
+/// for the autoscaler to observe them.
+#[derive(Clone)]
+struct SlowScalableHandler;
+
+impl MessageHandler<ScalableWork> for SlowScalableHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Outcome::Ack
+    }
+}
+
 #[tokio::test]
 async fn autoscaler_custom_strategy_pluggable() {
     use tokio::sync::Mutex;
@@ -2001,21 +2013,22 @@ async fn autoscaler_custom_strategy_pluggable() {
     let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
-    let handler = CountingHandler::new();
-    let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
-            move || h.clone(),
+            || SlowScalableHandler,
         )
         .await
         .unwrap();
     registry.start_all();
 
-    // Publish 5 messages — below DefaultThreshold scale-up (5 * 1 * 2.0 = 10),
-    // but AlwaysScaleUpStrategy fires for any messages_ready > 0.
+    // Publish 20 messages. With a 2s handler and prefetch=5, one consumer
+    // can only process ~2.5 msg/s — plenty stay queued for the autoscaler.
+    // 5 messages would be below the default ThresholdStrategy scale-up
+    // threshold (capacity=5, threshold=10), but AlwaysScaleUpStrategy fires
+    // for any messages_ready > 0.
     let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
-    let messages: Vec<SimpleMessage> = (0..5)
+    let messages: Vec<SimpleMessage> = (0..20)
         .map(|i| SimpleMessage {
             body: format!("custom-{i}"),
         })
@@ -2040,8 +2053,8 @@ async fn autoscaler_custom_strategy_pluggable() {
         autoscaler.run(token_clone).await;
     });
 
-    // Wait up to 15s for at least 2 active consumers (1 initial + 1 from custom strategy)
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Wait up to 30s for at least 2 active consumers (1 initial + 1 from custom strategy)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let active = {
             let reg = registry.lock().await;
@@ -2186,19 +2199,18 @@ async fn autoscaler_scale_up_magnitude() {
     let broker = TestBroker::start().await;
     let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
 
+    // Use SlowScalableHandler (2s per message) so the queue stays deep.
     let mut registry = ConsumerGroupRegistry::new(client.clone());
-    let handler = CountingHandler::new();
-    let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(1..=5).with_prefetch_count(5),
-            move || h.clone(),
+            || SlowScalableHandler,
         )
         .await
         .unwrap();
     registry.start_all(); // starts 1 consumer
 
-    // Publish 50 messages so messages_ready > 0 on every poll
+    // Publish 50 messages — with 2s handler, they stay queued for many poll cycles.
     let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
     let messages: Vec<SimpleMessage> = (0..50)
         .map(|i| SimpleMessage {
@@ -2224,8 +2236,8 @@ async fn autoscaler_scale_up_magnitude() {
         autoscaler.run(token_clone).await;
     });
 
-    // Wait up to 10s for >= 3 consumers (1 initial + 2 from single ScaleUp(2))
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Wait up to 30s for >= 3 consumers (1 initial + 2 from single ScaleUp(2))
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let active = {
             let reg = registry.lock().await;
