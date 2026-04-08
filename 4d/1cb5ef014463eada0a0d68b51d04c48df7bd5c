@@ -1,0 +1,25 @@
+tests/sns_sqs_integration.rs
+  df153fcedd6bc2c2 2077-2078,2251-2252,2257
+tests/rabbitmq_integration.rs
+  df153fcedd6bc2c2 1767-1781,1859-1873
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "4d1cb5ef014463eada0a0d68b51d04c48df7bd5c",
+  "prompts": {
+    "df153fcedd6bc2c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d620fbe-4b3e-4ea0-826d-3111b347d957",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 36,
+      "total_deletions": 55,
+      "accepted_lines": 35,
+      "overriden_lines": 0
+    }
+  }
+}
