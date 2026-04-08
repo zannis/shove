@@ -489,16 +489,265 @@ impl Consumer for NatsConsumer {
 
     async fn run_fifo<T: SequencedTopic>(
         &self,
-        _handler: impl MessageHandler<T>,
-        _options: ConsumerOptions,
+        handler: impl MessageHandler<T>,
+        options: ConsumerOptions,
     ) -> Result<()> {
-        todo!("NatsConsumer::run_fifo will be implemented in Task 6")
+        let topology = T::topology();
+        let queue = topology.queue();
+        let seq_config = topology
+            .sequencing()
+            .expect("run_fifo requires a sequenced topology");
+        let routing_shards = seq_config.routing_shards();
+
+        // Extract needed values from options before spawning tasks.
+        let shutdown = options.shutdown.clone();
+        let processing = options.processing.clone();
+        let max_retries = options.max_retries;
+        let handler_timeout = options.handler_timeout;
+        let hold_queues = topology.hold_queues();
+
+        // Get the stream
+        let stream = self
+            .client
+            .jetstream()
+            .get_stream(queue)
+            .await
+            .map_err(|e| ShoveError::Connection(format!("failed to get stream {queue}: {e}")))?;
+
+        // Wrap handler in Arc for sharing across shard tasks
+        let handler = Arc::new(handler);
+        let client = self.client.clone();
+
+        tracing::info!(
+            queue,
+            routing_shards,
+            max_retries,
+            "NATS FIFO consumer started"
+        );
+
+        let mut shard_tasks = Vec::with_capacity(routing_shards as usize);
+
+        for shard in 0..routing_shards {
+            let consumer_name = format!("{queue}-shard-{shard}");
+            let filter_subject = format!("{queue}.shard.{shard}");
+
+            let pull_consumer = stream
+                .get_or_create_consumer(
+                    &consumer_name,
+                    PullConsumerConfig {
+                        durable_name: Some(consumer_name.clone()),
+                        filter_subject: filter_subject.clone(),
+                        ack_policy: AckPolicy::Explicit,
+                        max_ack_pending: 1,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    ShoveError::Connection(format!(
+                        "failed to create shard consumer {consumer_name}: {e}"
+                    ))
+                })?;
+
+            let shard_handler = handler.clone();
+            let shard_client = client.clone();
+            let shard_shutdown = shutdown.clone();
+            let shard_processing = processing.clone();
+
+            let task = tokio::spawn(async move {
+                let mut messages = match pull_consumer.messages().await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            shard,
+                            "failed to get message stream for shard"
+                        );
+                        return;
+                    }
+                };
+
+                loop {
+                    tokio::select! {
+                        _ = shard_shutdown.cancelled() => {
+                            tracing::info!(shard, "shutdown signal received, stopping shard consumer");
+                            return;
+                        }
+                        item = messages.next() => {
+                            let msg = match item {
+                                Some(Ok(msg)) => msg,
+                                Some(Err(e)) => {
+                                    tracing::error!(error = %e, shard, "shard consumer stream error");
+                                    return;
+                                }
+                                None => {
+                                    tracing::warn!(shard, "shard consumer stream closed");
+                                    return;
+                                }
+                            };
+
+                            // Deserialize payload; reject to DLQ on failure
+                            let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        shard,
+                                        "failed to deserialize message, sending to DLQ"
+                                    );
+                                    if let Err(dlq_err) = publish_to_dlq(
+                                        &shard_client,
+                                        topology,
+                                        &msg,
+                                        &format!("deserialization_error: {e}"),
+                                    ).await {
+                                        tracing::error!(
+                                            error = %dlq_err,
+                                            "failed to publish bad message to DLQ, nak-ing"
+                                        );
+                                        let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                        continue;
+                                    }
+                                    let _ = msg.ack().await;
+                                    continue;
+                                }
+                            };
+
+                            let metadata = extract_message_metadata(&msg);
+                            let retry_count = metadata.retry_count;
+
+                            shard_processing.store(true, Ordering::Release);
+
+                            let outcome = invoke_handler(
+                                shard_handler.as_ref(),
+                                payload,
+                                metadata,
+                                handler_timeout,
+                            )
+                            .await;
+
+                            route_outcome(
+                                &shard_client,
+                                &msg,
+                                outcome,
+                                topology,
+                                retry_count,
+                                max_retries,
+                                hold_queues,
+                            )
+                            .await;
+
+                            shard_processing.store(false, Ordering::Release);
+                        }
+                    }
+                }
+            });
+
+            shard_tasks.push(task);
+        }
+
+        // Wait for all shard tasks to complete
+        for task in shard_tasks {
+            let _ = task.await;
+        }
+
+        Ok(())
     }
 
     async fn run_dlq<T: Topic>(
         &self,
-        _handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T>,
     ) -> Result<()> {
-        todo!("NatsConsumer::run_dlq will be implemented in Task 6")
+        let topology = T::topology();
+        let dlq = topology
+            .dlq()
+            .ok_or_else(|| ShoveError::Topology("run_dlq requires a DLQ to be configured".into()))?;
+
+        let dlq_consumer_name = format!("{dlq}-consumer");
+
+        // Get the DLQ stream
+        let stream = self
+            .client
+            .jetstream()
+            .get_stream(dlq)
+            .await
+            .map_err(|e| ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}")))?;
+
+        // Create durable pull consumer for the DLQ
+        let pull_consumer = stream
+            .get_or_create_consumer(
+                &dlq_consumer_name,
+                PullConsumerConfig {
+                    durable_name: Some(dlq_consumer_name.clone()),
+                    ack_policy: AckPolicy::Explicit,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| {
+                ShoveError::Connection(format!(
+                    "failed to create DLQ consumer {dlq_consumer_name}: {e}"
+                ))
+            })?;
+
+        let mut messages = pull_consumer
+            .messages()
+            .await
+            .map_err(|e| ShoveError::Connection(format!("failed to get DLQ message stream: {e}")))?;
+
+        let shutdown = self.client.shutdown_token();
+
+        tracing::info!(
+            dlq,
+            consumer = dlq_consumer_name,
+            "NATS DLQ consumer started"
+        );
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!(dlq, "shutdown signal received, stopping DLQ consumer");
+                    return Ok(());
+                }
+                item = messages.next() => {
+                    let msg = match item {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(e)) => {
+                            tracing::error!(error = %e, dlq, "DLQ consumer stream error");
+                            return Err(ShoveError::Connection(
+                                format!("DLQ consumer stream error on {dlq}: {e}"),
+                            ));
+                        }
+                        None => {
+                            tracing::warn!(dlq, "DLQ consumer stream closed");
+                            return Ok(());
+                        }
+                    };
+
+                    // Deserialize payload; on failure, log and ack anyway
+                    let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                dlq,
+                                "failed to deserialize DLQ message, acking anyway"
+                            );
+                            let _ = msg.ack().await;
+                            continue;
+                        }
+                    };
+
+                    let metadata = extract_dead_metadata(&msg);
+
+                    handler.handle_dead(payload, metadata).await;
+
+                    // Always ack after handle_dead completes
+                    if let Err(e) = msg.ack().await {
+                        tracing::error!(error = %e, dlq, "failed to ack DLQ message");
+                    }
+                }
+            }
+        }
     }
 }
