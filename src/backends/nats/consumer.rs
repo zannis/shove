@@ -516,6 +516,8 @@ impl Consumer for NatsConsumer {
                             let task_handler = handler.clone();
                             let task_client = client.clone();
                             let task_processing = processing.clone();
+                            let task_semaphore = semaphore.clone();
+                            let task_prefetch = prefetch_count;
 
                             tokio::spawn(async move {
                                 task_processing.store(true, Ordering::Release);
@@ -539,8 +541,11 @@ impl Consumer for NatsConsumer {
                                 )
                                 .await;
 
-                                task_processing.store(false, Ordering::Release);
                                 drop(permit);
+                                // Only report idle when ALL permits are available (no other tasks in-flight)
+                                if task_semaphore.available_permits() == task_prefetch as usize {
+                                    task_processing.store(false, Ordering::Release);
+                                }
                             });
                         }
                     }
@@ -699,8 +704,6 @@ impl Consumer for NatsConsumer {
                                 hold_queues,
                             )
                             .await;
-
-                            shard_processing.store(false, Ordering::Release);
                         }
                     }
                 }
