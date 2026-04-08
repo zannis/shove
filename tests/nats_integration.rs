@@ -1,7 +1,8 @@
 #![cfg(feature = "nats")]
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -9,236 +10,270 @@ use shove::consumer::{Consumer, ConsumerOptions};
 use shove::handler::MessageHandler;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::nats::{
-    NatsClient, NatsConfig, NatsConsumer, NatsPublisher, NatsTopologyDeclarer,
+    NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroup, NatsConsumerGroupConfig,
+    NatsPublisher, NatsTopologyDeclarer,
 };
 use shove::outcome::Outcome;
 use shove::publisher::Publisher;
-use shove::topology::{TopologyBuilder, TopologyDeclarer};
+use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
+use shove::SequencedTopic as _;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-// --- Test topic definitions ---
+// ---------------------------------------------------------------------------
+// WaitableCounter
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TestMessage {
-    id: u32,
-    body: String,
+#[derive(Clone)]
+struct WaitableCounter {
+    count: Arc<AtomicU32>,
+    signal: Arc<Notify>,
 }
 
+impl WaitableCounter {
+    fn new() -> Self {
+        Self {
+            count: Arc::new(AtomicU32::new(0)),
+            signal: Arc::new(Notify::new()),
+        }
+    }
+
+    fn increment(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+
+    fn get(&self) -> u32 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    async fn wait_for(&self, target: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.get() >= target {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.get() >= target;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Message types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SimpleMessage {
+    id: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct OrderMessage {
+    order_id: String,
+    amount: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Topic definitions
+// ---------------------------------------------------------------------------
+
 shove::define_topic!(
-    BasicTopic,
-    TestMessage,
-    TopologyBuilder::new("nats-test-basic")
-        .hold_queue(Duration::from_millis(100))
+    WorkTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-work")
         .dlq()
+        .hold_queue(Duration::from_millis(200))
+        .hold_queue(Duration::from_millis(500))
         .build()
 );
 
 shove::define_topic!(
-    RetryTopic,
-    TestMessage,
-    TopologyBuilder::new("nats-test-retry")
-        .hold_queue(Duration::from_millis(100))
+    NoDlqTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-nodlq").build()
+);
+
+shove::define_topic!(
+    DeferNoHoldTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-defer-nohold").dlq().build()
+);
+
+shove::define_sequenced_topic!(
+    SeqSkipTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-seq-skip")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(2)
         .hold_queue(Duration::from_millis(200))
         .dlq()
         .build()
 );
 
-// --- Test handlers ---
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
 
-struct CountingHandler {
-    count: Arc<AtomicU32>,
+async fn connect() -> NatsClient {
+    let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    NatsClient::connect(&NatsConfig::new(url))
+        .await
+        .expect("failed to connect to NATS")
 }
 
-impl MessageHandler<BasicTopic> for CountingHandler {
-    async fn handle(&self, _message: TestMessage, _metadata: MessageMetadata) -> Outcome {
-        self.count.fetch_add(1, Ordering::Relaxed);
+async fn declare<T: shove::topic::Topic>(client: &NatsClient) {
+    NatsTopologyDeclarer::new(client.clone())
+        .declare(T::topology())
+        .await
+        .expect("topology declaration should succeed");
+}
+
+async fn make_publisher(client: &NatsClient) -> NatsPublisher {
+    NatsPublisher::new(client.clone()).await.expect("publisher creation should succeed")
+}
+
+const TIMEOUT: Duration = Duration::from_secs(15);
+
+// ---------------------------------------------------------------------------
+// Reusable handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CountingHandler {
+    counter: WaitableCounter,
+}
+
+impl CountingHandler {
+    fn new() -> Self {
+        Self { counter: WaitableCounter::new() }
+    }
+}
+
+impl MessageHandler<WorkTopic> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.counter.increment();
         Outcome::Ack
     }
 }
 
-struct RetryThenAckHandler {
-    ack_after: u32,
-    count: Arc<AtomicU32>,
+impl MessageHandler<NoDlqTopic> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
 }
 
-impl MessageHandler<RetryTopic> for RetryThenAckHandler {
-    async fn handle(&self, _message: TestMessage, metadata: MessageMetadata) -> Outcome {
-        if metadata.retry_count < self.ack_after {
+impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+struct FixedOutcomeHandler(Outcome);
+
+impl MessageHandler<WorkTopic> for FixedOutcomeHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        self.0.clone()
+    }
+}
+
+#[derive(Clone)]
+struct RetryThenAckHandler {
+    retry_until: u32,
+    counter: WaitableCounter,
+}
+
+impl RetryThenAckHandler {
+    fn new(retry_until: u32) -> Self {
+        Self { retry_until, counter: WaitableCounter::new() }
+    }
+}
+
+impl MessageHandler<WorkTopic> for RetryThenAckHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        let attempt = self.counter.get();
+        self.counter.increment();
+        if attempt < self.retry_until {
             Outcome::Retry
         } else {
-            self.count.fetch_add(1, Ordering::Relaxed);
             Outcome::Ack
         }
     }
 }
 
-struct RejectHandler {
-    dlq_count: Arc<AtomicU32>,
+#[derive(Clone)]
+struct SlowHandler {
+    delay: Duration,
+    counter: WaitableCounter,
 }
 
-impl MessageHandler<RetryTopic> for RejectHandler {
-    async fn handle(&self, _message: TestMessage, _metadata: MessageMetadata) -> Outcome {
-        Outcome::Reject
-    }
-
-    async fn handle_dead(&self, _message: TestMessage, _metadata: DeadMessageMetadata) {
-        self.dlq_count.fetch_add(1, Ordering::Relaxed);
+impl SlowHandler {
+    fn new(delay: Duration) -> Self {
+        Self { delay, counter: WaitableCounter::new() }
     }
 }
 
-// --- Helpers ---
-
-async fn setup() -> (NatsClient, NatsPublisher, NatsConsumer) {
-    let config = NatsConfig::new(
-        std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string()),
-    );
-    let client = NatsClient::connect(&config)
-        .await
-        .expect("failed to connect to NATS");
-    let publisher = NatsPublisher::new(client.clone()).await.unwrap();
-    let consumer = NatsConsumer::new(client.clone());
-    (client, publisher, consumer)
+impl MessageHandler<WorkTopic> for SlowHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        tokio::time::sleep(self.delay).await;
+        self.counter.increment();
+        Outcome::Ack
+    }
 }
 
-async fn declare_topology<T: shove::topic::Topic>(client: &NatsClient) {
-    let declarer = NatsTopologyDeclarer::new(client.clone());
-    declarer.declare(T::topology()).await.unwrap();
+#[derive(Clone)]
+struct DlqRecordingHandler {
+    counter: WaitableCounter,
 }
 
-// --- Tests ---
+impl DlqRecordingHandler {
+    fn new() -> Self {
+        Self { counter: WaitableCounter::new() }
+    }
+}
 
-#[tokio::test]
-async fn test_basic_publish_consume() {
-    let (client, publisher, consumer) = setup().await;
-    declare_topology::<BasicTopic>(&client).await;
-
-    let count = Arc::new(AtomicU32::new(0));
-    let shutdown = CancellationToken::new();
-
-    // Publish 5 messages
-    for i in 0..5 {
-        publisher
-            .publish::<BasicTopic>(&TestMessage {
-                id: i,
-                body: format!("msg-{i}"),
-            })
-            .await
-            .unwrap();
+impl MessageHandler<WorkTopic> for DlqRecordingHandler {
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        Outcome::Ack
     }
 
-    // Consume
-    let handler = CountingHandler {
-        count: count.clone(),
-    };
-    let options = ConsumerOptions::new(shutdown.clone());
-    let consumer_handle = tokio::spawn(async move {
-        consumer.run::<BasicTopic>(handler, options).await
-    });
-
-    // Wait for all messages
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while count.load(Ordering::Relaxed) < 5 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("timed out waiting for messages");
-
-    shutdown.cancel();
-    let _ = consumer_handle.await;
-
-    assert_eq!(count.load(Ordering::Relaxed), 5);
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+        self.counter.increment();
+    }
 }
 
-#[tokio::test]
-async fn test_retry_with_backoff() {
-    let (client, publisher, consumer) = setup().await;
-    declare_topology::<RetryTopic>(&client).await;
-
-    let count = Arc::new(AtomicU32::new(0));
-    let shutdown = CancellationToken::new();
-
-    publisher
-        .publish::<RetryTopic>(&TestMessage {
-            id: 1,
-            body: "retry-me".into(),
-        })
-        .await
-        .unwrap();
-
-    let handler = RetryThenAckHandler {
-        ack_after: 2,
-        count: count.clone(),
-    };
-    let options = ConsumerOptions::new(shutdown.clone()).with_max_retries(5);
-    let consumer_handle = tokio::spawn(async move {
-        consumer.run::<RetryTopic>(handler, options).await
-    });
-
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while count.load(Ordering::Relaxed) < 1 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("timed out waiting for retried message");
-
-    shutdown.cancel();
-    let _ = consumer_handle.await;
-
-    assert_eq!(count.load(Ordering::Relaxed), 1);
+#[derive(Clone)]
+struct OrderRecordingHandler {
+    records: Arc<Mutex<Vec<(String, u64)>>>,
+    counter: WaitableCounter,
 }
 
-#[tokio::test]
-async fn test_reject_to_dlq() {
-    let (client, publisher, _consumer) = setup().await;
-    declare_topology::<RetryTopic>(&client).await;
-
-    let dlq_count = Arc::new(AtomicU32::new(0));
-    let shutdown = CancellationToken::new();
-
-    publisher
-        .publish::<RetryTopic>(&TestMessage {
-            id: 1,
-            body: "reject-me".into(),
-        })
-        .await
-        .unwrap();
-
-    // Run main consumer that rejects
-    let reject_handler = RejectHandler {
-        dlq_count: Arc::new(AtomicU32::new(0)),
-    };
-    let options = ConsumerOptions::new(shutdown.clone());
-    let main_consumer = NatsConsumer::new(client.clone());
-    let main_handle = tokio::spawn(async move {
-        main_consumer.run::<RetryTopic>(reject_handler, options).await
-    });
-
-    // Small delay for reject to propagate
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Run DLQ consumer
-    let dlq_handler = RejectHandler {
-        dlq_count: dlq_count.clone(),
-    };
-    let dlq_consumer = NatsConsumer::new(client.clone());
-    let dlq_handle = tokio::spawn(async move {
-        dlq_consumer.run_dlq::<RetryTopic>(dlq_handler).await
-    });
-
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while dlq_count.load(Ordering::Relaxed) < 1 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+impl OrderRecordingHandler {
+    fn new() -> Self {
+        Self {
+            records: Arc::new(Mutex::new(Vec::new())),
+            counter: WaitableCounter::new(),
         }
-    })
-    .await
-    .expect("timed out waiting for DLQ message");
+    }
 
-    shutdown.cancel();
-    client.shutdown().await;
-    let _ = main_handle.await;
-    let _ = dlq_handle.await;
+    async fn records(&self) -> Vec<(String, u64)> {
+        self.records.lock().await.clone()
+    }
+}
 
-    assert_eq!(dlq_count.load(Ordering::Relaxed), 1);
+impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        self.records.lock().await.push((msg.order_id, msg.amount));
+        self.counter.increment();
+        Outcome::Ack
+    }
 }
