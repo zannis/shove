@@ -553,9 +553,11 @@ impl RabbitMqConsumer {
                             continue;
                         }
                         Some(KeyState::AwaitingRetry) => {
-                            if retry_count > 0 {
-                                // This is the returning retry — clear AwaitingRetry
-                                // and fall through to spawn a handler below.
+                            if retry_count > 0 || delivery.redelivered {
+                                // This is the returning retry (or a nack+requeue
+                                // redelivery when no hold queue is configured) —
+                                // clear AwaitingRetry and fall through to spawn a
+                                // handler below.
                                 debug!(
                                     sequence_key = %seq_key,
                                     queue = %queue,
