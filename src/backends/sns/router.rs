@@ -120,6 +120,48 @@ pub(crate) async fn route_retry(
     .await;
 }
 
+/// Change message visibility timeout for retry with escalating delay.
+///
+/// Used by sequenced (FIFO) consumers where delete+re-send is not viable
+/// (FIFO queues require `MessageGroupId` and don't support per-message
+/// `DelaySeconds`). Retry count is tracked via `ApproximateReceiveCount`.
+pub(crate) async fn route_retry_fifo(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+    topology: &QueueTopology,
+    retry_count: u32,
+) {
+    let delay = if topology.hold_queues().is_empty() {
+        warn!(
+            queue_url,
+            "retrying message but no hold queues configured — visibility timeout set to 0"
+        );
+        Duration::ZERO
+    } else {
+        let index = (retry_count as usize).min(topology.hold_queues().len() - 1);
+        topology.hold_queues()[index].delay()
+    };
+
+    let timeout_secs = delay.as_secs() as i32;
+
+    debug!(
+        queue_url,
+        retry_count, timeout_secs, "changing visibility for retry (FIFO)"
+    );
+
+    if let Err(e) = sqs
+        .change_message_visibility()
+        .queue_url(queue_url)
+        .receipt_handle(receipt_handle)
+        .visibility_timeout(timeout_secs)
+        .send()
+        .await
+    {
+        warn!(queue_url, error = %e, "failed to change visibility for retry");
+    }
+}
+
 /// Reject a message. Sets visibility to 0 so SQS redelivers it immediately,
 /// incrementing ApproximateReceiveCount. Once maxReceiveCount is exceeded,
 /// SQS native redrive moves it to the DLQ.

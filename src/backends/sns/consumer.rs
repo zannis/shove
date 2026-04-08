@@ -770,12 +770,10 @@ where
                     .await;
                 }
                 Outcome::Retry => {
-                    router::route_retry(
+                    router::route_retry_fifo(
                         sqs,
                         queue_url,
                         &receipt_handle,
-                        &body,
-                        &message_attributes,
                         topology,
                         retry_count,
                     )
@@ -789,12 +787,10 @@ where
                         sequence_key = %key,
                         "Defer is not supported on sequenced (FIFO) consumers, treating as Retry"
                     );
-                    router::route_retry(
+                    router::route_retry_fifo(
                         sqs,
                         queue_url,
                         &receipt_handle,
-                        &body,
-                        &message_attributes,
                         topology,
                         retry_count,
                     )
@@ -821,7 +817,7 @@ where
                 );
                 // Wait for all in-flight handlers to complete.
                 for (key, state) in key_states.drain() {
-                    if let KeyState::InFlight { receipt_handle, body, message_attributes, retry_count, outcome_rx } = state {
+                    if let KeyState::InFlight { receipt_handle, body: _, message_attributes: _, retry_count, outcome_rx } = state {
                         let outcome = outcome_rx.await.unwrap_or(Outcome::Retry);
                         debug!(
                             queue_url,
@@ -837,12 +833,10 @@ where
                                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                             }
                             Outcome::Retry => {
-                                router::route_retry(
+                                router::route_retry_fifo(
                                     sqs,
                                     queue_url,
                                     &receipt_handle,
-                                    &body,
-                                    &message_attributes,
                                     topology,
                                     retry_count,
                                 )
@@ -854,12 +848,10 @@ where
                                     sequence_key = %key,
                                     "Defer is not supported on sequenced (FIFO) consumers, treating as Retry"
                                 );
-                                router::route_retry(
+                                router::route_retry_fifo(
                                     sqs,
                                     queue_url,
                                     &receipt_handle,
-                                    &body,
-                                    &message_attributes,
                                     topology,
                                     retry_count,
                                 )
