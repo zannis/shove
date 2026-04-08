@@ -1980,6 +1980,288 @@ async fn autoscaler_scales_down_when_idle() {
     broker.stop().await;
 }
 
+// --- Autoscaler custom strategy (pluggable) ---
+
+#[tokio::test]
+async fn autoscaler_custom_strategy_pluggable() {
+    use tokio::sync::Mutex;
+
+    struct AlwaysScaleUpStrategy;
+    impl ScalingStrategy for AlwaysScaleUpStrategy {
+        fn evaluate(&mut self, _group: &str, metrics: &ScalingMetrics) -> ScalingDecision {
+            if metrics.messages_ready > 0 {
+                ScalingDecision::ScaleUp(1)
+            } else {
+                ScalingDecision::Hold
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+    registry
+        .register::<ScalableWork, _>(
+            ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    registry.start_all();
+
+    // Publish 5 messages — below DefaultThreshold scale-up (5 * 1 * 2.0 = 10),
+    // but AlwaysScaleUpStrategy fires for any messages_ready > 0.
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..5)
+        .map(|i| SimpleMessage {
+            body: format!("custom-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ScalableWork>(&messages)
+        .await
+        .unwrap();
+
+    // Give management API time to reflect the queued messages
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let registry = Arc::new(Mutex::new(registry));
+    let mgmt_config = broker.mgmt_config();
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let mut autoscaler =
+        Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(500));
+
+    let autoscaler_token = CancellationToken::new();
+    let token_clone = autoscaler_token.clone();
+    let autoscaler_handle = tokio::spawn(async move {
+        autoscaler.run(token_clone).await;
+    });
+
+    // Wait up to 15s for at least 2 active consumers (1 initial + 1 from custom strategy)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let active = {
+            let reg = registry.lock().await;
+            reg.groups()["test-scalable"].active_consumers()
+        };
+        if active >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out: custom strategy did not trigger scale-up (active_consumers={})",
+                active
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let active = {
+        let reg = registry.lock().await;
+        reg.groups()["test-scalable"].active_consumers()
+    };
+    assert!(
+        active >= 2,
+        "expected at least 2 consumers after custom strategy scale-up, got {active}"
+    );
+
+    autoscaler_token.cancel();
+    autoscaler_handle.await.unwrap();
+
+    let mut reg = registry.lock().await;
+    reg.shutdown_all().await;
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Autoscaler without Stabilized scales immediately ---
+
+#[tokio::test]
+async fn autoscaler_without_stabilization_scales_immediately() {
+    use tokio::sync::Mutex;
+
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+    registry
+        .register::<ScalableWork, _>(
+            ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    registry.start_all(); // starts 0 consumers
+
+    // Publish 100 messages to ensure the threshold is crossed on every poll
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..100)
+        .map(|i| SimpleMessage {
+            body: format!("no-stab-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ScalableWork>(&messages)
+        .await
+        .unwrap();
+
+    // Give management API time to reflect the queued messages
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let registry = Arc::new(Mutex::new(registry));
+    let mgmt_config = broker.mgmt_config();
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    // Raw ThresholdStrategy with no Stabilized wrapper — no hysteresis/cooldown delay
+    let mut autoscaler = Autoscaler::new(
+        backend,
+        ThresholdStrategy::default(),
+        Duration::from_millis(500),
+    );
+
+    let autoscaler_token = CancellationToken::new();
+    let token_clone = autoscaler_token.clone();
+    let autoscaler_handle = tokio::spawn(async move {
+        autoscaler.run(token_clone).await;
+    });
+
+    // Wait up to 10s for >= 2 active consumers
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let active = {
+            let reg = registry.lock().await;
+            reg.groups()["test-scalable"].active_consumers()
+        };
+        if active >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out: unstabilized autoscaler did not scale up (active_consumers={})",
+                active
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let active = {
+        let reg = registry.lock().await;
+        reg.groups()["test-scalable"].active_consumers()
+    };
+    assert!(
+        active >= 2,
+        "expected at least 2 consumers with no stabilization, got {active}"
+    );
+
+    autoscaler_token.cancel();
+    autoscaler_handle.await.unwrap();
+
+    let mut reg = registry.lock().await;
+    reg.shutdown_all().await;
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Autoscaler ScaleUp magnitude > 1 ---
+
+#[tokio::test]
+async fn autoscaler_scale_up_magnitude() {
+    use tokio::sync::Mutex;
+
+    struct ScaleByTwoStrategy;
+    impl ScalingStrategy for ScaleByTwoStrategy {
+        fn evaluate(&mut self, _group: &str, metrics: &ScalingMetrics) -> ScalingDecision {
+            if metrics.messages_ready > 0 {
+                ScalingDecision::ScaleUp(2)
+            } else {
+                ScalingDecision::Hold
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+    registry
+        .register::<ScalableWork, _>(
+            ConsumerGroupConfig::new(1..=5).with_prefetch_count(5),
+            move || h.clone(),
+        )
+        .await
+        .unwrap();
+    registry.start_all(); // starts 1 consumer
+
+    // Publish 50 messages so messages_ready > 0 on every poll
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<SimpleMessage> = (0..50)
+        .map(|i| SimpleMessage {
+            body: format!("mag-{i}"),
+        })
+        .collect();
+    publisher
+        .publish_batch::<ScalableWork>(&messages)
+        .await
+        .unwrap();
+
+    // Give management API time to reflect the queued messages
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let registry = Arc::new(Mutex::new(registry));
+    let mgmt_config = broker.mgmt_config();
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let mut autoscaler =
+        Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(500));
+
+    let autoscaler_token = CancellationToken::new();
+    let token_clone = autoscaler_token.clone();
+    let autoscaler_handle = tokio::spawn(async move {
+        autoscaler.run(token_clone).await;
+    });
+
+    // Wait up to 10s for >= 3 consumers (1 initial + 2 from single ScaleUp(2))
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let active = {
+            let reg = registry.lock().await;
+            reg.groups()["test-scalable"].active_consumers()
+        };
+        if active >= 3 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out: ScaleUp(2) did not add 2 consumers (active_consumers={})",
+                active
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let active = {
+        let reg = registry.lock().await;
+        reg.groups()["test-scalable"].active_consumers()
+    };
+    assert!(
+        active >= 3,
+        "expected at least 3 consumers after ScaleUp(2), got {active}"
+    );
+
+    autoscaler_token.cancel();
+    autoscaler_handle.await.unwrap();
+
+    let mut reg = registry.lock().await;
+    reg.shutdown_all().await;
+    client.shutdown().await;
+    broker.stop().await;
+}
+
 // --- Audit wrapper captures records ---
 
 #[tokio::test]
