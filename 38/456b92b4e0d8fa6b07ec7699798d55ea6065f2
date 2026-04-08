@@ -1,0 +1,23 @@
+tests/nats_integration.rs
+  98039bddec9cc648 3,5,13-14,18-21,24-26,28-31,34-65,67-75,77-80,82-85,88-90,92-93,98-100,104-115,121-123,125-130,132-143,145-149,151,154-162,167-169,171-185,189,191-198,201-205,213-216,219-221,223,225-229,233-235,238-242,244-247,249-251,254-258,260-264,266,268-270,273-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "38456b92b4e0d8fa6b07ec7699798d55ea6065f2",
+  "prompts": {
+    "98039bddec9cc648": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15d3d33d-9ab0-4f69-a92d-8d6d157ea0b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 1732,
+      "total_deletions": 180,
+      "accepted_lines": 2474,
+      "overriden_lines": 0
+    }
+  }
+}
