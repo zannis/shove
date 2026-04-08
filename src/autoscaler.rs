@@ -193,9 +193,224 @@ impl<S: ScalingStrategy> ScalingStrategy for Stabilized<S> {
     }
 }
 
+/// A backend that provides group discovery, metric fetching, and scaling
+/// operations for the generic `Autoscaler`.
+pub trait AutoscalerBackend: Send + Sync {
+    type GroupId: Clone + Eq + std::hash::Hash + std::fmt::Display + Send + Sync;
+
+    fn list_groups(&self) -> impl Future<Output = crate::error::Result<Vec<Self::GroupId>>> + Send;
+    fn fetch_metrics(
+        &self,
+        group: &Self::GroupId,
+    ) -> impl Future<Output = crate::error::Result<ScalingMetrics>> + Send;
+    fn scale(
+        &self,
+        group: &Self::GroupId,
+        decision: ScalingDecision,
+    ) -> impl Future<Output = crate::error::Result<()>> + Send;
+}
+
+/// A generic autoscaler that polls a backend and applies a scaling strategy.
+pub struct Autoscaler<B: AutoscalerBackend, S: ScalingStrategy> {
+    backend: B,
+    strategy: S,
+    poll_interval: Duration,
+}
+
+impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
+    pub fn new(backend: B, strategy: S, poll_interval: Duration) -> Self {
+        Self {
+            backend,
+            strategy,
+            poll_interval,
+        }
+    }
+
+    /// Run the autoscaler loop until the `shutdown` token is cancelled.
+    pub async fn run(&mut self, shutdown: tokio_util::sync::CancellationToken) {
+        tracing::info!("autoscaler started");
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    tracing::info!("autoscaler shutting down");
+                    return;
+                }
+                _ = tokio::time::sleep(self.poll_interval) => {
+                    self.poll_and_scale().await;
+                }
+            }
+        }
+    }
+
+    /// Fetch groups and metrics, evaluate strategy, and issue scaling commands.
+    pub async fn poll_and_scale(&mut self) {
+        let groups = match self.backend.list_groups().await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!("failed to list groups: {e}");
+                return;
+            }
+        };
+
+        for group in groups {
+            let metrics = match self.backend.fetch_metrics(&group).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("failed to fetch metrics for {group}: {e}");
+                    continue;
+                }
+            };
+
+            let decision = self.strategy.evaluate(&group.to_string(), &metrics);
+
+            if decision == ScalingDecision::Hold {
+                continue;
+            }
+
+            if let Err(e) = self.backend.scale(&group, decision).await {
+                tracing::error!("failed to scale {group}: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct MockBackend {
+        groups: Vec<String>,
+        metrics: HashMap<String, ScalingMetrics>,
+        scale_log: Arc<Mutex<Vec<(String, ScalingDecision)>>>,
+    }
+
+    impl AutoscalerBackend for MockBackend {
+        type GroupId = String;
+
+        async fn list_groups(&self) -> crate::error::Result<Vec<Self::GroupId>> {
+            Ok(self.groups.clone())
+        }
+
+        async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
+            self.metrics
+                .get(group)
+                .cloned()
+                .ok_or_else(|| crate::error::ShoveError::Connection(format!("no metrics for {group}")))
+        }
+
+        async fn scale(&self, group: &Self::GroupId, decision: ScalingDecision) -> crate::error::Result<()> {
+            self.scale_log.lock().await.push((group.clone(), decision));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn autoscaler_calls_strategy_for_each_group() {
+        // group-a: 100 ready, cap=10 (1 consumer, 10 prefetch) → ScaleUp
+        // group-b: 1 ready, cap=20 (2 consumers, 10 prefetch) → ScaleDown
+        let mut metrics = HashMap::new();
+        metrics.insert("group-a".into(), ScalingMetrics::new(100, 0, 1, 10));
+        metrics.insert("group-b".into(), ScalingMetrics::new(1, 0, 2, 10));
+
+        let scale_log = Arc::new(Mutex::new(vec![]));
+        let backend = MockBackend {
+            groups: vec!["group-a".into(), "group-b".into()],
+            metrics,
+            scale_log: scale_log.clone(),
+        };
+        let strategy = Stabilized::new(
+            ThresholdStrategy::default(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(60));
+        autoscaler.poll_and_scale().await;
+
+        let log = scale_log.lock().await;
+        assert_eq!(log.len(), 2);
+        let has_a = log.iter().any(|(g, d)| g == "group-a" && matches!(d, ScalingDecision::ScaleUp(_)));
+        let has_b = log.iter().any(|(g, d)| g == "group-b" && matches!(d, ScalingDecision::ScaleDown(_)));
+        assert!(has_a, "expected ScaleUp for group-a, log: {log:?}");
+        assert!(has_b, "expected ScaleDown for group-b, log: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn autoscaler_skips_hold_decisions() {
+        // cap = 2*10 = 20, ready = 15 → within [10, 40] → Hold
+        let mut metrics = HashMap::new();
+        metrics.insert("group-a".into(), ScalingMetrics::new(15, 0, 2, 10));
+
+        let scale_log = Arc::new(Mutex::new(vec![]));
+        let backend = MockBackend {
+            groups: vec!["group-a".into()],
+            metrics,
+            scale_log: scale_log.clone(),
+        };
+        let strategy = Stabilized::new(
+            ThresholdStrategy::default(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(60));
+        autoscaler.poll_and_scale().await;
+
+        let log = scale_log.lock().await;
+        assert!(log.is_empty(), "expected no scaling actions, log: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn autoscaler_continues_on_metrics_error() {
+        // group-a has no metrics (will error), group-b should still be scaled
+        let mut metrics = HashMap::new();
+        metrics.insert("group-b".into(), ScalingMetrics::new(100, 0, 1, 10));
+
+        let scale_log = Arc::new(Mutex::new(vec![]));
+        let backend = MockBackend {
+            groups: vec!["group-a".into(), "group-b".into()],
+            metrics,
+            scale_log: scale_log.clone(),
+        };
+        let strategy = Stabilized::new(
+            ThresholdStrategy::default(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(60));
+        autoscaler.poll_and_scale().await;
+
+        let log = scale_log.lock().await;
+        assert_eq!(log.len(), 1, "expected only group-b to be scaled, log: {log:?}");
+        assert_eq!(log[0].0, "group-b");
+        assert!(matches!(log[0].1, ScalingDecision::ScaleUp(_)));
+    }
+
+    #[tokio::test]
+    async fn autoscaler_run_exits_on_shutdown() {
+        let backend = MockBackend {
+            groups: vec![],
+            metrics: HashMap::new(),
+            scale_log: Arc::new(Mutex::new(vec![])),
+        };
+        let strategy = Stabilized::new(
+            ThresholdStrategy::default(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(60));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            autoscaler.run(token),
+        )
+        .await
+        .expect("run() should return promptly after shutdown token is cancelled");
+    }
 
     #[test]
     fn scaling_metrics_new() {
