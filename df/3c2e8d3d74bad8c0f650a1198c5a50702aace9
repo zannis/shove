@@ -1,0 +1,23 @@
+tests/rabbitmq_integration.rs
+  df153fcedd6bc2c2 2003,2009,2014,2044,2051,2068-2069,2190,2196,2201,2229,2236,2253-2254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "df3c2e8d3d74bad8c0f650a1198c5a50702aace9",
+  "prompts": {
+    "df153fcedd6bc2c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d620fbe-4b3e-4ea0-826d-3111b347d957",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 12,
+      "accepted_lines": 14,
+      "overriden_lines": 0
+    }
+  }
+}
