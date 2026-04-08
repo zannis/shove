@@ -155,6 +155,18 @@ define_topic!(
     TopologyBuilder::new("test-defer-nohold").dlq().build()
 );
 
+// Topic for sequenced defer with no hold queues (allow_message_loss)
+define_sequenced_topic!(
+    DeferSeqNoHold,
+    OrderMessage,
+    |msg: &OrderMessage| msg.account.clone(),
+    TopologyBuilder::new("test-defer-seq-nohold")
+        .sequenced(shove::topology::SequenceFailure::Skip)
+        .routing_shards(1)
+        .allow_message_loss()
+        .build()
+);
+
 // Topic for defer tests (with hold queue)
 define_topic!(
     DeferWithHold,
@@ -1138,6 +1150,64 @@ impl MessageHandler<DeferSeqOrders> for SeqDeferHandler {
             self.ack_count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
             Outcome::Ack
+        }
+    }
+}
+
+impl MessageHandler<DeferSeqNoHold> for SeqDeferHandler {
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+        if call == 0 {
+            Outcome::Defer
+        } else {
+            self.ack_count.fetch_add(1, Ordering::Relaxed);
+            self.signal.notify_waiters();
+            Outcome::Ack
+        }
+    }
+}
+
+/// Handler that Retries once, then Defers once, then Acks — recording the
+/// retry_count seen on each delivery to verify Defer does not increment it.
+#[derive(Clone)]
+struct RetryThenDeferHandler {
+    call_count: Arc<AtomicU32>,
+    ack_count: Arc<AtomicU32>,
+    retry_counts: Arc<std::sync::Mutex<Vec<u32>>>,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl RetryThenDeferHandler {
+    fn new() -> Self {
+        Self {
+            call_count: Arc::new(AtomicU32::new(0)),
+            ack_count: Arc::new(AtomicU32::new(0)),
+            retry_counts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn ack_count(&self) -> u32 {
+        self.ack_count.load(Ordering::Relaxed)
+    }
+
+    fn retry_counts(&self) -> Vec<u32> {
+        self.retry_counts.lock().unwrap().clone()
+    }
+}
+
+impl MessageHandler<DeferWithHold> for RetryThenDeferHandler {
+    async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+        let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.retry_counts.lock().unwrap().push(meta.retry_count);
+        match call {
+            0 => Outcome::Retry, // retry_count=0 → will become 1
+            1 => Outcome::Defer, // retry_count=1 → should stay 1
+            _ => {
+                self.ack_count.fetch_add(1, Ordering::Relaxed);
+                self.signal.notify_waiters();
+                Outcome::Ack // retry_count should still be 1
+            }
         }
     }
 }
@@ -4500,4 +4570,106 @@ mod exactly_once {
         client.shutdown().await;
         broker.stop().await;
     }
+}
+
+// --- Defer preserves retry count ---
+
+#[tokio::test]
+async fn defer_preserves_retry_count() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(DeferWithHold::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<DeferWithHold>(&SimpleMessage {
+            body: "retry-then-defer".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = RetryThenDeferHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s)
+            .with_max_retries(5)
+            .with_prefetch_count(1);
+        consumer.run::<DeferWithHold>(h, opts).await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if handler.ack_count() >= 1 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for ack after retry-then-defer");
+        }
+        tokio::select! {
+            _ = handler.signal.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+    }
+
+    // Delivery 0: retry_count=0 → Retry (increments to 1)
+    // Delivery 1: retry_count=1 → Defer (should NOT increment)
+    // Delivery 2: retry_count=1 → Ack
+    let counts = handler.retry_counts();
+    assert_eq!(counts.len(), 3, "expected 3 deliveries, got {counts:?}");
+    assert_eq!(counts[0], 0, "first delivery should have retry_count=0");
+    assert_eq!(counts[1], 1, "after Retry, retry_count should be 1");
+    assert_eq!(counts[2], 1, "after Defer, retry_count should still be 1");
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- Sequenced defer without hold queues (nack+requeue fallback) ---
+
+#[tokio::test]
+async fn sequenced_defer_without_hold_queue_requeues() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let channel = client.create_channel().await.unwrap();
+
+    let declarer = RabbitMqTopologyDeclarer::new(channel);
+    declarer.declare(DeferSeqNoHold::topology()).await.unwrap();
+
+    let publisher = RabbitMqPublisher::new(client.clone()).await.unwrap();
+    publisher
+        .publish::<DeferSeqNoHold>(&OrderMessage {
+            account: "ACC-DEFER-NOHOLD".into(),
+            seq: 1,
+        })
+        .await
+        .unwrap();
+
+    let handler = SeqDeferHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::new(s).with_max_retries(5);
+        consumer.run_fifo::<DeferSeqNoHold>(h, opts).await
+    });
+
+    // Defer (nack-requeue) → redelivered → Ack
+    assert!(
+        handler.wait_for_ack(1, Duration::from_secs(30)).await,
+        "timed out waiting for ack after sequenced defer without hold queue"
+    );
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client.shutdown().await;
+    broker.stop().await;
 }

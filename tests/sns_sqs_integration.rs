@@ -239,6 +239,13 @@ define_topic!(
     TopologyBuilder::new("sqs-nodlq").build()
 );
 
+// Topic with no hold queues — for testing Defer fallback (visibility timeout 0)
+define_topic!(
+    DeferNoHoldTopic,
+    SimpleMessage,
+    TopologyBuilder::new("sqs-defer-nohold").dlq().build()
+);
+
 define_sequenced_topic!(
     SeqSkipTopic,
     OrderMessage,
@@ -2348,4 +2355,238 @@ async fn run_dlq_on_topic_without_dlq_fails() {
         err_msg.contains("no DLQ configured") || err_msg.contains("DLQ"),
         "error should mention DLQ, got: {err_msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Defer — no hold queues (visibility timeout 0 fallback)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn defer_without_hold_queues_redelivers() {
+    struct DeferThenAck(Arc<AtomicU32>);
+
+    impl MessageHandler<DeferNoHoldTopic> for DeferThenAck {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            let prev = self.0.fetch_add(1, Ordering::Relaxed);
+            if prev == 0 {
+                Outcome::Defer
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<DeferNoHoldTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "defer-nohold".to_string(),
+        content: "defer without hold queues".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<DeferNoHoldTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let handler = DeferThenAck(calls.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<DeferNoHoldTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // Defer (visibility timeout 0) → immediate redelivery → Ack
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if calls.load(Ordering::Relaxed) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("should receive deferred message redelivery within timeout");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+
+    assert!(
+        calls.load(Ordering::Relaxed) >= 2,
+        "expected at least 2 calls (1 defer + 1 ack)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Defer preserves retry count (SNS/SQS)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn defer_preserves_retry_count() {
+    struct RetryThenDefer {
+        calls: Arc<AtomicU32>,
+        retry_counts: Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+
+    impl MessageHandler<WorkTopic> for RetryThenDefer {
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            self.retry_counts.lock().unwrap().push(meta.retry_count);
+            match call {
+                0 => Outcome::Retry, // retry_count=0 → will become 1
+                1 => Outcome::Defer, // retry_count=1 → should stay 1
+                _ => Outcome::Ack,   // retry_count should still be 1
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let msg = SimpleMessage {
+        id: "retry-defer".to_string(),
+        content: "retry then defer".to_string(),
+    };
+    setup
+        .publisher
+        .publish::<WorkTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let retry_counts: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handler = RetryThenDefer {
+        calls: calls.clone(),
+        retry_counts: retry_counts.clone(),
+    };
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if calls.load(Ordering::Relaxed) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("should complete retry→defer→ack cycle within timeout");
+
+    let counts = retry_counts.lock().unwrap().clone();
+    assert_eq!(counts.len(), 3, "expected 3 deliveries, got {counts:?}");
+    assert_eq!(counts[0], 0, "first delivery should have retry_count=0");
+    assert_eq!(counts[1], 1, "after Retry, retry_count should be 1");
+    assert_eq!(counts[2], 1, "after Defer, retry_count should still be 1");
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
+}
+
+// ---------------------------------------------------------------------------
+// Sequenced consumer — defer redelivers (SNS/SQS)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sequenced_defer_redelivers() {
+    struct SeqDeferThenAck {
+        calls: Arc<AtomicU32>,
+        acks: WaitableCounter,
+    }
+
+    impl MessageHandler<SeqSkipTopic> for SeqDeferThenAck {
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+            let prev = self.calls.fetch_add(1, Ordering::Relaxed);
+            if prev == 0 {
+                Outcome::Defer
+            } else {
+                self.acks.increment();
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    let msg = OrderMessage {
+        order_id: "SEQ-DEFER-1".to_string(),
+        amount: 100,
+    };
+    setup
+        .publisher
+        .publish::<SeqSkipTopic>(&msg)
+        .await
+        .expect("publish should succeed");
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let acks = WaitableCounter::new();
+    let handler = SeqDeferThenAck {
+        calls: calls.clone(),
+        acks: acks.clone(),
+    };
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_max_retries(5)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    assert!(
+        acks.wait_for(1, Duration::from_secs(30)).await,
+        "timed out waiting for ack after sequenced defer"
+    );
+
+    assert!(
+        calls.load(Ordering::Relaxed) >= 2,
+        "expected at least 2 deliveries (1 defer + 1 ack)"
+    );
+
+    shutdown.cancel();
+    handle
+        .await
+        .expect("consumer task should not panic")
+        .expect("consumer should exit cleanly");
 }

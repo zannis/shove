@@ -334,6 +334,12 @@ impl RabbitMqConsumer {
                             .await;
                         } else {
                             // Defer
+                            if shard_hold_queues.is_empty() {
+                                warn!(
+                                    queue,
+                                    "deferring message but no shard hold queues configured — requeuing with no delay"
+                                );
+                            }
                             if !shard_hold_queues.is_empty() {
                                 let hold_queue = &shard_hold_queues[0];
                                 let headers = router::clone_headers(&delivery);
@@ -420,6 +426,12 @@ impl RabbitMqConsumer {
                                     router::route_reject(&delivery, topology, &publisher).await;
                                 }
                                 Outcome::Defer => {
+                                    if shard_hold_queues.is_empty() {
+                                        warn!(
+                                            queue,
+                                            "deferring message on shutdown but no shard hold queues configured — requeuing with no delay"
+                                        );
+                                    }
                                     if !shard_hold_queues.is_empty() {
                                         let hold_queue = &shard_hold_queues[0];
                                         let headers = router::clone_headers(&delivery);
