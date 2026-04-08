@@ -4,6 +4,10 @@ use tracing::{debug, error, warn};
 
 use crate::topology::QueueTopology;
 
+/// Custom SQS message attribute used to track retry count across
+/// delete+re-send cycles. Takes precedence over `ApproximateReceiveCount`.
+pub(crate) const RETRY_COUNT_ATTR: &str = "x-retry-count";
+
 /// Delete a message from SQS (acknowledge).
 pub(crate) async fn route_ack(sqs: &aws_sdk_sqs::Client, queue_url: &str, receipt_handle: &str) {
     if let Err(e) = sqs
@@ -191,9 +195,22 @@ pub(crate) async fn route_defer(
     }
 }
 
-/// Extract retry count from SQS message system attributes.
-/// Uses ApproximateReceiveCount - 1 (first receive = 0 retries).
+/// Extract retry count from SQS message attributes.
+///
+/// Prefers the explicit `x-retry-count` message attribute (set by our
+/// retry/defer re-send path). Falls back to `ApproximateReceiveCount - 1`
+/// for first-delivery or legacy messages that lack the attribute.
 pub(crate) fn get_retry_count(message: &aws_sdk_sqs::types::Message) -> u32 {
+    // Prefer explicit x-retry-count attribute (set by our retry/defer resend).
+    if let Some(count) = message
+        .message_attributes()
+        .and_then(|a| a.get(RETRY_COUNT_ATTR))
+        .and_then(|v| v.string_value())
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        return count;
+    }
+    // Fallback: ApproximateReceiveCount - 1 (first delivery or legacy messages).
     message
         .attributes()
         .and_then(|attrs| {
@@ -320,5 +337,33 @@ mod tests {
     fn reject_topology_with_dlq() {
         let topology = TopologyBuilder::new("test").dlq().build();
         assert!(topology.dlq().is_some());
+    }
+
+    #[test]
+    fn get_retry_count_prefers_custom_attribute() {
+        let attr = aws_sdk_sqs::types::MessageAttributeValue::builder()
+            .data_type("String")
+            .string_value("3")
+            .build()
+            .unwrap();
+        let msg = aws_sdk_sqs::types::Message::builder()
+            .attributes(
+                aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
+                "10", // ARC says 9, but x-retry-count says 3
+            )
+            .message_attributes(RETRY_COUNT_ATTR, attr)
+            .build();
+        assert_eq!(get_retry_count(&msg), 3);
+    }
+
+    #[test]
+    fn get_retry_count_falls_back_to_arc_without_custom_attribute() {
+        let msg = aws_sdk_sqs::types::Message::builder()
+            .attributes(
+                aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
+                "4",
+            )
+            .build();
+        assert_eq!(get_retry_count(&msg), 3);
     }
 }
