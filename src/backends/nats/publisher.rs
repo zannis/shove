@@ -28,12 +28,12 @@ impl NatsPublisher {
     }
 
     fn resolve_subject<T: Topic>(topology: &'static crate::topology::QueueTopology, message: &T::Message) -> String {
-        if let Some(seq) = topology.sequencing() {
-            if let Some(key_fn) = T::SEQUENCE_KEY_FN {
-                let key = key_fn(message);
-                let shard = fnv1a_hash(&key) % seq.routing_shards() as u64;
-                return format!("{}.shard.{shard}", topology.queue());
-            }
+        if let Some(seq) = topology.sequencing()
+            && let Some(key_fn) = T::SEQUENCE_KEY_FN
+        {
+            let key = key_fn(message);
+            let shard = fnv1a_hash(&key) % seq.routing_shards() as u64;
+            return format!("{}.shard.{shard}", topology.queue());
         }
         topology.queue().to_string()
     }
