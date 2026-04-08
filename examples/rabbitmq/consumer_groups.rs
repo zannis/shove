@@ -123,8 +123,9 @@ async fn main() -> Result<(), ShoveError> {
     // capacity (consumers × prefetch_count).
     let mgmt_config = ManagementConfig::new("http://localhost:15673", "guest", "guest");
 
-    let mut autoscaler = Autoscaler::new(
+    let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
         &mgmt_config,
+        registry.clone(),
         AutoscalerConfig {
             poll_interval: Duration::from_secs(2),
             // Scale up when messages_ready > capacity × 1.5
@@ -139,10 +140,9 @@ async fn main() -> Result<(), ShoveError> {
     );
 
     let shutdown = client.shutdown_token();
-    let r = registry.clone();
     let s = shutdown.clone();
     let autoscaler_task = tokio::spawn(async move {
-        autoscaler.run(r, s).await;
+        autoscaler.run(s).await;
     });
 
     // ── Let the system process and scale ──

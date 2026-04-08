@@ -165,13 +165,13 @@ async fn main() -> Result<(), ShoveError> {
         cooldown_duration: Duration::from_secs(8),
     };
 
-    let mut autoscaler = SqsAutoscaler::new(stats_provider, auto_config);
+    let mut autoscaler =
+        SqsAutoscalerBackend::autoscaler(stats_provider, registry.clone(), auto_config);
     let shutdown = CancellationToken::new();
 
-    let r = registry.clone();
     let s = shutdown.clone();
     let autoscaler_task = tokio::spawn(async move {
-        autoscaler.run(r, s).await;
+        autoscaler.run(s).await;
     });
 
     // ── Monitor — watch consumer count change as load spikes then drains ──
