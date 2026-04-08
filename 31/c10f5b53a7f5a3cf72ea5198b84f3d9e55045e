@@ -1,0 +1,42 @@
+src/backends/nats/autoscaler.rs
+  98039bddec9cc648 1-450
+src/backends/nats/consumer_group.rs
+  98039bddec9cc648 21,115-120,269-270,277-287,309-313,317,322
+src/backends/nats/mod.rs
+  98039bddec9cc648 1,8-10
+src/lib.rs
+  98039bddec9cc648 67-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "31c10f5b53a7f5a3cf72ea5198b84f3d9e55045e",
+  "prompts": {
+    "19e308383ce264d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d828ff25-e74c-42b0-8d2d-f6cd6db34844",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 87,
+      "overriden_lines": 0
+    },
+    "98039bddec9cc648": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15d3d33d-9ab0-4f69-a92d-8d6d157ea0b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 500,
+      "total_deletions": 31,
+      "accepted_lines": 1450,
+      "overriden_lines": 0
+    }
+  }
+}
