@@ -82,7 +82,10 @@ pub(crate) async fn route_retry(
     queue_url: &str,
     receipt_handle: &str,
     body: &str,
-    message_attributes: &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: &std::collections::HashMap<
+        String,
+        aws_sdk_sqs::types::MessageAttributeValue,
+    >,
     topology: &QueueTopology,
     retry_count: u32,
 ) {
@@ -282,7 +285,10 @@ pub(crate) async fn route_defer(
     queue_url: &str,
     receipt_handle: &str,
     body: &str,
-    message_attributes: &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: &std::collections::HashMap<
+        String,
+        aws_sdk_sqs::types::MessageAttributeValue,
+    >,
     topology: &QueueTopology,
     retry_count: u32,
 ) {
@@ -300,9 +306,7 @@ pub(crate) async fn route_defer(
 
     debug!(
         queue_url,
-        retry_count,
-        delay_seconds,
-        "re-sending message for defer"
+        retry_count, delay_seconds, "re-sending message for defer"
     );
 
     resend_to_queue(

@@ -405,10 +405,7 @@ where
             in_flight.push_back(PendingMessage {
                 receipt_handle,
                 body: msg.body().unwrap_or_default().to_string(),
-                message_attributes: msg
-                    .message_attributes()
-                    .cloned()
-                    .unwrap_or_default(),
+                message_attributes: msg.message_attributes().cloned().unwrap_or_default(),
                 retry_count,
                 outcome_rx: rx,
             });
@@ -500,7 +497,10 @@ async fn route_outcome(
     queue_url: &str,
     receipt_handle: &str,
     body: &str,
-    message_attributes: &std::collections::HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: &std::collections::HashMap<
+        String,
+        aws_sdk_sqs::types::MessageAttributeValue,
+    >,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
@@ -1185,10 +1185,7 @@ async fn drain_pending_for_key<T, H>(
             KeyState::InFlight {
                 receipt_handle,
                 body: msg.body().unwrap_or_default().to_string(),
-                message_attributes: msg
-                    .message_attributes()
-                    .cloned()
-                    .unwrap_or_default(),
+                message_attributes: msg.message_attributes().cloned().unwrap_or_default(),
                 retry_count,
                 outcome_rx: rx,
             },
