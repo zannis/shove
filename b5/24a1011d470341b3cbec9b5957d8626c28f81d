@@ -1,0 +1,25 @@
+src/backends/sns/consumer.rs
+  d0101a31a5cbcc85 773,790,836,851
+src/backends/sns/router.rs
+  d0101a31a5cbcc85 123-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "b524a1011d470341b3cbec9b5957d8626c28f81d",
+  "prompts": {
+    "d0101a31a5cbcc85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "27d518bf-dfa1-493a-b2ce-8068afb24db6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 46,
+      "total_deletions": 12,
+      "accepted_lines": 46,
+      "overriden_lines": 0
+    }
+  }
+}
