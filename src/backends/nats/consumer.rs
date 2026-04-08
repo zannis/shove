@@ -120,6 +120,20 @@ fn extract_dead_metadata(msg: &async_nats::jetstream::Message) -> DeadMessageMet
 // Outcome routing functions
 // ---------------------------------------------------------------------------
 
+/// In FIFO (sequenced) mode, Defer is not supported because it violates
+/// ordering guarantees. Convert Defer → Retry with a warning.
+fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Defer => {
+            tracing::warn!(
+                "Defer is not supported on sequenced consumers — treating as Retry"
+            );
+            Outcome::Retry
+        }
+        other => other,
+    }
+}
+
 /// Publishes a message to the DLQ stream with death headers.
 async fn publish_to_dlq(
     client: &NatsClient,
@@ -693,6 +707,7 @@ impl Consumer for NatsConsumer {
                                 handler_timeout,
                             )
                             .await;
+                            let outcome = adjust_outcome_for_fifo(outcome);
 
                             route_outcome(
                                 &shard_client,
