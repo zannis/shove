@@ -277,3 +277,228 @@ impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
         Outcome::Ack
     }
 }
+
+// ===========================================================================
+// Client lifecycle
+// ===========================================================================
+
+#[tokio::test]
+async fn client_connect_and_shutdown() {
+    let client = connect().await;
+
+    assert!(
+        !client.shutdown_token().is_cancelled(),
+        "shutdown token should not be cancelled before shutdown"
+    );
+
+    client.shutdown().await;
+
+    assert!(
+        client.shutdown_token().is_cancelled(),
+        "shutdown token should be cancelled after shutdown"
+    );
+}
+
+#[tokio::test]
+async fn client_shutdown_cancels_token() {
+    let client = connect().await;
+    let token = client.shutdown_token();
+    assert!(!token.is_cancelled());
+
+    client.shutdown().await;
+    assert!(token.is_cancelled());
+}
+
+// ===========================================================================
+// Topology declaration
+// ===========================================================================
+
+#[tokio::test]
+async fn topology_declares_standard_stream_and_dlq() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    // Verify main stream exists
+    let stream = client.jetstream().get_stream("nats-work").await;
+    assert!(stream.is_ok(), "main stream should exist");
+
+    // Verify DLQ stream exists
+    let dlq_stream = client.jetstream().get_stream("nats-work-dlq").await;
+    assert!(dlq_stream.is_ok(), "DLQ stream should exist");
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn topology_declares_sequenced_stream_with_shards() {
+    let client = connect().await;
+    declare::<SeqSkipTopic>(&client).await;
+
+    // Verify main stream exists with shard subjects
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-seq-skip")
+        .await
+        .expect("sequenced stream should exist");
+
+    let info = stream.info().await.expect("should get stream info");
+    let subjects = &info.config.subjects;
+    assert!(
+        subjects.contains(&"nats-seq-skip.shard.0".to_string()),
+        "stream should contain shard.0 subject"
+    );
+    assert!(
+        subjects.contains(&"nats-seq-skip.shard.1".to_string()),
+        "stream should contain shard.1 subject"
+    );
+
+    // Verify DLQ stream
+    let dlq = client.jetstream().get_stream("nats-seq-skip-dlq").await;
+    assert!(dlq.is_ok(), "DLQ stream should exist for sequenced topic");
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn topology_idempotent() {
+    let client = connect().await;
+
+    declare::<WorkTopic>(&client).await;
+    declare::<WorkTopic>(&client).await; // second call should not fail
+
+    let stream = client.jetstream().get_stream("nats-work").await;
+    assert!(stream.is_ok(), "stream should still exist after double declare");
+
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Basic publish & consume
+// ===========================================================================
+
+#[tokio::test]
+async fn publish_and_consume_simple_message() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "simple-1".into(),
+            content: "hello".into(),
+        })
+        .await
+        .expect("publish should succeed");
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+    });
+
+    assert!(handler.counter.wait_for(1, TIMEOUT).await, "should receive 1 message");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert_eq!(handler.counter.get(), 1);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn publish_and_consume_with_headers() {
+    #[derive(Clone)]
+    struct HeaderCapture(Arc<Mutex<HashMap<String, String>>>);
+
+    impl MessageHandler<WorkTopic> for HeaderCapture {
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+            *self.0.lock().await = meta.headers;
+            Outcome::Ack
+        }
+    }
+
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    let mut headers = HashMap::new();
+    headers.insert("x-trace-id".to_string(), "trace-abc-123".to_string());
+
+    pub_
+        .publish_with_headers::<WorkTopic>(
+            &SimpleMessage { id: "hdr-1".into(), content: "with headers".into() },
+            headers,
+        )
+        .await
+        .expect("publish_with_headers should succeed");
+
+    let captured = Arc::new(Mutex::new(HashMap::new()));
+    let handler = HeaderCapture(captured.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run::<WorkTopic>(handler, ConsumerOptions::new(sc).with_prefetch_count(1)).await
+    });
+
+    let result = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let map = captured.lock().await;
+            if !map.is_empty() { return map.clone(); }
+            drop(map);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let headers_received = result.expect("should receive headers within timeout");
+    assert_eq!(
+        headers_received.get("x-trace-id").map(|s| s.as_str()),
+        Some("trace-abc-123"),
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn publish_and_consume_batch() {
+    let client = connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage {
+            id: format!("batch-{i}"),
+            content: format!("message {i}"),
+        })
+        .collect();
+
+    pub_
+        .publish_batch::<WorkTopic>(&messages)
+        .await
+        .expect("publish_batch should succeed");
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer.run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10)).await
+    });
+
+    assert!(handler.counter.wait_for(5, TIMEOUT).await, "should receive all 5 messages");
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert_eq!(handler.counter.get(), 5);
+    client.shutdown().await;
+}
