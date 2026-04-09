@@ -174,6 +174,8 @@ Publish (NATS):
 
 ```rust,no_run
 use shove::nats::*;
+use shove::publisher::Publisher;
+use shove::topology::TopologyDeclarer;
 
 let client = NatsClient::connect(&NatsConfig::new("nats://localhost:4222")).await?;
 
@@ -193,6 +195,7 @@ Consume (NATS):
 
 ```rust,no_run
 use shove::nats::*;
+use shove::consumer::{Consumer, ConsumerOptions};
 
 let consumer = NatsConsumer::new(client.clone());
 let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
@@ -267,7 +270,9 @@ RabbitMQ:
 
 ```rust,no_run
 use shove::rabbitmq::*;
+use shove::autoscaler::AutoscalerConfig;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 let mut registry = ConsumerGroupRegistry::new(client.clone());
@@ -287,8 +292,10 @@ registry.start_all();
 
 let registry = Arc::new(Mutex::new(registry));
 
-let mut autoscaler = Autoscaler::new(
-    &ManagementConfig::new("http://localhost:15672", "guest", "guest"),
+let mgmt = ManagementConfig::new("http://localhost:15672", "guest", "guest");
+let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
+    &mgmt,
+    registry.clone(),
     AutoscalerConfig {
         poll_interval: Duration::from_secs(2),
         scale_up_multiplier: 1.5,
@@ -308,6 +315,7 @@ NATS:
 use shove::nats::*;
 use shove::autoscaler::AutoscalerConfig;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 let client = NatsClient::connect(&NatsConfig::new("nats://localhost:4222")).await?;
