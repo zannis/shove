@@ -147,6 +147,11 @@ name = "nats_sequenced"
 path = "examples/nats/sequenced.rs"
 required-features = ["nats"]
 
+[[example]]
+name = "nats_stress"
+path = "examples/nats/stress.rs"
+required-features = ["nats"]
+
 [[test]]
 name = "rabbitmq_integration"
 required-features = ["rabbitmq"]
