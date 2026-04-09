@@ -126,7 +126,7 @@ shove::define_sequenced_topic!(
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
-    _container: testcontainers::ContainerAsync<Nats>,
+    container: testcontainers::ContainerAsync<Nats>,
     nats_url: String,
 }
 
@@ -146,7 +146,7 @@ impl TestBroker {
         let nats_url = format!("nats://{host}:{port}");
 
         Self {
-            _container: container,
+            container,
             nats_url,
         }
     }
@@ -155,6 +155,17 @@ impl TestBroker {
         NatsClient::connect_with_retry(&NatsConfig::new(&self.nats_url), 10)
             .await
             .expect("failed to connect to NATS")
+    }
+
+    async fn stop(self) {
+        self.container
+            .stop_with_timeout(Some(0))
+            .await
+            .expect("failed to stop container");
+        self.container
+            .rm()
+            .await
+            .expect("failed to remove container");
     }
 }
 
@@ -339,6 +350,7 @@ async fn client_connect_and_shutdown() {
         client.shutdown_token().is_cancelled(),
         "shutdown token should be cancelled after shutdown"
     );
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -350,6 +362,7 @@ async fn client_shutdown_cancels_token() {
 
     client.shutdown().await;
     assert!(token.is_cancelled());
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -371,6 +384,7 @@ async fn topology_declares_standard_stream_and_dlq() {
     assert!(dlq_stream.is_ok(), "DLQ stream should exist");
 
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -402,6 +416,7 @@ async fn topology_declares_sequenced_stream_with_shards() {
     assert!(dlq.is_ok(), "DLQ stream should exist for sequenced topic");
 
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -419,6 +434,7 @@ async fn topology_idempotent() {
     );
 
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -460,6 +476,7 @@ async fn publish_and_consume_simple_message() {
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 1);
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -526,6 +543,7 @@ async fn publish_and_consume_with_headers() {
         Some("trace-abc-123"),
     );
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -567,6 +585,7 @@ async fn publish_and_consume_batch() {
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 5);
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -617,6 +636,7 @@ async fn rejected_message_lands_in_dlq() {
     client.shutdown().await;
     handle.await.unwrap().ok();
     dlq_handle.await.unwrap().ok();
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -663,6 +683,7 @@ async fn dlq_consumer_handles_dead_message() {
 
     client.shutdown().await;
     h2.await.unwrap().ok();
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -709,6 +730,7 @@ async fn retry_then_ack_succeeds() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -757,6 +779,7 @@ async fn max_retries_sends_to_dlq() {
     client.shutdown().await;
     handle.await.unwrap().ok();
     dlq_handle.await.unwrap().ok();
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -817,6 +840,7 @@ async fn defer_redelivers_message() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -859,6 +883,7 @@ async fn concurrent_consume_processes_all_messages() {
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 10);
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -925,6 +950,7 @@ async fn concurrent_consume_mixed_outcomes() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -967,6 +993,7 @@ async fn graceful_shutdown_drains_inflight() {
         "in-flight handler should have completed"
     );
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -1027,6 +1054,7 @@ async fn handler_timeout_triggers_retry() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -1073,6 +1101,7 @@ async fn sequenced_consume_preserves_order() {
     let amounts: Vec<u64> = records.iter().map(|(_, a)| *a).collect();
     assert_eq!(amounts, vec![0, 1, 2, 3, 4], "messages should be in order");
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -1129,6 +1158,7 @@ async fn sequenced_skip_continues_after_rejection() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -1187,6 +1217,7 @@ async fn sequenced_multiple_keys_concurrent() {
     assert_eq!(alice, vec![0, 1, 2], "alice messages should be in order");
     assert_eq!(bob, vec![100, 101, 102], "bob messages should be in order");
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -1235,6 +1266,7 @@ async fn consumer_group_processes_messages() {
     group.shutdown().await;
     assert_eq!(handler.counter.get(), 5);
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -1314,6 +1346,7 @@ async fn deserialization_failure_rejects_to_dlq() {
 
     shutdown.cancel();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 // ===========================================================================
@@ -1346,6 +1379,7 @@ async fn consumer_run_on_undeclared_stream_fails() {
 
     assert!(result.is_err(), "run on undeclared stream should fail");
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -1364,6 +1398,7 @@ async fn run_dlq_on_topic_without_dlq_fails() {
     let result = consumer.run_dlq::<NoDlqTopic>(Noop).await;
     assert!(result.is_err(), "run_dlq on topic without DLQ should fail");
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -1415,6 +1450,7 @@ async fn defer_without_hold_queues_redelivers() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     client.shutdown().await;
+    broker.stop().await;
 }
 
 #[tokio::test]
@@ -1491,4 +1527,5 @@ async fn defer_preserves_retry_count() {
     );
 
     client.shutdown().await;
+    broker.stop().await;
 }
