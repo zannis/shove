@@ -388,6 +388,8 @@ impl Consumer for NatsConsumer {
         let handler_timeout = options.handler_timeout;
         let hold_queues = topology.hold_queues();
 
+        let max_ack_pending = options.max_ack_pending.unwrap_or(prefetch_count as i64);
+
         let handler = Arc::new(handler);
         let client = self.client.clone();
 
@@ -395,6 +397,7 @@ impl Consumer for NatsConsumer {
             queue,
             consumer = consumer_name,
             prefetch_count,
+            max_ack_pending,
             max_retries,
             "NATS consumer started"
         );
@@ -423,7 +426,7 @@ impl Consumer for NatsConsumer {
                         PullConsumerConfig {
                             durable_name: Some(consumer_name.clone()),
                             ack_policy: AckPolicy::Explicit,
-                            max_ack_pending: prefetch_count as i64,
+                            max_ack_pending,
                             ..Default::default()
                         },
                     )

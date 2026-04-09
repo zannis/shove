@@ -306,12 +306,17 @@ impl Broker {
         }
     }
 
-    /// Purge the stream by deleting and re-creating it.
+    /// Purge the stream and delete the durable consumer so the next scenario
+    /// starts with a fresh `max_ack_pending` configuration.
     async fn purge_queue(&self) {
         let js = self.client.jetstream();
         let queue = StressTopic::topology().queue();
 
         if let Ok(stream) = js.get_stream(queue).await {
+            // Delete the durable consumer so it gets re-created with the
+            // correct max_ack_pending for the next scenario's consumer count.
+            let consumer_name = format!("{queue}-consumer");
+            let _ = stream.delete_consumer(&consumer_name).await;
             let _ = stream.purge().await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

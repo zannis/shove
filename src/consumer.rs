@@ -82,6 +82,14 @@ pub struct ConsumerOptions {
     /// Zero means "use `prefetch_count`" (the default).
     /// Only meaningful for SQS backends; ignored by RabbitMQ.
     pub(crate) receive_batch_size: u16,
+    /// Override for JetStream `max_ack_pending` on the durable consumer.
+    ///
+    /// When multiple consumer tasks share a single JetStream durable consumer
+    /// (as in consumer groups), `max_ack_pending` must account for the total
+    /// in-flight capacity across all tasks — not just the per-task prefetch.
+    /// `None` means use `prefetch_count` (the default for standalone consumers).
+    /// Only meaningful for NATS backends; ignored by RabbitMQ and SQS.
+    pub(crate) max_ack_pending: Option<i64>,
 }
 
 impl ConsumerOptions {
@@ -97,6 +105,7 @@ impl ConsumerOptions {
             max_pending_per_key: None,
             exactly_once: false,
             receive_batch_size: 0,
+            max_ack_pending: None,
         }
     }
 

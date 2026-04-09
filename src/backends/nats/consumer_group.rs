@@ -132,10 +132,15 @@ impl NatsConsumerGroup {
         H: MessageHandler<T> + Clone + 'static,
     {
         let concurrent = config.concurrent_processing;
+        let max_ack_pending = if concurrent {
+            config.prefetch_count as i64 * config.max_consumers as i64
+        } else {
+            config.max_consumers as i64
+        };
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = NatsConsumer::new(client.clone());
-            let options = if concurrent {
+            let mut options = if concurrent {
                 options
             } else {
                 ConsumerOptions {
@@ -143,6 +148,7 @@ impl NatsConsumerGroup {
                     ..options
                 }
             };
+            options.max_ack_pending = Some(max_ack_pending);
 
             tokio::spawn(async move {
                 let result = consumer.run::<T>(handler, options).await;
@@ -251,6 +257,7 @@ impl NatsConsumerGroup {
             max_pending_per_key: self.config.max_pending_per_key,
             exactly_once: false,
             receive_batch_size: 0,
+            max_ack_pending: None,
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));

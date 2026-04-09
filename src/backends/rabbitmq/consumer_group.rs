@@ -300,6 +300,7 @@ impl ConsumerGroup {
             max_pending_per_key: self.config.max_pending_per_key,
             exactly_once: false,
             receive_batch_size: 0,
+            max_ack_pending: None,
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
