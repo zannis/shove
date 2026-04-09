@@ -1,6 +1,6 @@
 [package]
 name = "shove"
-version = "0.6.3"
+version = "0.7.0"
 description = "Async tasks via pubsub on steroids. Comes with built-in support for complex queue configurations, audit logs, autoscaling consumer groups and more."
 edition = "2024"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
@@ -24,6 +24,7 @@ pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
 # Complete pubsub with AWS SNS and AWS SQS
 aws-sns-sqs = ["pub-aws-sns", "dep:aws-sdk-sqs"]
 audit = []
+nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -41,11 +42,14 @@ aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optio
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 rand = "0.10"
+async-nats = { version = "0.39", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack"] }
+testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -133,6 +137,21 @@ name = "rabbitmq_exactly_once"
 path = "examples/rabbitmq/exactly_once.rs"
 required-features = ["rabbitmq-transactional"]
 
+[[example]]
+name = "nats_basic"
+path = "examples/nats/basic.rs"
+required-features = ["nats"]
+
+[[example]]
+name = "nats_sequenced"
+path = "examples/nats/sequenced.rs"
+required-features = ["nats"]
+
+[[example]]
+name = "nats_stress"
+path = "examples/nats/stress.rs"
+required-features = ["nats"]
+
 [[test]]
 name = "rabbitmq_integration"
 required-features = ["rabbitmq"]
@@ -144,3 +163,7 @@ required-features = ["pub-aws-sns"]
 [[test]]
 name = "sns_sqs_integration"
 required-features = ["aws-sns-sqs"]
+
+[[test]]
+name = "nats_integration"
+required-features = ["nats"]

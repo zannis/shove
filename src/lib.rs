@@ -61,6 +61,17 @@ pub mod sns {
     };
 }
 
+#[cfg(feature = "nats")]
+pub mod nats {
+    pub use crate::backends::nats::autoscaler::{
+        JetStreamStatsProvider, NatsQueueStats, NatsQueueStatsProvider,
+    };
+    pub use crate::backends::nats::{
+        NatsAutoscalerBackend, NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroup,
+        NatsConsumerGroupConfig, NatsConsumerGroupRegistry, NatsPublisher, NatsTopologyDeclarer,
+    };
+}
+
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq {
     pub use crate::backends::rabbitmq::{

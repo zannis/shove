@@ -6,9 +6,9 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust on top of RabbitMQ or AWS SNS/SQS.
+Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, or NATS JetStream.
 
-`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it.
+`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it. Pick the transport that fits your stack — RabbitMQ, SNS/SQS, or NATS JetStream — and get the same high-level API everywhere.
 
 ## Why shove
 
@@ -20,8 +20,9 @@ Type-safe async pub/sub for Rust on top of RabbitMQ or AWS SNS/SQS.
 - Structured audit trails for every delivery attempt
 - RabbitMQ at-least-once by default, with opt-in transactional exactly-once routing
 - SNS publisher-only mode or full SNS + SQS consumption stack
+- NATS JetStream with per-key shard ordering and queue-depth autoscaling
 
-If you have one queue, one consumer, and little retry logic, use `lapin` or the AWS SDK directly. `shove` is the layer for multi-service event flows that need operational discipline.
+If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, or `async-nats` directly. `shove` is the layer for multi-service event flows that need operational discipline.
 
 ## Features
 
@@ -40,6 +41,9 @@ cargo add shove --features pub-aws-sns
 # Full AWS SNS + SQS backend
 cargo add shove --features aws-sns-sqs
 
+# NATS JetStream
+cargo add shove --features nats
+
 # Optional built-in audit publisher
 cargo add shove --features rabbitmq,audit
 ```
@@ -50,11 +54,12 @@ cargo add shove --features rabbitmq,audit
 | `rabbitmq-transactional` | RabbitMQ exactly-once routing via AMQP transactions |
 | `pub-aws-sns` | SNS publisher and topology declaration |
 | `aws-sns-sqs` | Full SNS + SQS publisher/consumer stack, consumer groups, autoscaling |
+| `nats` | NATS JetStream publisher, consumer, topology declaration, consumer groups, autoscaling |
 | `audit` | Built-in `ShoveAuditHandler` and `AuditLog` topic |
 
 ## Quick start
 
-For RabbitMQ, the repo's `docker-compose.yml` starts a local broker with the consistent-hash exchange plugin enabled. For the AWS path, it starts LocalStack with SNS and SQS on `http://localhost:4566`.
+For RabbitMQ, the repo's `docker-compose.yml` starts a local broker with the consistent-hash exchange plugin enabled. For the AWS path, it starts LocalStack with SNS and SQS on `http://localhost:4566`. For NATS, it starts a JetStream-enabled server on `localhost:4222`.
 
 ```sh
 docker compose up -d
@@ -165,6 +170,38 @@ let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
 consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
 ```
 
+Publish (NATS):
+
+```rust,no_run
+use shove::nats::*;
+use shove::publisher::Publisher;
+use shove::topology::TopologyDeclarer;
+
+let client = NatsClient::connect(&NatsConfig::new("nats://localhost:4222")).await?;
+
+let declarer = NatsTopologyDeclarer::new(client.clone());
+declarer.declare(OrderSettlement::topology()).await?;
+
+let publisher = NatsPublisher::new(client.clone()).await?;
+publisher
+    .publish::<OrderSettlement>(&SettlementEvent {
+        order_id: "ORD-1".into(),
+        amount_cents: 5000,
+    })
+    .await?;
+```
+
+Consume (NATS):
+
+```rust,no_run
+use shove::nats::*;
+use shove::consumer::{Consumer, ConsumerOptions};
+
+let consumer = NatsConsumer::new(client.clone());
+let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
+consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
+```
+
 ## Delivery model
 
 `shove` is at-least-once by default. That means handlers should be idempotent.
@@ -180,6 +217,7 @@ Additional behavior:
 - DLQ consumers receive `DeadMessageMetadata`
 - RabbitMQ publishes a stable `x-message-id` header for deduplication
 - RabbitMQ can opt into transactional exactly-once routing with `rabbitmq-transactional`
+- NATS uses `Nats-Msg-Id` for deduplication within a 120-second window
 
 Exactly-once mode removes the publish-then-ack race in RabbitMQ by wrapping routing decisions in AMQP transactions. It is materially slower and should be reserved for handlers with irreversible side effects.
 
@@ -222,17 +260,19 @@ Use `Skip` when messages are independently valid (e.g. audit entries). Use `Fail
 
 Messages for other sequence keys are unaffected by either policy.
 
-RabbitMQ uses consistent-hash routing for this. SNS/SQS uses FIFO topics and queues.
+RabbitMQ uses consistent-hash routing for this. SNS/SQS uses FIFO topics and queues. NATS uses subject-based shard routing with `max_ack_pending: 1` per shard to enforce strict ordering.
 
 ## Consumer groups and autoscaling
 
-Both backends support named consumer groups with min/max bounds, per-consumer prefetch, retry budget, handler timeouts, and optional concurrent processing inside each consumer.
+All backends support named consumer groups with min/max bounds, per-consumer prefetch, retry budget, handler timeouts, and optional concurrent processing inside each consumer.
 
 RabbitMQ:
 
 ```rust,no_run
 use shove::rabbitmq::*;
+use shove::autoscaler::AutoscalerConfig;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 let mut registry = ConsumerGroupRegistry::new(client.clone());
@@ -252,8 +292,10 @@ registry.start_all();
 
 let registry = Arc::new(Mutex::new(registry));
 
-let mut autoscaler = Autoscaler::new(
-    &ManagementConfig::new("http://localhost:15672", "guest", "guest"),
+let mgmt = ManagementConfig::new("http://localhost:15672", "guest", "guest");
+let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
+    &mgmt,
+    registry.clone(),
     AutoscalerConfig {
         poll_interval: Duration::from_secs(2),
         scale_up_multiplier: 1.5,
@@ -262,10 +304,51 @@ let mut autoscaler = Autoscaler::new(
         cooldown_duration: Duration::from_secs(8),
     },
 );
-autoscaler.run(registry, shutdown_token).await;
+autoscaler.run(shutdown_token).await;
 ```
 
 SNS/SQS uses `SqsConsumerGroupRegistry` and `SqsAutoscaler` with the same configuration shape.
+
+NATS:
+
+```rust,no_run
+use shove::nats::*;
+use shove::autoscaler::AutoscalerConfig;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+let client = NatsClient::connect(&NatsConfig::new("nats://localhost:4222")).await?;
+let mut registry = NatsConsumerGroupRegistry::new(client.clone());
+
+registry
+    .register::<WorkQueue, TaskHandler>(
+        NatsConsumerGroupConfig::new(1..=8)
+            .with_prefetch_count(10)
+            .with_max_retries(5)
+            .with_handler_timeout(Duration::from_secs(30))
+            .with_concurrent_processing(true),
+        || TaskHandler,
+    )
+    .await?;
+
+registry.start_all();
+
+let registry = Arc::new(Mutex::new(registry));
+
+let mut autoscaler = NatsAutoscalerBackend::autoscaler(
+    client.clone(),
+    registry.clone(),
+    AutoscalerConfig {
+        poll_interval: Duration::from_secs(2),
+        scale_up_multiplier: 1.5,
+        scale_down_multiplier: 0.3,
+        hysteresis_duration: Duration::from_secs(4),
+        cooldown_duration: Duration::from_secs(8),
+    },
+);
+autoscaler.run(shutdown_token).await;
+```
 
 ## Audit logging
 
@@ -336,6 +419,11 @@ SNS/SQS examples:
 - `sqs_audited_consumer`
 - `sqs_autoscaler`
 
+NATS examples:
+
+- `nats_basic`
+- `nats_sequenced`
+
 Run them with:
 
 ```sh
@@ -343,6 +431,8 @@ cargo run --example rabbitmq_basic_pubsub --features rabbitmq
 cargo run --example rabbitmq_exactly_once --features rabbitmq-transactional
 cargo run --example sqs_basic_pubsub --features aws-sns-sqs
 cargo run --example sqs_autoscaler --features aws-sns-sqs
+cargo run --example nats_basic --features nats
+cargo run --example nats_sequenced --features nats
 ```
 
 ## Reference
@@ -373,8 +463,9 @@ cargo run --example sqs_autoscaler --features aws-sns-sqs
 | RabbitMQ (exactly-once routing) | `rabbitmq-transactional` | Stable |
 | AWS SNS (publisher only) | `pub-aws-sns` | Stable |
 | AWS SNS + SQS | `aws-sns-sqs` | Stable |
+| NATS JetStream | `nats` | Stable |
 
-`aws-sns-sqs` implies `pub-aws-sns`. Sequenced topics use SNS FIFO topics with `MessageGroupId` and sharded FIFO SQS queues.
+`aws-sns-sqs` implies `pub-aws-sns`. Sequenced topics use SNS FIFO topics with `MessageGroupId` and sharded FIFO SQS queues. NATS uses subject-based shard routing with per-shard `max_ack_pending: 1`.
 
 ## Requirements
 
@@ -382,7 +473,7 @@ cargo run --example sqs_autoscaler --features aws-sns-sqs
 
 ## Background
 
-`shove` came out of production event-processing systems that needed more than a broker client but less than a platform rewrite. The crate focuses on the hard parts around message handling correctness and operational behavior, while leaving transport and persistence to RabbitMQ or SNS/SQS.
+`shove` came out of production event-processing systems that needed more than a broker client but less than a platform rewrite. The crate focuses on the hard parts around message handling correctness and operational behavior, while leaving transport and persistence to RabbitMQ, SNS/SQS, or NATS JetStream.
 
 The API is still evolving.
 

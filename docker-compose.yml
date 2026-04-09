@@ -11,6 +11,12 @@ services:
       bash -c "rabbitmq-plugins enable rabbitmq_consistent_hash_exchange &&
                rabbitmq-server "
 
+  nats:
+    image: nats:latest
+    ports:
+      - "4222:4222"
+    command: -js
+
   localstack:
     image: localstack/localstack:latest
     ports:

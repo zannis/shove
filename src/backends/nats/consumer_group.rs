@@ -1,5 +1,4 @@
-#![cfg(feature = "aws-sns-sqs")]
-
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,43 +6,36 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
 use tracing::{debug, info, warn};
 
-use crate::backends::sns::client::SnsClient;
-use crate::backends::sns::consumer::SqsConsumer;
-use crate::backends::sns::topology::QueueRegistry;
+use crate::backends::nats::client::NatsClient;
+use crate::backends::nats::consumer::NatsConsumer;
+use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{Consumer, ConsumerOptions};
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::topology::TopologyDeclarer;
 
 /// Type-erased factory that spawns a single consumer task.
-///
-/// The closure captures the client and receives fully-configured consumer
-/// options, returning the `JoinHandle` of the spawned task.
-type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
+pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
-/// Configuration that governs the behaviour of a [`SqsConsumerGroup`].
-pub struct SqsConsumerGroupConfig {
-    pub(crate) prefetch_count: u16,
-    pub(crate) min_consumers: u16,
-    pub(crate) max_consumers: u16,
-    pub(crate) max_retries: u32,
-    /// Maximum time a handler may spend processing a single message.
-    /// If exceeded the message is retried. `None` means no limit.
-    pub(crate) handler_timeout: Option<Duration>,
-    /// When `true`, each consumer in the group processes up to `prefetch_count`
-    /// messages concurrently while preserving in-order acknowledgement.
-    pub(crate) concurrent_processing: bool,
-    /// Maximum locally buffered messages per sequence key (sequenced consumers).
-    pub(crate) max_pending_per_key: Option<usize>,
+// ---------------------------------------------------------------------------
+// NatsConsumerGroupConfig
+// ---------------------------------------------------------------------------
+
+pub struct NatsConsumerGroupConfig {
+    prefetch_count: u16,
+    min_consumers: u16,
+    max_consumers: u16,
+    max_retries: u32,
+    handler_timeout: Option<Duration>,
+    concurrent_processing: bool,
+    max_pending_per_key: Option<usize>,
 }
 
-impl SqsConsumerGroupConfig {
+impl NatsConsumerGroupConfig {
     /// Create a new config with the given consumer count range.
-    ///
-    /// `range` sets `min_consumers..=max_consumers`.
-    /// Defaults: `prefetch_count=10`, `max_retries=10`, `handler_timeout=None`.
     ///
     /// # Panics
     ///
@@ -66,94 +58,72 @@ impl SqsConsumerGroupConfig {
         }
     }
 
-    /// Set the prefetch count (number of unacknowledged messages per consumer).
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
         self
     }
 
-    /// Set the maximum number of retries before a message is dead-lettered.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
     }
 
-    /// Set the maximum time a handler may spend processing a single message.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         self.handler_timeout = Some(timeout);
         self
     }
 
-    /// Enable concurrent message processing within each consumer.
-    ///
-    /// When enabled, each consumer processes up to `prefetch_count` messages
-    /// concurrently while preserving in-order acknowledgement.
     pub fn with_concurrent_processing(mut self, concurrent: bool) -> Self {
         self.concurrent_processing = concurrent;
         self
     }
 
-    /// Returns the configured prefetch count.
     pub fn prefetch_count(&self) -> u16 {
         self.prefetch_count
     }
 
-    /// Returns the minimum number of consumers.
     pub fn min_consumers(&self) -> u16 {
         self.min_consumers
     }
 
-    /// Returns the maximum number of consumers.
     pub fn max_consumers(&self) -> u16 {
         self.max_consumers
     }
 
-    /// Returns the maximum number of retries.
     pub fn max_retries(&self) -> u32 {
         self.max_retries
     }
 
-    /// Returns the handler timeout, if any.
     pub fn handler_timeout(&self) -> Option<Duration> {
         self.handler_timeout
     }
 
-    /// Returns whether concurrent processing is enabled.
     pub fn concurrent_processing(&self) -> bool {
         self.concurrent_processing
     }
+
+    pub fn max_pending_per_key(&self) -> Option<usize> {
+        self.max_pending_per_key
+    }
 }
 
-/// A named group of identical consumers all reading from the same SQS queue.
-///
-/// The group owns the concrete consumers and is responsible for scaling them
-/// up and down.  It keeps a [`CancellationToken`] per consumer so that
-/// individual consumers can be stopped without affecting the rest of the group.
-pub struct SqsConsumerGroup {
-    name: String,
-    /// The queue that every consumer in this group reads from.
-    queue: String,
-    config: SqsConsumerGroupConfig,
-    spawner: Spawner,
-    /// One entry per active consumer: (per-consumer token, processing flag, task handle).
-    consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
-    /// Cancelling this token stops every consumer in the group at once.
-    group_token: CancellationToken,
+// ---------------------------------------------------------------------------
+// NatsConsumerGroup
+// ---------------------------------------------------------------------------
+
+pub struct NatsConsumerGroup {
+    pub(crate) queue: String,
+    pub(crate) config: NatsConsumerGroupConfig,
+    pub(crate) spawner: Spawner,
+    pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
+    pub(crate) group_token: CancellationToken,
 }
 
-impl SqsConsumerGroup {
-    /// Create a new SQS consumer group.
-    ///
-    /// `handler_factory` is called once per consumer spawn to produce a fresh
-    /// handler instance.  The factory is stored inside a type-erased closure
-    /// so that the rest of the codebase does not have to carry `T`/`H` type
-    /// parameters.
+impl NatsConsumerGroup {
     pub fn new<T, H>(
-        name: impl Into<String>,
         queue: impl Into<String>,
-        config: SqsConsumerGroupConfig,
-        client: SnsClient,
-        queue_registry: Arc<QueueRegistry>,
+        config: NatsConsumerGroupConfig,
+        client: NatsClient,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
     ) -> Self
@@ -162,23 +132,23 @@ impl SqsConsumerGroup {
         H: MessageHandler<T> + Clone + 'static,
     {
         let concurrent = config.concurrent_processing;
+        let max_ack_pending = if concurrent {
+            config.prefetch_count as i64 * config.max_consumers as i64
+        } else {
+            config.max_consumers as i64
+        };
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
-            let consumer = SqsConsumer::new(client.clone(), queue_registry.clone());
-            // In non-concurrent mode, limit in-flight handlers to 1 (serial processing)
-            // while keeping the SQS receive batch size at the configured prefetch_count.
-            // This lets each consumer fetch up to prefetch_count messages per poll while
-            // still processing them one-at-a-time, reducing per-message API call overhead
-            // and improving throughput when multiple consumers share the same queue.
-            let options = if concurrent {
+            let consumer = NatsConsumer::new(client.clone());
+            let mut options = if concurrent {
                 options
             } else {
                 ConsumerOptions {
-                    receive_batch_size: options.prefetch_count,
                     prefetch_count: 1,
                     ..options
                 }
             };
+            options.max_ack_pending = Some(max_ack_pending);
 
             tokio::spawn(async move {
                 let result = consumer.run::<T>(handler, options).await;
@@ -189,7 +159,6 @@ impl SqsConsumerGroup {
         });
 
         Self {
-            name: name.into(),
             queue: queue.into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
@@ -198,55 +167,49 @@ impl SqsConsumerGroup {
         }
     }
 
-    /// Spawn `min_consumers` consumers to get the group to its minimum size.
+    /// Spawn `min_consumers` consumers.
     pub fn start(&mut self) {
         let target = self.config.min_consumers as usize;
         info!(
-            group = %self.name,
+            group = %self.queue,
             queue = %self.queue,
             initial_consumers = target,
-            "starting SQS consumer group"
+            "starting consumer group"
         );
         for _ in 0..target {
             self.spawn_one();
         }
     }
 
-    /// Spawn one additional consumer, respecting `max_consumers`.
-    ///
-    /// Returns `false` when the group is already at maximum capacity.
+    /// Spawn one additional consumer. Returns false at max capacity.
     pub fn scale_up(&mut self) -> bool {
         if self.consumers.len() >= self.config.max_consumers as usize {
-            debug!(group = %self.name, max = self.config.max_consumers, "scale_up rejected: at max capacity");
+            debug!(group = %self.queue, max = self.config.max_consumers, "scale_up rejected: at max capacity");
             return false;
         }
         self.spawn_one();
         info!(
-            group = %self.name,
+            group = %self.queue,
             consumers = self.consumers.len(),
             "scaled up: spawned new consumer"
         );
         true
     }
 
-    /// Cancel an idle consumer, respecting `min_consumers`.
-    ///
-    /// Returns `false` when the group is already at minimum capacity or all
-    /// consumers are currently processing a message.
+    /// Cancel an idle consumer. Returns false at min capacity or all busy.
     pub fn scale_down(&mut self) -> bool {
         if self.consumers.len() <= self.config.min_consumers as usize {
-            debug!(group = %self.name, min = self.config.min_consumers, "scale_down rejected: at min capacity");
+            debug!(group = %self.queue, min = self.config.min_consumers, "scale_down rejected: at min capacity");
             return false;
         }
 
-        // Find the last idle consumer (prefer removing recently-spawned ones).
         let idle_index = self
             .consumers
             .iter()
             .rposition(|(_, processing, _)| !processing.load(Ordering::Relaxed));
 
         let Some(index) = idle_index else {
-            warn!(group = %self.name, "scale_down rejected: all consumers are busy");
+            warn!(group = %self.queue, "scale_down rejected: all consumers are busy");
             return false;
         };
 
@@ -254,39 +217,33 @@ impl SqsConsumerGroup {
         token.cancel();
 
         info!(
-            group = %self.name,
+            group = %self.queue,
             consumers = self.consumers.len(),
             "scaled down: cancelled an idle consumer"
         );
         true
     }
 
-    /// Number of currently active (spawned) consumers.
     pub fn active_consumers(&self) -> usize {
         self.consumers.len()
     }
 
-    /// The queue name this group reads from.
     pub fn queue(&self) -> &str {
         &self.queue
     }
 
-    /// Access the group's configuration.
-    pub fn config(&self) -> &SqsConsumerGroupConfig {
+    pub fn config(&self) -> &NatsConsumerGroupConfig {
         &self.config
     }
 
-    /// Cancel every consumer in the group and wait for all tasks to finish.
     pub async fn shutdown(&mut self) {
-        info!(group = %self.name, consumers = self.consumers.len(), "shutting down SQS consumer group");
+        info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
         self.group_token.cancel();
         for (_token, _processing, handle) in self.consumers.drain(..) {
             let _ = handle.await;
         }
-        debug!(group = %self.name, "SQS consumer group shutdown complete");
+        debug!(group = %self.queue, "consumer group shutdown complete");
     }
-
-    // ---- private helpers ----
 
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
@@ -304,17 +261,111 @@ impl SqsConsumerGroup {
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
-        debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned SQS consumer");
+        debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
     }
 }
+
+// ---------------------------------------------------------------------------
+// NatsConsumerGroupRegistry
+// ---------------------------------------------------------------------------
+
+pub struct NatsConsumerGroupRegistry {
+    pub(crate) groups: HashMap<String, NatsConsumerGroup>,
+    client: Option<NatsClient>,
+}
+
+impl NatsConsumerGroupRegistry {
+    pub fn new(client: NatsClient) -> Self {
+        Self {
+            groups: HashMap::new(),
+            client: Some(client),
+        }
+    }
+
+    /// Create a registry from a pre-populated map of groups (for testing).
+    /// The resulting registry cannot be used to call `register()`.
+    #[cfg(test)]
+    pub(crate) fn from_groups(groups: HashMap<String, NatsConsumerGroup>) -> Self {
+        Self {
+            groups,
+            client: None,
+        }
+    }
+
+    pub async fn register<T, H>(
+        &mut self,
+        config: NatsConsumerGroupConfig,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+    ) -> Result<()>
+    where
+        T: Topic + 'static,
+        H: MessageHandler<T> + Clone + 'static,
+    {
+        let topology = T::topology();
+        let name = topology.queue().to_string();
+
+        if self.groups.contains_key(&name) {
+            return Err(ShoveError::Topology(format!(
+                "consumer group '{name}' is already registered"
+            )));
+        }
+
+        let client = self.client.as_ref().ok_or_else(|| {
+            ShoveError::Connection("registry has no client (test-only registry)".into())
+        })?;
+
+        let declarer = NatsTopologyDeclarer::new(client.clone());
+        declarer.declare(topology).await?;
+
+        info!(group = %name, "registering consumer group");
+        let group_token = client.shutdown_token().child_token();
+        let group = NatsConsumerGroup::new::<T, H>(
+            name.clone(),
+            config,
+            client.clone(),
+            group_token,
+            handler_factory,
+        );
+        self.groups.insert(name, group);
+        Ok(())
+    }
+
+    pub fn start_all(&mut self) {
+        info!(count = self.groups.len(), "starting all consumer groups");
+        for group in self.groups.values_mut() {
+            group.start();
+        }
+    }
+
+    pub fn groups(&self) -> &HashMap<String, NatsConsumerGroup> {
+        &self.groups
+    }
+
+    pub fn groups_mut(&mut self) -> &mut HashMap<String, NatsConsumerGroup> {
+        &mut self.groups
+    }
+
+    pub async fn shutdown_all(&mut self) {
+        info!(
+            count = self.groups.len(),
+            "shutting down all consumer groups"
+        );
+        for group in self.groups.values_mut() {
+            group.shutdown().await;
+        }
+        debug!("all consumer groups shut down");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a `SqsConsumerGroup` with a test spawner that simply waits on the
-    /// cancellation token (no AWS connection needed).
-    fn test_group(config: SqsConsumerGroupConfig) -> SqsConsumerGroup {
+    fn test_group(config: NatsConsumerGroupConfig) -> NatsConsumerGroup {
         let group_token = CancellationToken::new();
         let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
             tokio::spawn(async move {
@@ -322,8 +373,7 @@ mod tests {
             })
         });
 
-        SqsConsumerGroup {
-            name: "test-group".into(),
+        NatsConsumerGroup {
             queue: "test-queue".into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
@@ -332,8 +382,8 @@ mod tests {
         }
     }
 
-    fn default_config() -> SqsConsumerGroupConfig {
-        SqsConsumerGroupConfig::new(1..=4)
+    fn default_config() -> NatsConsumerGroupConfig {
+        NatsConsumerGroupConfig::new(1..=4)
     }
 
     // -- start --
@@ -345,9 +395,23 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(SqsConsumerGroupConfig::new(3..=5));
+            let mut group = test_group(NatsConsumerGroupConfig::new(3..=5));
             group.start();
             assert_eq!(group.active_consumers(), 3);
+            group.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn start_with_zero_min_spawns_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut group = test_group(NatsConsumerGroupConfig::new(0..=4));
+            group.start();
+            assert_eq!(group.active_consumers(), 0);
             group.shutdown().await;
         });
     }
@@ -364,7 +428,6 @@ mod tests {
             let mut group = test_group(default_config());
             group.start();
             assert_eq!(group.active_consumers(), 1);
-
             assert!(group.scale_up());
             assert_eq!(group.active_consumers(), 2);
             group.shutdown().await;
@@ -378,10 +441,8 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(SqsConsumerGroupConfig::new(2..=2));
+            let mut group = test_group(NatsConsumerGroupConfig::new(2..=2));
             group.start();
-            assert_eq!(group.active_consumers(), 2);
-
             assert!(!group.scale_up());
             assert_eq!(group.active_consumers(), 2);
             group.shutdown().await;
@@ -401,7 +462,6 @@ mod tests {
             group.start();
             group.scale_up();
             assert_eq!(group.active_consumers(), 2);
-
             assert!(group.scale_down());
             assert_eq!(group.active_consumers(), 1);
             group.shutdown().await;
@@ -417,8 +477,6 @@ mod tests {
         rt.block_on(async {
             let mut group = test_group(default_config());
             group.start();
-            assert_eq!(group.active_consumers(), 1);
-
             assert!(!group.scale_down());
             assert_eq!(group.active_consumers(), 1);
             group.shutdown().await;
@@ -432,19 +490,37 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(SqsConsumerGroupConfig::new(0..=3));
+            let mut group = test_group(NatsConsumerGroupConfig::new(0..=3));
             group.scale_up();
             group.scale_up();
             group.scale_up();
-            assert_eq!(group.active_consumers(), 3);
 
-            // Mark all consumers as busy.
             for (_, processing, _) in &group.consumers {
                 processing.store(true, Ordering::Release);
             }
 
             assert!(!group.scale_down());
             assert_eq!(group.active_consumers(), 3);
+            group.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn scale_down_cancels_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut group = test_group(NatsConsumerGroupConfig::new(0..=2));
+            group.scale_up();
+            group.scale_up();
+
+            let doomed_token = group.consumers[1].0.clone();
+            assert!(!doomed_token.is_cancelled());
+
+            group.scale_down();
+            assert!(doomed_token.is_cancelled());
             group.shutdown().await;
         });
     }
@@ -464,97 +540,36 @@ mod tests {
         assert_eq!(group.active_consumers(), 0);
     }
 
-    // -- ConsumerGroupConfig constructor validation --
+    // -- accessors --
 
     #[test]
-    fn new_with_valid_range() {
-        let config = SqsConsumerGroupConfig::new(2..=8);
+    fn queue_returns_configured_queue() {
+        let group = test_group(default_config());
+        assert_eq!(group.queue(), "test-queue");
+    }
+
+    #[test]
+    fn config_returns_reference() {
+        let group = test_group(
+            NatsConsumerGroupConfig::new(2..=8)
+                .with_prefetch_count(5)
+                .with_max_retries(3)
+                .with_handler_timeout(Duration::from_secs(30)),
+        );
+        let config = group.config();
         assert_eq!(config.min_consumers(), 2);
         assert_eq!(config.max_consumers(), 8);
+        assert_eq!(config.prefetch_count(), 5);
+        assert_eq!(config.max_retries(), 3);
+        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
     }
 
-    #[test]
-    fn new_sets_defaults() {
-        let config = SqsConsumerGroupConfig::new(1..=4);
-        assert_eq!(config.prefetch_count(), 10);
-        assert_eq!(config.max_retries(), 10);
-        assert!(config.handler_timeout().is_none());
-    }
-
-    #[test]
-    fn new_with_equal_min_max() {
-        let config = SqsConsumerGroupConfig::new(3..=3);
-        assert_eq!(config.min_consumers(), 3);
-        assert_eq!(config.max_consumers(), 3);
-    }
+    // -- config validation --
 
     #[test]
     #[should_panic]
     #[allow(clippy::reversed_empty_ranges)]
     fn new_panics_if_min_greater_than_max() {
-        let _ = SqsConsumerGroupConfig::new(5..=2);
-    }
-
-    // -- builder methods --
-
-    #[test]
-    fn with_prefetch_count_sets_value() {
-        let config = SqsConsumerGroupConfig::new(1..=4).with_prefetch_count(25);
-        assert_eq!(config.prefetch_count(), 25);
-    }
-
-    #[test]
-    fn with_max_retries_sets_value() {
-        let config = SqsConsumerGroupConfig::new(1..=4).with_max_retries(5);
-        assert_eq!(config.max_retries(), 5);
-    }
-
-    #[test]
-    fn with_handler_timeout_sets_value() {
-        let config =
-            SqsConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(60));
-        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn builder_chaining_sets_all_values() {
-        let config = SqsConsumerGroupConfig::new(1..=5)
-            .with_prefetch_count(20)
-            .with_max_retries(3)
-            .with_handler_timeout(Duration::from_secs(30));
-        assert_eq!(config.min_consumers(), 1);
-        assert_eq!(config.max_consumers(), 5);
-        assert_eq!(config.prefetch_count(), 20);
-        assert_eq!(config.max_retries(), 3);
-        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
-    }
-
-    // -- concurrent_processing --
-
-    #[test]
-    fn concurrent_processing_defaults_to_false() {
-        let config = SqsConsumerGroupConfig::new(1..=4);
-        assert!(!config.concurrent_processing());
-    }
-
-    #[test]
-    fn with_concurrent_processing_sets_value() {
-        let config = SqsConsumerGroupConfig::new(1..=4).with_concurrent_processing(true);
-        assert!(config.concurrent_processing());
-    }
-
-    #[test]
-    fn builder_chaining_with_concurrent_processing() {
-        let config = SqsConsumerGroupConfig::new(1..=8)
-            .with_prefetch_count(20)
-            .with_max_retries(3)
-            .with_handler_timeout(Duration::from_secs(30))
-            .with_concurrent_processing(true);
-        assert_eq!(config.min_consumers(), 1);
-        assert_eq!(config.max_consumers(), 8);
-        assert_eq!(config.prefetch_count(), 20);
-        assert_eq!(config.max_retries(), 3);
-        assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
-        assert!(config.concurrent_processing());
+        let _ = NatsConsumerGroupConfig::new(5..=2);
     }
 }
