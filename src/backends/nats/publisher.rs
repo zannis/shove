@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use async_nats::HeaderMap;
 use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::jetstream;
 use bytes::Bytes;
 use uuid::Uuid;
 
@@ -13,9 +14,55 @@ use crate::retry::Backoff;
 use crate::topic::Topic;
 
 use super::client::NatsClient;
+use super::constants::RETRY_COUNT_HEADER;
 
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
-const RETRY_COUNT_HEADER: &str = "Shove-Retry-Count";
+
+/// Publish a message to JetStream with retry on transient failures.
+/// Shared by both the publisher and consumer (for DLQ publishes).
+pub(super) async fn publish_with_retry(
+    js: &jetstream::Context,
+    subject: String,
+    headers: HeaderMap,
+    payload: Bytes,
+    max_attempts: u32,
+    label: &str,
+) -> Result<()> {
+    let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
+
+    for attempt in 1..=max_attempts {
+        match js
+            .publish_with_headers(subject.clone(), headers.clone(), payload.clone())
+            .await
+        {
+            Ok(ack_future) => match ack_future.await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if attempt == max_attempts {
+                        return Err(ShoveError::Connection(format!(
+                            "{label} ack failed after {max_attempts} attempts: {e}"
+                        )));
+                    }
+                    let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                    tracing::warn!(attempt, error = %e, "{label} ack failed, retrying");
+                    tokio::time::sleep(delay).await;
+                }
+            },
+            Err(e) => {
+                if attempt == max_attempts {
+                    return Err(ShoveError::Connection(format!(
+                        "{label} failed after {max_attempts} attempts: {e}"
+                    )));
+                }
+                let delay = backoff.next().unwrap_or(Duration::from_secs(2));
+                tracing::warn!(attempt, error = %e, "{label} failed, retrying");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+
+    unreachable!()
+}
 
 #[derive(Clone)]
 pub struct NatsPublisher {
@@ -55,52 +102,15 @@ impl NatsPublisher {
     }
 
     async fn publish_raw(&self, subject: String, headers: HeaderMap, payload: Bytes) -> Result<()> {
-        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
-
-        for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
-            match self
-                .client
-                .jetstream()
-                .publish_with_headers(subject.clone(), headers.clone(), payload.clone())
-                .await
-            {
-                Ok(ack_future) => match ack_future.await {
-                    Ok(_) => return Ok(()),
-                    Err(e) => {
-                        if attempt == MAX_PUBLISH_ATTEMPTS {
-                            return Err(ShoveError::Connection(format!(
-                                "publish ack failed after {MAX_PUBLISH_ATTEMPTS} attempts: {e}"
-                            )));
-                        }
-                        let delay = backoff.next().unwrap_or(Duration::from_secs(2));
-                        tracing::warn!(
-                            attempt,
-                            delay_ms = delay.as_millis() as u64,
-                            error = %e,
-                            "NATS publish ack failed, retrying"
-                        );
-                        tokio::time::sleep(delay).await;
-                    }
-                },
-                Err(e) => {
-                    if attempt == MAX_PUBLISH_ATTEMPTS {
-                        return Err(ShoveError::Connection(format!(
-                            "publish failed after {MAX_PUBLISH_ATTEMPTS} attempts: {e}"
-                        )));
-                    }
-                    let delay = backoff.next().unwrap_or(Duration::from_secs(2));
-                    tracing::warn!(
-                        attempt,
-                        delay_ms = delay.as_millis() as u64,
-                        error = %e,
-                        "NATS publish failed, retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-
-        unreachable!()
+        publish_with_retry(
+            self.client.jetstream(),
+            subject,
+            headers,
+            payload,
+            MAX_PUBLISH_ATTEMPTS,
+            "publish",
+        )
+        .await
     }
 }
 
@@ -128,7 +138,6 @@ impl Publisher for NatsPublisher {
     }
 
     async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
-        // Serialize all upfront for fail-fast
         let topology = T::topology();
         let prepared: Vec<(String, HeaderMap, Bytes)> = messages
             .iter()
@@ -140,8 +149,21 @@ impl Publisher for NatsPublisher {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Fire all publishes, then await all acks — O(1 RTT) instead of O(N RTT)
+        let mut ack_futures = Vec::with_capacity(prepared.len());
         for (subject, headers, payload) in prepared {
-            self.publish_raw(subject, headers, payload).await?;
+            let ack = self
+                .client
+                .jetstream()
+                .publish_with_headers(subject, headers, payload)
+                .await
+                .map_err(|e| ShoveError::Connection(format!("batch publish failed: {e}")))?;
+            ack_futures.push(ack);
+        }
+
+        for ack in ack_futures {
+            ack.await
+                .map_err(|e| ShoveError::Connection(format!("batch publish ack failed: {e}")))?;
         }
 
         Ok(())

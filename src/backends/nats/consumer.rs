@@ -22,15 +22,11 @@ use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 
 use super::client::NatsClient;
-
-// ---------------------------------------------------------------------------
-// Header constants
-// ---------------------------------------------------------------------------
-
-const RETRY_COUNT_HEADER: &str = "Shove-Retry-Count";
-const DEATH_REASON_HEADER: &str = "Shove-Death-Reason";
-const ORIGINAL_QUEUE_HEADER: &str = "Shove-Original-Queue";
-const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
+use super::constants::{
+    CONNECTION_RETRIES, DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER,
+    RETRY_COUNT_HEADER,
+};
+use super::publisher::publish_with_retry;
 
 // ---------------------------------------------------------------------------
 // Metadata extraction functions
@@ -151,7 +147,6 @@ async fn publish_to_dlq(
     headers.insert(DEATH_REASON_HEADER, reason);
     headers.insert(ORIGINAL_QUEUE_HEADER, topology.queue());
 
-    // Increment death count
     let current_death_count = msg
         .headers
         .as_ref()
@@ -172,43 +167,15 @@ async fn publish_to_dlq(
         .unwrap_or_default();
     headers.insert(NATS_MESSAGE_ID, format!("{original_id}-dlq").as_str());
 
-    let mut backoff =
-        crate::retry::Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
-    let max_attempts = 3u32;
-
-    for attempt in 1..=max_attempts {
-        match client
-            .jetstream()
-            .publish_with_headers(dlq_subject.clone(), headers.clone(), msg.payload.clone())
-            .await
-        {
-            Ok(ack_future) => match ack_future.await {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    if attempt == max_attempts {
-                        return Err(ShoveError::Connection(format!(
-                            "DLQ publish ack failed after {max_attempts} attempts: {e}"
-                        )));
-                    }
-                    let delay = backoff.next().unwrap_or(Duration::from_secs(2));
-                    tracing::warn!(attempt, error = %e, "DLQ publish ack failed, retrying");
-                    tokio::time::sleep(delay).await;
-                }
-            },
-            Err(e) => {
-                if attempt == max_attempts {
-                    return Err(ShoveError::Connection(format!(
-                        "DLQ publish failed after {max_attempts} attempts: {e}"
-                    )));
-                }
-                let delay = backoff.next().unwrap_or(Duration::from_secs(2));
-                tracing::warn!(attempt, error = %e, "DLQ publish failed, retrying");
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-
-    unreachable!()
+    publish_with_retry(
+        client.jetstream(),
+        dlq_subject,
+        headers,
+        msg.payload.clone(),
+        3,
+        "DLQ publish",
+    )
+    .await
 }
 
 /// Dispatches message routing based on the handler's outcome.
@@ -412,10 +379,8 @@ impl Consumer for NatsConsumer {
     ) -> Result<()> {
         let topology = T::topology();
         let queue = topology.queue();
-        let consumer_name = format!("{queue}-consumer");
+        let consumer_name = super::constants::consumer_name(queue);
 
-        // Extract needed values from options before moving into the reconnect closure.
-        // ConsumerOptions does not implement Clone in all configurations.
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
@@ -423,7 +388,6 @@ impl Consumer for NatsConsumer {
         let handler_timeout = options.handler_timeout;
         let hold_queues = topology.hold_queues();
 
-        // Wrap handler in Arc for sharing across tasks
         let handler = Arc::new(handler);
         let client = self.client.clone();
 
@@ -435,20 +399,15 @@ impl Consumer for NatsConsumer {
             "NATS consumer started"
         );
 
-        // Verify the stream exists before entering the reconnect loop.
-        // A missing stream is a permanent error, not a transient one.
-        let stream =
-            client.jetstream().get_stream(queue).await.map_err(|e| {
-                ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
-            })?;
-        drop(stream);
+        let semaphore = Arc::new(Semaphore::new(prefetch_count as usize));
 
-        run_with_reconnect(&shutdown, queue, max_retries, || {
+        run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
             let handler = handler.clone();
             let client = client.clone();
             let processing = processing.clone();
             let shutdown = shutdown.clone();
             let consumer_name = consumer_name.clone();
+            let semaphore = semaphore.clone();
             async move {
                 let stream = client
                     .jetstream()
@@ -458,7 +417,6 @@ impl Consumer for NatsConsumer {
                         ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
                     })?;
 
-                // Create durable pull consumer
                 let pull_consumer = stream
                     .get_or_create_consumer(
                         &consumer_name,
@@ -476,18 +434,14 @@ impl Consumer for NatsConsumer {
                         ))
                     })?;
 
-                // Get continuous message stream
                 let mut messages = pull_consumer.messages().await.map_err(|e| {
                     ShoveError::Connection(format!("failed to get message stream: {e}"))
                 })?;
-
-                let semaphore = Arc::new(Semaphore::new(prefetch_count as usize));
 
                 loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
-                            // Wait for all in-flight tasks to finish
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             return Ok(());
                         }
@@ -538,7 +492,6 @@ impl Consumer for NatsConsumer {
                             let metadata = extract_message_metadata(&msg);
                             let retry_count = metadata.retry_count;
 
-                            // Acquire semaphore permit to limit concurrency
                             let permit = semaphore.clone().acquire_owned().await.map_err(|_| {
                                 ShoveError::Connection("semaphore closed".to_string())
                             })?;
@@ -597,14 +550,12 @@ impl Consumer for NatsConsumer {
             .expect("run_fifo requires a sequenced topology");
         let routing_shards = seq_config.routing_shards();
 
-        // Extract needed values from options before spawning tasks.
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
         let hold_queues = topology.hold_queues();
 
-        // Get the stream
         let stream = self
             .client
             .jetstream()
@@ -612,7 +563,6 @@ impl Consumer for NatsConsumer {
             .await
             .map_err(|e| ShoveError::Connection(format!("failed to get stream {queue}: {e}")))?;
 
-        // Wrap handler in Arc for sharing across shard tasks
         let handler = Arc::new(handler);
         let client = self.client.clone();
 
@@ -757,7 +707,7 @@ impl Consumer for NatsConsumer {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
         })?;
 
-        let dlq_consumer_name = format!("{dlq}-consumer");
+        let dlq_consumer_name = super::constants::dlq_consumer_name(dlq);
         let shutdown = self.client.shutdown_token();
         let handler = Arc::new(handler);
         let client = self.client.clone();
@@ -768,25 +718,16 @@ impl Consumer for NatsConsumer {
             "NATS DLQ consumer started"
         );
 
-        // Verify the DLQ stream exists before entering the reconnect loop.
-        let stream =
-            client.jetstream().get_stream(dlq).await.map_err(|e| {
-                ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
-            })?;
-        drop(stream);
-
-        run_with_reconnect(&shutdown, dlq, 10, || {
+        run_with_reconnect(&shutdown, dlq, CONNECTION_RETRIES, || {
             let handler = handler.clone();
             let client = client.clone();
             let shutdown = shutdown.clone();
             let dlq_consumer_name = dlq_consumer_name.clone();
             async move {
-                // Get the DLQ stream
                 let stream = client.jetstream().get_stream(dlq).await.map_err(|e| {
                     ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
                 })?;
 
-                // Create durable pull consumer for the DLQ
                 let pull_consumer = stream
                     .get_or_create_consumer(
                         &dlq_consumer_name,

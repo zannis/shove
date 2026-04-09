@@ -40,10 +40,8 @@ impl NatsTopologyDeclarer {
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
 
-        // Main stream
         self.create_stream(queue, vec![queue.to_string()]).await?;
 
-        // DLQ stream
         if let Some(dlq) = topology.dlq() {
             self.create_stream(dlq, vec![dlq.to_string()]).await?;
         }
@@ -57,13 +55,11 @@ impl NatsTopologyDeclarer {
             .sequencing()
             .expect("sequenced topology must have sequencing config");
 
-        // Main stream with shard subjects
         let subjects: Vec<String> = (0..seq.routing_shards())
             .map(|i| format!("{queue}.shard.{i}"))
             .collect();
         self.create_stream(queue, subjects).await?;
 
-        // DLQ stream
         if let Some(dlq) = topology.dlq() {
             self.create_stream(dlq, vec![dlq.to_string()]).await?;
         }

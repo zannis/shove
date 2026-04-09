@@ -45,7 +45,7 @@ impl NatsQueueStatsProvider for JetStreamStatsProvider {
             .await
             .map_err(|e| ShoveError::Connection(format!("failed to get stream {queue}: {e}")))?;
 
-        let consumer_name = format!("{queue}-consumer");
+        let consumer_name = super::constants::consumer_name(queue);
         let mut consumer = stream
             .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
             .await
@@ -229,7 +229,6 @@ mod tests {
     type Spawner = Arc<dyn Fn(ConsumerOptions) -> tokio::task::JoinHandle<()> + Send + Sync>;
 
     fn make_test_group(
-        name: &str,
         queue: &str,
         config: NatsConsumerGroupConfig,
         started: bool,
@@ -242,7 +241,6 @@ mod tests {
         });
 
         let mut group = NatsConsumerGroup {
-            name: name.into(),
             queue: queue.into(),
             consumers: Vec::with_capacity(config.max_consumers() as usize),
             config,
@@ -262,7 +260,7 @@ mod tests {
         started: bool,
     ) -> Arc<Mutex<NatsConsumerGroupRegistry>> {
         let config = NatsConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch);
-        let group = make_test_group("test-group", "test-queue", config, started);
+        let group = make_test_group("test-queue", config, started);
 
         let mut groups = HashMap::new();
         groups.insert("test-group".to_string(), group);

@@ -25,13 +25,13 @@ pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send +
 // ---------------------------------------------------------------------------
 
 pub struct NatsConsumerGroupConfig {
-    pub(crate) prefetch_count: u16,
-    pub(crate) min_consumers: u16,
-    pub(crate) max_consumers: u16,
-    pub(crate) max_retries: u32,
-    pub(crate) handler_timeout: Option<Duration>,
-    pub(crate) concurrent_processing: bool,
-    pub(crate) max_pending_per_key: Option<usize>,
+    prefetch_count: u16,
+    min_consumers: u16,
+    max_consumers: u16,
+    max_retries: u32,
+    handler_timeout: Option<Duration>,
+    concurrent_processing: bool,
+    max_pending_per_key: Option<usize>,
 }
 
 impl NatsConsumerGroupConfig {
@@ -112,7 +112,6 @@ impl NatsConsumerGroupConfig {
 // ---------------------------------------------------------------------------
 
 pub struct NatsConsumerGroup {
-    pub(crate) name: String,
     pub(crate) queue: String,
     pub(crate) config: NatsConsumerGroupConfig,
     pub(crate) spawner: Spawner,
@@ -122,7 +121,6 @@ pub struct NatsConsumerGroup {
 
 impl NatsConsumerGroup {
     pub fn new<T, H>(
-        name: impl Into<String>,
         queue: impl Into<String>,
         config: NatsConsumerGroupConfig,
         client: NatsClient,
@@ -155,7 +153,6 @@ impl NatsConsumerGroup {
         });
 
         Self {
-            name: name.into(),
             queue: queue.into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
@@ -168,7 +165,7 @@ impl NatsConsumerGroup {
     pub fn start(&mut self) {
         let target = self.config.min_consumers as usize;
         info!(
-            group = %self.name,
+            group = %self.queue,
             queue = %self.queue,
             initial_consumers = target,
             "starting consumer group"
@@ -181,12 +178,12 @@ impl NatsConsumerGroup {
     /// Spawn one additional consumer. Returns false at max capacity.
     pub fn scale_up(&mut self) -> bool {
         if self.consumers.len() >= self.config.max_consumers as usize {
-            debug!(group = %self.name, max = self.config.max_consumers, "scale_up rejected: at max capacity");
+            debug!(group = %self.queue, max = self.config.max_consumers, "scale_up rejected: at max capacity");
             return false;
         }
         self.spawn_one();
         info!(
-            group = %self.name,
+            group = %self.queue,
             consumers = self.consumers.len(),
             "scaled up: spawned new consumer"
         );
@@ -196,7 +193,7 @@ impl NatsConsumerGroup {
     /// Cancel an idle consumer. Returns false at min capacity or all busy.
     pub fn scale_down(&mut self) -> bool {
         if self.consumers.len() <= self.config.min_consumers as usize {
-            debug!(group = %self.name, min = self.config.min_consumers, "scale_down rejected: at min capacity");
+            debug!(group = %self.queue, min = self.config.min_consumers, "scale_down rejected: at min capacity");
             return false;
         }
 
@@ -206,7 +203,7 @@ impl NatsConsumerGroup {
             .rposition(|(_, processing, _)| !processing.load(Ordering::Relaxed));
 
         let Some(index) = idle_index else {
-            warn!(group = %self.name, "scale_down rejected: all consumers are busy");
+            warn!(group = %self.queue, "scale_down rejected: all consumers are busy");
             return false;
         };
 
@@ -214,7 +211,7 @@ impl NatsConsumerGroup {
         token.cancel();
 
         info!(
-            group = %self.name,
+            group = %self.queue,
             consumers = self.consumers.len(),
             "scaled down: cancelled an idle consumer"
         );
@@ -234,12 +231,12 @@ impl NatsConsumerGroup {
     }
 
     pub async fn shutdown(&mut self) {
-        info!(group = %self.name, consumers = self.consumers.len(), "shutting down consumer group");
+        info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
         self.group_token.cancel();
         for (_token, _processing, handle) in self.consumers.drain(..) {
             let _ = handle.await;
         }
-        debug!(group = %self.name, "consumer group shutdown complete");
+        debug!(group = %self.queue, "consumer group shutdown complete");
     }
 
     fn spawn_one(&mut self) {
@@ -257,7 +254,7 @@ impl NatsConsumerGroup {
         };
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
-        debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned consumer");
+        debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
     }
 }
 
@@ -317,7 +314,6 @@ impl NatsConsumerGroupRegistry {
         let group_token = client.shutdown_token().child_token();
         let group = NatsConsumerGroup::new::<T, H>(
             name.clone(),
-            name.clone(),
             config,
             client.clone(),
             group_token,
@@ -371,7 +367,6 @@ mod tests {
         });
 
         NatsConsumerGroup {
-            name: "test-group".into(),
             queue: "test-queue".into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,

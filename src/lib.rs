@@ -63,10 +63,12 @@ pub mod sns {
 
 #[cfg(feature = "nats")]
 pub mod nats {
+    pub use crate::backends::nats::autoscaler::{
+        JetStreamStatsProvider, NatsQueueStats, NatsQueueStatsProvider,
+    };
     pub use crate::backends::nats::{
-        JetStreamStatsProvider, NatsAutoscalerBackend, NatsClient, NatsConfig, NatsConsumer,
-        NatsConsumerGroup, NatsConsumerGroupConfig, NatsConsumerGroupRegistry, NatsPublisher,
-        NatsQueueStats, NatsQueueStatsProvider, NatsTopologyDeclarer,
+        NatsAutoscalerBackend, NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroup,
+        NatsConsumerGroupConfig, NatsConsumerGroupRegistry, NatsPublisher, NatsTopologyDeclarer,
     };
 }
 

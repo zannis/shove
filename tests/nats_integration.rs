@@ -1218,7 +1218,6 @@ async fn consumer_group_processes_messages() {
 
     let group_token = shutdown.child_token();
     let mut group = NatsConsumerGroup::new::<WorkTopic, CountingHandler>(
-        "test-cg",
         "nats-work",
         config,
         client.clone(),
