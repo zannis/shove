@@ -1,0 +1,33 @@
+examples/nats/stress.rs
+  06baf356a0471559 309-310,316-319
+src/consumer.rs
+  06baf356a0471559 85-92,108
+src/backends/nats/consumer.rs
+  06baf356a0471559 391-392,400
+src/backends/nats/consumer_group.rs
+  06baf356a0471559 135-139,143,151,260
+src/backends/rabbitmq/consumer_group.rs
+  06baf356a0471559 303
+src/backends/sns/consumer_group.rs
+  06baf356a0471559 303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "46bc063c75a8c632fc9ecad82269e9bad33c3da9",
+  "prompts": {
+    "06baf356a0471559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "40e90cea-6d94-441c-88d1-f58d0c35d0ce",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 31,
+      "total_deletions": 3,
+      "accepted_lines": 28,
+      "overriden_lines": 0
+    }
+  }
+}
