@@ -1,0 +1,25 @@
+Cargo.toml
+  06baf356a0471559 150-154
+examples/nats/stress.rs
+  06baf356a0471559 1-881
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "3a02975a41623c5ba46d386778ff88eaeb275d8e",
+  "prompts": {
+    "06baf356a0471559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "40e90cea-6d94-441c-88d1-f58d0c35d0ce",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 2,
+      "accepted_lines": 887,
+      "overriden_lines": 0
+    }
+  }
+}
