@@ -1,0 +1,75 @@
+src/backends/mod.rs
+  a54986d0f8c3a872 9-11
+src/backends/kafka/publisher.rs
+  a54986d0f8c3a872 1-141,143-164,166-170
+src/backends/kafka/consumer.rs
+  a54986d0f8c3a872 1-114,116,118-282,284-306,308-541,544-639,641-828,830,832-880
+  9b877aae7a454eb9 542-543,640
+Cargo.toml
+  9b877aae7a454eb9 49,157-161,196-200
+  a54986d0f8c3a872 28,54,177-195
+examples/kafka/basic.rs
+  a54986d0f8c3a872 1-12,14-87
+src/backends/kafka/constants.rs
+  a54986d0f8c3a872 1-20
+src/backends/kafka/topology.rs
+  a54986d0f8c3a872 1-64
+examples/kafka/audited_consumer.rs
+  9b877aae7a454eb9 1-116
+src/backends/kafka/autoscaler.rs
+  a54986d0f8c3a872 1-68,83,85,87-208,210-484
+  9b877aae7a454eb9 69-82,84,86
+README.md
+  9b877aae7a454eb9 9,11,24,26,48-50,62,67,210-241,258,301,391-431,500,506-507,509-514,525-526,558,560,568
+src/backends/kafka/mod.rs
+  a54986d0f8c3a872 1-12,14-16
+src/lib.rs
+  a54986d0f8c3a872 75-86
+src/backends/kafka/client.rs
+  a54986d0f8c3a872 1-7,9-120,122-131,133-151
+  9b877aae7a454eb9 8,132
+examples/kafka/sequenced.rs
+  a54986d0f8c3a872 1-11,13-95
+tests/kafka_integration.rs
+  a54986d0f8c3a872 1-1360
+examples/kafka/stress.rs
+  a54986d0f8c3a872 1-868
+src/backends/kafka/consumer_group.rs
+  9b877aae7a454eb9 245-254
+  a54986d0f8c3a872 1-244,255-567
+examples/nats/audited_consumer.rs
+  9b877aae7a454eb9 1-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "1163d7ab9ca365fe164dce40460c397963b7c1d9",
+  "prompts": {
+    "9b877aae7a454eb9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c224ab2-d9c0-4986-971f-6a6ad2f86937",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 373,
+      "total_deletions": 42,
+      "accepted_lines": 373,
+      "overriden_lines": 0
+    },
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 26,
+      "total_deletions": 14,
+      "accepted_lines": 4754,
+      "overriden_lines": 11
+    }
+  }
+}
