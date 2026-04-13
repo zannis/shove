@@ -43,14 +43,14 @@ impl NatsQueueStatsProvider for JetStreamStatsProvider {
             .jetstream()
             .get_stream(queue)
             .await
-            .map_err(|e| ShoveError::Connection(format!("failed to get stream {queue}: {e}")))?;
+            .map_err(|e| ShoveError::Topology(format!("failed to get stream {queue}: {e}")))?;
 
         let consumer_name = super::constants::consumer_name(queue);
         let mut consumer = stream
             .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
             .await
             .map_err(|e| {
-                ShoveError::Connection(format!("failed to get consumer {consumer_name}: {e}"))
+                ShoveError::Topology(format!("failed to get consumer {consumer_name}: {e}"))
             })?;
 
         let info = consumer.info().await.map_err(|e| {
@@ -130,7 +130,7 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
             let g = reg
                 .groups()
                 .get(group)
-                .ok_or_else(|| ShoveError::Connection(format!("group not found: {group}")))?;
+                .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
                 g.config().prefetch_count(),
@@ -222,7 +222,7 @@ mod tests {
             self.stats
                 .get(queue)
                 .cloned()
-                .ok_or_else(|| ShoveError::Connection(format!("not found: {queue}")))
+                .ok_or_else(|| ShoveError::Topology(format!("not found: {queue}")))
         }
     }
 

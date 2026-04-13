@@ -303,7 +303,7 @@ impl KafkaConsumerGroupRegistry {
         }
 
         let client = self.client.as_ref().ok_or_else(|| {
-            ShoveError::Connection("registry has no client (test-only registry)".into())
+            ShoveError::Topology("registry has no client (test-only registry)".into())
         })?;
 
         let declarer = KafkaTopologyDeclarer::new(client.clone())

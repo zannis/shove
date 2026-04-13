@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer as RdkafkaConsumer, StreamConsumer};
+use rdkafka::error::KafkaError;
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::{Offset, TopicPartitionList};
 use tokio::sync::{Mutex, Semaphore, mpsc};
@@ -421,6 +422,28 @@ async fn invoke_handler<T: Topic>(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Maps a rdkafka `KafkaError` to the appropriate `ShoveError` variant.
+/// Permanent errors (bad config, fatal consumption, cancelled) become
+/// `Topology`; transient errors (broker down, network) become `Connection`.
+fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
+    let is_permanent = matches!(
+        &e,
+        KafkaError::ClientConfig(..)
+            | KafkaError::ClientCreation(_)
+            | KafkaError::MessageConsumptionFatal(_)
+            | KafkaError::Canceled
+            | KafkaError::Nul(_)
+    );
+    if is_permanent {
+        ShoveError::Topology(format!("{context}: {e}"))
+    } else {
+        ShoveError::Connection(format!("{context}: {e}"))
+    }
+}
+
 // Consumer helper
 // ---------------------------------------------------------------------------
 
@@ -433,7 +456,7 @@ fn create_stream_consumer(brokers: &str, group_id: &str) -> Result<StreamConsume
         .set("session.timeout.ms", "10000")
         .set("max.poll.interval.ms", "300000")
         .create()
-        .map_err(|e| ShoveError::Connection(format!("failed to create consumer: {e}")))?;
+        .map_err(|e| map_kafka_error("failed to create consumer", e))?;
     Ok(consumer)
 }
 
@@ -457,6 +480,9 @@ where
         match f().await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if !e.is_retryable() {
+                    return Err(e);
+                }
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
@@ -537,7 +563,7 @@ impl Consumer for KafkaConsumer {
                 let consumer = create_stream_consumer(client.brokers(), &group_id)?;
                 consumer
                     .subscribe(&[queue])
-                    .map_err(|e| ShoveError::Connection(format!("failed to subscribe: {e}")))?;
+                    .map_err(|e| map_kafka_error("failed to subscribe", e))?;
 
                 let queue_owned = queue.to_string();
                 let tracker = Arc::new(Mutex::new(OffsetTracker::new(queue_owned.clone())));
@@ -554,7 +580,7 @@ impl Consumer for KafkaConsumer {
                         let tpl = t.drain_committable();
                         if tpl.count() > 0 {
                             consumer.commit(&tpl, CommitMode::Async).map_err(|e| {
-                                ShoveError::Connection(format!("commit failed: {e}"))
+                                map_kafka_error("commit failed", e)
                             })?;
                         }
                     }
@@ -581,8 +607,9 @@ impl Consumer for KafkaConsumer {
                                 Ok(msg) => msg,
                                 Err(e) => {
                                     tracing::error!(error = %e, queue, "consumer recv error");
-                                    return Err(ShoveError::Connection(
-                                        format!("consumer recv error on {queue}: {e}"),
+                                    return Err(map_kafka_error(
+                                        &format!("consumer recv error on {queue}"),
+                                        e,
                                     ));
                                 }
                             };
@@ -717,7 +744,7 @@ impl Consumer for KafkaConsumer {
                 consumer
                     .subscribe(&[queue])
                     .map_err(|e| {
-                        ShoveError::Connection(format!("failed to subscribe: {e}"))
+                        map_kafka_error("failed to subscribe", e)
                     })?;
 
                 loop {
@@ -731,8 +758,9 @@ impl Consumer for KafkaConsumer {
                                 Ok(msg) => msg,
                                 Err(e) => {
                                     tracing::error!(error = %e, queue, "FIFO consumer recv error");
-                                    return Err(ShoveError::Connection(
-                                        format!("FIFO consumer recv error on {queue}: {e}"),
+                                    return Err(map_kafka_error(
+                                        &format!("FIFO consumer recv error on {queue}"),
+                                        e,
                                     ));
                                 }
                             };
@@ -826,9 +854,9 @@ impl Consumer for KafkaConsumer {
             let dlq_group_id = dlq_group_id.clone();
             async move {
                 let consumer = create_stream_consumer(_client.brokers(), &dlq_group_id)?;
-                consumer.subscribe(&[dlq]).map_err(|e| {
-                    ShoveError::Connection(format!("failed to subscribe to DLQ: {e}"))
-                })?;
+                consumer
+                    .subscribe(&[dlq])
+                    .map_err(|e| map_kafka_error("failed to subscribe to DLQ", e))?;
 
                 loop {
                     tokio::select! {
@@ -841,8 +869,9 @@ impl Consumer for KafkaConsumer {
                                 Ok(msg) => msg,
                                 Err(e) => {
                                     tracing::error!(error = %e, dlq, "DLQ consumer recv error");
-                                    return Err(ShoveError::Connection(
-                                        format!("DLQ consumer recv error on {dlq}: {e}"),
+                                    return Err(map_kafka_error(
+                                        &format!("DLQ consumer recv error on {dlq}"),
+                                        e,
                                     ));
                                 }
                             };

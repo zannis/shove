@@ -14,6 +14,15 @@ pub enum ShoveError {
     Topology(String),
 }
 
+impl ShoveError {
+    /// Returns `true` for transient errors that may succeed on retry (connection
+    /// failures). Non-transient errors (topology, serialization) are returned
+    /// immediately so callers don't waste time retrying.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, ShoveError::Connection(_))
+    }
+}
+
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, ShoveError>;
 

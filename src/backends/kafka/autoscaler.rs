@@ -51,7 +51,7 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
                 .set("group.id", &group_id)
                 .create()
                 .map_err(|e| {
-                    ShoveError::Connection(format!("failed to create stats consumer: {e}"))
+                    ShoveError::Topology(format!("failed to create stats consumer: {e}"))
                 })?;
 
             // Get topic metadata to find all partitions
@@ -64,7 +64,7 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             let topic_metadata = metadata
                 .topics()
                 .first()
-                .ok_or_else(|| ShoveError::Connection(format!("no metadata for topic {queue}")))?;
+                .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {queue}")))?;
 
             // Build a single TopicPartitionList for all partitions so we
             // fetch committed offsets in one RPC instead of N.
@@ -111,7 +111,7 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             })
         })
         .await
-        .map_err(|e| ShoveError::Connection(format!("stats task failed: {e}")))??;
+        .map_err(|e| ShoveError::Topology(format!("stats task failed: {e}")))??;
 
         Ok(stats)
     }
@@ -179,7 +179,7 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
             let g = reg
                 .groups()
                 .get(group)
-                .ok_or_else(|| ShoveError::Connection(format!("group not found: {group}")))?;
+                .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
                 g.config().prefetch_count(),
@@ -211,7 +211,7 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
         let g = reg
             .groups_mut()
             .get_mut(group)
-            .ok_or_else(|| ShoveError::Connection(format!("group not found: {group}")))?;
+            .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
 
         match decision {
             ScalingDecision::ScaleUp(n) => {
@@ -267,7 +267,7 @@ mod tests {
             self.stats
                 .get(queue)
                 .cloned()
-                .ok_or_else(|| ShoveError::Connection(format!("not found: {queue}")))
+                .ok_or_else(|| ShoveError::Topology(format!("not found: {queue}")))
         }
     }
 

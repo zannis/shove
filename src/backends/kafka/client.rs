@@ -52,7 +52,7 @@ impl KafkaClient {
             .set("message.timeout.ms", "5000")
             .set("acks", "all")
             .create()
-            .map_err(|e| ShoveError::Connection(format!("failed to create Kafka producer: {e}")))?;
+            .map_err(|e| ShoveError::Topology(format!("failed to create Kafka producer: {e}")))?;
 
         Ok(Self {
             brokers: config.brokers.clone(),
@@ -103,7 +103,7 @@ impl KafkaClient {
         let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
             .create()
-            .map_err(|e| ShoveError::Connection(format!("failed to create admin client: {e}")))?;
+            .map_err(|e| ShoveError::Topology(format!("failed to create admin client: {e}")))?;
         Ok(admin)
     }
 
@@ -164,7 +164,7 @@ impl KafkaClient {
                 .set("group.id", "shove-partition-check")
                 .create()
                 .map_err(|e| {
-                    ShoveError::Connection(format!("failed to create metadata consumer: {e}"))
+                    ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
                 })?;
             let md = consumer
                 .fetch_metadata(Some(&topic_name), Duration::from_secs(10))
@@ -179,7 +179,7 @@ impl KafkaClient {
             Ok(topic.partitions().len() as i32)
         })
         .await
-        .map_err(|e| ShoveError::Connection(format!("metadata task failed: {e}")))??;
+        .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??;
 
         if current >= desired {
             tracing::debug!(

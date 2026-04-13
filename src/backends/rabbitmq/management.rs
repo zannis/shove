@@ -98,7 +98,7 @@ impl QueueStatsProvider for ManagementClient {
 
         async move {
             let req = request.map_err(|e| {
-                ShoveError::Connection(format!("failed to build management API request: {e}"))
+                ShoveError::Topology(format!("failed to build management API request: {e}"))
             })?;
 
             let response = http.execute(req).await.map_err(|e| {
@@ -113,7 +113,7 @@ impl QueueStatsProvider for ManagementClient {
             }
 
             let stats = response.json::<QueueStats>().await.map_err(|e| {
-                ShoveError::Connection(format!(
+                ShoveError::Topology(format!(
                     "failed to deserialize management API response for queue {queue}: {e}"
                 ))
             })?;

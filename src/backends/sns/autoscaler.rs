@@ -75,7 +75,7 @@ impl<S: SqsQueueStatsProviderTrait> AutoscalerBackend for SqsAutoscalerBackend<S
         let (queue, prefetch, active) = {
             let reg = self.registry.lock().await;
             let g = reg.groups().get(group).ok_or_else(|| {
-                crate::error::ShoveError::Connection(format!("group not found: {group}"))
+                crate::error::ShoveError::Topology(format!("group not found: {group}"))
             })?;
             (
                 g.queue().to_owned(),
@@ -166,7 +166,7 @@ mod tests {
             self.stats
                 .get(queue_name)
                 .cloned()
-                .ok_or_else(|| ShoveError::Connection(format!("not found: {queue_name}")))
+                .ok_or_else(|| ShoveError::Topology(format!("not found: {queue_name}")))
         }
     }
 

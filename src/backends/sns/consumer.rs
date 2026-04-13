@@ -1,8 +1,9 @@
+use aws_sdk_sqs::config::http::HttpResponse;
+use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,42 @@ use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
+
+/// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
+///
+/// Transport-level errors (timeout, dispatch failure, response parse) are
+/// transient → `Connection`.  Service-level errors are classified by the
+/// specific SQS error code: throttling and over-limit are transient, while
+/// queue-not-found, auth, and config errors are permanent → `Topology`.
+fn map_sqs_error<E>(context: &str, e: SdkError<E, HttpResponse>) -> ShoveError
+where
+    E: std::fmt::Debug + std::fmt::Display + ProvideErrorMetadata,
+{
+    match &e {
+        // Transient transport-level errors
+        SdkError::TimeoutError(_) => ShoveError::Connection(format!("{context}: {e}")),
+        SdkError::DispatchFailure(_) => ShoveError::Connection(format!("{context}: {e}")),
+        SdkError::ResponseError(_) => ShoveError::Connection(format!("{context}: {e}")),
+        // Construction failures are config/code bugs — permanent
+        SdkError::ConstructionFailure(_) => ShoveError::Topology(format!("{context}: {e}")),
+        // Service errors — classify by AWS error code
+        SdkError::ServiceError(se) => {
+            let code = ProvideErrorMetadata::code(se.err());
+            let is_transient = matches!(
+                code,
+                Some("RequestThrottled" | "Throttling" | "KMS.ThrottlingException" | "OverLimit")
+            );
+            if is_transient {
+                ShoveError::Connection(format!("{context}: {e}"))
+            } else {
+                ShoveError::Topology(format!("{context}: {e}"))
+            }
+        }
+        // Required: SdkError is #[non_exhaustive]. All current variants are
+        // handled above; this only fires if the AWS SDK adds new ones.
+        _ => ShoveError::Connection(format!("{context}: {e}")),
+    }
+}
 
 pub struct SqsConsumer {
     client: SnsClient,
@@ -114,6 +151,9 @@ where
         match f().await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if !e.is_retryable() {
+                    return Err(e);
+                }
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
@@ -454,7 +494,7 @@ where
                 .send()
                 .await
                 .map_err(|e| {
-                    ShoveError::Connection(format!("SQS ReceiveMessage failed on {queue_url}: {e}"))
+                    map_sqs_error(&format!("SQS ReceiveMessage failed on {queue_url}"), e)
                 })?;
 
             let msgs = receive_result.messages.unwrap_or_default();
@@ -884,9 +924,10 @@ where
             }, if can_accept => {
                 let messages = result
                     .map_err(|e| {
-                        ShoveError::Connection(format!(
-                            "SQS ReceiveMessage failed on {queue_url}: {e}"
-                        ))
+                        map_sqs_error(
+                            &format!("SQS ReceiveMessage failed on {queue_url}"),
+                            e,
+                        )
                     })?
                     .messages
                     .unwrap_or_default();
@@ -1232,7 +1273,7 @@ where
                 .message_attribute_names("All")
                 .send() => {
                 let output = result.map_err(|e| {
-                    ShoveError::Connection(format!("SQS ReceiveMessage failed on DLQ {queue_url}: {e}"))
+                    map_sqs_error(&format!("SQS ReceiveMessage failed on DLQ {queue_url}"), e)
                 })?;
 
                 let messages = output.messages.unwrap_or_default();

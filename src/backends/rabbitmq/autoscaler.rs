@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::ShoveError;
 use crate::autoscaler::{
     AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics, Stabilized,
     ThresholdStrategy,
@@ -76,9 +77,10 @@ impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
     async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
         let (queue, prefetch, active) = {
             let reg = self.registry.lock().await;
-            let g = reg.groups().get(group).ok_or_else(|| {
-                crate::error::ShoveError::Connection(format!("group not found: {group}"))
-            })?;
+            let g = reg
+                .groups()
+                .get(group)
+                .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
                 g.config().prefetch_count(),
@@ -111,9 +113,10 @@ impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
         decision: ScalingDecision,
     ) -> crate::error::Result<()> {
         let mut reg = self.registry.lock().await;
-        let g = reg.groups_mut().get_mut(group).ok_or_else(|| {
-            crate::error::ShoveError::Connection(format!("group not found: {group}"))
-        })?;
+        let g = reg
+            .groups_mut()
+            .get_mut(group)
+            .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
 
         match decision {
             ScalingDecision::ScaleUp(n) => {

@@ -7,6 +7,7 @@ use async_nats::HeaderMap;
 use async_nats::header::NATS_MESSAGE_ID;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
+use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
 use async_nats::jetstream::message::AckKind;
 use futures_util::StreamExt;
 use tokio::sync::Semaphore;
@@ -311,6 +312,21 @@ async fn invoke_handler<T: Topic>(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Maps a NATS `GetStreamError` to the appropriate `ShoveError` variant based
+/// on the underlying error kind. Only `Request` errors (transient network
+/// failures) become `Connection`; everything else is a `Topology` error.
+fn map_get_stream_error(queue: &str, e: GetStreamError) -> ShoveError {
+    match e.kind() {
+        GetStreamErrorKind::Request => {
+            ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
+        }
+        _ => ShoveError::Topology(format!("failed to get stream {queue}: {e}")),
+    }
+}
+
 // Reconnect loop
 // ---------------------------------------------------------------------------
 
@@ -332,6 +348,9 @@ where
         match f().await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if !e.is_retryable() {
+                    return Err(e);
+                }
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
@@ -416,9 +435,7 @@ impl Consumer for NatsConsumer {
                     .jetstream()
                     .get_stream(queue)
                     .await
-                    .map_err(|e| {
-                        ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
-                    })?;
+                    .map_err(|e| map_get_stream_error(queue, e))?;
 
                 let pull_consumer = stream
                     .get_or_create_consumer(
@@ -564,7 +581,7 @@ impl Consumer for NatsConsumer {
             .jetstream()
             .get_stream(queue)
             .await
-            .map_err(|e| ShoveError::Connection(format!("failed to get stream {queue}: {e}")))?;
+            .map_err(|e| map_get_stream_error(queue, e))?;
 
         let handler = Arc::new(handler);
         let client = self.client.clone();
@@ -727,9 +744,11 @@ impl Consumer for NatsConsumer {
             let shutdown = shutdown.clone();
             let dlq_consumer_name = dlq_consumer_name.clone();
             async move {
-                let stream = client.jetstream().get_stream(dlq).await.map_err(|e| {
-                    ShoveError::Connection(format!("failed to get DLQ stream {dlq}: {e}"))
-                })?;
+                let stream = client
+                    .jetstream()
+                    .get_stream(dlq)
+                    .await
+                    .map_err(|e| map_get_stream_error(dlq, e))?;
 
                 let pull_consumer = stream
                     .get_or_create_consumer(

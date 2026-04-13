@@ -300,7 +300,7 @@ mod tests {
             group: &Self::GroupId,
         ) -> crate::error::Result<ScalingMetrics> {
             self.metrics.get(group).cloned().ok_or_else(|| {
-                crate::error::ShoveError::Connection(format!("no metrics for {group}"))
+                crate::error::ShoveError::Topology(format!("no metrics for {group}"))
             })
         }
 

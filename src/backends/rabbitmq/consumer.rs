@@ -30,9 +30,7 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
+use super::map_lapin_error;
 
 /// Opens a channel with QoS and starts consuming from `queue`.
 ///
@@ -59,7 +57,7 @@ async fn open_consumer(
     channel
         .basic_qos(prefetch_count, BasicQosOptions::default())
         .await
-        .map_err(|e| ShoveError::Connection(format!("failed to set QoS: {e}")))?;
+        .map_err(|e| map_lapin_error("failed to set QoS", e))?;
     let consumer = channel
         .basic_consume(
             ShortString::from(queue),
@@ -71,7 +69,7 @@ async fn open_consumer(
             FieldTable::default(),
         )
         .await
-        .map_err(|e| ShoveError::Connection(format!("failed to start consumer on {queue}: {e}")))?;
+        .map_err(|e| map_lapin_error(&format!("failed to start consumer on {queue}"), e))?;
     Ok((channel, consumer))
 }
 
@@ -82,9 +80,10 @@ fn unwrap_delivery(
 ) -> Result<Delivery> {
     match item {
         Some(Ok(d)) => Ok(d),
-        Some(Err(e)) => Err(ShoveError::Connection(format!(
-            "consumer stream error on {queue}: {e}"
-        ))),
+        Some(Err(e)) => Err(map_lapin_error(
+            &format!("consumer stream error on {queue}"),
+            e,
+        )),
         None => Err(ShoveError::Connection(format!(
             "consumer stream closed for {queue}"
         ))),
@@ -106,6 +105,9 @@ where
         match f().await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if !e.is_retryable() {
+                    return Err(e);
+                }
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }

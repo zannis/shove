@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
+use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
 use crate::publisher::Publisher;
 use crate::retry::Backoff;
@@ -153,9 +154,9 @@ impl RabbitMqPublisher {
                 props,
             )
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?
+            .map_err(|e| map_lapin_error("publish failed", e))?
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+            .map_err(|e| map_lapin_error("publish confirm failed", e))?;
 
         if confirm.is_nack() {
             return Err(ShoveError::Connection(
@@ -218,7 +219,7 @@ impl RabbitMqPublisher {
                     props.clone(),
                 )
                 .await
-                .map_err(|e| ShoveError::Connection(e.to_string()))?;
+                .map_err(|e| map_lapin_error("batch publish failed", e))?;
 
             confirms.push(confirm);
         }
@@ -226,7 +227,7 @@ impl RabbitMqPublisher {
         for confirm in confirms {
             let result = confirm
                 .await
-                .map_err(|e| ShoveError::Connection(e.to_string()))?;
+                .map_err(|e| map_lapin_error("batch confirm failed", e))?;
 
             if result.is_nack() {
                 return Err(ShoveError::Connection(
@@ -391,7 +392,7 @@ impl ChannelPublisher {
             self.channel
                 .tx_commit()
                 .await
-                .map_err(|e| ShoveError::Connection(format!("tx_commit failed: {e}")))?;
+                .map_err(|e| map_lapin_error("tx_commit failed", e))?;
         }
         Ok(())
     }
@@ -430,9 +431,9 @@ impl ChannelPublisher {
                 props,
             )
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?
+            .map_err(|e| map_lapin_error("publish to queue failed", e))?
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+            .map_err(|e| map_lapin_error("publish to queue confirm failed", e))?;
 
         if !self.tx_mode && confirm.is_nack() {
             return Err(ShoveError::Connection(

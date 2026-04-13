@@ -38,9 +38,10 @@ impl SqsQueueStatsProvider {
 
 impl SqsQueueStatsProviderTrait for SqsQueueStatsProvider {
     async fn get_queue_stats(&self, queue_name: &str) -> Result<SqsQueueStats> {
-        let queue_url = self.queue_registry.get(queue_name).await.ok_or_else(|| {
-            ShoveError::Connection(format!("no SQS queue URL for '{queue_name}'"))
-        })?;
+        let queue_url =
+            self.queue_registry.get(queue_name).await.ok_or_else(|| {
+                ShoveError::Topology(format!("no SQS queue URL for '{queue_name}'"))
+            })?;
 
         let result = self
             .client

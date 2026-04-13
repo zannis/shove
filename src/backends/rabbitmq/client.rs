@@ -7,6 +7,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use crate::SHUTDOWN_GRACE;
+use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
 
 /// RabbitMQ connection configuration.
@@ -70,7 +71,7 @@ impl RabbitMqClient {
 
         let connection = Connection::connect(&config.uri, properties)
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+            .map_err(|e| map_lapin_error("failed to connect to RabbitMQ", e))?;
 
         Ok(Self {
             connection: Arc::new(connection),
@@ -123,7 +124,7 @@ impl RabbitMqClient {
         self.connection
             .create_channel()
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))
+            .map_err(|e| map_lapin_error("failed to create channel", e))
     }
 
     /// Open a channel with publisher confirms enabled.
@@ -141,12 +142,12 @@ impl RabbitMqClient {
             .connection
             .create_channel()
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+            .map_err(|e| map_lapin_error("failed to create confirm channel", e))?;
 
         channel
             .confirm_select(ConfirmSelectOptions::default())
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+            .map_err(|e| map_lapin_error("failed to enable publisher confirms", e))?;
 
         Ok(channel)
     }
@@ -173,12 +174,12 @@ impl RabbitMqClient {
             .connection
             .create_channel()
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+            .map_err(|e| map_lapin_error("failed to create tx channel", e))?;
 
         channel
             .tx_select()
             .await
-            .map_err(|e| ShoveError::Connection(e.to_string()))?;
+            .map_err(|e| map_lapin_error("failed to enable tx mode", e))?;
 
         Ok(channel)
     }
