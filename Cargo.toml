@@ -46,6 +46,9 @@ rand = "0.10"
 async-nats = { version = "0.39", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
+rdkafka = { version = "0.39", features = ["tokio"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
 rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = true }
 
 [dev-dependencies]
