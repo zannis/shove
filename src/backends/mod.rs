@@ -6,3 +6,6 @@ pub mod sns;
 
 #[cfg(feature = "nats")]
 pub mod nats;
+
+#[cfg(feature = "kafka")]
+pub mod kafka;

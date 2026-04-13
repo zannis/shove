@@ -25,6 +25,7 @@ pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
 aws-sns-sqs = ["pub-aws-sns", "dep:aws-sdk-sqs"]
 audit = []
 nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
+kafka = ["dep:rdkafka"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -45,11 +46,12 @@ rand = "0.10"
 async-nats = { version = "0.39", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
+rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats"] }
+testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats", "kafka"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -152,6 +154,11 @@ name = "nats_stress"
 path = "examples/nats/stress.rs"
 required-features = ["nats"]
 
+[[example]]
+name = "nats_audited_consumer"
+path = "examples/nats/audited_consumer.rs"
+required-features = ["nats", "audit"]
+
 [[test]]
 name = "rabbitmq_integration"
 required-features = ["rabbitmq"]
@@ -167,3 +174,27 @@ required-features = ["aws-sns-sqs"]
 [[test]]
 name = "nats_integration"
 required-features = ["nats"]
+
+[[test]]
+name = "kafka_integration"
+required-features = ["kafka"]
+
+[[example]]
+name = "kafka_basic"
+path = "examples/kafka/basic.rs"
+required-features = ["kafka"]
+
+[[example]]
+name = "kafka_sequenced"
+path = "examples/kafka/sequenced.rs"
+required-features = ["kafka"]
+
+[[example]]
+name = "kafka_stress"
+path = "examples/kafka/stress.rs"
+required-features = ["kafka"]
+
+[[example]]
+name = "kafka_audited_consumer"
+path = "examples/kafka/audited_consumer.rs"
+required-features = ["kafka", "audit"]

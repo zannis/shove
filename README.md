@@ -6,9 +6,9 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, or NATS JetStream.
+Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS JetStream, or Apache Kafka.
 
-`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it. Pick the transport that fits your stack — RabbitMQ, SNS/SQS, or NATS JetStream — and get the same high-level API everywhere.
+`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it. Pick the transport that fits your stack — RabbitMQ, SNS/SQS, NATS JetStream, or Kafka — and get the same high-level API everywhere.
 
 ## Why shove
 
@@ -21,8 +21,9 @@ Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, or NATS JetStr
 - RabbitMQ at-least-once by default, with opt-in transactional exactly-once routing
 - SNS publisher-only mode or full SNS + SQS consumption stack
 - NATS JetStream with per-key shard ordering and queue-depth autoscaling
+- Kafka with partition-based ordering, consumer lag autoscaling, and reconnect resilience
 
-If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, or `async-nats` directly. `shove` is the layer for multi-service event flows that need operational discipline.
+If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, `async-nats`, or `rdkafka` directly. `shove` is the layer for multi-service event flows that need operational discipline.
 
 ## Features
 
@@ -44,6 +45,9 @@ cargo add shove --features aws-sns-sqs
 # NATS JetStream
 cargo add shove --features nats
 
+# Apache Kafka
+cargo add shove --features kafka
+
 # Optional built-in audit publisher
 cargo add shove --features rabbitmq,audit
 ```
@@ -55,11 +59,12 @@ cargo add shove --features rabbitmq,audit
 | `pub-aws-sns` | SNS publisher and topology declaration |
 | `aws-sns-sqs` | Full SNS + SQS publisher/consumer stack, consumer groups, autoscaling |
 | `nats` | NATS JetStream publisher, consumer, topology declaration, consumer groups, autoscaling |
+| `kafka` | Kafka publisher, consumer, topology declaration, consumer groups, autoscaling |
 | `audit` | Built-in `ShoveAuditHandler` and `AuditLog` topic |
 
 ## Quick start
 
-For RabbitMQ, the repo's `docker-compose.yml` starts a local broker with the consistent-hash exchange plugin enabled. For the AWS path, it starts LocalStack with SNS and SQS on `http://localhost:4566`. For NATS, it starts a JetStream-enabled server on `localhost:4222`.
+For RabbitMQ, the repo's `docker-compose.yml` starts a local broker with the consistent-hash exchange plugin enabled. For the AWS path, it starts LocalStack with SNS and SQS on `http://localhost:4566`. For NATS, it starts a JetStream-enabled server on `localhost:4222`. For Kafka, it starts a broker on `localhost:9092`.
 
 ```sh
 docker compose up -d
@@ -202,6 +207,38 @@ let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
 consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
 ```
 
+Publish (Kafka):
+
+```rust,no_run
+use shove::kafka::*;
+use shove::publisher::Publisher;
+use shove::topology::TopologyDeclarer;
+
+let client = KafkaClient::connect(&KafkaConfig::new("localhost:9092")).await?;
+
+let declarer = KafkaTopologyDeclarer::new(client.clone());
+declarer.declare(OrderSettlement::topology()).await?;
+
+let publisher = KafkaPublisher::new(client.clone()).await?;
+publisher
+    .publish::<OrderSettlement>(&SettlementEvent {
+        order_id: "ORD-1".into(),
+        amount_cents: 5000,
+    })
+    .await?;
+```
+
+Consume (Kafka):
+
+```rust,no_run
+use shove::kafka::*;
+use shove::consumer::{Consumer, ConsumerOptions};
+
+let consumer = KafkaConsumer::new(client.clone());
+let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
+consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
+```
+
 ## Delivery model
 
 `shove` is at-least-once by default. That means handlers should be idempotent.
@@ -218,6 +255,7 @@ Additional behavior:
 - RabbitMQ publishes a stable `x-message-id` header for deduplication
 - RabbitMQ can opt into transactional exactly-once routing with `rabbitmq-transactional`
 - NATS uses `Nats-Msg-Id` for deduplication within a 120-second window
+- Kafka uses partition-based ordering; retry and DLQ routing is handled via hold/DLQ topics
 
 Exactly-once mode removes the publish-then-ack race in RabbitMQ by wrapping routing decisions in AMQP transactions. It is materially slower and should be reserved for handlers with irreversible side effects.
 
@@ -260,7 +298,7 @@ Use `Skip` when messages are independently valid (e.g. audit entries). Use `Fail
 
 Messages for other sequence keys are unaffected by either policy.
 
-RabbitMQ uses consistent-hash routing for this. SNS/SQS uses FIFO topics and queues. NATS uses subject-based shard routing with `max_ack_pending: 1` per shard to enforce strict ordering.
+RabbitMQ uses consistent-hash routing for this. SNS/SQS uses FIFO topics and queues. NATS uses subject-based shard routing with `max_ack_pending: 1` per shard to enforce strict ordering. Kafka uses partition-key routing — messages with the same sequence key land in the same partition, and the consumer processes one message at a time to guarantee order.
 
 ## Consumer groups and autoscaling
 
@@ -350,6 +388,47 @@ let mut autoscaler = NatsAutoscalerBackend::autoscaler(
 autoscaler.run(shutdown_token).await;
 ```
 
+Kafka:
+
+```rust,no_run
+use shove::kafka::*;
+use shove::autoscaler::AutoscalerConfig;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+
+let client = KafkaClient::connect(&KafkaConfig::new("localhost:9092")).await?;
+let mut registry = KafkaConsumerGroupRegistry::new(client.clone());
+
+registry
+    .register::<WorkQueue, TaskHandler>(
+        KafkaConsumerGroupConfig::new(1..=8)
+            .with_prefetch_count(10)
+            .with_max_retries(5)
+            .with_handler_timeout(Duration::from_secs(30))
+            .with_concurrent_processing(true),
+        || TaskHandler,
+    )
+    .await?;
+
+registry.start_all();
+
+let registry = Arc::new(Mutex::new(registry));
+
+let mut autoscaler = KafkaAutoscalerBackend::autoscaler(
+    client.clone(),
+    registry.clone(),
+    AutoscalerConfig {
+        poll_interval: Duration::from_secs(2),
+        scale_up_multiplier: 1.5,
+        scale_down_multiplier: 0.3,
+        hysteresis_duration: Duration::from_secs(4),
+        cooldown_duration: Duration::from_secs(8),
+    },
+);
+autoscaler.run(shutdown_token).await;
+```
+
 ## Audit logging
 
 Wrap any handler with `Audited<H, A>` to persist a structured `AuditRecord` for each delivery attempt. Records include the trace id, topic, payload, message metadata, outcome, duration, and timestamp.
@@ -418,11 +497,21 @@ SNS/SQS examples:
 - `sqs_consumer_groups`
 - `sqs_audited_consumer`
 - `sqs_autoscaler`
+- `sqs_stress`
 
 NATS examples:
 
 - `nats_basic`
 - `nats_sequenced`
+- `nats_audited_consumer`
+- `nats_stress`
+
+Kafka examples:
+
+- `kafka_basic`
+- `kafka_sequenced`
+- `kafka_audited_consumer`
+- `kafka_stress`
 
 Run them with:
 
@@ -433,6 +522,8 @@ cargo run --example sqs_basic_pubsub --features aws-sns-sqs
 cargo run --example sqs_autoscaler --features aws-sns-sqs
 cargo run --example nats_basic --features nats
 cargo run --example nats_sequenced --features nats
+cargo run --example kafka_basic --features kafka
+cargo run --example kafka_sequenced --features kafka
 ```
 
 ## Reference
@@ -464,8 +555,9 @@ cargo run --example nats_sequenced --features nats
 | AWS SNS (publisher only) | `pub-aws-sns` | Stable |
 | AWS SNS + SQS | `aws-sns-sqs` | Stable |
 | NATS JetStream | `nats` | Stable |
+| Apache Kafka | `kafka` | Stable |
 
-`aws-sns-sqs` implies `pub-aws-sns`. Sequenced topics use SNS FIFO topics with `MessageGroupId` and sharded FIFO SQS queues. NATS uses subject-based shard routing with per-shard `max_ack_pending: 1`.
+`aws-sns-sqs` implies `pub-aws-sns`. Sequenced topics use SNS FIFO topics with `MessageGroupId` and sharded FIFO SQS queues. NATS uses subject-based shard routing with per-shard `max_ack_pending: 1`. Kafka uses partition-key routing for sequenced delivery and consumer lag for autoscaling.
 
 ## Requirements
 
@@ -473,7 +565,7 @@ cargo run --example nats_sequenced --features nats
 
 ## Background
 
-`shove` came out of production event-processing systems that needed more than a broker client but less than a platform rewrite. The crate focuses on the hard parts around message handling correctness and operational behavior, while leaving transport and persistence to RabbitMQ, SNS/SQS, or NATS JetStream.
+`shove` came out of production event-processing systems that needed more than a broker client but less than a platform rewrite. The crate focuses on the hard parts around message handling correctness and operational behavior, while leaving transport and persistence to RabbitMQ, SNS/SQS, NATS JetStream, or Kafka.
 
 The API is still evolving.
 

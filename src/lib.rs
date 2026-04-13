@@ -72,6 +72,18 @@ pub mod nats {
     };
 }
 
+#[cfg(feature = "kafka")]
+pub mod kafka {
+    pub use crate::backends::kafka::autoscaler::{
+        KafkaLagStatsProvider, KafkaQueueStats, KafkaQueueStatsProvider,
+    };
+    pub use crate::backends::kafka::{
+        KafkaAutoscalerBackend, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroup,
+        KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry, KafkaPublisher,
+        KafkaTopologyDeclarer,
+    };
+}
+
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq {
     pub use crate::backends::rabbitmq::{
