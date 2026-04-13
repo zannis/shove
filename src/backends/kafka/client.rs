@@ -107,7 +107,8 @@ impl KafkaClient {
         Ok(admin)
     }
 
-    /// Create a topic (idempotent — ignores "already exists").
+    /// Create a topic, or expand its partition count if it already exists
+    /// with fewer partitions than requested.
     pub(super) async fn create_topic(
         &self,
         name: &str,
@@ -130,13 +131,80 @@ impl KafkaClient {
                 Ok(_) => {}
                 Err((topic, code)) => {
                     if code == RDKafkaErrorCode::TopicAlreadyExists {
-                        tracing::debug!(topic, "topic already exists, skipping");
+                        tracing::debug!(topic, "topic already exists, checking partition count");
+                        self.ensure_partitions(&admin, name, num_partitions).await?;
                     } else {
                         return Err(ShoveError::Topology(format!(
                             "failed to create topic {topic}: {code:?}"
                         )));
                     }
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// If the existing topic has fewer partitions than `desired`, expand it.
+    async fn ensure_partitions(
+        &self,
+        admin: &AdminClient<DefaultClientContext>,
+        name: &str,
+        desired: i32,
+    ) -> Result<()> {
+        use rdkafka::admin::NewPartitions;
+
+        // Fetch current partition count from metadata.
+        let brokers = self.brokers.clone();
+        let topic_name = name.to_string();
+        let current = tokio::task::spawn_blocking(move || -> Result<i32> {
+            use rdkafka::consumer::{BaseConsumer, Consumer as _};
+            let consumer: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &brokers)
+                .set("group.id", "shove-partition-check")
+                .create()
+                .map_err(|e| {
+                    ShoveError::Connection(format!("failed to create metadata consumer: {e}"))
+                })?;
+            let md = consumer
+                .fetch_metadata(Some(&topic_name), Duration::from_secs(10))
+                .map_err(|e| {
+                    ShoveError::Connection(format!(
+                        "failed to fetch metadata for {topic_name}: {e}"
+                    ))
+                })?;
+            let topic = md.topics().first().ok_or_else(|| {
+                ShoveError::Topology(format!("no metadata for topic {topic_name}"))
+            })?;
+            Ok(topic.partitions().len() as i32)
+        })
+        .await
+        .map_err(|e| ShoveError::Connection(format!("metadata task failed: {e}")))??;
+
+        if current >= desired {
+            tracing::debug!(
+                topic = name,
+                current,
+                desired,
+                "partition count already sufficient"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(topic = name, current, desired, "expanding partition count");
+        let new_parts = NewPartitions::new(name, desired as usize);
+        let results = admin
+            .create_partitions(&[new_parts], &AdminOptions::new())
+            .await
+            .map_err(|e| {
+                ShoveError::Topology(format!("failed to expand partitions for {name}: {e}"))
+            })?;
+
+        for result in results {
+            if let Err((topic, code)) = result {
+                return Err(ShoveError::Topology(format!(
+                    "failed to expand partitions for {topic}: {code:?}"
+                )));
             }
         }
 

@@ -306,7 +306,8 @@ impl KafkaConsumerGroupRegistry {
             ShoveError::Connection("registry has no client (test-only registry)".into())
         })?;
 
-        let declarer = KafkaTopologyDeclarer::new(client.clone());
+        let declarer = KafkaTopologyDeclarer::new(client.clone())
+            .with_min_partitions(config.max_consumers as i32);
         declarer.declare(topology).await?;
 
         info!(group = %name, "registering consumer group");
