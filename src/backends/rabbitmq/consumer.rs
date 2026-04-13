@@ -228,7 +228,10 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let prefetch = options.prefetch_count;
+        #[cfg(feature = "rabbitmq-transactional")]
         let exactly_once = options.exactly_once;
+        #[cfg(not(feature = "rabbitmq-transactional"))]
+        let exactly_once = false;
         let (channel, mut stream) =
             open_consumer(&self.client, queue, prefetch, exactly_once).await?;
         #[cfg(feature = "rabbitmq-transactional")]
@@ -773,7 +776,10 @@ impl RabbitMqConsumer {
         T::Message: for<'de> serde::Deserialize<'de>,
         H: MessageHandler<T>,
     {
+        #[cfg(feature = "rabbitmq-transactional")]
         let exactly_once = options.exactly_once;
+        #[cfg(not(feature = "rabbitmq-transactional"))]
+        let exactly_once = false;
         let (channel, mut stream) =
             open_consumer(&self.client, queue, options.prefetch_count, exactly_once).await?;
         #[cfg(feature = "rabbitmq-transactional")]

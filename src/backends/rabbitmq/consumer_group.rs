@@ -298,8 +298,11 @@ impl ConsumerGroup {
             processing: processing.clone(),
             handler_timeout: self.config.handler_timeout,
             max_pending_per_key: self.config.max_pending_per_key,
+            #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
+            #[cfg(feature = "aws-sns-sqs")]
             receive_batch_size: 0,
+            #[cfg(feature = "nats")]
             max_ack_pending: None,
         };
         let handle = (self.spawner)(options);

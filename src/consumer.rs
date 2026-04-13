@@ -66,9 +66,7 @@ pub struct ConsumerOptions {
     /// round-trip per message. Expect roughly 10–15× lower throughput per channel
     /// compared to the default confirm mode. Use [`ConsumerOptions::with_exactly_once`]
     /// to opt in.
-    ///
-    /// Has no effect on SQS consumers (SQS `ChangeMessageVisibility` is already
-    /// atomic) or when the `rabbitmq-transactional` feature is not enabled.
+    #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
     /// Number of messages to request per SQS `ReceiveMessage` poll, independent
     /// of how many handlers may run concurrently (`prefetch_count`).
@@ -80,7 +78,7 @@ pub struct ConsumerOptions {
     /// API call overhead significantly when multiple consumers share the same queue.
     ///
     /// Zero means "use `prefetch_count`" (the default).
-    /// Only meaningful for SQS backends; ignored by RabbitMQ.
+    #[cfg(feature = "aws-sns-sqs")]
     pub(crate) receive_batch_size: u16,
     /// Override for JetStream `max_ack_pending` on the durable consumer.
     ///
@@ -88,7 +86,7 @@ pub struct ConsumerOptions {
     /// (as in consumer groups), `max_ack_pending` must account for the total
     /// in-flight capacity across all tasks — not just the per-task prefetch.
     /// `None` means use `prefetch_count` (the default for standalone consumers).
-    /// Only meaningful for NATS backends; ignored by RabbitMQ and SQS.
+    #[cfg(feature = "nats")]
     pub(crate) max_ack_pending: Option<i64>,
 }
 
@@ -103,8 +101,11 @@ impl ConsumerOptions {
             processing: Arc::new(AtomicBool::new(false)),
             handler_timeout: None,
             max_pending_per_key: None,
+            #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
+            #[cfg(feature = "aws-sns-sqs")]
             receive_batch_size: 0,
+            #[cfg(feature = "nats")]
             max_ack_pending: None,
         }
     }
@@ -270,6 +271,7 @@ mod tests {
         assert_eq!(opts.max_pending_per_key, Some(50));
     }
 
+    #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn exactly_once_defaults_to_false() {
         let opts = ConsumerOptions::new(CancellationToken::new());
