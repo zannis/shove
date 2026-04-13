@@ -1,0 +1,27 @@
+src/backends/kafka/consumer_group.rs
+  a54986d0f8c3a872 309-310
+src/backends/kafka/topology.rs
+  a54986d0f8c3a872 13-17,22-38,43,45,63
+src/backends/kafka/client.rs
+  a54986d0f8c3a872 110-111,134-135,148-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "e5d693126d01e0568b2eced134d8b84dbcc34aab",
+  "prompts": {
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 1627,
+      "total_deletions": 16,
+      "accepted_lines": 1617,
+      "overriden_lines": 0
+    }
+  }
+}
