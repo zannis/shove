@@ -1,0 +1,44 @@
+src/backends/sns/consumer_group.rs
+  9b877aae7a454eb9 301,304
+src/backends/nats/consumer_group.rs
+  9b877aae7a454eb9 258,260
+src/backends/rabbitmq/consumer_group.rs
+  9b877aae7a454eb9 301,303,305
+src/backends/rabbitmq/consumer.rs
+  9b877aae7a454eb9 231,233-234,779,781-782
+src/consumer.rs
+  9b877aae7a454eb9 69,81,89,104,106,108,274
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "2fa07cc31a00ca0f98170d02794a79994e92eee7",
+  "prompts": {
+    "9b877aae7a454eb9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c224ab2-d9c0-4986-971f-6a6ad2f86937",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 23,
+      "total_deletions": 5,
+      "accepted_lines": 23,
+      "overriden_lines": 0
+    },
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 4853,
+      "total_deletions": 61,
+      "accepted_lines": 4793,
+      "overriden_lines": 0
+    }
+  }
+}
