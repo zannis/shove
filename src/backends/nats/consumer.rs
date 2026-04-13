@@ -522,9 +522,8 @@ impl Consumer for NatsConsumer {
                             let task_semaphore = semaphore.clone();
                             let task_prefetch = prefetch_count;
 
+                            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
                             tokio::spawn(async move {
-                                task_processing.store(true, Ordering::Release);
-
                                 let outcome = invoke_handler(
                                     task_handler.as_ref(),
                                     payload,
@@ -532,6 +531,16 @@ impl Consumer for NatsConsumer {
                                     handler_timeout,
                                 )
                                 .await;
+                                let _ = outcome_tx.send(outcome);
+                            });
+
+                            tokio::spawn(async move {
+                                task_processing.store(true, Ordering::Release);
+
+                                let outcome = outcome_rx.await.unwrap_or_else(|_| {
+                                    tracing::warn!(queue = topology.queue(), "handler task panicked, retrying message");
+                                    Outcome::Retry
+                                });
 
                                 route_outcome(
                                     &task_client,
@@ -686,13 +695,18 @@ impl Consumer for NatsConsumer {
 
                             shard_processing.store(true, Ordering::Release);
 
-                            let outcome = invoke_handler(
-                                shard_handler.as_ref(),
-                                payload,
-                                metadata,
-                                handler_timeout,
-                            )
-                            .await;
+                            let outcome = {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let h = shard_handler.clone();
+                                tokio::spawn(async move {
+                                    let o = invoke_handler(h.as_ref(), payload, metadata, handler_timeout).await;
+                                    let _ = tx.send(o);
+                                });
+                                rx.await.unwrap_or_else(|_| {
+                                    tracing::warn!(shard, "handler task panicked, retrying message");
+                                    Outcome::Retry
+                                })
+                            };
                             let outcome = adjust_outcome_for_fifo(outcome);
 
                             route_outcome(

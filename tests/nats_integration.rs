@@ -1529,3 +1529,240 @@ async fn defer_preserves_retry_count() {
     client.shutdown().await;
     broker.stop().await;
 }
+
+// ===========================================================================
+// JetStream stats provider
+// ===========================================================================
+
+#[tokio::test]
+async fn jetstream_stats_provider_reports_pending_messages() {
+    use shove::nats::{JetStreamStatsProvider, NatsQueueStatsProvider};
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..5 {
+        pub_.publish::<WorkTopic>(&SimpleMessage {
+            id: format!("stats-{i}"),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let stats_provider = JetStreamStatsProvider::new(client.clone());
+    let stats = stats_provider
+        .get_queue_stats("nats-work")
+        .await
+        .expect("get_queue_stats should succeed");
+
+    assert!(
+        stats.messages_pending >= 5,
+        "should report at least 5 pending messages, got {}",
+        stats.messages_pending
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn jetstream_stats_provider_reports_zero_after_consumption() {
+    use shove::nats::{JetStreamStatsProvider, NatsQueueStatsProvider};
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..3 {
+        pub_.publish::<WorkTopic>(&SimpleMessage {
+            id: format!("stats-zero-{i}"),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10))
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "should consume all 3 messages"
+    );
+
+    // Shut down the consumer so all in-flight acks are flushed.
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    // Poll until acks propagate and pending count drops to 0.
+    let stats_provider = JetStreamStatsProvider::new(client.clone());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let stats = stats_provider
+            .get_queue_stats("nats-work")
+            .await
+            .expect("get_queue_stats should succeed");
+        if stats.messages_pending == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lag should be 0 after consuming all messages, still got {}",
+            stats.messages_pending
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// ===========================================================================
+// Handler panic recovery
+// ===========================================================================
+
+#[tokio::test]
+async fn handler_panic_does_not_crash_consumer() {
+    struct PanicThenAck(WaitableCounter);
+
+    impl MessageHandler<WorkTopic> for PanicThenAck {
+        async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            self.0.increment();
+            if msg.id == "panic-me" {
+                panic!("intentional test panic");
+            }
+            Outcome::Ack
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "panic-me".into(),
+        content: "boom".into(),
+    })
+    .await
+    .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "normal".into(),
+        content: "ok".into(),
+    })
+    .await
+    .unwrap();
+
+    let counter = WaitableCounter::new();
+    let handler = PanicThenAck(counter.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_prefetch_count(1)
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    assert!(
+        counter.wait_for(2, Duration::from_secs(30)).await,
+        "consumer should recover from panic and process messages"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// ===========================================================================
+// Sequenced defer falls back to retry
+// ===========================================================================
+
+#[tokio::test]
+async fn sequenced_defer_falls_back_to_retry() {
+    struct DeferThenAck {
+        counter: WaitableCounter,
+        retry_counts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl MessageHandler<SeqSkipTopic> for DeferThenAck {
+        async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata) -> Outcome {
+            self.retry_counts.lock().await.push(meta.retry_count);
+            let call = self.counter.get();
+            self.counter.increment();
+            if call == 0 {
+                Outcome::Defer // In FIFO mode, Defer should fall back to Retry
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<SeqSkipTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_.publish::<SeqSkipTopic>(&OrderMessage {
+        order_id: "defer-key".into(),
+        amount: 42,
+    })
+    .await
+    .unwrap();
+
+    let counter = WaitableCounter::new();
+    let retry_counts = Arc::new(Mutex::new(Vec::new()));
+    let handler = DeferThenAck {
+        counter: counter.clone(),
+        retry_counts: retry_counts.clone(),
+    };
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(handler, ConsumerOptions::new(sc).with_max_retries(5))
+            .await
+    });
+
+    assert!(
+        counter.wait_for(2, Duration::from_secs(30)).await,
+        "should be called at least 2 times (1 defer->retry + 1 ack)"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let counts = retry_counts.lock().await;
+    assert_eq!(counts[0], 0, "first call should have retry_count 0");
+    assert_eq!(
+        counts[1], 1,
+        "second call should have retry_count 1 (Defer became Retry)"
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}

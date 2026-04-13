@@ -38,7 +38,7 @@ impl JetStreamStatsProvider {
 
 impl NatsQueueStatsProvider for JetStreamStatsProvider {
     async fn get_queue_stats(&self, queue: &str) -> Result<NatsQueueStats> {
-        let stream = self
+        let mut stream = self
             .client
             .jetstream()
             .get_stream(queue)
@@ -46,23 +46,35 @@ impl NatsQueueStatsProvider for JetStreamStatsProvider {
             .map_err(|e| ShoveError::Topology(format!("failed to get stream {queue}: {e}")))?;
 
         let consumer_name = super::constants::consumer_name(queue);
-        let mut consumer = stream
+        let consumer_result = stream
             .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
-            .await
-            .map_err(|e| {
-                ShoveError::Topology(format!("failed to get consumer {consumer_name}: {e}"))
-            })?;
+            .await;
 
-        let info = consumer.info().await.map_err(|e| {
-            ShoveError::Connection(format!(
-                "failed to get consumer info for {consumer_name}: {e}"
-            ))
-        })?;
+        match consumer_result {
+            Ok(mut consumer) => {
+                let info = consumer.info().await.map_err(|e| {
+                    ShoveError::Connection(format!(
+                        "failed to get consumer info for {consumer_name}: {e}"
+                    ))
+                })?;
 
-        Ok(NatsQueueStats {
-            messages_pending: info.num_pending,
-            messages_ack_pending: info.num_ack_pending as u64,
-        })
+                Ok(NatsQueueStats {
+                    messages_pending: info.num_pending,
+                    messages_ack_pending: info.num_ack_pending as u64,
+                })
+            }
+            Err(_) => {
+                // Consumer hasn't been created yet — all stream messages are pending.
+                let info = stream.info().await.map_err(|e| {
+                    ShoveError::Connection(format!("failed to get stream info for {queue}: {e}"))
+                })?;
+
+                Ok(NatsQueueStats {
+                    messages_pending: info.state.messages,
+                    messages_ack_pending: 0,
+                })
+            }
+        }
     }
 }
 
@@ -438,5 +450,81 @@ mod tests {
             .unwrap()
             .active_consumers();
         assert_eq!(after, 2, "expected scale-up after poll_and_scale");
+    }
+
+    #[tokio::test]
+    async fn nats_backend_scale_hold_is_noop() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend = NatsAutoscalerBackend::with_stats_provider(
+            MockNatsStatsProvider::new(),
+            registry.clone(),
+        );
+
+        backend
+            .scale(&"test-group".to_string(), ScalingDecision::Hold)
+            .await
+            .unwrap();
+
+        let count = registry
+            .lock()
+            .await
+            .groups()
+            .get("test-group")
+            .unwrap()
+            .active_consumers();
+        assert_eq!(count, 1, "Hold should not change consumer count");
+    }
+
+    #[tokio::test]
+    async fn nats_backend_fetch_metrics_unknown_group_fails() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend =
+            NatsAutoscalerBackend::with_stats_provider(MockNatsStatsProvider::new(), registry);
+
+        let result = backend
+            .fetch_metrics(&"nonexistent-group".to_string())
+            .await;
+        assert!(
+            result.is_err(),
+            "fetch_metrics for unknown group should fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn nats_backend_scale_unknown_group_fails() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend =
+            NatsAutoscalerBackend::with_stats_provider(MockNatsStatsProvider::new(), registry);
+
+        let result = backend
+            .scale(
+                &"nonexistent-group".to_string(),
+                ScalingDecision::ScaleUp(1),
+            )
+            .await;
+        assert!(result.is_err(), "scale for unknown group should fail");
+    }
+
+    #[tokio::test]
+    async fn nats_backend_scale_down_clamped_at_min() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend = NatsAutoscalerBackend::with_stats_provider(
+            MockNatsStatsProvider::new(),
+            registry.clone(),
+        );
+
+        backend
+            .scale(&"test-group".to_string(), ScalingDecision::ScaleDown(5))
+            .await
+            .unwrap();
+
+        let count = registry
+            .lock()
+            .await
+            .groups()
+            .get("test-group")
+            .unwrap()
+            .active_consumers();
+        assert_eq!(count, 1, "should stay at min=1");
     }
 }

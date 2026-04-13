@@ -1,10 +1,6 @@
 #![cfg(feature = "kafka")]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
-
+use rdkafka::Message;
 use serde::{Deserialize, Serialize};
 use shove::SequencedTopic as _;
 use shove::consumer::{Consumer, ConsumerOptions};
@@ -16,7 +12,12 @@ use shove::kafka::{
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
 use shove::publisher::Publisher;
+use shove::topic::Topic as _;
 use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka};
 use tokio::sync::{Mutex, Notify};
@@ -1354,6 +1355,445 @@ async fn defer_preserves_retry_count() {
     assert_eq!(
         counts[2], 1,
         "third call (after Defer): retry_count should still be 1"
+    );
+
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Deserialization failure
+// ===========================================================================
+
+#[tokio::test]
+async fn deserialization_failure_rejects_to_dlq() {
+    use rdkafka::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer as RdkafkaConsumer};
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    // Publish raw invalid JSON directly via rdkafka producer
+    use rdkafka::producer::FutureRecord;
+    let record: FutureRecord<str, [u8]> =
+        FutureRecord::to("kafka-work").payload(b"not valid json" as &[u8]);
+    client
+        .producer()
+        .send(record, Duration::from_secs(5))
+        .await
+        .expect("raw publish should succeed");
+
+    // Start consumer — should reject the bad message to DLQ
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1))
+            .await
+    });
+
+    // Verify the message lands in the DLQ topic by consuming raw bytes.
+    // The DLQ payload is un-deserializable (that's why it was rejected),
+    // so we read directly with a BaseConsumer instead of run_dlq.
+    let dlq_topic = WorkTopic::topology().dlq().expect("WorkTopic has a DLQ");
+    let brokers = client.brokers().to_string();
+    let received = tokio::task::spawn_blocking(move || {
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &brokers)
+            .set("group.id", "test-dlq-verify")
+            .set("auto.offset.reset", "earliest")
+            .create()
+            .expect("DLQ verify consumer");
+        consumer
+            .subscribe(&[dlq_topic])
+            .expect("subscribe to DLQ topic");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            if let Some(result) = consumer.poll(Duration::from_secs(1)) {
+                let msg = result.expect("DLQ message");
+                let payload = msg.payload().unwrap_or_default().to_vec();
+                return Some(payload);
+            }
+        }
+    })
+    .await
+    .expect("spawn_blocking join");
+
+    let payload = received.expect("malformed message should land in DLQ");
+    assert_eq!(
+        payload, b"not valid json",
+        "DLQ should contain original payload"
+    );
+    assert_eq!(
+        handler.counter.get(),
+        0,
+        "handler should not be called for bad JSON"
+    );
+
+    shutdown.cancel();
+    client.shutdown().await;
+    handle.await.unwrap().ok();
+}
+
+// ===========================================================================
+// Lag stats provider
+// ===========================================================================
+
+#[tokio::test]
+async fn lag_stats_provider_reports_pending_messages() {
+    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..5 {
+        pub_.publish::<WorkTopic>(&SimpleMessage {
+            id: format!("lag-{i}"),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let stats: shove::kafka::KafkaQueueStats = stats_provider
+        .get_queue_stats("kafka-work")
+        .await
+        .expect("get_queue_stats should succeed");
+
+    assert!(
+        stats.messages_pending >= 5,
+        "should report at least 5 pending messages, got {}",
+        stats.messages_pending
+    );
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn lag_stats_provider_reports_zero_after_consumption() {
+    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    shove::define_topic!(
+        LagTestTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-lag-test").dlq().build()
+    );
+
+    impl MessageHandler<LagTestTopic> for CountingHandler {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<LagTestTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    for i in 0..3 {
+        pub_.publish::<LagTestTopic>(&SimpleMessage {
+            id: format!("lag-zero-{i}"),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<LagTestTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(10))
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "should consume all 3 messages"
+    );
+
+    // Shut down the consumer so it performs its final offset commit.
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    // Poll until committed offsets are visible (async commit may take a moment).
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let stats: shove::kafka::KafkaQueueStats = stats_provider
+            .get_queue_stats("kafka-lag-test")
+            .await
+            .expect("get_queue_stats should succeed");
+        if stats.messages_pending == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lag should be 0 after consuming all messages, still got {}",
+            stats.messages_pending
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Partition expansion
+// ===========================================================================
+
+#[tokio::test]
+async fn topology_expands_partitions_on_redeclare() {
+    shove::define_topic!(
+        ExpandTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-expand-test").build()
+    );
+
+    impl MessageHandler<ExpandTopic> for CountingHandler {
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<ExpandTopic>(&client).await;
+
+    // Re-declare with higher min_partitions to trigger ensure_partitions
+    let declarer = KafkaTopologyDeclarer::new(client.clone()).with_min_partitions(16);
+    declarer
+        .declare(ExpandTopic::topology())
+        .await
+        .expect("re-declaring with more partitions should succeed");
+
+    // Verify by publishing and consuming
+    let pub_ = make_publisher(&client).await;
+    pub_.publish::<ExpandTopic>(&SimpleMessage {
+        id: "expand-1".into(),
+        content: "test".into(),
+    })
+    .await
+    .unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<ExpandTopic>(hc, ConsumerOptions::new(sc).with_prefetch_count(1))
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "should receive message after partition expansion"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// DLQ consumer edge cases
+// ===========================================================================
+
+#[tokio::test]
+async fn dlq_consumer_handles_deserialization_failure() {
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    // Publish raw invalid JSON directly to the DLQ topic
+    use rdkafka::producer::FutureRecord;
+    let record: FutureRecord<str, [u8]> =
+        FutureRecord::to("kafka-work-dlq").payload(b"not valid json" as &[u8]);
+    client
+        .producer()
+        .send(record, Duration::from_secs(5))
+        .await
+        .expect("raw publish to DLQ should succeed");
+
+    // Also publish a valid message to DLQ
+    let valid_payload = serde_json::to_vec(&SimpleMessage {
+        id: "valid-dlq".into(),
+        content: "valid".into(),
+    })
+    .unwrap();
+    let record2: FutureRecord<str, [u8]> =
+        FutureRecord::to("kafka-work-dlq").payload(&valid_payload);
+    client
+        .producer()
+        .send(record2, Duration::from_secs(5))
+        .await
+        .expect("valid publish to DLQ should succeed");
+
+    let dlq_handler = DlqRecordingHandler::new();
+    let dhc = dlq_handler.clone();
+    let dlq_consumer = KafkaConsumer::new(client.clone());
+    let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic>(dhc).await });
+
+    // The valid message should still be processed
+    assert!(
+        dlq_handler.counter.wait_for(1, TIMEOUT).await,
+        "DLQ consumer should process valid messages even after a deserialization failure"
+    );
+
+    client.shutdown().await;
+    dlq_handle.await.unwrap().ok();
+}
+
+// ===========================================================================
+// Handler panic recovery
+// ===========================================================================
+
+#[tokio::test]
+async fn handler_panic_does_not_crash_consumer() {
+    struct PanicThenAck(WaitableCounter);
+
+    impl MessageHandler<WorkTopic> for PanicThenAck {
+        async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+            self.0.increment();
+            if msg.id == "panic-me" {
+                panic!("intentional test panic");
+            }
+            Outcome::Ack
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<WorkTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "panic-me".into(),
+        content: "boom".into(),
+    })
+    .await
+    .unwrap();
+    pub_.publish::<WorkTopic>(&SimpleMessage {
+        id: "normal".into(),
+        content: "ok".into(),
+    })
+    .await
+    .unwrap();
+
+    let counter = WaitableCounter::new();
+    let handler = PanicThenAck(counter.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::new(sc)
+                    .with_prefetch_count(1)
+                    .with_max_retries(5),
+            )
+            .await
+    });
+
+    assert!(
+        counter.wait_for(2, Duration::from_secs(60)).await,
+        "consumer should recover from panic and process messages"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    client.shutdown().await;
+}
+
+// ===========================================================================
+// Sequenced defer falls back to retry
+// ===========================================================================
+
+#[tokio::test]
+async fn sequenced_defer_falls_back_to_retry() {
+    struct DeferThenAck {
+        counter: WaitableCounter,
+        retry_counts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl MessageHandler<SeqSkipTopic> for DeferThenAck {
+        async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata) -> Outcome {
+            self.retry_counts.lock().await.push(meta.retry_count);
+            let call = self.counter.get();
+            self.counter.increment();
+            if call == 0 {
+                Outcome::Defer
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let client = broker.connect().await;
+    declare::<SeqSkipTopic>(&client).await;
+
+    let pub_ = make_publisher(&client).await;
+    pub_.publish::<SeqSkipTopic>(&OrderMessage {
+        order_id: "defer-fifo-key".into(),
+        amount: 42,
+    })
+    .await
+    .unwrap();
+
+    let counter = WaitableCounter::new();
+    let retry_counts = Arc::new(Mutex::new(Vec::new()));
+    let handler = DeferThenAck {
+        counter: counter.clone(),
+        retry_counts: retry_counts.clone(),
+    };
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic>(handler, ConsumerOptions::new(sc).with_max_retries(5))
+            .await
+    });
+
+    assert!(
+        counter.wait_for(2, Duration::from_secs(60)).await,
+        "should be called at least 2 times"
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let counts = retry_counts.lock().await;
+    assert_eq!(counts[0], 0, "first call should have retry_count 0");
+    assert_eq!(
+        counts[1], 1,
+        "second call should have retry_count 1 (Defer became Retry)"
     );
 
     client.shutdown().await;

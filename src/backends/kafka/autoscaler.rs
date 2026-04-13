@@ -73,13 +73,35 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             for &pid in &partitions {
                 tpl.add_partition(&queue, pid);
             }
-            let committed = consumer
-                .committed_offsets(tpl, Duration::from_secs(5))
-                .map_err(|e| {
+            // committed_offsets can fail with transient errors (e.g. NotCoordinator)
+            // when the group coordinator hasn't been elected yet. Retry a few times
+            // with a short delay before giving up.
+            let committed = {
+                let mut last_err = None;
+                let mut committed_result = None;
+                for attempt in 0..5u32 {
+                    match consumer.committed_offsets(tpl.clone(), Duration::from_secs(5)) {
+                        Ok(result) => {
+                            committed_result = Some(result);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            if attempt < 4 {
+                                std::thread::sleep(Duration::from_millis(
+                                    500 * (attempt as u64 + 1),
+                                ));
+                            }
+                        }
+                    }
+                }
+                committed_result.ok_or_else(|| {
                     ShoveError::Connection(format!(
-                        "failed to get committed offsets for {queue}: {e}"
+                        "failed to get committed offsets for {queue}: {}",
+                        last_err.unwrap()
                     ))
-                })?;
+                })?
+            };
 
             let mut total_lag: u64 = 0;
 
@@ -480,5 +502,81 @@ mod tests {
             .unwrap()
             .active_consumers();
         assert_eq!(after, 2, "expected scale-up after poll_and_scale");
+    }
+
+    #[tokio::test]
+    async fn kafka_backend_scale_hold_is_noop() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend = KafkaAutoscalerBackend::with_stats_provider(
+            MockKafkaStatsProvider::new(),
+            registry.clone(),
+        );
+
+        backend
+            .scale(&"test-group".to_string(), ScalingDecision::Hold)
+            .await
+            .unwrap();
+
+        let count = registry
+            .lock()
+            .await
+            .groups()
+            .get("test-group")
+            .unwrap()
+            .active_consumers();
+        assert_eq!(count, 1, "Hold should not change consumer count");
+    }
+
+    #[tokio::test]
+    async fn kafka_backend_fetch_metrics_unknown_group_fails() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend =
+            KafkaAutoscalerBackend::with_stats_provider(MockKafkaStatsProvider::new(), registry);
+
+        let result = backend
+            .fetch_metrics(&"nonexistent-group".to_string())
+            .await;
+        assert!(
+            result.is_err(),
+            "fetch_metrics for unknown group should fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn kafka_backend_scale_unknown_group_fails() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend =
+            KafkaAutoscalerBackend::with_stats_provider(MockKafkaStatsProvider::new(), registry);
+
+        let result = backend
+            .scale(
+                &"nonexistent-group".to_string(),
+                ScalingDecision::ScaleUp(1),
+            )
+            .await;
+        assert!(result.is_err(), "scale for unknown group should fail");
+    }
+
+    #[tokio::test]
+    async fn kafka_backend_scale_down_clamped_at_min() {
+        let registry = make_single_group_registry(1, 5, 10, true);
+        let backend = KafkaAutoscalerBackend::with_stats_provider(
+            MockKafkaStatsProvider::new(),
+            registry.clone(),
+        );
+
+        backend
+            .scale(&"test-group".to_string(), ScalingDecision::ScaleDown(5))
+            .await
+            .unwrap();
+
+        let count = registry
+            .lock()
+            .await
+            .groups()
+            .get("test-group")
+            .unwrap()
+            .active_consumers();
+        assert_eq!(count, 1, "should stay at min=1");
     }
 }
