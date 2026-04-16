@@ -1,0 +1,29 @@
+src/backends/kafka/publisher.rs
+  ba7b939f0f840377 124
+src/backends/nats/publisher.rs
+  ba7b939f0f840377 132
+src/publisher.rs
+  ba7b939f0f840377 54-92
+src/backends/sns/publisher.rs
+  ba7b939f0f840377 196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "1263647682c3ad9919a129b32f68ee03cde3b321",
+  "prompts": {
+    "ba7b939f0f840377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bba4a5b5-ec01-4adc-953b-46a9098831e1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 42,
+      "total_deletions": 0,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    }
+  }
+}
