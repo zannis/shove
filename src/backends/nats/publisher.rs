@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::ShoveError;
 use crate::error::Result;
-use crate::publisher::Publisher;
+use crate::publisher::{validate_headers, Publisher};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -129,6 +129,7 @@ impl Publisher for NatsPublisher {
         message: &T::Message,
         extra_headers: HashMap<String, String>,
     ) -> Result<()> {
+        validate_headers(&extra_headers)?;
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);

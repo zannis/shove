@@ -15,7 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
-use crate::publisher::Publisher;
+use crate::publisher::{validate_headers, Publisher};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -270,6 +270,7 @@ impl Publisher for RabbitMqPublisher {
         message: &T::Message,
         headers: HashMap<String, String>,
     ) -> impl Future<Output = Result<()>> + Send {
+        let validated = validate_headers(&headers);
         let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
         let field_table = hashmap_to_field_table(headers);
 
@@ -278,6 +279,7 @@ impl Publisher for RabbitMqPublisher {
         let key_fn = T::SEQUENCE_KEY_FN;
 
         async move {
+            validated?;
             let payload = payload?;
 
             match (sequencing, key_fn) {
