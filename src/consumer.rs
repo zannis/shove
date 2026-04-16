@@ -11,6 +11,9 @@ use crate::topic::{SequencedTopic, Topic};
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Default handler timeout: 30 seconds.
+pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Options for consumer behavior.
 #[derive(Clone)]
 pub struct ConsumerOptions {
@@ -49,7 +52,8 @@ pub struct ConsumerOptions {
     pub processing: Arc<AtomicBool>,
     /// Maximum time a handler may spend processing a single message.
     /// If the handler exceeds this duration the message is retried.
-    /// `None` means no timeout (the handler may run indefinitely).
+    ///
+    /// Default: [`DEFAULT_HANDLER_TIMEOUT`] (30 s). Set to `None` to disable.
     pub handler_timeout: Option<Duration>,
     /// Maximum number of locally buffered messages per sequence key in
     /// concurrent-sequenced consumers. When the limit is reached, new
@@ -109,7 +113,7 @@ impl ConsumerOptions {
             prefetch_count: 10,
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
-            handler_timeout: None,
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             max_pending_per_key: None,
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             #[cfg(feature = "rabbitmq-transactional")]
@@ -141,6 +145,12 @@ impl ConsumerOptions {
     /// is retried automatically.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         self.handler_timeout = Some(timeout);
+        self
+    }
+
+    /// Disable the handler timeout entirely (handlers may run indefinitely).
+    pub fn without_handler_timeout(mut self) -> Self {
+        self.handler_timeout = None;
         self
     }
 
@@ -255,7 +265,7 @@ mod tests {
         let opts = ConsumerOptions::new(CancellationToken::new());
         assert_eq!(opts.max_retries, 10);
         assert_eq!(opts.prefetch_count, 10);
-        assert!(opts.handler_timeout.is_none());
+        assert_eq!(opts.handler_timeout, Some(DEFAULT_HANDLER_TIMEOUT));
         assert!(opts.max_pending_per_key.is_none());
         assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
