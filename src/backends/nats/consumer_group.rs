@@ -53,7 +53,7 @@ impl NatsConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: None,
+            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
             max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),

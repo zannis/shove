@@ -1206,7 +1206,9 @@ impl Consumer for RabbitMqConsumer {
             let mut opts = ConsumerOptions::new(shutdown.clone())
                 .with_max_retries(options.max_retries)
                 .with_prefetch_count(prefetch);
+            opts.handler_timeout = options.handler_timeout;
             opts.max_pending_per_key = options.max_pending_per_key;
+            opts.max_message_size = options.max_message_size;
             handles.push(tokio::spawn(async move {
                 let consumer = RabbitMqConsumer::new(inner_client);
                 consumer
