@@ -604,7 +604,7 @@ impl RabbitMqConsumer {
 
                     // ── Spawn handler for this key ──
                     let metadata = extract_message_metadata(&delivery);
-                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher).await {
+                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, options).await {
                         None => {
                             // Reject undeserializable messages immediately.
                             if on_failure == SequenceFailure::FailAll {
@@ -700,7 +700,7 @@ impl RabbitMqConsumer {
             }
 
             let metadata = extract_message_metadata(&delivery);
-            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, publisher)
+            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, publisher, options)
                 .await
             {
                 None => {
@@ -882,7 +882,7 @@ impl RabbitMqConsumer {
 
                     let metadata = extract_message_metadata(&delivery);
 
-                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher).await {
+                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, &options).await {
                         let rx = spawn_handler::<T, H>(
                             &handler,
                             message,
@@ -932,16 +932,24 @@ where
 
                 let metadata = extract_dead_metadata(&delivery);
 
-                match serde_json::from_slice::<T::Message>(&delivery.data) {
-                    Err(err) => {
-                        error!(
-                            error = %err,
-                            delivery_id = %metadata.message.delivery_id,
-                            "Failed to deserialize message from dead letter queue — discarding"
-                        );
-                    }
-                    Ok(message) => {
-                        handler.handle_dead(message, metadata).await;
+                if let Err(e) = options.validate_payload_message_size(delivery.data.len()) {
+                    warn!(
+                        error = %e,
+                        delivery_id = %metadata.message.delivery_id,
+                        "oversized DLQ message — discarding"
+                    );
+                } else {
+                    match serde_json::from_slice::<T::Message>(&delivery.data) {
+                        Err(err) => {
+                            error!(
+                                error = %err,
+                                delivery_id = %metadata.message.delivery_id,
+                                "Failed to deserialize message from dead letter queue — discarding"
+                            );
+                        }
+                        Ok(message) => {
+                            handler.handle_dead(message, metadata).await;
+                        }
                     }
                 }
 
@@ -1129,10 +1137,21 @@ async fn try_deserialize_or_reject<T: Topic>(
     queue: &str,
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
+    options: &ConsumerOptions,
 ) -> Option<T::Message>
 where
     T::Message: for<'de> serde::Deserialize<'de>,
 {
+    if let Err(e) = options.validate_payload_message_size(delivery.data.len()) {
+        warn!(
+            error = %e,
+            delivery_id = %metadata.delivery_id,
+            queue,
+            "rejecting oversized message"
+        );
+        router::route_reject(delivery, topology, publisher).await;
+        return None;
+    }
     match serde_json::from_slice::<T::Message>(&delivery.data) {
         Ok(message) => Some(message),
         Err(err) => {

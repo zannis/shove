@@ -37,6 +37,8 @@ pub struct SqsConsumerGroupConfig {
     pub(crate) concurrent_processing: bool,
     /// Maximum locally buffered messages per sequence key (sequenced consumers).
     pub(crate) max_pending_per_key: Option<usize>,
+    /// Maximum allowed message payload size in bytes.
+    pub(crate) max_message_size: Option<usize>,
 }
 
 impl SqsConsumerGroupConfig {
@@ -63,6 +65,7 @@ impl SqsConsumerGroupConfig {
             handler_timeout: None,
             concurrent_processing: false,
             max_pending_per_key: None,
+            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -298,6 +301,7 @@ impl SqsConsumerGroup {
             processing: processing.clone(),
             handler_timeout: self.config.handler_timeout,
             max_pending_per_key: self.config.max_pending_per_key,
+            max_message_size: self.config.max_message_size,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             receive_batch_size: 0,

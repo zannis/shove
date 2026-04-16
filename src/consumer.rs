@@ -4,9 +4,12 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
+
+/// Default maximum message payload size: 10 MiB.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Options for consumer behavior.
 #[derive(Clone)]
@@ -53,6 +56,13 @@ pub struct ConsumerOptions {
     /// deliveries for that key are rejected to the DLQ.
     /// `None` means no limit (default).
     pub max_pending_per_key: Option<usize>,
+    /// Maximum allowed message payload size in bytes. Messages exceeding this
+    /// limit are rejected to the DLQ (or discarded in DLQ consumers) **before**
+    /// deserialization, preventing JSON-bomb OOM attacks.
+    ///
+    /// Default: [`DEFAULT_MAX_MESSAGE_SIZE`] (10 MiB). Set to `None` to
+    /// disable the check.
+    pub max_message_size: Option<usize>,
     /// Enable exactly-once delivery via AMQP transactions (RabbitMQ only).
     ///
     /// Requires the `rabbitmq-transactional` Cargo feature. When enabled, the
@@ -101,6 +111,7 @@ impl ConsumerOptions {
             processing: Arc::new(AtomicBool::new(false)),
             handler_timeout: None,
             max_pending_per_key: None,
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
@@ -138,6 +149,31 @@ impl ConsumerOptions {
     pub fn with_max_pending_per_key(mut self, limit: usize) -> Self {
         self.max_pending_per_key = Some(limit);
         self
+    }
+
+    /// Set the maximum allowed message payload size in bytes.
+    /// Messages exceeding this limit are rejected before deserialization.
+    pub fn with_max_message_size(mut self, max: usize) -> Self {
+        self.max_message_size = Some(max);
+        self
+    }
+
+    /// Disable the message size limit entirely.
+    pub fn without_message_size_limit(mut self) -> Self {
+        self.max_message_size = None;
+        self
+    }
+
+    /// Returns `Ok(())` if the payload is within the configured
+    /// [`max_message_size`](Self::max_message_size), or an error if it
+    /// exceeds the limit. Always succeeds when no limit is set.
+    pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
+        match self.max_message_size {
+            Some(max) if len > max => Err(ShoveError::Validation(format!(
+                "message size {len} exceeds max_message_size {max}"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Enable exactly-once delivery via AMQP transactions.
@@ -221,6 +257,7 @@ mod tests {
         assert_eq!(opts.prefetch_count, 10);
         assert!(opts.handler_timeout.is_none());
         assert!(opts.max_pending_per_key.is_none());
+        assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -249,11 +286,13 @@ mod tests {
             .with_max_retries(3)
             .with_prefetch_count(20)
             .with_handler_timeout(Duration::from_secs(5))
-            .with_max_pending_per_key(100);
+            .with_max_pending_per_key(100)
+            .with_max_message_size(5 * 1024 * 1024);
         assert_eq!(opts.max_retries, 3);
         assert_eq!(opts.prefetch_count, 20);
         assert_eq!(opts.handler_timeout, Some(Duration::from_secs(5)));
         assert_eq!(opts.max_pending_per_key, Some(100));
+        assert_eq!(opts.max_message_size, Some(5 * 1024 * 1024));
     }
 
     #[test]
@@ -269,6 +308,19 @@ mod tests {
     fn with_max_pending_per_key_sets_value() {
         let opts = ConsumerOptions::new(CancellationToken::new()).with_max_pending_per_key(50);
         assert_eq!(opts.max_pending_per_key, Some(50));
+    }
+
+    #[test]
+    fn with_max_message_size_overrides_default() {
+        let opts =
+            ConsumerOptions::new(CancellationToken::new()).with_max_message_size(1024 * 1024);
+        assert_eq!(opts.max_message_size, Some(1024 * 1024));
+    }
+
+    #[test]
+    fn without_message_size_limit_disables_check() {
+        let opts = ConsumerOptions::new(CancellationToken::new()).without_message_size_limit();
+        assert_eq!(opts.max_message_size, None);
     }
 
     #[cfg(feature = "rabbitmq-transactional")]

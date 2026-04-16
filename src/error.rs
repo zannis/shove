@@ -12,6 +12,10 @@ pub enum ShoveError {
     /// Topology declaration or validation failed.
     #[error("topology error: {0}")]
     Topology(String),
+
+    /// Input validation failed (e.g. message too large, reserved header).
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 impl ShoveError {
