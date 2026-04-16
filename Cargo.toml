@@ -11,6 +11,8 @@ categories = ["asynchronous"]
 
 [features]
 default = []
+
+# RabbitMQ Pubsub
 rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
 
 # Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.
@@ -23,8 +25,14 @@ pub-aws-sns = ["dep:aws-config", "dep:aws-sdk-sns"]
 
 # Complete pubsub with AWS SNS and AWS SQS
 aws-sns-sqs = ["pub-aws-sns", "dep:aws-sdk-sqs"]
+
+# Audit traits and default audit topic
 audit = []
+
+# NATS pubsub
 nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
+
+# Apache Kafka pubsub
 kafka = ["dep:rdkafka"]
 
 [dependencies]
