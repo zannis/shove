@@ -1,0 +1,107 @@
+src/backends/sns/publisher.rs
+  ba7b939f0f840377 196
+src/backends/nats/publisher.rs
+  ba7b939f0f840377 132
+src/publisher.rs
+  ba7b939f0f840377 54-92
+src/backends/kafka/publisher.rs
+  ba7b939f0f840377 124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "34e12e117bcd602ffac88b6ae7a5d8883d203376",
+  "prompts": {
+    "06baf356a0471559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "40e90cea-6d94-441c-88d1-f58d0c35d0ce",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 31,
+      "total_deletions": 3,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    },
+    "9b877aae7a454eb9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c224ab2-d9c0-4986-971f-6a6ad2f86937",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 373,
+      "total_deletions": 42,
+      "accepted_lines": 7,
+      "overriden_lines": 0
+    },
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 167,
+      "overriden_lines": 0
+    },
+    "a5ddff18f4ae305a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98dbbc56-bcb7-4639-b01f-b79be609ec98",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 2,
+      "accepted_lines": 71,
+      "overriden_lines": 0
+    },
+    "ba7b939f0f840377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bba4a5b5-ec01-4adc-953b-46a9098831e1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 1575,
+      "total_deletions": 2,
+      "accepted_lines": 1580,
+      "overriden_lines": 0
+    },
+    "bda21613c20607db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c382560-f7c7-4f14-bbca-370e6f256a6f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    },
+    "f24298483bede394": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48b0893f-38e6-4fb6-9ed5-448c1187a826",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 267,
+      "total_deletions": 13,
+      "accepted_lines": 62,
+      "overriden_lines": 0
+    }
+  }
+}
