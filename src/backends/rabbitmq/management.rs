@@ -81,8 +81,7 @@ impl ManagementClient {
 }
 
 impl QueueStatsProvider for ManagementClient {
-    fn get_queue_stats(&self, queue: &str) -> impl Future<Output = Result<QueueStats>> + Send {
-        // URL-encode the queue name: replace `/` with `%2F`.
+    async fn get_queue_stats(&self, queue: &str) -> Result<QueueStats> {
         let encoded_queue = queue.replace('/', "%2F");
         let url = format!(
             "{}/api/queues/{}/{}",
@@ -92,42 +91,37 @@ impl QueueStatsProvider for ManagementClient {
             .http
             .get(&url)
             .basic_auth(&self.config.username, Some(&self.config.password))
-            .build();
-
-        let http = self.http.clone();
-
-        async move {
-            let req = request.map_err(|e| {
+            .build()
+            .map_err(|e| {
                 ShoveError::Topology(format!("failed to build management API request: {e}"))
             })?;
 
-            let response = http.execute(req).await.map_err(|e| {
-                ShoveError::Connection(format!("management API request failed: {e}"))
-            })?;
+        let response = self.http.execute(request).await.map_err(|e| {
+            ShoveError::Connection(format!("management API request failed: {e}"))
+        })?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                return Err(ShoveError::Connection(format!(
-                    "management API returned non-success status {status} for queue {queue}"
-                )));
-            }
-
-            let stats = response.json::<QueueStats>().await.map_err(|e| {
-                ShoveError::Topology(format!(
-                    "failed to deserialize management API response for queue {queue}: {e}"
-                ))
-            })?;
-
-            debug!(
-                queue,
-                messages_ready = stats.messages_ready,
-                messages_unacknowledged = stats.messages_unacknowledged,
-                consumers = stats.consumers,
-                "fetched queue stats"
-            );
-
-            Ok(stats)
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(ShoveError::Connection(format!(
+                "management API returned non-success status {status} for queue {queue}"
+            )));
         }
+
+        let stats = response.json::<QueueStats>().await.map_err(|e| {
+            ShoveError::Topology(format!(
+                "failed to deserialize management API response for queue {queue}: {e}"
+            ))
+        })?;
+
+        debug!(
+            queue,
+            messages_ready = stats.messages_ready,
+            messages_unacknowledged = stats.messages_unacknowledged,
+            consumers = stats.consumers,
+            "fetched queue stats"
+        );
+
+        Ok(stats)
     }
 }
 
