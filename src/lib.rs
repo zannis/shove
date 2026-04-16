@@ -15,7 +15,10 @@ mod backends;
 pub(crate) mod retry;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
-pub use consumer::{Consumer, ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE};
+pub use consumer::{
+    Consumer, ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_MAX_PENDING_PER_KEY,
+};
 pub use error::ShoveError;
 pub use handler::MessageHandler;
 pub use metadata::{DeadMessageMetadata, MessageMetadata};

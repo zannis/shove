@@ -14,6 +14,9 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// Default handler timeout: 30 seconds.
 pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default per-key pending buffer limit for sequenced consumers.
+pub const DEFAULT_MAX_PENDING_PER_KEY: usize = 1_000;
+
 /// Options for consumer behavior.
 #[derive(Clone)]
 pub struct ConsumerOptions {
@@ -58,7 +61,9 @@ pub struct ConsumerOptions {
     /// Maximum number of locally buffered messages per sequence key in
     /// concurrent-sequenced consumers. When the limit is reached, new
     /// deliveries for that key are rejected to the DLQ.
-    /// `None` means no limit (default).
+    ///
+    /// Default: [`DEFAULT_MAX_PENDING_PER_KEY`] (1 000). Set to `None` to
+    /// disable.
     pub max_pending_per_key: Option<usize>,
     /// Maximum allowed message payload size in bytes. Messages exceeding this
     /// limit are rejected to the DLQ (or discarded in DLQ consumers) **before**
@@ -114,7 +119,7 @@ impl ConsumerOptions {
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
-            max_pending_per_key: None,
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
@@ -158,6 +163,12 @@ impl ConsumerOptions {
     /// When exceeded, new deliveries for that key are rejected to the DLQ.
     pub fn with_max_pending_per_key(mut self, limit: usize) -> Self {
         self.max_pending_per_key = Some(limit);
+        self
+    }
+
+    /// Disable the per-key pending buffer limit entirely (unbounded).
+    pub fn without_max_pending_per_key(mut self) -> Self {
+        self.max_pending_per_key = None;
         self
     }
 
@@ -266,7 +277,7 @@ mod tests {
         assert_eq!(opts.max_retries, 10);
         assert_eq!(opts.prefetch_count, 10);
         assert_eq!(opts.handler_timeout, Some(DEFAULT_HANDLER_TIMEOUT));
-        assert!(opts.max_pending_per_key.is_none());
+        assert_eq!(opts.max_pending_per_key, Some(DEFAULT_MAX_PENDING_PER_KEY));
         assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
     }

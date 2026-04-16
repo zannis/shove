@@ -64,7 +64,7 @@ impl SqsConsumerGroupConfig {
             max_retries: 10,
             handler_timeout: None,
             concurrent_processing: false,
-            max_pending_per_key: None,
+            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
