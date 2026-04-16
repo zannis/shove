@@ -484,30 +484,27 @@ impl Consumer for NatsConsumer {
                             };
 
                             // Reject oversized messages before deserialization
-                            if let Some(max) = max_message_size {
-                                if msg.payload.len() > max {
-                                    tracing::warn!(
-                                        bytes = msg.payload.len(),
-                                        max,
-                                        queue,
-                                        "rejecting oversized message to DLQ"
+                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    queue,
+                                    "rejecting oversized message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &client,
+                                    topology,
+                                    &msg,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ, nak-ing"
                                     );
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &client,
-                                        topology,
-                                        &msg,
-                                        &format!("message size {} exceeds max_message_size {max}", msg.payload.len()),
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish oversized message to DLQ, nak-ing"
-                                        );
-                                        let _ = msg.ack_with(AckKind::Nak(None)).await;
-                                        continue;
-                                    }
-                                    let _ = msg.ack().await;
+                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
                                     continue;
                                 }
+                                let _ = msg.ack().await;
+                                continue;
                             }
 
                             // Deserialize payload; reject to DLQ on failure
@@ -693,30 +690,27 @@ impl Consumer for NatsConsumer {
                             };
 
                             // Reject oversized messages before deserialization
-                            if let Some(max) = max_message_size {
-                                if msg.payload.len() > max {
-                                    tracing::warn!(
-                                        bytes = msg.payload.len(),
-                                        max,
-                                        shard,
-                                        "rejecting oversized message to DLQ"
+                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    shard,
+                                    "rejecting oversized message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &shard_client,
+                                    topology,
+                                    &msg,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ, nak-ing"
                                     );
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &shard_client,
-                                        topology,
-                                        &msg,
-                                        &format!("message size {} exceeds max_message_size {max}", msg.payload.len()),
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish oversized message to DLQ, nak-ing"
-                                        );
-                                        let _ = msg.ack_with(AckKind::Nak(None)).await;
-                                        continue;
-                                    }
-                                    let _ = msg.ack().await;
+                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
                                     continue;
                                 }
+                                let _ = msg.ack().await;
+                                continue;
                             }
 
                             // Deserialize payload; reject to DLQ on failure

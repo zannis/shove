@@ -17,6 +17,19 @@ pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default per-key pending buffer limit for sequenced consumers.
 pub const DEFAULT_MAX_PENDING_PER_KEY: usize = 1_000;
 
+/// Validates that `len` does not exceed the optional `max` limit.
+///
+/// Used by [`ConsumerOptions::validate_payload_message_size`] and directly by
+/// backends that destructure options before entering reconnect closures.
+pub(crate) fn validate_message_size(len: usize, max: Option<usize>) -> Result<()> {
+    match max {
+        Some(max) if len > max => Err(ShoveError::Validation(format!(
+            "message size {len} exceeds max_message_size {max}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Options for consumer behavior.
 #[derive(Clone)]
 pub struct ConsumerOptions {
@@ -189,12 +202,7 @@ impl ConsumerOptions {
     /// [`max_message_size`](Self::max_message_size), or an error if it
     /// exceeds the limit. Always succeeds when no limit is set.
     pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
-        match self.max_message_size {
-            Some(max) if len > max => Err(ShoveError::Validation(format!(
-                "message size {len} exceeds max_message_size {max}"
-            ))),
-            _ => Ok(()),
-        }
+        validate_message_size(len, self.max_message_size)
     }
 
     /// Enable exactly-once delivery via AMQP transactions.

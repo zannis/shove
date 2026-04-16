@@ -626,30 +626,27 @@ impl Consumer for KafkaConsumer {
                             }
 
                             // Reject oversized messages before deserialization
-                            if let Some(max) = max_message_size {
-                                if payload_bytes.len() > max {
-                                    tracing::warn!(
-                                        bytes = payload_bytes.len(),
-                                        max,
-                                        queue,
-                                        "rejecting oversized message to DLQ"
+                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    queue,
+                                    "rejecting oversized message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &client,
+                                    topology,
+                                    &payload_bytes,
+                                    key.as_deref(),
+                                    &headers,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ"
                                     );
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &client,
-                                        topology,
-                                        &payload_bytes,
-                                        key.as_deref(),
-                                        &headers,
-                                        &format!("message size {} exceeds max_message_size {max}", payload_bytes.len()),
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish oversized message to DLQ"
-                                        );
-                                    }
-                                    completion_tx.send((partition, offset)).ok();
-                                    continue;
                                 }
+                                completion_tx.send((partition, offset)).ok();
+                                continue;
                             }
 
                             // Deserialize payload; reject to DLQ on failure
@@ -808,30 +805,27 @@ impl Consumer for KafkaConsumer {
                             let key = msg.key().map(|k| k.to_vec());
 
                             // Reject oversized messages before deserialization
-                            if let Some(max) = max_message_size {
-                                if payload_bytes.len() > max {
-                                    tracing::warn!(
-                                        bytes = payload_bytes.len(),
-                                        max,
-                                        queue,
-                                        "rejecting oversized FIFO message to DLQ"
+                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    queue,
+                                    "rejecting oversized FIFO message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &client,
+                                    topology,
+                                    &payload_bytes,
+                                    key.as_deref(),
+                                    &headers,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ"
                                     );
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &client,
-                                        topology,
-                                        &payload_bytes,
-                                        key.as_deref(),
-                                        &headers,
-                                        &format!("message size {} exceeds max_message_size {max}", payload_bytes.len()),
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish oversized message to DLQ"
-                                        );
-                                    }
-                                    consumer.commit_message(&msg, CommitMode::Async).ok();
-                                    continue;
                                 }
+                                consumer.commit_message(&msg, CommitMode::Async).ok();
+                                continue;
                             }
 
                             // Deserialize payload; reject to DLQ on failure
