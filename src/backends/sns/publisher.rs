@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{validate_headers, Publisher};
+use crate::publisher::{Publisher, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 

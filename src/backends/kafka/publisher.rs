@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::ShoveError;
 use crate::error::Result;
-use crate::publisher::{validate_headers, Publisher};
+use crate::publisher::{Publisher, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 

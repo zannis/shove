@@ -700,8 +700,10 @@ impl RabbitMqConsumer {
             }
 
             let metadata = extract_message_metadata(&delivery);
-            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, publisher, options)
-                .await
+            match try_deserialize_or_reject::<T>(
+                &delivery, &metadata, queue, topology, publisher, options,
+            )
+            .await
             {
                 None => {
                     // Extra FailAll poisoning on deserialization failure.
@@ -882,7 +884,7 @@ impl RabbitMqConsumer {
 
                     let metadata = extract_message_metadata(&delivery);
 
-                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, &options).await {
+                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, options).await {
                         let rx = spawn_handler::<T, H>(
                             &handler,
                             message,
@@ -1235,14 +1237,11 @@ impl Consumer for RabbitMqConsumer {
         Ok(())
     }
 
-    async fn run_dlq<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T>,
-    ) -> Result<()> {
+    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T>) -> Result<()> {
         let topology = T::topology();
-        let dlq = topology.dlq().ok_or_else(|| {
-            ShoveError::Topology("run_dlq called on topic without DLQ".into())
-        })?;
+        let dlq = topology
+            .dlq()
+            .ok_or_else(|| ShoveError::Topology("run_dlq called on topic without DLQ".into()))?;
         let shutdown = self.client.shutdown_token();
         let options = ConsumerOptions::new(shutdown);
 

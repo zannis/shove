@@ -15,7 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{validate_headers, Publisher};
+use crate::publisher::{Publisher, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 

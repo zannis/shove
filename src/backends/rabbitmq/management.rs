@@ -96,9 +96,10 @@ impl QueueStatsProvider for ManagementClient {
                 ShoveError::Topology(format!("failed to build management API request: {e}"))
             })?;
 
-        let response = self.http.execute(request).await.map_err(|e| {
-            ShoveError::Connection(format!("management API request failed: {e}"))
-        })?;
+        let response =
+            self.http.execute(request).await.map_err(|e| {
+                ShoveError::Connection(format!("management API request failed: {e}"))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
