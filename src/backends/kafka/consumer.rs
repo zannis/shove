@@ -537,6 +537,7 @@ impl Consumer for KafkaConsumer {
         let max_retries = options.max_retries;
         let prefetch_count = options.prefetch_count;
         let handler_timeout = options.handler_timeout;
+        let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
 
         let handler = Arc::new(handler);
@@ -622,6 +623,30 @@ impl Consumer for KafkaConsumer {
 
                             {
                                 tracker.lock().await.track_received(partition, offset);
+                            }
+
+                            // Reject oversized messages before deserialization
+                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    queue,
+                                    "rejecting oversized message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &client,
+                                    topology,
+                                    &payload_bytes,
+                                    key.as_deref(),
+                                    &headers,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ"
+                                    );
+                                }
+                                completion_tx.send((partition, offset)).ok();
+                                continue;
                             }
 
                             // Deserialize payload; reject to DLQ on failure
@@ -730,6 +755,7 @@ impl Consumer for KafkaConsumer {
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
+        let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
 
         let handler = Arc::new(handler);
@@ -777,6 +803,30 @@ impl Consumer for KafkaConsumer {
                             let payload_bytes = msg.payload().unwrap_or_default().to_vec();
                             let headers = extract_string_headers(&msg);
                             let key = msg.key().map(|k| k.to_vec());
+
+                            // Reject oversized messages before deserialization
+                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    queue,
+                                    "rejecting oversized FIFO message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &client,
+                                    topology,
+                                    &payload_bytes,
+                                    key.as_deref(),
+                                    &headers,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ"
+                                    );
+                                }
+                                consumer.commit_message(&msg, CommitMode::Async).ok();
+                                continue;
+                            }
 
                             // Deserialize payload; reject to DLQ on failure
                             let payload: T::Message = match serde_json::from_slice(&payload_bytes) {
@@ -892,6 +942,18 @@ impl Consumer for KafkaConsumer {
 
                             let payload_bytes = msg.payload().unwrap_or_default().to_vec();
                             let headers = extract_string_headers(&msg);
+
+                            // Discard oversized DLQ messages
+                            if payload_bytes.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                                tracing::warn!(
+                                    bytes = payload_bytes.len(),
+                                    max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                                    dlq,
+                                    "oversized DLQ message — discarding"
+                                );
+                                consumer.commit_message(&msg, CommitMode::Async).ok();
+                                continue;
+                            }
 
                             // Deserialize payload; on failure, log and ack anyway
                             let payload: T::Message = match serde_json::from_slice(&payload_bytes) {

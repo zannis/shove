@@ -32,6 +32,7 @@ pub struct NatsConsumerGroupConfig {
     handler_timeout: Option<Duration>,
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
+    max_message_size: Option<usize>,
 }
 
 impl NatsConsumerGroupConfig {
@@ -52,9 +53,10 @@ impl NatsConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: None,
+            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
-            max_pending_per_key: None,
+            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -255,6 +257,7 @@ impl NatsConsumerGroup {
             processing: processing.clone(),
             handler_timeout: self.config.handler_timeout,
             max_pending_per_key: self.config.max_pending_per_key,
+            max_message_size: self.config.max_message_size,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

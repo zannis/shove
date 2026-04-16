@@ -37,13 +37,15 @@ pub struct SqsConsumerGroupConfig {
     pub(crate) concurrent_processing: bool,
     /// Maximum locally buffered messages per sequence key (sequenced consumers).
     pub(crate) max_pending_per_key: Option<usize>,
+    /// Maximum allowed message payload size in bytes.
+    pub(crate) max_message_size: Option<usize>,
 }
 
 impl SqsConsumerGroupConfig {
     /// Create a new config with the given consumer count range.
     ///
     /// `range` sets `min_consumers..=max_consumers`.
-    /// Defaults: `prefetch_count=10`, `max_retries=10`, `handler_timeout=None`.
+    /// Defaults: `prefetch_count=10`, `max_retries=10`, `handler_timeout=30s`.
     ///
     /// # Panics
     ///
@@ -60,9 +62,10 @@ impl SqsConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: None,
+            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
-            max_pending_per_key: None,
+            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -298,6 +301,7 @@ impl SqsConsumerGroup {
             processing: processing.clone(),
             handler_timeout: self.config.handler_timeout,
             max_pending_per_key: self.config.max_pending_per_key,
+            max_message_size: self.config.max_message_size,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             receive_batch_size: 0,
@@ -480,7 +484,10 @@ mod tests {
         let config = SqsConsumerGroupConfig::new(1..=4);
         assert_eq!(config.prefetch_count(), 10);
         assert_eq!(config.max_retries(), 10);
-        assert!(config.handler_timeout().is_none());
+        assert_eq!(
+            config.handler_timeout(),
+            Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT)
+        );
     }
 
     #[test]

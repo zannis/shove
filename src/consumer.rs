@@ -4,9 +4,31 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
+
+/// Default maximum message payload size: 10 MiB.
+pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Default handler timeout: 30 seconds.
+pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default per-key pending buffer limit for sequenced consumers.
+pub const DEFAULT_MAX_PENDING_PER_KEY: usize = 1_000;
+
+/// Validates that `len` does not exceed the optional `max` limit.
+///
+/// Used by [`ConsumerOptions::validate_payload_message_size`] and directly by
+/// backends that destructure options before entering reconnect closures.
+pub(crate) fn validate_message_size(len: usize, max: Option<usize>) -> Result<()> {
+    match max {
+        Some(max) if len > max => Err(ShoveError::Validation(format!(
+            "message size {len} exceeds max_message_size {max}"
+        ))),
+        _ => Ok(()),
+    }
+}
 
 /// Options for consumer behavior.
 #[derive(Clone)]
@@ -46,13 +68,23 @@ pub struct ConsumerOptions {
     pub processing: Arc<AtomicBool>,
     /// Maximum time a handler may spend processing a single message.
     /// If the handler exceeds this duration the message is retried.
-    /// `None` means no timeout (the handler may run indefinitely).
+    ///
+    /// Default: [`DEFAULT_HANDLER_TIMEOUT`] (30 s). Set to `None` to disable.
     pub handler_timeout: Option<Duration>,
     /// Maximum number of locally buffered messages per sequence key in
     /// concurrent-sequenced consumers. When the limit is reached, new
     /// deliveries for that key are rejected to the DLQ.
-    /// `None` means no limit (default).
+    ///
+    /// Default: [`DEFAULT_MAX_PENDING_PER_KEY`] (1 000). Set to `None` to
+    /// disable.
     pub max_pending_per_key: Option<usize>,
+    /// Maximum allowed message payload size in bytes. Messages exceeding this
+    /// limit are rejected to the DLQ (or discarded in DLQ consumers) **before**
+    /// deserialization, preventing JSON-bomb OOM attacks.
+    ///
+    /// Default: [`DEFAULT_MAX_MESSAGE_SIZE`] (10 MiB). Set to `None` to
+    /// disable the check.
+    pub max_message_size: Option<usize>,
     /// Enable exactly-once delivery via AMQP transactions (RabbitMQ only).
     ///
     /// Requires the `rabbitmq-transactional` Cargo feature. When enabled, the
@@ -99,8 +131,9 @@ impl ConsumerOptions {
             prefetch_count: 10,
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
-            handler_timeout: None,
-            max_pending_per_key: None,
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
@@ -133,11 +166,43 @@ impl ConsumerOptions {
         self
     }
 
+    /// Disable the handler timeout entirely (handlers may run indefinitely).
+    pub fn without_handler_timeout(mut self) -> Self {
+        self.handler_timeout = None;
+        self
+    }
+
     /// Set the maximum number of locally buffered messages per sequence key.
     /// When exceeded, new deliveries for that key are rejected to the DLQ.
     pub fn with_max_pending_per_key(mut self, limit: usize) -> Self {
         self.max_pending_per_key = Some(limit);
         self
+    }
+
+    /// Disable the per-key pending buffer limit entirely (unbounded).
+    pub fn without_max_pending_per_key(mut self) -> Self {
+        self.max_pending_per_key = None;
+        self
+    }
+
+    /// Set the maximum allowed message payload size in bytes.
+    /// Messages exceeding this limit are rejected before deserialization.
+    pub fn with_max_message_size(mut self, max: usize) -> Self {
+        self.max_message_size = Some(max);
+        self
+    }
+
+    /// Disable the message size limit entirely.
+    pub fn without_message_size_limit(mut self) -> Self {
+        self.max_message_size = None;
+        self
+    }
+
+    /// Returns `Ok(())` if the payload is within the configured
+    /// [`max_message_size`](Self::max_message_size), or an error if it
+    /// exceeds the limit. Always succeeds when no limit is set.
+    pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
+        validate_message_size(len, self.max_message_size)
     }
 
     /// Enable exactly-once delivery via AMQP transactions.
@@ -219,8 +284,9 @@ mod tests {
         let opts = ConsumerOptions::new(CancellationToken::new());
         assert_eq!(opts.max_retries, 10);
         assert_eq!(opts.prefetch_count, 10);
-        assert!(opts.handler_timeout.is_none());
-        assert!(opts.max_pending_per_key.is_none());
+        assert_eq!(opts.handler_timeout, Some(DEFAULT_HANDLER_TIMEOUT));
+        assert_eq!(opts.max_pending_per_key, Some(DEFAULT_MAX_PENDING_PER_KEY));
+        assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -249,11 +315,13 @@ mod tests {
             .with_max_retries(3)
             .with_prefetch_count(20)
             .with_handler_timeout(Duration::from_secs(5))
-            .with_max_pending_per_key(100);
+            .with_max_pending_per_key(100)
+            .with_max_message_size(5 * 1024 * 1024);
         assert_eq!(opts.max_retries, 3);
         assert_eq!(opts.prefetch_count, 20);
         assert_eq!(opts.handler_timeout, Some(Duration::from_secs(5)));
         assert_eq!(opts.max_pending_per_key, Some(100));
+        assert_eq!(opts.max_message_size, Some(5 * 1024 * 1024));
     }
 
     #[test]
@@ -269,6 +337,19 @@ mod tests {
     fn with_max_pending_per_key_sets_value() {
         let opts = ConsumerOptions::new(CancellationToken::new()).with_max_pending_per_key(50);
         assert_eq!(opts.max_pending_per_key, Some(50));
+    }
+
+    #[test]
+    fn with_max_message_size_overrides_default() {
+        let opts =
+            ConsumerOptions::new(CancellationToken::new()).with_max_message_size(1024 * 1024);
+        assert_eq!(opts.max_message_size, Some(1024 * 1024));
+    }
+
+    #[test]
+    fn without_message_size_limit_disables_check() {
+        let opts = ConsumerOptions::new(CancellationToken::new()).without_message_size_limit();
+        assert_eq!(opts.max_message_size, None);
     }
 
     #[cfg(feature = "rabbitmq-transactional")]

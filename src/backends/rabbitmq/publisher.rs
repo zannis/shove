@@ -15,7 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
-use crate::publisher::Publisher;
+use crate::publisher::{Publisher, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -241,73 +241,55 @@ impl RabbitMqPublisher {
 }
 
 impl Publisher for RabbitMqPublisher {
-    fn publish<T: Topic>(&self, message: &T::Message) -> impl Future<Output = Result<()>> + Send {
-        let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
-
+    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+        let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
-        let sequencing = topology.sequencing();
-        let key_fn = T::SEQUENCE_KEY_FN;
 
-        async move {
-            let payload = payload?;
-
-            match (sequencing, key_fn) {
-                (Some(seq), Some(kf)) => {
-                    let routing_key = kf(message);
-                    self.publish_raw(seq.exchange(), &routing_key, &payload, None)
-                        .await
-                }
-                (Some(_), None) => Err(ShoveError::Topology(
-                    "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
-                )),
-                (None, _) => self.publish_raw("", topology.queue(), &payload, None).await,
+        match (topology.sequencing(), T::SEQUENCE_KEY_FN) {
+            (Some(seq), Some(kf)) => {
+                let routing_key = kf(message);
+                self.publish_raw(seq.exchange(), &routing_key, &payload, None)
+                    .await
             }
+            (Some(_), None) => Err(ShoveError::Topology(
+                "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
+            )),
+            (None, _) => self.publish_raw("", topology.queue(), &payload, None).await,
         }
     }
 
-    fn publish_with_headers<T: Topic>(
+    async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        let payload = serde_json::to_vec(message).map_err(ShoveError::Serialization);
+    ) -> Result<()> {
+        validate_headers(&headers)?;
+        let payload = serde_json::to_vec(message)?;
         let field_table = hashmap_to_field_table(headers);
-
         let topology = T::topology();
-        let sequencing = topology.sequencing();
-        let key_fn = T::SEQUENCE_KEY_FN;
 
-        async move {
-            let payload = payload?;
-
-            match (sequencing, key_fn) {
-                (Some(seq), Some(kf)) => {
-                    let routing_key = kf(message);
-                    self.publish_raw(seq.exchange(), &routing_key, &payload, Some(field_table))
-                        .await
-                }
-                (Some(_), None) => Err(ShoveError::Topology(
-                    "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
-                )),
-                (None, _) => {
-                    self.publish_raw("", topology.queue(), &payload, Some(field_table))
-                        .await
-                }
+        match (topology.sequencing(), T::SEQUENCE_KEY_FN) {
+            (Some(seq), Some(kf)) => {
+                let routing_key = kf(message);
+                self.publish_raw(seq.exchange(), &routing_key, &payload, Some(field_table))
+                    .await
+            }
+            (Some(_), None) => Err(ShoveError::Topology(
+                "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
+            )),
+            (None, _) => {
+                self.publish_raw("", topology.queue(), &payload, Some(field_table))
+                    .await
             }
         }
     }
 
-    fn publish_batch<T: Topic>(
-        &self,
-        messages: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
+    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         let sequencing = topology.sequencing();
         let key_fn = T::SEQUENCE_KEY_FN;
 
-        // Serialize all messages up front for fail-fast behaviour.
-        // Pre-allocate buffers with estimated capacity to reduce heap fragmentation.
-        let serialized: Result<Vec<Vec<u8>>> = messages
+        let payloads: Result<Vec<Vec<u8>>> = messages
             .iter()
             .map(|m| {
                 let mut buf = Vec::with_capacity(128);
@@ -315,31 +297,27 @@ impl Publisher for RabbitMqPublisher {
                 Ok(buf)
             })
             .collect();
+        let payloads = payloads?;
 
-        // Pre-compute routing keys while we still have access to messages.
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
 
-        async move {
-            let payloads = serialized?;
-
-            match (sequencing, routing_keys) {
-                (Some(seq), Some(keys)) => {
-                    let items: Vec<(&str, Vec<u8>)> = keys
-                        .iter()
-                        .zip(payloads)
-                        .map(|(k, p)| (k.as_str(), p))
-                        .collect();
-                    self.publish_batch_raw(seq.exchange(), &items).await
-                }
-                (Some(_), None) => Err(ShoveError::Topology(
-                    "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
-                )),
-                (None, _) => {
-                    let queue = topology.queue();
-                    let items: Vec<(&str, Vec<u8>)> =
-                        payloads.into_iter().map(|p| (queue, p)).collect();
-                    self.publish_batch_raw("", &items).await
-                }
+        match (sequencing, routing_keys) {
+            (Some(seq), Some(keys)) => {
+                let items: Vec<(&str, Vec<u8>)> = keys
+                    .iter()
+                    .zip(payloads)
+                    .map(|(k, p)| (k.as_str(), p))
+                    .collect();
+                self.publish_batch_raw(seq.exchange(), &items).await
+            }
+            (Some(_), None) => Err(ShoveError::Topology(
+                "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
+            )),
+            (None, _) => {
+                let queue = topology.queue();
+                let items: Vec<(&str, Vec<u8>)> =
+                    payloads.into_iter().map(|p| (queue, p)).collect();
+                self.publish_batch_raw("", &items).await
             }
         }
     }

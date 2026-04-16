@@ -407,6 +407,7 @@ impl Consumer for NatsConsumer {
         let handler_timeout = options.handler_timeout;
         let hold_queues = topology.hold_queues();
 
+        let max_message_size = options.max_message_size;
         let max_ack_pending = options.max_ack_pending.unwrap_or(prefetch_count as i64);
 
         let handler = Arc::new(handler);
@@ -481,6 +482,30 @@ impl Consumer for NatsConsumer {
                                     ));
                                 }
                             };
+
+                            // Reject oversized messages before deserialization
+                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    queue,
+                                    "rejecting oversized message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &client,
+                                    topology,
+                                    &msg,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ, nak-ing"
+                                    );
+                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                    continue;
+                                }
+                                let _ = msg.ack().await;
+                                continue;
+                            }
 
                             // Deserialize payload; reject to DLQ on failure
                             let payload: T::Message = match serde_json::from_slice(&msg.payload) {
@@ -583,6 +608,7 @@ impl Consumer for NatsConsumer {
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
+        let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
 
         let stream = self
@@ -662,6 +688,30 @@ impl Consumer for NatsConsumer {
                                     return;
                                 }
                             };
+
+                            // Reject oversized messages before deserialization
+                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                                tracing::warn!(
+                                    error = %e,
+                                    shard,
+                                    "rejecting oversized message to DLQ"
+                                );
+                                if let Err(dlq_err) = publish_to_dlq(
+                                    &shard_client,
+                                    topology,
+                                    &msg,
+                                    &e.to_string(),
+                                ).await {
+                                    tracing::error!(
+                                        error = %dlq_err,
+                                        "failed to publish oversized message to DLQ, nak-ing"
+                                    );
+                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                    continue;
+                                }
+                                let _ = msg.ack().await;
+                                continue;
+                            }
 
                             // Deserialize payload; reject to DLQ on failure
                             let payload: T::Message = match serde_json::from_slice(&msg.payload) {
@@ -806,6 +856,18 @@ impl Consumer for NatsConsumer {
                                     ));
                                 }
                             };
+
+                            // Discard oversized DLQ messages
+                            if msg.payload.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                                tracing::warn!(
+                                    bytes = msg.payload.len(),
+                                    max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                                    dlq,
+                                    "oversized DLQ message — discarding"
+                                );
+                                let _ = msg.ack().await;
+                                continue;
+                            }
 
                             // Deserialize payload; on failure, log and ack anyway
                             let payload: T::Message = match serde_json::from_slice(&msg.payload) {

@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
-use crate::publisher::Publisher;
+use crate::publisher::{Publisher, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -193,6 +193,7 @@ impl Publisher for SnsPublisher {
         message: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
+        validate_headers(&headers)?;
         self.do_publish::<T>(message, Some(headers)).await
     }
 

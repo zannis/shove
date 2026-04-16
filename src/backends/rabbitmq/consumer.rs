@@ -604,7 +604,7 @@ impl RabbitMqConsumer {
 
                     // ── Spawn handler for this key ──
                     let metadata = extract_message_metadata(&delivery);
-                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher).await {
+                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, options).await {
                         None => {
                             // Reject undeserializable messages immediately.
                             if on_failure == SequenceFailure::FailAll {
@@ -700,8 +700,10 @@ impl RabbitMqConsumer {
             }
 
             let metadata = extract_message_metadata(&delivery);
-            match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, publisher)
-                .await
+            match try_deserialize_or_reject::<T>(
+                &delivery, &metadata, queue, topology, publisher, options,
+            )
+            .await
             {
                 None => {
                     // Extra FailAll poisoning on deserialization failure.
@@ -882,7 +884,7 @@ impl RabbitMqConsumer {
 
                     let metadata = extract_message_metadata(&delivery);
 
-                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher).await {
+                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, options).await {
                         let rx = spawn_handler::<T, H>(
                             &handler,
                             message,
@@ -932,16 +934,24 @@ where
 
                 let metadata = extract_dead_metadata(&delivery);
 
-                match serde_json::from_slice::<T::Message>(&delivery.data) {
-                    Err(err) => {
-                        error!(
-                            error = %err,
-                            delivery_id = %metadata.message.delivery_id,
-                            "Failed to deserialize message from dead letter queue — discarding"
-                        );
-                    }
-                    Ok(message) => {
-                        handler.handle_dead(message, metadata).await;
+                if let Err(e) = options.validate_payload_message_size(delivery.data.len()) {
+                    warn!(
+                        error = %e,
+                        delivery_id = %metadata.message.delivery_id,
+                        "oversized DLQ message — discarding"
+                    );
+                } else {
+                    match serde_json::from_slice::<T::Message>(&delivery.data) {
+                        Err(err) => {
+                            error!(
+                                error = %err,
+                                delivery_id = %metadata.message.delivery_id,
+                                "Failed to deserialize message from dead letter queue — discarding"
+                            );
+                        }
+                        Ok(message) => {
+                            handler.handle_dead(message, metadata).await;
+                        }
                     }
                 }
 
@@ -1129,10 +1139,21 @@ async fn try_deserialize_or_reject<T: Topic>(
     queue: &str,
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
+    options: &ConsumerOptions,
 ) -> Option<T::Message>
 where
     T::Message: for<'de> serde::Deserialize<'de>,
 {
+    if let Err(e) = options.validate_payload_message_size(delivery.data.len()) {
+        warn!(
+            error = %e,
+            delivery_id = %metadata.delivery_id,
+            queue,
+            "rejecting oversized message"
+        );
+        router::route_reject(delivery, topology, publisher).await;
+        return None;
+    }
     match serde_json::from_slice::<T::Message>(&delivery.data) {
         Ok(message) => Some(message),
         Err(err) => {
@@ -1149,94 +1170,85 @@ where
 }
 
 impl Consumer for RabbitMqConsumer {
-    fn run<T: Topic>(
+    async fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T>,
         options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
-        let client = self.client.clone();
-        async move {
-            let topology = T::topology();
-            let consumer = RabbitMqConsumer::new(client);
-            let handler = Arc::new(handler);
-            consumer
-                .run_internal_concurrent::<T, _>(handler, topology.queue(), topology, options)
-                .await
-        }
-    }
-
-    fn run_fifo<T: SequencedTopic>(
-        &self,
-        handler: impl MessageHandler<T>,
-        options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
-        let client = self.client.clone();
-        async move {
-            let topology = T::topology();
-            let seq = topology.sequencing().ok_or_else(|| {
-                ShoveError::Topology("run_fifo called on topic without sequencing config".into())
-            })?;
-
-            let on_failure = seq.on_failure();
-            let handler = Arc::new(handler);
-            let shutdown = options.shutdown.clone();
-            let prefetch = options.prefetch_count;
-            let mut handles = Vec::with_capacity(seq.routing_shards() as usize);
-
-            for i in 0..seq.routing_shards() {
-                let sub_queue = format!("{}-seq-{i}", topology.queue());
-                let shard_hold_queues = topology.shard_hold_queue_names(i);
-                let h = handler.clone();
-                let inner_client = client.clone();
-                let mut opts = ConsumerOptions::new(shutdown.clone())
-                    .with_max_retries(options.max_retries)
-                    .with_prefetch_count(prefetch);
-                opts.max_pending_per_key = options.max_pending_per_key;
-                handles.push(tokio::spawn(async move {
-                    let consumer = RabbitMqConsumer::new(inner_client);
-                    consumer
-                        .run_internal_concurrent_sequenced::<T, _>(
-                            h,
-                            &sub_queue,
-                            topology,
-                            opts,
-                            on_failure,
-                            shard_hold_queues,
-                        )
-                        .await
-                }));
-            }
-
-            for handle in handles {
-                match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => error!("sequenced consumer sub-task failed: {e}"),
-                    Err(e) => error!("sequenced consumer task panicked: {e}"),
-                }
-            }
-
-            Ok(())
-        }
-    }
-
-    fn run_dlq<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        let client = self.client.clone();
-        async move {
-            let topology = T::topology();
-            let dlq = topology.dlq().ok_or_else(|| {
-                ShoveError::Topology("run_dlq called on topic without DLQ".into())
-            })?;
-            let shutdown = client.shutdown_token();
-            let options = ConsumerOptions::new(shutdown);
-
-            run_with_reconnect(&options.shutdown, dlq, || {
-                consume_dlq_loop::<T, _>(&client, &handler, dlq, &options)
-            })
+    ) -> Result<()> {
+        let topology = T::topology();
+        let consumer = RabbitMqConsumer::new(self.client.clone());
+        let handler = Arc::new(handler);
+        consumer
+            .run_internal_concurrent::<T, _>(handler, topology.queue(), topology, options)
             .await
+    }
+
+    async fn run_fifo<T: SequencedTopic>(
+        &self,
+        handler: impl MessageHandler<T>,
+        options: ConsumerOptions,
+    ) -> Result<()> {
+        let topology = T::topology();
+        let seq = topology.sequencing().ok_or_else(|| {
+            ShoveError::Topology("run_fifo called on topic without sequencing config".into())
+        })?;
+
+        let on_failure = seq.on_failure();
+        let handler = Arc::new(handler);
+        let shutdown = options.shutdown.clone();
+        let prefetch = options.prefetch_count;
+        let client = self.client.clone();
+        let mut handles = Vec::with_capacity(seq.routing_shards() as usize);
+
+        for i in 0..seq.routing_shards() {
+            let sub_queue = format!("{}-seq-{i}", topology.queue());
+            let shard_hold_queues = topology.shard_hold_queue_names(i);
+            let h = handler.clone();
+            let inner_client = client.clone();
+            let mut opts = ConsumerOptions::new(shutdown.clone())
+                .with_max_retries(options.max_retries)
+                .with_prefetch_count(prefetch);
+            opts.handler_timeout = options.handler_timeout;
+            opts.max_pending_per_key = options.max_pending_per_key;
+            opts.max_message_size = options.max_message_size;
+            handles.push(tokio::spawn(async move {
+                let consumer = RabbitMqConsumer::new(inner_client);
+                consumer
+                    .run_internal_concurrent_sequenced::<T, _>(
+                        h,
+                        &sub_queue,
+                        topology,
+                        opts,
+                        on_failure,
+                        shard_hold_queues,
+                    )
+                    .await
+            }));
         }
+
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("sequenced consumer sub-task failed: {e}"),
+                Err(e) => error!("sequenced consumer task panicked: {e}"),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T>) -> Result<()> {
+        let topology = T::topology();
+        let dlq = topology
+            .dlq()
+            .ok_or_else(|| ShoveError::Topology("run_dlq called on topic without DLQ".into()))?;
+        let shutdown = self.client.shutdown_token();
+        let options = ConsumerOptions::new(shutdown);
+
+        run_with_reconnect(&options.shutdown, dlq, || {
+            consume_dlq_loop::<T, _>(&self.client, &handler, dlq, &options)
+        })
+        .await
     }
 }
 

@@ -32,6 +32,7 @@ pub struct KafkaConsumerGroupConfig {
     handler_timeout: Option<Duration>,
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
+    max_message_size: Option<usize>,
 }
 
 impl KafkaConsumerGroupConfig {
@@ -52,9 +53,10 @@ impl KafkaConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: None,
+            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
-            max_pending_per_key: None,
+            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -251,6 +253,11 @@ impl KafkaConsumerGroup {
         }
         if let Some(limit) = self.config.max_pending_per_key {
             options = options.with_max_pending_per_key(limit);
+        }
+        if let Some(max) = self.config.max_message_size {
+            options = options.with_max_message_size(max);
+        } else {
+            options = options.without_message_size_limit();
         }
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));

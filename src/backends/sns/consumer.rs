@@ -423,6 +423,14 @@ where
             }
 
             let body = extract_payload(msg.body().unwrap_or_default());
+
+            // Reject oversized messages before deserialization
+            if let Err(e) = options.validate_payload_message_size(body.len()) {
+                warn!(error = %e, queue_url, "rejecting oversized message");
+                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                continue;
+            }
+
             let message: T::Message = match serde_json::from_str(&body) {
                 Ok(m) => m,
                 Err(err) => {
@@ -1064,6 +1072,22 @@ where
 
                     // ── Spawn handler for this key ──
                     let body = extract_payload(msg.body().unwrap_or_default());
+
+                    // Reject oversized messages before deserialization
+                    if let Err(e) = options.validate_payload_message_size(body.len()) {
+                        warn!(
+                            error = %e,
+                            queue_url,
+                            sequence_key = %seq_key,
+                            "rejecting oversized message"
+                        );
+                        if on_failure == SequenceFailure::FailAll {
+                            poisoned_keys.insert(seq_key.clone());
+                        }
+                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                        continue;
+                    }
+
                     let message: T::Message = match serde_json::from_str(&body) {
                         Ok(m) => m,
                         Err(err) => {
@@ -1183,6 +1207,28 @@ async fn drain_pending_for_key<T, H>(
         }
 
         let body = extract_payload(msg.body().unwrap_or_default());
+
+        // Reject oversized messages before deserialization
+        if let Err(e) = options.validate_payload_message_size(body.len()) {
+            warn!(
+                error = %e,
+                queue_url,
+                sequence_key = %key,
+                "rejecting oversized buffered message"
+            );
+            if on_failure == SequenceFailure::FailAll {
+                poisoned_keys.insert(key.to_string());
+                while let Some(pd) = pending.pop_front() {
+                    let rh = pd.receipt_handle().unwrap_or_default();
+                    router::route_reject(sqs, queue_url, rh, topology).await;
+                }
+                pending_deliveries.remove(key);
+                return;
+            }
+            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+            continue;
+        }
+
         let message: T::Message = match serde_json::from_str(&body) {
             Ok(m) => m,
             Err(err) => {
@@ -1284,22 +1330,31 @@ where
                     let body = extract_payload(msg.body().unwrap_or_default());
                     let metadata = extract_dead_metadata(&msg, original_queue);
 
-                    match serde_json::from_str::<T::Message>(&body) {
-                        Err(err) => {
-                            error!(
-                                error = %err,
-                                delivery_id = %metadata.message.delivery_id,
-                                "failed to deserialize message from DLQ — discarding"
-                            );
-                        }
-                        Ok(message) => {
-                            debug!(
-                                queue_url,
-                                delivery_id = %metadata.message.delivery_id,
-                                death_count = metadata.death_count,
-                                "dispatching DLQ message to handle_dead"
-                            );
-                            handler.handle_dead(message, metadata).await;
+                    if body.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                        warn!(
+                            bytes = body.len(),
+                            max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                            delivery_id = %metadata.message.delivery_id,
+                            "oversized DLQ message — discarding"
+                        );
+                    } else {
+                        match serde_json::from_str::<T::Message>(&body) {
+                            Err(err) => {
+                                error!(
+                                    error = %err,
+                                    delivery_id = %metadata.message.delivery_id,
+                                    "failed to deserialize message from DLQ — discarding"
+                                );
+                            }
+                            Ok(message) => {
+                                debug!(
+                                    queue_url,
+                                    delivery_id = %metadata.message.delivery_id,
+                                    death_count = metadata.death_count,
+                                    "dispatching DLQ message to handle_dead"
+                                );
+                                handler.handle_dead(message, metadata).await;
+                            }
                         }
                     }
 
