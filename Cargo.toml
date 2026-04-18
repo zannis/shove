@@ -35,6 +35,9 @@ nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
 # Apache Kafka pubsub
 kafka = ["dep:rdkafka"]
 
+# In-process, zero-external-dependency backend (testing & single-process apps)
+inmemory = ["dep:dashmap"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,10 +54,11 @@ aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optio
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 rand = "0.10"
-async-nats = { version = "0.39", optional = true }
+async-nats = { version = "0.47", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
 rdkafka = { version = "0.39", features = ["tokio"], optional = true }
+dashmap = { version = "6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = true }
@@ -209,3 +213,32 @@ required-features = ["kafka"]
 name = "kafka_audited_consumer"
 path = "examples/kafka/audited_consumer.rs"
 required-features = ["kafka", "audit"]
+
+[[test]]
+name = "inmemory_integration"
+required-features = ["inmemory"]
+
+[[example]]
+name = "inmemory_basic"
+path = "examples/inmemory/basic.rs"
+required-features = ["inmemory"]
+
+[[example]]
+name = "inmemory_sequenced"
+path = "examples/inmemory/sequenced.rs"
+required-features = ["inmemory"]
+
+[[example]]
+name = "inmemory_consumer_groups"
+path = "examples/inmemory/consumer_groups.rs"
+required-features = ["inmemory"]
+
+[[example]]
+name = "inmemory_audited_consumer"
+path = "examples/inmemory/audited_consumer.rs"
+required-features = ["inmemory", "audit"]
+
+[[example]]
+name = "inmemory_stress"
+path = "examples/inmemory/stress.rs"
+required-features = ["inmemory"]

@@ -5,7 +5,8 @@ use crate::topic::Topic;
 
 /// Header prefixes reserved for internal use. Callers may not set headers
 /// that start with any of these via [`Publisher::publish_with_headers`].
-const RESERVED_HEADER_PREFIXES: &[&str] = &["x-retry-count", "x-message-id", "x-death"];
+const RESERVED_HEADER_PREFIXES: &[&str] =
+    &["x-retry-count", "x-message-id", "x-death", "x-sequence-key"];
 
 /// Rejects user-supplied headers that collide with internal header keys.
 pub(crate) fn validate_headers(headers: &HashMap<String, String>) -> Result<()> {
