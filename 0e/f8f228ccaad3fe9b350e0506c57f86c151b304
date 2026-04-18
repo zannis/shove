@@ -1,0 +1,53 @@
+examples/inmemory/basic.rs
+  ff64744fd3f7c0b3 1-83
+examples/inmemory/consumer_groups.rs
+  ff64744fd3f7c0b3 1-79
+examples/inmemory/audited_consumer.rs
+  ff64744fd3f7c0b3 1-92
+src/backends/inmemory/constants.rs
+  ff64744fd3f7c0b3 1-8
+src/backends/inmemory/topology.rs
+  ff64744fd3f7c0b3 1-111
+examples/inmemory/sequenced.rs
+  ff64744fd3f7c0b3 1-103
+src/backends/inmemory/consumer.rs
+  ff64744fd3f7c0b3 1-705
+src/backends/inmemory/autoscaler.rs
+  ff64744fd3f7c0b3 1-298
+src/publisher.rs
+  ff64744fd3f7c0b3 8-19
+src/backends/mod.rs
+  ff64744fd3f7c0b3 12-14
+src/backends/inmemory/publisher.rs
+  ff64744fd3f7c0b3 1-257
+src/backends/inmemory/consumer_group.rs
+  ff64744fd3f7c0b3 1-425
+src/backends/inmemory/client.rs
+  ff64744fd3f7c0b3 1-279
+src/backends/inmemory/mod.rs
+  ff64744fd3f7c0b3 1-20
+src/lib.rs
+  ff64744fd3f7c0b3 90-99
+tests/inmemory_integration.rs
+  ff64744fd3f7c0b3 1-545
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "0ef8f228ccaad3fe9b350e0506c57f86c151b304",
+  "prompts": {
+    "ff64744fd3f7c0b3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "abaa41b5-b787-4658-aa80-527554858c28",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 3276,
+      "total_deletions": 247,
+      "accepted_lines": 6534,
+      "overriden_lines": 0
+    }
+  }
+}
