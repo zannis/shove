@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod autoscaler;
 pub mod consumer;
+pub mod consumer_supervisor;
 pub mod error;
 pub mod handler;
 #[doc(hidden)]
@@ -19,6 +20,7 @@ pub use consumer::{
     Consumer, ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE,
     DEFAULT_MAX_PENDING_PER_KEY,
 };
+pub use consumer_supervisor::SupervisorOutcome;
 pub use error::ShoveError;
 pub use handler::MessageHandler;
 pub use metadata::{DeadMessageMetadata, MessageMetadata};
