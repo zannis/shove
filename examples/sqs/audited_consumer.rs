@@ -40,7 +40,8 @@ define_topic!(
 struct PaymentHandler;
 
 impl MessageHandler<Payments> for PaymentHandler {
-    async fn handle(&self, msg: PaymentEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[handler] payment={} amount=${:.2} attempt={}",
             msg.payment_id,

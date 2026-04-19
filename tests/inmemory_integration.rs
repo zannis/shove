@@ -144,7 +144,8 @@ async fn end_to_end_publish_consume_ack() {
     #[derive(Clone)]
     struct H(Arc<Mutex<Vec<Order>>>);
     impl MessageHandler<OrdersTopic> for H {
-        async fn handle(&self, msg: Order, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: Order, _: MessageMetadata, _: &()) -> Outcome {
             self.0.lock().await.push(msg);
             Outcome::Ack
         }
@@ -198,7 +199,8 @@ async fn retry_then_ack_after_hold_queue_delay() {
         final_retry: Arc<AtomicU32>,
     }
     impl MessageHandler<OrdersTopic> for Flaky {
-        async fn handle(&self, _: Order, m: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Order, m: MessageMetadata, _: &()) -> Outcome {
             if self.remaining.load(Ordering::Relaxed) > 0 {
                 self.remaining.fetch_sub(1, Ordering::Relaxed);
                 Outcome::Retry
@@ -257,7 +259,8 @@ async fn max_retries_exceeded_goes_to_dlq() {
     #[derive(Clone)]
     struct AlwaysRetry;
     impl MessageHandler<OrdersTopic> for AlwaysRetry {
-        async fn handle(&self, _: Order, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Retry
         }
     }
@@ -267,10 +270,11 @@ async fn max_retries_exceeded_goes_to_dlq() {
     #[derive(Clone)]
     struct DlqHandler(Arc<AtomicUsize>);
     impl MessageHandler<OrdersTopic> for DlqHandler {
-        async fn handle(&self, _: Order, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
-        async fn handle_dead(&self, _: Order, _: shove::DeadMessageMetadata) {
+        async fn handle_dead(&self, _: Order, _: shove::DeadMessageMetadata, _: &()) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -333,7 +337,8 @@ async fn sequenced_preserves_per_key_order() {
     #[derive(Clone)]
     struct H(Arc<Mutex<HashMap<String, Vec<u64>>>>);
     impl MessageHandler<LedgerSkipTopic> for H {
-        async fn handle(&self, msg: Event, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: Event, _: MessageMetadata, _: &()) -> Outcome {
             self.0
                 .lock()
                 .await
@@ -416,7 +421,8 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
         acked: Arc<Mutex<Vec<(String, u64)>>>,
     }
     impl MessageHandler<LedgerFailAllTopic> for H {
-        async fn handle(&self, msg: Event, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: Event, _: MessageMetadata, _: &()) -> Outcome {
             if msg.account == "A" && msg.seq == 3 {
                 return Outcome::Reject;
             }
@@ -442,10 +448,11 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
     #[derive(Clone)]
     struct DlqHandler(Arc<AtomicUsize>);
     impl MessageHandler<LedgerFailAllTopic> for DlqHandler {
-        async fn handle(&self, _: Event, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
-        async fn handle_dead(&self, _: Event, _: shove::DeadMessageMetadata) {
+        async fn handle_dead(&self, _: Event, _: shove::DeadMessageMetadata, _: &()) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -517,7 +524,8 @@ async fn handler_panic_does_not_crash_consumer() {
         acked_ids: Arc<Mutex<Vec<u64>>>,
     }
     impl MessageHandler<OrdersTopic> for H {
-        async fn handle(&self, msg: Order, m: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: Order, m: MessageMetadata, _: &()) -> Outcome {
             if msg.id == 1 && m.retry_count == 0 {
                 panic!("boom — first delivery of id=1");
             }
@@ -530,10 +538,11 @@ async fn handler_panic_does_not_crash_consumer() {
     #[derive(Clone)]
     struct DlqH(Arc<AtomicUsize>);
     impl MessageHandler<OrdersTopic> for DlqH {
-        async fn handle(&self, _: Order, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
-        async fn handle_dead(&self, _: Order, _: shove::DeadMessageMetadata) {
+        async fn handle_dead(&self, _: Order, _: shove::DeadMessageMetadata, _: &()) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -624,7 +633,8 @@ async fn oversized_message_rejected_to_dlq() {
     #[derive(Clone)]
     struct NeverCalled(Arc<AtomicUsize>);
     impl MessageHandler<BigTopic> for NeverCalled {
-        async fn handle(&self, _: BigPayload, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: BigPayload, _: MessageMetadata, _: &()) -> Outcome {
             self.0.fetch_add(1, Ordering::Relaxed);
             Outcome::Ack
         }
@@ -636,10 +646,11 @@ async fn oversized_message_rejected_to_dlq() {
     #[derive(Clone)]
     struct DlqH(Arc<AtomicUsize>);
     impl MessageHandler<BigTopic> for DlqH {
-        async fn handle(&self, _: BigPayload, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: BigPayload, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
-        async fn handle_dead(&self, _: BigPayload, _: shove::DeadMessageMetadata) {
+        async fn handle_dead(&self, _: BigPayload, _: shove::DeadMessageMetadata, _: &()) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -698,7 +709,8 @@ async fn handler_timeout_triggers_retry_then_dlq() {
     #[derive(Clone)]
     struct Sleepy(Arc<AtomicUsize>);
     impl MessageHandler<OrdersTopic> for Sleepy {
-        async fn handle(&self, _: Order, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
             self.0.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(60)).await;
             Outcome::Ack
@@ -711,10 +723,11 @@ async fn handler_timeout_triggers_retry_then_dlq() {
     #[derive(Clone)]
     struct DlqH(Arc<AtomicUsize>);
     impl MessageHandler<OrdersTopic> for DlqH {
-        async fn handle(&self, _: Order, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
-        async fn handle_dead(&self, _: Order, _: shove::DeadMessageMetadata) {
+        async fn handle_dead(&self, _: Order, _: shove::DeadMessageMetadata, _: &()) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -780,7 +793,8 @@ async fn defer_schedules_redelivery_without_incrementing_retry() {
         final_retry_count: Arc<AtomicU32>,
     }
     impl MessageHandler<OrdersTopic> for Deferring {
-        async fn handle(&self, _: Order, m: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: Order, m: MessageMetadata, _: &()) -> Outcome {
             if self.first_call.fetch_add(1, Ordering::Relaxed) == 0 {
                 Outcome::Defer
             } else {
@@ -865,7 +879,8 @@ async fn poison_cleared_after_shard_drains() {
         acked: Arc<Mutex<Vec<u64>>>,
     }
     impl MessageHandler<LedgerFailAllTopic> for H {
-        async fn handle(&self, msg: Event, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: Event, _: MessageMetadata, _: &()) -> Outcome {
             if msg.seq == 1 {
                 return Outcome::Reject;
             }
@@ -963,7 +978,8 @@ async fn autoscaler_scales_up_under_backlog() {
                 gate: CancellationToken,
             }
             impl MessageHandler<GroupTopic> for Slow {
-                async fn handle(&self, _: Ping, _: MessageMetadata) -> Outcome {
+                type Context = ();
+                async fn handle(&self, _: Ping, _: MessageMetadata, _: &()) -> Outcome {
                     // Block until released so the backlog persists long enough
                     // to trip the autoscaler's hysteresis window.
                     self.gate.cancelled().await;
@@ -1048,7 +1064,8 @@ async fn consumer_group_distributes_load_across_workers() {
             #[derive(Clone)]
             struct H(Arc<AtomicUsize>);
             impl MessageHandler<GroupTopic> for H {
-                async fn handle(&self, _: Ping, _: MessageMetadata) -> Outcome {
+                type Context = ();
+                async fn handle(&self, _: Ping, _: MessageMetadata, _: &()) -> Outcome {
                     self.0.fetch_add(1, Ordering::Relaxed);
                     Outcome::Ack
                 }

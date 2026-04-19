@@ -49,7 +49,8 @@ struct Handler {
     acked: Arc<AtomicUsize>,
 }
 impl MessageHandler<LedgerTopic> for Handler {
-    async fn handle(&self, msg: LedgerEntry, _: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: LedgerEntry, _: MessageMetadata, _: &()) -> Outcome {
         println!(
             "applied entry account={} seq={} amount={:+}",
             msg.account, msg.seq, msg.amount

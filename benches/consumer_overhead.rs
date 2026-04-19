@@ -376,7 +376,8 @@ struct BenchHandler {
 }
 
 impl MessageHandler<OverheadTopic> for BenchHandler {
-    async fn handle(&self, msg: BenchMsg, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: BenchMsg, _meta: MessageMetadata, _: &()) -> Outcome {
         // No simulated work — measures pure framework dispatch overhead.
         let received_at = self.epoch.elapsed().as_nanos() as u64;
         self.recorder

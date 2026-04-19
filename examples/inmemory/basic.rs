@@ -35,7 +35,8 @@ struct PingHandler {
     count: Arc<AtomicUsize>,
 }
 impl MessageHandler<PingTopic> for PingHandler {
-    async fn handle(&self, msg: Ping, _: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: Ping, _: MessageMetadata, _: &()) -> Outcome {
         println!("received #{}: {}", msg.id, msg.note);
         self.count.fetch_add(1, Ordering::Relaxed);
         Outcome::Ack

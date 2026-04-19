@@ -40,7 +40,8 @@ shove::define_sequenced_topic!(
 struct UserEventHandler;
 
 impl MessageHandler<UserEventTopic> for UserEventHandler {
-    async fn handle(&self, message: UserEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, message: UserEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[user={}] action={} seq={} (retry={})",
             message.user_id, message.action, message.seq, metadata.retry_count

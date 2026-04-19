@@ -76,7 +76,8 @@ impl AckHandler {
 }
 
 impl MessageHandler<PaymentTopic> for AckHandler {
-    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata, _: &()) -> Outcome {
         let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         println!(
             "[ack]    payment={} amount=${:.2}  (processed: {n})",
@@ -100,7 +101,8 @@ impl RetryThenAckHandler {
 }
 
 impl MessageHandler<RetryPaymentTopic> for RetryThenAckHandler {
-    async fn handle(&self, msg: PaymentEvent, meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
         println!(
             "[retry]  payment={} attempt={} retry_count={}",
@@ -131,12 +133,13 @@ impl RejectHandler {
 }
 
 impl MessageHandler<RejectPaymentTopic> for RejectHandler {
-    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata, _: &()) -> Outcome {
         println!("[reject] payment={} → routing to DLQ", msg.payment_id);
         Outcome::Reject
     }
 
-    async fn handle_dead(&self, msg: PaymentEvent, meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, msg: PaymentEvent, meta: DeadMessageMetadata, _: &()) {
         let n = self.dead_count.fetch_add(1, Ordering::Relaxed) + 1;
         println!(
             "[dlq]    payment={} reason={} deaths={} (dlq total: {n})",

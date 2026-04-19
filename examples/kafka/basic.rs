@@ -37,7 +37,8 @@ shove::define_topic!(
 struct OrderHandler;
 
 impl MessageHandler<OrderTopic> for OrderHandler {
-    async fn handle(&self, message: OrderCreated, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, message: OrderCreated, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "Processing order {} (${:.2}) [retry={}]",
             message.order_id, message.amount, metadata.retry_count

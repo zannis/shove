@@ -378,7 +378,8 @@ impl CountingHandler {
 }
 
 impl MessageHandler<SimpleWork> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -386,7 +387,8 @@ impl MessageHandler<SimpleWork> for CountingHandler {
 }
 
 impl MessageHandler<OrderTopic> for CountingHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -394,7 +396,8 @@ impl MessageHandler<OrderTopic> for CountingHandler {
 }
 
 impl MessageHandler<ScalableWork> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -402,7 +405,8 @@ impl MessageHandler<ScalableWork> for CountingHandler {
 }
 
 impl MessageHandler<AuditedWork> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -410,7 +414,8 @@ impl MessageHandler<AuditedWork> for CountingHandler {
 }
 
 impl MessageHandler<SkipOrders> for CountingHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -418,7 +423,8 @@ impl MessageHandler<SkipOrders> for CountingHandler {
 }
 
 impl MessageHandler<FailAllOrders> for CountingHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -464,7 +470,8 @@ impl SlowCountingHandler {
 }
 
 impl MessageHandler<ConcurrentWork> for SlowCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
@@ -473,7 +480,8 @@ impl MessageHandler<ConcurrentWork> for SlowCountingHandler {
 }
 
 impl MessageHandler<SimpleWork> for SlowCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
@@ -482,7 +490,8 @@ impl MessageHandler<SimpleWork> for SlowCountingHandler {
 }
 
 impl MessageHandler<UngracefulSeq1> for SlowCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
@@ -491,7 +500,8 @@ impl MessageHandler<UngracefulSeq1> for SlowCountingHandler {
 }
 
 impl MessageHandler<UngracefulSeq3> for SlowCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
@@ -500,7 +510,8 @@ impl MessageHandler<UngracefulSeq3> for SlowCountingHandler {
 }
 
 impl MessageHandler<UngracefulConc1> for SlowCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
@@ -509,7 +520,8 @@ impl MessageHandler<UngracefulConc1> for SlowCountingHandler {
 }
 
 impl MessageHandler<UngracefulConc3> for SlowCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
@@ -518,7 +530,8 @@ impl MessageHandler<UngracefulConc3> for SlowCountingHandler {
 }
 
 impl MessageHandler<SkipOrders> for SlowCountingHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
@@ -573,7 +586,8 @@ impl ConcurrentMixedHandler {
 }
 
 impl MessageHandler<ConcurrentRejectWork> for ConcurrentMixedHandler {
-    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         // Simulate some work
         tokio::time::sleep(Duration::from_millis(10)).await;
         if msg.body.starts_with("reject") {
@@ -589,7 +603,8 @@ impl MessageHandler<ConcurrentRejectWork> for ConcurrentMixedHandler {
 }
 
 impl MessageHandler<ConcurrentWork> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -597,7 +612,8 @@ impl MessageHandler<ConcurrentWork> for CountingHandler {
 }
 
 impl MessageHandler<UngracefulSeq1> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -605,7 +621,8 @@ impl MessageHandler<UngracefulSeq1> for CountingHandler {
 }
 
 impl MessageHandler<UngracefulSeq3> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -613,7 +630,8 @@ impl MessageHandler<UngracefulSeq3> for CountingHandler {
 }
 
 impl MessageHandler<UngracefulConc1> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -621,7 +639,8 @@ impl MessageHandler<UngracefulConc1> for CountingHandler {
 }
 
 impl MessageHandler<UngracefulConc3> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -629,11 +648,12 @@ impl MessageHandler<UngracefulConc3> for CountingHandler {
 }
 
 impl MessageHandler<ConcurrentRejectWork> for DlqCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
 
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
@@ -678,7 +698,8 @@ impl TimeoutThenAckHandler {
 }
 
 impl MessageHandler<TimeoutWork> for TimeoutThenAckHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.delivery_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.signal.notify_waiters();
         if attempt == 1 {
@@ -737,7 +758,8 @@ impl RejectSeqHandler {
 }
 
 impl MessageHandler<SkipOrders> for RejectSeqHandler {
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         if msg.seq == self.reject_seq {
             self.reject_count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
@@ -751,7 +773,8 @@ impl MessageHandler<SkipOrders> for RejectSeqHandler {
 }
 
 impl MessageHandler<FailAllOrders> for RejectSeqHandler {
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         if msg.seq == self.reject_seq {
             self.reject_count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
@@ -800,20 +823,22 @@ impl OrderDlqHandler {
 }
 
 impl MessageHandler<SkipOrders> for OrderDlqHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
-    async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
 }
 
 impl MessageHandler<FailAllOrders> for OrderDlqHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
-    async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
@@ -823,7 +848,8 @@ impl MessageHandler<FailAllOrders> for OrderDlqHandler {
 struct RejectHandler;
 
 impl MessageHandler<SimpleWork> for RejectHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Reject
     }
 }
@@ -864,11 +890,12 @@ impl DlqCountingHandler {
 }
 
 impl MessageHandler<SimpleWork> for DlqCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
 
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
@@ -899,7 +926,8 @@ impl RetryThenAckHandler {
 }
 
 impl MessageHandler<RetryWork> for RetryThenAckHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.attempt_count.fetch_add(1, Ordering::Relaxed);
         if attempt < self.retry_until {
             Outcome::Retry
@@ -912,7 +940,8 @@ impl MessageHandler<RetryWork> for RetryThenAckHandler {
 }
 
 impl MessageHandler<ConcurrentRetryWork> for RetryThenAckHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.attempt_count.fetch_add(1, Ordering::Relaxed);
         if attempt < self.retry_until {
             Outcome::Retry
@@ -947,7 +976,8 @@ impl DeferOnceHandler {
 }
 
 impl MessageHandler<DeferNoHold> for DeferOnceHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let call = self.call_count.fetch_add(1, Ordering::Relaxed);
         if call == 0 {
             Outcome::Defer
@@ -960,7 +990,8 @@ impl MessageHandler<DeferNoHold> for DeferOnceHandler {
 }
 
 impl MessageHandler<DeferWithHold> for DeferOnceHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let call = self.call_count.fetch_add(1, Ordering::Relaxed);
         if call == 0 {
             Outcome::Defer
@@ -993,7 +1024,8 @@ impl AlwaysRetryHandler {
 }
 
 impl MessageHandler<ConcurrentMaxRetry> for AlwaysRetryHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.attempt_count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Retry
@@ -1001,7 +1033,8 @@ impl MessageHandler<ConcurrentMaxRetry> for AlwaysRetryHandler {
 }
 
 impl MessageHandler<RetryWork> for AlwaysRetryHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.attempt_count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Retry
@@ -1009,27 +1042,30 @@ impl MessageHandler<RetryWork> for AlwaysRetryHandler {
 }
 
 impl MessageHandler<ConcurrentMaxRetry> for DlqCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
 }
 
 impl MessageHandler<RetryWork> for DlqCountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
 }
 
 impl MessageHandler<StrictWork> for CountingHandler {
-    async fn handle(&self, _msg: StrictMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: StrictMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
         Outcome::Ack
@@ -1037,17 +1073,19 @@ impl MessageHandler<StrictWork> for CountingHandler {
 }
 
 impl MessageHandler<StrictWork> for DlqCountingHandler {
-    async fn handle(&self, _msg: StrictMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: StrictMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
-    async fn handle_dead(&self, _msg: StrictMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: StrictMessage, _meta: DeadMessageMetadata, _: &()) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.signal.notify_waiters();
     }
 }
 
 impl MessageHandler<ConcurrentWork> for TimeoutThenAckHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.delivery_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.signal.notify_waiters();
         if attempt == 1 {
@@ -1093,7 +1131,8 @@ impl SeqRetryHandler {
 }
 
 impl MessageHandler<RetrySeqOrders> for SeqRetryHandler {
-    async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
         if meta.retry_count == 0 {
             Outcome::Retry
         } else {
@@ -1142,7 +1181,8 @@ impl SeqDeferHandler {
 }
 
 impl MessageHandler<DeferSeqOrders> for SeqDeferHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let call = self.call_count.fetch_add(1, Ordering::Relaxed);
         if call == 0 {
             Outcome::Defer
@@ -1155,7 +1195,8 @@ impl MessageHandler<DeferSeqOrders> for SeqDeferHandler {
 }
 
 impl MessageHandler<DeferSeqNoHold> for SeqDeferHandler {
-    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let call = self.call_count.fetch_add(1, Ordering::Relaxed);
         if call == 0 {
             Outcome::Defer
@@ -1197,7 +1238,8 @@ impl RetryThenDeferHandler {
 }
 
 impl MessageHandler<DeferWithHold> for RetryThenDeferHandler {
-    async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
         let call = self.call_count.fetch_add(1, Ordering::Relaxed);
         self.retry_counts.lock().unwrap().push(meta.retry_count);
         match call {
@@ -1988,7 +2030,8 @@ async fn autoscaler_scales_down_when_idle() {
 struct SlowScalableHandler;
 
 impl MessageHandler<ScalableWork> for SlowScalableHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(Duration::from_secs(2)).await;
         Outcome::Ack
     }
@@ -4358,7 +4401,8 @@ mod exactly_once {
     // ── Handler impls ────────────────────────────────────────────────────────
 
     impl MessageHandler<ExactlyOnceWork> for CountingHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
             Outcome::Ack
@@ -4366,7 +4410,8 @@ mod exactly_once {
     }
 
     impl MessageHandler<ExactlyOnceRetry> for RetryThenAckHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let attempt = self.attempt_count.fetch_add(1, Ordering::Relaxed);
             if attempt < self.retry_until {
                 Outcome::Retry
@@ -4379,10 +4424,11 @@ mod exactly_once {
     }
 
     impl MessageHandler<ExactlyOnceReject> for DlqCountingHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             Outcome::Reject
         }
-        async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+        async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
             self.count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
         }
@@ -4544,7 +4590,8 @@ mod exactly_once {
     );
 
     impl MessageHandler<ExactlyOnceDefer> for DeferOnceHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let call = self.call_count.fetch_add(1, Ordering::Relaxed);
             if call == 0 {
                 Outcome::Defer
@@ -4557,7 +4604,8 @@ mod exactly_once {
     }
 
     impl MessageHandler<ExactlyOnceMaxRetries> for AlwaysRetryHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.attempt_count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
             Outcome::Retry
@@ -4565,17 +4613,19 @@ mod exactly_once {
     }
 
     impl MessageHandler<ExactlyOnceMaxRetries> for DlqCountingHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
-        async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+        async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
             self.count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
         }
     }
 
     impl MessageHandler<ExactlyOnceShutdown> for SlowCountingHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             tokio::time::sleep(self.delay).await;
             self.count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
@@ -4584,7 +4634,8 @@ mod exactly_once {
     }
 
     impl MessageHandler<ExactlyOnceConcurrent> for CountingHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.count.fetch_add(1, Ordering::Relaxed);
             self.signal.notify_waiters();
             Outcome::Ack

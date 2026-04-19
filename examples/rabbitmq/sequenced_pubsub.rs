@@ -84,7 +84,8 @@ struct LedgerHandler {
 }
 
 impl MessageHandler<SkipLedger> for LedgerHandler {
-    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(Duration::from_millis(50)).await;
         println!(
             "[{}] account={} seq={} amount={} attempt={}",
@@ -105,7 +106,8 @@ impl MessageHandler<SkipLedger> for LedgerHandler {
 }
 
 impl MessageHandler<StrictLedger> for LedgerHandler {
-    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(Duration::from_millis(50)).await;
         println!(
             "[{}] account={} seq={} amount={} attempt={}",

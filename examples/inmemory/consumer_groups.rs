@@ -31,7 +31,8 @@ struct Worker {
     count: Arc<AtomicUsize>,
 }
 impl MessageHandler<WorkTopic> for Worker {
-    async fn handle(&self, msg: Work, _: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: Work, _: MessageMetadata, _: &()) -> Outcome {
         // Simulate some I/O.
         tokio::time::sleep(Duration::from_millis(5)).await;
         self.count.fetch_add(1, Ordering::Relaxed);

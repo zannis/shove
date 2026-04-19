@@ -188,21 +188,24 @@ impl CountingHandler {
 }
 
 impl MessageHandler<WorkTopic> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
         Outcome::Ack
     }
 }
 
 impl MessageHandler<NoDlqTopic> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
         Outcome::Ack
     }
 }
 
 impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
         Outcome::Ack
     }
@@ -211,7 +214,8 @@ impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
 struct FixedOutcomeHandler(Outcome);
 
 impl MessageHandler<WorkTopic> for FixedOutcomeHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.0.clone()
     }
 }
@@ -232,7 +236,8 @@ impl RetryThenAckHandler {
 }
 
 impl MessageHandler<WorkTopic> for RetryThenAckHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.counter.get();
         self.counter.increment();
         if attempt < self.retry_until {
@@ -259,7 +264,8 @@ impl SlowHandler {
 }
 
 impl MessageHandler<WorkTopic> for SlowHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.counter.increment();
         Outcome::Ack
@@ -280,11 +286,12 @@ impl DlqRecordingHandler {
 }
 
 impl MessageHandler<WorkTopic> for DlqRecordingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
 
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
         self.counter.increment();
     }
 }
@@ -309,7 +316,8 @@ impl OrderRecordingHandler {
 }
 
 impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.records.lock().await.push((msg.order_id, msg.amount));
         self.counter.increment();
         Outcome::Ack
@@ -428,7 +436,8 @@ async fn publish_and_consume_with_headers() {
     struct HeaderCapture(Arc<Mutex<HashMap<String, String>>>);
 
     impl MessageHandler<WorkTopic> for HeaderCapture {
-        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
             *self.0.lock().await = meta.headers;
             Outcome::Ack
         }
@@ -728,7 +737,8 @@ async fn defer_redelivers_message() {
     struct DeferThenAck(WaitableCounter);
 
     impl MessageHandler<WorkTopic> for DeferThenAck {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let prev = self.0.get();
             self.0.increment();
             if prev == 0 {
@@ -826,7 +836,8 @@ async fn concurrent_consume_mixed_outcomes() {
     struct MixedHandler(WaitableCounter, WaitableCounter);
 
     impl MessageHandler<WorkTopic> for MixedHandler {
-        async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             if msg.id.ends_with("-reject") {
                 self.1.increment();
                 Outcome::Reject
@@ -952,7 +963,8 @@ async fn handler_timeout_triggers_retry() {
     struct TimeoutThenAck(WaitableCounter);
 
     impl MessageHandler<WorkTopic> for TimeoutThenAck {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let attempt = self.0.get();
             self.0.increment();
             if attempt == 0 {
@@ -1056,7 +1068,8 @@ async fn sequenced_skip_continues_after_rejection() {
     }
 
     impl MessageHandler<SeqSkipTopic> for RejectFirstHandler {
-        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.counter.increment();
             if msg.amount == 0 {
                 Outcome::Reject
@@ -1219,7 +1232,8 @@ async fn consumer_group_processes_messages() {
 async fn run_dlq_on_topic_without_dlq_fails() {
     struct Noop;
     impl MessageHandler<NoDlqTopic> for Noop {
-        async fn handle(&self, _: SimpleMessage, _: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _: SimpleMessage, _: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
     }
@@ -1238,7 +1252,8 @@ async fn defer_without_hold_queues_redelivers() {
     struct DeferThenAck(WaitableCounter);
 
     impl MessageHandler<DeferNoHoldTopic> for DeferThenAck {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let prev = self.0.get();
             self.0.increment();
             if prev == 0 {
@@ -1292,7 +1307,8 @@ async fn defer_preserves_retry_count() {
     }
 
     impl MessageHandler<WorkTopic> for DeferCheckRetry {
-        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
             self.retry_counts.lock().await.push(meta.retry_count);
             let call = self.counter.get();
             self.counter.increment();
@@ -1491,7 +1507,8 @@ async fn lag_stats_provider_reports_zero_after_consumption() {
     );
 
     impl MessageHandler<LagTestTopic> for CountingHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.counter.increment();
             Outcome::Ack
         }
@@ -1567,7 +1584,8 @@ async fn topology_expands_partitions_on_redeclare() {
     );
 
     impl MessageHandler<ExpandTopic> for CountingHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.counter.increment();
             Outcome::Ack
         }
@@ -1673,7 +1691,8 @@ async fn handler_panic_does_not_crash_consumer() {
     struct PanicThenAck(WaitableCounter);
 
     impl MessageHandler<WorkTopic> for PanicThenAck {
-        async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.0.increment();
             if msg.id == "panic-me" {
                 panic!("intentional test panic");
@@ -1740,7 +1759,8 @@ async fn sequenced_defer_falls_back_to_retry() {
     }
 
     impl MessageHandler<SeqSkipTopic> for DeferThenAck {
-        async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, meta: MessageMetadata, _: &()) -> Outcome {
             self.retry_counts.lock().await.push(meta.retry_count);
             let call = self.counter.get();
             self.counter.increment();

@@ -76,7 +76,8 @@ impl SlowTaskHandler {
 }
 
 impl MessageHandler<SlowTasks> for SlowTaskHandler {
-    async fn handle(&self, task: Task, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, task: Task, _meta: MessageMetadata, _: &()) -> Outcome {
         // Simulate slow I/O (HTTP call, database query, etc.)
         tokio::time::sleep(self.delay).await;
         eprintln!("  processed task {}", task.id);

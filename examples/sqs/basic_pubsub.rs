@@ -62,7 +62,8 @@ define_topic!(
 struct AckHandler;
 
 impl MessageHandler<MinimalOrder> for AckHandler {
-    async fn handle(&self, msg: OrderEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[minimal] order={} amount=${:.2} attempt={}",
             msg.order_id,
@@ -77,12 +78,13 @@ impl MessageHandler<MinimalOrder> for AckHandler {
 struct RejectHandler;
 
 impl MessageHandler<DlqOrder> for RejectHandler {
-    async fn handle(&self, msg: OrderEvent, _metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderEvent, _metadata: MessageMetadata, _: &()) -> Outcome {
         println!("[dlq] rejecting order={} → DLQ", msg.order_id);
         Outcome::Reject
     }
 
-    async fn handle_dead(&self, msg: OrderEvent, metadata: DeadMessageMetadata) {
+    async fn handle_dead(&self, msg: OrderEvent, metadata: DeadMessageMetadata, _: &()) {
         println!(
             "[dlq] dead-letter: order={} reason={} deaths={}",
             msg.order_id,
@@ -96,7 +98,8 @@ impl MessageHandler<DlqOrder> for RejectHandler {
 struct RetryHandler;
 
 impl MessageHandler<RetryOrder> for RetryHandler {
-    async fn handle(&self, msg: OrderEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[retry] order={} attempt={}",
             msg.order_id,

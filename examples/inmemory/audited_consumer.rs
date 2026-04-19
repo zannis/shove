@@ -36,7 +36,8 @@ struct Inner {
     count: Arc<AtomicUsize>,
 }
 impl MessageHandler<EventTopic> for Inner {
-    async fn handle(&self, msg: Event, _: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: Event, _: MessageMetadata, _: &()) -> Outcome {
         self.count.fetch_add(1, Ordering::Relaxed);
         println!("handled event {}", msg.id);
         Outcome::Ack

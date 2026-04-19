@@ -487,7 +487,8 @@ pub struct StressTestHandler {
 }
 
 impl MessageHandler<StressTestTopic> for StressTestHandler {
-    async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata, _: &()) -> Outcome {
         let received_at = self.epoch.elapsed().as_nanos() as u64;
 
         match self.profile {

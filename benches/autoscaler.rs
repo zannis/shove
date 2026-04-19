@@ -47,7 +47,13 @@ struct LatencyHandler {
 }
 
 impl MessageHandler<BenchTopic> for LatencyHandler {
-    fn handle(&self, _: Msg, _: MessageMetadata) -> impl Future<Output = Outcome> + Send {
+    type Context = ();
+    fn handle(
+        &self,
+        _: Msg,
+        _: MessageMetadata,
+        _: &(),
+    ) -> impl Future<Output = Outcome> + Send {
         let processed = self.processed.clone();
         let delay = self.delay;
         async move {

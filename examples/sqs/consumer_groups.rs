@@ -39,7 +39,8 @@ define_topic!(
 struct TaskHandler;
 
 impl MessageHandler<WorkQueue> for TaskHandler {
-    async fn handle(&self, msg: TaskEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: TaskEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[worker] task={} attempt={}",
             msg.task_id,
