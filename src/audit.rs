@@ -504,4 +504,43 @@ mod tests {
             .await;
         assert!(tracker.called.load(Ordering::Relaxed));
     }
+
+    /// `Audited<H, A>::handle` forwards the caller-supplied `ctx` reference unchanged to the
+    /// inner handler on the success path.
+    #[tokio::test]
+    async fn audited_handle_forwards_context() {
+        struct CtxHandler;
+        impl MessageHandler<TestTopic> for CtxHandler {
+            type Context = u32;
+            async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata, ctx: &u32) -> Outcome {
+                assert_eq!(*ctx, 11);
+                Outcome::Ack
+            }
+        }
+
+        let audited = Audited::new(CtxHandler, OkAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata(), &11).await;
+        assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    /// `Audited<H, A>::handle_dead` forwards the caller-supplied `ctx` reference unchanged to
+    /// the inner handler.
+    #[tokio::test]
+    async fn audited_handle_dead_forwards_context() {
+        struct CtxDeadHandler;
+        impl MessageHandler<TestTopic> for CtxDeadHandler {
+            type Context = u32;
+            async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata, _: &u32) -> Outcome {
+                Outcome::Ack
+            }
+            async fn handle_dead(&self, _msg: TestMessage, _meta: DeadMessageMetadata, ctx: &u32) {
+                assert_eq!(*ctx, 13);
+            }
+        }
+
+        let audited = Audited::new(CtxDeadHandler, OkAuditHandler);
+        audited
+            .handle_dead(test_message(), test_dead_metadata(), &13)
+            .await;
+    }
 }
