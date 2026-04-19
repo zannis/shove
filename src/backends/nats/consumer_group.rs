@@ -131,7 +131,7 @@ impl NatsConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + Clone + 'static,
     {
         let concurrent = config.concurrent_processing;
         let max_ack_pending = if concurrent {
@@ -304,7 +304,7 @@ impl NatsConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + Clone + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();

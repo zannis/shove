@@ -146,7 +146,7 @@ impl InMemoryConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
@@ -308,7 +308,7 @@ impl InMemoryConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();

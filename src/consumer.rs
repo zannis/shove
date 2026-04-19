@@ -240,7 +240,7 @@ pub trait Consumer: Send + Sync + 'static {
     /// consumer instances.
     fn run<T: Topic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -260,7 +260,7 @@ pub trait Consumer: Send + Sync + 'static {
     /// Returns `Err(ShoveError::Topology)` if `T::topology().sequencing` is `None`.
     fn run_fifo<T: SequencedTopic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -271,7 +271,7 @@ pub trait Consumer: Send + Sync + 'static {
     /// Returns `Err(ShoveError::Topology)` if `T::topology().dlq` is `None`.
     fn run_dlq<T: Topic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
     ) -> impl Future<Output = Result<()>> + Send;
 }
 

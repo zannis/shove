@@ -168,7 +168,7 @@ impl ConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + Clone + 'static,
     {
         let concurrent = config.concurrent_processing;
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {

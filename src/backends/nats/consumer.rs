@@ -291,15 +291,15 @@ async fn route_outcome(
 // ---------------------------------------------------------------------------
 
 /// Wraps handler.handle() with optional timeout, returns Outcome::Retry on timeout.
-async fn invoke_handler<T: Topic>(
-    handler: &(impl MessageHandler<T> + ?Sized),
+async fn invoke_handler<T: Topic, H: MessageHandler<T, Context = ()> + ?Sized>(
+    handler: &H,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
         Some(duration) => {
-            match tokio::time::timeout(duration, handler.handle(message, metadata)).await {
+            match tokio::time::timeout(duration, handler.handle(message, metadata, &())).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     tracing::warn!("handler timed out after {duration:?}, retrying");
@@ -307,7 +307,7 @@ async fn invoke_handler<T: Topic>(
                 }
             }
         }
-        None => handler.handle(message, metadata).await,
+        None => handler.handle(message, metadata, &()).await,
     }
 }
 
@@ -393,7 +393,7 @@ impl NatsConsumer {
 impl Consumer for NatsConsumer {
     async fn run<T: Topic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> Result<()> {
         let topology = T::topology();
@@ -594,7 +594,7 @@ impl Consumer for NatsConsumer {
 
     async fn run_fifo<T: SequencedTopic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> Result<()> {
         let topology = T::topology();
@@ -785,7 +785,7 @@ impl Consumer for NatsConsumer {
         Ok(())
     }
 
-    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T>) -> Result<()> {
+    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T, Context = ()>) -> Result<()> {
         let topology = T::topology();
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
@@ -885,7 +885,7 @@ impl Consumer for NatsConsumer {
 
                             let metadata = extract_dead_metadata(&msg);
 
-                            handler.handle_dead(payload, metadata).await;
+                            handler.handle_dead(payload, metadata, &()).await;
 
                             // Always ack after handle_dead completes
                             if let Err(e) = msg.ack().await {

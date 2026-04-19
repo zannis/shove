@@ -167,7 +167,7 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T>,
+        H: MessageHandler<T, Context = ()>,
     {
         let mut poisoned_keys = HashSet::new();
         let mut pending_deliveries: HashMap<String, VecDeque<Delivery>> = HashMap::new();
@@ -227,7 +227,7 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T>,
+        H: MessageHandler<T, Context = ()>,
     {
         let prefetch = options.prefetch_count;
         #[cfg(feature = "rabbitmq-transactional")]
@@ -657,7 +657,7 @@ impl RabbitMqConsumer {
     ) where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T>,
+        H: MessageHandler<T, Context = ()>,
     {
         // If the key is poisoned, reject all pending deliveries for it.
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
@@ -759,7 +759,7 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T>,
+        H: MessageHandler<T, Context = ()>,
     {
         let shutdown = options.shutdown.clone();
         run_with_reconnect(&shutdown, queue, || {
@@ -778,7 +778,7 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T>,
+        H: MessageHandler<T, Context = ()>,
     {
         #[cfg(feature = "rabbitmq-transactional")]
         let exactly_once = options.exactly_once;
@@ -916,7 +916,7 @@ async fn consume_dlq_loop<T, H>(
 where
     T: Topic,
     T::Message: for<'de> serde::Deserialize<'de>,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     // DLQ consumer never uses exactly-once mode (always acks, no hold-queue routing).
     let (_channel, mut stream) = open_consumer(client, dlq, options.prefetch_count, false).await?;
@@ -950,7 +950,7 @@ where
                             );
                         }
                         Ok(message) => {
-                            handler.handle_dead(message, metadata).await;
+                            handler.handle_dead(message, metadata, &()).await;
                         }
                     }
                 }
@@ -1091,13 +1091,13 @@ fn spawn_handler<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
     let n = notify.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler(h.handle(message, metadata), timeout).await;
+        let outcome = invoke_handler(h.handle(message, metadata, &()), timeout).await;
         let _ = tx.send(outcome);
         n.notify_one();
     });
@@ -1117,13 +1117,13 @@ fn spawn_handler_keyed<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
     let ctx = completed_tx.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler(h.handle(message, metadata), timeout).await;
+        let outcome = invoke_handler(h.handle(message, metadata, &()), timeout).await;
         let _ = tx.send(outcome);
         let _ = ctx.send(key);
     });
@@ -1172,7 +1172,7 @@ where
 impl Consumer for RabbitMqConsumer {
     async fn run<T: Topic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> Result<()> {
         let topology = T::topology();
@@ -1185,7 +1185,7 @@ impl Consumer for RabbitMqConsumer {
 
     async fn run_fifo<T: SequencedTopic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> Result<()> {
         let topology = T::topology();
@@ -1237,7 +1237,7 @@ impl Consumer for RabbitMqConsumer {
         Ok(())
     }
 
-    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T>) -> Result<()> {
+    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T, Context = ()>) -> Result<()> {
         let topology = T::topology();
         let dlq = topology
             .dlq()

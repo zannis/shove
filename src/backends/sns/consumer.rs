@@ -168,20 +168,20 @@ where
     }
 }
 
-async fn invoke_handler<T: Topic, H: MessageHandler<T>>(
+async fn invoke_handler<T: Topic, H: MessageHandler<T, Context = ()>>(
     handler: &H,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata))
+        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, &()))
             .await
             .unwrap_or_else(|_| {
                 warn!("handler exceeded timeout ({duration:?}), retrying message");
                 Outcome::Retry
             }),
-        None => handler.handle(message, metadata).await,
+        None => handler.handle(message, metadata, &()).await,
     }
 }
 
@@ -196,7 +196,7 @@ fn spawn_handler<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
@@ -230,7 +230,7 @@ async fn consume_loop_concurrent<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     let notify = Arc::new(Notify::new());
 
@@ -621,7 +621,7 @@ fn spawn_handler_keyed<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
@@ -652,7 +652,7 @@ async fn run_sequenced_shard<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     let mut poisoned_keys = HashSet::new();
     let mut pending_deliveries: HashMap<String, VecDeque<aws_sdk_sqs::types::Message>> =
@@ -715,7 +715,7 @@ async fn consume_loop_sequenced<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     let prefetch = options.prefetch_count as usize;
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<String>();
@@ -1161,7 +1161,7 @@ async fn drain_pending_for_key<T, H>(
     pending_deliveries: &mut HashMap<String, VecDeque<aws_sdk_sqs::types::Message>>,
 ) where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     // If the key is poisoned, reject all pending deliveries for it.
     if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
@@ -1299,7 +1299,7 @@ async fn consume_dlq_loop<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T>,
+    H: MessageHandler<T, Context = ()>,
 {
     info!(queue_url, "DLQ consumer started");
 
@@ -1353,7 +1353,7 @@ where
                                     death_count = metadata.death_count,
                                     "dispatching DLQ message to handle_dead"
                                 );
-                                handler.handle_dead(message, metadata).await;
+                                handler.handle_dead(message, metadata, &()).await;
                             }
                         }
                     }
@@ -1374,7 +1374,7 @@ where
 impl Consumer for SqsConsumer {
     fn run<T: Topic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
@@ -1395,7 +1395,7 @@ impl Consumer for SqsConsumer {
 
     fn run_fifo<T: SequencedTopic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
@@ -1446,7 +1446,7 @@ impl Consumer for SqsConsumer {
 
     fn run_dlq<T: Topic>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: impl MessageHandler<T, Context = ()>,
     ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();

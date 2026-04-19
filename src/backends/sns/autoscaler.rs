@@ -202,10 +202,12 @@ mod tests {
         #[derive(Clone)]
         struct H;
         impl MessageHandler<T> for H {
+            type Context = ();
             async fn handle(
                 &self,
                 _: Msg,
                 _: crate::metadata::MessageMetadata,
+                _: &(),
             ) -> crate::outcome::Outcome {
                 crate::outcome::Outcome::Ack
             }
