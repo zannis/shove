@@ -6,24 +6,82 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS JetStream, or Apache Kafka.
+Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS JetStream, Apache Kafka, or an in-process broker.
 
-`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it. Pick the transport that fits your stack — RabbitMQ, SNS/SQS, NATS JetStream, or Kafka — and get the same high-level API everywhere.
+`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it. Pick the transport that fits your stack — RabbitMQ, SNS/SQS, NATS JetStream, Kafka, or the zero-dependency in-process backend for tests and single-process apps — and get the same high-level API everywhere.
 
 ## Why shove
 
-- Typed topics instead of stringly-typed queue names
-- Built-in retry topologies with delayed hold queues and DLQs
-- Concurrent consumers with in-order acknowledgements
-- Strict per-key ordering for sequenced topics
-- Consumer groups with queue-depth autoscaling
-- Structured audit trails for every delivery attempt
-- RabbitMQ at-least-once by default, with opt-in transactional exactly-once routing
-- SNS publisher-only mode or full SNS + SQS consumption stack
-- NATS JetStream with per-key shard ordering and queue-depth autoscaling
-- Kafka with partition-based ordering, consumer lag autoscaling, and reconnect resilience
+- **Typed topics** — define a topic once as a Rust type; queue names, DLQs, and hold queues all derive from it.
+- **Retry topologies without glue code** — escalating backoff through hold queues, DLQ routing, retry budgets, handler timeouts.
+- **Strict per-key ordering** — `SequencedTopic` with pluggable failure policies (`Skip` or `FailAll`), enforced by the broker.
+- **Consumer groups + autoscaling** — min/max bounds driven by queue depth (or consumer lag on Kafka), with optional structured audit trails.
+- **One API across five backends** — swap the transport without changing topic definitions or handlers.
 
 If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, `async-nats`, or `rdkafka` directly. `shove` is the layer for multi-service event flows that need operational discipline.
+
+## 30-second tour
+
+No Docker, no credentials, no config — this runs against the in-process backend:
+
+```rust,no_run
+use serde::{Deserialize, Serialize};
+use shove::inmemory::*;
+use shove::*;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrderPaid { order_id: String }
+
+define_topic!(Orders, OrderPaid,
+    TopologyBuilder::new("orders")
+        .hold_queue(Duration::from_secs(5))  // retry with backoff
+        .dlq()                               // dead-letter on permanent failure
+        .build());
+
+struct Handler;
+impl MessageHandler<Orders> for Handler {
+    async fn handle(&self, msg: OrderPaid, _: MessageMetadata) -> Outcome {
+        println!("paid: {}", msg.order_id);
+        Outcome::Ack
+    }
+}
+
+# async fn run() -> Result<(), ShoveError> {
+let broker = InMemoryBroker::new();
+InMemoryTopologyDeclarer::new(broker.clone())
+    .declare(Orders::topology()).await?;
+
+InMemoryPublisher::new(broker.clone())
+    .publish::<Orders>(&OrderPaid { order_id: "ORD-1".into() }).await?;
+
+InMemoryConsumer::new(broker)
+    .run::<Orders>(Handler, ConsumerOptions::new(CancellationToken::new())).await?;
+# Ok(()) }
+```
+
+Swap `InMemory*` for `RabbitMq*`, `Sns*`, `Nats*`, or `Kafka*` — the topic definition and handler stay identical.
+
+## Pick your backend
+
+| Backend        | Feature flag    | Durability        | Ordering primitive                   | Autoscale signal       | Ops burden            |
+|----------------|-----------------|-------------------|--------------------------------------|------------------------|-----------------------|
+| RabbitMQ       | `rabbitmq`      | Disk              | Consistent-hash exchange + SAC shards | Queue depth (mgmt API) | Broker + mgmt plugin  |
+| AWS SNS/SQS    | `aws-sns-sqs`   | Managed (AWS)     | FIFO topic + `MessageGroupId`         | Queue depth            | Managed — no infra    |
+| NATS JetStream | `nats`          | Disk (JetStream)  | Subject shard + `max_ack_pending=1`   | Pending messages       | NATS server           |
+| Apache Kafka   | `kafka`         | Disk (log)        | Partition key                        | Consumer lag           | Kafka cluster         |
+| In-process     | `inmemory`      | None (process RAM) | Per-key FIFO shards                  | Queue depth (in-proc)  | None                  |
+
+Rules of thumb:
+
+- **Prototyping, tests, single-process apps** → `inmemory`
+- **Already on AWS, don't want to run infra** → `aws-sns-sqs`
+- **Low-latency streaming, high throughput, replay** → `kafka`
+- **Complex routing + retry topologies, existing RabbitMQ** → `rabbitmq`
+- **Lightweight edge deployments, JetStream already in-stack** → `nats`
+
+All backends support typed topics, retry/DLQ, sequenced delivery, consumer groups, autoscaling, and audit — the trait surface is identical.
 
 ## Features
 
@@ -48,29 +106,33 @@ cargo add shove --features nats
 # Apache Kafka
 cargo add shove --features kafka
 
+# In-memory broker
+cargo add shove --features inmemory
+
 # Optional built-in audit publisher
 cargo add shove --features rabbitmq,audit
 ```
 
-| Feature | What it enables |
-|---|---|
-| `rabbitmq` | RabbitMQ publisher, consumer, topology declaration, consumer groups, autoscaling |
-| `rabbitmq-transactional` | RabbitMQ exactly-once routing via AMQP transactions |
-| `pub-aws-sns` | SNS publisher and topology declaration |
-| `aws-sns-sqs` | Full SNS + SQS publisher/consumer stack, consumer groups, autoscaling |
+| Feature | What it enables                                                                        |
+|---|----------------------------------------------------------------------------------------|
+| `rabbitmq` | RabbitMQ publisher, consumer, topology declaration, consumer groups, autoscaling       |
+| `rabbitmq-transactional` | RabbitMQ exactly-once routing via AMQP transactions                                    |
+| `pub-aws-sns` | SNS publisher and topology declaration                                                 |
+| `aws-sns-sqs` | Full SNS + SQS publisher/consumer stack, consumer groups, autoscaling                  |
 | `nats` | NATS JetStream publisher, consumer, topology declaration, consumer groups, autoscaling |
-| `kafka` | Kafka publisher, consumer, topology declaration, consumer groups, autoscaling |
-| `audit` | Built-in `ShoveAuditHandler` and `AuditLog` topic |
+| `kafka` | Kafka publisher, consumer, topology declaration, consumer groups, autoscaling          |
+| `inmemory` | In-memory broker — publisher, consumer, topology, consumer groups, autoscaling         |
+| `audit` | Built-in `ShoveAuditHandler` and `AuditLog` topic                                      |
 
 ## Quick start
 
-For RabbitMQ, the repo's `docker-compose.yml` starts a local broker with the consistent-hash exchange plugin enabled. For the AWS path, it starts LocalStack with SNS and SQS on `http://localhost:4566`. For NATS, it starts a JetStream-enabled server on `localhost:4222`. For Kafka, it starts a broker on `localhost:9092`.
+The repo's `docker-compose.yml` starts every broker needed below: RabbitMQ with the consistent-hash plugin, LocalStack (SNS + SQS on `http://localhost:4566`), NATS JetStream on `localhost:4222`, and Kafka on `localhost:9092`. The `inmemory` backend needs nothing.
 
 ```sh
 docker compose up -d
 ```
 
-Define a topic once:
+Define the topic and handler once — this is identical across every backend:
 
 ```rust,no_run
 use serde::{Deserialize, Serialize};
@@ -93,30 +155,6 @@ define_topic!(
         .dlq()
         .build()
 );
-```
-
-Publish:
-
-```rust,no_run
-use shove::rabbitmq::*;
-
-let client = RabbitMqClient::connect(&RabbitMqConfig::new("amqp://localhost")).await?;
-let publisher = RabbitMqPublisher::new(client.clone()).await?;
-
-publisher
-    .publish::<OrderSettlement>(&SettlementEvent {
-        order_id: "ORD-1".into(),
-        amount_cents: 5000,
-    })
-    .await?;
-```
-
-Consume:
-
-```rust,no_run
-use shove::rabbitmq::*;
-use shove::*;
-use tokio_util::sync::CancellationToken;
 
 struct SettlementHandler;
 
@@ -129,25 +167,43 @@ impl MessageHandler<OrderSettlement> for SettlementHandler {
         }
     }
 }
+```
 
+Then pick the transport:
+
+<details>
+<summary><strong>RabbitMQ</strong></summary>
+
+```rust,no_run
+use shove::rabbitmq::*;
+use tokio_util::sync::CancellationToken;
+
+let client = RabbitMqClient::connect(&RabbitMqConfig::new("amqp://localhost")).await?;
+
+// Publish
+let publisher = RabbitMqPublisher::new(client.clone()).await?;
+publisher.publish::<OrderSettlement>(&event).await?;
+
+// Consume
 let shutdown = CancellationToken::new();
 let consumer = RabbitMqConsumer::new(client);
 let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
-
 consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
 ```
 
-Publish (SNS):
+</details>
+
+<details>
+<summary><strong>AWS SNS + SQS</strong></summary>
 
 ```rust,no_run
 use shove::sns::*;
 use std::sync::Arc;
 
-let config = SnsConfig {
+let client = SnsClient::new(&SnsConfig {
     region: Some("us-east-1".into()),
     endpoint_url: Some("http://localhost:4566".into()), // omit for real AWS
-};
-let client = SnsClient::new(&config).await?;
+}).await?;
 
 let topic_registry = Arc::new(TopicRegistry::new());
 let queue_registry = Arc::new(QueueRegistry::new());
@@ -156,88 +212,81 @@ let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
     .with_queue_registry(queue_registry.clone());
 declare_topic::<OrderSettlement>(&declarer).await?;
 
-let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
-publisher
-    .publish::<OrderSettlement>(&SettlementEvent {
-        order_id: "ORD-1".into(),
-        amount_cents: 5000,
-    })
-    .await?;
+// Publish
+let publisher = SnsPublisher::new(client.clone(), topic_registry);
+publisher.publish::<OrderSettlement>(&event).await?;
+
+// Consume
+let consumer = SqsConsumer::new(client, queue_registry);
+consumer.run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
 ```
 
-Consume (SQS):
+</details>
 
-```rust,no_run
-use shove::sns::*;
-
-let consumer = SqsConsumer::new(client.clone(), queue_registry.clone());
-let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
-consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
-```
-
-Publish (NATS):
+<details>
+<summary><strong>NATS JetStream</strong></summary>
 
 ```rust,no_run
 use shove::nats::*;
-use shove::publisher::Publisher;
-use shove::topology::TopologyDeclarer;
 
 let client = NatsClient::connect(&NatsConfig::new("nats://localhost:4222")).await?;
+NatsTopologyDeclarer::new(client.clone())
+    .declare(OrderSettlement::topology()).await?;
 
-let declarer = NatsTopologyDeclarer::new(client.clone());
-declarer.declare(OrderSettlement::topology()).await?;
+// Publish
+NatsPublisher::new(client.clone()).await?
+    .publish::<OrderSettlement>(&event).await?;
 
-let publisher = NatsPublisher::new(client.clone()).await?;
-publisher
-    .publish::<OrderSettlement>(&SettlementEvent {
-        order_id: "ORD-1".into(),
-        amount_cents: 5000,
-    })
-    .await?;
+// Consume
+NatsConsumer::new(client)
+    .run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
 ```
 
-Consume (NATS):
+</details>
 
-```rust,no_run
-use shove::nats::*;
-use shove::consumer::{Consumer, ConsumerOptions};
-
-let consumer = NatsConsumer::new(client.clone());
-let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
-consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
-```
-
-Publish (Kafka):
+<details>
+<summary><strong>Apache Kafka</strong></summary>
 
 ```rust,no_run
 use shove::kafka::*;
-use shove::publisher::Publisher;
-use shove::topology::TopologyDeclarer;
 
 let client = KafkaClient::connect(&KafkaConfig::new("localhost:9092")).await?;
+KafkaTopologyDeclarer::new(client.clone())
+    .declare(OrderSettlement::topology()).await?;
 
-let declarer = KafkaTopologyDeclarer::new(client.clone());
-declarer.declare(OrderSettlement::topology()).await?;
+// Publish
+KafkaPublisher::new(client.clone()).await?
+    .publish::<OrderSettlement>(&event).await?;
 
-let publisher = KafkaPublisher::new(client.clone()).await?;
-publisher
-    .publish::<OrderSettlement>(&SettlementEvent {
-        order_id: "ORD-1".into(),
-        amount_cents: 5000,
-    })
-    .await?;
+// Consume
+KafkaConsumer::new(client)
+    .run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
 ```
 
-Consume (Kafka):
+</details>
+
+<details>
+<summary><strong>In-process (no broker, no Docker)</strong></summary>
 
 ```rust,no_run
-use shove::kafka::*;
-use shove::consumer::{Consumer, ConsumerOptions};
+use shove::inmemory::*;
 
-let consumer = KafkaConsumer::new(client.clone());
-let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
-consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
+let broker = InMemoryBroker::new();
+InMemoryTopologyDeclarer::new(broker.clone())
+    .declare(OrderSettlement::topology()).await?;
+
+// Publish
+InMemoryPublisher::new(broker.clone())
+    .publish::<OrderSettlement>(&event).await?;
+
+// Consume
+InMemoryConsumer::new(broker)
+    .run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
 ```
+
+Messages live only in the broker process and are dropped on shutdown — use a durable backend for anything production.
+
+</details>
 
 ## Delivery model
 
@@ -345,89 +394,7 @@ let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
 autoscaler.run(shutdown_token).await;
 ```
 
-SNS/SQS uses `SqsConsumerGroupRegistry` and `SqsAutoscaler` with the same configuration shape.
-
-NATS:
-
-```rust,no_run
-use shove::nats::*;
-use shove::autoscaler::AutoscalerConfig;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-
-let client = NatsClient::connect(&NatsConfig::new("nats://localhost:4222")).await?;
-let mut registry = NatsConsumerGroupRegistry::new(client.clone());
-
-registry
-    .register::<WorkQueue, TaskHandler>(
-        NatsConsumerGroupConfig::new(1..=8)
-            .with_prefetch_count(10)
-            .with_max_retries(5)
-            .with_handler_timeout(Duration::from_secs(30))
-            .with_concurrent_processing(true),
-        || TaskHandler,
-    )
-    .await?;
-
-registry.start_all();
-
-let registry = Arc::new(Mutex::new(registry));
-
-let mut autoscaler = NatsAutoscalerBackend::autoscaler(
-    client.clone(),
-    registry.clone(),
-    AutoscalerConfig {
-        poll_interval: Duration::from_secs(2),
-        scale_up_multiplier: 1.5,
-        scale_down_multiplier: 0.3,
-        hysteresis_duration: Duration::from_secs(4),
-        cooldown_duration: Duration::from_secs(8),
-    },
-);
-autoscaler.run(shutdown_token).await;
-```
-
-Kafka:
-
-```rust,no_run
-use shove::kafka::*;
-use shove::autoscaler::AutoscalerConfig;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-
-let client = KafkaClient::connect(&KafkaConfig::new("localhost:9092")).await?;
-let mut registry = KafkaConsumerGroupRegistry::new(client.clone());
-
-registry
-    .register::<WorkQueue, TaskHandler>(
-        KafkaConsumerGroupConfig::new(1..=8)
-            .with_prefetch_count(10)
-            .with_max_retries(5)
-            .with_handler_timeout(Duration::from_secs(30))
-            .with_concurrent_processing(true),
-        || TaskHandler,
-    )
-    .await?;
-
-registry.start_all();
-
-let registry = Arc::new(Mutex::new(registry));
-
-let mut autoscaler = KafkaAutoscalerBackend::autoscaler(
-    client.clone(),
-    registry.clone(),
-    AutoscalerConfig {
-        poll_interval: Duration::from_secs(2),
-        scale_up_multiplier: 1.5,
-        scale_down_multiplier: 0.3,
-        hysteresis_duration: Duration::from_secs(4),
-        cooldown_duration: Duration::from_secs(8),
-    },
-);
-autoscaler.run(shutdown_token).await;
-```
+Every other backend has an identical shape — swap `ConsumerGroupRegistry` / `RabbitMqAutoscalerBackend` for `SqsConsumerGroupRegistry` / `SqsAutoscalerBackend`, `NatsConsumerGroupRegistry` / `NatsAutoscalerBackend`, `KafkaConsumerGroupRegistry` / `KafkaAutoscalerBackend`, or `InMemoryConsumerGroupRegistry` / `InMemoryAutoscalerBackend`. Config constructors (`NatsConsumerGroupConfig::new`, `KafkaConsumerGroupConfig::new`, …) carry the same builder methods.
 
 ## Audit logging
 
@@ -479,85 +446,34 @@ Measured on a MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91. Re
 
 ## Examples
 
-RabbitMQ examples:
-
-- `rabbitmq_basic_pubsub`
-- `rabbitmq_concurrent_pubsub`
-- `rabbitmq_sequenced_pubsub`
-- `rabbitmq_consumer_groups`
-- `rabbitmq_audited_consumer`
-- `rabbitmq_exactly_once`
-- `rabbitmq_stress`
-
-SNS/SQS examples:
-
-- `sqs_basic_pubsub`
-- `sqs_concurrent_pubsub`
-- `sqs_sequenced_pubsub`
-- `sqs_consumer_groups`
-- `sqs_audited_consumer`
-- `sqs_autoscaler`
-- `sqs_stress`
-
-NATS examples:
-
-- `nats_basic`
-- `nats_sequenced`
-- `nats_audited_consumer`
-- `nats_stress`
-
-Kafka examples:
-
-- `kafka_basic`
-- `kafka_sequenced`
-- `kafka_audited_consumer`
-- `kafka_stress`
-
-Run them with:
+Run any with `cargo run --example <name> --features <flag>`:
 
 ```sh
-cargo run --example rabbitmq_basic_pubsub --features rabbitmq
+cargo run --example inmemory_basic --features inmemory
 cargo run --example rabbitmq_exactly_once --features rabbitmq-transactional
-cargo run --example sqs_basic_pubsub --features aws-sns-sqs
-cargo run --example sqs_autoscaler --features aws-sns-sqs
-cargo run --example nats_basic --features nats
-cargo run --example nats_sequenced --features nats
-cargo run --example kafka_basic --features kafka
-cargo run --example kafka_sequenced --features kafka
 ```
 
-## Reference
+| Backend         | Feature flag              | Examples |
+|-----------------|---------------------------|----------|
+| RabbitMQ        | `rabbitmq`                | `rabbitmq_basic_pubsub`, `rabbitmq_concurrent_pubsub`, `rabbitmq_sequenced_pubsub`, `rabbitmq_consumer_groups`, `rabbitmq_audited_consumer`, `rabbitmq_stress` |
+| RabbitMQ (tx)   | `rabbitmq-transactional`  | `rabbitmq_exactly_once` |
+| AWS SNS/SQS     | `aws-sns-sqs`             | `sqs_basic_pubsub`, `sqs_concurrent_pubsub`, `sqs_sequenced_pubsub`, `sqs_consumer_groups`, `sqs_audited_consumer`, `sqs_autoscaler`, `sqs_stress` |
+| NATS JetStream  | `nats`                    | `nats_basic`, `nats_sequenced`, `nats_audited_consumer`, `nats_stress` |
+| Apache Kafka    | `kafka`                   | `kafka_basic`, `kafka_sequenced`, `kafka_audited_consumer`, `kafka_stress` |
+| In-process      | `inmemory`                | `inmemory_basic`, `inmemory_sequenced`, `inmemory_consumer_groups`, `inmemory_audited_consumer`, `inmemory_stress` |
 
-### Outcome variants
+The `audit` feature is required on top of the backend flag for any `*_audited_consumer` example.
 
-| Variant        | Behavior |
-|----------------|----------|
-| `Outcome::Ack`    | Success — remove from queue |
-| `Outcome::Retry`  | Transient failure — route to hold queue with escalating backoff, increment retry counter. Also triggered when `handler_timeout` is exceeded |
-| `Outcome::Reject` | Permanent failure — route to DLQ (or discard if no DLQ configured) |
-| `Outcome::Defer`  | Re-deliver via hold queue without incrementing retry counter |
+## API reference
 
-### TopologyBuilder
+Full rustdoc is on [docs.rs/shove](https://docs.rs/shove):
 
-| Method | Effect |
-|--------|--------|
-| `.hold_queue(duration)` | Adds a hold queue for delayed retry (`{name}-hold-{secs}s`) |
-| `.sequenced(policy)` | Enables strict per-key ordering via consistent-hash exchange |
-| `.routing_shards(n)` | Sets the number of sub-queues for sequenced delivery (default: 8) |
-| `.dlq()` | Adds a dead-letter queue (`{name}-dlq`) |
+- [`Outcome`](https://docs.rs/shove/latest/shove/enum.Outcome.html) — what a handler returns (`Ack`, `Retry`, `Reject`, `Defer`)
+- [`TopologyBuilder`](https://docs.rs/shove/latest/shove/struct.TopologyBuilder.html) — `.hold_queue`, `.sequenced`, `.routing_shards`, `.dlq`
+- [`ConsumerOptions`](https://docs.rs/shove/latest/shove/struct.ConsumerOptions.html), [`MessageHandler`](https://docs.rs/shove/latest/shove/trait.MessageHandler.html), [`Publisher`](https://docs.rs/shove/latest/shove/trait.Publisher.html)
+- Per-backend modules: [`rabbitmq`](https://docs.rs/shove/latest/shove/rabbitmq/), [`sns`](https://docs.rs/shove/latest/shove/sns/), [`nats`](https://docs.rs/shove/latest/shove/nats/), [`kafka`](https://docs.rs/shove/latest/shove/kafka/), [`inmemory`](https://docs.rs/shove/latest/shove/inmemory/)
 
-### Backends
-
-| Backend | Feature flag | Status |
-|---------|-------------|--------|
-| RabbitMQ | `rabbitmq` | Stable |
-| RabbitMQ (exactly-once routing) | `rabbitmq-transactional` | Stable |
-| AWS SNS (publisher only) | `pub-aws-sns` | Stable |
-| AWS SNS + SQS | `aws-sns-sqs` | Stable |
-| NATS JetStream | `nats` | Stable |
-| Apache Kafka | `kafka` | Stable |
-
-`aws-sns-sqs` implies `pub-aws-sns`. Sequenced topics use SNS FIFO topics with `MessageGroupId` and sharded FIFO SQS queues. NATS uses subject-based shard routing with per-shard `max_ack_pending: 1`. Kafka uses partition-key routing for sequenced delivery and consumer lag for autoscaling.
+Backend-specific sequenced-delivery mapping: RabbitMQ uses a consistent-hash exchange with SAC shards. SNS/SQS uses FIFO topics + `MessageGroupId`. NATS uses subject-based shard routing with `max_ack_pending: 1`. Kafka uses partition-key routing. In-process uses per-key FIFO shards (ordering enforced in-memory, no persistence, no cross-process delivery).
 
 ## Requirements
 
