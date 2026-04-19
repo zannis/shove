@@ -38,7 +38,7 @@ struct Msg {
     id: u64,
 }
 
-shove::define_topic!(BenchTopic, Msg, TopologyBuilder::new("bench").dlq().build());
+define_topic!(BenchTopic, Msg, TopologyBuilder::new("bench").dlq().build());
 
 #[derive(Clone)]
 struct LatencyHandler {

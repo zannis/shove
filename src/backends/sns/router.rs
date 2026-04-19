@@ -377,7 +377,7 @@ mod tests {
 
         let hqs = topology.hold_queues();
         // retry_count 0 → hold_queues[0] = 5s
-        assert_eq!(hqs[0.min(hqs.len() - 1)].delay(), Duration::from_secs(5));
+        assert_eq!(hqs[0].delay(), Duration::from_secs(5));
         // retry_count 1 → hold_queues[1] = 30s
         assert_eq!(hqs[1.min(hqs.len() - 1)].delay(), Duration::from_secs(30));
         // retry_count 2 → hold_queues[2] = 120s

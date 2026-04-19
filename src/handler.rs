@@ -75,7 +75,7 @@ mod tests {
     }
 
     struct TestTopic;
-    impl crate::topic::Topic for TestTopic {
+    impl Topic for TestTopic {
         type Message = TestMessage;
         fn topology() -> &'static QueueTopology {
             static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();

@@ -87,6 +87,22 @@ pub mod kafka {
     };
 }
 
+/// In-process, non-durable broker backend.
+///
+/// Messages live only in this process, are not persisted, and are dropped on
+/// shutdown. Suitable for tests and single-process apps; use another backend
+/// (RabbitMQ, Kafka, NATS, SNS/SQS) for production workloads that require
+/// durability or cross-process delivery.
+#[cfg(feature = "inmemory")]
+pub mod inmemory {
+    pub use crate::backends::inmemory::{
+        BrokerStatsProvider, DEFAULT_QUEUE_CAPACITY, InMemoryAutoscalerBackend, InMemoryBroker,
+        InMemoryConfig, InMemoryConsumer, InMemoryConsumerGroup, InMemoryConsumerGroupConfig,
+        InMemoryConsumerGroupRegistry, InMemoryPublisher, InMemoryQueueStats,
+        InMemoryQueueStatsProvider, InMemoryTopologyDeclarer,
+    };
+}
+
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq {
     pub use crate::backends::rabbitmq::{

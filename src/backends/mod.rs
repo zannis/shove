@@ -9,3 +9,6 @@ pub mod nats;
 
 #[cfg(feature = "kafka")]
 pub mod kafka;
+
+#[cfg(feature = "inmemory")]
+pub mod inmemory;
