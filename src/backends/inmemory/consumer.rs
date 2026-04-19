@@ -602,14 +602,10 @@ fn schedule_redelivery(
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = broker_shutdown.cancelled() => {
-                let message_id = env
-                    .headers
-                    .get(X_MESSAGE_ID)
-                    .cloned()
-                    .unwrap_or_default();
+                let message_id = env.headers.get(X_MESSAGE_ID).map(String::as_str).unwrap_or("");
                 tracing::warn!(
                     queue = %main_queue,
-                    message_id = %message_id,
+                    %message_id,
                     "broker shutdown cancelled a pending redelivery — message dropped"
                 );
                 return;
