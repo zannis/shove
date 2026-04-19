@@ -1,6 +1,7 @@
 //! Consumer supervisor harness and its outcome type. See DESIGN_V2.md §6.5.
 
 /// Result of draining a supervisor or consumer group.
+#[must_use]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SupervisorOutcome {
     pub errors: usize,
@@ -23,6 +24,7 @@ impl SupervisorOutcome {
         }
     }
 
+    /// True when no errors, panics, or drain timeouts were recorded.
     pub fn is_clean(&self) -> bool {
         self.exit_code() == 0
     }
