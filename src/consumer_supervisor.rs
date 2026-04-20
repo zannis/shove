@@ -1,5 +1,16 @@
 //! Consumer supervisor harness and its outcome type. See DESIGN_V2.md §6.5.
 
+use std::time::Duration;
+
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+
+use crate::backend::{Backend, ConsumerImpl};
+use crate::consumer::ConsumerOptions;
+use crate::error::Result;
+use crate::handler::MessageHandler;
+use crate::topic::Topic;
+
 /// Result of draining a supervisor or consumer group.
 #[must_use]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -68,5 +79,121 @@ mod tests {
             timed_out: true,
         };
         assert_eq!(o.exit_code(), 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConsumerSupervisor<B, Ctx>
+// ---------------------------------------------------------------------------
+
+pub struct ConsumerSupervisor<B: Backend, Ctx: Clone + Send + Sync + 'static = ()> {
+    consumer: B::ConsumerImpl,
+    // Phase 12 injects `ctx` into handler calls once `ConsumerImpl::run`
+    // relaxes its `Context = ()` bound. Until then the field is stored but
+    // unused.
+    #[allow(dead_code)]
+    ctx: Ctx,
+    shutdown: CancellationToken,
+    tasks: JoinSet<Result<()>>,
+}
+
+impl<B: Backend> ConsumerSupervisor<B, ()> {
+    pub(crate) fn new(client: &B::Client) -> Self {
+        Self {
+            consumer: B::make_consumer(client),
+            ctx: (),
+            shutdown: CancellationToken::new(),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    pub fn with_context<Ctx: Clone + Send + Sync + 'static>(
+        self,
+        ctx: Ctx,
+    ) -> ConsumerSupervisor<B, Ctx> {
+        ConsumerSupervisor {
+            consumer: self.consumer,
+            ctx,
+            shutdown: self.shutdown,
+            tasks: self.tasks,
+        }
+    }
+}
+
+impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> {
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    pub fn register<T, H>(&mut self, handler: H, options: ConsumerOptions) -> Result<()>
+    where
+        T: Topic,
+        // TODO(phase-12): relax to Context = Ctx once all backend ConsumerImpl
+        // impls accept non-() context.
+        H: MessageHandler<T, Context = ()>,
+    {
+        let consumer = self.consumer.clone();
+        let inner = options
+            .with_shutdown_token(self.shutdown.clone())
+            .into_inner();
+        self.tasks.spawn(async move {
+            consumer.run::<T, H>(handler, (), inner).await
+        });
+        Ok(())
+    }
+
+    pub async fn run_until_timeout<S>(
+        mut self,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        S: Future<Output = ()> + Send,
+    {
+        tokio::select! {
+            _ = signal => { self.shutdown.cancel(); }
+            _ = self.shutdown.cancelled() => {}
+        }
+
+        let drain = async {
+            let mut errors = 0usize;
+            let mut panics = 0usize;
+            while let Some(res) = self.tasks.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "consumer task failed");
+                        errors += 1;
+                    }
+                    Err(e) if e.is_cancelled() => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "consumer task panicked");
+                        panics += 1;
+                    }
+                }
+            }
+            SupervisorOutcome {
+                errors,
+                panics,
+                timed_out: false,
+            }
+        };
+
+        match tokio::time::timeout(drain_timeout, drain).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving tasks"
+                );
+                self.tasks.abort_all();
+                while self.tasks.join_next().await.is_some() {}
+                SupervisorOutcome {
+                    errors: 0,
+                    panics: 0,
+                    timed_out: true,
+                }
+            }
+        }
     }
 }

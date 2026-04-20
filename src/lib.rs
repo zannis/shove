@@ -2,7 +2,9 @@ pub mod audit;
 pub mod autoscale_metrics;
 pub mod autoscaler;
 pub mod backend;
+pub mod broker;
 pub mod consumer;
+pub mod consumer_group;
 pub mod consumer_supervisor;
 pub mod error;
 pub mod handler;
@@ -12,8 +14,10 @@ pub mod markers;
 pub mod metadata;
 pub mod outcome;
 pub mod publisher;
+pub mod publisher_wrapper;
 pub mod topic;
 pub mod topology;
+pub mod topology_declarer;
 
 mod backends;
 pub(crate) mod retry;
@@ -25,7 +29,7 @@ pub use consumer::{
     Consumer, ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE,
     DEFAULT_MAX_PENDING_PER_KEY,
 };
-pub use consumer_supervisor::SupervisorOutcome;
+pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::ShoveError;
 pub use handler::MessageHandler;
 pub use metadata::{DeadMessageMetadata, MessageMetadata};
@@ -43,6 +47,12 @@ pub use autoscaler::{
     Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics,
     ScalingStrategy, Stabilized, ThresholdStrategy,
 };
+
+// --- v2 generic wrappers (Phase 5) ---
+pub use broker::Broker;
+pub use consumer_group::{ConsumerGroup, ConsumerGroupConfig};
+pub use publisher_wrapper::Publisher as PublisherV2; // temporary name to avoid clash with old trait
+pub use topology_declarer::{Topics, TopologyDeclarer as TopologyDeclarerV2}; // temporary name
 
 #[cfg(feature = "inmemory")]
 pub use markers::InMemory;

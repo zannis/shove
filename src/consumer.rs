@@ -205,6 +205,32 @@ impl ConsumerOptions {
         validate_message_size(len, self.max_message_size)
     }
 
+    /// Attach an external shutdown token. Harnesses call this during `.register()`.
+    pub(crate) fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    /// Lower to the internal options struct for passing across the Backend trait boundary.
+    pub(crate) fn into_inner(self) -> crate::backend::ConsumerOptionsInner {
+        crate::backend::ConsumerOptionsInner {
+            max_retries: self.max_retries,
+            prefetch_count: self.prefetch_count,
+            concurrent_processing: true, // Phase 12 adds the field to ConsumerOptions
+            handler_timeout: self.handler_timeout,
+            max_pending_per_key: self.max_pending_per_key,
+            max_message_size: self.max_message_size,
+            shutdown: self.shutdown.clone(),
+            processing: self.processing.clone(),
+            #[cfg(feature = "rabbitmq-transactional")]
+            exactly_once: self.exactly_once,
+            #[cfg(feature = "aws-sns-sqs")]
+            receive_batch_size: self.receive_batch_size,
+            #[cfg(feature = "nats")]
+            max_ack_pending: self.max_ack_pending,
+        }
+    }
+
     /// Enable exactly-once delivery via AMQP transactions.
     ///
     /// Requires the `rabbitmq-transactional` Cargo feature. See
