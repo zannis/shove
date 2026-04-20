@@ -1,0 +1,27 @@
+examples/common/stress_test.rs
+  a7e66bb650d7c23d 20,544-547,552,557-558,560-569,599-602,606,647-648,652-653,668-670,675,680-681,683-692,719-722,726,767-768,772-773,982-989,991,996-997,1036,1054-1056,1058,1063-1064,1103
+src/backend/capability.rs
+  a7e66bb650d7c23d 21
+src/consumer_group.rs
+  a7e66bb650d7c23d 50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "86044b907fac7053bb82d77d396d279d68eab7ef",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 253,
+      "total_deletions": 702,
+      "accepted_lines": 25228,
+      "overriden_lines": 0
+    }
+  }
+}
