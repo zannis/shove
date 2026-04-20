@@ -116,6 +116,12 @@ mod bounds_smoke {
         _require_has_coordinated_groups::<crate::markers::Nats>();
     }
 
+    #[cfg(feature = "rabbitmq")]
+    fn _anchor_rabbitmq() {
+        _require_backend::<crate::markers::RabbitMq>();
+        _require_has_coordinated_groups::<crate::markers::RabbitMq>();
+    }
+
     // Per-method anchoring: exercise every internal trait method once
     // against a concrete implementor so the methods aren't flagged as
     // `dead_code` before Phase 5+ wires the generic wrappers. These

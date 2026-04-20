@@ -42,7 +42,7 @@ impl ConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -87,6 +87,14 @@ impl ConsumerGroupRegistry {
     /// Mutable access to the underlying group map.
     pub fn groups_mut(&mut self) -> &mut HashMap<String, ConsumerGroup> {
         &mut self.groups
+    }
+
+    /// Return a clone of the client's shutdown token.
+    ///
+    /// Used by `RegistryImpl::cancellation_token` to surface a
+    /// backend-independent shutdown signal.
+    pub fn client_shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.client.shutdown_token()
     }
 
     /// Shut down every consumer group and wait for all tasks to complete.

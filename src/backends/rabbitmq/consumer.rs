@@ -143,6 +143,7 @@ enum KeyState {
 // RabbitMqConsumer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct RabbitMqConsumer {
     client: RabbitMqClient,
 }

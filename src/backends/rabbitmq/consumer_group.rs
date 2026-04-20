@@ -23,6 +23,7 @@ use crate::topic::Topic;
 type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
 /// Configuration that governs the behaviour of a [`ConsumerGroup`].
+#[derive(Clone)]
 pub struct ConsumerGroupConfig {
     pub(crate) prefetch_count: u16,
     pub(crate) min_consumers: u16,
@@ -129,6 +130,12 @@ impl ConsumerGroupConfig {
     }
 }
 
+impl Default for ConsumerGroupConfig {
+    fn default() -> Self {
+        Self::new(1..=4)
+    }
+}
+
 /// A named group of identical consumers all reading from the same queue.
 ///
 /// The group owns the concrete consumers and is responsible for scaling them
@@ -168,7 +175,7 @@ impl ConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let concurrent = config.concurrent_processing;
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
