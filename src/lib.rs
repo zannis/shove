@@ -208,6 +208,8 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 #[cfg_attr(docsrs, doc(cfg(feature = "pub-aws-sns")))]
 pub mod sns {
     pub use crate::backends::sns::client::SnsConfig;
+    #[cfg(feature = "aws-sns-sqs")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
     pub use crate::markers::Sqs;
 
     // Kept pub because `tests/sns_integration.rs` and `tests/sns_sqs_integration.rs`
