@@ -148,7 +148,7 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         drain_timeout: Duration,
     ) -> SupervisorOutcome
     where
-        S: Future<Output = ()> + Send,
+        S: Future<Output = ()> + Send + 'static,
     {
         tokio::select! {
             _ = signal => { self.shutdown.cancel(); }

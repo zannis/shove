@@ -47,8 +47,9 @@ async fn broker_consumer_supervisor_runs_empty() {
     // No handlers registered -- run_until_timeout should return immediately when signal fires.
     let token = supervisor.cancellation_token();
     token.cancel(); // fire immediately
+    let signal = token.clone().cancelled_owned();
     let outcome = supervisor
-        .run_until_timeout(token.cancelled(), Duration::from_secs(1))
+        .run_until_timeout(signal, Duration::from_secs(1))
         .await;
     assert!(outcome.is_clean());
     broker.close().await;
