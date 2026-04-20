@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::consumer::ConsumerOptions;
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -1376,6 +1376,14 @@ impl SqsConsumer {
     pub fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
+        options: crate::ConsumerOptions<crate::markers::Sqs>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.run_with_inner::<T>(handler, options.into_inner())
+    }
+
+    pub(crate) fn run_with_inner<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> impl Future<Output = Result<()>> + Send {
         let client = self.client.clone();
@@ -1395,6 +1403,14 @@ impl SqsConsumer {
     }
 
     pub fn run_fifo<T: SequencedTopic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
+        options: crate::ConsumerOptions<crate::markers::Sqs>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.run_fifo_with_inner::<T>(handler, options.into_inner())
+    }
+
+    pub(crate) fn run_fifo_with_inner<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,

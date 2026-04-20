@@ -8,9 +8,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner;
 use crate::consumer::{
-    ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE,
-    DEFAULT_MAX_PENDING_PER_KEY,
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -20,7 +20,7 @@ use super::client::InMemoryBroker;
 use super::consumer::InMemoryConsumer;
 use super::topology::InMemoryTopologyDeclarer;
 
-pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
+pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptionsInner) -> JoinHandle<()> + Send + Sync>;
 
 /// Configuration for an [`InMemoryConsumerGroup`].
 #[derive(Clone)]
@@ -157,11 +157,11 @@ impl InMemoryConsumerGroup {
         T: Topic + 'static,
         H: MessageHandler<T, Context = ()> + 'static,
     {
-        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptionsInner| {
             let handler = handler_factory();
             let consumer = InMemoryConsumer::new(broker.clone());
             tokio::spawn(async move {
-                if let Err(e) = consumer.run::<T>(handler, options).await {
+                if let Err(e) = consumer.run_with_inner::<T>(handler, options).await {
                     tracing::error!("in-memory consumer task exited with error: {e}");
                 }
             })
@@ -259,24 +259,12 @@ impl InMemoryConsumerGroup {
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
         let processing = Arc::new(AtomicBool::new(false));
-        let mut options = ConsumerOptions::new(child_token.clone())
-            .with_max_retries(self.config.max_retries)
-            .with_prefetch_count(self.config.prefetch_count);
-        if let Some(timeout) = self.config.handler_timeout {
-            options = options.with_handler_timeout(timeout);
-        } else {
-            options = options.without_handler_timeout();
-        }
-        if let Some(max) = self.config.max_message_size {
-            options = options.with_max_message_size(max);
-        } else {
-            options = options.without_message_size_limit();
-        }
-        if let Some(limit) = self.config.max_pending_per_key {
-            options = options.with_max_pending_per_key(limit);
-        } else {
-            options = options.without_max_pending_per_key();
-        }
+        let mut options = ConsumerOptionsInner::defaults_with_shutdown(child_token.clone());
+        options.max_retries = self.config.max_retries;
+        options.prefetch_count = self.config.prefetch_count;
+        options.handler_timeout = self.config.handler_timeout;
+        options.max_message_size = self.config.max_message_size;
+        options.max_pending_per_key = self.config.max_pending_per_key;
         options.processing = processing.clone();
 
         let handle = (self.spawner)(options);
@@ -399,7 +387,7 @@ mod tests {
 
     fn test_group(config: InMemoryConsumerGroupConfig) -> InMemoryConsumerGroup {
         let group_token = CancellationToken::new();
-        let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
+        let spawner: Spawner = Arc::new(|options: ConsumerOptionsInner| {
             tokio::spawn(async move {
                 options.shutdown.cancelled().await;
             })

@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
-use crate::consumer::ConsumerOptions;
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -527,6 +527,14 @@ impl KafkaConsumer {
     pub async fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
+        options: crate::ConsumerOptions<crate::markers::Kafka>,
+    ) -> Result<()> {
+        self.run_with_inner::<T>(handler, options.into_inner()).await
+    }
+
+    pub(crate) async fn run_with_inner<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> Result<()> {
         let topology = T::topology();
@@ -742,6 +750,15 @@ impl KafkaConsumer {
     }
 
     pub async fn run_fifo<T: SequencedTopic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
+        options: crate::ConsumerOptions<crate::markers::Kafka>,
+    ) -> Result<()> {
+        self.run_fifo_with_inner::<T>(handler, options.into_inner())
+            .await
+    }
+
+    pub(crate) async fn run_fifo_with_inner<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,

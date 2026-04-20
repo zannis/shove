@@ -1,9 +1,11 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::backend::Backend;
 use crate::error::{Result, ShoveError};
 
 /// Default maximum message payload size: 10 MiB.
@@ -28,9 +30,14 @@ pub(crate) fn validate_message_size(len: usize, max: Option<usize>) -> Result<()
     }
 }
 
-/// Options for consumer behavior.
-#[derive(Clone)]
-pub struct ConsumerOptions {
+/// Options for consumer behavior, parameterised by backend marker `B`.
+///
+/// Shared knobs (retries, prefetch, timeouts, size limits) live on the generic
+/// struct; backend-specific knobs (`exactly_once` for RabbitMQ,
+/// `receive_batch_size` for SQS, `max_ack_pending` for NATS) are still stored
+/// on the struct but set via feature-gated inherent-impl blocks so users can
+/// only reach them on the appropriate backend.
+pub struct ConsumerOptions<B: Backend> {
     /// Maximum retries before automatically rejecting to DLQ.
     ///
     /// Each time a handler returns [`Outcome::Retry`](crate::Outcome::Retry),
@@ -42,28 +49,13 @@ pub struct ConsumerOptions {
     ///
     /// When `retry_count >= max_retries`, the message is sent to the DLQ
     /// instead of another hold queue.
-    ///
-    /// # Example
-    ///
-    /// With `max_retries = 5` and hold queues `[1s, 5s, 30s]`:
-    ///
-    /// | retry | hold queue | delay |
-    /// |-------|-----------|-------|
-    /// | 0     | `[0]`     | 1s    |
-    /// | 1     | `[1]`     | 5s    |
-    /// | 2     | `[2]`     | 30s   |
-    /// | 3     | `[2]`     | 30s   |
-    /// | 4     | `[2]`     | 30s   |
-    /// | 5     | — DLQ —   |       |
     pub max_retries: u32,
     /// Prefetch count (number of unacked messages the broker will deliver).
     pub prefetch_count: u16,
-    /// Cancellation token for graceful shutdown. When triggered, the consumer
-    /// finishes processing the current message, acks it, and returns `Ok(())`.
-    pub shutdown: CancellationToken,
-    /// Flag that indicates the consumer is currently processing a message.
-    /// Used by the autoscaler to avoid scaling down busy consumers.
-    pub processing: Arc<AtomicBool>,
+    /// Process prefetched messages concurrently vs. one at a time.
+    ///
+    /// `true` by default — matches `ConsumerGroupConfig<B>::with_concurrent_processing`.
+    pub concurrent_processing: bool,
     /// Maximum time a handler may spend processing a single message.
     /// If the handler exceeds this duration the message is retried.
     ///
@@ -83,6 +75,7 @@ pub struct ConsumerOptions {
     /// Default: [`DEFAULT_MAX_MESSAGE_SIZE`] (10 MiB). Set to `None` to
     /// disable the check.
     pub max_message_size: Option<usize>,
+
     /// Enable exactly-once delivery via AMQP transactions (RabbitMQ only).
     ///
     /// Requires the `rabbitmq-transactional` Cargo feature. When enabled, the
@@ -92,43 +85,36 @@ pub struct ConsumerOptions {
     /// **atomic**. This eliminates the publish-then-ack race that can produce a
     /// duplicate delivery under at-least-once semantics.
     ///
-    /// **Trade-off**: AMQP transactions disable publisher confirms and add a
-    /// round-trip per message. Expect roughly 10–15× lower throughput per channel
-    /// compared to the default confirm mode. Use [`ConsumerOptions::with_exactly_once`]
-    /// to opt in.
+    /// Opt in via the feature-gated
+    /// [`ConsumerOptions::<RabbitMq>::with_exactly_once`] builder.
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
     /// Number of messages to request per SQS `ReceiveMessage` poll, independent
     /// of how many handlers may run concurrently (`prefetch_count`).
     ///
-    /// When non-zero, the SQS consumer fetches this many messages per API call
-    /// and buffers them locally, dispatching them to handlers one-by-one (serial
-    /// mode) or in parallel (concurrent mode) up to `prefetch_count` at a time.
-    /// This allows batching SQS receives even in non-concurrent mode, reducing
-    /// API call overhead significantly when multiple consumers share the same queue.
-    ///
     /// Zero means "use `prefetch_count`" (the default).
     #[cfg(feature = "aws-sns-sqs")]
-    pub(crate) receive_batch_size: u16,
+    pub receive_batch_size: u16,
     /// Override for JetStream `max_ack_pending` on the durable consumer.
     ///
-    /// When multiple consumer tasks share a single JetStream durable consumer
-    /// (as in consumer groups), `max_ack_pending` must account for the total
-    /// in-flight capacity across all tasks — not just the per-task prefetch.
     /// `None` means use `prefetch_count` (the default for standalone consumers).
     #[cfg(feature = "nats")]
-    pub(crate) max_ack_pending: Option<i64>,
+    pub max_ack_pending: Option<i64>,
+
+    // Runtime coordination — crate-private.
+    pub(crate) shutdown: Option<CancellationToken>,
+    pub(crate) processing: Arc<AtomicBool>,
+
+    _backend: PhantomData<fn() -> B>,
 }
 
-impl ConsumerOptions {
-    /// Create consumer options with the given shutdown token.
-    /// Uses defaults: `max_retries = 10`, `prefetch_count = 10`.
-    pub fn new(shutdown: CancellationToken) -> Self {
+impl<B: Backend> ConsumerOptions<B> {
+    /// Create consumer options with library-wide defaults.
+    pub fn new() -> Self {
         Self {
             max_retries: 10,
             prefetch_count: 10,
-            shutdown,
-            processing: Arc::new(AtomicBool::new(false)),
+            concurrent_processing: true,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
@@ -138,14 +124,18 @@ impl ConsumerOptions {
             receive_batch_size: 0,
             #[cfg(feature = "nats")]
             max_ack_pending: None,
+            shutdown: None,
+            processing: Arc::new(AtomicBool::new(false)),
+            _backend: PhantomData,
         }
     }
 
+    /// Shorthand for `ConsumerOptions::new().with_prefetch_count(prefetch)`.
+    pub fn preset(prefetch: u16) -> Self {
+        Self::new().with_prefetch_count(prefetch)
+    }
+
     /// Set the maximum number of retries before rejecting to DLQ.
-    ///
-    /// This controls the total retry budget, independent of how many hold
-    /// queues are configured. See [`max_retries`](Self::max_retries) for
-    /// details on how retries escalate through hold queues.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
         self
@@ -154,6 +144,12 @@ impl ConsumerOptions {
     /// Set the prefetch count (number of unacked messages the broker will deliver).
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Process prefetched messages concurrently (`true`) or serially (`false`).
+    pub fn with_concurrent_processing(mut self, on: bool) -> Self {
+        self.concurrent_processing = on;
         self
     }
 
@@ -196,17 +192,20 @@ impl ConsumerOptions {
         self
     }
 
-    /// Returns `Ok(())` if the payload is within the configured
-    /// [`max_message_size`](Self::max_message_size), or an error if it
-    /// exceeds the limit. Always succeeds when no limit is set.
-    pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
-        validate_message_size(len, self.max_message_size)
+    /// Attach a shutdown token. Supervisors/groups call this at `.register()`
+    /// time so application code does not have to thread tokens manually.
+    /// Direct `consumer.run()` call sites (primarily tests that bypass the
+    /// supervisor) may use this explicitly.
+    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
-    /// Attach an external shutdown token. Harnesses call this during `.register()`.
-    pub(crate) fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {
-        self.shutdown = shutdown;
-        self
+    /// Clone of the internal "is currently processing" flag. Primarily useful
+    /// for tests that want to block until a consumer starts handling a
+    /// message; production code observes this through the autoscaler.
+    pub fn processing_handle(&self) -> Arc<AtomicBool> {
+        self.processing.clone()
     }
 
     /// Lower to the internal options struct for passing across the Backend trait boundary.
@@ -214,12 +213,12 @@ impl ConsumerOptions {
         crate::backend::ConsumerOptionsInner {
             max_retries: self.max_retries,
             prefetch_count: self.prefetch_count,
-            concurrent_processing: true, // Phase 12 adds the field to ConsumerOptions
+            concurrent_processing: self.concurrent_processing,
             handler_timeout: self.handler_timeout,
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
-            shutdown: self.shutdown.clone(),
-            processing: self.processing.clone(),
+            shutdown: self.shutdown.unwrap_or_else(CancellationToken::new),
+            processing: self.processing,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]
@@ -228,18 +227,63 @@ impl ConsumerOptions {
             max_ack_pending: self.max_ack_pending,
         }
     }
+}
 
+impl<B: Backend> Default for ConsumerOptions<B> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<B: Backend> Clone for ConsumerOptions<B> {
+    fn clone(&self) -> Self {
+        Self {
+            max_retries: self.max_retries,
+            prefetch_count: self.prefetch_count,
+            concurrent_processing: self.concurrent_processing,
+            handler_timeout: self.handler_timeout,
+            max_pending_per_key: self.max_pending_per_key,
+            max_message_size: self.max_message_size,
+            #[cfg(feature = "rabbitmq-transactional")]
+            exactly_once: self.exactly_once,
+            #[cfg(feature = "aws-sns-sqs")]
+            receive_batch_size: self.receive_batch_size,
+            #[cfg(feature = "nats")]
+            max_ack_pending: self.max_ack_pending,
+            shutdown: self.shutdown.clone(),
+            processing: self.processing.clone(),
+            _backend: PhantomData,
+        }
+    }
+}
+
+// -- Backend-specific builders ---------------------------------------------
+
+#[cfg(feature = "aws-sns-sqs")]
+impl ConsumerOptions<crate::markers::Sqs> {
+    /// Number of messages requested per SQS `ReceiveMessage` poll.
+    ///
+    /// Zero (the default) means "use `prefetch_count`".
+    pub fn with_receive_batch_size(mut self, n: u16) -> Self {
+        self.receive_batch_size = n;
+        self
+    }
+}
+
+#[cfg(feature = "nats")]
+impl ConsumerOptions<crate::markers::Nats> {
+    /// Override the durable consumer's `max_ack_pending`.
+    pub fn with_max_ack_pending(mut self, n: i64) -> Self {
+        self.max_ack_pending = Some(n);
+        self
+    }
+}
+
+#[cfg(feature = "rabbitmq-transactional")]
+impl ConsumerOptions<crate::markers::RabbitMq> {
     /// Enable exactly-once delivery via AMQP transactions.
     ///
-    /// Requires the `rabbitmq-transactional` Cargo feature. See
-    /// [`ConsumerOptions::exactly_once`] for the full trade-off description.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let options = ConsumerOptions::new(shutdown)
-    ///     .with_exactly_once();
-    /// ```
-    #[cfg(feature = "rabbitmq-transactional")]
+    /// See [`ConsumerOptions::exactly_once`] for the full trade-off description.
     pub fn with_exactly_once(mut self) -> Self {
         self.exactly_once = true;
         self
@@ -250,39 +294,89 @@ impl ConsumerOptions {
 mod tests {
     use super::*;
 
+    // Tests use the InMemory marker when available; otherwise fall back to
+    // any enabled backend marker.
+    #[cfg(feature = "inmemory")]
+    type TestBackend = crate::markers::InMemory;
+
+    #[cfg(all(not(feature = "inmemory"), feature = "kafka"))]
+    type TestBackend = crate::markers::Kafka;
+
+    #[cfg(all(not(feature = "inmemory"), not(feature = "kafka"), feature = "nats"))]
+    type TestBackend = crate::markers::Nats;
+
+    #[cfg(all(
+        not(feature = "inmemory"),
+        not(feature = "kafka"),
+        not(feature = "nats"),
+        feature = "rabbitmq"
+    ))]
+    type TestBackend = crate::markers::RabbitMq;
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn defaults_are_correct() {
-        let opts = ConsumerOptions::new(CancellationToken::new());
+        let opts = ConsumerOptions::<TestBackend>::new();
         assert_eq!(opts.max_retries, 10);
         assert_eq!(opts.prefetch_count, 10);
+        assert!(opts.concurrent_processing);
         assert_eq!(opts.handler_timeout, Some(DEFAULT_HANDLER_TIMEOUT));
         assert_eq!(opts.max_pending_per_key, Some(DEFAULT_MAX_PENDING_PER_KEY));
         assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn with_max_retries_overrides() {
-        let opts = ConsumerOptions::new(CancellationToken::new()).with_max_retries(5);
+        let opts = ConsumerOptions::<TestBackend>::new().with_max_retries(5);
         assert_eq!(opts.max_retries, 5);
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn with_prefetch_count_overrides() {
-        let opts = ConsumerOptions::new(CancellationToken::new()).with_prefetch_count(50);
+        let opts = ConsumerOptions::<TestBackend>::new().with_prefetch_count(50);
         assert_eq!(opts.prefetch_count, 50);
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn with_handler_timeout_sets_timeout() {
-        let opts = ConsumerOptions::new(CancellationToken::new())
-            .with_handler_timeout(Duration::from_secs(30));
+        let opts =
+            ConsumerOptions::<TestBackend>::new().with_handler_timeout(Duration::from_secs(30));
         assert_eq!(opts.handler_timeout, Some(Duration::from_secs(30)));
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn builder_chains() {
-        let opts = ConsumerOptions::new(CancellationToken::new())
+        let opts = ConsumerOptions::<TestBackend>::new()
             .with_max_retries(3)
             .with_prefetch_count(20)
             .with_handler_timeout(Duration::from_secs(5))
@@ -295,52 +389,84 @@ mod tests {
         assert_eq!(opts.max_message_size, Some(5 * 1024 * 1024));
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
-    fn shutdown_token_propagated() {
-        let token = CancellationToken::new();
-        let opts = ConsumerOptions::new(token.clone());
-        assert!(!opts.shutdown.is_cancelled());
-        token.cancel();
-        assert!(opts.shutdown.is_cancelled());
+    fn preset_sets_prefetch() {
+        let opts = ConsumerOptions::<TestBackend>::preset(42);
+        assert_eq!(opts.prefetch_count, 42);
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn concurrent_processing_toggles() {
+        let opts = ConsumerOptions::<TestBackend>::new().with_concurrent_processing(false);
+        assert!(!opts.concurrent_processing);
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn with_max_pending_per_key_sets_value() {
-        let opts = ConsumerOptions::new(CancellationToken::new()).with_max_pending_per_key(50);
+        let opts = ConsumerOptions::<TestBackend>::new().with_max_pending_per_key(50);
         assert_eq!(opts.max_pending_per_key, Some(50));
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn with_max_message_size_overrides_default() {
-        let opts =
-            ConsumerOptions::new(CancellationToken::new()).with_max_message_size(1024 * 1024);
+        let opts = ConsumerOptions::<TestBackend>::new().with_max_message_size(1024 * 1024);
         assert_eq!(opts.max_message_size, Some(1024 * 1024));
     }
 
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
     #[test]
     fn without_message_size_limit_disables_check() {
-        let opts = ConsumerOptions::new(CancellationToken::new()).without_message_size_limit();
+        let opts = ConsumerOptions::<TestBackend>::new().without_message_size_limit();
         assert_eq!(opts.max_message_size, None);
     }
 
     #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn exactly_once_defaults_to_false() {
-        let opts = ConsumerOptions::new(CancellationToken::new());
+        let opts = ConsumerOptions::<crate::markers::RabbitMq>::new();
         assert!(!opts.exactly_once);
     }
 
     #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn with_exactly_once_sets_flag() {
-        let opts = ConsumerOptions::new(CancellationToken::new()).with_exactly_once();
+        let opts = ConsumerOptions::<crate::markers::RabbitMq>::new().with_exactly_once();
         assert!(opts.exactly_once);
     }
 
     #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn exactly_once_chains_with_other_builders() {
-        let opts = ConsumerOptions::new(CancellationToken::new())
+        let opts = ConsumerOptions::<crate::markers::RabbitMq>::new()
             .with_max_retries(5)
             .with_exactly_once()
             .with_prefetch_count(1);

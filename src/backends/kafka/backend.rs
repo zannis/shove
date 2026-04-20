@@ -106,8 +106,7 @@ impl ConsumerImpl for KafkaConsumer {
         T: Topic,
         H: MessageHandler<T, Context = ()>,
     {
-        let options = options.into_consumer_options();
-        KafkaConsumer::run::<T>(self, handler, options).await
+        KafkaConsumer::run_with_inner::<T>(self, handler, options).await
     }
 
     async fn run_fifo<T, H>(
@@ -120,8 +119,7 @@ impl ConsumerImpl for KafkaConsumer {
         T: SequencedTopic,
         H: MessageHandler<T, Context = ()>,
     {
-        let options = options.into_consumer_options();
-        KafkaConsumer::run_fifo::<T>(self, handler, options).await
+        KafkaConsumer::run_fifo_with_inner::<T>(self, handler, options).await
     }
 
     async fn run_dlq<T, H>(&self, handler: H, _ctx: H::Context) -> Result<()>

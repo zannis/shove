@@ -214,7 +214,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::backends::nats::consumer_group::{NatsConsumerGroup, NatsConsumerGroupConfig};
-    use crate::consumer::ConsumerOptions;
+    use crate::backend::ConsumerOptionsInner as ConsumerOptions;
     use tokio_util::sync::CancellationToken;
 
     struct MockNatsStatsProvider {

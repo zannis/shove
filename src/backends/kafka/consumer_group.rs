@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
-use crate::consumer::ConsumerOptions;
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
@@ -156,7 +156,7 @@ impl KafkaConsumerGroup {
             };
 
             tokio::spawn(async move {
-                let result = consumer.run::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T>(handler, options).await;
                 if let Err(e) = result {
                     tracing::error!("consumer task exited with error: {e}");
                 }
@@ -253,21 +253,17 @@ impl KafkaConsumerGroup {
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
         let processing = Arc::new(AtomicBool::new(false));
-        let mut options = ConsumerOptions::new(child_token.clone())
-            .with_max_retries(self.config.max_retries)
-            .with_prefetch_count(self.config.prefetch_count);
+        let mut options = ConsumerOptions::defaults_with_shutdown(child_token.clone());
+        options.max_retries = self.config.max_retries;
+        options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
         if let Some(timeout) = self.config.handler_timeout {
-            options = options.with_handler_timeout(timeout);
+            options.handler_timeout = Some(timeout);
         }
         if let Some(limit) = self.config.max_pending_per_key {
-            options = options.with_max_pending_per_key(limit);
+            options.max_pending_per_key = Some(limit);
         }
-        if let Some(max) = self.config.max_message_size {
-            options = options.with_max_message_size(max);
-        } else {
-            options = options.without_message_size_limit();
-        }
+        options.max_message_size = self.config.max_message_size;
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");

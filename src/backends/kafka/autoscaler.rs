@@ -269,7 +269,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::backends::kafka::consumer_group::{KafkaConsumerGroup, KafkaConsumerGroupConfig};
-    use crate::consumer::ConsumerOptions;
+    use crate::backend::ConsumerOptionsInner as ConsumerOptions;
     use tokio_util::sync::CancellationToken;
 
     struct MockKafkaStatsProvider {

@@ -1404,7 +1404,7 @@ async fn publish_and_consume_simple_message() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer.run::<SimpleWork>(h, opts).await
@@ -1443,7 +1443,7 @@ async fn publish_with_headers() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer.run::<SimpleWork>(h, opts).await
@@ -1480,7 +1480,7 @@ async fn publish_batch() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
         consumer.run::<SimpleWork>(h, opts).await
@@ -1518,7 +1518,7 @@ async fn rejected_message_lands_in_dlq() {
     let consumer = RabbitMqConsumer::new(client.clone());
     let s = shutdown.clone();
     let reject_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer.run::<SimpleWork>(RejectHandler, opts).await
@@ -1658,7 +1658,7 @@ async fn sequenced_consume_preserves_order() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
@@ -1695,7 +1695,7 @@ async fn retry_via_hold_queue_then_ack() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
         consumer.run::<RetryWork>(h, opts).await
@@ -1746,7 +1746,7 @@ async fn defer_with_hold_queue_redelivers() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
         consumer.run::<DeferWithHold>(h, opts).await
@@ -1797,7 +1797,7 @@ async fn defer_without_hold_queue_requeues() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
         consumer.run::<DeferNoHold>(h, opts).await
@@ -2368,7 +2368,7 @@ async fn audited_handler_captures_audit_records() {
     let consumer = RabbitMqConsumer::new(client.clone());
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
         consumer.run::<AuditedWork>(audited, opts).await
@@ -2438,7 +2438,7 @@ async fn sequenced_skip_continues_after_rejection() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<SkipOrders>(h, opts).await
     });
 
@@ -2519,7 +2519,7 @@ async fn sequenced_failall_poisons_key_after_rejection() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<FailAllOrders>(h, opts).await
     });
 
@@ -2597,7 +2597,7 @@ async fn concurrent_consume_processes_all_messages() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
         consumer.run::<ConcurrentWork>(h, opts).await
@@ -2646,7 +2646,7 @@ async fn concurrent_consume_slow_handler_faster_than_sequential() {
 
     let start = Instant::now();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(msg_count as u16); // all in-flight at once
         consumer.run::<SimpleWork>(h, opts).await
@@ -2703,7 +2703,7 @@ async fn concurrent_consume_prefetch_one_is_sequential() {
 
     let start = Instant::now();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1); // forces sequential
         consumer.run::<ConcurrentWork>(h, opts).await
@@ -2759,7 +2759,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
         consumer.run::<ConcurrentRejectWork>(h, opts).await
@@ -2866,7 +2866,7 @@ async fn concurrent_consume_graceful_shutdown_drains() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(5);
         consumer.run::<ConcurrentWork>(h, opts).await
@@ -2920,7 +2920,7 @@ async fn handler_timeout_triggers_retry() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1)
             .with_handler_timeout(Duration::from_millis(100));
@@ -2970,7 +2970,7 @@ async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
     let h1 = slow_handler.clone();
     let s1 = shutdown1.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s1)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer1.run::<UngracefulSeq1>(h1, opts).await
@@ -2997,7 +2997,7 @@ async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
     let h2 = handler.clone();
     let s2 = shutdown2.clone();
     let consume_handle2 = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s2)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer2.run::<UngracefulSeq1>(h2, opts).await
@@ -3042,7 +3042,7 @@ async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
     let h1 = slow_handler.clone();
     let s1 = shutdown1.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s1)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(3);
         consumer1.run::<UngracefulSeq3>(h1, opts).await
@@ -3065,7 +3065,7 @@ async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
     let h2 = handler.clone();
     let s2 = shutdown2.clone();
     let consume_handle2 = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s2)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(3);
         consumer2.run::<UngracefulSeq3>(h2, opts).await
@@ -3110,7 +3110,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
     let h1 = slow_handler.clone();
     let s1 = shutdown1.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s1)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer1.run::<UngracefulConc1>(h1, opts).await
@@ -3133,7 +3133,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
     let h2 = handler.clone();
     let s2 = shutdown2.clone();
     let consume_handle2 = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s2)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer2.run::<UngracefulConc1>(h2, opts).await
@@ -3177,7 +3177,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
     let h1 = slow_handler.clone();
     let s1 = shutdown1.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s1)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(3);
         consumer1.run::<UngracefulConc3>(h1, opts).await
@@ -3200,7 +3200,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
     let h2 = handler.clone();
     let s2 = shutdown2.clone();
     let consume_handle2 = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s2)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(3);
         consumer2.run::<UngracefulConc3>(h2, opts).await
@@ -3240,7 +3240,7 @@ async fn concurrent_consumer_retry_then_ack() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(4);
         consumer.run::<ConcurrentRetryWork>(h, opts).await
@@ -3290,7 +3290,7 @@ async fn concurrent_consumer_max_retries_sends_to_dlq() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(2)
             .with_prefetch_count(4);
         consumer.run::<ConcurrentMaxRetry>(h, opts).await
@@ -3352,7 +3352,7 @@ async fn concurrent_consumer_graceful_shutdown_drains_inflight() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(4);
         consumer.run::<ConcurrentWork>(h, opts).await
@@ -3411,7 +3411,7 @@ async fn deserialization_failure_rejects_to_dlq() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(4);
         consumer.run::<StrictWork>(h, opts).await
@@ -3494,7 +3494,7 @@ async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(8);
         consumer.run::<ConcurrentRejectWork>(h, opts).await
@@ -3544,7 +3544,7 @@ async fn sequential_consumer_max_retries_sends_to_dlq() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(2)
             .with_prefetch_count(1);
         consumer.run::<RetryWork>(h, opts).await
@@ -3604,7 +3604,7 @@ async fn concurrent_consumer_handler_timeout_triggers_retry() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(4)
             .with_handler_timeout(Duration::from_millis(200));
@@ -3643,7 +3643,7 @@ async fn sequenced_consumer_retry_via_shard_hold_queues() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(5);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(5);
         consumer.run_fifo::<RetrySeqOrders>(h, opts).await
     });
 
@@ -3682,7 +3682,7 @@ async fn sequenced_consumer_defer_via_shard_hold_queues() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(5);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(5);
         consumer.run_fifo::<DeferSeqOrders>(h, opts).await
     });
 
@@ -3733,7 +3733,7 @@ async fn sequenced_failall_max_retries_poisons_key() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<FailAllOrders>(h, opts).await
     });
 
@@ -3790,7 +3790,7 @@ async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<SkipOrders>(h, opts).await
     });
 
@@ -3814,7 +3814,7 @@ async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
         let h2 = handler2.clone();
         let s2 = shutdown2.clone();
         let consume_handle2 = tokio::spawn(async move {
-            let opts = ConsumerOptions::new(s2).with_max_retries(3);
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s2).with_max_retries(3);
             consumer2.run_fifo::<SkipOrders>(h2, opts).await
         });
 
@@ -3862,7 +3862,7 @@ async fn sequenced_publish_batch_routes_via_exchange() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
@@ -3904,7 +3904,7 @@ async fn sequenced_publish_with_headers() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
@@ -4023,7 +4023,7 @@ async fn publisher_with_channel_count_publishes() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
         consumer.run::<SimpleWork>(h, opts).await
@@ -4062,7 +4062,7 @@ async fn publisher_with_zero_channels_clamps_to_one() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
         consumer.run::<SimpleWork>(h, opts).await
@@ -4106,7 +4106,7 @@ async fn sequenced_batch_publish_with_pool() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<OrderTopic>(h, opts).await
     });
 
@@ -4264,7 +4264,7 @@ async fn sequenced_consumer_multiple_keys_concurrent() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(3);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(3);
         consumer.run_fifo::<SkipOrders>(h, opts).await
     });
 
@@ -4398,7 +4398,7 @@ mod exactly_once {
         let h = handler.clone();
         let s = shutdown.clone();
         let consume_handle = tokio::spawn(async move {
-            let opts = ConsumerOptions::new(s).with_exactly_once();
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_exactly_once();
             consumer.run::<ExactlyOnceWork>(h, opts).await
         });
 
@@ -4441,7 +4441,7 @@ mod exactly_once {
         let h = handler.clone();
         let s = shutdown.clone();
         let consume_handle = tokio::spawn(async move {
-            let opts = ConsumerOptions::new(s)
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
                 .with_max_retries(5)
                 .with_exactly_once();
             consumer.run::<ExactlyOnceRetry>(h, opts).await
@@ -4586,7 +4586,7 @@ mod exactly_once {
         let h = handler.clone();
         let s = shutdown.clone();
         let consume_handle = tokio::spawn(async move {
-            let opts = ConsumerOptions::new(s).with_exactly_once();
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_exactly_once();
             consumer.run::<ExactlyOnceDefer>(h, opts).await
         });
 
@@ -4642,7 +4642,7 @@ mod exactly_once {
         let s = shutdown.clone();
         let main_handle = tokio::spawn(async move {
             // max_retries=2 so only 3 total attempts before DLQ.
-            let opts = ConsumerOptions::new(s)
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
                 .with_max_retries(2)
                 .with_exactly_once();
             consumer.run::<ExactlyOnceMaxRetries>(h, opts).await
@@ -4703,7 +4703,7 @@ mod exactly_once {
         let h = handler.clone();
         let s = shutdown.clone();
         let consume_handle = tokio::spawn(async move {
-            let opts = ConsumerOptions::new(s)
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
                 .with_exactly_once()
                 .with_prefetch_count(1);
             consumer.run::<ExactlyOnceShutdown>(h, opts).await
@@ -4748,7 +4748,7 @@ mod exactly_once {
         let h = handler.clone();
         let s = shutdown.clone();
         let consume_handle = tokio::spawn(async move {
-            let opts = ConsumerOptions::new(s)
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
                 .with_exactly_once()
                 .with_prefetch_count(3);
             consumer.run::<ExactlyOnceConcurrent>(h, opts).await
@@ -4797,7 +4797,7 @@ mod exactly_once {
         let main_h = dlq_handler.clone();
         let main_s = shutdown.clone();
         let main_handle = tokio::spawn(async move {
-            let opts = ConsumerOptions::new(main_s).with_exactly_once();
+            let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(main_s).with_exactly_once();
             consumer.run::<ExactlyOnceReject>(main_h, opts).await
         });
 
@@ -4849,7 +4849,7 @@ async fn defer_preserves_retry_count() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s)
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
         consumer.run::<DeferWithHold>(h, opts).await
@@ -4908,7 +4908,7 @@ async fn sequenced_defer_without_hold_queue_requeues() {
     let h = handler.clone();
     let s = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_max_retries(5);
+        let opts = ConsumerOptions::<RabbitMqMarker>::new().with_shutdown(s).with_max_retries(5);
         consumer.run_fifo::<DeferSeqNoHold>(h, opts).await
     });
 

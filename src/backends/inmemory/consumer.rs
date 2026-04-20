@@ -12,7 +12,8 @@ use super::constants::{
     X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID, X_ORIGINAL_QUEUE, X_RETRY_COUNT, X_SEQUENCE_KEY,
 };
 use super::topology::InMemoryTopologyDeclarer;
-use crate::consumer::{ConsumerOptions, validate_message_size};
+use crate::backend::ConsumerOptionsInner;
+use crate::consumer::validate_message_size;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -36,15 +37,31 @@ impl InMemoryConsumer {
     pub fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
-        options: ConsumerOptions,
+        options: crate::ConsumerOptions<crate::markers::InMemory>,
     ) -> impl Future<Output = Result<()>> + Send {
-        run_concurrent::<T, _>(self.broker.clone(), handler, options)
+        run_concurrent::<T, _>(self.broker.clone(), handler, options.into_inner())
     }
 
     pub fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
-        options: ConsumerOptions,
+        options: crate::ConsumerOptions<crate::markers::InMemory>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        run_fifo_impl::<T, _>(self.broker.clone(), handler, options.into_inner())
+    }
+
+    pub(crate) fn run_with_inner<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
+        options: ConsumerOptionsInner,
+    ) -> impl Future<Output = Result<()>> + Send {
+        run_concurrent::<T, _>(self.broker.clone(), handler, options)
+    }
+
+    pub(crate) fn run_fifo_with_inner<T: SequencedTopic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
+        options: ConsumerOptionsInner,
     ) -> impl Future<Output = Result<()>> + Send {
         run_fifo_impl::<T, _>(self.broker.clone(), handler, options)
     }
@@ -64,7 +81,7 @@ impl InMemoryConsumer {
 async fn run_concurrent<T, H>(
     broker: InMemoryBroker,
     handler: H,
-    options: ConsumerOptions,
+    options: ConsumerOptionsInner,
 ) -> Result<()>
 where
     T: Topic,
@@ -212,7 +229,7 @@ async fn drain_pending(
     queue: &QueueState,
     pending: &mut BTreeMap<u64, (Envelope, Outcome)>,
     next_route: &mut u64,
-    options: &ConsumerOptions,
+    options: &ConsumerOptionsInner,
 ) {
     while let Some((env, outcome)) = pending.remove(next_route) {
         route_outcome(broker, topology, env, outcome, options).await;
@@ -228,7 +245,7 @@ async fn drain_pending(
 async fn run_fifo_impl<T, H>(
     broker: InMemoryBroker,
     handler: H,
-    options: ConsumerOptions,
+    options: ConsumerOptionsInner,
 ) -> Result<()>
 where
     T: SequencedTopic,
@@ -288,7 +305,7 @@ async fn run_fifo_shard<T, H>(
     topology: &'static QueueTopology,
     on_failure: SequenceFailure,
     handler: Arc<H>,
-    options: ConsumerOptions,
+    options: ConsumerOptionsInner,
     busy: Arc<AtomicUsize>,
 ) where
     T: SequencedTopic,
@@ -322,7 +339,7 @@ async fn run_fifo_shard<T, H>(
             };
 
             shard.in_flight.fetch_add(1, Ordering::Release);
-            let finish = |shard: &QueueState, busy: &AtomicUsize, options: &ConsumerOptions| {
+            let finish = |shard: &QueueState, busy: &AtomicUsize, options: &ConsumerOptionsInner| {
                 shard.in_flight.fetch_sub(1, Ordering::Release);
                 if busy.fetch_sub(1, Ordering::AcqRel) == 1 {
                     options.processing.store(false, Ordering::Release);
@@ -498,7 +515,7 @@ where
     let shutdown = broker.shutdown_token().clone();
     // DLQ consumer uses default options for the payload-size validator. Same
     // pattern as the RabbitMQ DLQ loop (`run_dlq`).
-    let options = ConsumerOptions::new(shutdown.clone());
+    let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown.clone());
 
     loop {
         if shutdown.is_cancelled() {
@@ -546,7 +563,7 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     env: Envelope,
     outcome: Outcome,
-    options: &ConsumerOptions,
+    options: &ConsumerOptionsInner,
 ) {
     match outcome {
         Outcome::Ack => {}

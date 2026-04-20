@@ -184,7 +184,7 @@ mod tests {
     use crate::backends::inmemory::consumer_group::{
         InMemoryConsumerGroup, InMemoryConsumerGroupConfig, Spawner,
     };
-    use crate::consumer::ConsumerOptions;
+    use crate::backend::ConsumerOptionsInner;
     use tokio_util::sync::CancellationToken;
 
     struct MockStats {
@@ -206,7 +206,7 @@ mod tests {
         started: bool,
     ) -> InMemoryConsumerGroup {
         let group_token = CancellationToken::new();
-        let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
+        let spawner: Spawner = Arc::new(|options: ConsumerOptionsInner| {
             tokio::spawn(async move {
                 options.shutdown.cancelled().await;
             })

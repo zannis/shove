@@ -84,7 +84,7 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         self.shutdown.clone()
     }
 
-    pub fn register<T, H>(&mut self, handler: H, options: ConsumerOptions) -> Result<()>
+    pub fn register<T, H>(&mut self, handler: H, options: ConsumerOptions<B>) -> Result<()>
     where
         T: Topic,
         // TODO(phase-12): relax to Context = Ctx once all backend ConsumerImpl
@@ -92,9 +92,7 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         H: MessageHandler<T, Context = ()>,
     {
         let consumer = self.consumer.clone();
-        let inner = options
-            .with_shutdown_token(self.shutdown.clone())
-            .into_inner();
+        let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
         self.tasks.spawn(async move {
             consumer.run::<T, H>(handler, (), inner).await
         });

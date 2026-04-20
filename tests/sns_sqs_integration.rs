@@ -649,7 +649,7 @@ async fn publish_and_consume_simple_message() {
         consumer
             .run::<WorkTopic>(
                 handler_clone,
-                ConsumerOptions::new(shutdown_clone).with_prefetch_count(1),
+                ConsumerOptions::<Sqs>::new().with_shutdown(shutdown_clone).with_prefetch_count(1),
             )
             .await
     });
@@ -705,7 +705,7 @@ async fn publish_and_consume_with_headers() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(shutdown_clone).with_prefetch_count(1),
+                ConsumerOptions::<Sqs>::new().with_shutdown(shutdown_clone).with_prefetch_count(1),
             )
             .await
     });
@@ -765,7 +765,7 @@ async fn publish_and_consume_batch() {
         consumer
             .run::<WorkTopic>(
                 handler_clone,
-                ConsumerOptions::new(shutdown_clone).with_prefetch_count(10),
+                ConsumerOptions::<Sqs>::new().with_shutdown(shutdown_clone).with_prefetch_count(10),
             )
             .await
     });
@@ -809,7 +809,7 @@ async fn rejected_message_lands_in_dlq() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(shutdown_clone)
+                ConsumerOptions::<Sqs>::new().with_shutdown(shutdown_clone)
                     .with_prefetch_count(1)
                     .with_max_retries(1),
             )
@@ -863,7 +863,7 @@ async fn dlq_consumer_handles_dead_message() {
         consumer1
             .run::<WorkTopic>(
                 reject_handler,
-                ConsumerOptions::new(shutdown1_clone)
+                ConsumerOptions::<Sqs>::new().with_shutdown(shutdown1_clone)
                     .with_prefetch_count(1)
                     .with_max_retries(1),
             )
@@ -953,7 +953,7 @@ async fn retry_then_ack_succeeds() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -1000,7 +1000,7 @@ async fn max_retries_sends_to_dlq() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(2)
                     .with_prefetch_count(1),
             )
@@ -1072,7 +1072,7 @@ async fn defer_redelivers_message() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -1137,7 +1137,7 @@ async fn concurrent_consume_processes_all_messages() {
         consumer
             .run::<WorkTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(10),
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc).with_prefetch_count(10),
             )
             .await
     });
@@ -1177,7 +1177,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(1)
                     .with_prefetch_count(5),
             )
@@ -1234,7 +1234,7 @@ async fn concurrent_consume_graceful_shutdown_drains_inflight() {
         consumer
             .run::<WorkTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(3),
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc).with_prefetch_count(3),
             )
             .await
     });
@@ -1305,7 +1305,7 @@ async fn handler_timeout_triggers_retry() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_handler_timeout(Duration::from_millis(200))
                     .with_max_retries(5),
             )
@@ -1370,7 +1370,7 @@ async fn sequenced_consume_preserves_order() {
         consumer
             .run_fifo::<SeqSkipTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(10),
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc).with_prefetch_count(10),
             )
             .await
     });
@@ -1448,7 +1448,7 @@ async fn sequenced_skip_continues_after_rejection() {
         consumer
             .run_fifo::<SeqSkipTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_prefetch_count(10)
                     .with_max_retries(1),
             )
@@ -1539,7 +1539,7 @@ async fn sequenced_failall_poisons_key() {
         consumer
             .run_fifo::<SeqFailAllTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_prefetch_count(10)
                     .with_max_retries(1),
             )
@@ -1618,7 +1618,7 @@ async fn sequenced_multiple_keys_processed_concurrently() {
         consumer
             .run_fifo::<SeqSkipTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(10),
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc).with_prefetch_count(10),
             )
             .await
     });
@@ -1687,7 +1687,7 @@ async fn fifo_topic_deduplicates_identical_payloads() {
         consumer
             .run_fifo::<SeqSkipTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(5),
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc).with_prefetch_count(5),
             )
             .await
     });
@@ -2029,7 +2029,7 @@ async fn deserialization_failure_rejects_to_dlq() {
         consumer
             .run::<WorkTopic>(
                 handler_clone,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(1)
                     .with_prefetch_count(1),
             )
@@ -2393,7 +2393,7 @@ async fn consumer_run_on_undeclared_queue_fails() {
 
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let result = consumer
-        .run::<WorkTopic>(handler, ConsumerOptions::new(shutdown))
+        .run::<WorkTopic>(handler, ConsumerOptions::<Sqs>::new().with_shutdown(shutdown))
         .await;
 
     assert!(
@@ -2474,7 +2474,7 @@ async fn defer_without_hold_queues_redelivers() {
         consumer
             .run::<DeferNoHoldTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -2558,7 +2558,7 @@ async fn defer_preserves_retry_count() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -2642,7 +2642,7 @@ async fn sequenced_defer_redelivers() {
         consumer
             .run_fifo::<SeqSkipTopic>(
                 handler,
-                ConsumerOptions::new(sc)
+                ConsumerOptions::<Sqs>::new().with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )

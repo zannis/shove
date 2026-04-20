@@ -103,8 +103,7 @@ impl ConsumerImpl for NatsConsumer {
         T: Topic,
         H: MessageHandler<T, Context = ()>,
     {
-        let options = options.into_consumer_options();
-        NatsConsumer::run::<T>(self, handler, options).await
+        NatsConsumer::run_with_inner::<T>(self, handler, options).await
     }
 
     async fn run_fifo<T, H>(
@@ -117,8 +116,7 @@ impl ConsumerImpl for NatsConsumer {
         T: SequencedTopic,
         H: MessageHandler<T, Context = ()>,
     {
-        let options = options.into_consumer_options();
-        NatsConsumer::run_fifo::<T>(self, handler, options).await
+        NatsConsumer::run_fifo_with_inner::<T>(self, handler, options).await
     }
 
     async fn run_dlq<T, H>(&self, handler: H, _ctx: H::Context) -> Result<()>

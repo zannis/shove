@@ -21,7 +21,7 @@ use crate::backends::rabbitmq::headers::{
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
-use crate::consumer::ConsumerOptions;
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
@@ -1174,6 +1174,14 @@ impl RabbitMqConsumer {
     pub async fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
+        options: crate::ConsumerOptions<crate::markers::RabbitMq>,
+    ) -> Result<()> {
+        self.run_with_inner::<T>(handler, options.into_inner()).await
+    }
+
+    pub(crate) async fn run_with_inner<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
     ) -> Result<()> {
         let topology = T::topology();
@@ -1185,6 +1193,15 @@ impl RabbitMqConsumer {
     }
 
     pub async fn run_fifo<T: SequencedTopic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
+        options: crate::ConsumerOptions<crate::markers::RabbitMq>,
+    ) -> Result<()> {
+        self.run_fifo_with_inner::<T>(handler, options.into_inner())
+            .await
+    }
+
+    pub(crate) async fn run_fifo_with_inner<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -1206,9 +1223,9 @@ impl RabbitMqConsumer {
             let shard_hold_queues = topology.shard_hold_queue_names(i);
             let h = handler.clone();
             let inner_client = client.clone();
-            let mut opts = ConsumerOptions::new(shutdown.clone())
-                .with_max_retries(options.max_retries)
-                .with_prefetch_count(prefetch);
+            let mut opts = ConsumerOptions::defaults_with_shutdown(shutdown.clone());
+            opts.max_retries = options.max_retries;
+            opts.prefetch_count = prefetch;
             opts.handler_timeout = options.handler_timeout;
             opts.max_pending_per_key = options.max_pending_per_key;
             opts.max_message_size = options.max_message_size;
@@ -1247,7 +1264,7 @@ impl RabbitMqConsumer {
             .dlq()
             .ok_or_else(|| ShoveError::Topology("run_dlq called on topic without DLQ".into()))?;
         let shutdown = self.client.shutdown_token();
-        let options = ConsumerOptions::new(shutdown);
+        let options = ConsumerOptions::defaults_with_shutdown(shutdown);
 
         run_with_reconnect(&options.shutdown, dlq, || {
             consume_dlq_loop::<T, _>(&self.client, &handler, dlq, &options)

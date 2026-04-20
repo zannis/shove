@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
-use crate::consumer::ConsumerOptions;
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 
@@ -191,7 +191,7 @@ impl ConsumerGroup {
             };
 
             tokio::spawn(async move {
-                let result = consumer.run::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T>(handler, options).await;
                 if let Err(e) = result {
                     tracing::error!("consumer task exited with error: {e}");
                 }
@@ -301,21 +301,13 @@ impl ConsumerGroup {
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
         let processing = Arc::new(AtomicBool::new(false));
-        let options = ConsumerOptions {
-            max_retries: self.config.max_retries,
-            prefetch_count: self.config.prefetch_count,
-            shutdown: child_token.clone(),
-            processing: processing.clone(),
-            handler_timeout: self.config.handler_timeout,
-            max_pending_per_key: self.config.max_pending_per_key,
-            max_message_size: self.config.max_message_size,
-            #[cfg(feature = "rabbitmq-transactional")]
-            exactly_once: false,
-            #[cfg(feature = "aws-sns-sqs")]
-            receive_batch_size: 0,
-            #[cfg(feature = "nats")]
-            max_ack_pending: None,
-        };
+        let mut options = ConsumerOptions::defaults_with_shutdown(child_token.clone());
+        options.max_retries = self.config.max_retries;
+        options.prefetch_count = self.config.prefetch_count;
+        options.processing = processing.clone();
+        options.handler_timeout = self.config.handler_timeout;
+        options.max_pending_per_key = self.config.max_pending_per_key;
+        options.max_message_size = self.config.max_message_size;
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned consumer");

@@ -8,13 +8,19 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::consumer::{
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
+    validate_message_size,
+};
+use crate::error::Result;
+
 #[derive(Clone)]
 pub(crate) struct ConsumerOptionsInner {
     pub max_retries: u32,
     pub prefetch_count: u16,
-    /// Phase 12 adds the matching field on `ConsumerOptions`. Until then this
-    /// flag is set but never read; mark it allowed to suppress dead-code
-    /// churn while the rest of the struct is wired up.
+    /// Read by per-backend `ConsumerImpl::run` adapters that honor it.
+    /// Backends that currently hardcode concurrency-on may ignore this flag
+    /// until they expose the knob through their internal loops.
     #[allow(dead_code)]
     pub concurrent_processing: bool,
     pub handler_timeout: Option<Duration>,
@@ -32,29 +38,32 @@ pub(crate) struct ConsumerOptionsInner {
 }
 
 impl ConsumerOptionsInner {
-    /// Lossy but lossless-within-shape conversion into the current public
-    /// `ConsumerOptions`. The `concurrent_processing` flag has no target
-    /// field yet (Phase 12 adds it) and is dropped on the floor for now.
-    ///
-    /// Used during Phase 4 porting to bridge the new `ConsumerImpl` trait
-    /// methods (which take `ConsumerOptionsInner`) down to the existing
-    /// concrete inherent `run*` methods (which still take `ConsumerOptions`).
-    #[allow(dead_code)] // consumed by per-backend `ConsumerImpl` impls as they port.
-    pub(crate) fn into_consumer_options(self) -> crate::consumer::ConsumerOptions {
-        crate::consumer::ConsumerOptions {
-            max_retries: self.max_retries,
-            prefetch_count: self.prefetch_count,
-            shutdown: self.shutdown,
-            processing: self.processing,
-            handler_timeout: self.handler_timeout,
-            max_pending_per_key: self.max_pending_per_key,
-            max_message_size: self.max_message_size,
+    /// Crate-internal constructor used by per-backend fallback paths
+    /// (e.g. DLQ consumer loops) that need a plain `ConsumerOptionsInner`
+    /// with library defaults bound to a supplied shutdown token.
+    pub(crate) fn defaults_with_shutdown(shutdown: CancellationToken) -> Self {
+        Self {
+            max_retries: 10,
+            prefetch_count: 10,
+            concurrent_processing: true,
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
+            shutdown,
+            processing: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "rabbitmq-transactional")]
-            exactly_once: self.exactly_once,
+            exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
-            receive_batch_size: self.receive_batch_size,
+            receive_batch_size: 0,
             #[cfg(feature = "nats")]
-            max_ack_pending: self.max_ack_pending,
+            max_ack_pending: None,
         }
+    }
+
+    /// Returns `Ok(())` if the payload is within the configured
+    /// `max_message_size`, or an error if it exceeds the limit. Always
+    /// succeeds when no limit is set.
+    pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
+        validate_message_size(len, self.max_message_size)
     }
 }
