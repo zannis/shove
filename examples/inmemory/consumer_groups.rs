@@ -61,7 +61,9 @@ async fn main() {
     let c = count.clone();
     group
         .register::<WorkTopic, _>(
-            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(3..=6).with_prefetch_count(4)),
+            ConsumerGroupConfig::new(
+                InMemoryConsumerGroupConfig::new(3..=6).with_prefetch_count(4),
+            ),
             move || Worker { count: c.clone() },
         )
         .await
@@ -81,9 +83,7 @@ async fn main() {
     let waiter_count = count.clone();
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while waiter_count.load(Ordering::Relaxed) < 100
-            && tokio::time::Instant::now() < deadline
-        {
+        while waiter_count.load(Ordering::Relaxed) < 100 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         waiter_stop.cancel();

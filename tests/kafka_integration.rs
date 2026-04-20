@@ -420,7 +420,12 @@ async fn publish_and_consume_simple_message() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(1))
+            .run::<WorkTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
             .await
     });
 
@@ -477,7 +482,12 @@ async fn publish_and_consume_with_headers() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(handler, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(1))
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
             .await
     });
 
@@ -532,7 +542,12 @@ async fn publish_and_consume_batch() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(10))
+            .run::<WorkTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
             .await
     });
 
@@ -575,7 +590,8 @@ async fn rejected_message_lands_in_dlq() {
         consumer
             .run::<WorkTopic>(
                 FixedOutcomeHandler(Outcome::Reject),
-                ConsumerOptions::<Kafka>::new().with_shutdown(sc)
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
                     .with_prefetch_count(1)
                     .with_max_retries(1),
             )
@@ -622,7 +638,9 @@ async fn dlq_consumer_handles_dead_message() {
     let h1 = tokio::spawn(async move {
         c1.run::<WorkTopic>(
             FixedOutcomeHandler(Outcome::Reject),
-            ConsumerOptions::<Kafka>::new().with_shutdown(sc1).with_prefetch_count(1),
+            ConsumerOptions::<Kafka>::new()
+                .with_shutdown(sc1)
+                .with_prefetch_count(1),
         )
         .await
     });
@@ -678,7 +696,8 @@ async fn retry_then_ack_succeeds() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::<Kafka>::new().with_shutdown(sc)
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -719,7 +738,8 @@ async fn max_retries_sends_to_dlq() {
         consumer
             .run::<WorkTopic>(
                 FixedOutcomeHandler(Outcome::Retry),
-                ConsumerOptions::<Kafka>::new().with_shutdown(sc)
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(2)
                     .with_prefetch_count(1),
             )
@@ -791,7 +811,8 @@ async fn defer_redelivers_message() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::<Kafka>::new().with_shutdown(sc)
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -826,7 +847,10 @@ async fn concurrent_consume_processes_all_messages() {
             content: format!("msg {i}"),
         })
         .collect();
-    publisher.publish_batch::<WorkTopic>(&messages).await.unwrap();
+    publisher
+        .publish_batch::<WorkTopic>(&messages)
+        .await
+        .unwrap();
 
     let handler = CountingHandler::new();
     let hc = handler.clone();
@@ -836,7 +860,12 @@ async fn concurrent_consume_processes_all_messages() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(10))
+            .run::<WorkTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
             .await
     });
 
@@ -903,7 +932,12 @@ async fn concurrent_consume_mixed_outcomes() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(handler, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(10))
+            .run::<WorkTopic>(
+                handler,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
             .await
     });
 
@@ -943,7 +977,9 @@ async fn graceful_shutdown_drains_inflight() {
     let sc = shutdown.clone();
 
     let consumer = KafkaConsumer::new(client.clone());
-    let options = ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(1);
+    let options = ConsumerOptions::<Kafka>::new()
+        .with_shutdown(sc)
+        .with_prefetch_count(1);
     let processing_flag = options.processing_handle();
     let handle = tokio::spawn(async move { consumer.run::<WorkTopic>(hc, options).await });
 
@@ -1024,7 +1060,8 @@ async fn handler_timeout_triggers_retry() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::<Kafka>::new().with_shutdown(sc)
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1)
                     .with_handler_timeout(Duration::from_millis(500)),
@@ -1072,7 +1109,12 @@ async fn sequenced_consume_preserves_order() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_max_retries(5))
+            .run_fifo::<SeqSkipTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5),
+            )
             .await
     });
 
@@ -1135,7 +1177,12 @@ async fn sequenced_skip_continues_after_rejection() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(handler, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_max_retries(5))
+            .run_fifo::<SeqSkipTopic>(
+                handler,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5),
+            )
             .await
     });
 
@@ -1182,7 +1229,12 @@ async fn sequenced_multiple_keys_concurrent() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_max_retries(5))
+            .run_fifo::<SeqSkipTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5),
+            )
             .await
     });
 
@@ -1227,7 +1279,10 @@ async fn consumer_group_processes_messages() {
             content: format!("msg {i}"),
         })
         .collect();
-    publisher.publish_batch::<WorkTopic>(&messages).await.unwrap();
+    publisher
+        .publish_batch::<WorkTopic>(&messages)
+        .await
+        .unwrap();
 
     let handler = CountingHandler::new();
     let handler_clone = handler.clone();
@@ -1238,10 +1293,9 @@ async fn consumer_group_processes_messages() {
 
     let mut group = broker.consumer_group();
     group
-        .register::<WorkTopic, _>(
-            ConsumerGroupConfig::new(config),
-            move || handler_clone.clone(),
-        )
+        .register::<WorkTopic, _>(ConsumerGroupConfig::new(config), move || {
+            handler_clone.clone()
+        })
         .await
         .unwrap();
 
@@ -1329,7 +1383,12 @@ async fn defer_without_hold_queues_redelivers() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<DeferNoHoldTopic>(handler, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(1))
+            .run::<DeferNoHoldTopic>(
+                handler,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
             .await
     });
 
@@ -1393,7 +1452,8 @@ async fn defer_preserves_retry_count() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::<Kafka>::new().with_shutdown(sc)
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(10)
                     .with_prefetch_count(1),
             )
@@ -1455,7 +1515,12 @@ async fn deserialization_failure_rejects_to_dlq() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(1))
+            .run::<WorkTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
             .await
     });
 
@@ -1587,7 +1652,12 @@ async fn lag_stats_provider_reports_zero_after_consumption() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<LagTestTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(10))
+            .run::<LagTestTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
             .await
     });
 
@@ -1672,7 +1742,12 @@ async fn topology_expands_partitions_on_redeclare() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<ExpandTopic>(hc, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_prefetch_count(1))
+            .run::<ExpandTopic>(
+                hc,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
             .await
     });
 
@@ -1787,7 +1862,8 @@ async fn handler_panic_does_not_crash_consumer() {
         consumer
             .run::<WorkTopic>(
                 handler,
-                ConsumerOptions::<Kafka>::new().with_shutdown(sc)
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
                     .with_prefetch_count(1)
                     .with_max_retries(5),
             )
@@ -1856,7 +1932,12 @@ async fn sequenced_defer_falls_back_to_retry() {
     let consumer = KafkaConsumer::new(client.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(handler, ConsumerOptions::<Kafka>::new().with_shutdown(sc).with_max_retries(5))
+            .run_fifo::<SeqSkipTopic>(
+                handler,
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(5),
+            )
             .await
     });
 

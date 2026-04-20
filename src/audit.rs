@@ -521,7 +521,12 @@ mod tests {
         struct CtxHandler;
         impl MessageHandler<TestTopic> for CtxHandler {
             type Context = u32;
-            async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata, ctx: &u32) -> Outcome {
+            async fn handle(
+                &self,
+                _msg: TestMessage,
+                _meta: MessageMetadata,
+                ctx: &u32,
+            ) -> Outcome {
                 assert_eq!(*ctx, 11);
                 Outcome::Ack
             }

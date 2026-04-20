@@ -339,12 +339,13 @@ async fn run_fifo_shard<T, H>(
             };
 
             shard.in_flight.fetch_add(1, Ordering::Release);
-            let finish = |shard: &QueueState, busy: &AtomicUsize, options: &ConsumerOptionsInner| {
-                shard.in_flight.fetch_sub(1, Ordering::Release);
-                if busy.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    options.processing.store(false, Ordering::Release);
-                }
-            };
+            let finish =
+                |shard: &QueueState, busy: &AtomicUsize, options: &ConsumerOptionsInner| {
+                    shard.in_flight.fetch_sub(1, Ordering::Release);
+                    if busy.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        options.processing.store(false, Ordering::Release);
+                    }
+                };
             busy.fetch_add(1, Ordering::AcqRel);
             options.processing.store(true, Ordering::Release);
 

@@ -235,7 +235,8 @@ impl TestSetup {
             .await
             .expect("broker topology declaration should succeed");
 
-        let ext_declarer = SnsTopologyDeclarer::new(self.client.clone(), self.topic_registry.clone());
+        let ext_declarer =
+            SnsTopologyDeclarer::new(self.client.clone(), self.topic_registry.clone());
         ext_declarer
             .declare(T::topology())
             .await

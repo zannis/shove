@@ -17,8 +17,5 @@ pub(crate) trait AutoscalerBackendImpl: Send + Sync {
 // until Phase 5+ adds the generic wrappers.
 #[allow(dead_code)]
 pub(crate) trait QueueStatsProviderImpl: Send + Sync {
-    fn snapshot(
-        &self,
-        queue: &str,
-    ) -> impl Future<Output = Result<AutoscaleMetrics>> + Send;
+    fn snapshot(&self, queue: &str) -> impl Future<Output = Result<AutoscaleMetrics>> + Send;
 }

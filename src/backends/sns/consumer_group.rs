@@ -10,10 +10,10 @@ use tokio_util::sync::CancellationToken;
 
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::consumer::SqsConsumer;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 

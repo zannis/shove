@@ -8,10 +8,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
-use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;

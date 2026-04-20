@@ -8,10 +8,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::nats::client::NatsClient;
 use crate::backends::nats::consumer::NatsConsumer;
 use crate::backends::nats::topology::NatsTopologyDeclarer;
-use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;

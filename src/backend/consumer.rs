@@ -46,11 +46,7 @@ pub(crate) trait ConsumerImpl: Send + Sync {
         T: SequencedTopic,
         H: MessageHandler<T, Context = ()>;
 
-    fn run_dlq<T, H>(
-        &self,
-        handler: H,
-        ctx: H::Context,
-    ) -> impl Future<Output = Result<()>> + Send
+    fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
         H: MessageHandler<T, Context = ()>;

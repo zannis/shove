@@ -575,9 +575,9 @@ where
 
     let sampler = ResourceSampler::start();
 
-    let prefetch = scenario
-        .prefetch
-        .unwrap_or_else(|| default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap));
+    let prefetch = scenario.prefetch.unwrap_or_else(|| {
+        default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
+    });
 
     let pc = processed.clone();
     let rec = recorder.clone();
@@ -698,9 +698,9 @@ where
 
     let sampler = ResourceSampler::start();
 
-    let prefetch = scenario
-        .prefetch
-        .unwrap_or_else(|| default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap));
+    let prefetch = scenario.prefetch.unwrap_or_else(|| {
+        default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
+    });
 
     let mut supervisor = broker.consumer_supervisor();
     for _ in 0..scenario.consumers {
@@ -943,11 +943,7 @@ fn finalize_report(
     }
 }
 
-fn push_metrics(
-    results: &mut Vec<ScenarioResult>,
-    scenario: &Scenario,
-    m: ScenarioMetrics,
-) {
+fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: ScenarioMetrics) {
     eprintln!(
         "  -> {:.1} msg/s | dispatch p50={:.1}ms p99={:.1}ms | e2e p50={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
         m.throughput,

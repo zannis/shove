@@ -529,7 +529,8 @@ impl KafkaConsumer {
         handler: impl MessageHandler<T, Context = ()>,
         options: crate::ConsumerOptions<crate::markers::Kafka>,
     ) -> Result<()> {
-        self.run_with_inner::<T>(handler, options.into_inner()).await
+        self.run_with_inner::<T>(handler, options.into_inner())
+            .await
     }
 
     pub(crate) async fn run_with_inner<T: Topic>(

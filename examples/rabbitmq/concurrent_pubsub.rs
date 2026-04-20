@@ -106,15 +106,19 @@ fn require_rabbitmq() {
 }
 
 async fn connect() -> (Broker<RabbitMq>, Publisher<RabbitMq>) {
-    let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
-        .await
-        .expect("failed to connect to RabbitMQ");
+    let broker =
+        Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
+            .await
+            .expect("failed to connect to RabbitMQ");
     broker
         .topology()
         .declare::<SlowTasks>()
         .await
         .expect("failed to declare topology");
-    let publisher = broker.publisher().await.expect("failed to create publisher");
+    let publisher = broker
+        .publisher()
+        .await
+        .expect("failed to create publisher");
     (broker, publisher)
 }
 
@@ -188,7 +192,10 @@ async fn run_round(
         )
         .await;
     let duration = start.elapsed();
-    assert!(outcome.is_clean(), "supervisor reported errors: {outcome:?}");
+    assert!(
+        outcome.is_clean(),
+        "supervisor reported errors: {outcome:?}"
+    );
     duration
 }
 

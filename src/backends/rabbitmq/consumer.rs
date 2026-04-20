@@ -15,13 +15,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::QueueTopology;
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
     extract_dead_metadata, extract_message_metadata, get_retry_count,
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
-use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
@@ -1176,7 +1176,8 @@ impl RabbitMqConsumer {
         handler: impl MessageHandler<T, Context = ()>,
         options: crate::ConsumerOptions<crate::markers::RabbitMq>,
     ) -> Result<()> {
-        self.run_with_inner::<T>(handler, options.into_inner()).await
+        self.run_with_inner::<T>(handler, options.into_inner())
+            .await
     }
 
     pub(crate) async fn run_with_inner<T: Topic>(

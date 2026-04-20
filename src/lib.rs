@@ -157,9 +157,7 @@ pub use outcome::Outcome;
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 use std::time::Duration;
 pub use topic::{SequencedTopic, Topic};
-pub use topology::{
-    HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder,
-};
+pub use topology::{HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder};
 
 pub use autoscaler::{
     Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics,

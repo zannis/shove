@@ -9,10 +9,10 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};

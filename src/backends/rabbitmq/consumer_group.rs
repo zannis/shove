@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
-use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 

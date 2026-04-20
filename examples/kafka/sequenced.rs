@@ -11,7 +11,9 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisher, KafkaTopologyDeclarer};
+use shove::kafka::{
+    KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisher, KafkaTopologyDeclarer,
+};
 use shove::{
     ConsumerOptions, Kafka, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
     SequencedTopic, Topic, TopologyBuilder,

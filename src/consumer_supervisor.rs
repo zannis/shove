@@ -93,9 +93,8 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     {
         let consumer = self.consumer.clone();
         let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
-        self.tasks.spawn(async move {
-            consumer.run::<T, H>(handler, (), inner).await
-        });
+        self.tasks
+            .spawn(async move { consumer.run::<T, H>(handler, (), inner).await });
         Ok(())
     }
 

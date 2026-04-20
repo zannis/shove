@@ -59,20 +59,14 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         // impls accept non-() context.
         H: MessageHandler<T, Context = ()>,
     {
-        self.inner
-            .register::<T, H>(config.inner, factory, ())
-            .await
+        self.inner.register::<T, H>(config.inner, factory, ()).await
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
         self.inner.cancellation_token()
     }
 
-    pub async fn run_until_timeout<S>(
-        self,
-        signal: S,
-        drain_timeout: Duration,
-    ) -> SupervisorOutcome
+    pub async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {

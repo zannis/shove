@@ -181,10 +181,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::backend::ConsumerOptionsInner;
     use crate::backends::inmemory::consumer_group::{
         InMemoryConsumerGroup, InMemoryConsumerGroupConfig, Spawner,
     };
-    use crate::backend::ConsumerOptionsInner;
     use tokio_util::sync::CancellationToken;
 
     struct MockStats {

@@ -213,8 +213,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use crate::backends::nats::consumer_group::{NatsConsumerGroup, NatsConsumerGroupConfig};
     use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+    use crate::backends::nats::consumer_group::{NatsConsumerGroup, NatsConsumerGroupConfig};
     use tokio_util::sync::CancellationToken;
 
     struct MockNatsStatsProvider {

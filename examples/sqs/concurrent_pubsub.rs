@@ -160,7 +160,10 @@ async fn run_round(
         )
         .await;
     let duration = start.elapsed();
-    assert!(outcome.is_clean(), "supervisor reported errors: {outcome:?}");
+    assert!(
+        outcome.is_clean(),
+        "supervisor reported errors: {outcome:?}"
+    );
     duration
 }
 

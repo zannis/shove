@@ -9,13 +9,17 @@ use shove::markers::InMemory;
 
 #[tokio::test]
 async fn broker_connects_and_closes() {
-    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
     broker.close().await;
 }
 
 #[tokio::test]
 async fn broker_publisher_publishes() {
-    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
     // Just test that we can create a publisher without error.
     let _publisher = broker.publisher().await.unwrap();
     broker.close().await;
@@ -23,8 +27,8 @@ async fn broker_publisher_publishes() {
 
 #[tokio::test]
 async fn broker_topology_declares() {
-    use shove::topology::{QueueTopology, TopologyBuilder};
     use shove::topic::Topic;
+    use shove::topology::{QueueTopology, TopologyBuilder};
 
     struct SmokeTopic;
     impl Topic for SmokeTopic {
@@ -35,14 +39,18 @@ async fn broker_topology_declares() {
         }
     }
 
-    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
     broker.topology().declare::<SmokeTopic>().await.unwrap();
     broker.close().await;
 }
 
 #[tokio::test]
 async fn broker_consumer_supervisor_runs_empty() {
-    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
     let supervisor = broker.consumer_supervisor();
     // No handlers registered -- run_until_timeout should return immediately when signal fires.
     let token = supervisor.cancellation_token();
@@ -57,7 +65,9 @@ async fn broker_consumer_supervisor_runs_empty() {
 
 #[tokio::test]
 async fn broker_consumer_group_exists_for_inmemory() {
-    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
     // InMemory implements HasCoordinatedGroups, so this compiles.
     let _group = broker.consumer_group();
     broker.close().await;

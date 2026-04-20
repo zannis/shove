@@ -28,7 +28,9 @@ use crate::topic::{SequencedTopic, Topic};
 // effect: the `BrokerStatsProvider::get_queue_stats` inherent name is the
 // trait method, not an inherent method, so the trait must be in scope for
 // `snapshot` to resolve it.
-use super::autoscaler::{BrokerStatsProvider, InMemoryAutoscalerBackend, InMemoryQueueStatsProvider};
+use super::autoscaler::{
+    BrokerStatsProvider, InMemoryAutoscalerBackend, InMemoryQueueStatsProvider,
+};
 use super::client::{InMemoryBroker, InMemoryConfig};
 use super::consumer::InMemoryConsumer;
 use super::consumer_group::{InMemoryConsumerGroupConfig, InMemoryConsumerGroupRegistry};
@@ -79,7 +81,9 @@ impl Backend for InMemory {
         // real wiring point until Phase 8's `Autoscaler<B>` harness lands.
         use std::sync::Arc;
         use tokio::sync::Mutex;
-        let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(client.clone())));
+        let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
+            client.clone(),
+        )));
         InMemoryAutoscalerBackend::new(client.clone(), registry)
     }
 
@@ -242,4 +246,3 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
         }
     }
 }
-

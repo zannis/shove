@@ -60,7 +60,9 @@ async fn main() {
     let c = count.clone();
     group
         .register::<PingTopic, _>(
-            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1).with_prefetch_count(4)),
+            ConsumerGroupConfig::new(
+                InMemoryConsumerGroupConfig::new(1..=1).with_prefetch_count(4),
+            ),
             move || PingHandler { count: c.clone() },
         )
         .await
@@ -83,9 +85,7 @@ async fn main() {
     let waiter_count = count.clone();
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while waiter_count.load(Ordering::Relaxed) < 5
-            && tokio::time::Instant::now() < deadline
-        {
+        while waiter_count.load(Ordering::Relaxed) < 5 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         waiter_stop.cancel();

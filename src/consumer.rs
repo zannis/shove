@@ -220,7 +220,7 @@ impl<B: Backend> ConsumerOptions<B> {
             handler_timeout: self.handler_timeout,
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
-            shutdown: self.shutdown.unwrap_or_else(CancellationToken::new),
+            shutdown: self.shutdown.unwrap_or_default(),
             processing: self.processing,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,

@@ -46,8 +46,7 @@ pub trait Backend: sealed::Sealed + Sized + Send + Sync + 'static {
     type AutoscalerImpl: AutoscalerBackendImpl + Send + Sync + 'static;
     type QueueStatsImpl: QueueStatsProviderImpl + Send + Sync + 'static;
 
-    fn connect(config: Self::Config)
-    -> impl Future<Output = Result<Self::Client>> + Send;
+    fn connect(config: Self::Config) -> impl Future<Output = Result<Self::Client>> + Send;
 
     fn make_publisher(
         client: &Self::Client,
@@ -78,7 +77,6 @@ mod bounds_smoke {
 
     use super::*;
     use crate::backend::capability::HasCoordinatedGroups;
-    
 
     fn _require_backend<B: Backend>() {
         fn needs_send_sync_static<T: Send + Sync + 'static>() {}
@@ -205,13 +203,8 @@ mod bounds_smoke {
         let _ =
             <_ as ConsumerImpl>::run::<Dummy, DummyHandler>(c, DummyHandler, (), options.clone())
                 .await;
-        let _ = <_ as ConsumerImpl>::run_fifo::<Dummy, DummyHandler>(
-            c,
-            DummyHandler,
-            (),
-            options,
-        )
-        .await;
+        let _ = <_ as ConsumerImpl>::run_fifo::<Dummy, DummyHandler>(c, DummyHandler, (), options)
+            .await;
         let _ = <_ as ConsumerImpl>::run_dlq::<Dummy, DummyHandler>(c, DummyHandler, ()).await;
     }
 
@@ -272,8 +265,7 @@ mod bounds_smoke {
             (),
         )
         .await;
-        let _: tokio_util::sync::CancellationToken =
-            <_ as RegistryImpl>::cancellation_token(r);
+        let _: tokio_util::sync::CancellationToken = <_ as RegistryImpl>::cancellation_token(r);
     }
 
     // The `run_until_timeout` consumer of the registry can't be anchored
