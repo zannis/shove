@@ -30,7 +30,7 @@ pub use consumer::{
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::ShoveError;
-pub use handler::MessageHandler;
+pub use handler::{MessageHandler, MessageHandlerExt};
 pub use metadata::{DeadMessageMetadata, MessageMetadata};
 pub use outcome::Outcome;
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]

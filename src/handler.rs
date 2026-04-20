@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::audit::{AuditHandler, Audited};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
 use crate::topic::Topic;
@@ -42,6 +43,28 @@ pub trait MessageHandler<T: Topic>: Send + Sync + 'static {
                 "Dead-letter message received, no handler implemented"
             );
         }
+    }
+}
+
+/// Fluent extension trait for wrapping a handler in audit instrumentation.
+///
+/// Lets you write `MyHandler::new(state).audited(audit)` instead of
+/// `Audited::new(MyHandler::new(state), audit)`. The wrapper's outcome and
+/// retry behaviour is identical to calling `Audited::new` directly.
+pub trait MessageHandlerExt<T: Topic>: MessageHandler<T> + Sized {
+    /// Wrap `self` with the given audit handler, returning the combined
+    /// [`Audited<Self, A>`](crate::audit::Audited).
+    fn audited<A>(self, audit: A) -> Audited<Self, A>
+    where
+        A: AuditHandler<T>;
+}
+
+impl<T: Topic, H: MessageHandler<T>> MessageHandlerExt<T> for H {
+    fn audited<A>(self, audit: A) -> Audited<Self, A>
+    where
+        A: AuditHandler<T>,
+    {
+        Audited::new(self, audit)
     }
 }
 
@@ -178,6 +201,24 @@ mod tests {
             }
         }
         let outcome = CtxHandler.handle(test_message(), test_metadata(), &42).await;
+        assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    /// `MessageHandlerExt::audited` wraps a handler with an `Audited<Self, A>`
+    /// adapter and preserves its outcome.
+    #[tokio::test]
+    async fn audited_extension_wraps_handler() {
+        use crate::audit::{AuditHandler, AuditRecord};
+
+        struct NullAudit;
+        impl AuditHandler<TestTopic> for NullAudit {
+            async fn audit(&self, _rec: &AuditRecord<TestMessage>) -> crate::error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let wrapped = FixedOutcomeHandler(Outcome::Ack).audited(NullAudit);
+        let outcome = wrapped.handle(test_message(), test_metadata(), &()).await;
         assert!(matches!(outcome, Outcome::Ack));
     }
 
