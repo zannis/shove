@@ -86,6 +86,7 @@ mod bounds_smoke {
         needs_send_sync_static::<B::Client>();
         needs_send_sync_static::<B::PublisherImpl>();
         needs_send_sync_static::<B::ConsumerImpl>();
+        needs_send_sync_static::<B::TopologyImpl>();
         needs_send_sync_static::<B::AutoscalerImpl>();
         needs_send_sync_static::<B::QueueStatsImpl>();
     }
