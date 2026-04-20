@@ -48,6 +48,18 @@ impl RabbitMqConfig {
     pub fn new(uri: impl Into<String>) -> Self {
         Self { uri: uri.into() }
     }
+
+    /// AMQP connection URI this config was built with.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
+
+impl Default for RabbitMqConfig {
+    /// Default RabbitMQ endpoint for local development.
+    fn default() -> Self {
+        Self::new("amqp://guest:guest@localhost:5672")
+    }
 }
 
 /// RabbitMQ client with connection management and graceful shutdown.
@@ -235,5 +247,11 @@ mod tests {
     fn config_new_stores_uri() {
         let config = RabbitMqConfig::new("amqp://host:1234/%2F");
         assert_eq!(config.uri, "amqp://host:1234/%2F");
+    }
+
+    #[test]
+    fn default_config_is_localhost() {
+        let cfg = RabbitMqConfig::default();
+        assert!(cfg.uri().contains("localhost:5672"));
     }
 }

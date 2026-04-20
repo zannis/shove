@@ -17,6 +17,18 @@ impl NatsConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
     }
+
+    /// URL of the NATS server this config connects to.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl Default for NatsConfig {
+    /// Default NATS endpoint for local development.
+    fn default() -> Self {
+        Self::new("nats://localhost:4222")
+    }
 }
 
 impl fmt::Debug for NatsConfig {
@@ -113,5 +125,16 @@ impl NatsClient {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
         let _ = self.client.drain().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_localhost() {
+        let cfg = NatsConfig::default();
+        assert!(cfg.url().contains("localhost:4222"));
     }
 }
