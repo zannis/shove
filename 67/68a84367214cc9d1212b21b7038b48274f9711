@@ -1,0 +1,31 @@
+src/lib.rs
+  a7e66bb650d7c23d 176,179,182,185,188,192,208,222,234,250,273,287
+src/backends/mod.rs
+  a7e66bb650d7c23d 2,6,10,14,18
+src/consumer.rs
+  a7e66bb650d7c23d 91,98,104,266,278,288
+src/markers.rs
+  a7e66bb650d7c23d 5,9,13,41,45
+src/audit.rs
+  a7e66bb650d7c23d 231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "6768a84367214cc9d1212b21b7038b48274f9711",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 29,
+      "total_deletions": 0,
+      "accepted_lines": 22680,
+      "overriden_lines": 0
+    }
+  }
+}
