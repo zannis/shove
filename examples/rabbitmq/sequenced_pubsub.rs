@@ -3,6 +3,11 @@
 //! Demonstrates: `define_sequenced_topic!`, `SequenceFailure::Skip` vs
 //! `SequenceFailure::FailAll`, `run_fifo`, and custom `routing_shards`.
 //!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` wrappers — this example
+//! therefore keeps using the backend-specific `RabbitMqConsumer::run_fifo`
+//! directly, same as the stress example.
+//!
 //! Each handler sums the `amount_cents` of successfully processed messages per
 //! account. After shutdown the totals are compared against expected values to
 //! verify that the failure policies work correctly.
@@ -28,8 +33,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::*;
-use shove::*;
+use shove::rabbitmq::{
+    RabbitMqClient, RabbitMqConfig, RabbitMqConsumer, RabbitMqPublisher, RabbitMqTopologyDeclarer,
+};
+use shove::{
+    ConsumerOptions, MessageHandler, MessageMetadata, Outcome, RabbitMq, SequenceFailure,
+    SequencedTopic, ShoveError, Topic, TopologyBuilder, define_sequenced_topic,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -154,8 +164,8 @@ async fn main() -> Result<(), ShoveError> {
     // ── Declare topologies ──
     let channel = client.create_channel().await?;
     let declarer = RabbitMqTopologyDeclarer::new(channel);
-    declare_topic::<SkipLedger>(&declarer).await?;
-    declare_topic::<StrictLedger>(&declarer).await?;
+    declarer.declare(SkipLedger::topology()).await?;
+    declarer.declare(StrictLedger::topology()).await?;
     println!("sequenced topologies declared\n");
 
     // ── Publish ordered entries for account ACC-A ──
@@ -207,7 +217,8 @@ async fn main() -> Result<(), ShoveError> {
         RabbitMqConsumer::new(c)
             .run_fifo::<SkipLedger>(
                 handler,
-                ConsumerOptions::new(s)
+                ConsumerOptions::<RabbitMq>::new()
+                    .with_shutdown(s)
                     .with_max_retries(2)
                     .with_prefetch_count(8),
             )
@@ -225,7 +236,8 @@ async fn main() -> Result<(), ShoveError> {
         RabbitMqConsumer::new(c)
             .run_fifo::<StrictLedger>(
                 handler,
-                ConsumerOptions::new(s)
+                ConsumerOptions::<RabbitMq>::new()
+                    .with_shutdown(s)
                     .with_max_retries(2)
                     .with_prefetch_count(8),
             )

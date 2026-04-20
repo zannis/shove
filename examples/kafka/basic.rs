@@ -6,17 +6,10 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::Topic;
-use shove::consumer::{Consumer, ConsumerOptions};
-use shove::handler::MessageHandler;
-use shove::kafka::{
-    KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisher, KafkaTopologyDeclarer,
+use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
+use shove::{
+    Broker, ConsumerGroupConfig, Kafka, MessageHandler, MessageMetadata, Outcome, TopologyBuilder,
 };
-use shove::metadata::MessageMetadata;
-use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{TopologyBuilder, TopologyDeclarer};
-use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
@@ -51,15 +44,11 @@ impl MessageHandler<OrderTopic> for OrderHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = KafkaConfig::new("localhost:9092");
-    let client = KafkaClient::connect(&config).await?;
-
-    // Declare topology
-    let declarer = KafkaTopologyDeclarer::new(client.clone());
-    declarer.declare(OrderTopic::topology()).await?;
+    let broker = Broker::<Kafka>::new(KafkaConfig::new("localhost:9092")).await?;
+    broker.topology().declare::<OrderTopic>().await?;
 
     // Publish
-    let publisher = KafkaPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
     for i in 0..3 {
         publisher
             .publish::<OrderTopic>(&OrderCreated {
@@ -70,19 +59,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Published order ORD-{i}");
     }
 
-    // Consume
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        shutdown_clone.cancel();
-    });
+    // Consume via a coordinated consumer group.
+    let mut group = broker.consumer_group();
+    group
+        .register::<OrderTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            || OrderHandler,
+        )
+        .await?;
 
-    let consumer = KafkaConsumer::new(client.clone());
-    let options = ConsumerOptions::new(shutdown);
-    consumer.run::<OrderTopic>(OrderHandler, options).await?;
+    // Stop after 3 s for demo purposes, or on ctrl-c.
+    let outcome = group
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
 
-    client.shutdown().await;
     println!("Done.");
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

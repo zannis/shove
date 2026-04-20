@@ -4,6 +4,11 @@
 //! `Autoscaler`, `AutoscalerConfig`, `ManagementClient`, and dynamic scaling
 //! based on queue depth.
 //!
+//! Note: the autoscaler machinery isn't yet surfaced on the generic
+//! `Broker<B>` wrapper, so this example stays on the backend-specific
+//! `ConsumerGroupRegistry` / `RabbitMqAutoscalerBackend` path (same as
+//! `sqs_autoscaler`).
+//!
 //! Requires a running RabbitMQ instance with the management plugin enabled
 //! (see docker-compose.yml):
 //!
@@ -14,8 +19,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::*;
-use shove::*;
+use shove::rabbitmq::{
+    ConsumerGroupConfig, ConsumerGroupRegistry, ManagementConfig, RabbitMqAutoscalerBackend,
+    RabbitMqClient, RabbitMqConfig, RabbitMqPublisher,
+};
+use shove::{
+    AutoscalerConfig, MessageHandler, MessageMetadata, Outcome, ShoveError, Topic, TopologyBuilder,
+    define_topic,
+};
 use tokio::sync::Mutex;
 
 // ─── Message type ───────────────────────────────────────────────────────────

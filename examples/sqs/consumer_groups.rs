@@ -3,6 +3,11 @@
 //! Demonstrates: `SqsConsumerGroupRegistry`, `SqsConsumerGroupConfig`,
 //! `SqsQueueStatsProvider`, and dynamic queue depth monitoring.
 //!
+//! Note: SQS has no broker-level coordinated-group primitive — the SQS
+//! registry spawns independent poll workers. The generic `Broker<Sqs>`
+//! deliberately exposes only a supervisor (see `Sqs`'s doctest), so this
+//! example stays on the backend-specific `SqsConsumerGroupRegistry` path.
+//!
 //! Requires a running LocalStack instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
@@ -97,7 +102,7 @@ async fn main() -> Result<(), ShoveError> {
     // We declare topology manually here so the publisher can resolve the SNS ARN.
     let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
         .with_queue_registry(queue_registry.clone());
-    declare_topic::<WorkQueue>(&declarer).await?;
+    declarer.declare(WorkQueue::topology()).await?;
 
     let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
     let burst_size = 50;

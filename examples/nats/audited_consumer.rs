@@ -1,7 +1,7 @@
 //! Audited consumer example — custom `AuditHandler` that writes to stdout (NATS backend).
 //!
-//! Demonstrates: `Audited` wrapper, custom `AuditHandler` implementation,
-//! trace ID propagation across retries.
+//! Demonstrates: `MessageHandlerExt::audited` wrapper, custom `AuditHandler`
+//! implementation, trace ID propagation across retries.
 //!
 //! Requires a running NATS server with JetStream enabled:
 //!
@@ -11,9 +11,8 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::nats::*;
+use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
 use shove::*;
-use tokio_util::sync::CancellationToken;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -59,7 +58,9 @@ impl MessageHandler<Payments> for PaymentHandler {
 
 // ─── Custom audit handler ───────────────────────────────────────────────────
 
-/// Prints every audit record to stdout as JSON.
+/// Prints every audit record to stdout as JSON. Clone-able so a fresh instance
+/// can be handed to each spawned consumer.
+#[derive(Clone, Default)]
 struct StdoutAuditHandler;
 
 impl AuditHandler<Payments> for StdoutAuditHandler {
@@ -74,16 +75,12 @@ impl AuditHandler<Payments> for StdoutAuditHandler {
 
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
-    let config = NatsConfig::new("nats://localhost:4222");
-    let client = NatsClient::connect(&config).await?;
-
-    // ── Declare topology ──
-    let declarer = NatsTopologyDeclarer::new(client.clone());
-    declarer.declare(Payments::topology()).await?;
+    let broker = Broker::<Nats>::new(NatsConfig::new("nats://localhost:4222")).await?;
+    broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");
 
     // ── Publish a payment ──
-    let publisher = NatsPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
     let event = PaymentEvent {
         payment_id: "PAY-001".into(),
         amount_cents: 4999,
@@ -91,27 +88,31 @@ async fn main() -> Result<(), ShoveError> {
     publisher.publish::<Payments>(&event).await?;
     println!("published payment\n");
 
-    // ── Start audited consumer ──
+    // ── Start audited consumer via a consumer group ──
     //
-    // Wrap the handler with `Audited` — the consumer sees a normal
-    // `MessageHandler<Payments>`, no API changes needed.
-    let audited_handler = Audited::new(PaymentHandler, StdoutAuditHandler);
-    let shutdown = CancellationToken::new();
+    // `audited(audit)` wraps the handler in the `Audited` decorator — the
+    // group sees a normal `MessageHandler<Payments>`, no API changes needed.
+    let mut group = broker.consumer_group();
+    group
+        .register::<Payments, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::new(1..=1)),
+            || PaymentHandler.audited(StdoutAuditHandler),
+        )
+        .await?;
 
-    let s = shutdown.clone();
-    let consumer_task = tokio::spawn(async move {
-        NatsConsumer::new(client.clone())
-            .run::<Payments>(audited_handler, ConsumerOptions::new(s).with_max_retries(3))
-            .await
-    });
+    // Let it process (first attempt retries, second acks), then shut down.
+    let outcome = group
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
 
-    // ── Let it process (first attempt retries, second acks) ──
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    println!("\nshutting down...");
-    shutdown.cancel();
-    let _ = consumer_task.await;
     println!("done");
-
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

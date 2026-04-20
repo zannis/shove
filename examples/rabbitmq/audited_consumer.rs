@@ -1,7 +1,7 @@
 //! Audited consumer example — custom `AuditHandler` that writes to stdout.
 //!
-//! Demonstrates: `Audited` wrapper, custom `AuditHandler` implementation,
-//! trace ID propagation across retries.
+//! Demonstrates: `MessageHandlerExt::audited` wrapper, custom `AuditHandler`
+//! implementation, trace ID propagation across retries.
 //!
 //! Requires a running RabbitMQ instance (see docker-compose.yml):
 //!
@@ -11,9 +11,8 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::*;
+use shove::rabbitmq::RabbitMqConfig;
 use shove::*;
-use tokio_util::sync::CancellationToken;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -60,6 +59,7 @@ impl MessageHandler<Payments> for PaymentHandler {
 // ─── Custom audit handler ───────────────────────────────────────────────────
 
 /// Prints every audit record to stdout as JSON.
+#[derive(Clone, Default)]
 struct StdoutAuditHandler;
 
 impl AuditHandler<Payments> for StdoutAuditHandler {
@@ -88,17 +88,14 @@ fn require_rabbitmq() {
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
     require_rabbitmq();
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
-    let client = RabbitMqClient::connect(&config).await?;
-
-    // ── Declare topology ──
-    let channel = client.create_channel().await?;
-    let declarer = RabbitMqTopologyDeclarer::new(channel);
-    declare_topic::<Payments>(&declarer).await?;
+    let broker =
+        Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
+            .await?;
+    broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");
 
     // ── Publish a payment ──
-    let publisher = RabbitMqPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
     let event = PaymentEvent {
         payment_id: "PAY-001".into(),
         amount_cents: 4999,
@@ -108,27 +105,27 @@ async fn main() -> Result<(), ShoveError> {
 
     // ── Start audited consumer ──
     //
-    // Wrap the handler with `Audited` — the consumer sees a normal
-    // `MessageHandler<Payments>`, no API changes needed.
-    let audited_handler = Audited::new(PaymentHandler, StdoutAuditHandler);
-    let shutdown = CancellationToken::new();
+    // `audited(audit)` wraps the handler in the `Audited` decorator — the
+    // supervisor sees a normal `MessageHandler<Payments>`, no API changes needed.
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor.register::<Payments, _>(
+        PaymentHandler.audited(StdoutAuditHandler),
+        ConsumerOptions::<RabbitMq>::new().with_max_retries(3),
+    )?;
 
-    let s = shutdown.clone();
-    let c = client.clone();
-    let consumer_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<Payments>(audited_handler, ConsumerOptions::new(s).with_max_retries(3))
-            .await
-    });
+    // Let it process (first attempt retries, second acks), then shut down.
+    let outcome = supervisor
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-    // ── Let it process (first attempt retries, second acks) ──
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    println!("\nshutting down...");
-    shutdown.cancel();
-    client.shutdown().await;
-    let _ = consumer_task.await;
     println!("done");
-
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

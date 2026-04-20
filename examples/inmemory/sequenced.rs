@@ -1,4 +1,9 @@
 //! Sequenced (per-key FIFO) delivery with `SequenceFailure::FailAll`.
+//!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` / `ConsumerGroup<B>`
+//! wrappers — this example therefore keeps using the backend-specific
+//! `InMemoryConsumer::run_fifo` directly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,8 +16,8 @@ use shove::inmemory::{
     InMemoryBroker, InMemoryConsumer, InMemoryPublisher, InMemoryTopologyDeclarer,
 };
 use shove::{
-    Consumer, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Publisher,
-    SequenceFailure, SequencedTopic, Topic, TopologyBuilder, declare_topic,
+    ConsumerOptions, InMemory, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +71,7 @@ async fn main() {
 
     let broker = InMemoryBroker::new();
     let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<LedgerTopic>(&declarer).await.unwrap();
+    declarer.declare(LedgerTopic::topology()).await.unwrap();
 
     let acked = Arc::new(AtomicUsize::new(0));
     let handler = Handler {
@@ -77,7 +82,9 @@ async fn main() {
     let consumer = InMemoryConsumer::new(broker.clone());
     let shutdown_for_task = shutdown.clone();
     let consume_handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(shutdown_for_task).with_prefetch_count(1);
+        let opts = ConsumerOptions::<InMemory>::new()
+            .with_shutdown(shutdown_for_task)
+            .with_prefetch_count(1);
         consumer.run_fifo::<LedgerTopic>(handler, opts).await
     });
 

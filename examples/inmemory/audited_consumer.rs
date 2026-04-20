@@ -9,12 +9,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use shove::inmemory::{
-    InMemoryBroker, InMemoryConsumer, InMemoryPublisher, InMemoryTopologyDeclarer,
-};
+use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
 use shove::{
-    AuditHandler, AuditRecord, Audited, Consumer, ConsumerOptions, MessageHandler, MessageMetadata,
-    Outcome, Publisher, Topic, TopologyBuilder, declare_topic,
+    AuditHandler, AuditRecord, Broker, ConsumerGroupConfig, InMemory, MessageHandler,
+    MessageHandlerExt, MessageMetadata, Outcome, Topic, TopologyBuilder,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +42,7 @@ impl MessageHandler<EventTopic> for Inner {
     }
 }
 
+#[derive(Clone, Default)]
 struct StdoutAudit;
 impl AuditHandler<EventTopic> for StdoutAudit {
     async fn audit(&self, record: &AuditRecord<Event>) -> shove::error::Result<()> {
@@ -59,38 +58,56 @@ impl AuditHandler<EventTopic> for StdoutAudit {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<EventTopic>(&declarer).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("connect InMemory");
+    broker
+        .topology()
+        .declare::<EventTopic>()
+        .await
+        .expect("declare");
 
     let count = Arc::new(AtomicUsize::new(0));
-    let audited = Audited::new(
-        Inner {
-            count: count.clone(),
-        },
-        StdoutAudit,
-    );
 
-    let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
-    let shutdown_for_task = shutdown.clone();
-    let handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(shutdown_for_task).with_prefetch_count(1);
-        consumer.run::<EventTopic>(audited, opts).await
-    });
+    let mut group = broker.consumer_group();
+    let c = count.clone();
+    group
+        .register::<EventTopic, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1).with_prefetch_count(1)),
+            move || Inner { count: c.clone() }.audited(StdoutAudit),
+        )
+        .await
+        .expect("register");
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.expect("publisher");
     for id in 0..3 {
         publisher
             .publish::<EventTopic>(&Event { id })
             .await
-            .unwrap();
+            .expect("publish");
     }
 
-    while count.load(Ordering::Relaxed) < 3 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Stop when all three events have been processed (or after a deadline).
+    let stop = CancellationToken::new();
+    let waiter_stop = stop.clone();
+    let waiter_count = count.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while waiter_count.load(Ordering::Relaxed) < 3
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        waiter_stop.cancel();
+    });
 
-    shutdown.cancel();
-    let _ = handle.await;
+    let signal_stop = stop.clone();
+    let outcome = group
+        .run_until_timeout(
+            async move { signal_stop.cancelled().await },
+            Duration::from_secs(5),
+        )
+        .await;
+
+    std::process::exit(outcome.exit_code());
 }

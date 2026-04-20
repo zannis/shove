@@ -1,8 +1,12 @@
 //! Basic pub/sub examples covering all non-sequenced topology configurations.
 //!
 //! Demonstrates: `define_topic!`, manual `Topic` impl, all `Outcome` variants,
-//! `publish`, `publish_with_headers`, `publish_batch`, `run`, `run_dlq`,
-//! and `handle_dead`.
+//! `publish`, `publish_with_headers`, `publish_batch`, and per-topic consumer
+//! registration via `Broker<RabbitMq>::consumer_supervisor()`.
+//!
+//! Note: the earlier DLQ-consumer demo (`run_dlq::<DlqOrder>`) isn't wired
+//! through the generic `ConsumerSupervisor<B>` wrapper yet — messages that
+//! land in the DLQ here are simply left there for inspection.
 //!
 //! Requires a running RabbitMQ instance (see docker-compose.yml):
 //!
@@ -13,9 +17,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::*;
-use shove::*;
-use tokio_util::sync::CancellationToken;
+use shove::rabbitmq::RabbitMqConfig;
+use shove::{
+    Broker, ConsumerOptions, DeadMessageMetadata, MessageHandler, MessageMetadata, Outcome,
+    QueueTopology, RabbitMq, ShoveError, Topic, TopologyBuilder, define_topic,
+};
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -173,20 +179,20 @@ fn require_rabbitmq() {
 #[tokio::main]
 async fn main() -> Result<(), ShoveError> {
     require_rabbitmq();
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
-    let client = RabbitMqClient::connect(&config).await?;
+    let broker =
+        Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
+            .await?;
 
     // ── Declare all topologies ──
-    let channel = client.create_channel().await?;
-    let declarer = RabbitMqTopologyDeclarer::new(channel);
-    declare_topic::<MinimalOrder>(&declarer).await?;
-    declare_topic::<DlqOrder>(&declarer).await?;
-    declare_topic::<RetryOrder>(&declarer).await?;
-    declare_topic::<ScheduledOrder>(&declarer).await?;
+    let topology = broker.topology();
+    topology.declare::<MinimalOrder>().await?;
+    topology.declare::<DlqOrder>().await?;
+    topology.declare::<RetryOrder>().await?;
+    topology.declare::<ScheduledOrder>().await?;
     println!("topologies declared\n");
 
     // ── Publish ──
-    let publisher = RabbitMqPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
 
     // Single publish
     let order = OrderEvent {
@@ -228,63 +234,33 @@ async fn main() -> Result<(), ShoveError> {
     publisher.publish_batch::<MinimalOrder>(&batch).await?;
     println!("messages published\n");
 
-    // ── Start consumers ──
-    let shutdown = CancellationToken::new();
+    // ── Start consumers via a single supervisor ──
+    //
+    // Each `register` spawns one tokio task running that topic's consumer.
+    // The supervisor owns a shared shutdown token so ctrl-c or our timeout
+    // stops every consumer in lock-step.
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor.register::<MinimalOrder, _>(AckHandler, ConsumerOptions::<RabbitMq>::new())?;
+    supervisor.register::<DlqOrder, _>(RejectHandler, ConsumerOptions::<RabbitMq>::new())?;
+    supervisor.register::<RetryOrder, _>(
+        RetryHandler,
+        ConsumerOptions::<RabbitMq>::new().with_max_retries(3),
+    )?;
+    supervisor.register::<ScheduledOrder, _>(DeferHandler, ConsumerOptions::<RabbitMq>::new())?;
 
-    let s = shutdown.clone();
-    let c = client.clone();
-    let minimal_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<MinimalOrder>(AckHandler, ConsumerOptions::new(s))
-            .await
-    });
+    // Run until ctrl-c or a 5 s demo timeout, then drain for up to 5 s.
+    let outcome = supervisor
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-    let s = shutdown.clone();
-    let c = client.clone();
-    let dlq_main_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<DlqOrder>(RejectHandler, ConsumerOptions::new(s))
-            .await
-    });
-
-    // DLQ consumer — calls handle_dead for each dead-lettered message
-    let c = client.clone();
-    let dlq_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run_dlq::<DlqOrder>(RejectHandler)
-            .await
-    });
-
-    let s = shutdown.clone();
-    let c = client.clone();
-    let retry_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<RetryOrder>(RetryHandler, ConsumerOptions::new(s).with_max_retries(3))
-            .await
-    });
-
-    let s = shutdown.clone();
-    let c = client.clone();
-    let defer_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<ScheduledOrder>(DeferHandler, ConsumerOptions::new(s))
-            .await
-    });
-
-    // ── Let everything run, then shut down ──
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    println!("\nshutting down...");
-    shutdown.cancel();
-    client.shutdown().await;
-
-    let _ = tokio::join!(
-        minimal_task,
-        dlq_main_task,
-        dlq_task,
-        retry_task,
-        defer_task
-    );
     println!("done");
-
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

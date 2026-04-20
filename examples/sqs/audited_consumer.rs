@@ -1,20 +1,18 @@
 //! Audited consumer example — custom `AuditHandler` that writes to stdout (SQS backend).
 //!
-//! Demonstrates: `Audited` wrapper, custom `AuditHandler` implementation,
-//! trace ID propagation across retries.
+//! Demonstrates: `MessageHandlerExt::audited` wrapper, custom `AuditHandler`
+//! implementation, trace ID propagation across retries.
 //!
 //! Requires a running LocalStack instance (see docker-compose.yml):
 //!
 //!     docker compose up -d
 //!     cargo run --example sqs_audited_consumer --features aws-sns-sqs,audit
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::sns::*;
+use shove::sns::SnsConfig;
 use shove::*;
-use tokio_util::sync::CancellationToken;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -61,6 +59,7 @@ impl MessageHandler<Payments> for PaymentHandler {
 // ─── Custom audit handler ───────────────────────────────────────────────────
 
 /// Prints every audit record to stdout as JSON.
+#[derive(Clone, Default)]
 struct StdoutAuditHandler;
 
 impl AuditHandler<Payments> for StdoutAuditHandler {
@@ -96,23 +95,18 @@ async fn main() -> Result<(), ShoveError> {
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     }
 
-    let config = SnsConfig {
+    let broker = Broker::<Sqs>::new(SnsConfig {
         region: Some("us-east-1".into()),
         endpoint_url: Some("http://localhost:4566".into()),
-    };
-    let client = SnsClient::new(&config).await?;
-
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
+    })
+    .await?;
 
     // ── Declare topology ──
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
-    declare_topic::<Payments>(&declarer).await?;
+    broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");
 
     // ── Publish a payment ──
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = broker.publisher().await?;
     let event = PaymentEvent {
         payment_id: "PAY-001".into(),
         amount_cents: 4999,
@@ -122,28 +116,27 @@ async fn main() -> Result<(), ShoveError> {
 
     // ── Start audited consumer ──
     //
-    // Wrap the handler with `Audited` — the consumer sees a normal
-    // `MessageHandler<Payments>`, no API changes needed.
-    let audited_handler = Audited::new(PaymentHandler, StdoutAuditHandler);
-    let shutdown = CancellationToken::new();
+    // `audited(audit)` wraps the handler in the `Audited` decorator — the
+    // supervisor sees a normal `MessageHandler<Payments>`, no API changes needed.
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor.register::<Payments, _>(
+        PaymentHandler.audited(StdoutAuditHandler),
+        ConsumerOptions::<Sqs>::new().with_max_retries(3),
+    )?;
 
-    let s = shutdown.clone();
-    let c = client.clone();
-    let qr = queue_registry.clone();
-    let consumer_task = tokio::spawn(async move {
-        SqsConsumer::new(c, qr)
-            .run::<Payments>(audited_handler, ConsumerOptions::new(s).with_max_retries(3))
-            .await
-    });
+    // Let it process (first attempt retries, second acks), then shut down.
+    let outcome = supervisor
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-    // ── Let it process (first attempt retries, second acks) ──
-    tokio::time::sleep(Duration::from_secs(15)).await;
-
-    println!("\nshutting down...");
-    shutdown.cancel();
-    client.shutdown().await;
-    let _ = consumer_task.await;
     println!("done");
-
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

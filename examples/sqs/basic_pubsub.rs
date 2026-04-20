@@ -1,8 +1,12 @@
 //! Basic pub/sub examples covering all non-sequenced topology configurations (SQS backend).
 //!
 //! Demonstrates: `define_topic!`, all `Outcome` variants (`Ack`, `Retry`, `Reject`),
-//! `publish`, `publish_with_headers`, `publish_batch`, `run`, `run_dlq`,
-//! and `handle_dead`.
+//! `publish`, `publish_with_headers`, `publish_batch`, and per-topic consumer
+//! registration via `Broker<Sqs>::consumer_supervisor()`.
+//!
+//! Note: the earlier DLQ-consumer demo (`run_dlq::<DlqOrder>`) isn't wired
+//! through the generic `ConsumerSupervisor<B>` wrapper yet — messages that
+//! land in the DLQ here are simply left there for inspection.
 //!
 //! Requires a running LocalStack instance (see docker-compose.yml):
 //!
@@ -10,13 +14,14 @@
 //!     cargo run --example sqs_basic_pubsub --features aws-sns-sqs
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::sns::*;
-use shove::*;
-use tokio_util::sync::CancellationToken;
+use shove::sns::SnsConfig;
+use shove::{
+    Broker, ConsumerOptions, DeadMessageMetadata, MessageHandler, MessageMetadata, Outcome,
+    ShoveError, Sqs, TopologyBuilder, define_topic,
+};
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -146,26 +151,21 @@ async fn main() -> Result<(), ShoveError> {
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     }
 
-    let config = SnsConfig {
+    let broker = Broker::<Sqs>::new(SnsConfig {
         region: Some("us-east-1".into()),
         endpoint_url: Some("http://localhost:4566".into()),
-    };
-    let client = SnsClient::new(&config).await?;
-
-    // ── Registries ──
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
+    })
+    .await?;
 
     // ── Declare all topologies ──
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
-    declare_topic::<MinimalOrder>(&declarer).await?;
-    declare_topic::<DlqOrder>(&declarer).await?;
-    declare_topic::<RetryOrder>(&declarer).await?;
+    let topology = broker.topology();
+    topology.declare::<MinimalOrder>().await?;
+    topology.declare::<DlqOrder>().await?;
+    topology.declare::<RetryOrder>().await?;
     println!("topologies declared\n");
 
     // ── Publish ──
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = broker.publisher().await?;
 
     // Single publish
     let order = OrderEvent {
@@ -207,53 +207,27 @@ async fn main() -> Result<(), ShoveError> {
     println!("messages published\n");
 
     // ── Start consumers ──
-    let shutdown = CancellationToken::new();
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor.register::<MinimalOrder, _>(AckHandler, ConsumerOptions::<Sqs>::new())?;
+    supervisor.register::<DlqOrder, _>(RejectHandler, ConsumerOptions::<Sqs>::new())?;
+    supervisor.register::<RetryOrder, _>(
+        RetryHandler,
+        ConsumerOptions::<Sqs>::new().with_max_retries(3),
+    )?;
 
-    let s = shutdown.clone();
-    let c = client.clone();
-    let qr = queue_registry.clone();
-    let minimal_task = tokio::spawn(async move {
-        SqsConsumer::new(c, qr)
-            .run::<MinimalOrder>(AckHandler, ConsumerOptions::new(s))
-            .await
-    });
+    // Let everything run, then shut down.
+    let outcome = supervisor
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-    let s = shutdown.clone();
-    let c = client.clone();
-    let qr = queue_registry.clone();
-    let dlq_main_task = tokio::spawn(async move {
-        SqsConsumer::new(c, qr)
-            .run::<DlqOrder>(RejectHandler, ConsumerOptions::new(s))
-            .await
-    });
-
-    // DLQ consumer — calls handle_dead for each dead-lettered message.
-    // Uses the client's own shutdown token (cancelled when client.shutdown() is called).
-    let c = client.clone();
-    let qr = queue_registry.clone();
-    let dlq_task = tokio::spawn(async move {
-        SqsConsumer::new(c, qr)
-            .run_dlq::<DlqOrder>(RejectHandler)
-            .await
-    });
-
-    let s = shutdown.clone();
-    let c = client.clone();
-    let qr = queue_registry.clone();
-    let retry_task = tokio::spawn(async move {
-        SqsConsumer::new(c, qr)
-            .run::<RetryOrder>(RetryHandler, ConsumerOptions::new(s).with_max_retries(3))
-            .await
-    });
-
-    // ── Let everything run, then shut down ──
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    println!("\nshutting down...");
-    shutdown.cancel();
-    client.shutdown().await;
-
-    let _ = tokio::join!(minimal_task, dlq_main_task, dlq_task, retry_task);
     println!("done");
-
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

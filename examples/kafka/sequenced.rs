@@ -2,20 +2,20 @@
 //!
 //! Run: cargo run -q --example kafka_sequenced --features kafka
 //! Requires: Kafka broker at localhost:9092
+//!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` / `ConsumerGroup<B>`
+//! wrappers — this example therefore keeps using the backend-specific
+//! `KafkaConsumer::run_fifo` directly.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::consumer::{Consumer, ConsumerOptions};
-use shove::handler::MessageHandler;
-use shove::kafka::{
-    KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisher, KafkaTopologyDeclarer,
+use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisher, KafkaTopologyDeclarer};
+use shove::{
+    ConsumerOptions, Kafka, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
 };
-use shove::metadata::MessageMetadata;
-use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
-use shove::{SequencedTopic, Topic};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let consumer = KafkaConsumer::new(client.clone());
-    let options = ConsumerOptions::new(shutdown);
+    let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown);
     consumer
         .run_fifo::<UserEventTopic>(UserEventHandler, options)
         .await?;

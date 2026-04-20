@@ -3,6 +3,11 @@
 //! Demonstrates: `SqsAutoscaler`, `AutoscalerConfig`, `SqsConsumerGroupRegistry`,
 //! and dynamic scaling of SQS consumer groups based on queue depth.
 //!
+//! Note: the autoscaler + consumer-group registry machinery isn't yet
+//! surfaced on the generic `Broker<Sqs>` wrapper, so this example stays on
+//! the backend-specific `SqsConsumerGroupRegistry` / `SqsAutoscalerBackend`
+//! path (same as the stress harness).
+//!
 //! The autoscaler polls SQS queue attributes on a configurable interval and
 //! scales consumer groups up or down using hysteresis (condition must be
 //! sustained for `hysteresis_duration`) and cooldown (minimum gap between
@@ -102,7 +107,7 @@ async fn main() -> Result<(), ShoveError> {
     // ── Declare topology and publish a burst ──
     let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
         .with_queue_registry(queue_registry.clone());
-    declare_topic::<WorkQueue>(&declarer).await?;
+    declarer.declare(WorkQueue::topology()).await?;
 
     let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
     let burst_size = 60usize;

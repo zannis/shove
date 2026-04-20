@@ -2,18 +2,20 @@
 //!
 //! Run: cargo run -q --example nats_sequenced --features nats
 //! Requires: NATS server with JetStream enabled at localhost:4222
+//!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` / `ConsumerGroup<B>`
+//! wrappers — this example therefore keeps using the backend-specific
+//! `NatsConsumer::run_fifo` directly.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::consumer::{Consumer, ConsumerOptions};
-use shove::handler::MessageHandler;
-use shove::metadata::MessageMetadata;
 use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsPublisher, NatsTopologyDeclarer};
-use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
-use shove::{SequencedTopic, Topic};
+use shove::{
+    ConsumerOptions, MessageHandler, MessageMetadata, Nats, Outcome, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let consumer = NatsConsumer::new(client.clone());
-    let options = ConsumerOptions::new(shutdown);
+    let options = ConsumerOptions::<Nats>::new().with_shutdown(shutdown);
     consumer
         .run_fifo::<UserEventTopic>(UserEventHandler, options)
         .await?;

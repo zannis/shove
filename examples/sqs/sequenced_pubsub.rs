@@ -3,6 +3,10 @@
 //! Demonstrates: `define_sequenced_topic!`, `SequenceFailure::Skip` vs
 //! `SequenceFailure::FailAll`, `run_fifo`, and custom `routing_shards`.
 //!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` wrappers — this example
+//! therefore keeps using the backend-specific `SqsConsumer::run_fifo` directly.
+//!
 //! Each handler sums the `amount_cents` of successfully processed messages per
 //! account. After shutdown the totals are compared against expected values to
 //! verify that the failure policies work correctly.
@@ -27,8 +31,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use shove::sns::*;
-use shove::*;
+use shove::sns::{
+    QueueRegistry, SnsClient, SnsConfig, SnsPublisher, SnsTopologyDeclarer, SqsConsumer,
+    TopicRegistry,
+};
+use shove::{
+    ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure, SequencedTopic,
+    ShoveError, Sqs, Topic, TopologyBuilder, define_sequenced_topic,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -43,8 +53,6 @@ struct LedgerEntry {
 
 // ─── Topic definitions ──────────────────────────────────────────────────────
 
-// Skip policy: if one entry fails, DLQ it and continue the sequence.
-// Good for independent events that happen to need ordering (e.g. audit logs).
 define_sequenced_topic!(
     SkipLedger,
     LedgerEntry,
@@ -57,8 +65,6 @@ define_sequenced_topic!(
         .build()
 );
 
-// FailAll policy: if one entry fails, DLQ it AND all subsequent entries for
-// the same key. Good for causally dependent sequences (e.g. financial ledger).
 define_sequenced_topic!(
     StrictLedger,
     LedgerEntry,
@@ -75,8 +81,6 @@ define_sequenced_topic!(
 
 type Totals = Arc<Mutex<HashMap<String, i64>>>;
 
-// Rejects ACC-A seq 3 to demonstrate failure policies.
-// Sums amount_cents per account for successfully acked messages.
 struct LedgerHandler {
     label: &'static str,
     totals: Totals,
@@ -167,8 +171,8 @@ async fn main() -> Result<(), ShoveError> {
     // ── Declare topologies ──
     let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
         .with_queue_registry(queue_registry.clone());
-    declare_topic::<SkipLedger>(&declarer).await?;
-    declare_topic::<StrictLedger>(&declarer).await?;
+    declarer.declare(SkipLedger::topology()).await?;
+    declarer.declare(StrictLedger::topology()).await?;
     println!("sequenced topologies declared\n");
 
     // ── Publish ordered entries for account ACC-A ──
@@ -185,7 +189,6 @@ async fn main() -> Result<(), ShoveError> {
     }
     println!("published 5 entries per topic for ACC-A");
 
-    // Also publish for an independent account to show cross-key concurrency.
     for seq in 1..=3 {
         let entry = LedgerEntry {
             account_id: "ACC-B".into(),
@@ -215,7 +218,8 @@ async fn main() -> Result<(), ShoveError> {
         SqsConsumer::new(c, qr)
             .run_fifo::<SkipLedger>(
                 handler,
-                ConsumerOptions::new(s)
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(s)
                     .with_max_retries(2)
                     .with_prefetch_count(8),
             )
@@ -234,7 +238,8 @@ async fn main() -> Result<(), ShoveError> {
         SqsConsumer::new(c, qr)
             .run_fifo::<StrictLedger>(
                 handler,
-                ConsumerOptions::new(s)
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(s)
                     .with_max_retries(2)
                     .with_prefetch_count(8),
             )
