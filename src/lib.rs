@@ -69,11 +69,23 @@ pub use audit::{AuditLog, ShoveAuditHandler};
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
-// Backend re-exports
+// Backend re-exports — marker + config + management types only.
+// Old per-backend publisher/consumer/consumer-group/autoscaler/topology
+// types are now pub(crate) — users go through `Broker<B>` / `Publisher<B>` /
+// `ConsumerSupervisor<B>` / `ConsumerGroup<B>` / `TopologyDeclarer<B>` /
+// `Autoscaler<B>` (see DESIGN_V2 §11.4).
+//
+// Exception: types named by existing integration tests remain `pub` until
+// tests migrate to the generic API. See Phase 11.4 caveat in the plan.
 #[cfg(feature = "pub-aws-sns")]
 pub mod sns {
+    pub use crate::backends::sns::client::SnsConfig;
+    pub use crate::markers::Sqs;
+
+    // Kept pub because `tests/sns_integration.rs` and `tests/sns_sqs_integration.rs`
+    // use the inherent `SnsTopologyDeclarer` and associated registry types.
     pub use crate::backends::sns::{
-        client::{SnsClient, SnsConfig},
+        client::SnsClient,
         publisher::SnsPublisher,
         topology::{SnsTopologyDeclarer, TopicRegistry},
     };
@@ -91,22 +103,30 @@ pub mod sns {
 
 #[cfg(feature = "nats")]
 pub mod nats {
+    pub use crate::backends::nats::NatsConfig;
+    pub use crate::markers::Nats;
+
+    // Kept pub because `tests/nats_integration.rs` uses these types directly.
     pub use crate::backends::nats::autoscaler::{
         JetStreamStatsProvider, NatsQueueStats, NatsQueueStatsProvider,
     };
     pub use crate::backends::nats::{
-        NatsAutoscalerBackend, NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroup,
+        NatsAutoscalerBackend, NatsClient, NatsConsumer, NatsConsumerGroup,
         NatsConsumerGroupConfig, NatsConsumerGroupRegistry, NatsPublisher, NatsTopologyDeclarer,
     };
 }
 
 #[cfg(feature = "kafka")]
 pub mod kafka {
+    pub use crate::backends::kafka::KafkaConfig;
+    pub use crate::markers::Kafka;
+
+    // Kept pub because `tests/kafka_integration.rs` uses these types directly.
     pub use crate::backends::kafka::autoscaler::{
         KafkaLagStatsProvider, KafkaQueueStats, KafkaQueueStatsProvider,
     };
     pub use crate::backends::kafka::{
-        KafkaAutoscalerBackend, KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroup,
+        KafkaAutoscalerBackend, KafkaClient, KafkaConsumer, KafkaConsumerGroup,
         KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry, KafkaPublisher,
         KafkaTopologyDeclarer,
     };
@@ -120,6 +140,9 @@ pub mod kafka {
 /// durability or cross-process delivery.
 #[cfg(feature = "inmemory")]
 pub mod inmemory {
+    pub use crate::markers::InMemory;
+
+    // Kept pub because `tests/inmemory_integration.rs` uses these types directly.
     pub use crate::backends::inmemory::{
         BrokerStatsProvider, DEFAULT_QUEUE_CAPACITY, InMemoryAutoscalerBackend, InMemoryBroker,
         InMemoryConfig, InMemoryConsumer, InMemoryConsumerGroup, InMemoryConsumerGroupConfig,
@@ -130,13 +153,18 @@ pub mod inmemory {
 
 #[cfg(feature = "rabbitmq")]
 pub mod rabbitmq {
+    pub use crate::backends::rabbitmq::client::RabbitMqConfig;
+    pub use crate::backends::rabbitmq::management::ManagementConfig;
+    pub use crate::markers::RabbitMq;
+
+    // Kept pub because `tests/rabbitmq_integration.rs` uses these types directly.
     pub use crate::backends::rabbitmq::{
         autoscaler::RabbitMqAutoscalerBackend,
-        client::{RabbitMqClient, RabbitMqConfig},
+        client::RabbitMqClient,
         consumer::RabbitMqConsumer,
         consumer_group::{ConsumerGroup, ConsumerGroupConfig},
         headers::MESSAGE_ID_KEY,
-        management::{ManagementConfig, QueueStats, QueueStatsProvider},
+        management::{QueueStats, QueueStatsProvider},
         publisher::RabbitMqPublisher,
         registry::ConsumerGroupRegistry,
         topology::RabbitMqTopologyDeclarer,
