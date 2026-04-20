@@ -2,12 +2,15 @@
 //! the existing Cargo feature. See DESIGN_V2.md §7.
 
 #[cfg(feature = "kafka")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
 pub struct Kafka;
 
 #[cfg(feature = "nats")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
 pub struct Nats;
 
 #[cfg(feature = "rabbitmq")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
 pub struct RabbitMq;
 
 /// AWS SQS backend marker.
@@ -35,7 +38,9 @@ pub struct RabbitMq;
 /// # }
 /// ```
 #[cfg(feature = "aws-sns-sqs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
 pub struct Sqs;
 
 #[cfg(feature = "inmemory")]
+#[cfg_attr(docsrs, doc(cfg(feature = "inmemory")))]
 pub struct InMemory;

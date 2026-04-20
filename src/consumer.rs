@@ -88,17 +88,20 @@ pub struct ConsumerOptions<B: Backend> {
     /// Opt in via the feature-gated
     /// [`ConsumerOptions::<RabbitMq>::with_exactly_once`] builder.
     #[cfg(feature = "rabbitmq-transactional")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq-transactional")))]
     pub exactly_once: bool,
     /// Number of messages to request per SQS `ReceiveMessage` poll, independent
     /// of how many handlers may run concurrently (`prefetch_count`).
     ///
     /// Zero means "use `prefetch_count`" (the default).
     #[cfg(feature = "aws-sns-sqs")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
     pub receive_batch_size: u16,
     /// Override for JetStream `max_ack_pending` on the durable consumer.
     ///
     /// `None` means use `prefetch_count` (the default for standalone consumers).
     #[cfg(feature = "nats")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
     pub max_ack_pending: Option<i64>,
 
     // Runtime coordination — crate-private.
@@ -260,6 +263,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
 // -- Backend-specific builders ---------------------------------------------
 
 #[cfg(feature = "aws-sns-sqs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
 impl ConsumerOptions<crate::markers::Sqs> {
     /// Number of messages requested per SQS `ReceiveMessage` poll.
     ///
@@ -271,6 +275,7 @@ impl ConsumerOptions<crate::markers::Sqs> {
 }
 
 #[cfg(feature = "nats")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
 impl ConsumerOptions<crate::markers::Nats> {
     /// Override the durable consumer's `max_ack_pending`.
     pub fn with_max_ack_pending(mut self, n: i64) -> Self {
@@ -280,6 +285,7 @@ impl ConsumerOptions<crate::markers::Nats> {
 }
 
 #[cfg(feature = "rabbitmq-transactional")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq-transactional")))]
 impl ConsumerOptions<crate::markers::RabbitMq> {
     /// Enable exactly-once delivery via AMQP transactions.
     ///

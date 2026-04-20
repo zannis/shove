@@ -228,6 +228,7 @@ mod shove_backend {
 }
 
 #[cfg(feature = "audit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "audit")))]
 pub use shove_backend::{AuditLog, ShoveAuditHandler};
 
 #[cfg(test)]

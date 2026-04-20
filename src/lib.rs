@@ -173,17 +173,23 @@ pub use publisher::Publisher;
 pub use topology_declarer::{Topics, TopologyDeclarer};
 
 #[cfg(feature = "inmemory")]
+#[cfg_attr(docsrs, doc(cfg(feature = "inmemory")))]
 pub use markers::InMemory;
 #[cfg(feature = "kafka")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
 pub use markers::Kafka;
 #[cfg(feature = "nats")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
 pub use markers::Nats;
 #[cfg(feature = "rabbitmq")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
 pub use markers::RabbitMq;
 #[cfg(feature = "aws-sns-sqs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
 pub use markers::Sqs;
 
 #[cfg(feature = "audit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "audit")))]
 pub use audit::{AuditLog, ShoveAuditHandler};
 
 /// Grace period for in-flight operations before closing connections.
@@ -199,6 +205,7 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 // Exception: types named by existing integration tests remain `pub` until
 // tests migrate to the generic API. See Phase 11.4 caveat in the plan.
 #[cfg(feature = "pub-aws-sns")]
+#[cfg_attr(docsrs, doc(cfg(feature = "pub-aws-sns")))]
 pub mod sns {
     pub use crate::backends::sns::client::SnsConfig;
     pub use crate::markers::Sqs;
@@ -212,6 +219,7 @@ pub mod sns {
     };
 
     #[cfg(feature = "aws-sns-sqs")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
     pub use crate::backends::sns::{
         autoscaler::SqsAutoscalerBackend,
         consumer::SqsConsumer,
@@ -223,6 +231,7 @@ pub mod sns {
 }
 
 #[cfg(feature = "nats")]
+#[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
 pub mod nats {
     pub use crate::backends::nats::NatsConfig;
     pub use crate::markers::Nats;
@@ -238,6 +247,7 @@ pub mod nats {
 }
 
 #[cfg(feature = "kafka")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
 pub mod kafka {
     pub use crate::backends::kafka::KafkaConfig;
     pub use crate::markers::Kafka;
@@ -260,6 +270,7 @@ pub mod kafka {
 /// (RabbitMQ, Kafka, NATS, SNS/SQS) for production workloads that require
 /// durability or cross-process delivery.
 #[cfg(feature = "inmemory")]
+#[cfg_attr(docsrs, doc(cfg(feature = "inmemory")))]
 pub mod inmemory {
     pub use crate::markers::InMemory;
 
@@ -273,6 +284,7 @@ pub mod inmemory {
 }
 
 #[cfg(feature = "rabbitmq")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
 pub mod rabbitmq {
     pub use crate::backends::rabbitmq::client::RabbitMqConfig;
     pub use crate::backends::rabbitmq::management::ManagementConfig;
