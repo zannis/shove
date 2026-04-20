@@ -1,12 +1,14 @@
 pub mod audit;
 pub mod autoscale_metrics;
 pub mod autoscaler;
+pub mod backend;
 pub mod consumer;
 pub mod consumer_supervisor;
 pub mod error;
 pub mod handler;
 #[doc(hidden)]
 pub mod macros;
+pub mod markers;
 pub mod metadata;
 pub mod outcome;
 pub mod publisher;
@@ -18,6 +20,7 @@ pub(crate) mod retry;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;
+pub use backend::{Backend, capability::HasCoordinatedGroups};
 pub use consumer::{
     Consumer, ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE,
     DEFAULT_MAX_PENDING_PER_KEY,
@@ -40,6 +43,17 @@ pub use autoscaler::{
     Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics,
     ScalingStrategy, Stabilized, ThresholdStrategy,
 };
+
+#[cfg(feature = "inmemory")]
+pub use markers::InMemory;
+#[cfg(feature = "kafka")]
+pub use markers::Kafka;
+#[cfg(feature = "nats")]
+pub use markers::Nats;
+#[cfg(feature = "rabbitmq")]
+pub use markers::RabbitMq;
+#[cfg(feature = "aws-sns-sqs")]
+pub use markers::Sqs;
 
 #[cfg(feature = "audit")]
 pub use audit::{AuditLog, ShoveAuditHandler};
