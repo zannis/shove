@@ -1,0 +1,23 @@
+examples/common/stress_test.rs
+  a7e66bb650d7c23d 3-6,10-11,19-26,497-548,551-557,565-567,579-597,607-612,615,617,620,624,630,633-639,642-740,742,744-745,869,871-872,877-878,880,882,886-945,947-974,978,1006-1007,1021-1023,1025-1036,1038-1064,1066-1094,1098-1099
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "63c6eddaf94e30024d323d80504241e2ed79d8f2",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 386,
+      "total_deletions": 131,
+      "accepted_lines": 25412,
+      "overriden_lines": 0
+    }
+  }
+}
