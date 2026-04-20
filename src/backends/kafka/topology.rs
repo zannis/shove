@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::topology::{QueueTopology, TopologyDeclarer};
+use crate::topology::QueueTopology;
 
 use super::client::KafkaClient;
 
@@ -75,8 +75,8 @@ impl KafkaTopologyDeclarer {
     }
 }
 
-impl TopologyDeclarer for KafkaTopologyDeclarer {
-    async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+impl KafkaTopologyDeclarer {
+    pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {

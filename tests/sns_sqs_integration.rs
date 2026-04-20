@@ -26,7 +26,6 @@ use shove::Broker;
 use shove::Sqs;
 use shove::publisher::Publisher as PublisherV2;
 use shove::sns::{SqsQueueStatsProviderTrait, *};
-use shove::topology::TopologyDeclarer as _;
 use shove::*;
 use std::collections::HashMap;
 use std::future::Future;

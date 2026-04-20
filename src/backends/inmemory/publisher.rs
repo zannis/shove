@@ -131,7 +131,6 @@ mod tests {
     use crate::topology::{QueueTopology, SequenceFailure, TopologyBuilder};
 
     use crate::backends::inmemory::topology::InMemoryTopologyDeclarer as Declarer;
-    use crate::topology::TopologyDeclarer;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Msg {

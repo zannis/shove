@@ -37,8 +37,7 @@ pub use outcome::Outcome;
 use std::time::Duration;
 pub use topic::{SequencedTopic, Topic};
 pub use topology::{
-    HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder, TopologyDeclarer,
-    declare_topic,
+    HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder,
 };
 
 pub use autoscaler::{
@@ -50,7 +49,7 @@ pub use autoscaler::{
 pub use broker::Broker;
 pub use consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 pub use publisher::Publisher;
-pub use topology_declarer::{Topics, TopologyDeclarer as TopologyDeclarerV2}; // temporary name
+pub use topology_declarer::{Topics, TopologyDeclarer};
 
 #[cfg(feature = "inmemory")]
 pub use markers::InMemory;

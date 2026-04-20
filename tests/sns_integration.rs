@@ -19,7 +19,6 @@
 use shove::Broker;
 use shove::Sqs;
 use shove::sns::*;
-use shove::topology::TopologyDeclarer as _;
 use shove::*;
 use std::collections::HashMap;
 use std::sync::Arc;

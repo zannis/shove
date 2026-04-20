@@ -15,7 +15,6 @@ use crate::consumer::{
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::topology::TopologyDeclarer;
 
 use super::client::InMemoryBroker;
 use super::consumer::InMemoryConsumer;

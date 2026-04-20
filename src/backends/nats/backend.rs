@@ -136,7 +136,7 @@ impl ConsumerImpl for NatsConsumer {
 
 impl TopologyImpl for NatsTopologyDeclarer {
     async fn declare<T: Topic>(&self) -> Result<()> {
-        <Self as crate::topology::TopologyDeclarer>::declare(self, T::topology()).await
+        NatsTopologyDeclarer::declare(self, T::topology()).await
     }
 }
 

@@ -149,7 +149,7 @@ impl ConsumerImpl for InMemoryConsumer {
 
 impl TopologyImpl for InMemoryTopologyDeclarer {
     async fn declare<T: Topic>(&self) -> Result<()> {
-        <Self as crate::topology::TopologyDeclarer>::declare(self, T::topology()).await
+        InMemoryTopologyDeclarer::declare(self, T::topology()).await
     }
 }
 

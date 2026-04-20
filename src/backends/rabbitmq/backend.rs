@@ -164,11 +164,7 @@ impl TopologyImpl for LazyRabbitMqTopologyDeclarer {
     async fn declare<T: Topic>(&self) -> Result<()> {
         let channel = self.client.create_channel().await?;
         let declarer = RabbitMqTopologyDeclarer::new(channel);
-        <RabbitMqTopologyDeclarer as crate::topology::TopologyDeclarer>::declare(
-            &declarer,
-            T::topology(),
-        )
-        .await
+        RabbitMqTopologyDeclarer::declare(&declarer, T::topology()).await
     }
 }
 

@@ -139,7 +139,7 @@ impl ConsumerImpl for KafkaConsumer {
 
 impl TopologyImpl for KafkaTopologyDeclarer {
     async fn declare<T: Topic>(&self) -> Result<()> {
-        <Self as crate::topology::TopologyDeclarer>::declare(self, T::topology()).await
+        KafkaTopologyDeclarer::declare(self, T::topology()).await
     }
 }
 

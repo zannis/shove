@@ -144,7 +144,7 @@ impl ConsumerImpl for SqsConsumer {
 
 impl TopologyImpl for SnsTopologyDeclarer {
     async fn declare<T: Topic>(&self) -> Result<()> {
-        <Self as crate::topology::TopologyDeclarer>::declare(self, T::topology()).await
+        SnsTopologyDeclarer::declare(self, T::topology()).await
     }
 }
 

@@ -6,7 +6,7 @@ use tracing::{debug, info};
 
 use crate::backends::sns::client::SnsClient;
 use crate::error::{Result, ShoveError};
-use crate::topology::{QueueTopology, TopologyDeclarer};
+use crate::topology::QueueTopology;
 
 /// Default SQS maxReceiveCount for redrive policies.
 /// Messages that exceed this receive count are moved to the DLQ.
@@ -414,8 +414,8 @@ impl SnsTopologyDeclarer {
     }
 }
 
-impl TopologyDeclarer for SnsTopologyDeclarer {
-    async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+impl SnsTopologyDeclarer {
+    pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         // If the registry already has an ARN for this queue (pre-configured),
         // validate it exists and skip creation.
         if let Some(arn) = self.topic_registry.get(topology.queue()).await {

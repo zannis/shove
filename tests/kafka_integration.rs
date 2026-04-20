@@ -21,7 +21,7 @@ use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
 use shove::topic::Topic as _;
-use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
+use shove::topology::{SequenceFailure, TopologyBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

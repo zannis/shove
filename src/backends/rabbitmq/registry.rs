@@ -8,7 +8,6 @@ use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::topology::TopologyDeclarer;
 
 /// Registry of all [`ConsumerGroup`]s managed by the autoscaler.
 ///

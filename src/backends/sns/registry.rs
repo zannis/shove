@@ -11,7 +11,6 @@ use crate::backends::sns::topology::{QueueRegistry, SnsTopologyDeclarer, TopicRe
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::topology::TopologyDeclarer;
 
 /// Registry of all [`SqsConsumerGroup`]s.
 ///

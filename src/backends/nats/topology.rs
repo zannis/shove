@@ -6,7 +6,7 @@ use async_nats::jetstream::stream::{
 
 use crate::ShoveError;
 use crate::error::Result;
-use crate::topology::{QueueTopology, TopologyDeclarer};
+use crate::topology::QueueTopology;
 
 use super::client::NatsClient;
 
@@ -68,8 +68,8 @@ impl NatsTopologyDeclarer {
     }
 }
 
-impl TopologyDeclarer for NatsTopologyDeclarer {
-    async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+impl NatsTopologyDeclarer {
+    pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {
