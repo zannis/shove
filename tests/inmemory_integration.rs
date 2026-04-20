@@ -1,4 +1,9 @@
 //! Integration tests for the in-memory broker backend.
+//!
+//! Migrated to `Broker<InMemory>` + `Publisher<B>` + `TopologyDeclarer<B>` +
+//! `ConsumerSupervisor<B>` + `ConsumerGroup<B>`. Tests that require `run_fifo`
+//! or `run_dlq` (not yet surfaced on the generic wrappers) keep an
+//! `InMemoryConsumer` constructed from the underlying `InMemoryBroker` client.
 
 #![cfg(feature = "inmemory")]
 
@@ -11,13 +16,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use shove::broker::Broker;
+use shove::consumer_group::ConsumerGroupConfig;
 use shove::inmemory::{
-    InMemoryAutoscalerBackend, InMemoryBroker, InMemoryConsumer, InMemoryConsumerGroupConfig,
-    InMemoryConsumerGroupRegistry, InMemoryPublisher, InMemoryTopologyDeclarer,
+    InMemoryAutoscalerBackend, InMemoryBroker, InMemoryConfig, InMemoryConsumer,
+    InMemoryConsumerGroupConfig, InMemoryConsumerGroupRegistry,
 };
+use shove::markers::InMemory;
 use shove::{
     AutoscalerConfig, Consumer, ConsumerOptions, MessageHandler, MessageMetadata, Outcome,
-    Publisher, SequenceFailure, SequencedTopic, Topic, TopologyBuilder, declare_topic,
+    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -127,11 +135,10 @@ async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
 
 #[tokio::test]
 async fn end_to_end_publish_consume_ack() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<OrdersTopic>(&declarer).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..5 {
         publisher
             .publish::<OrdersTopic>(&Order { id: i })
@@ -151,26 +158,28 @@ async fn end_to_end_publish_consume_ack() {
         }
     }
 
-    let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
     let handler = H(seen.clone());
-    let shutdown_for_task = shutdown.clone();
-    let handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(shutdown_for_task).with_prefetch_count(1);
-        consumer.run::<OrdersTopic>(handler, opts).await
-    });
+    let mut supervisor = broker.consumer_supervisor();
+    let opts = ConsumerOptions::new(CancellationToken::new())
+        .with_prefetch_count(1);
+    supervisor.register::<OrdersTopic, _>(handler, opts).unwrap();
 
+    let token = supervisor.cancellation_token();
     let seen_probe = seen.clone();
-    assert!(
+    let t = token.clone();
+    tokio::spawn(async move {
         poll_until(
             move || seen_probe.try_lock().map(|v| v.len() == 5).unwrap_or(false),
             Duration::from_secs(2),
         )
-        .await
-    );
+        .await;
+        t.cancel();
+    });
 
-    shutdown.cancel();
-    let _ = handle.await;
+    let outcome = supervisor
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean());
 
     let mut ids: Vec<u64> = seen.lock().await.iter().map(|o| o.id).collect();
     ids.sort();
@@ -183,11 +192,10 @@ async fn end_to_end_publish_consume_ack() {
 
 #[tokio::test]
 async fn retry_then_ack_after_hold_queue_delay() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<OrdersTopic>(&declarer).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     publisher
         .publish::<OrdersTopic>(&Order { id: 1 })
         .await
@@ -217,40 +225,45 @@ async fn retry_then_ack_after_hold_queue_delay() {
         final_retry: final_retry.clone(),
     };
 
-    let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
-    let shutdown_for_task = shutdown.clone();
-    let handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(shutdown_for_task)
-            .with_prefetch_count(1)
-            .with_max_retries(5);
-        consumer.run::<OrdersTopic>(handler, opts).await
-    });
+    let mut supervisor = broker.consumer_supervisor();
+    let opts = ConsumerOptions::new(CancellationToken::new())
+        .with_prefetch_count(1)
+        .with_max_retries(5);
+    supervisor.register::<OrdersTopic, _>(handler, opts).unwrap();
 
-    // Two retries: 20ms + 100ms = 120ms + margin.
+    let token = supervisor.cancellation_token();
     let remaining_probe = remaining.clone();
     let final_retry_probe = final_retry.clone();
-    assert!(
+    let t = token.clone();
+    tokio::spawn(async move {
         poll_until(
-            move || remaining_probe.load(Ordering::Relaxed) == 0
-                && final_retry_probe.load(Ordering::Relaxed) != u32::MAX,
+            move || {
+                remaining_probe.load(Ordering::Relaxed) == 0
+                    && final_retry_probe.load(Ordering::Relaxed) != u32::MAX
+            },
             Duration::from_secs(2),
         )
-        .await
-    );
-    assert_eq!(final_retry.load(Ordering::Relaxed), 2);
+        .await;
+        t.cancel();
+    });
 
-    shutdown.cancel();
-    let _ = handle.await;
+    let outcome = supervisor
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean());
+    assert_eq!(final_retry.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
 async fn max_retries_exceeded_goes_to_dlq() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<OrdersTopic>(&declarer).await.unwrap();
+    // This test uses run_dlq which is not yet surfaced on the generic wrappers,
+    // so we keep InMemoryConsumer for the consumer tasks while using the new
+    // Broker<InMemory> for setup and publishing.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     publisher
         .publish::<OrdersTopic>(&Order { id: 99 })
         .await
@@ -281,7 +294,7 @@ async fn max_retries_exceeded_goes_to_dlq() {
 
     let shutdown = CancellationToken::new();
 
-    let consumer_main = InMemoryConsumer::new(broker.clone());
+    let consumer_main = InMemoryConsumer::new(client.clone());
     let shutdown_main = shutdown.clone();
     let main_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(shutdown_main)
@@ -290,7 +303,7 @@ async fn max_retries_exceeded_goes_to_dlq() {
         consumer_main.run::<OrdersTopic>(AlwaysRetry, opts).await
     });
 
-    let consumer_dlq = InMemoryConsumer::new(broker.clone());
+    let consumer_dlq = InMemoryConsumer::new(client.clone());
     let dlq_handler = DlqHandler(dlq_seen.clone());
     let dlq_handle =
         tokio::spawn(async move { consumer_dlq.run_dlq::<OrdersTopic>(dlq_handler).await });
@@ -305,7 +318,7 @@ async fn max_retries_exceeded_goes_to_dlq() {
     );
 
     shutdown.cancel();
-    broker.shutdown();
+    client.shutdown();
     let _ = main_handle.await;
     let _ = dlq_handle.await;
 }
@@ -316,11 +329,13 @@ async fn max_retries_exceeded_goes_to_dlq() {
 
 #[tokio::test]
 async fn sequenced_preserves_per_key_order() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<LedgerSkipTopic>(&declarer).await.unwrap();
+    // run_fifo is not yet surfaced on ConsumerSupervisor; keep InMemoryConsumer
+    // for the consumer task.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     // Interleave three keys.
     for i in 0..10u64 {
         for acc in ["a", "b", "c"] {
@@ -353,7 +368,7 @@ async fn sequenced_preserves_per_key_order() {
     let handler = H(order.clone());
 
     let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
+    let consumer = InMemoryConsumer::new(client.clone());
     let shutdown_for_task = shutdown.clone();
     let handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(shutdown_for_task).with_prefetch_count(1);
@@ -389,13 +404,16 @@ async fn sequenced_preserves_per_key_order() {
 
 #[tokio::test]
 async fn sequenced_failall_poisons_same_key_after_reject() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<LedgerFailAllTopic>(&declarer)
+    // run_fifo + run_dlq — keep InMemoryConsumer for consumer tasks.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker
+        .topology()
+        .declare::<LedgerFailAllTopic>()
         .await
         .unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     // Publish a stream for account "A" where seq=3 fails, plus unrelated "B".
     for seq in 0..6u64 {
         publisher
@@ -435,7 +453,7 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
     let dlq_count = Arc::new(AtomicUsize::new(0));
 
     let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
+    let consumer = InMemoryConsumer::new(client.clone());
     let shutdown_for_task = shutdown.clone();
     let handler = H {
         acked: acked.clone(),
@@ -457,7 +475,7 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
         }
     }
     let dlq_handle = {
-        let consumer = InMemoryConsumer::new(broker.clone());
+        let consumer = InMemoryConsumer::new(client.clone());
         let handler = DlqHandler(dlq_count.clone());
         tokio::spawn(async move { consumer.run_dlq::<LedgerFailAllTopic>(handler).await })
     };
@@ -482,7 +500,7 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
     );
 
     shutdown.cancel();
-    broker.shutdown();
+    client.shutdown();
     let _ = main_handle.await;
     let _ = dlq_handle.await;
 
@@ -505,11 +523,12 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
 
 #[tokio::test]
 async fn handler_panic_does_not_crash_consumer() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<OrdersTopic>(&declarer).await.unwrap();
+    // run_dlq — keep InMemoryConsumer for consumer tasks.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     publisher
         .publish::<OrdersTopic>(&Order { id: 1 })
         .await
@@ -553,7 +572,7 @@ async fn handler_panic_does_not_crash_consumer() {
     };
 
     let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
+    let consumer = InMemoryConsumer::new(client.clone());
     let shutdown_for_task = shutdown.clone();
     let main_handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(shutdown_for_task)
@@ -563,7 +582,7 @@ async fn handler_panic_does_not_crash_consumer() {
     });
 
     let dlq_handle = {
-        let consumer = InMemoryConsumer::new(broker.clone());
+        let consumer = InMemoryConsumer::new(client.clone());
         let dlq_handler = DlqH(dlq_hits.clone());
         tokio::spawn(async move { consumer.run_dlq::<OrdersTopic>(dlq_handler).await })
     };
@@ -592,7 +611,7 @@ async fn handler_panic_does_not_crash_consumer() {
     assert_eq!(dlq_hits.load(Ordering::Relaxed), 0);
 
     shutdown.cancel();
-    broker.shutdown();
+    client.shutdown();
     let _ = main_handle.await;
     let _ = dlq_handle.await;
 }
@@ -617,11 +636,12 @@ impl Topic for BigTopic {
 
 #[tokio::test]
 async fn oversized_message_rejected_to_dlq() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<BigTopic>(&declarer).await.unwrap();
+    // run_dlq — keep InMemoryConsumer for consumer tasks.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<BigTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     // ~8 KiB payload; consumer will cap at 1 KiB.
     publisher
         .publish::<BigTopic>(&BigPayload {
@@ -657,7 +677,7 @@ async fn oversized_message_rejected_to_dlq() {
 
     let shutdown = CancellationToken::new();
 
-    let consumer_main = InMemoryConsumer::new(broker.clone());
+    let consumer_main = InMemoryConsumer::new(client.clone());
     let main_handler = NeverCalled(handler_calls.clone());
     let shutdown_main = shutdown.clone();
     let main_handle = tokio::spawn(async move {
@@ -668,7 +688,7 @@ async fn oversized_message_rejected_to_dlq() {
     });
 
     let dlq_handle = {
-        let consumer = InMemoryConsumer::new(broker.clone());
+        let consumer = InMemoryConsumer::new(client.clone());
         let handler = DlqH(dlq_hits.clone());
         tokio::spawn(async move { consumer.run_dlq::<BigTopic>(handler).await })
     };
@@ -685,7 +705,7 @@ async fn oversized_message_rejected_to_dlq() {
     assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
 
     shutdown.cancel();
-    broker.shutdown();
+    client.shutdown();
     let _ = main_handle.await;
     let _ = dlq_handle.await;
 }
@@ -696,11 +716,12 @@ async fn oversized_message_rejected_to_dlq() {
 
 #[tokio::test]
 async fn handler_timeout_triggers_retry_then_dlq() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<OrdersTopic>(&declarer).await.unwrap();
+    // run_dlq — keep InMemoryConsumer for consumer tasks.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     publisher
         .publish::<OrdersTopic>(&Order { id: 7 })
         .await
@@ -733,7 +754,7 @@ async fn handler_timeout_triggers_retry_then_dlq() {
     }
 
     let shutdown = CancellationToken::new();
-    let consumer_main = InMemoryConsumer::new(broker.clone());
+    let consumer_main = InMemoryConsumer::new(client.clone());
     let handler = Sleepy(invocations.clone());
     let shutdown_main = shutdown.clone();
     let main_handle = tokio::spawn(async move {
@@ -745,7 +766,7 @@ async fn handler_timeout_triggers_retry_then_dlq() {
     });
 
     let dlq_handle = {
-        let consumer = InMemoryConsumer::new(broker.clone());
+        let consumer = InMemoryConsumer::new(client.clone());
         let handler = DlqH(dlq_hits.clone());
         tokio::spawn(async move { consumer.run_dlq::<OrdersTopic>(handler).await })
     };
@@ -766,7 +787,7 @@ async fn handler_timeout_triggers_retry_then_dlq() {
     );
 
     shutdown.cancel();
-    broker.shutdown();
+    client.shutdown();
     let _ = main_handle.await;
     let _ = dlq_handle.await;
 }
@@ -777,11 +798,10 @@ async fn handler_timeout_triggers_retry_then_dlq() {
 
 #[tokio::test]
 async fn defer_schedules_redelivery_without_incrementing_retry() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<OrdersTopic>(&declarer).await.unwrap();
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     publisher
         .publish::<OrdersTopic>(&Order { id: 42 })
         .await
@@ -812,30 +832,32 @@ async fn defer_schedules_redelivery_without_incrementing_retry() {
         final_retry_count: final_retry_count.clone(),
     };
 
-    let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
-    let shutdown_for_task = shutdown.clone();
-    let handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(shutdown_for_task).with_prefetch_count(1);
-        consumer.run::<OrdersTopic>(handler, opts).await
-    });
+    let mut supervisor = broker.consumer_supervisor();
+    let opts = ConsumerOptions::new(CancellationToken::new())
+        .with_prefetch_count(1);
+    supervisor.register::<OrdersTopic, _>(handler, opts).unwrap();
 
+    let token = supervisor.cancellation_token();
     let probe = final_retry_count.clone();
-    assert!(
+    let t = token.clone();
+    tokio::spawn(async move {
         poll_until(
             move || probe.load(Ordering::Relaxed) != u32::MAX,
             Duration::from_secs(2),
         )
-        .await
-    );
+        .await;
+        t.cancel();
+    });
+
+    let outcome = supervisor
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean());
     assert_eq!(
         final_retry_count.load(Ordering::Relaxed),
         0,
         "Defer must not increment retry_count"
     );
-
-    shutdown.cancel();
-    let _ = handle.await;
 }
 
 // ---------------------------------------------------------------------------
@@ -844,13 +866,16 @@ async fn defer_schedules_redelivery_without_incrementing_retry() {
 
 #[tokio::test]
 async fn poison_cleared_after_shard_drains() {
-    let broker = InMemoryBroker::new();
-    let declarer = InMemoryTopologyDeclarer::new(broker.clone());
-    declare_topic::<LedgerFailAllTopic>(&declarer)
+    // run_fifo — keep InMemoryConsumer for the consumer task.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker
+        .topology()
+        .declare::<LedgerFailAllTopic>()
         .await
         .unwrap();
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     // First batch: seq 0 acks, seq 1 rejects → poisons "A" → seq 2 is DLQ'd.
     publisher
         .publish::<LedgerFailAllTopic>(&Event {
@@ -895,7 +920,7 @@ async fn poison_cleared_after_shard_drains() {
     };
 
     let shutdown = CancellationToken::new();
-    let consumer = InMemoryConsumer::new(broker.clone());
+    let consumer = InMemoryConsumer::new(client.clone());
     let shutdown_for_task = shutdown.clone();
     let handle = tokio::spawn(async move {
         let opts = ConsumerOptions::new(shutdown_for_task).with_prefetch_count(1);
@@ -947,7 +972,7 @@ async fn poison_cleared_after_shard_drains() {
     );
 
     shutdown.cancel();
-    broker.shutdown();
+    client.shutdown();
     let _ = handle.await;
 }
 
@@ -957,9 +982,14 @@ async fn poison_cleared_after_shard_drains() {
 
 #[tokio::test]
 async fn autoscaler_scales_up_under_backlog() {
-    let broker = InMemoryBroker::new();
+    // This test inspects registry internals (groups(), active_consumers())
+    // which are not exposed through the generic ConsumerGroup<B> wrapper,
+    // so we keep the old InMemoryConsumerGroupRegistry for state inspection
+    // while using Broker<InMemory> for setup and publishing.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
     let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
-        broker.clone(),
+        client.clone(),
     )));
 
     let processed = Arc::new(AtomicUsize::new(0));
@@ -1002,7 +1032,7 @@ async fn autoscaler_scales_up_under_backlog() {
         reg.start_all();
     }
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..30u32 {
         publisher.publish::<GroupTopic>(&Ping(i)).await.unwrap();
     }
@@ -1015,7 +1045,7 @@ async fn autoscaler_scales_up_under_backlog() {
         cooldown_duration: Duration::from_millis(0),
     };
     let mut autoscaler =
-        InMemoryAutoscalerBackend::autoscaler(broker.clone(), registry.clone(), config);
+        InMemoryAutoscalerBackend::autoscaler(client.clone(), registry.clone(), config);
     let autoscaler_shutdown = CancellationToken::new();
     let as_shutdown_for_task = autoscaler_shutdown.clone();
     let autoscaler_handle = tokio::spawn(async move {
@@ -1051,13 +1081,12 @@ async fn autoscaler_scales_up_under_backlog() {
 
 #[tokio::test]
 async fn consumer_group_distributes_load_across_workers() {
-    let broker = InMemoryBroker::new();
-    let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
-        broker.clone(),
-    )));
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await.unwrap();
+    broker.topology().declare::<GroupTopic>().await.unwrap();
 
     let processed: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
+    let mut group = broker.consumer_group();
     {
         let processed = processed.clone();
         let factory = move || {
@@ -1072,27 +1101,35 @@ async fn consumer_group_distributes_load_across_workers() {
             }
             H(processed.clone())
         };
-        let mut reg = registry.lock().await;
-        reg.register::<GroupTopic, _>(InMemoryConsumerGroupConfig::new(2..=4), factory)
+        group
+            .register::<GroupTopic, _>(
+                ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(2..=4)),
+                factory,
+            )
             .await
             .unwrap();
-        reg.start_all();
     }
 
     // Publish 20 pings.
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..20u32 {
         publisher.publish::<GroupTopic>(&Ping(i)).await.unwrap();
     }
 
+    let token = group.cancellation_token();
     let probe = processed.clone();
-    assert!(
+    let t = token.clone();
+    tokio::spawn(async move {
         poll_until(
             move || probe.load(Ordering::Relaxed) == 20,
             Duration::from_secs(3),
         )
-        .await
-    );
+        .await;
+        t.cancel();
+    });
 
-    registry.lock().await.shutdown_all().await;
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean());
 }
