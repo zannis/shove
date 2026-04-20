@@ -1,0 +1,33 @@
+src/backends/rabbitmq/consumer_group.rs
+  a7e66bb650d7c23d 26,133-138,178
+src/backends/rabbitmq/registry.rs
+  a7e66bb650d7c23d 90-99
+src/backends/rabbitmq/consumer.rs
+  a7e66bb650d7c23d 171,231,661,763,782,920,954,1095,1101,1121,1127,1176,1189
+src/backend/mod.rs
+  a7e66bb650d7c23d 1-44,46-88,90-106,125-287
+src/backends/rabbitmq/mod.rs
+  a7e66bb650d7c23d 2
+src/backends/rabbitmq/backend.rs
+  a7e66bb650d7c23d 1-12,14-18,21-117,144-157,160-171,174-180,182-192,198-284
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "c4155f62a715f233f935106ba626458cab7616e1",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 5624,
+      "total_deletions": 374,
+      "accepted_lines": 264,
+      "overriden_lines": 0
+    }
+  }
+}
