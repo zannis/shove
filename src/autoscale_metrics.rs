@@ -6,6 +6,7 @@ use std::time::Duration;
 /// each backend fills what it can and leaves the rest `None`. Scaling
 /// policies handle the `Option` shape explicitly instead of reading a
 /// field that silently reports zero on a backend that can't compute it.
+#[must_use]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AutoscaleMetrics {
     /// Messages waiting to be delivered. Kafka: consumer lag; SQS:
