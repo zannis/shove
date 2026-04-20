@@ -24,6 +24,7 @@ pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send +
 // NatsConsumerGroupConfig
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct NatsConsumerGroupConfig {
     prefetch_count: u16,
     min_consumers: u16,
@@ -33,6 +34,12 @@ pub struct NatsConsumerGroupConfig {
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
+}
+
+impl Default for NatsConsumerGroupConfig {
+    fn default() -> Self {
+        Self::new(1..=4)
+    }
 }
 
 impl NatsConsumerGroupConfig {
@@ -131,7 +138,7 @@ impl NatsConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let concurrent = config.concurrent_processing;
         let max_ack_pending = if concurrent {
@@ -297,6 +304,17 @@ impl NatsConsumerGroupRegistry {
         }
     }
 
+    /// Return the client's shutdown token.
+    ///
+    /// Used by `RegistryImpl::cancellation_token` and `run_until_timeout`
+    /// to coordinate graceful shutdown with the broker's lifecycle.
+    pub(crate) fn client_shutdown_token(&self) -> CancellationToken {
+        self.client
+            .as_ref()
+            .map(|c| c.shutdown_token())
+            .unwrap_or_default()
+    }
+
     pub async fn register<T, H>(
         &mut self,
         config: NatsConsumerGroupConfig,
@@ -304,7 +322,7 @@ impl NatsConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();

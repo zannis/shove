@@ -110,6 +110,12 @@ mod bounds_smoke {
         _require_has_coordinated_groups::<crate::markers::Kafka>();
     }
 
+    #[cfg(feature = "nats")]
+    fn _anchor_nats() {
+        _require_backend::<crate::markers::Nats>();
+        _require_has_coordinated_groups::<crate::markers::Nats>();
+    }
+
     // Per-method anchoring: exercise every internal trait method once
     // against a concrete implementor so the methods aren't flagged as
     // `dead_code` before Phase 5+ wires the generic wrappers. These

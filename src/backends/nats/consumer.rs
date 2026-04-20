@@ -380,6 +380,7 @@ where
 // NatsConsumer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct NatsConsumer {
     client: NatsClient,
 }
