@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::Topic;
+use crate::backend::PublisherImpl;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 
 use super::client::{Envelope, InMemoryBroker};
 use super::constants::{X_MESSAGE_ID, X_SEQUENCE_KEY};
@@ -57,7 +58,7 @@ impl InMemoryPublisher {
     }
 }
 
-impl Publisher for InMemoryPublisher {
+impl PublisherImpl for InMemoryPublisher {
     async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.publish_one::<T>(message, HashMap::new()).await
     }

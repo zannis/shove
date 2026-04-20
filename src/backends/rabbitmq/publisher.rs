@@ -11,11 +11,12 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::backend::PublisherImpl;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -240,7 +241,7 @@ impl RabbitMqPublisher {
     }
 }
 
-impl Publisher for RabbitMqPublisher {
+impl PublisherImpl for RabbitMqPublisher {
     async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();

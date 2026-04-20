@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::backend::PublisherImpl;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -183,7 +184,7 @@ impl SnsPublisher {
     }
 }
 
-impl Publisher for SnsPublisher {
+impl PublisherImpl for SnsPublisher {
     async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.do_publish::<T>(message, None).await
     }

@@ -5,7 +5,7 @@ use crate::backend::capability::HasCoordinatedGroups;
 use crate::consumer_group::ConsumerGroup;
 use crate::consumer_supervisor::ConsumerSupervisor;
 use crate::error::Result;
-use crate::publisher_wrapper::Publisher;
+use crate::publisher::Publisher;
 use crate::topology_declarer::TopologyDeclarer;
 
 pub struct Broker<B: Backend> {

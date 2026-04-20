@@ -173,6 +173,7 @@ mod shove_backend {
     use serde_json::Value;
 
     use crate::audit::{AuditHandler, AuditRecord};
+    use crate::backend::Backend;
     use crate::define_topic;
     use crate::error::{Result, ShoveError};
     use crate::publisher::Publisher;
@@ -186,22 +187,29 @@ mod shove_backend {
     );
 
     /// An `AuditHandler` that publishes audit records as messages to the
-    /// `shove-audit-log` topic using any `Publisher` implementation.
-    pub struct ShoveAuditHandler<P: Publisher> {
-        publisher: P,
+    /// `shove-audit-log` topic using any backend's `Publisher<B>`.
+    pub struct ShoveAuditHandler<B: Backend> {
+        publisher: Publisher<B>,
     }
 
-    impl<P: Publisher> ShoveAuditHandler<P> {
-        pub fn new(publisher: P) -> Self {
+    impl<B: Backend> ShoveAuditHandler<B> {
+        pub fn new(publisher: Publisher<B>) -> Self {
             Self { publisher }
+        }
+
+        /// Convenience constructor that clones the borrowed publisher.
+        pub fn for_publisher(publisher: &Publisher<B>) -> Self {
+            Self {
+                publisher: publisher.clone(),
+            }
         }
     }
 
-    impl<T, P> AuditHandler<T> for ShoveAuditHandler<P>
+    impl<T, B> AuditHandler<T> for ShoveAuditHandler<B>
     where
         T: Topic,
         T::Message: Serialize,
-        P: Publisher,
+        B: Backend,
     {
         async fn audit(&self, record: &AuditRecord<T::Message>) -> Result<()> {
             let value_record = AuditRecord {

@@ -14,7 +14,7 @@ pub mod markers;
 pub mod metadata;
 pub mod outcome;
 pub mod publisher;
-pub mod publisher_wrapper;
+pub(crate) mod publisher_internal;
 pub mod topic;
 pub mod topology;
 pub mod topology_declarer;
@@ -34,7 +34,6 @@ pub use error::ShoveError;
 pub use handler::MessageHandler;
 pub use metadata::{DeadMessageMetadata, MessageMetadata};
 pub use outcome::Outcome;
-pub use publisher::Publisher;
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 use std::time::Duration;
 pub use topic::{SequencedTopic, Topic};
@@ -51,7 +50,7 @@ pub use autoscaler::{
 // --- v2 generic wrappers (Phase 5) ---
 pub use broker::Broker;
 pub use consumer_group::{ConsumerGroup, ConsumerGroupConfig};
-pub use publisher_wrapper::Publisher as PublisherV2; // temporary name to avoid clash with old trait
+pub use publisher::Publisher;
 pub use topology_declarer::{Topics, TopologyDeclarer as TopologyDeclarerV2}; // temporary name
 
 #[cfg(feature = "inmemory")]

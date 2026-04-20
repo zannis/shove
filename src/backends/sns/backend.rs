@@ -18,16 +18,14 @@
 
 #![cfg(feature = "aws-sns-sqs")]
 
-use std::collections::HashMap;
-use std::future::Future;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, PublisherImpl,
-    QueueStatsProviderImpl, TopologyImpl, sealed,
+    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
+    TopologyImpl, sealed,
 };
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -95,31 +93,6 @@ impl Backend for Sqs {
 
     async fn close(client: &Self::Client) {
         client.shutdown().await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PublisherImpl — delegate to the existing `Publisher` inherent impl
-// ---------------------------------------------------------------------------
-
-impl PublisherImpl for SnsPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
-        <Self as crate::publisher::Publisher>::publish::<T>(self, msg)
-    }
-
-    fn publish_with_headers<T: Topic>(
-        &self,
-        msg: &T::Message,
-        headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        <Self as crate::publisher::Publisher>::publish_with_headers::<T>(self, msg, headers)
-    }
-
-    fn publish_batch<T: Topic>(
-        &self,
-        msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
-        <Self as crate::publisher::Publisher>::publish_batch::<T>(self, msgs)
     }
 }
 

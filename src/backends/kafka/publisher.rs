@@ -6,8 +6,9 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use uuid::Uuid;
 
 use crate::ShoveError;
+use crate::backend::PublisherImpl;
 use crate::error::Result;
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -98,7 +99,7 @@ impl KafkaPublisher {
     }
 }
 
-impl Publisher for KafkaPublisher {
+impl PublisherImpl for KafkaPublisher {
     async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();

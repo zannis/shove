@@ -10,14 +10,13 @@
 //! `inmemory` feature at the parent (`crate::backends`); no per-file cfg
 //! is needed here.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, PublisherImpl,
-    QueueStatsProviderImpl, RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
+    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
+    RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
 };
 use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::Result;
@@ -99,31 +98,6 @@ impl HasCoordinatedGroups for InMemory {
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl {
         InMemoryConsumerGroupRegistry::new(client.clone())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PublisherImpl — delegate to the existing `Publisher` inherent impl
-// ---------------------------------------------------------------------------
-
-impl PublisherImpl for InMemoryPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
-        <Self as crate::publisher::Publisher>::publish::<T>(self, msg)
-    }
-
-    fn publish_with_headers<T: Topic>(
-        &self,
-        msg: &T::Message,
-        headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        <Self as crate::publisher::Publisher>::publish_with_headers::<T>(self, msg, headers)
-    }
-
-    fn publish_batch<T: Topic>(
-        &self,
-        msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
-        <Self as crate::publisher::Publisher>::publish_batch::<T>(self, msgs)
     }
 }
 
