@@ -41,47 +41,6 @@ impl SupervisorOutcome {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clean_outcome_has_exit_code_zero() {
-        assert_eq!(SupervisorOutcome::default().exit_code(), 0);
-        assert!(SupervisorOutcome::default().is_clean());
-    }
-
-    #[test]
-    fn errors_produce_exit_code_one() {
-        let o = SupervisorOutcome {
-            errors: 3,
-            panics: 0,
-            timed_out: false,
-        };
-        assert_eq!(o.exit_code(), 1);
-    }
-
-    #[test]
-    fn panics_outrank_errors() {
-        let o = SupervisorOutcome {
-            errors: 3,
-            panics: 1,
-            timed_out: false,
-        };
-        assert_eq!(o.exit_code(), 2);
-    }
-
-    #[test]
-    fn timeout_outranks_everything() {
-        let o = SupervisorOutcome {
-            errors: 3,
-            panics: 1,
-            timed_out: true,
-        };
-        assert_eq!(o.exit_code(), 3);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // ConsumerSupervisor<B, Ctx>
 // ---------------------------------------------------------------------------
@@ -195,5 +154,46 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_outcome_has_exit_code_zero() {
+        assert_eq!(SupervisorOutcome::default().exit_code(), 0);
+        assert!(SupervisorOutcome::default().is_clean());
+    }
+
+    #[test]
+    fn errors_produce_exit_code_one() {
+        let o = SupervisorOutcome {
+            errors: 3,
+            panics: 0,
+            timed_out: false,
+        };
+        assert_eq!(o.exit_code(), 1);
+    }
+
+    #[test]
+    fn panics_outrank_errors() {
+        let o = SupervisorOutcome {
+            errors: 3,
+            panics: 1,
+            timed_out: false,
+        };
+        assert_eq!(o.exit_code(), 2);
+    }
+
+    #[test]
+    fn timeout_outranks_everything() {
+        let o = SupervisorOutcome {
+            errors: 3,
+            panics: 1,
+            timed_out: true,
+        };
+        assert_eq!(o.exit_code(), 3);
     }
 }

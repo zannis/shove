@@ -1,11 +1,32 @@
 //! Integration tests for the SNS/SQS pub-sub backend.
 //!
+//! Migrated to `Broker<Sqs>` + `Publisher<Sqs>` + `TopologyDeclarer<Sqs>` +
+//! `ConsumerSupervisor<Sqs>`. SQS does **not** implement
+//! `HasCoordinatedGroups`, so tests that exercise the SQS-specific
+//! `SqsConsumerGroup[Registry]` / `SqsAutoscalerBackend` plumbing stay on the
+//! old API surface — the old types are still `pub` re-exports.
+//!
+//! Tests that need direct access to the queue URLs (e.g. to drive raw SQS
+//! sends, receive from DLQs, or hand the registry to `SqsConsumer::new` for
+//! bespoke consumer runs) keep using an external [`TopicRegistry`] /
+//! [`QueueRegistry`] populated via the inherent `SnsTopologyDeclarer`; the
+//! broker's client-owned registries are `pub(crate)` and so not visible from
+//! tests. Topology is therefore declared through **both** paths: once via
+//! `broker.topology()` (populates the client-owned registries used by
+//! `Publisher<Sqs>`) and once via a test-owned `SnsTopologyDeclarer`
+//! (populates the external registries queried by the test body). SNS/SQS
+//! topology creation is idempotent so the double declaration is safe.
+//!
 //! Each test spins up a fresh LocalStack container via testcontainers, runs
 //! the test, and drops the container on completion (automatic cleanup).
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
+use shove::Broker;
+use shove::Sqs;
+use shove::publisher_wrapper::Publisher as PublisherV2;
 use shove::sns::{SqsQueueStatsProviderTrait, *};
+use shove::topology::TopologyDeclarer as _;
 use shove::*;
 use std::collections::HashMap;
 use std::future::Future;
@@ -159,12 +180,23 @@ impl TestBroker {
 // ---------------------------------------------------------------------------
 // TestSetup — creates a fully wired SNS/SQS setup
 // ---------------------------------------------------------------------------
+//
+// Exposes:
+//   - `sns_client`         — raw client for bespoke consumer construction
+//   - `broker`             — `Broker<Sqs>::from_client(sns_client.clone())`
+//   - `topic_registry`/`queue_registry` — external registries populated in
+//     parallel via `SnsTopologyDeclarer` so tests can look up topic ARNs and
+//     queue URLs (the client-owned registries are `pub(crate)`).
+//   - `publisher`          — `Publisher<Sqs>` built via `broker.publisher()`,
+//     resolving ARNs against the client-owned registry populated by
+//     `broker.topology()`.
 
 struct TestSetup {
     sns_client: SnsClient,
+    broker: Broker<Sqs>,
     topic_registry: Arc<TopicRegistry>,
     queue_registry: Arc<QueueRegistry>,
-    publisher: SnsPublisher,
+    publisher: PublisherV2<Sqs>,
 }
 
 impl TestSetup {
@@ -175,31 +207,44 @@ impl TestSetup {
             .await
             .expect("failed to create SNS client");
 
+        let broker = Broker::<Sqs>::from_client(sns_client.clone());
         let topic_registry = Arc::new(TopicRegistry::new());
         let queue_registry = Arc::new(QueueRegistry::new());
 
-        let publisher = SnsPublisher::new(sns_client.clone(), topic_registry.clone());
+        let publisher = broker.publisher().await.expect("publisher construction");
 
         Self {
             sns_client,
+            broker,
             topic_registry,
             queue_registry,
             publisher,
         }
     }
 
-    /// Returns an `SnsTopologyDeclarer` with queue registry attached.
-    fn declarer(&self) -> SnsTopologyDeclarer {
+    /// Returns an external `SnsTopologyDeclarer` wired to `topic_registry`
+    /// and `queue_registry` — used to populate the test-visible registries
+    /// alongside the broker-owned ones.
+    fn external_declarer(&self) -> SnsTopologyDeclarer {
         SnsTopologyDeclarer::new(self.sns_client.clone(), self.topic_registry.clone())
             .with_queue_registry(self.queue_registry.clone())
     }
 
-    /// Declare the full topology for topic `T`.
+    /// Declare the full topology for topic `T` via both the broker (populates
+    /// the client-owned registry used by `self.publisher`) and the external
+    /// declarer (populates `self.topic_registry` and `self.queue_registry`).
+    /// SNS/SQS topology creation is idempotent so this is safe to call
+    /// repeatedly.
     async fn declare<T: Topic>(&self) {
-        self.declarer()
+        self.broker
+            .topology()
+            .declare::<T>()
+            .await
+            .expect("broker topology declaration should succeed");
+        self.external_declarer()
             .declare(T::topology())
             .await
-            .expect("topology declaration should succeed");
+            .expect("external topology declaration should succeed");
     }
 }
 
@@ -461,17 +506,18 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
 
 #[tokio::test]
 async fn client_connect_and_shutdown() {
-    let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
+    let tb = TestBroker::start().await;
+    let client = SnsClient::new(&tb.sns_config())
         .await
         .expect("client should connect");
+    let broker = Broker::<Sqs>::from_client(client.clone());
 
     assert!(
         !client.shutdown_token().is_cancelled(),
         "shutdown token should not be cancelled before shutdown"
     );
 
-    client.shutdown().await;
+    broker.close().await;
 
     assert!(
         client.shutdown_token().is_cancelled(),
@@ -481,15 +527,16 @@ async fn client_connect_and_shutdown() {
 
 #[tokio::test]
 async fn client_shutdown_cancels_token() {
-    let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
+    let tb = TestBroker::start().await;
+    let client = SnsClient::new(&tb.sns_config())
         .await
         .expect("client should connect");
+    let broker = Broker::<Sqs>::from_client(client.clone());
 
     let token = client.shutdown_token();
     assert!(!token.is_cancelled());
 
-    client.shutdown().await;
+    broker.close().await;
     assert!(token.is_cancelled());
 }
 
@@ -1865,7 +1912,8 @@ async fn registry_register_declares_topology_and_starts() {
         .await
         .expect("register should succeed");
 
-    // Topology should now be declared.
+    // Topology should now be declared on the external registries (populated
+    // by `SqsConsumerGroupRegistry.register`).
     assert!(
         setup.topic_registry.get("sqs-work").await.is_some(),
         "topic_registry should have 'sqs-work' entry"
@@ -1874,6 +1922,17 @@ async fn registry_register_declares_topology_and_starts() {
         setup.queue_registry.get("sqs-work").await.is_some(),
         "queue_registry should have 'sqs-work' entry"
     );
+
+    // `setup.publisher` (a `Publisher<Sqs>`) resolves ARNs against the
+    // client-owned registry, which the registry above did NOT populate.
+    // Declare through the broker to populate it — SNS topic creation is
+    // idempotent.
+    setup
+        .broker
+        .topology()
+        .declare::<WorkTopic>()
+        .await
+        .expect("broker topology declaration should succeed");
 
     // Publish 1 message before starting.
     let msg = SimpleMessage {
