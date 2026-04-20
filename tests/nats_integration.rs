@@ -1,3 +1,10 @@
+//! Integration tests for the NATS backend.
+//!
+//! Migrated to `Broker<Nats>` + `Publisher<B>` + `TopologyDeclarer<B>` +
+//! `ConsumerGroup<B>`. Tests that require `run`/`run_fifo`/`run_dlq` (not yet
+//! surfaced on the generic wrappers) keep a `NatsConsumer` constructed from
+//! the underlying `NatsClient`.
+
 #![cfg(feature = "nats")]
 
 use std::collections::HashMap;
@@ -7,19 +14,18 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use shove::SequencedTopic as _;
+use shove::broker::Broker;
 use shove::consumer::{Consumer, ConsumerOptions};
+use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
+use shove::markers::Nats;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
-use shove::nats::{
-    NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroup, NatsConsumerGroupConfig,
-    NatsPublisher, NatsTopologyDeclarer,
-};
+use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
 use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
+use shove::topology::{SequenceFailure, TopologyBuilder};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::nats::{Nats, NatsServerCmd};
+use testcontainers_modules::nats::{Nats as NatsContainer, NatsServerCmd};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -126,14 +132,14 @@ shove::define_sequenced_topic!(
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
-    container: testcontainers::ContainerAsync<Nats>,
-    nats_url: String,
+    _container: testcontainers::ContainerAsync<NatsContainer>,
+    client: NatsClient,
 }
 
 impl TestBroker {
     async fn start() -> Self {
         let cmd = NatsServerCmd::default().with_jetstream();
-        let container = Nats::default()
+        let container = NatsContainer::default()
             .with_cmd(&cmd)
             .start()
             .await
@@ -145,41 +151,23 @@ impl TestBroker {
             .expect("failed to get NATS port");
         let nats_url = format!("nats://{host}:{port}");
 
+        let client = NatsClient::connect_with_retry(&NatsConfig::new(&nats_url), 10)
+            .await
+            .expect("failed to connect to NATS");
+
         Self {
-            container,
-            nats_url,
+            _container: container,
+            client,
         }
     }
 
-    async fn connect(&self) -> NatsClient {
-        NatsClient::connect_with_retry(&NatsConfig::new(&self.nats_url), 10)
-            .await
-            .expect("failed to connect to NATS")
+    fn broker(&self) -> Broker<Nats> {
+        Broker::<Nats>::from_client(self.client.clone())
     }
 
-    async fn stop(self) {
-        self.container
-            .stop_with_timeout(Some(0))
-            .await
-            .expect("failed to stop container");
-        self.container
-            .rm()
-            .await
-            .expect("failed to remove container");
+    fn client(&self) -> NatsClient {
+        self.client.clone()
     }
-}
-
-async fn declare<T: shove::topic::Topic>(client: &NatsClient) {
-    NatsTopologyDeclarer::new(client.clone())
-        .declare(T::topology())
-        .await
-        .expect("topology declaration should succeed");
-}
-
-async fn make_publisher(client: &NatsClient) -> NatsPublisher {
-    NatsPublisher::new(client.clone())
-        .await
-        .expect("publisher creation should succeed")
 }
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -344,33 +332,33 @@ impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
 
 #[tokio::test]
 async fn client_connect_and_shutdown() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
 
     assert!(
         !client.shutdown_token().is_cancelled(),
         "shutdown token should not be cancelled before shutdown"
     );
 
-    client.shutdown().await;
+    broker.close().await;
 
     assert!(
         client.shutdown_token().is_cancelled(),
         "shutdown token should be cancelled after shutdown"
     );
-    broker.stop().await;
 }
 
 #[tokio::test]
 async fn client_shutdown_cancels_token() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
+    let tb = TestBroker::start().await;
+    let client = tb.client();
     let token = client.shutdown_token();
     assert!(!token.is_cancelled());
 
-    client.shutdown().await;
+    let broker = tb.broker();
+    broker.close().await;
     assert!(token.is_cancelled());
-    broker.stop().await;
 }
 
 // ===========================================================================
@@ -379,9 +367,10 @@ async fn client_shutdown_cancels_token() {
 
 #[tokio::test]
 async fn topology_declares_standard_stream_and_dlq() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
     // Verify main stream exists
     let stream = client.jetstream().get_stream("nats-work").await;
@@ -391,15 +380,15 @@ async fn topology_declares_standard_stream_and_dlq() {
     let dlq_stream = client.jetstream().get_stream("nats-work-dlq").await;
     assert!(dlq_stream.is_ok(), "DLQ stream should exist");
 
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
 async fn topology_declares_sequenced_stream_with_shards() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<SeqSkipTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
 
     // Verify main stream exists with shard subjects
     let mut stream = client
@@ -423,17 +412,17 @@ async fn topology_declares_sequenced_stream_with_shards() {
     let dlq = client.jetstream().get_stream("nats-seq-skip-dlq").await;
     assert!(dlq.is_ok(), "DLQ stream should exist for sequenced topic");
 
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
 async fn topology_idempotent() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
 
-    declare::<WorkTopic>(&client).await;
-    declare::<WorkTopic>(&client).await; // second call should not fail
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    broker.topology().declare::<WorkTopic>().await.unwrap(); // second call should not fail
 
     let stream = client.jetstream().get_stream("nats-work").await;
     assert!(
@@ -441,8 +430,7 @@ async fn topology_idempotent() {
         "stream should still exist after double declare"
     );
 
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -451,17 +439,19 @@ async fn topology_idempotent() {
 
 #[tokio::test]
 async fn publish_and_consume_simple_message() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "simple-1".into(),
-        content: "hello".into(),
-    })
-    .await
-    .expect("publish should succeed");
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "simple-1".into(),
+            content: "hello".into(),
+        })
+        .await
+        .expect("publish should succeed");
 
     let handler = CountingHandler::new();
     let hc = handler.clone();
@@ -483,8 +473,7 @@ async fn publish_and_consume_simple_message() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 1);
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
@@ -500,23 +489,25 @@ async fn publish_and_consume_with_headers() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     let mut headers = HashMap::new();
     headers.insert("x-trace-id".to_string(), "trace-abc-123".to_string());
 
-    pub_.publish_with_headers::<WorkTopic>(
-        &SimpleMessage {
-            id: "hdr-1".into(),
-            content: "with headers".into(),
-        },
-        headers,
-    )
-    .await
-    .expect("publish_with_headers should succeed");
+    publisher
+        .publish_with_headers::<WorkTopic>(
+            &SimpleMessage {
+                id: "hdr-1".into(),
+                content: "with headers".into(),
+            },
+            headers,
+        )
+        .await
+        .expect("publish_with_headers should succeed");
 
     let captured = Arc::new(Mutex::new(HashMap::new()));
     let handler = HeaderCapture(captured.clone());
@@ -551,17 +542,17 @@ async fn publish_and_consume_with_headers() {
         headers_received.get("x-trace-id").map(|s| s.as_str()),
         Some("trace-abc-123"),
     );
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
 async fn publish_and_consume_batch() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     let messages: Vec<SimpleMessage> = (1..=5)
         .map(|i| SimpleMessage {
             id: format!("batch-{i}"),
@@ -569,7 +560,8 @@ async fn publish_and_consume_batch() {
         })
         .collect();
 
-    pub_.publish_batch::<WorkTopic>(&messages)
+    publisher
+        .publish_batch::<WorkTopic>(&messages)
         .await
         .expect("publish_batch should succeed");
 
@@ -593,8 +585,7 @@ async fn publish_and_consume_batch() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 5);
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -603,17 +594,19 @@ async fn publish_and_consume_batch() {
 
 #[tokio::test]
 async fn rejected_message_lands_in_dlq() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "reject-1".into(),
-        content: "reject me".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "reject-1".into(),
+            content: "reject me".into(),
+        })
+        .await
+        .unwrap();
 
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
@@ -642,25 +635,26 @@ async fn rejected_message_lands_in_dlq() {
     );
 
     shutdown.cancel();
-    client.shutdown().await;
+    broker.close().await;
     handle.await.unwrap().ok();
     dlq_handle.await.unwrap().ok();
-    broker.stop().await;
 }
 
 #[tokio::test]
 async fn dlq_consumer_handles_dead_message() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "dlq-test".into(),
-        content: "dead".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "dlq-test".into(),
+            content: "dead".into(),
+        })
+        .await
+        .unwrap();
 
     // Step 1: reject to get message into DLQ
     let shutdown1 = CancellationToken::new();
@@ -690,9 +684,8 @@ async fn dlq_consumer_handles_dead_message() {
     );
     assert_eq!(dlq_handler.counter.get(), 1);
 
-    client.shutdown().await;
+    broker.close().await;
     h2.await.unwrap().ok();
-    broker.stop().await;
 }
 
 // ===========================================================================
@@ -701,17 +694,19 @@ async fn dlq_consumer_handles_dead_message() {
 
 #[tokio::test]
 async fn retry_then_ack_succeeds() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "retry-ack".into(),
-        content: "retry then ack".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "retry-ack".into(),
+            content: "retry then ack".into(),
+        })
+        .await
+        .unwrap();
 
     let handler = RetryThenAckHandler::new(1);
     let counter = handler.counter.clone();
@@ -738,23 +733,24 @@ async fn retry_then_ack_succeeds() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
 async fn max_retries_sends_to_dlq() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "always-retry".into(),
-        content: "exhaust retries".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "always-retry".into(),
+            content: "exhaust retries".into(),
+        })
+        .await
+        .unwrap();
 
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
@@ -785,10 +781,9 @@ async fn max_retries_sends_to_dlq() {
     );
 
     shutdown.cancel();
-    client.shutdown().await;
+    broker.close().await;
     handle.await.unwrap().ok();
     dlq_handle.await.unwrap().ok();
-    broker.stop().await;
 }
 
 // ===========================================================================
@@ -812,17 +807,19 @@ async fn defer_redelivers_message() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "defer-1".into(),
-        content: "defer then ack".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "defer-1".into(),
+            content: "defer then ack".into(),
+        })
+        .await
+        .unwrap();
 
     let counter = WaitableCounter::new();
     let handler = DeferThenAck(counter.clone());
@@ -849,8 +846,7 @@ async fn defer_redelivers_message() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -859,18 +855,19 @@ async fn defer_redelivers_message() {
 
 #[tokio::test]
 async fn concurrent_consume_processes_all_messages() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     let messages: Vec<SimpleMessage> = (1..=10)
         .map(|i| SimpleMessage {
             id: format!("cc-{i}"),
             content: format!("msg {i}"),
         })
         .collect();
-    pub_.publish_batch::<WorkTopic>(&messages).await.unwrap();
+    publisher.publish_batch::<WorkTopic>(&messages).await.unwrap();
 
     let handler = CountingHandler::new();
     let hc = handler.clone();
@@ -892,8 +889,7 @@ async fn concurrent_consume_processes_all_messages() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 10);
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
@@ -913,26 +909,29 @@ async fn concurrent_consume_mixed_outcomes() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..3 {
-        pub_.publish::<WorkTopic>(&SimpleMessage {
-            id: format!("ack-{i}"),
-            content: "ack".into(),
-        })
-        .await
-        .unwrap();
+        publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("ack-{i}"),
+                content: "ack".into(),
+            })
+            .await
+            .unwrap();
     }
     for i in 0..2 {
-        pub_.publish::<WorkTopic>(&SimpleMessage {
-            id: format!("{i}-reject"),
-            content: "reject".into(),
-        })
-        .await
-        .unwrap();
+        publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("{i}-reject"),
+                content: "reject".into(),
+            })
+            .await
+            .unwrap();
     }
 
     let ack_counter = WaitableCounter::new();
@@ -960,23 +959,24 @@ async fn concurrent_consume_mixed_outcomes() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
 async fn graceful_shutdown_drains_inflight() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "drain-1".into(),
-        content: "slow".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "drain-1".into(),
+            content: "slow".into(),
+        })
+        .await
+        .unwrap();
 
     let handler = SlowHandler::new(Duration::from_millis(500));
     let hc = handler.clone();
@@ -1003,8 +1003,7 @@ async fn graceful_shutdown_drains_inflight() {
         handler.counter.get() >= 1,
         "in-flight handler should have completed"
     );
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1027,17 +1026,19 @@ async fn handler_timeout_triggers_retry() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "timeout-1".into(),
-        content: "timeout".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "timeout-1".into(),
+            content: "timeout".into(),
+        })
+        .await
+        .unwrap();
 
     let counter = WaitableCounter::new();
     let handler = TimeoutThenAck(counter.clone());
@@ -1065,8 +1066,7 @@ async fn handler_timeout_triggers_retry() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1075,18 +1075,20 @@ async fn handler_timeout_triggers_retry() {
 
 #[tokio::test]
 async fn sequenced_consume_preserves_order() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<SeqSkipTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..5u64 {
-        pub_.publish::<SeqSkipTopic>(&OrderMessage {
-            order_id: "key-A".into(),
-            amount: i,
-        })
-        .await
-        .unwrap();
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "key-A".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
     }
 
     let handler = OrderRecordingHandler::new();
@@ -1112,8 +1114,7 @@ async fn sequenced_consume_preserves_order() {
     let records = handler.records().await;
     let amounts: Vec<u64> = records.iter().map(|(_, a)| *a).collect();
     assert_eq!(amounts, vec![0, 1, 2, 3, 4], "messages should be in order");
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
@@ -1134,18 +1135,20 @@ async fn sequenced_skip_continues_after_rejection() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<SeqSkipTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..3u64 {
-        pub_.publish::<SeqSkipTopic>(&OrderMessage {
-            order_id: "key-B".into(),
-            amount: i,
-        })
-        .await
-        .unwrap();
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "key-B".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
     }
 
     let counter = WaitableCounter::new();
@@ -1170,30 +1173,32 @@ async fn sequenced_skip_continues_after_rejection() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
 async fn sequenced_multiple_keys_concurrent() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<SeqSkipTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..3u64 {
-        pub_.publish::<SeqSkipTopic>(&OrderMessage {
-            order_id: "alice".into(),
-            amount: i,
-        })
-        .await
-        .unwrap();
-        pub_.publish::<SeqSkipTopic>(&OrderMessage {
-            order_id: "bob".into(),
-            amount: i + 100,
-        })
-        .await
-        .unwrap();
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "alice".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "bob".into(),
+                amount: i + 100,
+            })
+            .await
+            .unwrap();
     }
 
     let handler = OrderRecordingHandler::new();
@@ -1229,8 +1234,7 @@ async fn sequenced_multiple_keys_concurrent() {
         .collect();
     assert_eq!(alice, vec![0, 1, 2], "alice messages should be in order");
     assert_eq!(bob, vec![100, 101, 102], "bob messages should be in order");
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1239,47 +1243,50 @@ async fn sequenced_multiple_keys_concurrent() {
 
 #[tokio::test]
 async fn consumer_group_processes_messages() {
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     let messages: Vec<SimpleMessage> = (1..=5)
         .map(|i| SimpleMessage {
             id: format!("cg-{i}"),
             content: format!("msg {i}"),
         })
         .collect();
-    pub_.publish_batch::<WorkTopic>(&messages).await.unwrap();
+    publisher.publish_batch::<WorkTopic>(&messages).await.unwrap();
 
     let handler = CountingHandler::new();
     let handler_clone = handler.clone();
-    let shutdown = CancellationToken::new();
 
     let config = NatsConsumerGroupConfig::new(2..=2)
         .with_prefetch_count(5)
         .with_max_retries(5);
 
-    let group_token = shutdown.child_token();
-    let mut group = NatsConsumerGroup::new::<WorkTopic, CountingHandler>(
-        "nats-work",
-        config,
-        client.clone(),
-        group_token,
-        move || handler_clone.clone(),
-    );
-    group.start();
+    let mut group = broker.consumer_group();
+    group
+        .register::<WorkTopic, _>(
+            ConsumerGroupConfig::new(config),
+            move || handler_clone.clone(),
+        )
+        .await
+        .unwrap();
 
-    assert!(
-        handler.counter.wait_for(5, Duration::from_secs(30)).await,
-        "consumer group should process all 5 messages"
-    );
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(5, Duration::from_secs(60)).await;
+        t.cancel();
+    });
 
-    shutdown.cancel();
-    group.shutdown().await;
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+
     assert_eq!(handler.counter.get(), 5);
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1291,9 +1298,10 @@ async fn deserialization_failure_rejects_to_dlq() {
     use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
     use futures_util::StreamExt;
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
     // Publish raw invalid JSON directly to the stream
     let mut headers = async_nats::HeaderMap::new();
@@ -1358,8 +1366,7 @@ async fn deserialization_failure_rejects_to_dlq() {
     );
 
     shutdown.cancel();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1382,8 +1389,8 @@ async fn consumer_run_on_undeclared_stream_fails() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
+    let tb = TestBroker::start().await;
+    let client = tb.client();
     let consumer = NatsConsumer::new(client.clone());
     let shutdown = CancellationToken::new();
 
@@ -1392,8 +1399,7 @@ async fn consumer_run_on_undeclared_stream_fails() {
         .await;
 
     assert!(result.is_err(), "run on undeclared stream should fail");
-    client.shutdown().await;
-    broker.stop().await;
+    tb.broker().close().await;
 }
 
 #[tokio::test]
@@ -1406,14 +1412,13 @@ async fn run_dlq_on_topic_without_dlq_fails() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
+    let tb = TestBroker::start().await;
+    let client = tb.client();
     let consumer = NatsConsumer::new(client.clone());
 
     let result = consumer.run_dlq::<NoDlqTopic>(Noop).await;
     assert!(result.is_err(), "run_dlq on topic without DLQ should fail");
-    client.shutdown().await;
-    broker.stop().await;
+    tb.broker().close().await;
 }
 
 #[tokio::test]
@@ -1433,17 +1438,19 @@ async fn defer_without_hold_queues_redelivers() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<DeferNoHoldTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<DeferNoHoldTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<DeferNoHoldTopic>(&SimpleMessage {
-        id: "defer-nohold".into(),
-        content: "test".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<DeferNoHoldTopic>(&SimpleMessage {
+            id: "defer-nohold".into(),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
 
     let counter = WaitableCounter::new();
     let handler = DeferThenAck(counter.clone());
@@ -1465,8 +1472,7 @@ async fn defer_without_hold_queues_redelivers() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
@@ -1490,17 +1496,19 @@ async fn defer_preserves_retry_count() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "defer-retry".into(),
-        content: "test".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "defer-retry".into(),
+            content: "test".into(),
+        })
+        .await
+        .unwrap();
 
     let counter = WaitableCounter::new();
     let retry_counts = Arc::new(Mutex::new(Vec::new()));
@@ -1543,8 +1551,7 @@ async fn defer_preserves_retry_count() {
         "third call (after Defer): retry_count should still be 1"
     );
 
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1555,18 +1562,20 @@ async fn defer_preserves_retry_count() {
 async fn jetstream_stats_provider_reports_pending_messages() {
     use shove::nats::{JetStreamStatsProvider, NatsQueueStatsProvider};
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..5 {
-        pub_.publish::<WorkTopic>(&SimpleMessage {
-            id: format!("stats-{i}"),
-            content: "test".into(),
-        })
-        .await
-        .unwrap();
+        publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("stats-{i}"),
+                content: "test".into(),
+            })
+            .await
+            .unwrap();
     }
 
     let stats_provider = JetStreamStatsProvider::new(client.clone());
@@ -1581,26 +1590,27 @@ async fn jetstream_stats_provider_reports_pending_messages() {
         stats.messages_pending
     );
 
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 #[tokio::test]
 async fn jetstream_stats_provider_reports_zero_after_consumption() {
     use shove::nats::{JetStreamStatsProvider, NatsQueueStatsProvider};
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
+    let publisher = broker.publisher().await.unwrap();
     for i in 0..3 {
-        pub_.publish::<WorkTopic>(&SimpleMessage {
-            id: format!("stats-zero-{i}"),
-            content: "test".into(),
-        })
-        .await
-        .unwrap();
+        publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("stats-zero-{i}"),
+                content: "test".into(),
+            })
+            .await
+            .unwrap();
     }
 
     let handler = CountingHandler::new();
@@ -1643,8 +1653,7 @@ async fn jetstream_stats_provider_reports_zero_after_consumption() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1666,23 +1675,26 @@ async fn handler_panic_does_not_crash_consumer() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<WorkTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "panic-me".into(),
-        content: "boom".into(),
-    })
-    .await
-    .unwrap();
-    pub_.publish::<WorkTopic>(&SimpleMessage {
-        id: "normal".into(),
-        content: "ok".into(),
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "panic-me".into(),
+            content: "boom".into(),
+        })
+        .await
+        .unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "normal".into(),
+            content: "ok".into(),
+        })
+        .await
+        .unwrap();
 
     let counter = WaitableCounter::new();
     let handler = PanicThenAck(counter.clone());
@@ -1709,8 +1721,7 @@ async fn handler_panic_does_not_crash_consumer() {
 
     shutdown.cancel();
     handle.await.unwrap().ok();
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
 
 // ===========================================================================
@@ -1738,17 +1749,19 @@ async fn sequenced_defer_falls_back_to_retry() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = broker.connect().await;
-    declare::<SeqSkipTopic>(&client).await;
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
 
-    let pub_ = make_publisher(&client).await;
-    pub_.publish::<SeqSkipTopic>(&OrderMessage {
-        order_id: "defer-key".into(),
-        amount: 42,
-    })
-    .await
-    .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "defer-key".into(),
+            amount: 42,
+        })
+        .await
+        .unwrap();
 
     let counter = WaitableCounter::new();
     let retry_counts = Arc::new(Mutex::new(Vec::new()));
@@ -1782,6 +1795,5 @@ async fn sequenced_defer_falls_back_to_retry() {
         "second call should have retry_count 1 (Defer became Retry)"
     );
 
-    client.shutdown().await;
-    broker.stop().await;
+    broker.close().await;
 }
