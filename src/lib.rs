@@ -1,3 +1,124 @@
+//! Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS
+//! JetStream, Apache Kafka, or an in-process broker.
+//!
+//! # The `Broker<B>` pattern
+//!
+//! Everything hangs off a single generic hub [`Broker<B>`], parameterised by a
+//! backend marker `B` (one of [`RabbitMq`], [`Sqs`], [`Nats`], [`Kafka`],
+//! [`InMemory`], each gated on its Cargo feature). The marker binds that
+//! backend's client / publisher / consumer / topology / registry types
+//! together; the generic wrappers below delegate through the sealed
+//! [`Backend`] trait.
+//!
+//! ```text
+//! Broker<B>
+//!    ├─ .topology()             → TopologyDeclarer<B>
+//!    ├─ .publisher().await      → Publisher<B>
+//!    ├─ .consumer_supervisor()  → ConsumerSupervisor<B>   (all backends)
+//!    └─ .consumer_group()       → ConsumerGroup<B>        (B: HasCoordinatedGroups)
+//! ```
+//!
+//! # Capability gating
+//!
+//! - **Kafka, RabbitMQ, NATS, InMemory** implement the
+//!   [`HasCoordinatedGroups`] capability trait — they expose
+//!   [`Broker::consumer_group`] for min/max-bounded coordinated groups with
+//!   autoscaling.
+//! - **SQS** does **not**. A "group" on SQS is N parallel independent
+//!   pollers on one queue, which maps to [`ConsumerSupervisor`] (the
+//!   backend-agnostic path available on every `Broker<B>`). Calling
+//!   `consumer_group()` on `Broker<Sqs>` is a compile error.
+//!
+//! # Feature flags
+//!
+//! No features are enabled by default. Enable only what you need.
+//!
+//! | Feature                    | What it enables                                                                             |
+//! |----------------------------|---------------------------------------------------------------------------------------------|
+//! | `inmemory`                 | In-process broker, publisher, consumer, topology, groups, autoscaler (no external broker)   |
+//! | `kafka`                    | Apache Kafka publisher, consumer, topology, consumer groups, autoscaling                    |
+//! | `nats`                     | NATS JetStream publisher, consumer, topology, consumer groups, autoscaling                  |
+//! | `rabbitmq`                 | RabbitMQ publisher, consumer, topology, consumer groups, autoscaling                        |
+//! | `rabbitmq-transactional`   | RabbitMQ exactly-once routing via AMQP transactions (implies `rabbitmq`)                    |
+//! | `pub-aws-sns`              | SNS publisher and topology declaration only                                                 |
+//! | `aws-sns-sqs`              | Full SNS + SQS stack — publisher, SQS consumer, supervisor, autoscaling (implies `pub-aws-sns`) |
+//! | `audit`                    | [`ShoveAuditHandler`] + [`AuditLog`] topic for persisting audit records through any backend |
+//!
+//! # Quickstart
+//!
+//! The example below uses the in-process backend so it needs no external
+//! services. Swap `InMemory` for [`RabbitMq`], [`Sqs`], [`Nats`], or
+//! [`Kafka`] — the topic definition, handler, and every call site stay
+//! identical.
+//!
+//! ```no_run
+//! use serde::{Deserialize, Serialize};
+//! use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
+//! use shove::{
+//!     Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome,
+//!     TopologyBuilder, define_topic,
+//! };
+//! use std::time::Duration;
+//!
+//! #[derive(Debug, Clone, Serialize, Deserialize)]
+//! struct OrderPaid { order_id: String }
+//!
+//! define_topic!(Orders, OrderPaid,
+//!     TopologyBuilder::new("orders").dlq().build());
+//!
+//! struct Handler;
+//! impl MessageHandler<Orders> for Handler {
+//!     type Context = ();
+//!     async fn handle(&self, msg: OrderPaid, _: MessageMetadata, _: &()) -> Outcome {
+//!         println!("paid: {}", msg.order_id);
+//!         Outcome::Ack
+//!     }
+//! }
+//!
+//! # async fn run() -> Result<(), shove::ShoveError> {
+//! let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await?;
+//! broker.topology().declare::<Orders>().await?;
+//!
+//! let publisher = broker.publisher().await?;
+//! publisher.publish::<Orders>(&OrderPaid { order_id: "ORD-1".into() }).await?;
+//!
+//! let mut group = broker.consumer_group();
+//! group
+//!     .register::<Orders, _>(
+//!         ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1)),
+//!         || Handler,
+//!     )
+//!     .await?;
+//!
+//! let outcome = group
+//!     .run_until_timeout(std::future::ready(()), Duration::from_secs(1))
+//!     .await;
+//! std::process::exit(outcome.exit_code());
+//! # }
+//! ```
+//!
+//! # Ergonomics
+//!
+//! - [`MessageHandlerExt::audited`] — fluent audit wrapping:
+//!   `handler.audited(sink)` instead of `Audited::new(handler, sink)`.
+//! - [`TopologyDeclarer::declare_all`] — declare multiple topics in one
+//!   call via tuple arities 1 through 16.
+//! - [`ConsumerOptions::preset`] — shorthand for `new().with_prefetch_count(n)`.
+//! - [`SupervisorOutcome::exit_code`] — canonical process exit code from a
+//!   consumer group or supervisor: `0` clean, `1` any handler error,
+//!   `2` any task panic, `3` drain timeout.
+//!
+//! # See also
+//!
+//! - [`TopologyBuilder`] for hold queues, DLQs, and sequenced routing.
+//! - [`define_topic!`] and [`define_sequenced_topic!`] for the typed-topic
+//!   macros.
+//! - Per-backend modules: [`rabbitmq`], [`sns`], [`nats`], [`kafka`],
+//!   [`inmemory`] — expose the config and client types bound to each
+//!   marker.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 pub mod audit;
 pub mod autoscale_metrics;
 pub mod autoscaler;
