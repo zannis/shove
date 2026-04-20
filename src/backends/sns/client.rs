@@ -1,7 +1,9 @@
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::backends::sns::topology::TopicRegistry;
 use crate::error::Result;
 
 /// AWS SNS connection configuration.
@@ -27,11 +29,18 @@ impl Debug for SnsConfig {
 /// Wraps the AWS SDK `sns::Client` (and optionally `sqs::Client` when the
 /// `aws-sns-sqs` feature is enabled). Both clients are `Clone` and internally
 /// manage HTTP/2 connection pooling.
+///
+/// Also owns the [`TopicRegistry`] (and [`QueueRegistry`] when `aws-sns-sqs`
+/// is enabled) so that `Backend::Client` is self-contained — callers no
+/// longer need to construct or pass registries separately.
 #[derive(Clone)]
 pub struct SnsClient {
     sns_client: aws_sdk_sns::Client,
     #[cfg(feature = "aws-sns-sqs")]
     sqs_client: aws_sdk_sqs::Client,
+    topic_registry: Arc<TopicRegistry>,
+    #[cfg(feature = "aws-sns-sqs")]
+    queue_registry: Arc<crate::backends::sns::topology::QueueRegistry>,
     shutdown_token: CancellationToken,
 }
 
@@ -61,6 +70,9 @@ impl SnsClient {
             sns_client,
             #[cfg(feature = "aws-sns-sqs")]
             sqs_client,
+            topic_registry: Arc::new(TopicRegistry::new()),
+            #[cfg(feature = "aws-sns-sqs")]
+            queue_registry: Arc::new(crate::backends::sns::topology::QueueRegistry::new()),
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -88,6 +100,9 @@ impl SnsClient {
             sns_client,
             #[cfg(feature = "aws-sns-sqs")]
             sqs_client,
+            topic_registry: Arc::new(TopicRegistry::new()),
+            #[cfg(feature = "aws-sns-sqs")]
+            queue_registry: Arc::new(crate::backends::sns::topology::QueueRegistry::new()),
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -101,6 +116,21 @@ impl SnsClient {
     #[cfg(feature = "aws-sns-sqs")]
     pub(crate) fn sqs(&self) -> &aws_sdk_sqs::Client {
         &self.sqs_client
+    }
+
+    /// Client-owned SNS topic-ARN registry.
+    ///
+    /// Shared by every publisher, consumer, and topology declarer built
+    /// from this client so that topology declaration and publish lookups
+    /// agree without external bookkeeping.
+    pub(crate) fn topic_registry(&self) -> &Arc<TopicRegistry> {
+        &self.topic_registry
+    }
+
+    /// Client-owned SQS queue-URL registry.
+    #[cfg(feature = "aws-sns-sqs")]
+    pub(crate) fn queue_registry(&self) -> &Arc<crate::backends::sns::topology::QueueRegistry> {
+        &self.queue_registry
     }
 
     /// Return a clone of the shutdown [`CancellationToken`].

@@ -57,6 +57,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct SqsConsumer {
     client: SnsClient,
     queue_registry: Arc<QueueRegistry>,

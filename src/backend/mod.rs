@@ -122,6 +122,14 @@ mod bounds_smoke {
         _require_has_coordinated_groups::<crate::markers::RabbitMq>();
     }
 
+    // SQS deliberately does NOT implement `HasCoordinatedGroups` — its
+    // "group" is N parallel independent pollers (covered by
+    // `ConsumerSupervisor<Sqs>`). Anchor only the `Backend` bound.
+    #[cfg(feature = "aws-sns-sqs")]
+    fn _anchor_sqs() {
+        _require_backend::<crate::markers::Sqs>();
+    }
+
     // Per-method anchoring: exercise every internal trait method once
     // against a concrete implementor so the methods aren't flagged as
     // `dead_code` before Phase 5+ wires the generic wrappers. These
