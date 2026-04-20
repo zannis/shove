@@ -1,0 +1,97 @@
+src/backends/kafka/autoscaler.rs
+  a7e66bb650d7c23d 272
+src/backends/nats/consumer.rs
+  a7e66bb650d7c23d 400-401
+benches/autoscaler.rs
+  a7e66bb650d7c23d 51
+src/backends/kafka/consumer_group.rs
+  a7e66bb650d7c23d 11
+tests/broker_inmemory.rs
+  a7e66bb650d7c23d 12-14,20-22,31,42-44,51-53,68-70
+src/backends/rabbitmq/consumer.rs
+  a7e66bb650d7c23d 18,1179-1180
+examples/rabbitmq/concurrent_pubsub.rs
+  a7e66bb650d7c23d 109-112,118-121,195-198
+examples/inmemory/audited_consumer.rs
+  a7e66bb650d7c23d 76-78,98
+src/backends/inmemory/consumer.rs
+  a7e66bb650d7c23d 342-348
+src/consumer_group.rs
+  a7e66bb650d7c23d 62,69
+examples/inmemory/consumer_groups.rs
+  a7e66bb650d7c23d 64-66,86
+examples/sqs/concurrent_pubsub.rs
+  a7e66bb650d7c23d 163-166
+src/backends/kafka/consumer.rs
+  a7e66bb650d7c23d 532-533
+src/handler.rs
+  a7e66bb650d7c23d 198-203,208-210,238-243
+src/lib.rs
+  a7e66bb650d7c23d 160
+tests/rabbitmq_integration.rs
+  a7e66bb650d7c23d 1407-1408,1447-1448,1485-1486,1524-1525,1665-1667,1704-1705,1756-1757,1808-1809,2380-2381,2451-2453,2534-2536,2614-2615,2664-2665,2722-2723,2755-2758,2782-2783,2890-2891,2945-2946,2996-2997,3024-3025,3070-3071,3094-3095,3140-3141,3164-3165,3209-3210,3233-3234,3274-3275,3325-3326,3388-3389,3448-3449,3501-3504,3535-3536,3586-3587,3647-3648,3687-3689,3728-3730,3781-3783,3840-3842,3866-3868,3916-3918,3960-3962,4081-4082,4121-4122,4166-4168,4326-4328,4443,4462-4464,4489,4507-4508,4636,4653-4655,4690-4694,4714-4715,4756,4776-4777,4802-4806,4825-4826,4853,4875-4877,4929-4930,4989-4991
+src/backend/mod.rs
+  a7e66bb650d7c23d 49,206-207,268
+tests/nats_integration.rs
+  a7e66bb650d7c23d 464-469,526-531,586-591,634-635,682-684,740-741,782-783,855-856,891-894,904-909,976-981,1023-1028,1093-1094,1142-1147,1210-1215,1262-1267,1312-1315,1326-1328,1387-1392,1506-1510,1530-1535,1599-1600,1696-1701,1787-1788,1857-1862
+src/consumer_supervisor.rs
+  a7e66bb650d7c23d 96-97
+src/backends/inmemory/autoscaler.rs
+  a7e66bb650d7c23d 184
+src/backend/consumer.rs
+  a7e66bb650d7c23d 49
+src/backends/rabbitmq/consumer_group.rs
+  a7e66bb650d7c23d 13
+examples/kafka/sequenced.rs
+  a7e66bb650d7c23d 14-16
+tests/sns_sqs_integration.rs
+  a7e66bb650d7c23d 652-654,710-712,772-774,818-819,873-874,964-965,1012-1013,1085-1086,1151-1153,1193-1194,1251-1253,1324-1325,1390-1392,1470-1471,1562-1563,1642-1644,1713-1715,2057-2058,2422-2425,2506-2507,2591-2592,2676-2677
+src/topology_declarer.rs
+  a7e66bb650d7c23d 60-65
+tests/sns_integration.rs
+  a7e66bb650d7c23d 238-239
+src/backends/sns/consumer.rs
+  a7e66bb650d7c23d 12
+src/backends/sns/consumer_group.rs
+  a7e66bb650d7c23d 13
+examples/inmemory/basic.rs
+  a7e66bb650d7c23d 63-65,88
+examples/common/stress_test.rs
+  a7e66bb650d7c23d 578-580,701-703,946
+src/backends/nats/autoscaler.rs
+  a7e66bb650d7c23d 217
+src/backend/publisher.rs
+  a7e66bb650d7c23d 18
+tests/inmemory_integration.rs
+  a7e66bb650d7c23d 138-140,165-166,168-170,200-202,236-237,240-242,310-311,347-351,389-391,479-481,597-598,704-705,782-783,823-825,860-861,863-865,953-955,1113-1115
+src/backend/autoscaler.rs
+  a7e66bb650d7c23d 20
+src/backends/nats/consumer_group.rs
+  a7e66bb650d7c23d 11
+src/audit.rs
+  a7e66bb650d7c23d 524-529
+src/backends/inmemory/backend.rs
+  a7e66bb650d7c23d 31-33,84-86
+tests/kafka_integration.rs
+  a7e66bb650d7c23d 423-428,485-490,545-550,593-594,641-643,699-700,741-742,814-815,850-853,863-868,935-940,980-982,1063-1064,1112-1117,1180-1185,1232-1237,1282-1285,1296-1298,1386-1391,1455-1456,1518-1523,1655-1660,1745-1750,1865-1866,1935-1940
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "0079e8bfe0b88632568077d1e527ab3d634573ae",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 590,
+      "total_deletions": 266,
+      "accepted_lines": 23241,
+      "overriden_lines": 0
+    }
+  }
+}
