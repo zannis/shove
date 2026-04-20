@@ -1,0 +1,51 @@
+src/backends/sns/autoscaler.rs
+  a7e66bb650d7c23d 205,210
+src/backends/rabbitmq/registry.rs
+  a7e66bb650d7c23d 90-91
+src/backends/inmemory/consumer.rs
+  a7e66bb650d7c23d 37-38,40-43,45-46,54,71,235,295,488,535,695,699,707,721,744
+src/backends/sns/registry.rs
+  a7e66bb650d7c23d 56
+src/backends/kafka/consumer_group.rs
+  a7e66bb650d7c23d 292-293
+src/backends/sns/consumer_group.rs
+  a7e66bb650d7c23d 165
+src/backends/nats/consumer_group.rs
+  a7e66bb650d7c23d 298-299
+src/consumer.rs
+  a7e66bb650d7c23d 159-161,198-200,206-208
+src/backends/nats/consumer.rs
+  a7e66bb650d7c23d 294-295,302,310,396,593-594,597,888
+src/handler.rs
+  a7e66bb650d7c23d 13-17,23,34,50-51,56,58,65,67,101-102,139,147,155,165,168-182
+src/backends/kafka/consumer.rs
+  a7e66bb650d7c23d 404-405,412,420,528,741-742,745,973
+src/backends/inmemory/consumer_group.rs
+  a7e66bb650d7c23d 149,311,350-351
+src/audit.rs
+  a7e66bb650d7c23d 88-95,100,115,162,164,254-255,330-331,334,344,351,358,365,372,380,393,403,419,424,461,477,486,494,503,506
+src/backends/rabbitmq/consumer.rs
+  a7e66bb650d7c23d 170,230,660,762,781,919,953,1094,1100,1120,1126,1175,1183-1185,1188
+src/backends/sns/consumer.rs
+  a7e66bb650d7c23d 171,178,184,199,233,624,655,718,1164,1302,1356,1377,1394-1395,1398,1449
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "a9a1333c8a3f685b880e372d15267e300a06362d",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 22766,
+      "total_deletions": 97,
+      "accepted_lines": 126,
+      "overriden_lines": 0
+    }
+  }
+}

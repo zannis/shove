@@ -1,0 +1,65 @@
+examples/rabbitmq/sequenced_pubsub.rs
+  a7e66bb650d7c23d 97-98,119-120,167-168,220-221,239-240
+examples/inmemory/audited_consumer.rs
+  a7e66bb650d7c23d 37-38,111-112
+examples/rabbitmq/basic_pubsub.rs
+  a7e66bb650d7c23d 10,88-89,104-105,110,124-125,146-147,182-184,187-191,195,237-262,264-265
+examples/inmemory/consumer_groups.rs
+  a7e66bb650d7c23d 35-36,49-56,59-65,68,70,75,78-98,101
+examples/kafka/sequenced.rs
+  a7e66bb650d7c23d 43-44,88
+examples/nats/basic.rs
+  a7e66bb650d7c23d 33-34,47-48,51,62-69,71-81,84
+examples/kafka/basic.rs
+  a7e66bb650d7c23d 33-34,47-48,51,62-69,71-82,85
+examples/sqs/audited_consumer.rs
+  a7e66bb650d7c23d 41-42,62,98,101-102,105,109,119-138,140-141
+examples/sqs/autoscaler.rs
+  a7e66bb650d7c23d 52-53,110
+examples/sqs/concurrent_pubsub.rs
+  a7e66bb650d7c23d 79-80,165-166,170,176,183,186,201,204,227,232-233
+examples/inmemory/basic.rs
+  a7e66bb650d7c23d 36-37,101-102
+examples/sqs/sequenced_pubsub.rs
+  a7e66bb650d7c23d 90-91,112-113,174-175,221-222,241-242
+examples/nats/sequenced.rs
+  a7e66bb650d7c23d 43-44,88
+examples/nats/audited_consumer.rs
+  a7e66bb650d7c23d 41-42,61-63,78-79,83,91,93-114,116-117
+examples/rabbitmq/consumer_groups.rs
+  a7e66bb650d7c23d 58-59
+examples/sqs/basic_pubsub.rs
+  a7e66bb650d7c23d 10,70-71,86-87,92,106-107,154,157-158,161-164,168,210-229,232
+examples/rabbitmq/concurrent_pubsub.rs
+  a7e66bb650d7c23d 82-83,108-109,112-114,116-118,121,134,156-192,204,211,215,229,233,256,261
+examples/sqs/consumer_groups.rs
+  a7e66bb650d7c23d 47-48,105
+examples/kafka/audited_consumer.rs
+  a7e66bb650d7c23d 41-42,61-63,78-79,83,91,93-115,117-118
+examples/rabbitmq/audited_consumer.rs
+  a7e66bb650d7c23d 41-42,62,91-94,98,108-127,129-130
+examples/inmemory/sequenced.rs
+  a7e66bb650d7c23d 57-58,74,85-87
+examples/rabbitmq/exactly_once.rs
+  a7e66bb650d7c23d 82-83,107-108,139-140,145,183-185,188-191,195,229-243,246-256,259
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "4d4cfb78522d5429241fe2b26470f872fe52bbeb",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 877,
+      "total_deletions": 856,
+      "accepted_lines": 667,
+      "overriden_lines": 0
+    }
+  }
+}
