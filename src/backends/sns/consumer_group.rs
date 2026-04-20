@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::consumer::SqsConsumer;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer::ConsumerOptions;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 

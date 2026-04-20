@@ -184,12 +184,12 @@ impl SnsPublisher {
     }
 }
 
-impl PublisherImpl for SnsPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl SnsPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.do_publish::<T>(message, None).await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
@@ -198,7 +198,7 @@ impl PublisherImpl for SnsPublisher {
         self.do_publish::<T>(message, Some(headers)).await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         let key_fn = T::SEQUENCE_KEY_FN;
 
@@ -310,6 +310,30 @@ impl PublisherImpl for SnsPublisher {
 
         debug!(queue_name, count = payloads.len(), "batch published to SNS");
         Ok(())
+    }
+}
+
+impl PublisherImpl for SnsPublisher {
+    fn publish<T: Topic>(
+        &self,
+        msg: &T::Message,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        SnsPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        SnsPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        SnsPublisher::publish_batch::<T>(self, msgs)
     }
 }
 

@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::backends::nats::client::NatsClient;
 use crate::backends::nats::consumer::NatsConsumer;
 use crate::backends::nats::topology::NatsTopologyDeclarer;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer::ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;

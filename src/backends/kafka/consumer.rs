@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer::ConsumerOptions;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -523,8 +523,8 @@ impl KafkaConsumer {
     }
 }
 
-impl Consumer for KafkaConsumer {
-    async fn run<T: Topic>(
+impl KafkaConsumer {
+    pub async fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -741,7 +741,7 @@ impl Consumer for KafkaConsumer {
         .await
     }
 
-    async fn run_fifo<T: SequencedTopic>(
+    pub async fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -899,7 +899,10 @@ impl Consumer for KafkaConsumer {
         .await
     }
 
-    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T, Context = ()>) -> Result<()> {
+    pub async fn run_dlq<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
+    ) -> Result<()> {
         let topology = T::topology();
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())

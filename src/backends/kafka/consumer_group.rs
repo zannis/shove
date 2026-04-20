@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer::ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;

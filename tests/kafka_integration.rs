@@ -11,7 +11,7 @@ use rdkafka::Message;
 use serde::{Deserialize, Serialize};
 use shove::SequencedTopic as _;
 use shove::broker::Broker;
-use shove::consumer::{Consumer, ConsumerOptions};
+use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{

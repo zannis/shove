@@ -115,8 +115,8 @@ impl NatsPublisher {
     }
 }
 
-impl PublisherImpl for NatsPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl NatsPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
@@ -125,7 +125,7 @@ impl PublisherImpl for NatsPublisher {
             .await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
@@ -139,7 +139,7 @@ impl PublisherImpl for NatsPublisher {
             .await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         let prepared: Vec<(String, HeaderMap, Bytes)> = messages
             .iter()
@@ -169,6 +169,30 @@ impl PublisherImpl for NatsPublisher {
         }
 
         Ok(())
+    }
+}
+
+impl PublisherImpl for NatsPublisher {
+    fn publish<T: Topic>(
+        &self,
+        msg: &T::Message,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        NatsPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        NatsPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        NatsPublisher::publish_batch::<T>(self, msgs)
     }
 }
 

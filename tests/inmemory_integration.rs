@@ -24,8 +24,8 @@ use shove::inmemory::{
 };
 use shove::markers::InMemory;
 use shove::{
-    AutoscalerConfig, Consumer, ConsumerOptions, MessageHandler, MessageMetadata, Outcome,
-    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
+    AutoscalerConfig, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------

@@ -99,8 +99,8 @@ impl KafkaPublisher {
     }
 }
 
-impl PublisherImpl for KafkaPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl KafkaPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
@@ -117,7 +117,7 @@ impl PublisherImpl for KafkaPublisher {
         .await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
@@ -139,7 +139,7 @@ impl PublisherImpl for KafkaPublisher {
         .await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         #[allow(clippy::type_complexity)]
         let prepared: Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)> = messages
@@ -168,5 +168,29 @@ impl PublisherImpl for KafkaPublisher {
         }
 
         Ok(())
+    }
+}
+
+impl PublisherImpl for KafkaPublisher {
+    fn publish<T: Topic>(
+        &self,
+        msg: &T::Message,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        KafkaPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        KafkaPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        KafkaPublisher::publish_batch::<T>(self, msgs)
     }
 }

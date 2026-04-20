@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer::ConsumerOptions;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 

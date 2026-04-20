@@ -117,7 +117,7 @@ impl ConsumerImpl for InMemoryConsumer {
         H: MessageHandler<T, Context = ()>,
     {
         let options = options.into_consumer_options();
-        <Self as crate::consumer::Consumer>::run::<T>(self, handler, options).await
+        InMemoryConsumer::run::<T>(self, handler, options).await
     }
 
     async fn run_fifo<T, H>(
@@ -131,7 +131,7 @@ impl ConsumerImpl for InMemoryConsumer {
         H: MessageHandler<T, Context = ()>,
     {
         let options = options.into_consumer_options();
-        <Self as crate::consumer::Consumer>::run_fifo::<T>(self, handler, options).await
+        InMemoryConsumer::run_fifo::<T>(self, handler, options).await
     }
 
     async fn run_dlq<T, H>(&self, handler: H, _ctx: H::Context) -> Result<()>
@@ -139,7 +139,7 @@ impl ConsumerImpl for InMemoryConsumer {
         T: Topic,
         H: MessageHandler<T, Context = ()>,
     {
-        <Self as crate::consumer::Consumer>::run_dlq::<T>(self, handler).await
+        InMemoryConsumer::run_dlq::<T>(self, handler).await
     }
 }
 

@@ -5,8 +5,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, ShoveError};
-use crate::handler::MessageHandler;
-use crate::topic::{SequencedTopic, Topic};
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -246,59 +244,6 @@ impl ConsumerOptions {
         self.exactly_once = true;
         self
     }
-}
-
-/// Consume messages from a topic's queues.
-///
-/// This trait is intentionally **not object-safe** — methods are generic over
-/// `T: Topic`. Backends are always concrete types (e.g., `RabbitMqConsumer`),
-/// not `dyn Consumer`. For test doubles, implement the trait on a mock struct
-/// or use an in-memory backend.
-pub trait Consumer: Send + Sync + 'static {
-    /// Run the consumer loop — the default mode. Blocks until shutdown signal.
-    ///
-    /// Processes up to `prefetch_count` messages concurrently within the same
-    /// consumer task, while **always acknowledging messages in delivery order**.
-    /// Set `prefetch_count = 1` for sequential processing.
-    ///
-    /// This significantly improves throughput for handlers with I/O latency
-    /// (HTTP calls, database queries, etc.) without requiring additional
-    /// consumer instances.
-    fn run<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T, Context = ()>,
-        options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send;
-
-    /// Run the consumer loop with FIFO (per-key ordered) delivery.
-    /// Blocks until shutdown signal.
-    ///
-    /// Messages sharing the same sequence key are delivered in strict order.
-    /// Different sequence keys are independent and may be processed concurrently
-    /// within the same shard.
-    ///
-    /// Each shard prefetches up to `ConsumerOptions::prefetch_count` messages.
-    /// Messages for idle keys are processed immediately; messages for busy keys
-    /// (in-flight handler or awaiting retry) are buffered locally and drained
-    /// sequentially when the key becomes free. This avoids redelivery storms
-    /// while consuming prefetch slots as natural back-pressure.
-    ///
-    /// Returns `Err(ShoveError::Topology)` if `T::topology().sequencing` is `None`.
-    fn run_fifo<T: SequencedTopic>(
-        &self,
-        handler: impl MessageHandler<T, Context = ()>,
-        options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send;
-
-    /// Run a DLQ consumer loop for the topic. Blocks until shutdown signal.
-    ///
-    /// Calls `handler.handle_dead()` for each message, then always acks.
-    ///
-    /// Returns `Err(ShoveError::Topology)` if `T::topology().dlq` is `None`.
-    fn run_dlq<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T, Context = ()>,
-    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[cfg(test)]

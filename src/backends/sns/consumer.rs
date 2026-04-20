@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer::ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -1372,8 +1372,8 @@ where
 // Consumer trait implementation
 // ---------------------------------------------------------------------------
 
-impl Consumer for SqsConsumer {
-    fn run<T: Topic>(
+impl SqsConsumer {
+    pub fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -1394,7 +1394,7 @@ impl Consumer for SqsConsumer {
         }
     }
 
-    fn run_fifo<T: SequencedTopic>(
+    pub fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -1445,7 +1445,7 @@ impl Consumer for SqsConsumer {
         }
     }
 
-    fn run_dlq<T: Topic>(
+    pub fn run_dlq<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
     ) -> impl Future<Output = Result<()>> + Send {

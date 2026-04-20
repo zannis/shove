@@ -130,7 +130,7 @@ impl ConsumerImpl for RabbitMqConsumer {
         H: MessageHandler<T, Context = ()>,
     {
         let options = options.into_consumer_options();
-        <Self as crate::consumer::Consumer>::run::<T>(self, handler, options).await
+        RabbitMqConsumer::run::<T>(self, handler, options).await
     }
 
     async fn run_fifo<T, H>(
@@ -144,7 +144,7 @@ impl ConsumerImpl for RabbitMqConsumer {
         H: MessageHandler<T, Context = ()>,
     {
         let options = options.into_consumer_options();
-        <Self as crate::consumer::Consumer>::run_fifo::<T>(self, handler, options).await
+        RabbitMqConsumer::run_fifo::<T>(self, handler, options).await
     }
 
     async fn run_dlq<T, H>(&self, handler: H, _ctx: H::Context) -> Result<()>
@@ -152,7 +152,7 @@ impl ConsumerImpl for RabbitMqConsumer {
         T: Topic,
         H: MessageHandler<T, Context = ()>,
     {
-        <Self as crate::consumer::Consumer>::run_dlq::<T>(self, handler).await
+        RabbitMqConsumer::run_dlq::<T>(self, handler).await
     }
 }
 

@@ -241,8 +241,8 @@ impl RabbitMqPublisher {
     }
 }
 
-impl PublisherImpl for RabbitMqPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl RabbitMqPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
 
@@ -259,7 +259,7 @@ impl PublisherImpl for RabbitMqPublisher {
         }
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
@@ -285,7 +285,7 @@ impl PublisherImpl for RabbitMqPublisher {
         }
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         let sequencing = topology.sequencing();
         let key_fn = T::SEQUENCE_KEY_FN;
@@ -321,6 +321,30 @@ impl PublisherImpl for RabbitMqPublisher {
                 self.publish_batch_raw("", &items).await
             }
         }
+    }
+}
+
+impl PublisherImpl for RabbitMqPublisher {
+    fn publish<T: Topic>(
+        &self,
+        msg: &T::Message,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        RabbitMqPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        RabbitMqPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        RabbitMqPublisher::publish_batch::<T>(self, msgs)
     }
 }
 

@@ -21,7 +21,7 @@ use crate::backends::rabbitmq::headers::{
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer::ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
@@ -1170,8 +1170,8 @@ where
     }
 }
 
-impl Consumer for RabbitMqConsumer {
-    async fn run<T: Topic>(
+impl RabbitMqConsumer {
+    pub async fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -1184,7 +1184,7 @@ impl Consumer for RabbitMqConsumer {
             .await
     }
 
-    async fn run_fifo<T: SequencedTopic>(
+    pub async fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -1238,7 +1238,10 @@ impl Consumer for RabbitMqConsumer {
         Ok(())
     }
 
-    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T, Context = ()>) -> Result<()> {
+    pub async fn run_dlq<T: Topic>(
+        &self,
+        handler: impl MessageHandler<T, Context = ()>,
+    ) -> Result<()> {
         let topology = T::topology();
         let dlq = topology
             .dlq()

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use shove::broker::Broker;
-use shove::consumer::{Consumer, ConsumerOptions};
+use shove::consumer::ConsumerOptions;
 use shove::handler::MessageHandler;
 use shove::markers::RabbitMq as RabbitMqMarker;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};

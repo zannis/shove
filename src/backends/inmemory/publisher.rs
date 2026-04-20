@@ -58,12 +58,12 @@ impl InMemoryPublisher {
     }
 }
 
-impl PublisherImpl for InMemoryPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl InMemoryPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.publish_one::<T>(message, HashMap::new()).await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
@@ -72,11 +72,35 @@ impl PublisherImpl for InMemoryPublisher {
         self.publish_one::<T>(message, headers).await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         for message in messages {
             self.publish_one::<T>(message, HashMap::new()).await?;
         }
         Ok(())
+    }
+}
+
+impl PublisherImpl for InMemoryPublisher {
+    fn publish<T: Topic>(
+        &self,
+        msg: &T::Message,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        InMemoryPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        InMemoryPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        InMemoryPublisher::publish_batch::<T>(self, msgs)
     }
 }
 

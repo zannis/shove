@@ -12,7 +12,7 @@ use super::constants::{
     X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID, X_ORIGINAL_QUEUE, X_RETRY_COUNT, X_SEQUENCE_KEY,
 };
 use super::topology::InMemoryTopologyDeclarer;
-use crate::consumer::{Consumer, ConsumerOptions, validate_message_size};
+use crate::consumer::{ConsumerOptions, validate_message_size};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -32,8 +32,8 @@ impl InMemoryConsumer {
     }
 }
 
-impl Consumer for InMemoryConsumer {
-    fn run<T: Topic>(
+impl InMemoryConsumer {
+    pub fn run<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -41,7 +41,7 @@ impl Consumer for InMemoryConsumer {
         run_concurrent::<T, _>(self.broker.clone(), handler, options)
     }
 
-    fn run_fifo<T: SequencedTopic>(
+    pub fn run_fifo<T: SequencedTopic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
         options: ConsumerOptions,
@@ -49,7 +49,7 @@ impl Consumer for InMemoryConsumer {
         run_fifo_impl::<T, _>(self.broker.clone(), handler, options)
     }
 
-    fn run_dlq<T: Topic>(
+    pub fn run_dlq<T: Topic>(
         &self,
         handler: impl MessageHandler<T, Context = ()>,
     ) -> impl Future<Output = Result<()>> + Send {
