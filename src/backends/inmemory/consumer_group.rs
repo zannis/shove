@@ -24,6 +24,7 @@ use super::topology::InMemoryTopologyDeclarer;
 pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
 /// Configuration for an [`InMemoryConsumerGroup`].
+#[derive(Clone)]
 pub struct InMemoryConsumerGroupConfig {
     prefetch_count: u16,
     min_consumers: u16,
@@ -32,6 +33,15 @@ pub struct InMemoryConsumerGroupConfig {
     handler_timeout: Option<Duration>,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
+}
+
+impl Default for InMemoryConsumerGroupConfig {
+    /// A single consumer, default tuning. Matches the defaults baked into
+    /// `InMemoryConsumerGroupConfig::new(1..=1)`. Mirrors the
+    /// `HasCoordinatedGroups::ConsumerGroupConfig: Default` bound.
+    fn default() -> Self {
+        Self::new(1..=1)
+    }
 }
 
 impl InMemoryConsumerGroupConfig {
@@ -347,6 +357,17 @@ impl InMemoryConsumerGroupRegistry {
         for group in self.groups.values_mut() {
             group.start();
         }
+    }
+
+    /// Broker-wide shutdown token. Used by the `RegistryImpl::run_until_timeout`
+    /// adapter in `backend.rs` to propagate cancellation deterministically
+    /// when the caller-supplied shutdown signal fires. Returns a fresh
+    /// `CancellationToken` for test-only registries that have no broker.
+    pub(crate) fn broker_shutdown_token(&self) -> CancellationToken {
+        self.broker
+            .as_ref()
+            .map(|b| b.shutdown_token().clone())
+            .unwrap_or_default()
     }
 
     pub fn groups(&self) -> &HashMap<String, InMemoryConsumerGroup> {

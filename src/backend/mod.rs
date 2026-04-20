@@ -63,3 +63,206 @@ pub trait Backend: sealed::Sealed + Sized + Send + Sync + 'static {
     /// after close are no-ops.
     fn close(client: &Self::Client) -> impl Future<Output = ()> + Send;
 }
+
+#[cfg(test)]
+mod bounds_smoke {
+    //! Compile-only assertions that `Backend` and `HasCoordinatedGroups`
+    //! keep their intended bounds, plus a per-method exerciser against
+    //! every `pub(crate) trait Impl` for the InMemory concrete types.
+    //! Does not test behaviour — existence of the body being well-typed
+    //! is the test; the monomorphized functions are never called.
+    //!
+    //! The trait methods themselves keep a narrow `#[allow(dead_code)]`
+    //! on the trait declaration until Phase 5+ wires real call sites
+    //! through `Broker<B>`/`Publisher<B>`/etc.
+
+    use super::*;
+    use crate::backend::capability::HasCoordinatedGroups;
+    
+
+    fn _require_backend<B: Backend>() {
+        fn needs_send_sync_static<T: Send + Sync + 'static>() {}
+        needs_send_sync_static::<B>();
+        needs_send_sync_static::<B::Client>();
+        needs_send_sync_static::<B::PublisherImpl>();
+        needs_send_sync_static::<B::ConsumerImpl>();
+        needs_send_sync_static::<B::AutoscalerImpl>();
+        needs_send_sync_static::<B::QueueStatsImpl>();
+    }
+
+    fn _require_has_coordinated_groups<B: HasCoordinatedGroups>() {
+        fn needs_default_clone<T: Default + Clone + Send + 'static>() {}
+        needs_default_clone::<B::ConsumerGroupConfig>();
+    }
+
+    // Anchor the generic assertions to a concrete backend so they fire
+    // at compile time instead of only at monomorphization.
+    #[cfg(feature = "inmemory")]
+    fn _anchor_inmemory() {
+        _require_backend::<crate::markers::InMemory>();
+        _require_has_coordinated_groups::<crate::markers::InMemory>();
+    }
+
+    // Per-method anchoring: exercise every internal trait method once
+    // against a concrete implementor so the methods aren't flagged as
+    // `dead_code` before Phase 5+ wires the generic wrappers. These
+    // functions are `#[cfg(test)]`-only and never called; their bodies
+    // just need to type-check.
+    #[cfg(feature = "inmemory")]
+    async fn _anchor_publisher_impl(p: &<crate::markers::InMemory as Backend>::PublisherImpl) {
+        use crate::topic::Topic;
+        struct Dummy;
+        impl Topic for Dummy {
+            type Message = ();
+            fn topology() -> &'static crate::topology::QueueTopology {
+                unreachable!("anchor only")
+            }
+        }
+        let _ = <_ as PublisherImpl>::publish::<Dummy>(p, &()).await;
+        let _ = <_ as PublisherImpl>::publish_with_headers::<Dummy>(
+            p,
+            &(),
+            std::collections::HashMap::new(),
+        )
+        .await;
+        let _ = <_ as PublisherImpl>::publish_batch::<Dummy>(p, &[]).await;
+    }
+
+    #[cfg(feature = "inmemory")]
+    async fn _anchor_consumer_impl(c: &<crate::markers::InMemory as Backend>::ConsumerImpl) {
+        use crate::handler::MessageHandler;
+        use crate::outcome::Outcome;
+        use crate::topic::{SequencedTopic, Topic};
+
+        struct Dummy;
+        impl Topic for Dummy {
+            type Message = ();
+            fn topology() -> &'static crate::topology::QueueTopology {
+                unreachable!("anchor only")
+            }
+        }
+        impl SequencedTopic for Dummy {
+            fn sequence_key(_m: &Self::Message) -> String {
+                unreachable!("anchor only")
+            }
+        }
+        struct DummyHandler;
+        impl MessageHandler<Dummy> for DummyHandler {
+            type Context = ();
+            async fn handle(
+                &self,
+                _m: (),
+                _meta: crate::metadata::MessageMetadata,
+                _ctx: &(),
+            ) -> Outcome {
+                Outcome::Ack
+            }
+        }
+
+        let options = ConsumerOptionsInner {
+            max_retries: 0,
+            prefetch_count: 1,
+            concurrent_processing: false,
+            handler_timeout: None,
+            max_pending_per_key: None,
+            max_message_size: None,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            processing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "rabbitmq-transactional")]
+            exactly_once: false,
+            #[cfg(feature = "aws-sns-sqs")]
+            receive_batch_size: 0,
+            #[cfg(feature = "nats")]
+            max_ack_pending: None,
+        };
+        let _ =
+            <_ as ConsumerImpl>::run::<Dummy, DummyHandler>(c, DummyHandler, (), options.clone())
+                .await;
+        let _ = <_ as ConsumerImpl>::run_fifo::<Dummy, DummyHandler>(
+            c,
+            DummyHandler,
+            (),
+            options,
+        )
+        .await;
+        let _ = <_ as ConsumerImpl>::run_dlq::<Dummy, DummyHandler>(c, DummyHandler, ()).await;
+    }
+
+    #[cfg(feature = "inmemory")]
+    async fn _anchor_topology_impl(t: &<crate::markers::InMemory as Backend>::TopologyImpl) {
+        use crate::topic::Topic;
+        struct Dummy;
+        impl Topic for Dummy {
+            type Message = ();
+            fn topology() -> &'static crate::topology::QueueTopology {
+                unreachable!("anchor only")
+            }
+        }
+        let _ = <_ as TopologyImpl>::declare::<Dummy>(t).await;
+    }
+
+    #[cfg(feature = "inmemory")]
+    async fn _anchor_autoscaler_impl(_a: &<crate::markers::InMemory as Backend>::AutoscalerImpl) {
+        // AutoscalerBackendImpl has no methods in Phase 4.
+    }
+
+    #[cfg(feature = "inmemory")]
+    async fn _anchor_stats_impl(s: &<crate::markers::InMemory as Backend>::QueueStatsImpl) {
+        let _ = <_ as QueueStatsProviderImpl>::snapshot(s, "q").await;
+    }
+
+    #[cfg(feature = "inmemory")]
+    async fn _anchor_registry_impl(
+        r: &mut <crate::markers::InMemory as HasCoordinatedGroups>::RegistryImpl,
+    ) {
+        use crate::handler::MessageHandler;
+        use crate::outcome::Outcome;
+        use crate::topic::Topic;
+
+        struct Dummy;
+        impl Topic for Dummy {
+            type Message = ();
+            fn topology() -> &'static crate::topology::QueueTopology {
+                unreachable!("anchor only")
+            }
+        }
+        struct DummyHandler;
+        impl MessageHandler<Dummy> for DummyHandler {
+            type Context = ();
+            async fn handle(
+                &self,
+                _m: (),
+                _meta: crate::metadata::MessageMetadata,
+                _ctx: &(),
+            ) -> Outcome {
+                Outcome::Ack
+            }
+        }
+        let _ = <_ as RegistryImpl>::register::<Dummy, DummyHandler>(
+            r,
+            <<crate::markers::InMemory as HasCoordinatedGroups>::ConsumerGroupConfig>::default(),
+            || DummyHandler,
+            (),
+        )
+        .await;
+        let _: tokio_util::sync::CancellationToken =
+            <_ as RegistryImpl>::cancellation_token(r);
+    }
+
+    // The `run_until_timeout` consumer of the registry can't be anchored
+    // with the same borrowed-registry pattern because the method takes
+    // `self` by value. Exercise it against an owned registry in a
+    // dedicated anchor.
+    #[cfg(feature = "inmemory")]
+    async fn _anchor_registry_run_until_timeout(
+        r: <crate::markers::InMemory as HasCoordinatedGroups>::RegistryImpl,
+    ) {
+        let _: crate::consumer_supervisor::SupervisorOutcome =
+            <_ as RegistryImpl>::run_until_timeout::<std::future::Pending<()>>(
+                r,
+                std::future::pending(),
+                std::time::Duration::ZERO,
+            )
+            .await;
+    }
+}

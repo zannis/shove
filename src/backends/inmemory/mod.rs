@@ -2,6 +2,7 @@
 //! docs live in [`crate::inmemory`].
 
 mod autoscaler;
+mod backend;
 mod client;
 mod constants;
 mod consumer;
