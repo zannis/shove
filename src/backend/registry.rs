@@ -28,6 +28,26 @@ pub(crate) trait RegistryImpl: Send {
 
     fn cancellation_token(&self) -> CancellationToken;
 
+    /// Run the registered consumer-group loops until `signal` resolves or
+    /// the group's cancellation token fires, then drain in-flight work
+    /// with a bounded grace window and return a `SupervisorOutcome`.
+    ///
+    /// # Implementor notes
+    ///
+    /// - The registry is consumed (`self`, not `&mut self`). Any task
+    ///   handles or `JoinSet`s held by the implementation are owned by
+    ///   the returned future and drop at the end of the async body.
+    ///   Conventional shape: hold per-task handles in a `JoinSet`,
+    ///   drive them with `join_next()` until the drain deadline, then
+    ///   call `abort_all()` and let `Drop` finalize surviving tasks.
+    /// - Implementations MUST NOT call `std::process::exit` or panic;
+    ///   the caller decides exit policy based on the returned outcome.
+    /// - `drain_timeout == Duration::ZERO` is allowed and means "abort
+    ///   immediately after `signal` fires" — implementations should
+    ///   not treat zero as "no timeout".
+    /// - The `signal` future is `'static` because implementations may
+    ///   `tokio::spawn` it onto a task for concurrent selection with the
+    ///   cancellation token.
     fn run_until_timeout<S>(
         self,
         signal: S,

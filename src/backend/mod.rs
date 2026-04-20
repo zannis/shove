@@ -42,7 +42,7 @@ pub trait Backend: sealed::Sealed + Sized + Send + Sync + 'static {
 
     type PublisherImpl: PublisherImpl + Clone + Send + Sync + 'static;
     type ConsumerImpl: ConsumerImpl + Clone + Send + Sync + 'static;
-    type TopologyImpl: TopologyImpl;
+    type TopologyImpl: TopologyImpl + Send + Sync + 'static;
     type AutoscalerImpl: AutoscalerBackendImpl + Send + Sync + 'static;
     type QueueStatsImpl: QueueStatsProviderImpl + Send + Sync + 'static;
 
