@@ -512,6 +512,7 @@ where
 // KafkaConsumer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct KafkaConsumer {
     client: KafkaClient,
 }

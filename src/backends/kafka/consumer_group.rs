@@ -24,6 +24,7 @@ pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send +
 // KafkaConsumerGroupConfig
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct KafkaConsumerGroupConfig {
     prefetch_count: u16,
     min_consumers: u16,
@@ -33,6 +34,15 @@ pub struct KafkaConsumerGroupConfig {
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
+}
+
+impl Default for KafkaConsumerGroupConfig {
+    /// A single consumer, default tuning. Matches the defaults baked into
+    /// `KafkaConsumerGroupConfig::new(1..=1)`. Mirrors the
+    /// `HasCoordinatedGroups::ConsumerGroupConfig: Default` bound.
+    fn default() -> Self {
+        Self::new(1..=1)
+    }
 }
 
 impl KafkaConsumerGroupConfig {
@@ -131,7 +141,7 @@ impl KafkaConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let concurrent = config.concurrent_processing;
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
@@ -291,6 +301,17 @@ impl KafkaConsumerGroupRegistry {
         }
     }
 
+    /// Return the client's shutdown token.
+    ///
+    /// Used by `RegistryImpl::cancellation_token` and `run_until_timeout`
+    /// to coordinate graceful shutdown with the broker's lifecycle.
+    pub(crate) fn client_shutdown_token(&self) -> CancellationToken {
+        self.client
+            .as_ref()
+            .map(|c| c.shutdown_token())
+            .unwrap_or_default()
+    }
+
     pub async fn register<T, H>(
         &mut self,
         config: KafkaConsumerGroupConfig,
@@ -298,7 +319,7 @@ impl KafkaConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T, Context = ()> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();

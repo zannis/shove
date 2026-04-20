@@ -104,6 +104,12 @@ mod bounds_smoke {
         _require_has_coordinated_groups::<crate::markers::InMemory>();
     }
 
+    #[cfg(feature = "kafka")]
+    fn _anchor_kafka() {
+        _require_backend::<crate::markers::Kafka>();
+        _require_has_coordinated_groups::<crate::markers::Kafka>();
+    }
+
     // Per-method anchoring: exercise every internal trait method once
     // against a concrete implementor so the methods aren't flagged as
     // `dead_code` before Phase 5+ wires the generic wrappers. These
