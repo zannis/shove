@@ -47,11 +47,7 @@ impl<B: HasCoordinatedGroups> ConsumerGroup<B, ()> {
     }
 }
 
-#[allow(private_bounds)]
-impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<B, Ctx>
-where
-    B::RegistryImpl: RegistryImpl<GroupConfig = B::ConsumerGroupConfig>,
-{
+impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<B, Ctx> {
     pub async fn register<T, H>(
         &mut self,
         config: ConsumerGroupConfig<B>,

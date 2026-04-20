@@ -18,7 +18,7 @@ use crate::backend::{Backend, RegistryImpl};
 #[allow(private_interfaces, private_bounds)]
 pub trait HasCoordinatedGroups: Backend {
     type ConsumerGroupConfig: Default + Clone + Send + 'static;
-    type RegistryImpl: RegistryImpl + Send + 'static;
+    type RegistryImpl: RegistryImpl<GroupConfig = Self::ConsumerGroupConfig> + Send + 'static;
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl;
 }
