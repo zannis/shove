@@ -299,7 +299,7 @@ async fn route_outcome(
         Outcome::Retry => {
             let new_count = retry_count + 1;
             if new_count >= max_retries {
-                match publish_to_dlq(
+                return match publish_to_dlq(
                     client,
                     topology,
                     payload,
@@ -309,12 +309,12 @@ async fn route_outcome(
                 )
                 .await
                 {
-                    Ok(()) => return true,
+                    Ok(()) => true,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to publish to DLQ after exhausting retries");
-                        return false;
+                        false
                     }
-                }
+                };
             }
 
             let delay = if hold_queues.is_empty() {
@@ -409,15 +409,12 @@ async fn invoke_handler<T: Topic, H: MessageHandler<T> + ?Sized>(
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => {
-            match tokio::time::timeout(duration, handler.handle(message, metadata, ctx)).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    tracing::warn!("handler timed out after {duration:?}, retrying");
-                    Outcome::Retry
-                }
-            }
-        }
+        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!("handler timed out after {duration:?}, retrying");
+                Outcome::Retry
+            }),
         None => handler.handle(message, metadata, ctx).await,
     }
 }
@@ -473,7 +470,7 @@ async fn run_with_reconnect<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
 {
     let mut backoff = crate::retry::Backoff::default();
     let mut attempts = 0u32;

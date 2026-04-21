@@ -4,7 +4,7 @@
 //!
 //! The trait bound is `H: MessageHandler<T>` — the `ctx: H::Context`
 //! parameter is threaded to every spawned consumer task so handlers with
-//! a non-unit [`MessageHandler::Context`](crate::handler::MessageHandler::Context)
+//! a non-unit [`MessageHandler::Context`](MessageHandler::Context)
 //! work through the generic harness.
 
 use crate::backend::ConsumerOptionsInner;

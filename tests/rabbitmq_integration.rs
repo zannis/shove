@@ -137,7 +137,7 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
-        .sequenced(shove::topology::SequenceFailure::Skip)
+        .sequenced(SequenceFailure::Skip)
         .routing_shards(2)
         .build()
 );
@@ -175,7 +175,7 @@ define_sequenced_topic!(
     OrderMessage,
     |msg: &OrderMessage| msg.account.clone(),
     TopologyBuilder::new("test-defer-seq-nohold")
-        .sequenced(shove::topology::SequenceFailure::Skip)
+        .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .allow_message_loss()
         .build()
@@ -239,7 +239,7 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-failall-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
-        .sequenced(shove::topology::SequenceFailure::FailAll)
+        .sequenced(SequenceFailure::FailAll)
         .routing_shards(2)
         .build()
 );
@@ -253,7 +253,7 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-skip-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
-        .sequenced(shove::topology::SequenceFailure::Skip)
+        .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .build()
 );
@@ -338,7 +338,7 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-retry-seq-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
-        .sequenced(shove::topology::SequenceFailure::Skip)
+        .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .build()
 );
@@ -351,7 +351,7 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-defer-seq-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
-        .sequenced(shove::topology::SequenceFailure::Skip)
+        .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .build()
 );
@@ -2352,7 +2352,7 @@ async fn audited_handler_captures_audit_records() {
     }
 
     impl AuditHandler<AuditedWork> for CollectingAuditHandler {
-        async fn audit(&self, record: &AuditRecord<SimpleMessage>) -> shove::error::Result<()> {
+        async fn audit(&self, record: &AuditRecord<SimpleMessage>) -> error::Result<()> {
             self.records.lock().unwrap().push(record.clone());
             self.signal.notify_waiters();
             Ok(())

@@ -105,10 +105,7 @@ async fn setup(
     Ok((broker, publisher))
 }
 
-async fn publish_tasks(
-    publisher: &Publisher<Sqs>,
-    count: u32,
-) -> Result<(), shove::ShoveError> {
+async fn publish_tasks(publisher: &Publisher<Sqs>, count: u32) -> Result<(), shove::ShoveError> {
     let messages: Vec<Task> = (0..count)
         .map(|id| Task {
             id,

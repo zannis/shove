@@ -53,7 +53,7 @@ pub trait MessageHandler<T: Topic>: Send + Sync + 'static {
 /// retry behaviour is identical to calling `Audited::new` directly.
 pub trait MessageHandlerExt<T: Topic>: MessageHandler<T> + Sized {
     /// Wrap `self` with the given audit handler, returning the combined
-    /// [`Audited<Self, A>`](crate::audit::Audited).
+    /// [`Audited<Self, A>`](Audited).
     fn audited<A>(self, audit: A) -> Audited<Self, A>
     where
         A: AuditHandler<T>;

@@ -3,7 +3,7 @@
 //!
 //! `register` accepts an `H::Context` that each backend clones into every
 //! spawned task so handlers with a non-unit
-//! [`MessageHandler::Context`](crate::handler::MessageHandler::Context)
+//! [`MessageHandler::Context`](MessageHandler::Context)
 //! work through the generic `ConsumerGroup<B, Ctx>` harness.
 
 use std::time::Duration;

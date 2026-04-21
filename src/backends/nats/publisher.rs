@@ -173,10 +173,7 @@ impl NatsPublisher {
 }
 
 impl PublisherImpl for NatsPublisher {
-    fn publish<T: Topic>(
-        &self,
-        msg: &T::Message,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
         NatsPublisher::publish::<T>(self, msg)
     }
 
@@ -184,14 +181,14 @@ impl PublisherImpl for NatsPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         NatsPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         NatsPublisher::publish_batch::<T>(self, msgs)
     }
 }

@@ -299,15 +299,12 @@ async fn invoke_handler<T: Topic, H: MessageHandler<T> + ?Sized>(
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => {
-            match tokio::time::timeout(duration, handler.handle(message, metadata, ctx)).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    tracing::warn!("handler timed out after {duration:?}, retrying");
-                    Outcome::Retry
-                }
-            }
-        }
+        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!("handler timed out after {duration:?}, retrying");
+                Outcome::Retry
+            }),
         None => handler.handle(message, metadata, ctx).await,
     }
 }
@@ -341,7 +338,7 @@ async fn run_with_reconnect<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
 {
     let mut backoff = crate::retry::Backoff::default();
     let mut attempts = 0u32;

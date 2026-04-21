@@ -131,12 +131,12 @@ impl<S: NatsQueueStatsProvider> NatsAutoscalerBackend<S> {
 impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
     type GroupId = String;
 
-    async fn list_groups(&self) -> crate::error::Result<Vec<Self::GroupId>> {
+    async fn list_groups(&self) -> Result<Vec<Self::GroupId>> {
         let reg = self.registry.lock().await;
         Ok(reg.groups().keys().cloned().collect())
     }
 
-    async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
+    async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
         let (queue, prefetch, active) = {
             let reg = self.registry.lock().await;
             let g = reg
@@ -169,11 +169,7 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
         ))
     }
 
-    async fn scale(
-        &self,
-        group: &Self::GroupId,
-        decision: ScalingDecision,
-    ) -> crate::error::Result<()> {
+    async fn scale(&self, group: &Self::GroupId, decision: ScalingDecision) -> Result<()> {
         let mut reg = self.registry.lock().await;
         let g = reg
             .groups_mut()
