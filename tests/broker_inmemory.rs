@@ -164,7 +164,10 @@ async fn non_unit_context_plumbs_through_supervisor_and_group() {
     // Publish one message to each topic.
     let publisher = broker.publisher().await.unwrap();
     publisher.publish::<SupTopic>(&Msg { n: 7 }).await.unwrap();
-    publisher.publish::<GroupTopic>(&Msg { n: 13 }).await.unwrap();
+    publisher
+        .publish::<GroupTopic>(&Msg { n: 13 })
+        .await
+        .unwrap();
 
     // The group's `run_until_timeout` calls `start_all()`, so we must let it
     // run to start the group consumers. Drive shutdown from a signal that

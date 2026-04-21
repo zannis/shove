@@ -113,7 +113,11 @@ impl ConsumerGroupRegistry {
         for group in self.groups.values_mut() {
             tally.add(group.shutdown_with_tally().await);
         }
-        debug!(errors = tally.errors, panics = tally.panics, "all consumer groups shut down");
+        debug!(
+            errors = tally.errors,
+            panics = tally.panics,
+            "all consumer groups shut down"
+        );
         tally
     }
 }

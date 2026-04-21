@@ -311,13 +311,18 @@ async fn max_retries_exceeded_goes_to_dlq() {
             .with_shutdown(shutdown_main)
             .with_prefetch_count(1)
             .with_max_retries(2);
-        consumer_main.run::<OrdersTopic, _>(AlwaysRetry, (), opts).await
+        consumer_main
+            .run::<OrdersTopic, _>(AlwaysRetry, (), opts)
+            .await
     });
 
     let consumer_dlq = InMemoryConsumer::new(client.clone());
     let dlq_handler = DlqHandler(dlq_seen.clone());
-    let dlq_handle =
-        tokio::spawn(async move { consumer_dlq.run_dlq::<OrdersTopic, _>(dlq_handler, ()).await });
+    let dlq_handle = tokio::spawn(async move {
+        consumer_dlq
+            .run_dlq::<OrdersTopic, _>(dlq_handler, ())
+            .await
+    });
 
     let dlq_probe = dlq_seen.clone();
     assert!(
@@ -389,7 +394,9 @@ async fn sequenced_preserves_per_key_order() {
         let opts = ConsumerOptions::<InMemory>::new()
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1);
-        consumer.run_fifo::<LedgerSkipTopic, _>(handler, (), opts).await
+        consumer
+            .run_fifo::<LedgerSkipTopic, _>(handler, (), opts)
+            .await
     });
 
     let probe = order.clone();
@@ -479,7 +486,9 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
         let opts = ConsumerOptions::<InMemory>::new()
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1);
-        consumer.run_fifo::<LedgerFailAllTopic, _>(handler, (), opts).await
+        consumer
+            .run_fifo::<LedgerFailAllTopic, _>(handler, (), opts)
+            .await
     });
 
     #[derive(Clone)]
@@ -705,7 +714,9 @@ async fn oversized_message_rejected_to_dlq() {
             .with_shutdown(shutdown_main)
             .with_prefetch_count(1)
             .with_max_message_size(1024);
-        consumer_main.run::<BigTopic, _>(main_handler, (), opts).await
+        consumer_main
+            .run::<BigTopic, _>(main_handler, (), opts)
+            .await
     });
 
     let dlq_handle = {
@@ -953,7 +964,9 @@ async fn poison_cleared_after_shard_drains() {
         let opts = ConsumerOptions::<InMemory>::new()
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1);
-        consumer.run_fifo::<LedgerFailAllTopic, _>(handler, (), opts).await
+        consumer
+            .run_fifo::<LedgerFailAllTopic, _>(handler, (), opts)
+            .await
     });
 
     // Wait until the shard has drained the first batch (seq 0 acked, 1 rejected, 2 DLQ'd).

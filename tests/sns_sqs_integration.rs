@@ -924,7 +924,11 @@ async fn dlq_consumer_handles_dead_message() {
     let dlq_handler_clone = dlq_handler.clone();
 
     let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
-    let h2 = tokio::spawn(async move { consumer2.run_dlq::<WorkTopic, _>(dlq_handler_clone, ()).await });
+    let h2 = tokio::spawn(async move {
+        consumer2
+            .run_dlq::<WorkTopic, _>(dlq_handler_clone, ())
+            .await
+    });
 
     let reached = dlq_handler.wait_for_count(1, Duration::from_secs(15)).await;
 

@@ -452,8 +452,14 @@ where
                 retry_count = metadata.retry_count,
                 "dispatching message to handler"
             );
-            let rx =
-                spawn_handler::<T, H>(handler, ctx, message, metadata, options.handler_timeout, &notify);
+            let rx = spawn_handler::<T, H>(
+                handler,
+                ctx,
+                message,
+                metadata,
+                options.handler_timeout,
+                &notify,
+            );
             in_flight.push_back(PendingMessage {
                 receipt_handle,
                 body: msg.body().unwrap_or_default().to_string(),
@@ -1423,12 +1429,7 @@ impl SqsConsumer {
 
             run_with_reconnect(&options.shutdown, topology.queue(), || {
                 consume_loop_concurrent::<T, H>(
-                    &sqs,
-                    &queue_url,
-                    topology,
-                    &handler,
-                    &ctx,
-                    &options,
+                    &sqs, &queue_url, topology, &handler, &ctx, &options,
                 )
             })
             .await

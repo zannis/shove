@@ -1853,7 +1853,8 @@ async fn autoscaler_scales_up_under_load() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
-            (),        )
+            (),
+        )
         .await
         .unwrap();
     registry.start_all(); // starts 0 consumers
@@ -1948,7 +1949,8 @@ async fn autoscaler_scales_down_when_idle() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
             move || h.clone(),
-            (),        )
+            (),
+        )
         .await
         .unwrap();
     registry.start_all();
@@ -2154,7 +2156,8 @@ async fn autoscaler_without_stabilization_scales_immediately() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
-            (),        )
+            (),
+        )
         .await
         .unwrap();
     registry.start_all(); // starts 0 consumers
@@ -2571,7 +2574,8 @@ async fn sequenced_failall_poisons_key_after_rejection() {
     let dlq_handler = OrderDlqHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders, _>(dh, ()).await });
+    let dlq_handle =
+        tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders, _>(dh, ()).await });
 
     assert!(
         dlq_handler.wait_for_count(4, Duration::from_secs(10)).await,
@@ -2834,7 +2838,8 @@ async fn consumer_group_concurrent_processing() {
                 .with_prefetch_count(10)
                 .with_concurrent_processing(true),
             move || h.clone(),
-            (),        )
+            (),
+        )
         .await
         .unwrap();
 
@@ -3352,7 +3357,8 @@ async fn concurrent_consumer_max_retries_sends_to_dlq() {
     let dlq_handler = DlqCountingHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<ConcurrentMaxRetry, _>(dh, ()).await });
+    let dlq_handle =
+        tokio::spawn(async move { consumer2.run_dlq::<ConcurrentMaxRetry, _>(dh, ()).await });
 
     assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
     assert_eq!(dlq_handler.count(), 1);
@@ -3800,7 +3806,8 @@ async fn sequenced_failall_max_retries_poisons_key() {
     let dlq_handler = OrderDlqHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders, _>(dh, ()).await });
+    let dlq_handle =
+        tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders, _>(dh, ()).await });
 
     assert!(
         dlq_handler.wait_for_count(3, Duration::from_secs(10)).await,
@@ -4199,7 +4206,8 @@ async fn registry_concurrent_processing_consumes_messages() {
                 .with_concurrent_processing(true)
                 .with_prefetch_count(5),
             move || h.clone(),
-            (),        )
+            (),
+        )
         .await
         .unwrap();
 
@@ -4273,7 +4281,8 @@ async fn registry_concurrent_with_timeout_processes_messages() {
                 .with_prefetch_count(5)
                 .with_handler_timeout(Duration::from_secs(10)),
             move || h.clone(),
-            (),        )
+            (),
+        )
         .await
         .unwrap();
 
@@ -4726,7 +4735,9 @@ mod exactly_once {
         let dlq_s = shutdown.clone();
         let dlq_handle = tokio::spawn(async move {
             let _s = dlq_s;
-            dlq_consumer.run_dlq::<ExactlyOnceMaxRetries, _>(dlq_h, ()).await
+            dlq_consumer
+                .run_dlq::<ExactlyOnceMaxRetries, _>(dlq_h, ())
+                .await
         });
 
         assert!(
@@ -4885,7 +4896,9 @@ mod exactly_once {
         let dlq_s = shutdown.clone();
         let dlq_handle = tokio::spawn(async move {
             let _s = dlq_s;
-            dlq_consumer.run_dlq::<ExactlyOnceReject, _>(dlq_h, ()).await
+            dlq_consumer
+                .run_dlq::<ExactlyOnceReject, _>(dlq_h, ())
+                .await
         });
 
         assert!(

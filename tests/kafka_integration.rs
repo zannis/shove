@@ -606,7 +606,8 @@ async fn rejected_message_lands_in_dlq() {
     let dlq_handler = DlqRecordingHandler::new();
     let dhc = dlq_handler.clone();
     let dlq_consumer = KafkaConsumer::new(client.clone());
-    let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic, _>(dhc, ()).await });
+    let dlq_handle =
+        tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic, _>(dhc, ()).await });
 
     assert!(
         dlq_handler.counter.wait_for(1, TIMEOUT).await,
@@ -756,7 +757,8 @@ async fn max_retries_sends_to_dlq() {
     let dlq_handler = DlqRecordingHandler::new();
     let dhc = dlq_handler.clone();
     let dlq_consumer = KafkaConsumer::new(client.clone());
-    let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic, _>(dhc, ()).await });
+    let dlq_handle =
+        tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic, _>(dhc, ()).await });
 
     assert!(
         dlq_handler
@@ -1818,7 +1820,8 @@ async fn dlq_consumer_handles_deserialization_failure() {
     let dlq_handler = DlqRecordingHandler::new();
     let dhc = dlq_handler.clone();
     let dlq_consumer = KafkaConsumer::new(client.clone());
-    let dlq_handle = tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic, _>(dhc, ()).await });
+    let dlq_handle =
+        tokio::spawn(async move { dlq_consumer.run_dlq::<WorkTopic, _>(dhc, ()).await });
 
     // The valid message should still be processed
     assert!(
