@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let consumer = NatsConsumer::new(client.clone());
     let options = ConsumerOptions::<Nats>::new().with_shutdown(shutdown);
     consumer
-        .run_fifo::<UserEventTopic>(UserEventHandler, options)
+        .run_fifo::<UserEventTopic, _>(UserEventHandler, (), options)
         .await?;
 
     client.shutdown().await;

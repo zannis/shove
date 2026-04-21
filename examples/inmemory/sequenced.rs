@@ -85,7 +85,7 @@ async fn main() {
         let opts = ConsumerOptions::<InMemory>::new()
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1);
-        consumer.run_fifo::<LedgerTopic>(handler, opts).await
+        consumer.run_fifo::<LedgerTopic, _>(handler, (), opts).await
     });
 
     let publisher = InMemoryPublisher::new(broker.clone());

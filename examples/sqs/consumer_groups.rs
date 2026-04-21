@@ -133,6 +133,7 @@ async fn main() -> Result<(), ShoveError> {
                 .with_prefetch_count(10) // messages per consumer
                 .with_max_retries(3),
             || TaskHandler, // factory — called once per spawned consumer
+            (),             // handler context (unit for this example)
         )
         .await?;
 

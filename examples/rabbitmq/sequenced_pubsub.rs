@@ -215,8 +215,9 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         RabbitMqConsumer::new(c)
-            .run_fifo::<SkipLedger>(
+            .run_fifo::<SkipLedger, _>(
                 handler,
+                (),
                 ConsumerOptions::<RabbitMq>::new()
                     .with_shutdown(s)
                     .with_max_retries(2)
@@ -234,8 +235,9 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         RabbitMqConsumer::new(c)
-            .run_fifo::<StrictLedger>(
+            .run_fifo::<StrictLedger, _>(
                 handler,
+                (),
                 ConsumerOptions::<RabbitMq>::new()
                     .with_shutdown(s)
                     .with_max_retries(2)

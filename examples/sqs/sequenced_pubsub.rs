@@ -216,8 +216,9 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         SqsConsumer::new(c, qr)
-            .run_fifo::<SkipLedger>(
+            .run_fifo::<SkipLedger, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(s)
                     .with_max_retries(2)
@@ -236,8 +237,9 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         SqsConsumer::new(c, qr)
-            .run_fifo::<StrictLedger>(
+            .run_fifo::<StrictLedger, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(s)
                     .with_max_retries(2)

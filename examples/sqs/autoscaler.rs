@@ -138,6 +138,7 @@ async fn main() -> Result<(), ShoveError> {
                 .with_prefetch_count(5) // each consumer holds up to 5 in-flight messages
                 .with_max_retries(3),
             || TaskHandler,
+            (),
         )
         .await?;
 
