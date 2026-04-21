@@ -153,11 +153,7 @@ cargo add shove --features rabbitmq,audit
 
 ## Quick start
 
-The repo's `docker-compose.yml` starts every broker needed below: RabbitMQ with the consistent-hash plugin, LocalStack (SNS + SQS on `http://localhost:4566`), NATS JetStream on `localhost:4222`, and Kafka on `localhost:9092`. The `inmemory` backend needs nothing.
-
-```sh
-docker compose up -d
-```
+Every non-`inmemory` example spins up its broker on demand via [testcontainers](https://crates.io/crates/testcontainers) — you just need a running Docker daemon. The SQS/SNS examples additionally need a LocalStack Pro auth token (`LOCALSTACK_AUTH_TOKEN`). The `inmemory` backend needs nothing at all.
 
 Define the topic and handler once — this is identical across every backend:
 

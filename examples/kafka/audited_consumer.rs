@@ -3,9 +3,9 @@
 //! Demonstrates: `MessageHandlerExt::audited` wrapper, custom `AuditHandler`
 //! implementation, trace ID propagation across retries.
 //!
-//! Requires a running Kafka broker:
+//! Spins up a Kafka testcontainer automatically (requires a running Docker
+//! daemon):
 //!
-//!     docker compose up -d
 //!     cargo run --example kafka_audited_consumer --features kafka,audit
 
 use std::time::Duration;
@@ -13,6 +13,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
 use shove::*;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -74,8 +76,12 @@ impl AuditHandler<Payments> for StdoutAuditHandler {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    let broker = Broker::<Kafka>::new(KafkaConfig::new("localhost:9092")).await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let container = KafkaImage::default().start().await?;
+    let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
+    let bootstrap = format!("127.0.0.1:{port}");
+
+    let broker = Broker::<Kafka>::new(KafkaConfig::new(&bootstrap)).await?;
     broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");
 

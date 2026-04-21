@@ -5,10 +5,10 @@
 //! concurrent throughput with a slow handler, both driven through the generic
 //! `Broker<Sqs>::consumer_supervisor()` path.
 //!
-//! Requires a running LocalStack instance (see docker-compose.yml):
+//! Spins up a LocalStack testcontainer automatically. Requires a running
+//! Docker daemon and the `LOCALSTACK_AUTH_TOKEN` environment variable:
 //!
-//!     docker compose up -d
-//!     cargo run --example sqs_concurrent_pubsub --features aws-sns-sqs
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run --example sqs_concurrent_pubsub --features aws-sns-sqs
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,9 +17,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use shove::sns::SnsConfig;
 use shove::{
-    Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Publisher, ShoveError, Sqs,
+    Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Publisher, Sqs,
     TopologyBuilder, define_topic,
 };
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::localstack::LocalStack;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -89,29 +92,12 @@ impl MessageHandler<SlowTasks> for SlowTaskHandler {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn require_localstack() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
-        _ => {
-            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn setup() -> Result<(Broker<Sqs>, Publisher<Sqs>), ShoveError> {
-    // SAFETY: called before any concurrent env access in this process.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    }
-
+async fn setup(
+    endpoint: String,
+) -> Result<(Broker<Sqs>, Publisher<Sqs>), Box<dyn std::error::Error>> {
     let broker = Broker::<Sqs>::new(SnsConfig {
         region: Some("us-east-1".into()),
-        endpoint_url: Some("http://localhost:4566".into()),
+        endpoint_url: Some(endpoint),
     })
     .await?;
     broker.topology().declare::<SlowTasks>().await?;
@@ -119,7 +105,10 @@ async fn setup() -> Result<(Broker<Sqs>, Publisher<Sqs>), ShoveError> {
     Ok((broker, publisher))
 }
 
-async fn publish_tasks(publisher: &Publisher<Sqs>, count: u32) -> Result<(), ShoveError> {
+async fn publish_tasks(
+    publisher: &Publisher<Sqs>,
+    count: u32,
+) -> Result<(), shove::ShoveError> {
     let messages: Vec<Task> = (0..count)
         .map(|id| Task {
             id,
@@ -170,13 +159,37 @@ async fn run_round(
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_localstack();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "LOCALSTACK_AUTH_TOKEN is not set. This example requires a LocalStack Pro auth \
+                 token:\n\n    export LOCALSTACK_AUTH_TOKEN=...\n"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // SAFETY: called before any concurrent env access in this process.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
+    }
+
+    let container = LocalStack::default()
+        .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+        .start()
+        .await?;
+    let port = container.get_host_port_ipv4(4566).await?;
+    let endpoint = format!("http://localhost:{port}");
+
     let msg_count = 20u32;
     let handler_delay = Duration::from_millis(100);
     let prefetch = 20u16;
 
-    let (broker, publisher) = setup().await?;
+    let (broker, publisher) = setup(endpoint).await?;
 
     // ── Sequential run ──────────────────────────────────────────────────
 
@@ -233,5 +246,6 @@ async fn main() -> Result<(), ShoveError> {
     eprintln!("  Concurrent mode overlaps handler I/O within a single consumer.");
 
     broker.close().await;
+    drop(container);
     Ok(())
 }

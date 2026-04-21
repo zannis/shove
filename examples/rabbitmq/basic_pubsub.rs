@@ -8,9 +8,9 @@
 //! through the generic `ConsumerSupervisor<B>` wrapper yet — messages that
 //! land in the DLQ here are simply left there for inspection.
 //!
-//! Requires a running RabbitMQ instance (see docker-compose.yml):
+//! Spins up a RabbitMQ testcontainer automatically (requires a running
+//! Docker daemon):
 //!
-//!     docker compose up -d
 //!     cargo run --example rabbitmq_basic_pubsub --features rabbitmq
 
 use std::collections::HashMap;
@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use shove::rabbitmq::RabbitMqConfig;
 use shove::{
     Broker, ConsumerOptions, DeadMessageMetadata, MessageHandler, MessageMetadata, Outcome,
-    QueueTopology, RabbitMq, ShoveError, Topic, TopologyBuilder, define_topic,
+    QueueTopology, RabbitMq, Topic, TopologyBuilder, define_topic,
 };
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -163,25 +165,14 @@ impl MessageHandler<ScheduledOrder> for DeferHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_rabbitmq() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
-        _ => {
-            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_rabbitmq();
-    let broker =
-        Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
-            .await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Spin up a RabbitMQ testcontainer for the lifetime of this example.
+    let container = RabbitMqImage::default().start().await?;
+    let port = container.get_host_port_ipv4(5672).await?;
+    let uri = format!("amqp://guest:guest@localhost:{port}/%2f");
+
+    let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new(&uri)).await?;
 
     // ── Declare all topologies ──
     let topology = broker.topology();

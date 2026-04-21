@@ -1,21 +1,36 @@
 //! Stress benchmarks for the NATS JetStream backend.
 //!
-//! Reads the NATS URL from `NATS_URL` (default `nats://localhost:4222`).
+//! Spins up a NATS JetStream testcontainer for the lifetime of the process.
+//! Requires a running Docker daemon.
 //!
 //!     cargo run -q --example nats_stress --features nats
-//!     NATS_URL=nats://localhost:4222 cargo run -q --example nats_stress --features nats -- --tier moderate
+//!     cargo run -q --example nats_stress --features nats -- --tier moderate
 
 #[path = "../common/stress_test.rs"]
 mod harness;
 
 use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
 use shove::{Broker, Nats};
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
 use harness::{HarnessConfig, run_all_scenarios};
 
 #[tokio::main]
 async fn main() {
-    let url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let cmd = NatsServerCmd::default().with_jetstream();
+    let container = NatsImage::default()
+        .with_cmd(&cmd)
+        .start()
+        .await
+        .expect("failed to start NATS container");
+    let port = container
+        .get_host_port_ipv4(4222)
+        .await
+        .expect("failed to read NATS port");
+    let url = format!("nats://localhost:{port}");
+
     let hcfg = HarnessConfig::<Nats>::new("nats");
     run_all_scenarios(
         hcfg,
@@ -34,4 +49,6 @@ async fn main() {
         },
     )
     .await;
+
+    drop(container);
 }

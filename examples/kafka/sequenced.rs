@@ -1,7 +1,9 @@
 //! Sequenced Kafka example — per-key ordering.
 //!
-//! Run: cargo run -q --example kafka_sequenced --features kafka
-//! Requires: Kafka broker at localhost:9092
+//! Spins up a Kafka testcontainer automatically (requires a running Docker
+//! daemon):
+//!
+//!     cargo run -q --example kafka_sequenced --features kafka
 //!
 //! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
 //! generic `Broker<B>` / `ConsumerSupervisor<B>` / `ConsumerGroup<B>`
@@ -18,6 +20,8 @@ use shove::{
     ConsumerOptions, Kafka, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
     SequencedTopic, Topic, TopologyBuilder,
 };
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,7 +60,11 @@ impl MessageHandler<UserEventTopic> for UserEventHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = KafkaConfig::new("localhost:9092");
+    let container = KafkaImage::default().start().await?;
+    let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
+    let bootstrap = format!("127.0.0.1:{port}");
+
+    let config = KafkaConfig::new(&bootstrap);
     let client = KafkaClient::connect(&config).await?;
 
     // Declare topology
@@ -94,5 +102,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.shutdown().await;
     println!("Done.");
+    drop(container);
     Ok(())
 }

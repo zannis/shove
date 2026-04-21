@@ -21,10 +21,10 @@
 //!   FailAll: ACC-A = 100+200         = 300   (seq 3 + subsequent DLQ'd)
 //!            ACC-B = 50+100+150      = 300   (independent key, unaffected)
 //!
-//! Requires a running LocalStack instance (see docker-compose.yml):
+//! Spins up a LocalStack testcontainer automatically. Requires a running
+//! Docker daemon and the `LOCALSTACK_AUTH_TOKEN` environment variable:
 //!
-//!     docker compose up -d
-//!     cargo run --example sqs_sequenced_pubsub --features aws-sns-sqs
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run --example sqs_sequenced_pubsub --features aws-sns-sqs
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,8 +37,11 @@ use shove::sns::{
 };
 use shove::{
     ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure, SequencedTopic,
-    ShoveError, Sqs, Topic, TopologyBuilder, define_sequenced_topic,
+    Sqs, Topic, TopologyBuilder, define_sequenced_topic,
 };
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -135,32 +138,36 @@ impl MessageHandler<StrictLedger> for LedgerHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_localstack() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
-        _ => {
-            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "LOCALSTACK_AUTH_TOKEN is not set. This example requires a LocalStack Pro auth \
+                 token:\n\n    export LOCALSTACK_AUTH_TOKEN=...\n"
+            );
             std::process::exit(1);
         }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_localstack();
+    };
 
     // SAFETY: called before any concurrent env access in this process.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
     }
+
+    let container = LocalStack::default()
+        .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+        .start()
+        .await?;
+    let port = container.get_host_port_ipv4(4566).await?;
+    let endpoint = format!("http://localhost:{port}");
 
     let config = SnsConfig {
         region: Some("us-east-1".into()),
-        endpoint_url: Some("http://localhost:4566".into()),
+        endpoint_url: Some(endpoint),
     };
     let client = SnsClient::new(&config).await?;
 
@@ -294,5 +301,6 @@ async fn main() -> Result<(), ShoveError> {
         "strict ACC-B"
     );
 
+    drop(container);
     Ok(())
 }

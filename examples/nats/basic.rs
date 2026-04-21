@@ -1,7 +1,9 @@
 //! Basic NATS JetStream publish/consume example.
 //!
-//! Run: cargo run -q --example nats_basic --features nats
-//! Requires: NATS server with JetStream enabled at localhost:4222
+//! Spins up a NATS JetStream testcontainer automatically (requires a running
+//! Docker daemon):
+//!
+//!     cargo run -q --example nats_basic --features nats
 
 use std::time::Duration;
 
@@ -10,6 +12,9 @@ use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
 use shove::{
     Broker, ConsumerGroupConfig, MessageHandler, MessageMetadata, Nats, Outcome, TopologyBuilder,
 };
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
@@ -44,7 +49,12 @@ impl MessageHandler<OrderTopic> for OrderHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let broker = Broker::<Nats>::new(NatsConfig::new("nats://localhost:4222")).await?;
+    let cmd = NatsServerCmd::default().with_jetstream();
+    let container = NatsImage::default().with_cmd(&cmd).start().await?;
+    let port = container.get_host_port_ipv4(4222).await?;
+    let url = format!("nats://localhost:{port}");
+
+    let broker = Broker::<Nats>::new(NatsConfig::new(&url)).await?;
     broker.topology().declare::<OrderTopic>().await?;
 
     // Publish

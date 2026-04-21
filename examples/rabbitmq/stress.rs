@@ -1,24 +1,47 @@
 //! Stress benchmarks for the RabbitMQ backend.
 //!
-//! Reads the AMQP URI from `RABBITMQ_URI` (default
-//! `amqp://guest:guest@localhost:5672`). The consistent-hash exchange plugin
-//! must already be enabled on the broker.
+//! Spins up a RabbitMQ testcontainer (with the `rabbitmq_consistent_hash_exchange`
+//! plugin enabled) for the lifetime of the process. Requires a running Docker
+//! daemon.
 //!
 //!     cargo run -q --example rabbitmq_stress --features rabbitmq
-//!     RABBITMQ_URI=amqp://guest:guest@localhost:5672 cargo run -q --example rabbitmq_stress --features rabbitmq -- --tier moderate
+//!     cargo run -q --example rabbitmq_stress --features rabbitmq -- --tier moderate
 
 #[path = "../common/stress_test.rs"]
 mod harness;
 
+use std::time::Duration;
+
 use shove::rabbitmq as rmq;
 use shove::{Broker, RabbitMq};
+use testcontainers::core::ExecCommand;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
 use harness::{HarnessConfig, run_all_scenarios};
 
 #[tokio::main]
 async fn main() {
-    let uri = std::env::var("RABBITMQ_URI")
-        .unwrap_or_else(|_| "amqp://guest:guest@localhost:5672".to_string());
+    let container = RabbitMqImage::default()
+        .start()
+        .await
+        .expect("failed to start RabbitMQ container");
+    let port = container
+        .get_host_port_ipv4(5672)
+        .await
+        .expect("failed to read AMQP port");
+    let mut exec = container
+        .exec(ExecCommand::new([
+            "rabbitmq-plugins",
+            "enable",
+            "rabbitmq_consistent_hash_exchange",
+        ]))
+        .await
+        .expect("failed to enable consistent-hash plugin");
+    let _ = exec.stdout_to_vec().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let uri = format!("amqp://guest:guest@localhost:{port}");
     let hcfg = HarnessConfig::<RabbitMq>::new("rabbitmq");
     run_all_scenarios(
         hcfg,
@@ -37,4 +60,6 @@ async fn main() {
         },
     )
     .await;
+
+    drop(container);
 }

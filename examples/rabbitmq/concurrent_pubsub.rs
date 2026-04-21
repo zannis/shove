@@ -5,9 +5,9 @@
 //! concurrent throughput with a slow handler, both driven through the generic
 //! `Broker<RabbitMq>::consumer_supervisor()` path.
 //!
-//! Requires a running RabbitMQ instance (see docker-compose.yml):
+//! Spins up a RabbitMQ testcontainer automatically (requires a running
+//! Docker daemon):
 //!
-//!     docker compose up -d
 //!     cargo run --example rabbitmq_concurrent_pubsub --features rabbitmq
 
 use std::sync::Arc;
@@ -20,6 +20,8 @@ use shove::{
     Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Publisher, RabbitMq, Topic,
     TopologyBuilder, define_topic,
 };
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -92,24 +94,11 @@ impl MessageHandler<SlowTasks> for SlowTaskHandler {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn require_rabbitmq() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
-        _ => {
-            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn connect() -> (Broker<RabbitMq>, Publisher<RabbitMq>) {
-    let broker =
-        Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
-            .await
-            .expect("failed to connect to RabbitMQ");
+async fn connect(amqp_port: u16) -> (Broker<RabbitMq>, Publisher<RabbitMq>) {
+    let uri = format!("amqp://guest:guest@localhost:{amqp_port}/%2f");
+    let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new(&uri))
+        .await
+        .expect("failed to connect to RabbitMQ");
     broker
         .topology()
         .declare::<SlowTasks>()
@@ -135,12 +124,12 @@ async fn publish_tasks(publisher: &Publisher<RabbitMq>, count: u32) {
         .unwrap();
 }
 
-async fn purge_queue() {
+async fn purge_queue(mgmt_port: u16) {
     // Purge via management API to start clean.
     let http = reqwest::Client::new();
     let _ = http
         .delete(format!(
-            "http://localhost:15673/api/queues/%2F/{}/contents",
+            "http://localhost:{mgmt_port}/api/queues/%2F/{}/contents",
             SlowTasks::topology().queue()
         ))
         .basic_auth("guest", Some("guest"))
@@ -149,7 +138,7 @@ async fn purge_queue() {
     // Also purge the hold queue.
     let _ = http
         .delete(format!(
-            "http://localhost:15673/api/queues/%2F/{}-hold-5s/contents",
+            "http://localhost:{mgmt_port}/api/queues/%2F/{}-hold-5s/contents",
             SlowTasks::topology().queue()
         ))
         .basic_auth("guest", Some("guest"))
@@ -203,19 +192,31 @@ async fn run_round(
 
 #[tokio::main]
 async fn main() {
-    require_rabbitmq();
+    let container = RabbitMqImage::default()
+        .start()
+        .await
+        .expect("failed to start RabbitMQ container");
+    let amqp_port = container
+        .get_host_port_ipv4(5672)
+        .await
+        .expect("failed to read AMQP port");
+    let mgmt_port = container
+        .get_host_port_ipv4(15672)
+        .await
+        .expect("failed to read management port");
+
     let msg_count = 20u32;
     let handler_delay = Duration::from_millis(100);
     let prefetch = 20u16;
 
-    let (broker, publisher) = connect().await;
+    let (broker, publisher) = connect(amqp_port).await;
 
     // ── Sequential run ──────────────────────────────────────────────────
 
     eprintln!("--- Sequential (prefetch_count=1) ---");
     eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch=1");
 
-    purge_queue().await;
+    purge_queue(mgmt_port).await;
     publish_tasks(&publisher, msg_count).await;
 
     let handler = SlowTaskHandler::new(handler_delay);
@@ -233,7 +234,7 @@ async fn main() {
     eprintln!("--- Concurrent (prefetch_count={prefetch}) ---");
     eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch={prefetch}");
 
-    purge_queue().await;
+    purge_queue(mgmt_port).await;
     publish_tasks(&publisher, msg_count).await;
 
     let handler = SlowTaskHandler::new(handler_delay);
@@ -266,4 +267,5 @@ async fn main() {
     eprintln!("  Concurrent mode overlaps handler I/O within a single consumer.");
 
     broker.close().await;
+    drop(container);
 }

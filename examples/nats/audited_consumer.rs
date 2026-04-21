@@ -3,9 +3,9 @@
 //! Demonstrates: `MessageHandlerExt::audited` wrapper, custom `AuditHandler`
 //! implementation, trace ID propagation across retries.
 //!
-//! Requires a running NATS server with JetStream enabled:
+//! Spins up a NATS JetStream testcontainer automatically (requires a running
+//! Docker daemon):
 //!
-//!     docker compose up -d
 //!     cargo run --example nats_audited_consumer --features nats,audit
 
 use std::time::Duration;
@@ -13,6 +13,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
 use shove::*;
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -74,8 +77,13 @@ impl AuditHandler<Payments> for StdoutAuditHandler {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    let broker = Broker::<Nats>::new(NatsConfig::new("nats://localhost:4222")).await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cmd = NatsServerCmd::default().with_jetstream();
+    let container = NatsImage::default().with_cmd(&cmd).start().await?;
+    let port = container.get_host_port_ipv4(4222).await?;
+    let url = format!("nats://localhost:{port}");
+
+    let broker = Broker::<Nats>::new(NatsConfig::new(&url)).await?;
     broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");
 

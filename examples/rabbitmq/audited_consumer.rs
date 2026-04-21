@@ -3,16 +3,18 @@
 //! Demonstrates: `MessageHandlerExt::audited` wrapper, custom `AuditHandler`
 //! implementation, trace ID propagation across retries.
 //!
-//! Requires a running RabbitMQ instance (see docker-compose.yml):
+//! Spins up a RabbitMQ testcontainer automatically (requires a running
+//! Docker daemon):
 //!
-//!     docker compose up -d
-//!     cargo run --example rabbitmq_audited_consumer --features rabbitmq
+//!     cargo run --example rabbitmq_audited_consumer --features rabbitmq,audit
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::RabbitMqConfig;
 use shove::*;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -72,25 +74,12 @@ impl AuditHandler<Payments> for StdoutAuditHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_rabbitmq() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
-        _ => {
-            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_rabbitmq();
-    let broker =
-        Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
-            .await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let container = RabbitMqImage::default().start().await?;
+    let port = container.get_host_port_ipv4(5672).await?;
+    let uri = format!("amqp://guest:guest@localhost:{port}/%2f");
+    let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new(&uri)).await?;
     broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");
 

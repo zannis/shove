@@ -1,17 +1,20 @@
 //! Stress benchmarks for the SNS/SQS backend.
 //!
-//! Reads the endpoint from `LOCALSTACK_ENDPOINT` (e.g.
-//! `http://localhost:4566`) if set; otherwise uses the default AWS endpoint.
-//! Region defaults to `us-east-1` but respects `AWS_REGION`.
+//! Spins up a LocalStack testcontainer for the lifetime of the process.
+//! Requires a running Docker daemon and the `LOCALSTACK_AUTH_TOKEN`
+//! environment variable.
 //!
-//!     cargo run -q --example sqs_stress --features aws-sns-sqs
-//!     LOCALSTACK_ENDPOINT=http://localhost:4566 cargo run -q --example sqs_stress --features aws-sns-sqs -- --tier moderate
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run -q --example sqs_stress --features aws-sns-sqs
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run -q --example sqs_stress --features aws-sns-sqs -- --tier moderate
 
 #[path = "../common/stress_test.rs"]
 mod harness;
 
 use shove::sns::SnsConfig;
 use shove::{Broker, ConsumerOptions, Sqs};
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::localstack::LocalStack;
 
 use harness::{HarnessConfig, run_supervisor_scenarios};
 
@@ -25,8 +28,34 @@ const SQS_PUBLISH_CHUNK: usize = 500;
 
 #[tokio::main]
 async fn main() {
-    let endpoint = std::env::var("LOCALSTACK_ENDPOINT").ok();
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "LOCALSTACK_AUTH_TOKEN is not set. This example requires a LocalStack Pro auth \
+                 token:\n\n    export LOCALSTACK_AUTH_TOKEN=...\n"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // SAFETY: called before any concurrent env access in this process.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
+    }
+
+    let container = LocalStack::default()
+        .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+        .start()
+        .await
+        .expect("failed to start LocalStack container");
+    let port = container
+        .get_host_port_ipv4(4566)
+        .await
+        .expect("failed to read LocalStack port");
+    let endpoint = format!("http://localhost:{port}");
 
     let hcfg = HarnessConfig::<Sqs>::new("sqs")
         .with_prefetch_cap(SQS_PREFETCH_CAP)
@@ -35,9 +64,10 @@ async fn main() {
     run_supervisor_scenarios(
         hcfg,
         move || {
+            let endpoint = endpoint.clone();
             let cfg = SnsConfig {
-                region: Some(region.clone()),
-                endpoint_url: endpoint.clone(),
+                region: Some("us-east-1".into()),
+                endpoint_url: Some(endpoint),
             };
             async move { Broker::<Sqs>::new(cfg).await.expect("connect SNS/SQS") }
         },
@@ -48,4 +78,6 @@ async fn main() {
         },
     )
     .await;
+
+    drop(container);
 }

@@ -22,10 +22,10 @@
 //!   FailAll: ACC-A = 100+200         = 300   (seq 3 + subsequent DLQ'd)
 //!            ACC-B = 50+100+150      = 300   (independent key, unaffected)
 //!
-//! Requires a running RabbitMQ instance with the consistent-hash exchange
-//! plugin enabled (see docker-compose.yml):
+//! Spins up a RabbitMQ testcontainer and enables the
+//! `rabbitmq_consistent_hash_exchange` plugin automatically. Requires a
+//! running Docker daemon.
 //!
-//!     docker compose up -d
 //!     cargo run --example rabbitmq_sequenced_pubsub --features rabbitmq
 
 use std::collections::HashMap;
@@ -38,8 +38,11 @@ use shove::rabbitmq::{
 };
 use shove::{
     ConsumerOptions, MessageHandler, MessageMetadata, Outcome, RabbitMq, SequenceFailure,
-    SequencedTopic, ShoveError, Topic, TopologyBuilder, define_sequenced_topic,
+    SequencedTopic, Topic, TopologyBuilder, define_sequenced_topic,
 };
+use testcontainers::core::ExecCommand;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -142,23 +145,23 @@ impl MessageHandler<StrictLedger> for LedgerHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_rabbitmq() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
-        _ => {
-            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_rabbitmq();
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Spin up a RabbitMQ testcontainer and enable the consistent-hash plugin.
+    let container = RabbitMqImage::default().start().await?;
+    let port = container.get_host_port_ipv4(5672).await?;
+    let mut exec_res = container
+        .exec(ExecCommand::new([
+            "rabbitmq-plugins",
+            "enable",
+            "rabbitmq_consistent_hash_exchange",
+        ]))
+        .await?;
+    let _ = exec_res.stdout_to_vec().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let uri = format!("amqp://guest:guest@localhost:{port}/%2f");
+    let config = RabbitMqConfig::new(&uri);
     let client = RabbitMqClient::connect(&config).await?;
 
     // ── Declare topologies ──
@@ -292,5 +295,6 @@ async fn main() -> Result<(), ShoveError> {
         "strict ACC-B"
     );
 
+    drop(container);
     Ok(())
 }

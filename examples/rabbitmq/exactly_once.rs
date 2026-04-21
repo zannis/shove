@@ -11,9 +11,9 @@
 //! Trade-off: expect ~10-15× lower throughput per channel compared to the
 //! default confirm-mode consumer.
 //!
-//! Requires a running RabbitMQ instance (see docker-compose.yml):
+//! Spins up a RabbitMQ testcontainer automatically (requires a running
+//! Docker daemon):
 //!
-//!     docker compose up -d
 //!     cargo run --example rabbitmq_exactly_once --features rabbitmq-transactional
 
 use std::sync::Arc;
@@ -24,8 +24,10 @@ use serde::{Deserialize, Serialize};
 use shove::rabbitmq::RabbitMqConfig;
 use shove::{
     Broker, ConsumerOptions, DeadMessageMetadata, MessageHandler, MessageMetadata, Outcome,
-    RabbitMq, ShoveError, TopologyBuilder, define_topic,
+    RabbitMq, TopologyBuilder, define_topic,
 };
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -153,26 +155,10 @@ impl MessageHandler<RejectPaymentTopic> for RejectHandler {
     }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-fn require_rabbitmq() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
-        _ => {
-            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_rabbitmq();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -180,9 +166,10 @@ async fn main() -> Result<(), ShoveError> {
         )
         .init();
 
-    let broker =
-        Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f"))
-            .await?;
+    let container = RabbitMqImage::default().start().await?;
+    let port = container.get_host_port_ipv4(5672).await?;
+    let uri = format!("amqp://guest:guest@localhost:{port}/%2f");
+    let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new(&uri)).await?;
 
     // ── Declare topologies ──
     let topology = broker.topology();

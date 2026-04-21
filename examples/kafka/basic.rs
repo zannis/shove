@@ -1,7 +1,9 @@
 //! Basic Kafka publish/consume example.
 //!
-//! Run: cargo run -q --example kafka_basic --features kafka
-//! Requires: Kafka broker at localhost:9092
+//! Spins up a Kafka testcontainer automatically (requires a running Docker
+//! daemon):
+//!
+//!     cargo run -q --example kafka_basic --features kafka
 
 use std::time::Duration;
 
@@ -10,6 +12,8 @@ use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
 use shove::{
     Broker, ConsumerGroupConfig, Kafka, MessageHandler, MessageMetadata, Outcome, TopologyBuilder,
 };
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
@@ -44,7 +48,11 @@ impl MessageHandler<OrderTopic> for OrderHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let broker = Broker::<Kafka>::new(KafkaConfig::new("localhost:9092")).await?;
+    let container = KafkaImage::default().start().await?;
+    let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
+    let bootstrap = format!("127.0.0.1:{port}");
+
+    let broker = Broker::<Kafka>::new(KafkaConfig::new(&bootstrap)).await?;
     broker.topology().declare::<OrderTopic>().await?;
 
     // Publish
