@@ -187,7 +187,6 @@ mod bounds_smoke {
         let options = ConsumerOptionsInner {
             max_retries: 0,
             prefetch_count: 1,
-            concurrent_processing: false,
             handler_timeout: None,
             max_pending_per_key: None,
             max_message_size: None,

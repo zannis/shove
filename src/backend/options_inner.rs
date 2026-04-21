@@ -18,11 +18,6 @@ use crate::error::Result;
 pub(crate) struct ConsumerOptionsInner {
     pub max_retries: u32,
     pub prefetch_count: u16,
-    /// Read by per-backend `ConsumerImpl::run` adapters that honor it.
-    /// Backends that currently hardcode concurrency-on may ignore this flag
-    /// until they expose the knob through their internal loops.
-    #[allow(dead_code)]
-    pub concurrent_processing: bool,
     pub handler_timeout: Option<Duration>,
     pub max_pending_per_key: Option<usize>,
     pub max_message_size: Option<usize>,
@@ -45,7 +40,6 @@ impl ConsumerOptionsInner {
         Self {
             max_retries: 10,
             prefetch_count: 10,
-            concurrent_processing: true,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),

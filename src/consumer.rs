@@ -51,10 +51,24 @@ pub struct ConsumerOptions<B: Backend> {
     /// instead of another hold queue.
     pub max_retries: u32,
     /// Prefetch count (number of unacked messages the broker will deliver).
-    pub prefetch_count: u16,
-    /// Process prefetched messages concurrently vs. one at a time.
     ///
-    /// `true` by default — matches `ConsumerGroupConfig<B>::with_concurrent_processing`.
+    /// Note: when [`concurrent_processing`](Self::concurrent_processing) is
+    /// `false`, [`into_inner`](Self::into_inner) clamps the effective
+    /// prefetch to `1` regardless of this value, so the consumer processes
+    /// one message at a time.
+    pub prefetch_count: u16,
+    /// Process prefetched messages concurrently (`true`, default) or one at
+    /// a time (`false`). When `false`, [`into_inner`](Self::into_inner)
+    /// clamps [`prefetch_count`](Self::prefetch_count) to `1` on the way
+    /// across the backend trait boundary.
+    ///
+    /// Semantically equivalent to the per-backend
+    /// `ConsumerGroupConfig::with_concurrent_processing` setter; set this
+    /// flag via [`ConsumerOptions::with_concurrent_processing`] when
+    /// registering a handler through [`ConsumerSupervisor`] rather than a
+    /// coordinated group.
+    ///
+    /// [`ConsumerSupervisor`]: crate::consumer_supervisor::ConsumerSupervisor
     pub concurrent_processing: bool,
     /// Maximum time a handler may spend processing a single message.
     /// If the handler exceeds this duration the message is retried.
@@ -150,7 +164,10 @@ impl<B: Backend> ConsumerOptions<B> {
         self
     }
 
-    /// Process prefetched messages concurrently (`true`) or serially (`false`).
+    /// Process prefetched messages concurrently (`true`) or one at a time
+    /// (`false`). When `false`, `prefetch_count` is clamped to `1` on the
+    /// way to the backend, matching the semantic of the per-backend
+    /// `ConsumerGroupConfig::with_concurrent_processing` setter.
     pub fn with_concurrent_processing(mut self, on: bool) -> Self {
         self.concurrent_processing = on;
         self
@@ -211,12 +228,20 @@ impl<B: Backend> ConsumerOptions<B> {
         self.processing.clone()
     }
 
-    /// Lower to the internal options struct for passing across the Backend trait boundary.
+    /// Lower to the internal options struct for passing across the Backend
+    /// trait boundary. When [`concurrent_processing`](Self::concurrent_processing)
+    /// is `false`, the effective prefetch is clamped to `1` so the consumer
+    /// processes one message at a time — matching the semantic of the
+    /// per-backend `ConsumerGroupConfig::with_concurrent_processing`.
     pub(crate) fn into_inner(self) -> crate::backend::ConsumerOptionsInner {
+        let effective_prefetch = if self.concurrent_processing {
+            self.prefetch_count
+        } else {
+            1
+        };
         crate::backend::ConsumerOptionsInner {
             max_retries: self.max_retries,
-            prefetch_count: self.prefetch_count,
-            concurrent_processing: self.concurrent_processing,
+            prefetch_count: effective_prefetch,
             handler_timeout: self.handler_timeout,
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
@@ -344,6 +369,50 @@ mod tests {
         feature = "rabbitmq"
     ))]
     #[test]
+    fn with_concurrent_processing_toggles_flag() {
+        let opts = ConsumerOptions::<TestBackend>::new().with_concurrent_processing(false);
+        assert!(!opts.concurrent_processing);
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn into_inner_clamps_prefetch_when_non_concurrent() {
+        let inner = ConsumerOptions::<TestBackend>::new()
+            .with_prefetch_count(32)
+            .with_concurrent_processing(false)
+            .into_inner();
+        assert_eq!(
+            inner.prefetch_count, 1,
+            "prefetch must clamp to 1 when concurrent_processing=false"
+        );
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn into_inner_preserves_prefetch_when_concurrent() {
+        let inner = ConsumerOptions::<TestBackend>::new()
+            .with_prefetch_count(32)
+            .into_inner();
+        assert_eq!(inner.prefetch_count, 32);
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
     fn with_max_retries_overrides() {
         let opts = ConsumerOptions::<TestBackend>::new().with_max_retries(5);
         assert_eq!(opts.max_retries, 5);
@@ -405,18 +474,6 @@ mod tests {
     fn preset_sets_prefetch() {
         let opts = ConsumerOptions::<TestBackend>::preset(42);
         assert_eq!(opts.prefetch_count, 42);
-    }
-
-    #[cfg(any(
-        feature = "inmemory",
-        feature = "kafka",
-        feature = "nats",
-        feature = "rabbitmq"
-    ))]
-    #[test]
-    fn concurrent_processing_toggles() {
-        let opts = ConsumerOptions::<TestBackend>::new().with_concurrent_processing(false);
-        assert!(!opts.concurrent_processing);
     }
 
     #[cfg(any(
