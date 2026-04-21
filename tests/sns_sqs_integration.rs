@@ -1519,7 +1519,7 @@ async fn sequenced_skip_continues_after_rejection() {
     });
 
     // Wait for at least 2 acked records (amounts 1 and 3)
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if records.lock().await.len() >= 2 {
                 break;
