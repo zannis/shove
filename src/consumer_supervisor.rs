@@ -46,15 +46,14 @@ impl SupervisorOutcome {
 /// `ConsumerGroupRegistry::shutdown_all_with_tally` fill this out so
 /// `RegistryImpl::run_until_timeout` can return a truthful
 /// [`SupervisorOutcome`].
-#[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ShutdownTally {
+pub(crate) struct ShutdownTally {
     pub errors: usize,
     pub panics: usize,
 }
 
 impl ShutdownTally {
-    pub fn add(&mut self, other: ShutdownTally) {
+    pub(crate) fn add(&mut self, other: ShutdownTally) {
         self.errors += other.errors;
         self.panics += other.panics;
     }

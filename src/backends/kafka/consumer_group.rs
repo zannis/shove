@@ -259,6 +259,11 @@ impl KafkaConsumerGroup {
         for (_token, _processing, handle) in self.consumers.drain(..) {
             match handle.await {
                 Ok(()) => {}
+                // Defensive: shutdown is cooperative via `group_token`; no
+                // code path currently calls `JoinHandle::abort()` on these
+                // handles, so this arm is unreachable today. Mirrors the
+                // `ConsumerSupervisor` drain and keeps parity if a future
+                // timeout escalation adds `abort_all`.
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
