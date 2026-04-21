@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
+// Disambiguate against the generic `shove::ConsumerGroupConfig<B>` wrapper
+// in favour of the rabbitmq-specific config this bench uses.
+use shove::rabbitmq::ConsumerGroupConfig;
 use shove::*;
 use testcontainers::ImageExt;
 use testcontainers::core::ExecCommand;
@@ -425,6 +428,7 @@ async fn measure_rss(broker: &Broker, consumers: u16) -> Result<f64, String> {
                 processed: pc.clone(),
                 recorder: rec.clone(),
             },
+            (),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -467,6 +471,7 @@ async fn run_once(
                 processed: pc.clone(),
                 recorder: rec.clone(),
             },
+            (),
         )
         .await
         .map_err(|e| e.to_string())?;

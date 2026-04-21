@@ -22,6 +22,9 @@ fn require_docker() {
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
+// Disambiguate against the generic `shove::ConsumerGroupConfig<B>` wrapper
+// in favour of the rabbitmq-specific config this bench uses.
+use shove::rabbitmq::ConsumerGroupConfig;
 use shove::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,12 +166,14 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
             rt.block_on(async {
                 let mut registry = rabbit.new_registry();
                 registry
-                    .register::<BenchTopic, LatencyHandler>(ConsumerGroupConfig::new(1..=1), || {
-                        LatencyHandler {
+                    .register::<BenchTopic, LatencyHandler>(
+                        ConsumerGroupConfig::new(1..=1),
+                        || LatencyHandler {
                             processed: Arc::new(AtomicU64::new(0)),
                             delay: Duration::ZERO,
-                        }
-                    })
+                        },
+                        (),
+                    )
                     .await
                     .unwrap();
                 registry.start_all();
@@ -242,6 +247,7 @@ fn bench_throughput(c: &mut Criterion) {
                                     processed: pc.clone(),
                                     delay,
                                 },
+                                (),
                             )
                             .await
                             .unwrap();
@@ -298,6 +304,7 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                                     processed: pc.clone(),
                                     delay,
                                 },
+                                (),
                             )
                             .await
                             .unwrap();
