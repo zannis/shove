@@ -37,7 +37,7 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +89,32 @@ impl WaitableCounter {
 // Test harness
 // ---------------------------------------------------------------------------
 
+/// Poll SNS and SQS against the LocalStack endpoint until both respond, or
+/// panic after 30s. Eliminates dispatch-failure flakes when the container is
+/// booted concurrently with other tests and the services aren't yet routable.
+async fn wait_for_localstack_ready(endpoint_url: &str) {
+    let aws_config = aws_config::from_env()
+        .region(aws_config::Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .load()
+        .await;
+    let sns = aws_sdk_sns::Client::new(&aws_config);
+    let sqs = aws_sdk_sqs::Client::new(&aws_config);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let sns_ok = sns.list_topics().send().await.is_ok();
+        let sqs_ok = sqs.list_queues().send().await.is_ok();
+        if sns_ok && sqs_ok {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("LocalStack services not ready within 30s at {endpoint_url}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 struct TestBroker {
     #[allow(dead_code)]
     container: testcontainers::ContainerAsync<LocalStack>,
@@ -120,8 +146,7 @@ impl TestBroker {
 
         let endpoint_url = format!("http://localhost:{port}");
 
-        // Give LocalStack a moment to finish initializing SNS/SQS services
-        sleep(Duration::from_secs(1)).await;
+        wait_for_localstack_ready(&endpoint_url).await;
 
         Self {
             container,
