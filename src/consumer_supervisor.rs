@@ -41,6 +41,25 @@ impl SupervisorOutcome {
     }
 }
 
+/// Internal tally of errors and panics captured while draining a consumer
+/// group. Each backend's `ConsumerGroup::shutdown_with_tally` and
+/// `ConsumerGroupRegistry::shutdown_all_with_tally` fill this out so
+/// `RegistryImpl::run_until_timeout` can return a truthful
+/// [`SupervisorOutcome`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShutdownTally {
+    pub errors: usize,
+    pub panics: usize,
+}
+
+impl ShutdownTally {
+    pub fn add(&mut self, other: ShutdownTally) {
+        self.errors += other.errors;
+        self.panics += other.panics;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ConsumerSupervisor<B, Ctx>
 // ---------------------------------------------------------------------------

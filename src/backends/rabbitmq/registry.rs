@@ -5,6 +5,7 @@ use tracing::{debug, info};
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
+use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
@@ -98,13 +99,19 @@ impl ConsumerGroupRegistry {
 
     /// Shut down every consumer group and wait for all tasks to complete.
     pub async fn shutdown_all(&mut self) {
+        let _ = self.shutdown_all_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
+        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            group.shutdown().await;
+            tally.add(group.shutdown_with_tally().await);
         }
-        debug!("all consumer groups shut down");
+        debug!(errors = tally.errors, panics = tally.panics, "all consumer groups shut down");
+        tally
     }
 }

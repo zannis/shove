@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -12,6 +12,7 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
+use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
@@ -128,6 +129,7 @@ pub struct KafkaConsumerGroup {
     pub(crate) spawner: Spawner,
     pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
     pub(crate) group_token: CancellationToken,
+    pub(crate) error_count: Arc<AtomicUsize>,
 }
 
 impl KafkaConsumerGroup {
@@ -143,6 +145,8 @@ impl KafkaConsumerGroup {
         H: MessageHandler<T, Context = ()> + 'static,
     {
         let concurrent = config.concurrent_processing;
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = KafkaConsumer::new(client.clone());
@@ -154,10 +158,12 @@ impl KafkaConsumerGroup {
                     ..options
                 }
             };
+            let ec = ec_for_spawner.clone();
 
             tokio::spawn(async move {
                 let result = consumer.run_with_inner::<T>(handler, options).await;
                 if let Err(e) = result {
+                    ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -169,6 +175,7 @@ impl KafkaConsumerGroup {
             config,
             spawner,
             group_token,
+            error_count,
         }
     }
 
@@ -242,12 +249,26 @@ impl KafkaConsumerGroup {
     }
 
     pub async fn shutdown(&mut self) {
+        let _ = self.shutdown_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
         info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
         self.group_token.cancel();
+        let mut panics = 0usize;
         for (_token, _processing, handle) in self.consumers.drain(..) {
-            let _ = handle.await;
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
+                    panics += 1;
+                }
+            }
         }
-        debug!(group = %self.queue, "consumer group shutdown complete");
+        let errors = self.error_count.swap(0, Ordering::Relaxed);
+        debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
+        ShutdownTally { errors, panics }
     }
 
     fn spawn_one(&mut self) {
@@ -362,14 +383,20 @@ impl KafkaConsumerGroupRegistry {
     }
 
     pub async fn shutdown_all(&mut self) {
+        let _ = self.shutdown_all_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
+        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            group.shutdown().await;
+            tally.add(group.shutdown_with_tally().await);
         }
-        debug!("all consumer groups shut down");
+        debug!(errors = tally.errors, panics = tally.panics, "all consumer groups shut down");
+        tally
     }
 }
 
@@ -395,6 +422,7 @@ mod tests {
             config,
             spawner,
             group_token,
+            error_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 

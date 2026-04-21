@@ -230,14 +230,13 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
             }
         }
 
-        // The existing `shutdown_all` performs per-group cancellation and
-        // awaits each consumer task's `JoinHandle` without surfacing
-        // per-task panic counts. Phase 11 rebuilds the registry around a
-        // single `JoinSet` so errors/panics can be tallied here; for
-        // Phase 4 the best-effort outcome records only drain-timeout.
-        let drain = self.shutdown_all();
+        let drain = self.shutdown_all_with_tally();
         match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(()) => SupervisorOutcome::default(),
+            Ok(tally) => SupervisorOutcome {
+                errors: tally.errors,
+                panics: tally.panics,
+                timed_out: false,
+            },
             Err(_) => SupervisorOutcome {
                 errors: 0,
                 panics: 0,
