@@ -1,0 +1,36 @@
+src/consumer_supervisor.rs
+  117d9116ef391f72 10,111-119,141-155,158-170,175-179,186-188,190-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "5a3c7ebabe9da788b9892cac51cfeb7c4b8bde9d",
+  "prompts": {
+    "117d9116ef391f72": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f9062d0b-e6dc-4fdd-baf0-5b34259162dc",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 48,
+      "total_deletions": 24,
+      "accepted_lines": 48,
+      "overriden_lines": 0
+    },
+    "4de9846a29396b97": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019db220-3d82-7e11-8333-29421a230d00",
+        "model": "gpt-5.4"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    }
+  }
+}
