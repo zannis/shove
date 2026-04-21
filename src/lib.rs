@@ -52,6 +52,8 @@
 //! identical.
 //!
 //! ```no_run
+//! # #[cfg(feature = "inmemory")]
+//! # mod example {
 //! use serde::{Deserialize, Serialize};
 //! use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
 //! use shove::{
@@ -75,7 +77,7 @@
 //!     }
 //! }
 //!
-//! # async fn run() -> Result<(), shove::ShoveError> {
+//! # pub async fn run() -> Result<(), shove::ShoveError> {
 //! let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await?;
 //! broker.topology().declare::<Orders>().await?;
 //!
@@ -94,6 +96,7 @@
 //!     .run_until_timeout(std::future::ready(()), Duration::from_secs(1))
 //!     .await;
 //! std::process::exit(outcome.exit_code());
+//! # }
 //! # }
 //! ```
 //!
