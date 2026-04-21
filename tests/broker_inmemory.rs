@@ -72,3 +72,129 @@ async fn broker_consumer_group_exists_for_inmemory() {
     let _group = broker.consumer_group();
     broker.close().await;
 }
+
+/// Regression test: a handler whose `Context` is a non-unit `Arc<AppState>`
+/// must compile through both `ConsumerSupervisor::register` and
+/// `ConsumerGroup::register` once the `with_context` fluent API has been
+/// applied, and the handler's `handle` call must receive the stored context.
+#[tokio::test]
+async fn non_unit_context_plumbs_through_supervisor_and_group() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use shove::consumer::ConsumerOptions;
+    use shove::consumer_group::ConsumerGroupConfig;
+    use shove::handler::MessageHandler;
+    use shove::inmemory::InMemoryConsumerGroupConfig;
+    use shove::metadata::MessageMetadata;
+    use shove::outcome::Outcome;
+    use shove::topic::Topic;
+    use shove::topology::{QueueTopology, TopologyBuilder};
+
+    #[derive(Clone)]
+    struct AppState {
+        counter: Arc<AtomicU32>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Msg {
+        n: u32,
+    }
+
+    struct SupTopic;
+    impl Topic for SupTopic {
+        type Message = Msg;
+        fn topology() -> &'static QueueTopology {
+            static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("ctx-supervisor").build())
+        }
+    }
+
+    struct GroupTopic;
+    impl Topic for GroupTopic {
+        type Message = Msg;
+        fn topology() -> &'static QueueTopology {
+            static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("ctx-group").build())
+        }
+    }
+
+    struct CountingHandler;
+    impl MessageHandler<SupTopic> for CountingHandler {
+        type Context = AppState;
+        async fn handle(&self, msg: Msg, _: MessageMetadata, ctx: &AppState) -> Outcome {
+            ctx.counter.fetch_add(msg.n, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+    impl MessageHandler<GroupTopic> for CountingHandler {
+        type Context = AppState;
+        async fn handle(&self, msg: Msg, _: MessageMetadata, ctx: &AppState) -> Outcome {
+            ctx.counter.fetch_add(msg.n, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
+    broker.topology().declare::<SupTopic>().await.unwrap();
+    broker.topology().declare::<GroupTopic>().await.unwrap();
+
+    let state = AppState {
+        counter: Arc::new(AtomicU32::new(0)),
+    };
+
+    // ── ConsumerSupervisor<InMemory, AppState> ──
+    let mut supervisor = broker.consumer_supervisor().with_context(state.clone());
+    supervisor
+        .register::<SupTopic, _>(CountingHandler, ConsumerOptions::new())
+        .unwrap();
+
+    // ── ConsumerGroup<InMemory, AppState> ──
+    let mut group = broker.consumer_group().with_context(state.clone());
+    group
+        .register::<GroupTopic, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1)),
+            || CountingHandler,
+        )
+        .await
+        .unwrap();
+
+    // Publish one message to each topic.
+    let publisher = broker.publisher().await.unwrap();
+    publisher.publish::<SupTopic>(&Msg { n: 7 }).await.unwrap();
+    publisher.publish::<GroupTopic>(&Msg { n: 13 }).await.unwrap();
+
+    // The group's `run_until_timeout` calls `start_all()`, so we must let it
+    // run to start the group consumers. Drive shutdown from a signal that
+    // waits for both counters to be visited, then cancels both harnesses.
+    let sup_token = supervisor.cancellation_token();
+    let group_token = group.cancellation_token();
+    let counter_for_signal = state.counter.clone();
+    let signal = async move {
+        for _ in 0..200 {
+            if counter_for_signal.load(Ordering::Relaxed) >= 20 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sup_token.cancel();
+        group_token.cancel();
+    };
+
+    // Supervisor: consumers were already spawned by `register()`. Use a
+    // never-ready signal so the drain waits for the shared tokens above.
+    let (sup_outcome, group_outcome) = tokio::join!(
+        supervisor.run_until_timeout(std::future::pending::<()>(), Duration::from_secs(3)),
+        group.run_until_timeout(signal, Duration::from_secs(3)),
+    );
+
+    assert!(sup_outcome.is_clean(), "supervisor: {sup_outcome:?}");
+    assert!(group_outcome.is_clean(), "group: {group_outcome:?}");
+
+    // Both handlers saw the injected AppState: supervisor added 7, group added 13.
+    assert_eq!(state.counter.load(Ordering::Relaxed), 20);
+
+    broker.close().await;
+}

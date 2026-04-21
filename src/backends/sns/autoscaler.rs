@@ -222,6 +222,7 @@ mod tests {
             Arc::new(QueueRegistry::new()),
             token.clone(),
             || H,
+            (),
         );
         if started {
             group.start();

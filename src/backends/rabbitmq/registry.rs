@@ -39,10 +39,11 @@ impl ConsumerGroupRegistry {
         &mut self,
         config: ConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -66,6 +67,7 @@ impl ConsumerGroupRegistry {
             self.client.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())

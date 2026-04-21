@@ -113,35 +113,35 @@ impl ConsumerImpl for InMemoryConsumer {
     async fn run<T, H>(
         &self,
         handler: H,
-        _ctx: H::Context,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
     ) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        InMemoryConsumer::run_with_inner::<T>(self, handler, options).await
+        InMemoryConsumer::run_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
     async fn run_fifo<T, H>(
         &self,
         handler: H,
-        _ctx: H::Context,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
     ) -> Result<()>
     where
         T: SequencedTopic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        InMemoryConsumer::run_fifo_with_inner::<T>(self, handler, options).await
+        InMemoryConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, _ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        InMemoryConsumer::run_dlq::<T>(self, handler).await
+        InMemoryConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 }
 
@@ -189,19 +189,17 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
         &mut self,
         config: Self::GroupConfig,
         factory: impl Fn() -> H + Send + Sync + 'static,
-        _ctx: H::Context,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        // `Context = ()` on the bound makes the generic `T: Topic` + `H: MessageHandler<T, Context = ()>`
-        // the right shape for the existing inherent `register`. Inherent
-        // methods take precedence over trait methods at call sites where
-        // both are in scope, so `self.register` resolves to the inherent
-        // method here — the `<Self as _>::` disambiguation would be an
-        // infinite recursion.
-        InMemoryConsumerGroupRegistry::register::<T, H>(self, config, factory).await
+        // Inherent methods take precedence over trait methods at call sites
+        // where both are in scope, so `self.register` resolves to the inherent
+        // method here — `<Self as _>::` disambiguation would be infinite
+        // recursion.
+        InMemoryConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
     }
 
     fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {

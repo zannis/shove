@@ -49,10 +49,11 @@ impl SqsConsumerGroupRegistry {
         &mut self,
         config: SqsConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T> + Clone + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -77,6 +78,7 @@ impl SqsConsumerGroupRegistry {
             self.queue_registry.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())

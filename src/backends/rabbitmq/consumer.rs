@@ -156,9 +156,11 @@ impl RabbitMqConsumer {
     /// Runs the concurrent-sequenced consumer loop with reconnect handling.
     /// Processes multiple keys concurrently within a single shard, using local
     /// buffering for messages that arrive while their key is busy.
+    #[allow(clippy::too_many_arguments)]
     async fn run_internal_concurrent_sequenced<T, H>(
         &self,
         handler: Arc<H>,
+        ctx: Arc<H::Context>,
         queue: &str,
         topology: &'static QueueTopology,
         options: ConsumerOptions,
@@ -168,7 +170,7 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
         let mut poisoned_keys = HashSet::new();
         let mut pending_deliveries: HashMap<String, VecDeque<Delivery>> = HashMap::new();
@@ -177,6 +179,7 @@ impl RabbitMqConsumer {
             match self
                 .consume_loop_concurrent_sequenced::<T, H>(
                     handler.clone(),
+                    ctx.clone(),
                     queue,
                     topology,
                     &options,
@@ -217,6 +220,7 @@ impl RabbitMqConsumer {
     async fn consume_loop_concurrent_sequenced<T, H>(
         &self,
         handler: Arc<H>,
+        ctx: Arc<H::Context>,
         queue: &str,
         topology: &'static QueueTopology,
         options: &ConsumerOptions,
@@ -228,7 +232,7 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
         let prefetch = options.prefetch_count;
         #[cfg(feature = "rabbitmq-transactional")]
@@ -314,6 +318,7 @@ impl RabbitMqConsumer {
                         self.drain_pending_for_key::<T, H>(
                             &key,
                             &handler,
+                            &ctx,
                             options,
                             on_failure,
                             poisoned_keys,
@@ -615,6 +620,7 @@ impl RabbitMqConsumer {
                         Some(message) => {
                             let rx = spawn_handler_keyed::<T, H>(
                                 &handler,
+                                &ctx,
                                 message,
                                 metadata,
                                 options.handler_timeout,
@@ -645,6 +651,7 @@ impl RabbitMqConsumer {
         &self,
         key: &str,
         handler: &Arc<H>,
+        ctx: &Arc<H::Context>,
         options: &ConsumerOptions,
         on_failure: SequenceFailure,
         poisoned_keys: &mut HashSet<String>,
@@ -658,7 +665,7 @@ impl RabbitMqConsumer {
     ) where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
         // If the key is poisoned, reject all pending deliveries for it.
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
@@ -721,6 +728,7 @@ impl RabbitMqConsumer {
                 Some(message) => {
                     let rx = spawn_handler_keyed::<T, H>(
                         handler,
+                        ctx,
                         message,
                         metadata,
                         options.handler_timeout,
@@ -753,6 +761,7 @@ impl RabbitMqConsumer {
     async fn run_internal_concurrent<T, H>(
         &self,
         handler: Arc<H>,
+        ctx: Arc<H::Context>,
         queue: &str,
         topology: &'static QueueTopology,
         options: ConsumerOptions,
@@ -760,11 +769,17 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
         let shutdown = options.shutdown.clone();
         run_with_reconnect(&shutdown, queue, || {
-            self.consume_loop_concurrent::<T, H>(handler.clone(), queue, topology, &options)
+            self.consume_loop_concurrent::<T, H>(
+                handler.clone(),
+                ctx.clone(),
+                queue,
+                topology,
+                &options,
+            )
         })
         .await
     }
@@ -772,6 +787,7 @@ impl RabbitMqConsumer {
     async fn consume_loop_concurrent<T, H>(
         &self,
         handler: Arc<H>,
+        ctx: Arc<H::Context>,
         queue: &str,
         topology: &'static QueueTopology,
         options: &ConsumerOptions,
@@ -779,7 +795,7 @@ impl RabbitMqConsumer {
     where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
         #[cfg(feature = "rabbitmq-transactional")]
         let exactly_once = options.exactly_once;
@@ -888,6 +904,7 @@ impl RabbitMqConsumer {
                     if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, options).await {
                         let rx = spawn_handler::<T, H>(
                             &handler,
+                            &ctx,
                             message,
                             metadata,
                             options.handler_timeout,
@@ -911,13 +928,14 @@ impl RabbitMqConsumer {
 async fn consume_dlq_loop<T, H>(
     client: &RabbitMqClient,
     handler: &H,
+    ctx: &H::Context,
     dlq: &str,
     options: &ConsumerOptions,
 ) -> Result<()>
 where
     T: Topic,
     T::Message: for<'de> serde::Deserialize<'de>,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     // DLQ consumer never uses exactly-once mode (always acks, no hold-queue routing).
     let (_channel, mut stream) = open_consumer(client, dlq, options.prefetch_count, false).await?;
@@ -951,7 +969,7 @@ where
                             );
                         }
                         Ok(message) => {
-                            handler.handle_dead(message, metadata, &()).await;
+                            handler.handle_dead(message, metadata, ctx).await;
                         }
                     }
                 }
@@ -1085,6 +1103,7 @@ async fn invoke_handler(fut: impl Future<Output = Outcome>, timeout: Option<Dura
 /// Returns the oneshot receiver that will resolve with the handler's outcome.
 fn spawn_handler<T, H>(
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
@@ -1092,13 +1111,18 @@ fn spawn_handler<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
+    let c = ctx.clone();
     let n = notify.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler(h.handle(message, metadata, &()), timeout).await;
+        let outcome = invoke_handler(
+            async move { h.handle(message, metadata, c.as_ref()).await },
+            timeout,
+        )
+        .await;
         let _ = tx.send(outcome);
         n.notify_one();
     });
@@ -1110,6 +1134,7 @@ where
 /// keys to find which one completed.
 fn spawn_handler_keyed<T, H>(
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
@@ -1118,15 +1143,20 @@ fn spawn_handler_keyed<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
-    let ctx = completed_tx.clone();
+    let c = ctx.clone();
+    let completed = completed_tx.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler(h.handle(message, metadata, &()), timeout).await;
+        let outcome = invoke_handler(
+            async move { h.handle(message, metadata, c.as_ref()).await },
+            timeout,
+        )
+        .await;
         let _ = tx.send(outcome);
-        let _ = ctx.send(key);
+        let _ = completed.send(key);
     });
     rx
 }
@@ -1171,42 +1201,63 @@ where
 }
 
 impl RabbitMqConsumer {
-    pub async fn run<T: Topic>(
+    pub async fn run<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::RabbitMq>,
-    ) -> Result<()> {
-        self.run_with_inner::<T>(handler, options.into_inner())
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
             .await
     }
 
-    pub(crate) async fn run_with_inner<T: Topic>(
+    pub(crate) async fn run_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let consumer = RabbitMqConsumer::new(self.client.clone());
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         consumer
-            .run_internal_concurrent::<T, _>(handler, topology.queue(), topology, options)
+            .run_internal_concurrent::<T, H>(handler, ctx, topology.queue(), topology, options)
             .await
     }
 
-    pub async fn run_fifo<T: SequencedTopic>(
+    pub async fn run_fifo<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::RabbitMq>,
-    ) -> Result<()> {
-        self.run_fifo_with_inner::<T>(handler, options.into_inner())
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
             .await
     }
 
-    pub(crate) async fn run_fifo_with_inner<T: SequencedTopic>(
+    pub(crate) async fn run_fifo_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let seq = topology.sequencing().ok_or_else(|| {
             ShoveError::Topology("run_fifo called on topic without sequencing config".into())
@@ -1214,6 +1265,7 @@ impl RabbitMqConsumer {
 
         let on_failure = seq.on_failure();
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let shutdown = options.shutdown.clone();
         let prefetch = options.prefetch_count;
         let client = self.client.clone();
@@ -1223,6 +1275,7 @@ impl RabbitMqConsumer {
             let sub_queue = format!("{}-seq-{i}", topology.queue());
             let shard_hold_queues = topology.shard_hold_queue_names(i);
             let h = handler.clone();
+            let c = ctx.clone();
             let inner_client = client.clone();
             let mut opts = ConsumerOptions::defaults_with_shutdown(shutdown.clone());
             opts.max_retries = options.max_retries;
@@ -1233,8 +1286,9 @@ impl RabbitMqConsumer {
             handles.push(tokio::spawn(async move {
                 let consumer = RabbitMqConsumer::new(inner_client);
                 consumer
-                    .run_internal_concurrent_sequenced::<T, _>(
+                    .run_internal_concurrent_sequenced::<T, H>(
                         h,
+                        c,
                         &sub_queue,
                         topology,
                         opts,
@@ -1256,10 +1310,11 @@ impl RabbitMqConsumer {
         Ok(())
     }
 
-    pub async fn run_dlq<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T, Context = ()>,
-    ) -> Result<()> {
+    pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let dlq = topology
             .dlq()
@@ -1268,7 +1323,7 @@ impl RabbitMqConsumer {
         let options = ConsumerOptions::defaults_with_shutdown(shutdown);
 
         run_with_reconnect(&options.shutdown, dlq, || {
-            consume_dlq_loop::<T, _>(&self.client, &handler, dlq, &options)
+            consume_dlq_loop::<T, H>(&self.client, &handler, &ctx, dlq, &options)
         })
         .await
     }

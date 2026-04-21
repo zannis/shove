@@ -647,8 +647,9 @@ async fn publish_and_consume_simple_message() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(shutdown_clone)
                     .with_prefetch_count(1),
@@ -705,8 +706,9 @@ async fn publish_and_consume_with_headers() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(shutdown_clone)
                     .with_prefetch_count(1),
@@ -767,8 +769,9 @@ async fn publish_and_consume_batch() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(shutdown_clone)
                     .with_prefetch_count(10),
@@ -813,8 +816,9 @@ async fn rejected_message_lands_in_dlq() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(shutdown_clone)
                     .with_prefetch_count(1)
@@ -868,8 +872,9 @@ async fn dlq_consumer_handles_dead_message() {
     let consumer1 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle1 = tokio::spawn(async move {
         consumer1
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 reject_handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(shutdown1_clone)
                     .with_prefetch_count(1)
@@ -919,7 +924,7 @@ async fn dlq_consumer_handles_dead_message() {
     let dlq_handler_clone = dlq_handler.clone();
 
     let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
-    let h2 = tokio::spawn(async move { consumer2.run_dlq::<WorkTopic>(dlq_handler_clone).await });
+    let h2 = tokio::spawn(async move { consumer2.run_dlq::<WorkTopic, _>(dlq_handler_clone, ()).await });
 
     let reached = dlq_handler.wait_for_count(1, Duration::from_secs(15)).await;
 
@@ -959,8 +964,9 @@ async fn retry_then_ack_succeeds() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(5)
@@ -1007,8 +1013,9 @@ async fn max_retries_sends_to_dlq() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(2)
@@ -1080,8 +1087,9 @@ async fn defer_redelivers_message() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(5)
@@ -1146,8 +1154,9 @@ async fn concurrent_consume_processes_all_messages() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_prefetch_count(10),
@@ -1188,8 +1197,9 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(1)
@@ -1246,8 +1256,9 @@ async fn concurrent_consume_graceful_shutdown_drains_inflight() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_prefetch_count(3),
@@ -1319,8 +1330,9 @@ async fn handler_timeout_triggers_retry() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_handler_timeout(Duration::from_millis(200))
@@ -1385,8 +1397,9 @@ async fn sequenced_consume_preserves_order() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_prefetch_count(10),
@@ -1465,8 +1478,9 @@ async fn sequenced_skip_continues_after_rejection() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_prefetch_count(10)
@@ -1557,8 +1571,9 @@ async fn sequenced_failall_poisons_key() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqFailAllTopic>(
+            .run_fifo::<SeqFailAllTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_prefetch_count(10)
@@ -1637,8 +1652,9 @@ async fn sequenced_multiple_keys_processed_concurrently() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_prefetch_count(10),
@@ -1708,8 +1724,9 @@ async fn fifo_topic_deduplicates_identical_payloads() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_prefetch_count(5),
@@ -1837,6 +1854,7 @@ async fn consumer_group_processes_messages() {
         setup.queue_registry.clone(),
         group_token.clone(),
         move || template_handler.clone(),
+        (),
     );
 
     group.start();
@@ -1871,6 +1889,7 @@ async fn consumer_group_scales_up_and_down() {
         setup.queue_registry.clone(),
         group_token.clone(),
         CountingHandler::new,
+        (),
     );
 
     group.start();
@@ -1932,7 +1951,7 @@ async fn registry_register_declares_topology_and_starts() {
     );
 
     registry
-        .register::<WorkTopic, CountingHandler>(config, move || template_handler.clone())
+        .register::<WorkTopic, CountingHandler>(config, move || template_handler.clone(), ())
         .await
         .expect("register should succeed");
 
@@ -1997,14 +2016,14 @@ async fn registry_duplicate_registration_fails() {
 
     // First registration should succeed.
     registry
-        .register::<WorkTopic, CountingHandler>(config, CountingHandler::new)
+        .register::<WorkTopic, CountingHandler>(config, CountingHandler::new, ())
         .await
         .expect("first registration should succeed");
 
     // Second registration for the same topic should fail.
     let config2 = SqsConsumerGroupConfig::new(1..=2);
     let result = registry
-        .register::<WorkTopic, CountingHandler>(config2, CountingHandler::new)
+        .register::<WorkTopic, CountingHandler>(config2, CountingHandler::new, ())
         .await;
 
     assert!(result.is_err(), "duplicate registration should return Err");
@@ -2052,8 +2071,9 @@ async fn deserialization_failure_rejects_to_dlq() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(1)
@@ -2156,10 +2176,14 @@ async fn sqs_autoscaler_scales_group_on_load() {
     let config = SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1);
 
     registry
-        .register::<WorkTopic, _>(config, {
-            let h = sticky.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopic, _>(
+            config,
+            {
+                let h = sticky.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register should succeed");
 
@@ -2324,18 +2348,26 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
     let (sticky_b, signal_b) = StickyHandler::new();
 
     registry
-        .register::<WorkTopicA, _>(SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1), {
-            let h = sticky_a.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopicA, _>(
+            SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1),
+            {
+                let h = sticky_a.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register A should succeed");
 
     registry
-        .register::<WorkTopicB, _>(SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1), {
-            let h = sticky_b.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopicB, _>(
+            SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1),
+            {
+                let h = sticky_b.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register B should succeed");
 
@@ -2419,8 +2451,9 @@ async fn consumer_run_on_undeclared_queue_fails() {
 
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let result = consumer
-        .run::<WorkTopic>(
+        .run::<WorkTopic, _>(
             handler,
+            (),
             ConsumerOptions::<Sqs>::new().with_shutdown(shutdown),
         )
         .await;
@@ -2445,7 +2478,7 @@ async fn run_dlq_on_topic_without_dlq_fails() {
     let handler = CountingHandler::new();
 
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
-    let result = consumer.run_dlq::<NoDlqTopic>(handler).await;
+    let result = consumer.run_dlq::<NoDlqTopic, _>(handler, ()).await;
 
     assert!(
         result.is_err(),
@@ -2501,8 +2534,9 @@ async fn defer_without_hold_queues_redelivers() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<DeferNoHoldTopic>(
+            .run::<DeferNoHoldTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(5)
@@ -2586,8 +2620,9 @@ async fn defer_preserves_retry_count() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(5)
@@ -2671,8 +2706,9 @@ async fn sequenced_defer_redelivers() {
     let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler,
+                (),
                 ConsumerOptions::<Sqs>::new()
                     .with_shutdown(sc)
                     .with_max_retries(5)
@@ -2757,10 +2793,14 @@ async fn autoscaler_custom_strategy_with_sqs() {
     let config = SqsConsumerGroupConfig::new(1..=4).with_prefetch_count(5);
 
     registry
-        .register::<WorkTopic, _>(config, {
-            let h = sticky.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopic, _>(
+            config,
+            {
+                let h = sticky.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register should succeed");
 
@@ -2859,10 +2899,14 @@ async fn autoscaler_scale_magnitude_with_sqs() {
     let config = SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5);
 
     registry
-        .register::<WorkTopic, _>(config, {
-            let h = sticky.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopic, _>(
+            config,
+            {
+                let h = sticky.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register should succeed");
 

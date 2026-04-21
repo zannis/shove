@@ -151,6 +151,7 @@ impl SqsConsumerGroup {
     /// handler instance.  The factory is stored inside a type-erased closure
     /// so that the rest of the codebase does not have to carry `T`/`H` type
     /// parameters.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<T, H>(
         name: impl Into<String>,
         queue: impl Into<String>,
@@ -159,10 +160,11 @@ impl SqsConsumerGroup {
         queue_registry: Arc<QueueRegistry>,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + Clone + 'static,
+        H: MessageHandler<T> + Clone + 'static,
     {
         let concurrent = config.concurrent_processing;
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
@@ -182,9 +184,10 @@ impl SqsConsumerGroup {
                     ..options
                 }
             };
+            let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run_with_inner::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
                     tracing::error!("consumer task exited with error: {e}");
                 }

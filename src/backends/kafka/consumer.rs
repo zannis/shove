@@ -401,15 +401,16 @@ async fn route_outcome(
 // Handler invocation
 // ---------------------------------------------------------------------------
 
-async fn invoke_handler<T: Topic, H: MessageHandler<T, Context = ()> + ?Sized>(
+async fn invoke_handler<T: Topic, H: MessageHandler<T> + ?Sized>(
     handler: &H,
+    ctx: &H::Context,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
         Some(duration) => {
-            match tokio::time::timeout(duration, handler.handle(message, metadata, &())).await {
+            match tokio::time::timeout(duration, handler.handle(message, metadata, ctx)).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     tracing::warn!("handler timed out after {duration:?}, retrying");
@@ -417,7 +418,7 @@ async fn invoke_handler<T: Topic, H: MessageHandler<T, Context = ()> + ?Sized>(
                 }
             }
         }
-        None => handler.handle(message, metadata, &()).await,
+        None => handler.handle(message, metadata, ctx).await,
     }
 }
 
@@ -524,20 +525,30 @@ impl KafkaConsumer {
 }
 
 impl KafkaConsumer {
-    pub async fn run<T: Topic>(
+    pub async fn run<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::Kafka>,
-    ) -> Result<()> {
-        self.run_with_inner::<T>(handler, options.into_inner())
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
             .await
     }
 
-    pub(crate) async fn run_with_inner<T: Topic>(
+    pub(crate) async fn run_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
         let group_id = super::constants::consumer_group_id(queue);
@@ -551,6 +562,7 @@ impl KafkaConsumer {
         let hold_queues = topology.hold_queues();
 
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         tracing::info!(
@@ -565,6 +577,7 @@ impl KafkaConsumer {
 
         run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let client = client.clone();
             let processing = processing.clone();
             let shutdown = shutdown.clone();
@@ -694,6 +707,7 @@ impl KafkaConsumer {
                             })?;
 
                             let task_handler = handler.clone();
+                            let task_ctx = ctx.clone();
                             let task_client = client.clone();
                             let task_processing = processing.clone();
                             let task_semaphore = semaphore.clone();
@@ -705,6 +719,7 @@ impl KafkaConsumer {
                             tokio::spawn(async move {
                                 let outcome = invoke_handler(
                                     task_handler.as_ref(),
+                                    task_ctx.as_ref(),
                                     payload,
                                     metadata,
                                     handler_timeout,
@@ -750,20 +765,30 @@ impl KafkaConsumer {
         .await
     }
 
-    pub async fn run_fifo<T: SequencedTopic>(
+    pub async fn run_fifo<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::Kafka>,
-    ) -> Result<()> {
-        self.run_fifo_with_inner::<T>(handler, options.into_inner())
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
             .await
     }
 
-    pub(crate) async fn run_fifo_with_inner<T: SequencedTopic>(
+    pub(crate) async fn run_fifo_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
         let _seq_config = topology
@@ -778,6 +803,7 @@ impl KafkaConsumer {
         let hold_queues = topology.hold_queues();
 
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         // Kafka naturally provides per-partition ordering. A single consumer
@@ -789,6 +815,7 @@ impl KafkaConsumer {
 
         run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let client = client.clone();
             let shutdown = shutdown.clone();
             let processing = processing.clone();
@@ -882,8 +909,9 @@ impl KafkaConsumer {
                             let outcome = {
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let h = handler.clone();
+                                let c = ctx.clone();
                                 tokio::spawn(async move {
-                                    let o = invoke_handler(h.as_ref(), payload, metadata, handler_timeout).await;
+                                    let o = invoke_handler(h.as_ref(), c.as_ref(), payload, metadata, handler_timeout).await;
                                     let _ = tx.send(o);
                                 });
                                 rx.await.unwrap_or_else(|_| {
@@ -917,10 +945,11 @@ impl KafkaConsumer {
         .await
     }
 
-    pub async fn run_dlq<T: Topic>(
-        &self,
-        handler: impl MessageHandler<T, Context = ()>,
-    ) -> Result<()> {
+    pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
@@ -929,12 +958,14 @@ impl KafkaConsumer {
         let dlq_group_id = super::constants::dlq_consumer_group_id(dlq);
         let shutdown = self.client.shutdown_token();
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
         run_with_reconnect(&shutdown, dlq, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let _client = client.clone();
             let shutdown = shutdown.clone();
             let dlq_group_id = dlq_group_id.clone();
@@ -992,7 +1023,7 @@ impl KafkaConsumer {
                             };
 
                             let metadata = build_dead_metadata(&headers);
-                            handler.handle_dead(payload, metadata, &()).await;
+                            handler.handle_dead(payload, metadata, ctx.as_ref()).await;
 
                             if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
                                 tracing::error!(error = %e, dlq, "failed to commit DLQ message");

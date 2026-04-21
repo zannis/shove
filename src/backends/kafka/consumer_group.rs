@@ -139,10 +139,11 @@ impl KafkaConsumerGroup {
         client: KafkaClient,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
         let error_count = Arc::new(AtomicUsize::new(0));
@@ -159,9 +160,10 @@ impl KafkaConsumerGroup {
                 }
             };
             let ec = ec_for_spawner.clone();
+            let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run_with_inner::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
                     ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");
@@ -337,10 +339,11 @@ impl KafkaConsumerGroupRegistry {
         &mut self,
         config: KafkaConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -367,6 +370,7 @@ impl KafkaConsumerGroupRegistry {
             client.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())

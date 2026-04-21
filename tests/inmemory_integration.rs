@@ -311,13 +311,13 @@ async fn max_retries_exceeded_goes_to_dlq() {
             .with_shutdown(shutdown_main)
             .with_prefetch_count(1)
             .with_max_retries(2);
-        consumer_main.run::<OrdersTopic>(AlwaysRetry, opts).await
+        consumer_main.run::<OrdersTopic, _>(AlwaysRetry, (), opts).await
     });
 
     let consumer_dlq = InMemoryConsumer::new(client.clone());
     let dlq_handler = DlqHandler(dlq_seen.clone());
     let dlq_handle =
-        tokio::spawn(async move { consumer_dlq.run_dlq::<OrdersTopic>(dlq_handler).await });
+        tokio::spawn(async move { consumer_dlq.run_dlq::<OrdersTopic, _>(dlq_handler, ()).await });
 
     let dlq_probe = dlq_seen.clone();
     assert!(
@@ -389,7 +389,7 @@ async fn sequenced_preserves_per_key_order() {
         let opts = ConsumerOptions::<InMemory>::new()
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1);
-        consumer.run_fifo::<LedgerSkipTopic>(handler, opts).await
+        consumer.run_fifo::<LedgerSkipTopic, _>(handler, (), opts).await
     });
 
     let probe = order.clone();
@@ -479,7 +479,7 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
         let opts = ConsumerOptions::<InMemory>::new()
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1);
-        consumer.run_fifo::<LedgerFailAllTopic>(handler, opts).await
+        consumer.run_fifo::<LedgerFailAllTopic, _>(handler, (), opts).await
     });
 
     #[derive(Clone)]
@@ -496,7 +496,7 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
     let dlq_handle = {
         let consumer = InMemoryConsumer::new(client.clone());
         let handler = DlqHandler(dlq_count.clone());
-        tokio::spawn(async move { consumer.run_dlq::<LedgerFailAllTopic>(handler).await })
+        tokio::spawn(async move { consumer.run_dlq::<LedgerFailAllTopic, _>(handler, ()).await })
     };
 
     let acked_probe = acked.clone();
@@ -598,13 +598,13 @@ async fn handler_panic_does_not_crash_consumer() {
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1)
             .with_max_retries(5);
-        consumer.run::<OrdersTopic>(handler, opts).await
+        consumer.run::<OrdersTopic, _>(handler, (), opts).await
     });
 
     let dlq_handle = {
         let consumer = InMemoryConsumer::new(client.clone());
         let dlq_handler = DlqH(dlq_hits.clone());
-        tokio::spawn(async move { consumer.run_dlq::<OrdersTopic>(dlq_handler).await })
+        tokio::spawn(async move { consumer.run_dlq::<OrdersTopic, _>(dlq_handler, ()).await })
     };
 
     // Both messages should eventually ack (panicked one after one retry).
@@ -705,13 +705,13 @@ async fn oversized_message_rejected_to_dlq() {
             .with_shutdown(shutdown_main)
             .with_prefetch_count(1)
             .with_max_message_size(1024);
-        consumer_main.run::<BigTopic>(main_handler, opts).await
+        consumer_main.run::<BigTopic, _>(main_handler, (), opts).await
     });
 
     let dlq_handle = {
         let consumer = InMemoryConsumer::new(client.clone());
         let handler = DlqH(dlq_hits.clone());
-        tokio::spawn(async move { consumer.run_dlq::<BigTopic>(handler).await })
+        tokio::spawn(async move { consumer.run_dlq::<BigTopic, _>(handler, ()).await })
     };
 
     let probe = dlq_hits.clone();
@@ -784,13 +784,13 @@ async fn handler_timeout_triggers_retry_then_dlq() {
             .with_prefetch_count(1)
             .with_max_retries(1)
             .with_handler_timeout(Duration::from_millis(50));
-        consumer_main.run::<OrdersTopic>(handler, opts).await
+        consumer_main.run::<OrdersTopic, _>(handler, (), opts).await
     });
 
     let dlq_handle = {
         let consumer = InMemoryConsumer::new(client.clone());
         let handler = DlqH(dlq_hits.clone());
-        tokio::spawn(async move { consumer.run_dlq::<OrdersTopic>(handler).await })
+        tokio::spawn(async move { consumer.run_dlq::<OrdersTopic, _>(handler, ()).await })
     };
 
     let probe = dlq_hits.clone();
@@ -953,7 +953,7 @@ async fn poison_cleared_after_shard_drains() {
         let opts = ConsumerOptions::<InMemory>::new()
             .with_shutdown(shutdown_for_task)
             .with_prefetch_count(1);
-        consumer.run_fifo::<LedgerFailAllTopic>(handler, opts).await
+        consumer.run_fifo::<LedgerFailAllTopic, _>(handler, (), opts).await
     });
 
     // Wait until the shard has drained the first batch (seq 0 acked, 1 rejected, 2 DLQ'd).
@@ -1055,6 +1055,7 @@ async fn autoscaler_scales_up_under_backlog() {
         reg.register::<GroupTopic, _>(
             InMemoryConsumerGroupConfig::new(1..=3).with_prefetch_count(1),
             factory,
+            (),
         )
         .await
         .unwrap();

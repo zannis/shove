@@ -1408,7 +1408,7 @@ async fn publish_and_consume_simple_message() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer.run::<SimpleWork>(h, opts).await
+        consumer.run::<SimpleWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(1, Duration::from_secs(10)).await);
@@ -1448,7 +1448,7 @@ async fn publish_with_headers() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer.run::<SimpleWork>(h, opts).await
+        consumer.run::<SimpleWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(1, Duration::from_secs(10)).await);
@@ -1486,7 +1486,7 @@ async fn publish_batch() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
-        consumer.run::<SimpleWork>(h, opts).await
+        consumer.run::<SimpleWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(5, Duration::from_secs(10)).await);
@@ -1525,7 +1525,7 @@ async fn rejected_message_lands_in_dlq() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer.run::<SimpleWork>(RejectHandler, opts).await
+        consumer.run::<SimpleWork, _>(RejectHandler, (), opts).await
     });
 
     // Give it time to reject
@@ -1537,7 +1537,7 @@ async fn rejected_message_lands_in_dlq() {
     let dlq_handler = DlqCountingHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<SimpleWork>(dh).await });
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<SimpleWork, _>(dh, ()).await });
 
     assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
     assert_eq!(dlq_handler.count(), 1);
@@ -1611,7 +1611,7 @@ async fn registry_register_declares_topology_and_starts() {
 
     // register auto-declares topology
     registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=3), move || h.clone())
+        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=3), move || h.clone(), ())
         .await
         .unwrap();
 
@@ -1665,7 +1665,7 @@ async fn sequenced_consume_preserves_order() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(5, Duration::from_secs(15)).await);
@@ -1705,7 +1705,7 @@ async fn retry_via_hold_queue_then_ack() {
             .with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
-        consumer.run::<RetryWork>(h, opts).await
+        consumer.run::<RetryWork, _>(h, (), opts).await
     });
 
     // Wait up to 30s for the message to be eventually acked after 2 retries
@@ -1757,7 +1757,7 @@ async fn defer_with_hold_queue_redelivers() {
             .with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
-        consumer.run::<DeferWithHold>(h, opts).await
+        consumer.run::<DeferWithHold, _>(h, (), opts).await
     });
 
     // Wait up to 30s: first delivery → Defer → hold queue → redeliver → Ack
@@ -1809,7 +1809,7 @@ async fn defer_without_hold_queue_requeues() {
             .with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
-        consumer.run::<DeferNoHold>(h, opts).await
+        consumer.run::<DeferNoHold, _>(h, (), opts).await
     });
 
     // Wait up to 30s: first delivery → Defer (nack+requeue) → redelivered → Ack
@@ -1853,7 +1853,7 @@ async fn autoscaler_scales_up_under_load() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
-        )
+            (),        )
         .await
         .unwrap();
     registry.start_all(); // starts 0 consumers
@@ -1948,7 +1948,7 @@ async fn autoscaler_scales_down_when_idle() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
             move || h.clone(),
-        )
+            (),        )
         .await
         .unwrap();
     registry.start_all();
@@ -2063,6 +2063,7 @@ async fn autoscaler_custom_strategy_pluggable() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
             || SlowScalableHandler,
+            (),
         )
         .await
         .unwrap();
@@ -2153,7 +2154,7 @@ async fn autoscaler_without_stabilization_scales_immediately() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
-        )
+            (),        )
         .await
         .unwrap();
     registry.start_all(); // starts 0 consumers
@@ -2253,6 +2254,7 @@ async fn autoscaler_scale_up_magnitude() {
         .register::<ScalableWork, _>(
             ConsumerGroupConfig::new(1..=5).with_prefetch_count(5),
             || SlowScalableHandler,
+            (),
         )
         .await
         .unwrap();
@@ -2381,7 +2383,7 @@ async fn audited_handler_captures_audit_records() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
-        consumer.run::<AuditedWork>(audited, opts).await
+        consumer.run::<AuditedWork, _>(audited, (), opts).await
     });
 
     // Wait for 3 audit records
@@ -2451,7 +2453,7 @@ async fn sequenced_skip_continues_after_rejection() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<SkipOrders>(h, opts).await
+        consumer.run_fifo::<SkipOrders, _>(h, (), opts).await
     });
 
     // With Skip: 4 messages should be acked (0,1,3,4), 1 rejected (2)
@@ -2475,7 +2477,7 @@ async fn sequenced_skip_continues_after_rejection() {
     let dlq_handler = OrderDlqHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<SkipOrders>(dh).await });
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<SkipOrders, _>(dh, ()).await });
 
     assert!(
         dlq_handler.wait_for_count(1, Duration::from_secs(10)).await,
@@ -2534,7 +2536,7 @@ async fn sequenced_failall_poisons_key_after_rejection() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<FailAllOrders>(h, opts).await
+        consumer.run_fifo::<FailAllOrders, _>(h, (), opts).await
     });
 
     // Wait for the handler to process messages.
@@ -2569,7 +2571,7 @@ async fn sequenced_failall_poisons_key_after_rejection() {
     let dlq_handler = OrderDlqHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders>(dh).await });
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders, _>(dh, ()).await });
 
     assert!(
         dlq_handler.wait_for_count(4, Duration::from_secs(10)).await,
@@ -2615,7 +2617,7 @@ async fn concurrent_consume_processes_all_messages() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
-        consumer.run::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork, _>(h, (), opts).await
     });
 
     assert!(
@@ -2665,7 +2667,7 @@ async fn concurrent_consume_slow_handler_faster_than_sequential() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(msg_count as u16); // all in-flight at once
-        consumer.run::<SimpleWork>(h, opts).await
+        consumer.run::<SimpleWork, _>(h, (), opts).await
     });
 
     assert!(
@@ -2723,7 +2725,7 @@ async fn concurrent_consume_prefetch_one_is_sequential() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1); // forces sequential
-        consumer.run::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork, _>(h, (), opts).await
     });
 
     assert!(
@@ -2783,7 +2785,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
-        consumer.run::<ConcurrentRejectWork>(h, opts).await
+        consumer.run::<ConcurrentRejectWork, _>(h, (), opts).await
     });
 
     assert!(
@@ -2802,7 +2804,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
     let dlq_handle =
-        tokio::spawn(async move { consumer2.run_dlq::<ConcurrentRejectWork>(dh).await });
+        tokio::spawn(async move { consumer2.run_dlq::<ConcurrentRejectWork, _>(dh, ()).await });
 
     assert!(
         dlq_handler.wait_for_count(3, Duration::from_secs(10)).await,
@@ -2832,7 +2834,7 @@ async fn consumer_group_concurrent_processing() {
                 .with_prefetch_count(10)
                 .with_concurrent_processing(true),
             move || h.clone(),
-        )
+            (),        )
         .await
         .unwrap();
 
@@ -2891,7 +2893,7 @@ async fn concurrent_consume_graceful_shutdown_drains() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(5);
-        consumer.run::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork, _>(h, (), opts).await
     });
 
     // Wait briefly for messages to be dispatched to handler tasks
@@ -2947,7 +2949,7 @@ async fn handler_timeout_triggers_retry() {
             .with_max_retries(3)
             .with_prefetch_count(1)
             .with_handler_timeout(Duration::from_millis(100));
-        consumer.run::<TimeoutWork>(h, opts).await
+        consumer.run::<TimeoutWork, _>(h, (), opts).await
     });
 
     // Wait for at least 2 deliveries: first times out, second acks.
@@ -2997,7 +2999,7 @@ async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
             .with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer1.run::<UngracefulSeq1>(h1, opts).await
+        consumer1.run::<UngracefulSeq1, _>(h1, (), opts).await
     });
 
     // Let the consumer pick up messages
@@ -3025,7 +3027,7 @@ async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
             .with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer2.run::<UngracefulSeq1>(h2, opts).await
+        consumer2.run::<UngracefulSeq1, _>(h2, (), opts).await
     });
 
     assert!(
@@ -3071,7 +3073,7 @@ async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
             .with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(3);
-        consumer1.run::<UngracefulSeq3>(h1, opts).await
+        consumer1.run::<UngracefulSeq3, _>(h1, (), opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3095,7 +3097,7 @@ async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
             .with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(3);
-        consumer2.run::<UngracefulSeq3>(h2, opts).await
+        consumer2.run::<UngracefulSeq3, _>(h2, (), opts).await
     });
 
     assert!(
@@ -3141,7 +3143,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
             .with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer1.run::<UngracefulConc1>(h1, opts).await
+        consumer1.run::<UngracefulConc1, _>(h1, (), opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3165,7 +3167,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
             .with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer2.run::<UngracefulConc1>(h2, opts).await
+        consumer2.run::<UngracefulConc1, _>(h2, (), opts).await
     });
 
     assert!(
@@ -3210,7 +3212,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
             .with_shutdown(s1)
             .with_max_retries(3)
             .with_prefetch_count(3);
-        consumer1.run::<UngracefulConc3>(h1, opts).await
+        consumer1.run::<UngracefulConc3, _>(h1, (), opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3234,7 +3236,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
             .with_shutdown(s2)
             .with_max_retries(3)
             .with_prefetch_count(3);
-        consumer2.run::<UngracefulConc3>(h2, opts).await
+        consumer2.run::<UngracefulConc3, _>(h2, (), opts).await
     });
 
     assert!(
@@ -3275,7 +3277,7 @@ async fn concurrent_consumer_retry_then_ack() {
             .with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(4);
-        consumer.run::<ConcurrentRetryWork>(h, opts).await
+        consumer.run::<ConcurrentRetryWork, _>(h, (), opts).await
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -3326,7 +3328,7 @@ async fn concurrent_consumer_max_retries_sends_to_dlq() {
             .with_shutdown(s)
             .with_max_retries(2)
             .with_prefetch_count(4);
-        consumer.run::<ConcurrentMaxRetry>(h, opts).await
+        consumer.run::<ConcurrentMaxRetry, _>(h, (), opts).await
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -3350,7 +3352,7 @@ async fn concurrent_consumer_max_retries_sends_to_dlq() {
     let dlq_handler = DlqCountingHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<ConcurrentMaxRetry>(dh).await });
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<ConcurrentMaxRetry, _>(dh, ()).await });
 
     assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
     assert_eq!(dlq_handler.count(), 1);
@@ -3389,7 +3391,7 @@ async fn concurrent_consumer_graceful_shutdown_drains_inflight() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(4);
-        consumer.run::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork, _>(h, (), opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3449,7 +3451,7 @@ async fn deserialization_failure_rejects_to_dlq() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(4);
-        consumer.run::<StrictWork>(h, opts).await
+        consumer.run::<StrictWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(1, Duration::from_secs(10)).await);
@@ -3536,7 +3538,7 @@ async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(8);
-        consumer.run::<ConcurrentRejectWork>(h, opts).await
+        consumer.run::<ConcurrentRejectWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_total(5, Duration::from_secs(15)).await);
@@ -3550,7 +3552,7 @@ async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
     let dlq_handle =
-        tokio::spawn(async move { consumer2.run_dlq::<ConcurrentRejectWork>(dh).await });
+        tokio::spawn(async move { consumer2.run_dlq::<ConcurrentRejectWork, _>(dh, ()).await });
 
     assert!(dlq_handler.wait_for_count(2, Duration::from_secs(10)).await);
     assert_eq!(dlq_handler.count(), 2);
@@ -3587,7 +3589,7 @@ async fn sequential_consumer_max_retries_sends_to_dlq() {
             .with_shutdown(s)
             .with_max_retries(2)
             .with_prefetch_count(1);
-        consumer.run::<RetryWork>(h, opts).await
+        consumer.run::<RetryWork, _>(h, (), opts).await
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -3611,7 +3613,7 @@ async fn sequential_consumer_max_retries_sends_to_dlq() {
     let dlq_handler = DlqCountingHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<RetryWork>(dh).await });
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<RetryWork, _>(dh, ()).await });
 
     assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
     assert_eq!(dlq_handler.count(), 1);
@@ -3649,7 +3651,7 @@ async fn concurrent_consumer_handler_timeout_triggers_retry() {
             .with_max_retries(5)
             .with_prefetch_count(4)
             .with_handler_timeout(Duration::from_millis(200));
-        consumer.run::<ConcurrentWork>(h, opts).await
+        consumer.run::<ConcurrentWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(2, Duration::from_secs(30)).await);
@@ -3687,7 +3689,7 @@ async fn sequenced_consumer_retry_via_shard_hold_queues() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(5);
-        consumer.run_fifo::<RetrySeqOrders>(h, opts).await
+        consumer.run_fifo::<RetrySeqOrders, _>(h, (), opts).await
     });
 
     assert!(
@@ -3728,7 +3730,7 @@ async fn sequenced_consumer_defer_via_shard_hold_queues() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(5);
-        consumer.run_fifo::<DeferSeqOrders>(h, opts).await
+        consumer.run_fifo::<DeferSeqOrders, _>(h, (), opts).await
     });
 
     assert!(
@@ -3781,7 +3783,7 @@ async fn sequenced_failall_max_retries_poisons_key() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<FailAllOrders>(h, opts).await
+        consumer.run_fifo::<FailAllOrders, _>(h, (), opts).await
     });
 
     assert!(
@@ -3798,7 +3800,7 @@ async fn sequenced_failall_max_retries_poisons_key() {
     let dlq_handler = OrderDlqHandler::new();
     let consumer2 = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders>(dh).await });
+    let dlq_handle = tokio::spawn(async move { consumer2.run_dlq::<FailAllOrders, _>(dh, ()).await });
 
     assert!(
         dlq_handler.wait_for_count(3, Duration::from_secs(10)).await,
@@ -3840,7 +3842,7 @@ async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<SkipOrders>(h, opts).await
+        consumer.run_fifo::<SkipOrders, _>(h, (), opts).await
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3866,7 +3868,7 @@ async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
             let opts = ConsumerOptions::<RabbitMqMarker>::new()
                 .with_shutdown(s2)
                 .with_max_retries(3);
-            consumer2.run_fifo::<SkipOrders>(h2, opts).await
+            consumer2.run_fifo::<SkipOrders, _>(h2, (), opts).await
         });
 
         assert!(
@@ -3916,7 +3918,7 @@ async fn sequenced_publish_batch_routes_via_exchange() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(10, Duration::from_secs(15)).await);
@@ -3960,7 +3962,7 @@ async fn sequenced_publish_with_headers() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(1, Duration::from_secs(15)).await);
@@ -4016,7 +4018,7 @@ async fn dlq_consumer_handles_deserialization_failure() {
     let dlq_handler = DlqCountingHandler::new();
     let consumer = RabbitMqConsumer::new(client.clone());
     let dh = dlq_handler.clone();
-    let dlq_handle = tokio::spawn(async move { consumer.run_dlq::<SimpleWork>(dh).await });
+    let dlq_handle = tokio::spawn(async move { consumer.run_dlq::<SimpleWork, _>(dh, ()).await });
 
     assert!(dlq_handler.wait_for_count(1, Duration::from_secs(10)).await);
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -4082,7 +4084,7 @@ async fn publisher_with_channel_count_publishes() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(10);
-        consumer.run::<SimpleWork>(h, opts).await
+        consumer.run::<SimpleWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(6, Duration::from_secs(10)).await);
@@ -4122,7 +4124,7 @@ async fn publisher_with_zero_channels_clamps_to_one() {
             .with_shutdown(s)
             .with_max_retries(3)
             .with_prefetch_count(1);
-        consumer.run::<SimpleWork>(h, opts).await
+        consumer.run::<SimpleWork, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(1, Duration::from_secs(10)).await);
@@ -4166,7 +4168,7 @@ async fn sequenced_batch_publish_with_pool() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<OrderTopic>(h, opts).await
+        consumer.run_fifo::<OrderTopic, _>(h, (), opts).await
     });
 
     assert!(handler.wait_for_count(20, Duration::from_secs(20)).await);
@@ -4197,7 +4199,7 @@ async fn registry_concurrent_processing_consumes_messages() {
                 .with_concurrent_processing(true)
                 .with_prefetch_count(5),
             move || h.clone(),
-        )
+            (),        )
         .await
         .unwrap();
 
@@ -4234,14 +4236,14 @@ async fn registry_duplicate_registration_fails() {
     let h = handler.clone();
 
     registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h.clone())
+        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h.clone(), ())
         .await
         .unwrap();
 
     let handler2 = CountingHandler::new();
     let h2 = handler2.clone();
     let result = registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h2.clone())
+        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h2.clone(), ())
         .await;
 
     assert!(result.is_err(), "duplicate registration should fail");
@@ -4271,7 +4273,7 @@ async fn registry_concurrent_with_timeout_processes_messages() {
                 .with_prefetch_count(5)
                 .with_handler_timeout(Duration::from_secs(10)),
             move || h.clone(),
-        )
+            (),        )
         .await
         .unwrap();
 
@@ -4326,7 +4328,7 @@ async fn sequenced_consumer_multiple_keys_concurrent() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(3);
-        consumer.run_fifo::<SkipOrders>(h, opts).await
+        consumer.run_fifo::<SkipOrders, _>(h, (), opts).await
     });
 
     assert!(
@@ -4462,7 +4464,7 @@ mod exactly_once {
             let opts = ConsumerOptions::<RabbitMqMarker>::new()
                 .with_shutdown(s)
                 .with_exactly_once();
-            consumer.run::<ExactlyOnceWork>(h, opts).await
+            consumer.run::<ExactlyOnceWork, _>(h, (), opts).await
         });
 
         assert!(
@@ -4508,7 +4510,7 @@ mod exactly_once {
                 .with_shutdown(s)
                 .with_max_retries(5)
                 .with_exactly_once();
-            consumer.run::<ExactlyOnceRetry>(h, opts).await
+            consumer.run::<ExactlyOnceRetry, _>(h, (), opts).await
         });
 
         // Hold queue TTL is 1 s per retry; allow generous timeout.
@@ -4653,7 +4655,7 @@ mod exactly_once {
             let opts = ConsumerOptions::<RabbitMqMarker>::new()
                 .with_shutdown(s)
                 .with_exactly_once();
-            consumer.run::<ExactlyOnceDefer>(h, opts).await
+            consumer.run::<ExactlyOnceDefer, _>(h, (), opts).await
         });
 
         // Hold queue TTL is 1 s; allow generous timeout for both deliveries.
@@ -4715,7 +4717,7 @@ mod exactly_once {
                 .with_shutdown(s)
                 .with_max_retries(2)
                 .with_exactly_once();
-            consumer.run::<ExactlyOnceMaxRetries>(h, opts).await
+            consumer.run::<ExactlyOnceMaxRetries, _>(h, (), opts).await
         });
 
         // DLQ consumer.
@@ -4724,7 +4726,7 @@ mod exactly_once {
         let dlq_s = shutdown.clone();
         let dlq_handle = tokio::spawn(async move {
             let _s = dlq_s;
-            dlq_consumer.run_dlq::<ExactlyOnceMaxRetries>(dlq_h).await
+            dlq_consumer.run_dlq::<ExactlyOnceMaxRetries, _>(dlq_h, ()).await
         });
 
         assert!(
@@ -4777,7 +4779,7 @@ mod exactly_once {
                 .with_shutdown(s)
                 .with_exactly_once()
                 .with_prefetch_count(1);
-            consumer.run::<ExactlyOnceShutdown>(h, opts).await
+            consumer.run::<ExactlyOnceShutdown, _>(h, (), opts).await
         });
 
         // Wait until at least one message is processed, then cancel.
@@ -4826,7 +4828,7 @@ mod exactly_once {
                 .with_shutdown(s)
                 .with_exactly_once()
                 .with_prefetch_count(3);
-            consumer.run::<ExactlyOnceConcurrent>(h, opts).await
+            consumer.run::<ExactlyOnceConcurrent, _>(h, (), opts).await
         });
 
         assert!(
@@ -4875,7 +4877,7 @@ mod exactly_once {
             let opts = ConsumerOptions::<RabbitMqMarker>::new()
                 .with_shutdown(main_s)
                 .with_exactly_once();
-            consumer.run::<ExactlyOnceReject>(main_h, opts).await
+            consumer.run::<ExactlyOnceReject, _>(main_h, (), opts).await
         });
 
         // DLQ consumer — counts dead messages.
@@ -4883,7 +4885,7 @@ mod exactly_once {
         let dlq_s = shutdown.clone();
         let dlq_handle = tokio::spawn(async move {
             let _s = dlq_s;
-            dlq_consumer.run_dlq::<ExactlyOnceReject>(dlq_h).await
+            dlq_consumer.run_dlq::<ExactlyOnceReject, _>(dlq_h, ()).await
         });
 
         assert!(
@@ -4930,7 +4932,7 @@ async fn defer_preserves_retry_count() {
             .with_shutdown(s)
             .with_max_retries(5)
             .with_prefetch_count(1);
-        consumer.run::<DeferWithHold>(h, opts).await
+        consumer.run::<DeferWithHold, _>(h, (), opts).await
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -4989,7 +4991,7 @@ async fn sequenced_defer_without_hold_queue_requeues() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_max_retries(5);
-        consumer.run_fifo::<DeferSeqNoHold>(h, opts).await
+        consumer.run_fifo::<DeferSeqNoHold, _>(h, (), opts).await
     });
 
     // Defer (nack-requeue) → redelivered → Ack

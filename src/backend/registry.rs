@@ -1,12 +1,10 @@
 //! Internal `RegistryImpl` trait for coordinated consumer groups (Kafka,
 //! RabbitMQ, NATS, InMemory). Not implemented by SQS. See DESIGN_V2.md §5.
 //!
-//! # Phase 4 bound
-//!
-//! `register` currently narrows to `H: MessageHandler<T, Context = ()>` so
-//! the trait matches the existing per-backend inherent `register` methods.
-//! Phase 11/12 relaxes the bound to `H: MessageHandler<T>` once every
-//! backend's registry accepts a non-`()` context.
+//! `register` accepts an `H::Context` that each backend clones into every
+//! spawned task so handlers with a non-unit
+//! [`MessageHandler::Context`](crate::handler::MessageHandler::Context)
+//! work through the generic `ConsumerGroup<B, Ctx>` harness.
 
 use std::time::Duration;
 
@@ -21,8 +19,7 @@ use crate::topic::Topic;
 // `backend::mod` under the `inmemory` feature. Under
 // `--no-default-features` no backend is compiled, so the trait methods
 // genuinely have no call site; `dead_code` is expected there and the
-// per-trait allow avoids polluting the default build with warnings
-// until Phase 5+ adds the generic wrappers.
+// per-trait allow avoids polluting the default build with warnings.
 #[allow(dead_code)]
 pub(crate) trait RegistryImpl: Send {
     type GroupConfig;
@@ -35,7 +32,7 @@ pub(crate) trait RegistryImpl: Send {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>;
+        H: MessageHandler<T>;
 
     fn cancellation_token(&self) -> CancellationToken;
 

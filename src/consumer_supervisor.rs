@@ -65,10 +65,6 @@ impl ShutdownTally {
 
 pub struct ConsumerSupervisor<B: Backend, Ctx: Clone + Send + Sync + 'static = ()> {
     consumer: B::ConsumerImpl,
-    // Phase 12 injects `ctx` into handler calls once `ConsumerImpl::run`
-    // relaxes its `Context = ()` bound. Until then the field is stored but
-    // unused.
-    #[allow(dead_code)]
     ctx: Ctx,
     shutdown: CancellationToken,
     tasks: JoinSet<Result<()>>,
@@ -105,14 +101,13 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     pub fn register<T, H>(&mut self, handler: H, options: ConsumerOptions<B>) -> Result<()>
     where
         T: Topic,
-        // TODO(phase-12): relax to Context = Ctx once all backend ConsumerImpl
-        // impls accept non-() context.
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T, Context = Ctx>,
     {
         let consumer = self.consumer.clone();
+        let ctx = self.ctx.clone();
         let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
         self.tasks
-            .spawn(async move { consumer.run::<T, H>(handler, (), inner).await });
+            .spawn(async move { consumer.run::<T, H>(handler, ctx, inner).await });
         Ok(())
     }
 

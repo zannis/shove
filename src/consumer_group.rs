@@ -14,10 +14,6 @@ use crate::topic::Topic;
 
 pub struct ConsumerGroup<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static = ()> {
     pub(crate) inner: B::RegistryImpl,
-    // Phase 12 injects `ctx` into handler calls once `RegistryImpl::register`
-    // relaxes its `Context = ()` bound. Until then the field is stored but
-    // unused.
-    #[allow(dead_code)]
     ctx: Ctx,
 }
 
@@ -55,11 +51,11 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     ) -> Result<()>
     where
         T: Topic,
-        // TODO(phase-12): relax to Context = Ctx once all backend RegistryImpl
-        // impls accept non-() context.
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T, Context = Ctx>,
     {
-        self.inner.register::<T, H>(config.inner, factory, ()).await
+        self.inner
+            .register::<T, H>(config.inner, factory, self.ctx.clone())
+            .await
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {

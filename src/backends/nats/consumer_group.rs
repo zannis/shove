@@ -136,10 +136,11 @@ impl NatsConsumerGroup {
         client: NatsClient,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
         let max_ack_pending = if concurrent {
@@ -162,9 +163,10 @@ impl NatsConsumerGroup {
             };
             options.max_ack_pending = Some(max_ack_pending);
             let ec = ec_for_spawner.clone();
+            let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run_with_inner::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
                     ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");
@@ -337,10 +339,11 @@ impl NatsConsumerGroupRegistry {
         &mut self,
         config: NatsConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -366,6 +369,7 @@ impl NatsConsumerGroupRegistry {
             client.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())

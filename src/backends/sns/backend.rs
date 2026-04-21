@@ -104,35 +104,35 @@ impl ConsumerImpl for SqsConsumer {
     async fn run<T, H>(
         &self,
         handler: H,
-        _ctx: H::Context,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
     ) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        SqsConsumer::run_with_inner::<T>(self, handler, options).await
+        SqsConsumer::run_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
     async fn run_fifo<T, H>(
         &self,
         handler: H,
-        _ctx: H::Context,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
     ) -> Result<()>
     where
         T: SequencedTopic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        SqsConsumer::run_fifo_with_inner::<T>(self, handler, options).await
+        SqsConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, _ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        SqsConsumer::run_dlq::<T>(self, handler).await
+        SqsConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 }
 

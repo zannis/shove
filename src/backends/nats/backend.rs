@@ -96,35 +96,35 @@ impl ConsumerImpl for NatsConsumer {
     async fn run<T, H>(
         &self,
         handler: H,
-        _ctx: H::Context,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
     ) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        NatsConsumer::run_with_inner::<T>(self, handler, options).await
+        NatsConsumer::run_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
     async fn run_fifo<T, H>(
         &self,
         handler: H,
-        _ctx: H::Context,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
     ) -> Result<()>
     where
         T: SequencedTopic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        NatsConsumer::run_fifo_with_inner::<T>(self, handler, options).await
+        NatsConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, _ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        NatsConsumer::run_dlq::<T>(self, handler).await
+        NatsConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 }
 
@@ -172,13 +172,13 @@ impl RegistryImpl for NatsConsumerGroupRegistry {
         &mut self,
         config: Self::GroupConfig,
         factory: impl Fn() -> H + Send + Sync + 'static,
-        _ctx: H::Context,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic,
-        H: MessageHandler<T, Context = ()>,
+        H: MessageHandler<T>,
     {
-        NatsConsumerGroupRegistry::register::<T, H>(self, config, factory).await
+        NatsConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
     }
 
     fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {

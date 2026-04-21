@@ -34,43 +34,68 @@ impl InMemoryConsumer {
 }
 
 impl InMemoryConsumer {
-    pub fn run<T: Topic>(
+    pub fn run<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::InMemory>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        run_concurrent::<T, _>(self.broker.clone(), handler, options.into_inner())
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        run_concurrent::<T, H>(self.broker.clone(), handler, ctx, options.into_inner())
     }
 
-    pub fn run_fifo<T: SequencedTopic>(
+    pub fn run_fifo<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::InMemory>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        run_fifo_impl::<T, _>(self.broker.clone(), handler, options.into_inner())
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options.into_inner())
     }
 
-    pub(crate) fn run_with_inner<T: Topic>(
+    pub(crate) fn run_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
-    ) -> impl Future<Output = Result<()>> + Send {
-        run_concurrent::<T, _>(self.broker.clone(), handler, options)
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        run_concurrent::<T, H>(self.broker.clone(), handler, ctx, options)
     }
 
-    pub(crate) fn run_fifo_with_inner<T: SequencedTopic>(
+    pub(crate) fn run_fifo_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptionsInner,
-    ) -> impl Future<Output = Result<()>> + Send {
-        run_fifo_impl::<T, _>(self.broker.clone(), handler, options)
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options)
     }
 
-    pub fn run_dlq<T: Topic>(
+    pub fn run_dlq<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        run_dlq_impl::<T, _>(self.broker.clone(), handler)
+        handler: H,
+        ctx: H::Context,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        run_dlq_impl::<T, H>(self.broker.clone(), handler, ctx)
     }
 }
 
@@ -81,15 +106,17 @@ impl InMemoryConsumer {
 async fn run_concurrent<T, H>(
     broker: InMemoryBroker,
     handler: H,
+    ctx: H::Context,
     options: ConsumerOptionsInner,
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let topology = T::topology();
     let queue = broker.lookup(topology.queue())?;
     let handler = Arc::new(handler);
+    let ctx = Arc::new(ctx);
 
     let prefetch = options.prefetch_count.max(1) as usize;
     let shutdown = options.shutdown.clone();
@@ -122,14 +149,20 @@ where
             next_ticket += 1;
 
             let handler_clone = Arc::clone(&handler);
+            let ctx_clone = Arc::clone(&ctx);
             let max_size = options.max_message_size;
             let timeout_opt = options.handler_timeout;
             let env_for_task = env.clone();
 
             let abort = inflight.spawn(async move {
-                let outcome =
-                    invoke_handler::<T, H>(handler_clone, &env_for_task, max_size, timeout_opt)
-                        .await;
+                let outcome = invoke_handler::<T, H>(
+                    handler_clone,
+                    ctx_clone,
+                    &env_for_task,
+                    max_size,
+                    timeout_opt,
+                )
+                .await;
                 (ticket, outcome)
             });
             envelopes.insert(abort.id(), (ticket, env));
@@ -245,11 +278,12 @@ async fn drain_pending(
 async fn run_fifo_impl<T, H>(
     broker: InMemoryBroker,
     handler: H,
+    ctx: H::Context,
     options: ConsumerOptionsInner,
 ) -> Result<()>
 where
     T: SequencedTopic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let topology = T::topology();
     let seq = topology.sequencing().ok_or_else(|| {
@@ -260,6 +294,7 @@ where
     })?;
 
     let handler = Arc::new(handler);
+    let ctx = Arc::new(ctx);
     let n_shards = seq.routing_shards();
     let on_failure = seq.on_failure();
 
@@ -279,11 +314,12 @@ where
     for (shard_name, shard) in shards {
         let broker = broker.clone();
         let handler = Arc::clone(&handler);
+        let ctx = Arc::clone(&ctx);
         let options = options.clone();
         let busy = Arc::clone(&busy);
         workers.spawn(async move {
             run_fifo_shard::<T, H>(
-                broker, shard_name, shard, topology, on_failure, handler, options, busy,
+                broker, shard_name, shard, topology, on_failure, handler, ctx, options, busy,
             )
             .await;
         });
@@ -305,11 +341,12 @@ async fn run_fifo_shard<T, H>(
     topology: &'static QueueTopology,
     on_failure: SequenceFailure,
     handler: Arc<H>,
+    ctx: Arc<H::Context>,
     options: ConsumerOptionsInner,
     busy: Arc<AtomicUsize>,
 ) where
     T: SequencedTopic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let mut poisoned: HashSet<String> = HashSet::new();
     let shutdown = options.shutdown.clone();
@@ -363,6 +400,7 @@ async fn run_fifo_shard<T, H>(
             } else {
                 let raw = invoke_handler_caught::<T, H>(
                     Arc::clone(&handler),
+                    Arc::clone(&ctx),
                     &env,
                     options.max_message_size,
                     options.handler_timeout,
@@ -500,10 +538,10 @@ async fn route_reject_sequenced(
 // DLQ loop
 // ---------------------------------------------------------------------------
 
-async fn run_dlq_impl<T, H>(broker: InMemoryBroker, handler: H) -> Result<()>
+async fn run_dlq_impl<T, H>(broker: InMemoryBroker, handler: H, ctx: H::Context) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let topology = T::topology();
     let dlq_name = topology.dlq().ok_or_else(|| {
@@ -550,7 +588,7 @@ where
         };
 
         let dead = dead_metadata_from(&env);
-        handler.handle_dead(message, dead, &()).await;
+        handler.handle_dead(message, dead, &ctx).await;
         dlq.in_flight.fetch_sub(1, Ordering::Release);
     }
 }
@@ -704,17 +742,18 @@ fn prepare_message<T: Topic>(
 /// Await the handler with an optional timeout, mapping timeouts to `Retry`.
 async fn run_handler<T, H>(
     handler: Arc<H>,
+    ctx: Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout_opt: Option<Duration>,
 ) -> Outcome
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     match timeout_opt {
         Some(timeout_dur) => {
-            match tokio::time::timeout(timeout_dur, handler.handle(message, metadata, &())).await {
+            match tokio::time::timeout(timeout_dur, handler.handle(message, metadata, &ctx)).await {
                 Ok(o) => o,
                 Err(_) => {
                     tracing::warn!(timeout = ?timeout_dur, "handler timed out — retrying");
@@ -722,7 +761,7 @@ where
                 }
             }
         }
-        None => handler.handle(message, metadata, &()).await,
+        None => handler.handle(message, metadata, &ctx).await,
     }
 }
 
@@ -730,17 +769,18 @@ where
 /// (the concurrent path relies on `JoinSet::join_next_with_id` for this).
 async fn invoke_handler<T, H>(
     handler: Arc<H>,
+    ctx: Arc<H::Context>,
     env: &Envelope,
     max_size: Option<usize>,
     timeout_opt: Option<Duration>,
 ) -> Outcome
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     match prepare_message::<T>(env, max_size) {
         Ok((message, metadata)) => {
-            run_handler::<T, H>(handler, message, metadata, timeout_opt).await
+            run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt).await
         }
         Err(o) => o,
     }
@@ -751,6 +791,7 @@ where
 /// shutdown aborts the in-flight handler — the caller must drop the message.
 async fn invoke_handler_caught<T, H>(
     handler: Arc<H>,
+    ctx: Arc<H::Context>,
     env: &Envelope,
     max_size: Option<usize>,
     timeout_opt: Option<Duration>,
@@ -759,7 +800,7 @@ async fn invoke_handler_caught<T, H>(
 ) -> Option<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     // Deserialize on the caller task so the spawned task only owns the
     // already-decoded message + metadata — avoids cloning the full Envelope
@@ -769,10 +810,9 @@ where
         Err(o) => return Some(o),
     };
 
-    let mut join =
-        tokio::spawn(
-            async move { run_handler::<T, H>(handler, message, metadata, timeout_opt).await },
-        );
+    let mut join = tokio::spawn(async move {
+        run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt).await
+    });
 
     tokio::select! {
         biased;

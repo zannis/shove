@@ -169,20 +169,21 @@ where
     }
 }
 
-async fn invoke_handler<T: Topic, H: MessageHandler<T, Context = ()>>(
+async fn invoke_handler<T: Topic, H: MessageHandler<T>>(
     handler: &H,
+    ctx: &H::Context,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, &()))
+        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
             .await
             .unwrap_or_else(|_| {
                 warn!("handler exceeded timeout ({duration:?}), retrying message");
                 Outcome::Retry
             }),
-        None => handler.handle(message, metadata, &()).await,
+        None => handler.handle(message, metadata, ctx).await,
     }
 }
 
@@ -190,6 +191,7 @@ async fn invoke_handler<T: Topic, H: MessageHandler<T, Context = ()>>(
 /// Returns the oneshot receiver that will resolve with the handler's outcome.
 fn spawn_handler<T, H>(
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
@@ -197,13 +199,14 @@ fn spawn_handler<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
+    let c = ctx.clone();
     let n = notify.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, message, metadata, timeout).await;
+        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
         let _ = tx.send(outcome);
         n.notify_one();
     });
@@ -227,11 +230,12 @@ async fn consume_loop_concurrent<T, H>(
     queue_url: &str,
     topology: &'static QueueTopology,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let notify = Arc::new(Notify::new());
 
@@ -449,7 +453,7 @@ where
                 "dispatching message to handler"
             );
             let rx =
-                spawn_handler::<T, H>(handler, message, metadata, options.handler_timeout, &notify);
+                spawn_handler::<T, H>(handler, ctx, message, metadata, options.handler_timeout, &notify);
             in_flight.push_back(PendingMessage {
                 receipt_handle,
                 body: msg.body().unwrap_or_default().to_string(),
@@ -614,6 +618,7 @@ fn extract_sequence_key(msg: &aws_sdk_sqs::types::Message) -> Option<String> {
 /// mpsc channel with the sequence key.
 fn spawn_handler_keyed<T, H>(
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
@@ -622,15 +627,16 @@ fn spawn_handler_keyed<T, H>(
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
-    let ctx = completed_tx.clone();
+    let c = ctx.clone();
+    let completed = completed_tx.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, message, metadata, timeout).await;
+        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
         let _ = tx.send(outcome);
-        let _ = ctx.send(key);
+        let _ = completed.send(key);
     });
     rx
 }
@@ -648,12 +654,13 @@ async fn run_sequenced_shard<T, H>(
     queue_name: &str,
     topology: &'static QueueTopology,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let mut poisoned_keys = HashSet::new();
     let mut pending_deliveries: HashMap<String, VecDeque<aws_sdk_sqs::types::Message>> =
@@ -666,6 +673,7 @@ where
             queue_url,
             topology,
             handler,
+            ctx,
             options,
             on_failure,
             &mut poisoned_keys,
@@ -709,6 +717,7 @@ async fn consume_loop_sequenced<T, H>(
     queue_url: &str,
     topology: &'static QueueTopology,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
     poisoned_keys: &mut HashSet<String>,
@@ -716,7 +725,7 @@ async fn consume_loop_sequenced<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     let prefetch = options.prefetch_count as usize;
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<String>();
@@ -776,6 +785,7 @@ where
                         queue_url,
                         &key,
                         handler,
+                        ctx,
                         options,
                         on_failure,
                         topology,
@@ -803,6 +813,7 @@ where
                         queue_url,
                         &key,
                         handler,
+                        ctx,
                         options,
                         on_failure,
                         topology,
@@ -1116,6 +1127,7 @@ where
                     );
                     let rx = spawn_handler_keyed::<T, H>(
                         handler,
+                        ctx,
                         message,
                         metadata,
                         options.handler_timeout,
@@ -1152,6 +1164,7 @@ async fn drain_pending_for_key<T, H>(
     queue_url: &str,
     key: &str,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
     topology: &'static QueueTopology,
@@ -1162,7 +1175,7 @@ async fn drain_pending_for_key<T, H>(
     pending_deliveries: &mut HashMap<String, VecDeque<aws_sdk_sqs::types::Message>>,
 ) where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     // If the key is poisoned, reject all pending deliveries for it.
     if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
@@ -1257,6 +1270,7 @@ async fn drain_pending_for_key<T, H>(
 
         let rx = spawn_handler_keyed::<T, H>(
             handler,
+            ctx,
             message,
             metadata,
             options.handler_timeout,
@@ -1296,11 +1310,12 @@ async fn consume_dlq_loop<T, H>(
     queue_url: &str,
     original_queue: &str,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     shutdown: &CancellationToken,
 ) -> Result<()>
 where
     T: Topic,
-    H: MessageHandler<T, Context = ()>,
+    H: MessageHandler<T>,
 {
     info!(queue_url, "DLQ consumer started");
 
@@ -1354,7 +1369,7 @@ where
                                     death_count = metadata.death_count,
                                     "dispatching DLQ message to handle_dead"
                                 );
-                                handler.handle_dead(message, metadata, &()).await;
+                                handler.handle_dead(message, metadata, ctx.as_ref()).await;
                             }
                         }
                     }
@@ -1373,19 +1388,29 @@ where
 // ---------------------------------------------------------------------------
 
 impl SqsConsumer {
-    pub fn run<T: Topic>(
+    pub fn run<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::Sqs>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        self.run_with_inner::<T>(handler, options.into_inner())
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
     }
 
-    pub(crate) fn run_with_inner<T: Topic>(
+    pub(crate) fn run_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1393,28 +1418,46 @@ impl SqsConsumer {
             let consumer = SqsConsumer::new(client, queue_registry);
             let queue_url = consumer.resolve_queue_url(topology.queue()).await?;
             let handler = Arc::new(handler);
+            let ctx = Arc::new(ctx);
             let sqs = consumer.client.sqs().clone();
 
             run_with_reconnect(&options.shutdown, topology.queue(), || {
-                consume_loop_concurrent::<T, _>(&sqs, &queue_url, topology, &handler, &options)
+                consume_loop_concurrent::<T, H>(
+                    &sqs,
+                    &queue_url,
+                    topology,
+                    &handler,
+                    &ctx,
+                    &options,
+                )
             })
             .await
         }
     }
 
-    pub fn run_fifo<T: SequencedTopic>(
+    pub fn run_fifo<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: crate::ConsumerOptions<crate::markers::Sqs>,
-    ) -> impl Future<Output = Result<()>> + Send {
-        self.run_fifo_with_inner::<T>(handler, options.into_inner())
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
     }
 
-    pub(crate) fn run_fifo_with_inner<T: SequencedTopic>(
+    pub(crate) fn run_fifo_with_inner<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1424,6 +1467,7 @@ impl SqsConsumer {
             })?;
 
             let handler = Arc::new(handler);
+            let ctx = Arc::new(ctx);
             let consumer = SqsConsumer::new(client, queue_registry);
             let on_failure = seq.on_failure();
             let mut handles = Vec::new();
@@ -1434,15 +1478,17 @@ impl SqsConsumer {
 
                 let sqs = consumer.client.sqs().clone();
                 let h = handler.clone();
+                let c = ctx.clone();
                 let opts = options.clone();
 
                 handles.push(tokio::spawn(async move {
-                    run_sequenced_shard::<T, _>(
+                    run_sequenced_shard::<T, H>(
                         &sqs,
                         &shard_queue_url,
                         &shard_queue_name,
                         topology,
                         &h,
+                        &c,
                         &opts,
                         on_failure,
                     )
@@ -1461,10 +1507,15 @@ impl SqsConsumer {
         }
     }
 
-    pub fn run_dlq<T: Topic>(
+    pub fn run_dlq<T, H>(
         &self,
-        handler: impl MessageHandler<T, Context = ()>,
-    ) -> impl Future<Output = Result<()>> + Send {
+        handler: H,
+        ctx: H::Context,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1478,11 +1529,19 @@ impl SqsConsumer {
             let consumer = SqsConsumer::new(client, queue_registry);
             let queue_url = consumer.resolve_queue_url(dlq).await?;
             let handler = Arc::new(handler);
+            let ctx = Arc::new(ctx);
             let sqs = consumer.client.sqs().clone();
             let shutdown = consumer.client.shutdown_token();
 
             run_with_reconnect(&shutdown, dlq, || {
-                consume_dlq_loop::<T, _>(&sqs, &queue_url, topology.queue(), &handler, &shutdown)
+                consume_dlq_loop::<T, H>(
+                    &sqs,
+                    &queue_url,
+                    topology.queue(),
+                    &handler,
+                    &ctx,
+                    &shutdown,
+                )
             })
             .await
         }

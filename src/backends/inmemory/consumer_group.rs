@@ -157,10 +157,11 @@ impl InMemoryConsumerGroup {
         broker: InMemoryBroker,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
@@ -168,8 +169,9 @@ impl InMemoryConsumerGroup {
             let handler = handler_factory();
             let consumer = InMemoryConsumer::new(broker.clone());
             let ec = ec_for_spawner.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                if let Err(e) = consumer.run_with_inner::<T>(handler, options).await {
+                if let Err(e) = consumer.run_with_inner::<T, H>(handler, ctx, options).await {
                     ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("in-memory consumer task exited with error: {e}");
                 }
@@ -336,10 +338,11 @@ impl InMemoryConsumerGroupRegistry {
         &mut self,
         config: InMemoryConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T, Context = ()> + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -365,6 +368,7 @@ impl InMemoryConsumerGroupRegistry {
             broker.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())
