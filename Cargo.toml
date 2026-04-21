@@ -33,7 +33,7 @@ audit = []
 nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
 
 # Apache Kafka pubsub
-kafka = ["dep:rdkafka"]
+kafka = ["dep:rdkafka", "dep:futures-util"]
 
 # In-process backend
 inmemory = ["dep:dashmap"]

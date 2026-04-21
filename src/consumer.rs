@@ -537,4 +537,111 @@ mod tests {
         assert_eq!(opts.max_retries, 5);
         assert_eq!(opts.prefetch_count, 1);
     }
+
+    #[test]
+    fn validate_message_size_accepts_payload_at_limit() {
+        assert!(validate_message_size(100, Some(100)).is_ok());
+    }
+
+    #[test]
+    fn validate_message_size_accepts_payload_under_limit() {
+        assert!(validate_message_size(99, Some(100)).is_ok());
+    }
+
+    #[test]
+    fn validate_message_size_rejects_oversize_payload() {
+        let err = validate_message_size(101, Some(100)).unwrap_err();
+        let ShoveError::Validation(msg) = err else {
+            panic!("expected Validation variant");
+        };
+        assert!(msg.contains("101"));
+        assert!(msg.contains("100"));
+    }
+
+    #[test]
+    fn validate_message_size_skips_check_when_limit_absent() {
+        assert!(validate_message_size(usize::MAX, None).is_ok());
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn with_shutdown_stores_token() {
+        let token = CancellationToken::new();
+        let opts = ConsumerOptions::<TestBackend>::new().with_shutdown(token.clone());
+        let inner = opts.into_inner();
+        // into_inner picks up the provided token instead of a fresh default.
+        token.cancel();
+        assert!(inner.shutdown.is_cancelled());
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn into_inner_without_shutdown_yields_fresh_token() {
+        let inner = ConsumerOptions::<TestBackend>::new().into_inner();
+        assert!(!inner.shutdown.is_cancelled());
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn processing_handle_is_a_shared_view() {
+        use std::sync::atomic::Ordering;
+        let opts = ConsumerOptions::<TestBackend>::new();
+        let handle = opts.processing_handle();
+        handle.store(true, Ordering::Release);
+        let inner = opts.into_inner();
+        assert!(inner.processing.load(Ordering::Acquire));
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn clone_preserves_all_settings() {
+        let opts = ConsumerOptions::<TestBackend>::new()
+            .with_max_retries(7)
+            .with_prefetch_count(13)
+            .with_concurrent_processing(false)
+            .with_handler_timeout(Duration::from_secs(11))
+            .with_max_pending_per_key(99)
+            .with_max_message_size(4096);
+        let copy = opts.clone();
+        assert_eq!(copy.max_retries, 7);
+        assert_eq!(copy.prefetch_count, 13);
+        assert!(!copy.concurrent_processing);
+        assert_eq!(copy.handler_timeout, Some(Duration::from_secs(11)));
+        assert_eq!(copy.max_pending_per_key, Some(99));
+        assert_eq!(copy.max_message_size, Some(4096));
+    }
+
+    #[cfg(feature = "aws-sns-sqs")]
+    #[test]
+    fn sqs_with_receive_batch_size_sets_value() {
+        let opts = ConsumerOptions::<crate::markers::Sqs>::new().with_receive_batch_size(7);
+        assert_eq!(opts.receive_batch_size, 7);
+    }
+
+    #[cfg(feature = "nats")]
+    #[test]
+    fn nats_with_max_ack_pending_sets_value() {
+        let opts = ConsumerOptions::<crate::markers::Nats>::new().with_max_ack_pending(128);
+        assert_eq!(opts.max_ack_pending, Some(128));
+    }
 }

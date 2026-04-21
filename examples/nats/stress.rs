@@ -17,6 +17,8 @@ use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
 use harness::{HarnessConfig, run_all_scenarios};
 
+const STREAM_NAME: &str = "shove-stress-bench";
+
 #[tokio::main]
 async fn main() {
     let cmd = NatsServerCmd::default().with_jetstream();
@@ -31,7 +33,23 @@ async fn main() {
         .expect("failed to read NATS port");
     let url = format!("nats://localhost:{port}");
 
-    let hcfg = HarnessConfig::<Nats>::new("nats");
+    let purge_url = url.clone();
+    let purge: harness::PurgeFn = Box::new(move || {
+        let url = purge_url.clone();
+        Box::pin(async move {
+            // Drop the whole stream (and its durable consumer) so the next
+            // scenario creates both fresh with its own config. JetStream
+            // `create_consumer` upserts, but changing `max_ack_pending` on an
+            // existing consumer requires explicit update — cleanest to drop.
+            let Ok(client) = async_nats::connect(&url).await else {
+                return;
+            };
+            let js = async_nats::jetstream::new(client);
+            let _ = js.delete_stream(STREAM_NAME).await;
+        })
+    });
+
+    let hcfg = HarnessConfig::<Nats>::new("nats").with_purge(purge);
     run_all_scenarios(
         hcfg,
         || {

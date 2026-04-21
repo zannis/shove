@@ -26,6 +26,9 @@ const SQS_PREFETCH_CAP: u16 = 10;
 /// size; smaller values reduce peak memory.
 const SQS_PUBLISH_CHUNK: usize = 500;
 
+const QUEUE_NAME: &str = "shove-stress-bench";
+const DLQ_NAME: &str = "shove-stress-bench-dlq";
+
 #[tokio::main]
 async fn main() {
     let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
@@ -57,9 +60,37 @@ async fn main() {
         .expect("failed to read LocalStack port");
     let endpoint = format!("http://localhost:{port}");
 
+    let purge_endpoint = endpoint.clone();
+    let purge: harness::PurgeFn = Box::new(move || {
+        let endpoint = purge_endpoint.clone();
+        Box::pin(async move {
+            // `purge_queue` drains without deleting — avoids SQS's "wait 60 s
+            // before recreating a queue with the same name" rule that breaks
+            // the next scenario's topology declare. LocalStack enforces
+            // `purge_queue`'s own 60 s rate limit so the call may fail; we
+            // ignore errors and let the next scenario re-publish on top of
+            // whatever is left (the harness still counts ok once
+            // `scenario.messages` are processed).
+            let aws_cfg = aws_config::from_env()
+                .region(aws_config::Region::new("us-east-1"))
+                .endpoint_url(&endpoint)
+                .load()
+                .await;
+            let sqs = aws_sdk_sqs::Client::new(&aws_cfg);
+            for name in [QUEUE_NAME, DLQ_NAME, &format!("{QUEUE_NAME}.fifo")] {
+                if let Ok(url) = sqs.get_queue_url().queue_name(name).send().await
+                    && let Some(u) = url.queue_url()
+                {
+                    let _ = sqs.purge_queue().queue_url(u).send().await;
+                }
+            }
+        })
+    });
+
     let hcfg = HarnessConfig::<Sqs>::new("sqs")
         .with_prefetch_cap(SQS_PREFETCH_CAP)
-        .with_publish_chunk_size(SQS_PUBLISH_CHUNK);
+        .with_publish_chunk_size(SQS_PUBLISH_CHUNK)
+        .with_purge(purge);
 
     run_supervisor_scenarios(
         hcfg,

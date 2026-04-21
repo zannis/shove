@@ -12,6 +12,8 @@ mod harness;
 
 use std::time::Duration;
 
+use lapin::options::QueuePurgeOptions;
+use lapin::{Connection, ConnectionProperties};
 use shove::rabbitmq as rmq;
 use shove::{Broker, RabbitMq};
 use testcontainers::core::ExecCommand;
@@ -19,6 +21,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
 use harness::{HarnessConfig, run_all_scenarios};
+
+const QUEUE_NAME: &str = "shove-stress-bench";
 
 #[tokio::main]
 async fn main() {
@@ -42,7 +46,27 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let uri = format!("amqp://guest:guest@localhost:{port}");
-    let hcfg = HarnessConfig::<RabbitMq>::new("rabbitmq");
+
+    let purge_uri = uri.clone();
+    let purge: harness::PurgeFn = Box::new(move || {
+        let uri = purge_uri.clone();
+        Box::pin(async move {
+            // Drain leftover messages so each scenario starts with an empty
+            // queue. The topology (exchanges / bindings) is idempotent, so
+            // purging rather than deleting keeps scenario boot cost low.
+            let Ok(conn) = Connection::connect(&uri, ConnectionProperties::default()).await else {
+                return;
+            };
+            if let Ok(ch) = conn.create_channel().await {
+                let _ = ch
+                    .queue_purge(QUEUE_NAME.into(), QueuePurgeOptions::default())
+                    .await;
+            }
+            let _ = conn.close(0, "purge done".into()).await;
+        })
+    });
+
+    let hcfg = HarnessConfig::<RabbitMq>::new("rabbitmq").with_purge(purge);
     run_all_scenarios(
         hcfg,
         || {

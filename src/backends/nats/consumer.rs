@@ -416,6 +416,10 @@ impl NatsConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        // All tasks in a consumer group bind to the same durable consumer name;
+        // the JetStream server load-balances messages across them. The registry
+        // pre-configures this consumer with an aggregate `max_ack_pending` so
+        // N pullers can actually have N × prefetch messages in flight.
         let consumer_name = super::constants::consumer_name(queue);
 
         let shutdown = options.shutdown.clone();
@@ -458,16 +462,19 @@ impl NatsConsumer {
                     .await
                     .map_err(|e| map_get_stream_error(queue, e))?;
 
+                // `create_consumer` upserts the durable consumer — unlike
+                // `get_or_create_consumer`, which returns the pre-existing
+                // config verbatim and silently ignores the caller's config
+                // (including `max_ack_pending`). That path caused N-way
+                // parallel pullers to inherit whatever ack-budget the first
+                // registrant set, bottlenecking the whole group.
                 let pull_consumer = stream
-                    .get_or_create_consumer(
-                        &consumer_name,
-                        PullConsumerConfig {
-                            durable_name: Some(consumer_name.clone()),
-                            ack_policy: AckPolicy::Explicit,
-                            max_ack_pending,
-                            ..Default::default()
-                        },
-                    )
+                    .create_consumer(PullConsumerConfig {
+                        durable_name: Some(consumer_name.clone()),
+                        ack_policy: AckPolicy::Explicit,
+                        max_ack_pending,
+                        ..Default::default()
+                    })
                     .await
                     .map_err(|e| {
                         ShoveError::Connection(format!(

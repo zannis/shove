@@ -254,3 +254,29 @@ impl RegistryImpl for ConsumerGroupRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn noop_stats_provider_snapshot_errors() {
+        let provider = NoopQueueStatsProvider;
+        let err =
+            <NoopQueueStatsProvider as QueueStatsProviderImpl>::snapshot(&provider, "whatever")
+                .await
+                .expect_err("NoopQueueStatsProvider must refuse to produce metrics");
+        assert!(matches!(err, ShoveError::Topology(_)));
+        assert!(err.to_string().contains("ManagementConfig"));
+    }
+
+    #[tokio::test]
+    async fn noop_stats_provider_queue_stats_errors() {
+        use super::super::management::QueueStatsProvider as MgmtProvider;
+        let provider = NoopQueueStatsProvider;
+        let err = <NoopQueueStatsProvider as MgmtProvider>::get_queue_stats(&provider, "whatever")
+            .await
+            .expect_err("NoopQueueStatsProvider must refuse to produce stats");
+        assert!(matches!(err, ShoveError::Topology(_)));
+    }
+}

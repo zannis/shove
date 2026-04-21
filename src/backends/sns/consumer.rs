@@ -242,16 +242,16 @@ where
     // Max number of handlers running concurrently (1 = serial / non-concurrent mode).
     let max_in_flight = options.prefetch_count as usize;
 
-    // How many messages to request per SQS poll.  When `receive_batch_size` is
-    // set (non-concurrent mode), we fetch a full batch even though we only run
-    // one handler at a time.  This amortises the `ReceiveMessage` API call
-    // overhead across multiple messages, which is critical for throughput when
-    // several consumers share the same queue.
+    // How many messages to request per SQS poll. Defaults to SQS's hard cap
+    // (10) to amortise `ReceiveMessage` round-trips across as many messages
+    // as possible — critical in serial / low-prefetch mode where `max_in_flight`
+    // would otherwise pin the batch to 1 and bottleneck throughput on poll
+    // RTT. Users can override via `ConsumerOptions::with_receive_batch_size`.
     let receive_batch: usize = {
         let configured = if options.receive_batch_size > 0 {
             options.receive_batch_size as usize
         } else {
-            max_in_flight
+            10
         };
         configured.min(10)
     };

@@ -46,12 +46,17 @@ impl SupervisorOutcome {
 /// `ConsumerGroupRegistry::shutdown_all_with_tally` fill this out so
 /// `RegistryImpl::run_until_timeout` can return a truthful
 /// [`SupervisorOutcome`].
+///
+/// Only coordinated-group backends (RabbitMQ / Kafka / NATS / InMemory) use
+/// this; a supervisor-only build such as `aws-sns-sqs` doesn't.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ShutdownTally {
     pub errors: usize,
     pub panics: usize,
 }
 
+#[allow(dead_code)]
 impl ShutdownTally {
     pub(crate) fn add(&mut self, other: ShutdownTally) {
         self.errors += other.errors;

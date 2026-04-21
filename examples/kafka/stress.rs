@@ -9,12 +9,18 @@
 #[path = "../common/stress_test.rs"]
 mod harness;
 
+use rdkafka::ClientConfig;
+use rdkafka::admin::{AdminClient, AdminOptions};
+use rdkafka::client::DefaultClientContext;
 use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
 use shove::{Broker, Kafka};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 use harness::{HarnessConfig, run_all_scenarios};
+
+const TOPIC_NAME: &str = "shove-stress-bench";
+const DLQ_NAME: &str = "shove-stress-bench-dlq";
 
 #[tokio::main]
 async fn main() {
@@ -28,7 +34,27 @@ async fn main() {
         .expect("failed to read Kafka port");
     let bootstrap = format!("127.0.0.1:{port}");
 
-    let hcfg = HarnessConfig::<Kafka>::new("kafka");
+    let purge_bootstrap = bootstrap.clone();
+    let purge: harness::PurgeFn = Box::new(move || {
+        let bootstrap = purge_bootstrap.clone();
+        Box::pin(async move {
+            // Delete and recreate: removes leftover messages AND lets the next
+            // scenario re-declare with a partition count sized to its own
+            // `max_consumers`. Kafka's `ensure_partitions` only expands, so
+            // this is the simplest way to reset to a clean baseline.
+            let Ok(admin): Result<AdminClient<DefaultClientContext>, _> = ClientConfig::new()
+                .set("bootstrap.servers", &bootstrap)
+                .create()
+            else {
+                return;
+            };
+            let _ = admin
+                .delete_topics(&[TOPIC_NAME, DLQ_NAME], &AdminOptions::new())
+                .await;
+        })
+    });
+
+    let hcfg = HarnessConfig::<Kafka>::new("kafka").with_purge(purge);
     run_all_scenarios(
         hcfg,
         || {

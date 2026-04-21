@@ -446,13 +446,30 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 // ---------------------------------------------------------------------------
 
 fn create_stream_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
+    // Each consumer task within a group gets a distinct `client.id` so
+    // librdkafka treats them as separate members. Without this, group
+    // rebalances across repeated join attempts can produce stale
+    // "group generation id is not valid" commit errors.
+    let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .set("group.id", group_id)
+        .set("client.id", client_id)
+        // Cooperative-sticky assignment performs incremental rebalance so that
+        // adding/removing a consumer only reassigns the delta — without this,
+        // every join triggers an eager (stop-the-world) rebalance that
+        // freezes the entire group for the heartbeat window.
+        .set("partition.assignment.strategy", "cooperative-sticky")
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .set("session.timeout.ms", "10000")
         .set("max.poll.interval.ms", "300000")
+        // Minimise fetch-latency so small-payload workloads aren't bottlenecked
+        // by the default 500 ms broker dwell. `fetch.min.bytes=1` returns as
+        // soon as any data is available; `fetch.wait.max.ms=50` caps the
+        // blocking dwell so the broker doesn't hold the connection open.
+        .set("fetch.min.bytes", "1")
+        .set("fetch.wait.max.ms", "50")
         .create()
         .map_err(|e| map_kafka_error("failed to create consumer", e))?;
     Ok(consumer)

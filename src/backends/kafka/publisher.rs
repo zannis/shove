@@ -140,6 +140,8 @@ impl KafkaPublisher {
     }
 
     pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+        use futures_util::future::try_join_all;
+
         let topology = T::topology();
         #[allow(clippy::type_complexity)]
         let prepared: Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)> = messages
@@ -152,20 +154,31 @@ impl KafkaPublisher {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        for (topic, key, headers, payload) in &prepared {
-            let mut record = FutureRecord::to(topic)
-                .payload(payload.as_slice())
-                .headers(headers.clone());
-            if let Some(k) = key {
-                record = record.key(k.as_slice());
-            }
-
-            self.client
-                .producer()
-                .send(record, PRODUCE_TIMEOUT)
-                .await
-                .map_err(|(e, _)| ShoveError::Connection(format!("batch publish failed: {e}")))?;
-        }
+        // Submit every record concurrently so librdkafka's internal batching
+        // (`batch.size` / `linger.ms`) can coalesce them into broker-side
+        // batches. Awaiting each `send` serially forced one round-trip per
+        // message and pinned publish throughput at ~200 msg/s on localhost.
+        let producer = self.client.producer();
+        try_join_all(
+            prepared
+                .into_iter()
+                .map(|(topic, key, headers, payload)| async move {
+                    let mut record = FutureRecord::to(&topic)
+                        .payload(payload.as_slice())
+                        .headers(headers);
+                    if let Some(k) = key.as_deref() {
+                        record = record.key(k);
+                    }
+                    producer
+                        .send(record, PRODUCE_TIMEOUT)
+                        .await
+                        .map_err(|(e, _)| {
+                            ShoveError::Connection(format!("batch publish failed: {e}"))
+                        })?;
+                    Ok::<(), ShoveError>(())
+                }),
+        )
+        .await?;
 
         Ok(())
     }

@@ -243,3 +243,96 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{PublisherImpl, QueueStatsProviderImpl};
+    use crate::topic::Topic;
+    use crate::topology::{QueueTopology, TopologyBuilder};
+
+    struct BS;
+    impl Topic for BS {
+        type Message = String;
+        fn topology() -> &'static QueueTopology {
+            static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("backend-stats").build())
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_backend_connect_and_close_are_symmetric() {
+        let client = <InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        assert!(!client.shutdown_token().is_cancelled());
+        <InMemory as Backend>::close(&client).await;
+        assert!(client.shutdown_token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn stats_provider_snapshot_reflects_queue_state() {
+        let client = <InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+
+        let declarer = <InMemory as Backend>::make_declarer(&client);
+        <InMemoryTopologyDeclarer as TopologyImpl>::declare::<BS>(&declarer)
+            .await
+            .expect("declare");
+
+        let publisher = <InMemory as Backend>::make_publisher(&client)
+            .await
+            .expect("publisher");
+        for i in 0..4u32 {
+            <InMemoryPublisher as PublisherImpl>::publish::<BS>(&publisher, &format!("m-{i}"))
+                .await
+                .expect("publish");
+        }
+
+        let stats = <InMemory as Backend>::make_stats_provider(&client);
+        let metrics =
+            <BrokerStatsProvider as QueueStatsProviderImpl>::snapshot(&stats, "backend-stats")
+                .await
+                .expect("snapshot");
+        assert_eq!(metrics.backlog, Some(4));
+        assert_eq!(metrics.inflight, Some(0));
+        assert!(metrics.throughput_per_sec.is_none());
+        assert!(metrics.processing_latency.is_none());
+
+        // Missing queue propagates an error instead of returning defaulted metrics.
+        let err =
+            <BrokerStatsProvider as QueueStatsProviderImpl>::snapshot(&stats, "missing-queue")
+                .await
+                .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("queue"));
+
+        <InMemory as Backend>::close(&client).await;
+    }
+
+    #[tokio::test]
+    async fn make_autoscaler_produces_fresh_registry_handle() {
+        let client = <InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        // `make_autoscaler` must not panic and must construct the backend with
+        // an independent fresh registry (the doc comment on the impl).
+        let _autoscaler = <InMemory as Backend>::make_autoscaler(&client);
+        <InMemory as Backend>::close(&client).await;
+    }
+
+    #[tokio::test]
+    async fn make_registry_reuses_client_shutdown_token() {
+        let client = <InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        let registry = <InMemory as HasCoordinatedGroups>::make_registry(&client);
+        let token = <InMemoryConsumerGroupRegistry as RegistryImpl>::cancellation_token(&registry);
+        assert!(!token.is_cancelled());
+        <InMemory as Backend>::close(&client).await;
+        assert!(
+            token.is_cancelled(),
+            "client close must trip registry token"
+        );
+    }
+}

@@ -57,6 +57,10 @@ impl ConsumerOptionsInner {
     /// Returns `Ok(())` if the payload is within the configured
     /// `max_message_size`, or an error if it exceeds the limit. Always
     /// succeeds when no limit is set.
+    ///
+    /// Only some backend consumers route through this helper; a feature-limited
+    /// build (e.g. just `aws-sns-sqs`) may not call it at all.
+    #[allow(dead_code)]
     pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
         validate_message_size(len, self.max_message_size)
     }

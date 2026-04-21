@@ -73,6 +73,68 @@ async fn broker_consumer_group_exists_for_inmemory() {
     broker.close().await;
 }
 
+/// The drain-timeout branch of `ConsumerSupervisor::run_until_timeout`:
+/// a handler that refuses to finish forces the supervisor to abort, yielding
+/// `timed_out: true`. Covers the timeout arm of the generic supervisor.
+#[tokio::test]
+async fn supervisor_drain_timeout_surfaces_in_outcome() {
+    use shove::consumer::ConsumerOptions;
+    use shove::handler::MessageHandler;
+    use shove::metadata::MessageMetadata;
+    use shove::outcome::Outcome;
+    use shove::topic::Topic;
+    use shove::topology::{QueueTopology, TopologyBuilder};
+
+    struct SlowTopic;
+    impl Topic for SlowTopic {
+        type Message = String;
+        fn topology() -> &'static QueueTopology {
+            static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("drain-timeout").build())
+        }
+    }
+
+    struct StuckHandler;
+    impl MessageHandler<SlowTopic> for StuckHandler {
+        type Context = ();
+        async fn handle(&self, _: String, _: MessageMetadata, _: &()) -> Outcome {
+            // Park forever — on cancel the consumer loop still exits, but if
+            // a handler is mid-flight the drain arm waits for it.
+            std::future::pending::<()>().await;
+            Outcome::Ack
+        }
+    }
+
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
+    broker.topology().declare::<SlowTopic>().await.unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<SlowTopic>(&"hang".to_string())
+        .await
+        .unwrap();
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<SlowTopic, _>(StuckHandler, ConsumerOptions::new())
+        .unwrap();
+    let token = supervisor.cancellation_token();
+
+    // Let the stuck handler pick up the message before we trigger shutdown.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    token.cancel();
+
+    let signal = std::future::pending::<()>();
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_millis(200))
+        .await;
+    assert!(outcome.timed_out, "expected drain timeout, got {outcome:?}");
+    assert_eq!(outcome.exit_code(), 3);
+
+    broker.close().await;
+}
+
 /// Regression test: a handler whose `Context` is a non-unit `Arc<AppState>`
 /// must compile through both `ConsumerSupervisor::register` and
 /// `ConsumerGroup::register` once the `with_context` fluent API has been
