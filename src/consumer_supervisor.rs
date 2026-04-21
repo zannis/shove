@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerImpl};
 use crate::consumer::ConsumerOptions;
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 
@@ -108,6 +108,15 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         T: Topic,
         H: MessageHandler<T, Context = Ctx>,
     {
+        if T::topology().sequencing().is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{}' has a sequencing config; `ConsumerSupervisor::register` \
+                 would silently drop FIFO ordering. Use the backend-specific \
+                 consumer's `run_fifo` for sequenced topics until FIFO registration \
+                 is surfaced on the harness.",
+                T::topology().queue(),
+            )));
+        }
         let consumer = self.consumer.clone();
         let ctx = self.ctx.clone();
         let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
@@ -129,42 +138,57 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
             _ = self.shutdown.cancelled() => {}
         }
 
-        let drain = async {
-            let mut errors = 0usize;
-            let mut panics = 0usize;
-            while let Some(res) = self.tasks.join_next().await {
-                match res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!(error = %e, "consumer task failed");
-                        errors += 1;
-                    }
-                    Err(e) if e.is_cancelled() => {}
-                    Err(e) => {
-                        tracing::error!(error = %e, "consumer task panicked");
-                        panics += 1;
-                    }
+        fn tally(
+            res: std::result::Result<Result<()>, tokio::task::JoinError>,
+            errors: &mut usize,
+            panics: &mut usize,
+        ) {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "consumer task failed");
+                    *errors += 1;
+                }
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "consumer task panicked");
+                    *panics += 1;
                 }
             }
-            SupervisorOutcome {
-                errors,
-                panics,
-                timed_out: false,
+        }
+
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+
+        let drain = {
+            let tasks = &mut self.tasks;
+            let errors = &mut errors;
+            let panics = &mut panics;
+            async move {
+                while let Some(res) = tasks.join_next().await {
+                    tally(res, errors, panics);
+                }
             }
         };
 
         match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(outcome) => outcome,
+            Ok(()) => SupervisorOutcome {
+                errors,
+                panics,
+                timed_out: false,
+            },
             Err(_) => {
                 tracing::warn!(
                     timeout_ms = drain_timeout.as_millis() as u64,
                     "drain timeout elapsed; aborting surviving tasks"
                 );
                 self.tasks.abort_all();
-                while self.tasks.join_next().await.is_some() {}
+                while let Some(res) = self.tasks.join_next().await {
+                    tally(res, &mut errors, &mut panics);
+                }
                 SupervisorOutcome {
-                    errors: 0,
-                    panics: 0,
+                    errors,
+                    panics,
                     timed_out: true,
                 }
             }
