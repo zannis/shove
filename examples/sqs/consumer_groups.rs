@@ -102,17 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = SnsClient::new(&config).await?;
 
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
-
     // ── Publish an initial burst of tasks ──
     //
     // We declare topology manually here so the publisher can resolve the SNS ARN.
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
+    // The declarer reads the client-owned topic/queue registries shared with
+    // every publisher and consumer group built from the same client.
+    let declarer = SnsTopologyDeclarer::new(client.clone());
     declarer.declare(WorkQueue::topology()).await?;
 
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = SnsPublisher::new(client.clone(), client.topic_registry().clone());
     let burst_size = 50;
     for i in 0..burst_size {
         let event = TaskEvent {
@@ -129,11 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // It automatically declares the topology and starts consumers at their
     // minimum count. Each group reads from a single SQS queue and can be
     // scaled up/down manually or via a custom autoscaler.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        client.clone(),
-        topic_registry.clone(),
-        queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(client.clone());
 
     registry
         .register::<WorkQueue, TaskHandler>(
@@ -154,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Monitor queue depth using SqsQueueStatsProvider ──
     //
     // Poll queue attributes to observe the backlog draining.
-    let stats_provider = SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
+    let stats_provider = SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
 
     println!("monitoring queue depth — watching backlog drain\n");
 

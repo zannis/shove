@@ -178,16 +178,13 @@ mod tests {
     ) -> Arc<Mutex<SqsConsumerGroupRegistry>> {
         use crate::backends::sns::client::SnsClient;
         use crate::backends::sns::consumer_group::SqsConsumerGroupConfig;
-        use crate::backends::sns::topology::{QueueRegistry, TopicRegistry};
+        use crate::backends::sns::topology::QueueRegistry;
         use crate::handler::MessageHandler;
         use crate::topic::Topic;
         use crate::topology::QueueTopology;
 
         let client = SnsClient::mock();
-        let topic_reg = Arc::new(TopicRegistry::new());
-        let queue_reg = Arc::new(QueueRegistry::new());
-        let mut registry =
-            SqsConsumerGroupRegistry::new(client.clone(), topic_reg, queue_reg.clone());
+        let mut registry = SqsConsumerGroupRegistry::new(client.clone());
 
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         struct Msg;

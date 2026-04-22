@@ -31,10 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use shove::sns::{
-    QueueRegistry, SnsClient, SnsConfig, SnsPublisher, SnsTopologyDeclarer, SqsConsumer,
-    TopicRegistry,
-};
+use shove::sns::{SnsClient, SnsConfig, SnsPublisher, SnsTopologyDeclarer, SqsConsumer};
 use shove::{
     ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure, SequencedTopic,
     Sqs, Topic, TopologyBuilder, define_sequenced_topic,
@@ -171,19 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = SnsClient::new(&config).await?;
 
-    // ── Registries ──
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
-
     // ── Declare topologies ──
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
+    // The declarer reads the client-owned topic/queue registries shared with
+    // every publisher and consumer built from the same client.
+    let declarer = SnsTopologyDeclarer::new(client.clone());
     declarer.declare(SkipLedger::topology()).await?;
     declarer.declare(StrictLedger::topology()).await?;
     println!("sequenced topologies declared\n");
 
     // ── Publish ordered entries for account ACC-A ──
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = SnsPublisher::new(client.clone(), client.topic_registry().clone());
 
     for seq in 1..=5 {
         let entry = LedgerEntry {
@@ -215,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let s = shutdown.clone();
     let c = client.clone();
-    let qr = queue_registry.clone();
+    let qr = client.queue_registry().clone();
     let t = skip_totals.clone();
     let skip_task = tokio::spawn(async move {
         let handler = LedgerHandler {
@@ -236,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let s = shutdown.clone();
     let c = client.clone();
-    let qr = queue_registry.clone();
+    let qr = client.queue_registry().clone();
     let t = strict_totals.clone();
     let strict_task = tokio::spawn(async move {
         let handler = LedgerHandler {

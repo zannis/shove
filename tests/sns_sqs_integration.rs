@@ -1,21 +1,17 @@
 //! Integration tests for the SNS/SQS pub-sub backend.
 //!
-//! Migrated to `Broker<Sqs>` + `Publisher<Sqs>` + `TopologyDeclarer<Sqs>` +
+//! Uses `Broker<Sqs>` + `Publisher<Sqs>` + `TopologyDeclarer<Sqs>` +
 //! `ConsumerSupervisor<Sqs>`. SQS does **not** implement
 //! `HasCoordinatedGroups`, so tests that exercise the SQS-specific
-//! `SqsConsumerGroup[Registry]` / `SqsAutoscalerBackend` plumbing stay on the
-//! old API surface — the old types are still `pub` re-exports.
+//! `SqsConsumerGroup[Registry]` / `SqsAutoscalerBackend` plumbing use those
+//! types directly — they share the same client-owned registries as the
+//! broker.
 //!
-//! Tests that need direct access to the queue URLs (e.g. to drive raw SQS
-//! sends, receive from DLQs, or hand the registry to `SqsConsumer::new` for
-//! bespoke consumer runs) keep using an external [`TopicRegistry`] /
-//! [`QueueRegistry`] populated via the inherent `SnsTopologyDeclarer`; the
-//! broker's client-owned registries are `pub(crate)` and so not visible from
-//! tests. Topology is therefore declared through **both** paths: once via
-//! `broker.topology()` (populates the client-owned registries used by
-//! `Publisher<Sqs>`) and once via a test-owned `SnsTopologyDeclarer`
-//! (populates the external registries queried by the test body). SNS/SQS
-//! topology creation is idempotent so the double declaration is safe.
+//! All registries are owned by `SnsClient` and reachable via
+//! `client.topic_registry()` / `client.queue_registry()`. Publishers,
+//! declarers, consumer groups, and tests all read from the same state, so a
+//! single `broker.topology().declare::<T>()` call is enough to make ARNs
+//! visible everywhere.
 //!
 //! Each test spins up a fresh LocalStack container via testcontainers, runs
 //! the test, and drops the container on completion (automatic cleanup).
@@ -206,20 +202,19 @@ impl TestBroker {
 // ---------------------------------------------------------------------------
 //
 // Exposes:
-//   - `sns_client`         — raw client for bespoke consumer construction
-//   - `broker`             — `Broker<Sqs>::from_client(sns_client.clone())`
-//   - `topic_registry`/`queue_registry` — external registries populated in
-//     parallel via `SnsTopologyDeclarer` so tests can look up topic ARNs and
-//     queue URLs (the client-owned registries are `pub(crate)`).
-//   - `publisher`          — `Publisher<Sqs>` built via `broker.publisher()`,
-//     resolving ARNs against the client-owned registry populated by
-//     `broker.topology()`.
+//   - `sns_client` — raw client for bespoke consumer construction; owns the
+//     single topic/queue registry shared with every publisher, declarer,
+//     and consumer group built from the same client
+//   - `broker`     — `Broker<Sqs>::from_client(sns_client.clone())`
+//   - `publisher`  — `Publisher<Sqs>` built via `broker.publisher()`
+//
+// `topic_registry()` / `queue_registry()` accessors forward to the
+// client-owned registries so tests can look up ARNs/URLs without maintaining
+// a divergent copy.
 
 struct TestSetup {
     sns_client: SnsClient,
     broker: Broker<Sqs>,
-    topic_registry: Arc<TopicRegistry>,
-    queue_registry: Arc<QueueRegistry>,
     publisher: PublisherV2<Sqs>,
 }
 
@@ -232,43 +227,31 @@ impl TestSetup {
             .expect("failed to create SNS client");
 
         let broker = Broker::<Sqs>::from_client(sns_client.clone());
-        let topic_registry = Arc::new(TopicRegistry::new());
-        let queue_registry = Arc::new(QueueRegistry::new());
-
         let publisher = broker.publisher().await.expect("publisher construction");
 
         Self {
             sns_client,
             broker,
-            topic_registry,
-            queue_registry,
             publisher,
         }
     }
 
-    /// Returns an external `SnsTopologyDeclarer` wired to `topic_registry`
-    /// and `queue_registry` — used to populate the test-visible registries
-    /// alongside the broker-owned ones.
-    fn external_declarer(&self) -> SnsTopologyDeclarer {
-        SnsTopologyDeclarer::new(self.sns_client.clone(), self.topic_registry.clone())
-            .with_queue_registry(self.queue_registry.clone())
+    fn topic_registry(&self) -> &Arc<TopicRegistry> {
+        self.sns_client.topic_registry()
     }
 
-    /// Declare the full topology for topic `T` via both the broker (populates
-    /// the client-owned registry used by `self.publisher`) and the external
-    /// declarer (populates `self.topic_registry` and `self.queue_registry`).
-    /// SNS/SQS topology creation is idempotent so this is safe to call
-    /// repeatedly.
+    fn queue_registry(&self) -> &Arc<QueueRegistry> {
+        self.sns_client.queue_registry()
+    }
+
+    /// Declare the full topology for topic `T` via the broker. SNS/SQS
+    /// topology creation is idempotent so this is safe to call repeatedly.
     async fn declare<T: Topic>(&self) {
         self.broker
             .topology()
             .declare::<T>()
             .await
             .expect("broker topology declaration should succeed");
-        self.external_declarer()
-            .declare(T::topology())
-            .await
-            .expect("external topology declaration should succeed");
     }
 }
 
@@ -575,21 +558,21 @@ async fn topology_declares_standard_queue_and_dlq() {
     setup.declare::<WorkTopic>().await;
 
     let main_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work")
         .await
         .expect("main queue URL should be registered");
     assert!(!main_url.is_empty());
 
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should be registered");
     assert!(!dlq_url.is_empty());
 
     let arn = setup
-        .topic_registry
+        .topic_registry()
         .get("sqs-work")
         .await
         .expect("topic ARN should be registered");
@@ -603,7 +586,7 @@ async fn topology_declares_fifo_shard_queues() {
     setup.declare::<SeqSkipTopic>().await;
 
     let arn = setup
-        .topic_registry
+        .topic_registry()
         .get("sqs-seq-skip")
         .await
         .expect("FIFO topic ARN should be registered");
@@ -612,7 +595,7 @@ async fn topology_declares_fifo_shard_queues() {
     for i in 0..2 {
         let shard_name = format!("sqs-seq-skip-seq-{i}");
         let url = setup
-            .queue_registry
+            .queue_registry()
             .get(&shard_name)
             .await
             .unwrap_or_else(|| panic!("shard queue '{shard_name}' should be registered"));
@@ -620,7 +603,7 @@ async fn topology_declares_fifo_shard_queues() {
     }
 
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-seq-skip-dlq")
         .await
         .expect("DLQ for sequenced topic should be registered");
@@ -636,7 +619,7 @@ async fn topology_idempotent_with_queues() {
     setup.declare::<WorkTopic>().await;
 
     let url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work")
         .await
         .expect("queue should still be registered");
@@ -669,7 +652,7 @@ async fn publish_and_consume_simple_message() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -728,7 +711,7 @@ async fn publish_and_consume_with_headers() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -791,7 +774,7 @@ async fn publish_and_consume_batch() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -838,7 +821,7 @@ async fn rejected_message_lands_in_dlq() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -854,7 +837,7 @@ async fn rejected_message_lands_in_dlq() {
 
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -894,7 +877,7 @@ async fn dlq_consumer_handles_dead_message() {
     let shutdown1 = CancellationToken::new();
     let shutdown1_clone = shutdown1.clone();
 
-    let consumer1 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer1 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle1 = tokio::spawn(async move {
         consumer1
             .run::<WorkTopic, _>(
@@ -911,7 +894,7 @@ async fn dlq_consumer_handles_dead_message() {
     // Wait for message to reach DLQ
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -948,7 +931,7 @@ async fn dlq_consumer_handles_dead_message() {
     let dlq_handler = DlqRecordingHandler::new();
     let dlq_handler_clone = dlq_handler.clone();
 
-    let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let h2 = tokio::spawn(async move {
         consumer2
             .run_dlq::<WorkTopic, _>(dlq_handler_clone, ())
@@ -990,7 +973,7 @@ async fn retry_then_ack_succeeds() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -1039,7 +1022,7 @@ async fn max_retries_sends_to_dlq() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -1055,7 +1038,7 @@ async fn max_retries_sends_to_dlq() {
 
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -1113,7 +1096,7 @@ async fn defer_redelivers_message() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -1180,7 +1163,7 @@ async fn concurrent_consume_processes_all_messages() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -1223,7 +1206,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -1239,7 +1222,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
 
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -1282,7 +1265,7 @@ async fn concurrent_consume_graceful_shutdown_drains_inflight() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -1356,7 +1339,7 @@ async fn handler_timeout_triggers_retry() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -1423,7 +1406,7 @@ async fn sequenced_consume_preserves_order() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run_fifo::<SeqSkipTopic, _>(
@@ -1504,7 +1487,7 @@ async fn sequenced_skip_continues_after_rejection() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run_fifo::<SeqSkipTopic, _>(
@@ -1597,7 +1580,7 @@ async fn sequenced_failall_poisons_key() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run_fifo::<SeqFailAllTopic, _>(
@@ -1678,7 +1661,7 @@ async fn sequenced_multiple_keys_processed_concurrently() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run_fifo::<SeqSkipTopic, _>(
@@ -1750,7 +1733,7 @@ async fn fifo_topic_deduplicates_identical_payloads() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run_fifo::<SeqSkipTopic, _>(
@@ -1813,7 +1796,7 @@ async fn stats_provider_fetches_queue_depth() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let stats = provider
         .get_queue_stats("sqs-work")
         .await
@@ -1833,7 +1816,7 @@ async fn stats_provider_missing_queue_errors() {
     // Do NOT declare any topology — queue_registry is empty.
 
     let provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let result = provider.get_queue_stats("nonexistent-queue").await;
 
     assert!(
@@ -1880,7 +1863,7 @@ async fn consumer_group_processes_messages() {
         "sqs-work",
         config,
         setup.sns_client.clone(),
-        setup.queue_registry.clone(),
+        setup.queue_registry().clone(),
         group_token.clone(),
         move || template_handler.clone(),
         (),
@@ -1915,7 +1898,7 @@ async fn consumer_group_scales_up_and_down() {
         "sqs-work",
         config,
         setup.sns_client.clone(),
-        setup.queue_registry.clone(),
+        setup.queue_registry().clone(),
         group_token.clone(),
         CountingHandler::new,
         (),
@@ -1973,11 +1956,7 @@ async fn registry_register_declares_topology_and_starts() {
 
     let config = SqsConsumerGroupConfig::new(1..=2).with_prefetch_count(5);
 
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     registry
         .register::<WorkTopic, CountingHandler>(config, move || template_handler.clone(), ())
@@ -1987,11 +1966,11 @@ async fn registry_register_declares_topology_and_starts() {
     // Topology should now be declared on the external registries (populated
     // by `SqsConsumerGroupRegistry.register`).
     assert!(
-        setup.topic_registry.get("sqs-work").await.is_some(),
+        setup.topic_registry().get("sqs-work").await.is_some(),
         "topic_registry should have 'sqs-work' entry"
     );
     assert!(
-        setup.queue_registry.get("sqs-work").await.is_some(),
+        setup.queue_registry().get("sqs-work").await.is_some(),
         "queue_registry should have 'sqs-work' entry"
     );
 
@@ -2037,11 +2016,7 @@ async fn registry_duplicate_registration_fails() {
 
     let config = SqsConsumerGroupConfig::new(1..=2);
 
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     // First registration should succeed.
     registry
@@ -2078,7 +2053,7 @@ async fn deserialization_failure_rejects_to_dlq() {
     // Send a malformed message directly via SQS (bypasses SNS publisher/serialization).
     let sqs_client = broker.sqs_client().await;
     let queue_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work")
         .await
         .expect("sqs-work queue URL should be registered");
@@ -2097,7 +2072,7 @@ async fn deserialization_failure_rejects_to_dlq() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -2112,7 +2087,7 @@ async fn deserialization_failure_rejects_to_dlq() {
     });
 
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should be registered");
@@ -2194,11 +2169,7 @@ async fn sqs_autoscaler_scales_group_on_load() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // 2. Setup Registry and Group.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky, sticky_signal) = StickyHandler::new();
 
@@ -2222,7 +2193,7 @@ async fn sqs_autoscaler_scales_group_on_load() {
 
     // 3. Setup Autoscaler.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
 
     let auto_config = AutoscalerConfig {
         poll_interval: Duration::from_millis(100),
@@ -2245,7 +2216,7 @@ async fn sqs_autoscaler_scales_group_on_load() {
     // Wait for scale up.
     let mut scaled_up = false;
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     for i in 0..50 {
         let stats = stats_provider.get_queue_stats("sqs-work").await.unwrap();
         let reg = registry_arc.lock().await;
@@ -2367,11 +2338,7 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Build a registry with two groups — one per topic.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky_a, signal_a) = StickyHandler::new();
     let (sticky_b, signal_b) = StickyHandler::new();
@@ -2406,7 +2373,7 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
 
     // Autoscaler with fast polling and no hysteresis/cooldown.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let auto_config = AutoscalerConfig {
         poll_interval: Duration::from_millis(100),
         scale_up_multiplier: 0.5,
@@ -2478,7 +2445,7 @@ async fn consumer_run_on_undeclared_queue_fails() {
     let handler = CountingHandler::new();
     let shutdown = CancellationToken::new();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let result = consumer
         .run::<WorkTopic, _>(
             handler,
@@ -2506,7 +2473,7 @@ async fn run_dlq_on_topic_without_dlq_fails() {
 
     let handler = CountingHandler::new();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let result = consumer.run_dlq::<NoDlqTopic, _>(handler, ()).await;
 
     assert!(
@@ -2560,7 +2527,7 @@ async fn defer_without_hold_queues_redelivers() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<DeferNoHoldTopic, _>(
@@ -2646,7 +2613,7 @@ async fn defer_preserves_retry_count() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run::<WorkTopic, _>(
@@ -2732,7 +2699,7 @@ async fn sequenced_defer_redelivers() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
             .run_fifo::<SeqSkipTopic, _>(
@@ -2812,11 +2779,7 @@ async fn autoscaler_custom_strategy_with_sqs() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Set up registry with prefetch=5 so threshold would be 10 (3 remaining < 10).
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky, sticky_signal) = StickyHandler::new();
     let config = SqsConsumerGroupConfig::new(1..=4).with_prefetch_count(5);
@@ -2839,7 +2802,7 @@ async fn autoscaler_custom_strategy_with_sqs() {
 
     // Build autoscaler with custom strategy — NO Stabilized wrapper.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let backend = SqsAutoscalerBackend::new(stats_provider, registry_arc.clone());
     let mut autoscaler =
         Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(200));
@@ -2918,11 +2881,7 @@ async fn autoscaler_scale_magnitude_with_sqs() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Set up registry: min=1, max=5, prefetch=5. Starts with 1 consumer.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky, sticky_signal) = StickyHandler::new();
     let config = SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5);
@@ -2945,7 +2904,7 @@ async fn autoscaler_scale_magnitude_with_sqs() {
 
     // Build autoscaler with ScaleByTwoStrategy — NO Stabilized wrapper.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let backend = SqsAutoscalerBackend::new(stats_provider, registry_arc.clone());
     let mut autoscaler = Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(200));
 

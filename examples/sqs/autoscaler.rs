@@ -107,15 +107,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let client = SnsClient::new(&config).await?;
 
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
-
     // ── Declare topology and publish a burst ──
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
+    // The declarer reads the client-owned topic/queue registries shared with
+    // every publisher and consumer group built from the same client.
+    let declarer = SnsTopologyDeclarer::new(client.clone());
     declarer.declare(WorkQueue::topology()).await?;
 
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = SnsPublisher::new(client.clone(), client.topic_registry().clone());
     let burst_size = 60usize;
     for i in 0..burst_size {
         publisher
@@ -132,11 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Consumer groups manage identical consumers reading from the same queue.
     // `register` declares the topology and prepares the group; `start_all`
     // starts consumers at their minimum count (1 here).
-    let mut registry = SqsConsumerGroupRegistry::new(
-        client.clone(),
-        topic_registry.clone(),
-        queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(client.clone());
 
     registry
         .register::<WorkQueue, TaskHandler>(
@@ -164,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `hysteresis_duration` before action is taken.
     // Cooldown prevents back-to-back scaling: at least `cooldown_duration`
     // must elapse between two scaling actions for the same group.
-    let stats_provider = SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
+    let stats_provider = SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
 
     let auto_config = AutoscalerConfig {
         poll_interval: Duration::from_secs(2),
@@ -193,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 2: queue drains  → autoscaler scales back down to min_consumers.
     println!("autoscaler running — watching consumer count change\n");
 
-    let monitor_stats = SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
+    let monitor_stats = SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_secs(3)).await;
 

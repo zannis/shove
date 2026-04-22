@@ -120,16 +120,17 @@ impl SnsClient {
 
     /// Client-owned SNS topic-ARN registry.
     ///
-    /// Shared by every publisher, consumer, and topology declarer built
-    /// from this client so that topology declaration and publish lookups
-    /// agree without external bookkeeping.
-    pub(crate) fn topic_registry(&self) -> &Arc<TopicRegistry> {
+    /// Shared by every publisher, consumer, topology declarer, and consumer
+    /// group registry built from this client so that topology declaration
+    /// and publish lookups always agree — there is no way to supply an
+    /// alternative registry and create a divergent view.
+    pub fn topic_registry(&self) -> &Arc<TopicRegistry> {
         &self.topic_registry
     }
 
     /// Client-owned SQS queue-URL registry.
     #[cfg(feature = "aws-sns-sqs")]
-    pub(crate) fn queue_registry(&self) -> &Arc<crate::backends::sns::topology::QueueRegistry> {
+    pub fn queue_registry(&self) -> &Arc<crate::backends::sns::topology::QueueRegistry> {
         &self.queue_registry
     }
 

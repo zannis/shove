@@ -72,18 +72,13 @@ impl Backend for Sqs {
     }
 
     fn make_declarer(client: &Self::Client) -> Self::TopologyImpl {
-        SnsTopologyDeclarer::new(client.clone(), client.topic_registry().clone())
-            .with_queue_registry(client.queue_registry().clone())
+        SnsTopologyDeclarer::new(client.clone())
     }
 
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
         let stats_provider =
             SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
-        let registry = Arc::new(Mutex::new(SqsConsumerGroupRegistry::new(
-            client.clone(),
-            client.topic_registry().clone(),
-            client.queue_registry().clone(),
-        )));
+        let registry = Arc::new(Mutex::new(SqsConsumerGroupRegistry::new(client.clone())));
         SqsAutoscalerBackend::new(stats_provider, registry)
     }
 
