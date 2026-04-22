@@ -4,18 +4,30 @@
 //! `Autoscaler`, `AutoscalerConfig`, `ManagementClient`, and dynamic scaling
 //! based on queue depth.
 //!
-//! Requires a running RabbitMQ instance with the management plugin enabled
-//! (see docker-compose.yml):
+//! Note: the autoscaler machinery isn't yet surfaced on the generic
+//! `Broker<B>` wrapper, so this example stays on the backend-specific
+//! `ConsumerGroupRegistry` / `RabbitMqAutoscalerBackend` path (same as
+//! `sqs_autoscaler`).
 //!
-//!     docker compose up -d
+//! Spins up a RabbitMQ testcontainer with the management plugin enabled
+//! automatically (requires a running Docker daemon):
+//!
 //!     cargo run --example rabbitmq_consumer_groups --features rabbitmq
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::*;
-use shove::*;
+use shove::rabbitmq::{
+    ConsumerGroupConfig, ConsumerGroupRegistry, ManagementConfig, RabbitMqAutoscalerBackend,
+    RabbitMqClient, RabbitMqConfig, RabbitMqPublisher,
+};
+use shove::{
+    AutoscalerConfig, MessageHandler, MessageMetadata, Outcome, Topic, TopologyBuilder,
+    define_topic,
+};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 use tokio::sync::Mutex;
 
 // ─── Message type ───────────────────────────────────────────────────────────
@@ -44,7 +56,8 @@ define_topic!(
 struct TaskHandler;
 
 impl MessageHandler<WorkQueue> for TaskHandler {
-    async fn handle(&self, msg: TaskEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: TaskEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[worker] task={} attempt={}",
             msg.task_id,
@@ -58,29 +71,23 @@ impl MessageHandler<WorkQueue> for TaskHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_rabbitmq() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
-        _ => {
-            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_rabbitmq();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "shove=debug,consumer_groups=debug".parse().unwrap()),
         )
         .init();
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
+
+    // Spin up a RabbitMQ testcontainer (management plugin is enabled by default
+    // in the `management` tag — the default image already exposes the API).
+    let container = RabbitMqImage::default().start().await?;
+    let amqp_port = container.get_host_port_ipv4(5672).await?;
+    let mgmt_port = container.get_host_port_ipv4(15672).await?;
+
+    let uri = format!("amqp://guest:guest@localhost:{amqp_port}/%2f");
+    let config = RabbitMqConfig::new(&uri);
     let client = RabbitMqClient::connect(&config).await?;
 
     // ── Publish an initial burst of tasks ──
@@ -107,6 +114,7 @@ async fn main() -> Result<(), ShoveError> {
                 .with_prefetch_count(10) // messages per consumer
                 .with_max_retries(3),
             || TaskHandler, // factory — called once per spawned consumer
+            (),             // handler context (unit for this example)
         )
         .await?;
 
@@ -121,7 +129,8 @@ async fn main() -> Result<(), ShoveError> {
     // The autoscaler polls the RabbitMQ Management API for queue statistics
     // and scales consumer groups up/down based on queue depth relative to
     // capacity (consumers × prefetch_count).
-    let mgmt_config = ManagementConfig::new("http://localhost:15673", "guest", "guest");
+    let mgmt_config =
+        ManagementConfig::new(format!("http://localhost:{mgmt_port}"), "guest", "guest");
 
     let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
         &mgmt_config,
@@ -176,5 +185,6 @@ async fn main() -> Result<(), ShoveError> {
     let _ = autoscaler_task.await;
     println!("done");
 
+    drop(container);
     Ok(())
 }

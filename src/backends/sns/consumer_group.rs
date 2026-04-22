@@ -10,12 +10,13 @@ use tokio_util::sync::CancellationToken;
 
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::consumer::SqsConsumer;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::consumer::{Consumer, ConsumerOptions};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 ///
@@ -62,10 +63,10 @@ impl SqsConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
-            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
-            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -151,6 +152,7 @@ impl SqsConsumerGroup {
     /// handler instance.  The factory is stored inside a type-erased closure
     /// so that the rest of the codebase does not have to carry `T`/`H` type
     /// parameters.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<T, H>(
         name: impl Into<String>,
         queue: impl Into<String>,
@@ -159,6 +161,7 @@ impl SqsConsumerGroup {
         queue_registry: Arc<QueueRegistry>,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
@@ -182,9 +185,10 @@ impl SqsConsumerGroup {
                     ..options
                 }
             };
+            let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
                     tracing::error!("consumer task exited with error: {e}");
                 }
@@ -294,20 +298,13 @@ impl SqsConsumerGroup {
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
         let processing = Arc::new(AtomicBool::new(false));
-        let options = ConsumerOptions {
-            max_retries: self.config.max_retries,
-            prefetch_count: self.config.prefetch_count,
-            shutdown: child_token.clone(),
-            processing: processing.clone(),
-            handler_timeout: self.config.handler_timeout,
-            max_pending_per_key: self.config.max_pending_per_key,
-            max_message_size: self.config.max_message_size,
-            #[cfg(feature = "rabbitmq-transactional")]
-            exactly_once: false,
-            receive_batch_size: 0,
-            #[cfg(feature = "nats")]
-            max_ack_pending: None,
-        };
+        let mut options = ConsumerOptions::defaults_with_shutdown(child_token.clone());
+        options.max_retries = self.config.max_retries;
+        options.prefetch_count = self.config.prefetch_count;
+        options.processing = processing.clone();
+        options.handler_timeout = self.config.handler_timeout;
+        options.max_pending_per_key = self.config.max_pending_per_key;
+        options.max_message_size = self.config.max_message_size;
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned SQS consumer");
@@ -484,10 +481,7 @@ mod tests {
         let config = SqsConsumerGroupConfig::new(1..=4);
         assert_eq!(config.prefetch_count(), 10);
         assert_eq!(config.max_retries(), 10);
-        assert_eq!(
-            config.handler_timeout(),
-            Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT)
-        );
+        assert_eq!(config.handler_timeout(), Some(DEFAULT_HANDLER_TIMEOUT));
     }
 
     #[test]

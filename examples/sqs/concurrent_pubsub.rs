@@ -1,22 +1,28 @@
 //! Concurrent consumption example (SQS backend).
 //!
-//! Demonstrates `run` for non-blocking message processing with in-order
-//! acknowledgement. Compares sequential vs concurrent throughput with a
-//! slow handler.
+//! Demonstrates `ConsumerOptions::with_concurrent_processing` for non-blocking
+//! message processing with in-order acknowledgement. Compares sequential vs
+//! concurrent throughput with a slow handler, both driven through the generic
+//! `Broker<Sqs>::consumer_supervisor()` path.
 //!
-//! Requires a running LocalStack instance (see docker-compose.yml):
+//! Spins up a LocalStack testcontainer automatically. Requires a running
+//! Docker daemon and the `LOCALSTACK_AUTH_TOKEN` environment variable:
 //!
-//!     docker compose up -d
-//!     cargo run --example sqs_concurrent_pubsub --features aws-sns-sqs
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run --example sqs_concurrent_pubsub --features aws-sns-sqs
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use shove::sns::*;
-use shove::*;
-use tokio_util::sync::CancellationToken;
+use shove::sns::SnsConfig;
+use shove::{
+    Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Publisher, Sqs,
+    TopologyBuilder, define_topic,
+};
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::localstack::LocalStack;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -73,7 +79,8 @@ impl SlowTaskHandler {
 }
 
 impl MessageHandler<SlowTasks> for SlowTaskHandler {
-    async fn handle(&self, task: Task, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, task: Task, _meta: MessageMetadata, _: &()) -> Outcome {
         // Simulate slow I/O (HTTP call, database query, etc.)
         tokio::time::sleep(self.delay).await;
         eprintln!("  processed task {}", task.id);
@@ -85,96 +92,111 @@ impl MessageHandler<SlowTasks> for SlowTaskHandler {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn require_localstack() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
-        _ => {
-            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn setup() -> (SnsClient, SnsPublisher, Arc<QueueRegistry>) {
-    // SAFETY: called before any concurrent env access in this process.
-    unsafe {
-        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-    }
-
-    let config = SnsConfig {
+async fn setup(
+    endpoint: String,
+) -> Result<(Broker<Sqs>, Publisher<Sqs>), Box<dyn std::error::Error>> {
+    let broker = Broker::<Sqs>::new(SnsConfig {
         region: Some("us-east-1".into()),
-        endpoint_url: Some("http://localhost:4566".into()),
-    };
-    let client = SnsClient::new(&config)
-        .await
-        .expect("failed to connect to LocalStack");
-
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
-
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
-    declarer
-        .declare(SlowTasks::topology())
-        .await
-        .expect("topology declaration failed");
-
-    let publisher = SnsPublisher::new(client.clone(), topic_registry);
-    (client, publisher, queue_registry)
+        endpoint_url: Some(endpoint),
+    })
+    .await?;
+    broker.topology().declare::<SlowTasks>().await?;
+    let publisher = broker.publisher().await?;
+    Ok((broker, publisher))
 }
 
-async fn publish_tasks(publisher: &SnsPublisher, count: u32) {
+async fn publish_tasks(publisher: &Publisher<Sqs>, count: u32) -> Result<(), shove::ShoveError> {
     let messages: Vec<Task> = (0..count)
         .map(|id| Task {
             id,
             payload: format!("task-{id}"),
         })
         .collect();
-    publisher
-        .publish_batch::<SlowTasks>(&messages)
-        .await
-        .expect("publish failed");
+    publisher.publish_batch::<SlowTasks>(&messages).await
+}
+
+async fn run_round(
+    broker: &Broker<Sqs>,
+    handler: SlowTaskHandler,
+    prefetch: u16,
+    concurrent: bool,
+    msg_count: u32,
+) -> Duration {
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<SlowTasks, _>(
+            handler.clone(),
+            ConsumerOptions::<Sqs>::new()
+                .with_prefetch_count(prefetch)
+                .with_concurrent_processing(concurrent),
+        )
+        .expect("register");
+
+    let start = Instant::now();
+
+    let signal_handler = handler.clone();
+    let outcome = supervisor
+        .run_until_timeout(
+            async move {
+                signal_handler
+                    .wait_for(msg_count, Duration::from_secs(120))
+                    .await;
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    let duration = start.elapsed();
+    assert!(
+        outcome.is_clean(),
+        "supervisor reported errors: {outcome:?}"
+    );
+    duration
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() {
-    require_localstack();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "LOCALSTACK_AUTH_TOKEN is not set. This example requires a LocalStack Pro auth \
+                 token:\n\n    export LOCALSTACK_AUTH_TOKEN=...\n"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // SAFETY: called before any concurrent env access in this process.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
+    }
+
+    let container = LocalStack::default()
+        .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+        .start()
+        .await?;
+    let port = container.get_host_port_ipv4(4566).await?;
+    let endpoint = format!("http://localhost:{port}");
+
     let msg_count = 20u32;
     let handler_delay = Duration::from_millis(100);
     let prefetch = 20u16;
 
-    let (client, publisher, queue_registry) = setup().await;
+    let (broker, publisher) = setup(endpoint).await?;
 
     // ── Sequential run ──────────────────────────────────────────────────
 
     eprintln!("--- Sequential (prefetch_count=1) ---");
     eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch=1");
 
-    publish_tasks(&publisher, msg_count).await;
+    publish_tasks(&publisher, msg_count).await?;
 
     let handler = SlowTaskHandler::new(handler_delay);
-    let shutdown = CancellationToken::new();
-    let h = handler.clone();
-    let s = shutdown.clone();
-    let c = client.clone();
-    let qr = queue_registry.clone();
-
-    let start = Instant::now();
-    let handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_prefetch_count(1);
-        SqsConsumer::new(c, qr).run::<SlowTasks>(h, opts).await
-    });
-
-    handler.wait_for(msg_count, Duration::from_secs(120)).await;
-    let sequential_dur = start.elapsed();
-    shutdown.cancel();
-    handle.await.unwrap().unwrap();
+    let sequential_dur = run_round(&broker, handler, 1, false, msg_count).await;
 
     let seq_throughput = msg_count as f64 / sequential_dur.as_secs_f64();
     eprintln!(
@@ -189,25 +211,10 @@ async fn main() {
     eprintln!("--- Concurrent (prefetch_count={prefetch}) ---");
     eprintln!("  {msg_count} messages, {handler_delay:?} handler delay, prefetch={prefetch}");
 
-    publish_tasks(&publisher, msg_count).await;
+    publish_tasks(&publisher, msg_count).await?;
 
     let handler = SlowTaskHandler::new(handler_delay);
-    let shutdown = CancellationToken::new();
-    let h = handler.clone();
-    let s = shutdown.clone();
-    let c = client.clone();
-    let qr = queue_registry.clone();
-
-    let start = Instant::now();
-    let handle = tokio::spawn(async move {
-        let opts = ConsumerOptions::new(s).with_prefetch_count(prefetch);
-        SqsConsumer::new(c, qr).run::<SlowTasks>(h, opts).await
-    });
-
-    handler.wait_for(msg_count, Duration::from_secs(120)).await;
-    let concurrent_dur = start.elapsed();
-    shutdown.cancel();
-    handle.await.unwrap().unwrap();
+    let concurrent_dur = run_round(&broker, handler, prefetch, true, msg_count).await;
 
     let conc_throughput = msg_count as f64 / concurrent_dur.as_secs_f64();
     eprintln!(
@@ -230,10 +237,12 @@ async fn main() {
         concurrent_dur.as_secs_f64(),
         conc_throughput
     );
-    eprintln!("  speedup:     {:.1}x", speedup);
+    eprintln!("  speedup:     {speedup:.1}x");
     eprintln!();
     eprintln!("  Messages are always acked in delivery order.");
     eprintln!("  Concurrent mode overlaps handler I/O within a single consumer.");
 
-    client.shutdown().await;
+    broker.close().await;
+    drop(container);
+    Ok(())
 }

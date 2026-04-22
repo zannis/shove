@@ -1,5 +1,6 @@
 use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_sqs::types::{Message, MessageAttributeValue, MessageSystemAttributeName};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -9,10 +10,10 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::consumer::{Consumer, ConsumerOptions};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -20,6 +21,7 @@ use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
 
 /// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
 ///
@@ -57,6 +59,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct SqsConsumer {
     client: SnsClient,
     queue_registry: Arc<QueueRegistry>,
@@ -83,7 +86,7 @@ impl SqsConsumer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_metadata(msg: &aws_sdk_sqs::types::Message) -> MessageMetadata {
+fn extract_metadata(msg: &Message) -> MessageMetadata {
     let retry_count = router::get_retry_count(msg);
     MessageMetadata {
         retry_count,
@@ -122,10 +125,7 @@ fn extract_payload(body: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(body)
 }
 
-fn extract_dead_metadata(
-    msg: &aws_sdk_sqs::types::Message,
-    queue_name: &str,
-) -> DeadMessageMetadata {
+fn extract_dead_metadata(msg: &Message, queue_name: &str) -> DeadMessageMetadata {
     let metadata = extract_metadata(msg);
     let death_count = metadata.retry_count;
     DeadMessageMetadata {
@@ -170,18 +170,19 @@ where
 
 async fn invoke_handler<T: Topic, H: MessageHandler<T>>(
     handler: &H,
+    ctx: &H::Context,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata))
+        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
             .await
             .unwrap_or_else(|_| {
                 warn!("handler exceeded timeout ({duration:?}), retrying message");
                 Outcome::Retry
             }),
-        None => handler.handle(message, metadata).await,
+        None => handler.handle(message, metadata, ctx).await,
     }
 }
 
@@ -189,6 +190,7 @@ async fn invoke_handler<T: Topic, H: MessageHandler<T>>(
 /// Returns the oneshot receiver that will resolve with the handler's outcome.
 fn spawn_handler<T, H>(
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
@@ -200,9 +202,10 @@ where
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
+    let c = ctx.clone();
     let n = notify.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, message, metadata, timeout).await;
+        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
         let _ = tx.send(outcome);
         n.notify_one();
     });
@@ -216,7 +219,7 @@ where
 struct PendingMessage {
     receipt_handle: String,
     body: String,
-    message_attributes: HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: HashMap<String, MessageAttributeValue>,
     retry_count: u32,
     outcome_rx: oneshot::Receiver<Outcome>,
 }
@@ -226,6 +229,7 @@ async fn consume_loop_concurrent<T, H>(
     queue_url: &str,
     topology: &'static QueueTopology,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
 ) -> Result<()>
 where
@@ -237,16 +241,16 @@ where
     // Max number of handlers running concurrently (1 = serial / non-concurrent mode).
     let max_in_flight = options.prefetch_count as usize;
 
-    // How many messages to request per SQS poll.  When `receive_batch_size` is
-    // set (non-concurrent mode), we fetch a full batch even though we only run
-    // one handler at a time.  This amortises the `ReceiveMessage` API call
-    // overhead across multiple messages, which is critical for throughput when
-    // several consumers share the same queue.
+    // How many messages to request per SQS poll. Defaults to SQS's hard cap
+    // (10) to amortise `ReceiveMessage` round-trips across as many messages
+    // as possible — critical in serial / low-prefetch mode where `max_in_flight`
+    // would otherwise pin the batch to 1 and bottleneck throughput on poll
+    // RTT. Users can override via `ConsumerOptions::with_receive_batch_size`.
     let receive_batch: usize = {
         let configured = if options.receive_batch_size > 0 {
             options.receive_batch_size as usize
         } else {
-            max_in_flight
+            10
         };
         configured.min(10)
     };
@@ -254,8 +258,7 @@ where
     let mut in_flight: VecDeque<PendingMessage> = VecDeque::with_capacity(max_in_flight);
     // Received from SQS but not yet dispatched to a handler.  Populated when
     // the receive batch is larger than `max_in_flight`.
-    let mut local_buffer: VecDeque<aws_sdk_sqs::types::Message> =
-        VecDeque::with_capacity(receive_batch);
+    let mut local_buffer: VecDeque<Message> = VecDeque::with_capacity(receive_batch);
 
     // Ack receipt handles accumulated across loop iterations.
     //
@@ -447,8 +450,14 @@ where
                 retry_count = metadata.retry_count,
                 "dispatching message to handler"
             );
-            let rx =
-                spawn_handler::<T, H>(handler, message, metadata, options.handler_timeout, &notify);
+            let rx = spawn_handler::<T, H>(
+                handler,
+                ctx,
+                message,
+                metadata,
+                options.handler_timeout,
+                &notify,
+            );
             in_flight.push_back(PendingMessage {
                 receipt_handle,
                 body: msg.body().unwrap_or_default().to_string(),
@@ -495,9 +504,7 @@ where
                 .queue_url(queue_url)
                 .wait_time_seconds(0)
                 .max_number_of_messages(max_messages)
-                .message_system_attribute_names(
-                    aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
-                )
+                .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
                 .message_attribute_names("All")
                 .send()
                 .await
@@ -545,7 +552,7 @@ async fn route_outcome(
     queue_url: &str,
     receipt_handle: &str,
     body: &str,
-    message_attributes: &HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: &HashMap<String, MessageAttributeValue>,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
@@ -591,7 +598,7 @@ enum KeyState {
     InFlight {
         receipt_handle: String,
         body: String,
-        message_attributes: HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+        message_attributes: HashMap<String, MessageAttributeValue>,
         retry_count: u32,
         outcome_rx: oneshot::Receiver<Outcome>,
     },
@@ -601,11 +608,9 @@ enum KeyState {
 }
 
 /// Extract the sequence key from SQS MessageGroupId system attribute.
-fn extract_sequence_key(msg: &aws_sdk_sqs::types::Message) -> Option<String> {
+fn extract_sequence_key(msg: &Message) -> Option<String> {
     msg.attributes()
-        .and_then(|attrs| {
-            attrs.get(&aws_sdk_sqs::types::MessageSystemAttributeName::MessageGroupId)
-        })
+        .and_then(|attrs| attrs.get(&MessageSystemAttributeName::MessageGroupId))
         .map(|s| s.to_string())
 }
 
@@ -613,6 +618,7 @@ fn extract_sequence_key(msg: &aws_sdk_sqs::types::Message) -> Option<String> {
 /// mpsc channel with the sequence key.
 fn spawn_handler_keyed<T, H>(
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
@@ -625,11 +631,12 @@ where
 {
     let (tx, rx) = oneshot::channel();
     let h = handler.clone();
-    let ctx = completed_tx.clone();
+    let c = ctx.clone();
+    let completed = completed_tx.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, message, metadata, timeout).await;
+        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
         let _ = tx.send(outcome);
-        let _ = ctx.send(key);
+        let _ = completed.send(key);
     });
     rx
 }
@@ -647,6 +654,7 @@ async fn run_sequenced_shard<T, H>(
     queue_name: &str,
     topology: &'static QueueTopology,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
 ) -> Result<()>
@@ -655,8 +663,7 @@ where
     H: MessageHandler<T>,
 {
     let mut poisoned_keys = HashSet::new();
-    let mut pending_deliveries: HashMap<String, VecDeque<aws_sdk_sqs::types::Message>> =
-        HashMap::new();
+    let mut pending_deliveries: HashMap<String, VecDeque<Message>> = HashMap::new();
     let mut backoff = Backoff::default();
 
     loop {
@@ -665,6 +672,7 @@ where
             queue_url,
             topology,
             handler,
+            ctx,
             options,
             on_failure,
             &mut poisoned_keys,
@@ -708,10 +716,11 @@ async fn consume_loop_sequenced<T, H>(
     queue_url: &str,
     topology: &'static QueueTopology,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
     poisoned_keys: &mut HashSet<String>,
-    pending_deliveries: &mut HashMap<String, VecDeque<aws_sdk_sqs::types::Message>>,
+    pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
 ) -> Result<()>
 where
     T: Topic,
@@ -775,6 +784,7 @@ where
                         queue_url,
                         &key,
                         handler,
+                        ctx,
                         options,
                         on_failure,
                         topology,
@@ -802,6 +812,7 @@ where
                         queue_url,
                         &key,
                         handler,
+                        ctx,
                         options,
                         on_failure,
                         topology,
@@ -924,8 +935,8 @@ where
                     .queue_url(queue_url)
                     .wait_time_seconds(5)
                     .max_number_of_messages(prefetch.saturating_sub(in_flight_count).min(10) as i32)
-                    .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
-                    .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::MessageGroupId)
+                    .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+                    .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
                     .message_attribute_names("All")
                     .send()
                     .await
@@ -1115,6 +1126,7 @@ where
                     );
                     let rx = spawn_handler_keyed::<T, H>(
                         handler,
+                        ctx,
                         message,
                         metadata,
                         options.handler_timeout,
@@ -1151,6 +1163,7 @@ async fn drain_pending_for_key<T, H>(
     queue_url: &str,
     key: &str,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
     topology: &'static QueueTopology,
@@ -1158,7 +1171,7 @@ async fn drain_pending_for_key<T, H>(
     completed_tx: &mpsc::UnboundedSender<String>,
     key_states: &mut HashMap<String, KeyState>,
     in_flight_count: &mut usize,
-    pending_deliveries: &mut HashMap<String, VecDeque<aws_sdk_sqs::types::Message>>,
+    pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
 ) where
     T: Topic,
     H: MessageHandler<T>,
@@ -1256,6 +1269,7 @@ async fn drain_pending_for_key<T, H>(
 
         let rx = spawn_handler_keyed::<T, H>(
             handler,
+            ctx,
             message,
             metadata,
             options.handler_timeout,
@@ -1295,6 +1309,7 @@ async fn consume_dlq_loop<T, H>(
     queue_url: &str,
     original_queue: &str,
     handler: &Arc<H>,
+    ctx: &Arc<H::Context>,
     shutdown: &CancellationToken,
 ) -> Result<()>
 where
@@ -1315,7 +1330,7 @@ where
                 .queue_url(queue_url)
                 .wait_time_seconds(5)
                 .max_number_of_messages(10)
-                .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
+                .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
                 .message_attribute_names("All")
                 .send() => {
                 let output = result.map_err(|e| {
@@ -1330,10 +1345,10 @@ where
                     let body = extract_payload(msg.body().unwrap_or_default());
                     let metadata = extract_dead_metadata(&msg, original_queue);
 
-                    if body.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                    if body.len() > DEFAULT_MAX_MESSAGE_SIZE {
                         warn!(
                             bytes = body.len(),
-                            max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                            max = DEFAULT_MAX_MESSAGE_SIZE,
                             delivery_id = %metadata.message.delivery_id,
                             "oversized DLQ message — discarding"
                         );
@@ -1353,7 +1368,7 @@ where
                                     death_count = metadata.death_count,
                                     "dispatching DLQ message to handle_dead"
                                 );
-                                handler.handle_dead(message, metadata).await;
+                                handler.handle_dead(message, metadata, ctx.as_ref()).await;
                             }
                         }
                     }
@@ -1371,12 +1386,30 @@ where
 // Consumer trait implementation
 // ---------------------------------------------------------------------------
 
-impl Consumer for SqsConsumer {
-    fn run<T: Topic>(
+impl SqsConsumer {
+    pub fn run<T, H>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Sqs>,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
+    }
+
+    pub(crate) fn run_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1384,20 +1417,41 @@ impl Consumer for SqsConsumer {
             let consumer = SqsConsumer::new(client, queue_registry);
             let queue_url = consumer.resolve_queue_url(topology.queue()).await?;
             let handler = Arc::new(handler);
+            let ctx = Arc::new(ctx);
             let sqs = consumer.client.sqs().clone();
 
             run_with_reconnect(&options.shutdown, topology.queue(), || {
-                consume_loop_concurrent::<T, _>(&sqs, &queue_url, topology, &handler, &options)
+                consume_loop_concurrent::<T, H>(
+                    &sqs, &queue_url, topology, &handler, &ctx, &options,
+                )
             })
             .await
         }
     }
 
-    fn run_fifo<T: SequencedTopic>(
+    pub fn run_fifo<T, H>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Sqs>,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
+    }
+
+    pub(crate) fn run_fifo_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1407,6 +1461,7 @@ impl Consumer for SqsConsumer {
             })?;
 
             let handler = Arc::new(handler);
+            let ctx = Arc::new(ctx);
             let consumer = SqsConsumer::new(client, queue_registry);
             let on_failure = seq.on_failure();
             let mut handles = Vec::new();
@@ -1417,15 +1472,17 @@ impl Consumer for SqsConsumer {
 
                 let sqs = consumer.client.sqs().clone();
                 let h = handler.clone();
+                let c = ctx.clone();
                 let opts = options.clone();
 
                 handles.push(tokio::spawn(async move {
-                    run_sequenced_shard::<T, _>(
+                    run_sequenced_shard::<T, H>(
                         &sqs,
                         &shard_queue_url,
                         &shard_queue_name,
                         topology,
                         &h,
+                        &c,
                         &opts,
                         on_failure,
                     )
@@ -1444,10 +1501,15 @@ impl Consumer for SqsConsumer {
         }
     }
 
-    fn run_dlq<T: Topic>(
+    pub fn run_dlq<T, H>(
         &self,
-        handler: impl MessageHandler<T>,
-    ) -> impl Future<Output = Result<()>> + Send {
+        handler: H,
+        ctx: H::Context,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let client = self.client.clone();
         let queue_registry = self.queue_registry.clone();
         async move {
@@ -1461,11 +1523,19 @@ impl Consumer for SqsConsumer {
             let consumer = SqsConsumer::new(client, queue_registry);
             let queue_url = consumer.resolve_queue_url(dlq).await?;
             let handler = Arc::new(handler);
+            let ctx = Arc::new(ctx);
             let sqs = consumer.client.sqs().clone();
             let shutdown = consumer.client.shutdown_token();
 
             run_with_reconnect(&shutdown, dlq, || {
-                consume_dlq_loop::<T, _>(&sqs, &queue_url, topology.queue(), &handler, &shutdown)
+                consume_dlq_loop::<T, H>(
+                    &sqs,
+                    &queue_url,
+                    topology.queue(),
+                    &handler,
+                    &ctx,
+                    &shutdown,
+                )
             })
             .await
         }

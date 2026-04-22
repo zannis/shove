@@ -23,6 +23,18 @@ impl KafkaConfig {
             brokers: brokers.into(),
         }
     }
+
+    /// Bootstrap brokers string this config was built with.
+    pub fn brokers(&self) -> &str {
+        &self.brokers
+    }
+}
+
+impl Default for KafkaConfig {
+    /// Default Kafka bootstrap endpoint for local development.
+    fn default() -> Self {
+        Self::new("localhost:9092")
+    }
 }
 
 impl fmt::Debug for KafkaConfig {
@@ -215,5 +227,16 @@ impl KafkaClient {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
         self.producer.flush(Duration::from_secs(5)).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_localhost() {
+        let cfg = KafkaConfig::default();
+        assert!(cfg.brokers().contains("localhost:9092"));
     }
 }

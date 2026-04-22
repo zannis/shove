@@ -8,7 +8,13 @@ pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";
 pub(super) const CONNECTION_RETRIES: u32 = 10;
 
 /// Derives the durable consumer name from a queue name.
-/// Used by both the consumer and autoscaler to ensure consistency.
+///
+/// JetStream WorkQueue retention permits only one non-filtered consumer per
+/// stream, so every task in a consumer group binds to the *same* durable
+/// consumer and the server load-balances messages across them. The group
+/// registry is responsible for configuring the consumer once (with a
+/// sufficient `max_ack_pending`) so all tasks inherit the right in-flight
+/// budget.
 pub(super) fn consumer_name(queue: &str) -> String {
     format!("{queue}-consumer")
 }

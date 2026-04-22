@@ -11,14 +11,16 @@ use rdkafka::{Offset, TopicPartitionList};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::ShoveError;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::consumer::validate_message_size;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
 
 use super::client::KafkaClient;
 use super::constants::{
@@ -292,14 +294,14 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     retry_count: u32,
     max_retries: u32,
-    hold_queues: &[crate::topology::HoldQueue],
+    hold_queues: &[HoldQueue],
 ) -> bool {
     match outcome {
         Outcome::Ack => true,
         Outcome::Retry => {
             let new_count = retry_count + 1;
             if new_count >= max_retries {
-                match publish_to_dlq(
+                return match publish_to_dlq(
                     client,
                     topology,
                     payload,
@@ -309,12 +311,12 @@ async fn route_outcome(
                 )
                 .await
                 {
-                    Ok(()) => return true,
+                    Ok(()) => true,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to publish to DLQ after exhausting retries");
-                        return false;
+                        false
                     }
-                }
+                };
             }
 
             let delay = if hold_queues.is_empty() {
@@ -401,23 +403,21 @@ async fn route_outcome(
 // Handler invocation
 // ---------------------------------------------------------------------------
 
-async fn invoke_handler<T: Topic>(
-    handler: &(impl MessageHandler<T> + ?Sized),
+async fn invoke_handler<T: Topic, H: MessageHandler<T> + ?Sized>(
+    handler: &H,
+    ctx: &H::Context,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => {
-            match tokio::time::timeout(duration, handler.handle(message, metadata)).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    tracing::warn!("handler timed out after {duration:?}, retrying");
-                    Outcome::Retry
-                }
-            }
-        }
-        None => handler.handle(message, metadata).await,
+        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!("handler timed out after {duration:?}, retrying");
+                Outcome::Retry
+            }),
+        None => handler.handle(message, metadata, ctx).await,
     }
 }
 
@@ -448,13 +448,30 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 // ---------------------------------------------------------------------------
 
 fn create_stream_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
+    // Each consumer task within a group gets a distinct `client.id` so
+    // librdkafka treats them as separate members. Without this, group
+    // rebalances across repeated join attempts can produce stale
+    // "group generation id is not valid" commit errors.
+    let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .set("group.id", group_id)
+        .set("client.id", client_id)
+        // Cooperative-sticky assignment performs incremental rebalance so that
+        // adding/removing a consumer only reassigns the delta — without this,
+        // every join triggers an eager (stop-the-world) rebalance that
+        // freezes the entire group for the heartbeat window.
+        .set("partition.assignment.strategy", "cooperative-sticky")
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .set("session.timeout.ms", "10000")
         .set("max.poll.interval.ms", "300000")
+        // Minimise fetch-latency so small-payload workloads aren't bottlenecked
+        // by the default 500 ms broker dwell. `fetch.min.bytes=1` returns as
+        // soon as any data is available; `fetch.wait.max.ms=50` caps the
+        // blocking dwell so the broker doesn't hold the connection open.
+        .set("fetch.min.bytes", "1")
+        .set("fetch.wait.max.ms", "50")
         .create()
         .map_err(|e| map_kafka_error("failed to create consumer", e))?;
     Ok(consumer)
@@ -472,9 +489,9 @@ async fn run_with_reconnect<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
 {
-    let mut backoff = crate::retry::Backoff::default();
+    let mut backoff = Backoff::default();
     let mut attempts = 0u32;
     loop {
         match f().await {
@@ -512,6 +529,7 @@ where
 // KafkaConsumer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct KafkaConsumer {
     client: KafkaClient,
 }
@@ -522,12 +540,31 @@ impl KafkaConsumer {
     }
 }
 
-impl Consumer for KafkaConsumer {
-    async fn run<T: Topic>(
+impl KafkaConsumer {
+    pub async fn run<T, H>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Kafka>,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
+            .await
+    }
+
+    pub(crate) async fn run_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
         let group_id = super::constants::consumer_group_id(queue);
@@ -541,6 +578,7 @@ impl Consumer for KafkaConsumer {
         let hold_queues = topology.hold_queues();
 
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         tracing::info!(
@@ -555,6 +593,7 @@ impl Consumer for KafkaConsumer {
 
         run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let client = client.clone();
             let processing = processing.clone();
             let shutdown = shutdown.clone();
@@ -626,7 +665,7 @@ impl Consumer for KafkaConsumer {
                             }
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -684,6 +723,7 @@ impl Consumer for KafkaConsumer {
                             })?;
 
                             let task_handler = handler.clone();
+                            let task_ctx = ctx.clone();
                             let task_client = client.clone();
                             let task_processing = processing.clone();
                             let task_semaphore = semaphore.clone();
@@ -695,6 +735,7 @@ impl Consumer for KafkaConsumer {
                             tokio::spawn(async move {
                                 let outcome = invoke_handler(
                                     task_handler.as_ref(),
+                                    task_ctx.as_ref(),
                                     payload,
                                     metadata,
                                     handler_timeout,
@@ -740,11 +781,30 @@ impl Consumer for KafkaConsumer {
         .await
     }
 
-    async fn run_fifo<T: SequencedTopic>(
+    pub async fn run_fifo<T, H>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Kafka>,
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
+            .await
+    }
+
+    pub(crate) async fn run_fifo_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
         let _seq_config = topology
@@ -759,6 +819,7 @@ impl Consumer for KafkaConsumer {
         let hold_queues = topology.hold_queues();
 
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         // Kafka naturally provides per-partition ordering. A single consumer
@@ -770,6 +831,7 @@ impl Consumer for KafkaConsumer {
 
         run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let client = client.clone();
             let shutdown = shutdown.clone();
             let processing = processing.clone();
@@ -805,7 +867,7 @@ impl Consumer for KafkaConsumer {
                             let key = msg.key().map(|k| k.to_vec());
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -863,8 +925,9 @@ impl Consumer for KafkaConsumer {
                             let outcome = {
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let h = handler.clone();
+                                let c = ctx.clone();
                                 tokio::spawn(async move {
-                                    let o = invoke_handler(h.as_ref(), payload, metadata, handler_timeout).await;
+                                    let o = invoke_handler(h.as_ref(), c.as_ref(), payload, metadata, handler_timeout).await;
                                     let _ = tx.send(o);
                                 });
                                 rx.await.unwrap_or_else(|_| {
@@ -898,7 +961,11 @@ impl Consumer for KafkaConsumer {
         .await
     }
 
-    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T>) -> Result<()> {
+    pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
@@ -907,12 +974,14 @@ impl Consumer for KafkaConsumer {
         let dlq_group_id = super::constants::dlq_consumer_group_id(dlq);
         let shutdown = self.client.shutdown_token();
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
         run_with_reconnect(&shutdown, dlq, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let _client = client.clone();
             let shutdown = shutdown.clone();
             let dlq_group_id = dlq_group_id.clone();
@@ -944,10 +1013,10 @@ impl Consumer for KafkaConsumer {
                             let headers = extract_string_headers(&msg);
 
                             // Discard oversized DLQ messages
-                            if payload_bytes.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                            if payload_bytes.len() > DEFAULT_MAX_MESSAGE_SIZE {
                                 tracing::warn!(
                                     bytes = payload_bytes.len(),
-                                    max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                                    max = DEFAULT_MAX_MESSAGE_SIZE,
                                     dlq,
                                     "oversized DLQ message — discarding"
                                 );
@@ -970,7 +1039,7 @@ impl Consumer for KafkaConsumer {
                             };
 
                             let metadata = build_dead_metadata(&headers);
-                            handler.handle_dead(payload, metadata).await;
+                            handler.handle_dead(payload, metadata, ctx.as_ref()).await;
 
                             if let Err(e) = consumer.commit_message(&msg, CommitMode::Async) {
                                 tracing::error!(error = %e, dlq, "failed to commit DLQ message");

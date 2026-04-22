@@ -3,15 +3,20 @@
 //! Demonstrates: `SqsAutoscaler`, `AutoscalerConfig`, `SqsConsumerGroupRegistry`,
 //! and dynamic scaling of SQS consumer groups based on queue depth.
 //!
+//! Note: the autoscaler + consumer-group registry machinery isn't yet
+//! surfaced on the generic `Broker<Sqs>` wrapper, so this example stays on
+//! the backend-specific `SqsConsumerGroupRegistry` / `SqsAutoscalerBackend`
+//! path (same as the stress harness).
+//!
 //! The autoscaler polls SQS queue attributes on a configurable interval and
 //! scales consumer groups up or down using hysteresis (condition must be
 //! sustained for `hysteresis_duration`) and cooldown (minimum gap between
 //! consecutive scaling actions) to prevent flapping.
 //!
-//! Requires a running LocalStack instance (see docker-compose.yml):
+//! Spins up a LocalStack testcontainer automatically. Requires a running
+//! Docker daemon and the `LOCALSTACK_AUTH_TOKEN` environment variable:
 //!
-//!     docker compose up -d
-//!     cargo run --example sqs_autoscaler --features aws-sns-sqs
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run --example sqs_autoscaler --features aws-sns-sqs
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +24,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use shove::sns::*;
 use shove::*;
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -44,7 +52,8 @@ define_topic!(
 struct TaskHandler;
 
 impl MessageHandler<WorkQueue> for TaskHandler {
-    async fn handle(&self, msg: TaskEvent, meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: TaskEvent, meta: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[worker] task={} attempt={}",
             msg.task_id,
@@ -56,26 +65,10 @@ impl MessageHandler<WorkQueue> for TaskHandler {
     }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-fn require_localstack() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
-        _ => {
-            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_localstack();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -83,27 +76,44 @@ async fn main() -> Result<(), ShoveError> {
         )
         .init();
 
+    let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "LOCALSTACK_AUTH_TOKEN is not set. This example requires a LocalStack Pro auth \
+                 token:\n\n    export LOCALSTACK_AUTH_TOKEN=...\n"
+            );
+            std::process::exit(1);
+        }
+    };
+
     // SAFETY: called before any concurrent env access in this process.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
     }
+
+    let container = LocalStack::default()
+        .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+        .start()
+        .await?;
+    let port = container.get_host_port_ipv4(4566).await?;
+    let endpoint = format!("http://localhost:{port}");
 
     let config = SnsConfig {
         region: Some("us-east-1".into()),
-        endpoint_url: Some("http://localhost:4566".into()),
+        endpoint_url: Some(endpoint),
     };
     let client = SnsClient::new(&config).await?;
 
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
-
     // ── Declare topology and publish a burst ──
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
-    declare_topic::<WorkQueue>(&declarer).await?;
+    // The declarer reads the client-owned topic/queue registries shared with
+    // every publisher and consumer group built from the same client.
+    let declarer = SnsTopologyDeclarer::new(client.clone());
+    declarer.declare(WorkQueue::topology()).await?;
 
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = SnsPublisher::new(client.clone(), client.topic_registry().clone());
     let burst_size = 60usize;
     for i in 0..burst_size {
         publisher
@@ -120,11 +130,7 @@ async fn main() -> Result<(), ShoveError> {
     // Consumer groups manage identical consumers reading from the same queue.
     // `register` declares the topology and prepares the group; `start_all`
     // starts consumers at their minimum count (1 here).
-    let mut registry = SqsConsumerGroupRegistry::new(
-        client.clone(),
-        topic_registry.clone(),
-        queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(client.clone());
 
     registry
         .register::<WorkQueue, TaskHandler>(
@@ -132,6 +138,7 @@ async fn main() -> Result<(), ShoveError> {
                 .with_prefetch_count(5) // each consumer holds up to 5 in-flight messages
                 .with_max_retries(3),
             || TaskHandler,
+            (),
         )
         .await?;
 
@@ -151,7 +158,8 @@ async fn main() -> Result<(), ShoveError> {
     // `hysteresis_duration` before action is taken.
     // Cooldown prevents back-to-back scaling: at least `cooldown_duration`
     // must elapse between two scaling actions for the same group.
-    let stats_provider = SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
+    let stats_provider =
+        SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
 
     let auto_config = AutoscalerConfig {
         poll_interval: Duration::from_secs(2),
@@ -180,7 +188,7 @@ async fn main() -> Result<(), ShoveError> {
     // Phase 2: queue drains  → autoscaler scales back down to min_consumers.
     println!("autoscaler running — watching consumer count change\n");
 
-    let monitor_stats = SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
+    let monitor_stats = SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
@@ -213,5 +221,6 @@ async fn main() -> Result<(), ShoveError> {
     client.shutdown().await;
     println!("done");
 
+    drop(container);
     Ok(())
 }

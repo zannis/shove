@@ -1,11 +1,14 @@
 //! Shared stress-benchmark harness for all shove backends.
 //!
-//! Each backend's `stress.rs` is a thin wrapper that implements
-//! [`StressTestBroker`] + [`StressGroupHandle`] and hands control to
-//! [`run_all_scenarios`].
+//! Each backend's `stress.rs` is a thin wrapper that constructs a
+//! `Broker<B>` and calls either [`run_all_scenarios`] (coordinated-group
+//! backends: InMemory, Kafka, NATS, RabbitMQ) or
+//! [`run_supervisor_scenarios`] (SQS).
 
 #![allow(dead_code)]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -13,10 +16,14 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
-use shove::handler::MessageHandler;
-use shove::metadata::MessageMetadata;
-use shove::outcome::Outcome;
-use shove::topology::TopologyBuilder;
+use shove::{
+    Broker, ConsumerGroupConfig, ConsumerOptions,
+    backend::{Backend, capability::HasCoordinatedGroups},
+    handler::MessageHandler,
+    metadata::MessageMetadata,
+    outcome::Outcome,
+    topology::TopologyBuilder,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -200,51 +207,6 @@ fn build_scenarios(cli: &Cli) -> Vec<Scenario> {
     scenarios
 }
 
-// ── Backend abstraction ─────────────────────────────────────────────────────
-
-/// Implemented by each backend. The harness drives setup → per-scenario
-/// purge/publish/consume/shutdown → final cleanup entirely through this trait.
-pub trait StressTestBroker: Sized + Send + Sync + 'static {
-    type GroupHandle: StressGroupHandle + Send + 'static;
-
-    /// Human-readable backend name printed in the report header.
-    const NAME: &'static str;
-
-    /// Upper bound for the computed default prefetch (e.g. SQS caps at 10).
-    const PREFETCH_CAP: u16 = 100;
-
-    /// Bring up the backend (container, connections, topology declaration).
-    fn setup() -> impl Future<Output = Self> + Send;
-
-    /// Drain the main queue between scenarios so measurements start clean.
-    /// Default is a no-op (acceptable for log-based backends like Kafka where
-    /// offsets isolate scenarios).
-    fn purge(&self) -> impl Future<Output = ()> + Send {
-        async {}
-    }
-
-    fn publish_batch(&self, messages: &[StressTestMsg]) -> impl Future<Output = ()> + Send;
-
-    /// Register and start a consumer group of `consumers` consumers with the
-    /// given prefetch and concurrency flag, using `factory` to build each
-    /// handler instance.
-    fn run_consumer_group<F>(
-        &self,
-        consumers: u16,
-        prefetch: u16,
-        concurrent: bool,
-        factory: F,
-    ) -> impl Future<Output = Result<Self::GroupHandle, String>> + Send
-    where
-        F: Fn() -> StressTestHandler + Send + Sync + 'static;
-
-    fn shutdown(self) -> impl Future<Output = ()> + Send;
-}
-
-pub trait StressGroupHandle {
-    fn shutdown_all(self) -> impl Future<Output = ()> + Send;
-}
-
 /// Panic if Docker is unreachable. Shared by all container-backed backends.
 pub fn require_docker() {
     match std::process::Command::new("docker").arg("info").output() {
@@ -331,11 +293,12 @@ fn current_cpu_secs() -> f64 {
     {
         use mach2::task::task_info;
         use mach2::task_info::{MACH_TASK_BASIC_INFO, mach_task_basic_info, task_flavor_t};
+        use mach2::traps::mach_task_self;
         let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
         let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
         let kr = unsafe {
             task_info(
-                mach2::traps::mach_task_self(),
+                mach_task_self(),
                 MACH_TASK_BASIC_INFO as task_flavor_t,
                 &mut info as *mut _ as *mut i32,
                 &mut count,
@@ -375,11 +338,12 @@ fn current_rss_bytes() -> u64 {
     {
         use mach2::task::task_info;
         use mach2::task_info::{MACH_TASK_BASIC_INFO, mach_task_basic_info, task_flavor_t};
+        use mach2::traps::mach_task_self;
         let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
         let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
         let kr = unsafe {
             task_info(
-                mach2::traps::mach_task_self(),
+                mach_task_self(),
                 MACH_TASK_BASIC_INFO as task_flavor_t,
                 &mut info as *mut _ as *mut i32,
                 &mut count,
@@ -487,7 +451,8 @@ pub struct StressTestHandler {
 }
 
 impl MessageHandler<StressTestTopic> for StressTestHandler {
-    async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata, _: &()) -> Outcome {
         let received_at = self.epoch.elapsed().as_nanos() as u64;
 
         match self.profile {
@@ -531,12 +496,80 @@ fn default_prefetch(messages: u64, consumers: u16, cap: u16) -> u16 {
     (messages / consumers as u64).clamp(1, cap as u64) as u16
 }
 
-async fn run_scenario<B: StressTestBroker>(
-    broker: &B,
+/// Purge closure — invoked between scenarios to clear the main queue.
+/// Default is a no-op via [`noop_purge`].
+pub type PurgeFn = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+pub fn noop_purge() -> PurgeFn {
+    Box::new(|| Box::pin(async {}))
+}
+
+/// Knobs a backend binary supplies to the harness.
+pub struct HarnessConfig<B: Backend> {
+    pub backend_name: &'static str,
+    /// Upper bound for computed default prefetch (e.g. SQS caps at 10).
+    pub prefetch_cap: u16,
+    /// Maximum batch size for `publish_batch` (some backends have SDK limits).
+    pub publish_chunk_size: usize,
+    /// Drain the main queue between scenarios.
+    pub purge: PurgeFn,
+    _backend: std::marker::PhantomData<fn() -> B>,
+}
+
+impl<B: Backend> HarnessConfig<B> {
+    pub fn new(backend_name: &'static str) -> Self {
+        Self {
+            backend_name,
+            prefetch_cap: 100,
+            publish_chunk_size: 1000,
+            purge: noop_purge(),
+            _backend: std::marker::PhantomData,
+        }
+    }
+
+    pub fn with_prefetch_cap(mut self, cap: u16) -> Self {
+        self.prefetch_cap = cap;
+        self
+    }
+
+    pub fn with_publish_chunk_size(mut self, chunk: usize) -> Self {
+        self.publish_chunk_size = chunk;
+        self
+    }
+
+    pub fn with_purge(mut self, purge: PurgeFn) -> Self {
+        self.purge = purge;
+        self
+    }
+}
+
+/// Execute a single coordinated-group scenario. A fresh `Broker<B>` is built
+/// per scenario because the generic `run_until_timeout` path trips the
+/// broker-wide shutdown token once it completes.
+async fn run_scenario_group<B, MkCfg, Connect, Fut>(
+    hcfg: &HarnessConfig<B>,
     scenario: &Scenario,
     cancel: &CancellationToken,
-) -> Result<ScenarioMetrics, String> {
-    broker.purge().await;
+    make_cfg: &MkCfg,
+    connect: &Connect,
+) -> Result<ScenarioMetrics, String>
+where
+    B: Backend + HasCoordinatedGroups,
+    MkCfg: Fn(u16, u16, bool) -> B::ConsumerGroupConfig,
+    Connect: Fn() -> Fut,
+    Fut: Future<Output = Broker<B>>,
+{
+    let broker = connect().await;
+    broker
+        .topology()
+        .declare::<StressTestTopic>()
+        .await
+        .map_err(|e| format!("declare: {e}"))?;
+    let publisher = broker
+        .publisher()
+        .await
+        .map_err(|e| format!("publisher: {e}"))?;
+    (hcfg.purge)().await;
 
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
@@ -545,7 +578,7 @@ async fn run_scenario<B: StressTestBroker>(
     let sampler = ResourceSampler::start();
 
     let prefetch = scenario.prefetch.unwrap_or_else(|| {
-        default_prefetch(scenario.messages, scenario.consumers, B::PREFETCH_CAP)
+        default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
     });
 
     let pc = processed.clone();
@@ -558,9 +591,25 @@ async fn run_scenario<B: StressTestBroker>(
         profile,
     };
 
-    let handle = broker
-        .run_consumer_group(scenario.consumers, prefetch, scenario.concurrent, factory)
-        .await?;
+    let mut group = broker.consumer_group();
+    let inner_cfg = make_cfg(scenario.consumers, prefetch, scenario.concurrent);
+    group
+        .register::<StressTestTopic, _>(ConsumerGroupConfig::new(inner_cfg), factory)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Per-scenario stop signal (distinct from the broker's global shutdown
+    // token, which we must not trip between scenarios).
+    let scenario_stop = CancellationToken::new();
+    let run_stop = scenario_stop.clone();
+    let run_handle = tokio::spawn(async move {
+        group
+            .run_until_timeout(
+                async move { run_stop.cancelled().await },
+                Duration::from_secs(30),
+            )
+            .await
+    });
 
     let start = Instant::now();
 
@@ -570,36 +619,164 @@ async fn run_scenario<B: StressTestBroker>(
             published_at_ns: epoch.elapsed().as_nanos() as u64,
         })
         .collect();
-    broker.publish_batch(&messages).await;
+    for chunk in messages.chunks(hcfg.publish_chunk_size) {
+        publisher
+            .publish_batch::<StressTestTopic>(chunk)
+            .await
+            .map_err(|e| format!("publish_batch: {e}"))?;
+    }
 
     let deadline = tokio::time::Instant::now() + scenario.deadline;
-    loop {
+    let outcome = loop {
         if processed.load(Ordering::Relaxed) >= scenario.messages {
-            break;
+            break Ok(());
         }
         if cancel.is_cancelled() {
-            handle.shutdown_all().await;
-            let _ = sampler.stop().await;
-            return Err("interrupted".to_string());
+            break Err("interrupted".to_string());
         }
         if tokio::time::Instant::now() >= deadline {
             let done = processed.load(Ordering::Relaxed);
-            handle.shutdown_all().await;
-            let _ = sampler.stop().await;
-            return Err(format!(
+            break Err(format!(
                 "timeout after {:?}: processed {done} / {}",
                 scenario.deadline, scenario.messages
             ));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    };
 
     let duration = start.elapsed();
+
+    // Signal the consumer group to stop and wait for the drain to complete.
+    scenario_stop.cancel();
+    let _ = run_handle.await;
+
+    let resources = sampler.stop().await;
+    drop(publisher);
+    broker.close().await;
+    outcome?;
+
     let throughput = scenario.messages as f64 / duration.as_secs_f64();
     let latencies = recorder.compute_percentiles().await;
-    let resources = sampler.stop().await;
 
-    handle.shutdown_all().await;
+    Ok(ScenarioMetrics {
+        throughput,
+        latencies,
+        peak_rss_mb: resources.peak_rss_mb,
+        cpu_pct: resources.cpu_pct,
+        duration_secs: duration.as_secs_f64(),
+    })
+}
+
+/// Execute a single supervisor scenario (SQS). A fresh broker is built per
+/// scenario for the same reason as [`run_scenario_group`].
+async fn run_scenario_supervisor<B, MkOpts, Connect, Fut>(
+    hcfg: &HarnessConfig<B>,
+    scenario: &Scenario,
+    cancel: &CancellationToken,
+    make_opts: &MkOpts,
+    connect: &Connect,
+) -> Result<ScenarioMetrics, String>
+where
+    B: Backend,
+    MkOpts: Fn(u16, bool) -> ConsumerOptions<B>,
+    Connect: Fn() -> Fut,
+    Fut: Future<Output = Broker<B>>,
+{
+    let broker = connect().await;
+    broker
+        .topology()
+        .declare::<StressTestTopic>()
+        .await
+        .map_err(|e| format!("declare: {e}"))?;
+    let publisher = broker
+        .publisher()
+        .await
+        .map_err(|e| format!("publisher: {e}"))?;
+    (hcfg.purge)().await;
+
+    let epoch = Instant::now();
+    let recorder = Arc::new(LatencyRecorder::new());
+    let processed = Arc::new(AtomicU64::new(0));
+
+    let sampler = ResourceSampler::start();
+
+    let prefetch = scenario.prefetch.unwrap_or_else(|| {
+        default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
+    });
+
+    let mut supervisor = broker.consumer_supervisor();
+    for _ in 0..scenario.consumers {
+        let handler = StressTestHandler {
+            epoch,
+            processed: processed.clone(),
+            recorder: recorder.clone(),
+            profile: scenario.handler,
+        };
+        let opts = make_opts(prefetch, scenario.concurrent);
+        supervisor
+            .register::<StressTestTopic, _>(handler, opts)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Per-scenario stop signal (distinct from the supervisor's own
+    // cancellation token so we don't trip global state between scenarios).
+    let scenario_stop = CancellationToken::new();
+    let run_stop = scenario_stop.clone();
+    let run_handle = tokio::spawn(async move {
+        supervisor
+            .run_until_timeout(
+                async move { run_stop.cancelled().await },
+                Duration::from_secs(30),
+            )
+            .await
+    });
+
+    let start = Instant::now();
+
+    let messages: Vec<StressTestMsg> = (0..scenario.messages)
+        .map(|id| StressTestMsg {
+            id,
+            published_at_ns: epoch.elapsed().as_nanos() as u64,
+        })
+        .collect();
+    for chunk in messages.chunks(hcfg.publish_chunk_size) {
+        publisher
+            .publish_batch::<StressTestTopic>(chunk)
+            .await
+            .map_err(|e| format!("publish_batch: {e}"))?;
+    }
+
+    let deadline = tokio::time::Instant::now() + scenario.deadline;
+    let outcome = loop {
+        if processed.load(Ordering::Relaxed) >= scenario.messages {
+            break Ok(());
+        }
+        if cancel.is_cancelled() {
+            break Err("interrupted".to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let done = processed.load(Ordering::Relaxed);
+            break Err(format!(
+                "timeout after {:?}: processed {done} / {}",
+                scenario.deadline, scenario.messages
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    let duration = start.elapsed();
+
+    // Signal the supervisor to stop and wait for the drain to complete.
+    scenario_stop.cancel();
+    let _ = run_handle.await;
+
+    let resources = sampler.stop().await;
+    drop(publisher);
+    broker.close().await;
+    outcome?;
+
+    let throughput = scenario.messages as f64 / duration.as_secs_f64();
+    let latencies = recorder.compute_percentiles().await;
 
     Ok(ScenarioMetrics {
         throughput,
@@ -723,34 +900,110 @@ fn print_table(report: &Report) {
     }
 }
 
-// ── Entry point ─────────────────────────────────────────────────────────────
+// ── Entry points ────────────────────────────────────────────────────────────
 
-/// Parse CLI args, bring up the broker, run every scenario, emit a report,
-/// and tear the broker down. Each backend's `main` calls this and nothing else.
-pub async fn run_all_scenarios<B: StressTestBroker>() {
-    tracing_subscriber::fmt()
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "warn".parse().unwrap()),
         )
-        .init();
+        .try_init();
+}
+
+fn spawn_ctrlc_watcher() -> CancellationToken {
+    let cancel = CancellationToken::new();
+    let clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("\ninterrupted, shutting down gracefully...");
+        clone.cancel();
+    });
+    cancel
+}
+
+fn finalize_report(
+    mut results: Vec<ScenarioResult>,
+    failures: Vec<FailedResult>,
+    backend_name: &str,
+    output: OutputFormat,
+) {
+    compute_scaling(&mut results);
+    let report = Report {
+        backend: backend_name.to_string(),
+        results,
+        failures,
+    };
+    match output {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            println!("{json}");
+        }
+        OutputFormat::Table => {
+            print_table(&report);
+        }
+    }
+}
+
+fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: ScenarioMetrics) {
+    eprintln!(
+        "  -> {:.1} msg/s | dispatch p50={:.1}ms p99={:.1}ms | e2e p50={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
+        m.throughput,
+        m.latencies.dispatch_p50,
+        m.latencies.dispatch_p99,
+        m.latencies.e2e_p50,
+        m.latencies.e2e_p99,
+        m.cpu_pct,
+        m.peak_rss_mb,
+        m.duration_secs
+    );
+    results.push(ScenarioResult {
+        tier: scenario.tier.to_string(),
+        messages: scenario.messages,
+        consumers: scenario.consumers,
+        handler: scenario.handler.to_string(),
+        throughput_msg_per_sec: m.throughput,
+        dispatch_p50_ms: m.latencies.dispatch_p50,
+        dispatch_p95_ms: m.latencies.dispatch_p95,
+        dispatch_p99_ms: m.latencies.dispatch_p99,
+        e2e_p50_ms: m.latencies.e2e_p50,
+        e2e_p95_ms: m.latencies.e2e_p95,
+        e2e_p99_ms: m.latencies.e2e_p99,
+        scaling_efficiency: 0.0,
+        peak_rss_mb: m.peak_rss_mb,
+        cpu_pct: m.cpu_pct,
+        duration_secs: m.duration_secs,
+    });
+}
+
+/// Run every scenario against a coordinated-group backend (InMemory, Kafka,
+/// NATS, RabbitMQ). Each binary supplies:
+///
+/// * `connect` — builds a fresh `Broker<B>`. Called once per scenario so the
+///   broker-wide shutdown-token state tripped by `run_until_timeout` does not
+///   bleed between scenarios.
+/// * `make_cfg` — turns `(consumers, prefetch, concurrent)` into
+///   `B::ConsumerGroupConfig`.
+pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
+    hcfg: HarnessConfig<B>,
+    connect: Connect,
+    make_cfg: MkCfg,
+) where
+    B: Backend + HasCoordinatedGroups,
+    MkCfg: Fn(u16, u16, bool) -> B::ConsumerGroupConfig,
+    Connect: Fn() -> Fut,
+    Fut: Future<Output = Broker<B>>,
+{
+    init_tracing();
 
     let cli = Cli::parse();
     let scenarios = build_scenarios(&cli);
 
-    let broker = B::setup().await;
-
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        eprintln!("\ninterrupted, shutting down gracefully...");
-        cancel_clone.cancel();
-    });
+    let cancel = spawn_ctrlc_watcher();
 
     eprintln!(
         "shove stress benchmarks — {}{}",
-        B::NAME,
+        hcfg.backend_name,
         if cli.concurrent { " (concurrent)" } else { "" }
     );
     eprintln!("scenarios: {}\n", scenarios.len());
@@ -778,37 +1031,8 @@ pub async fn run_all_scenarios<B: StressTestBroker>() {
             scenario.handler,
         );
 
-        match run_scenario(&broker, scenario, &cancel).await {
-            Ok(m) => {
-                eprintln!(
-                    "  -> {:.1} msg/s | dispatch p50={:.1}ms p99={:.1}ms | e2e p50={:.1}ms p99={:.1}ms | cpu={:.0}% rss={:.1}MB | {:.1}s",
-                    m.throughput,
-                    m.latencies.dispatch_p50,
-                    m.latencies.dispatch_p99,
-                    m.latencies.e2e_p50,
-                    m.latencies.e2e_p99,
-                    m.cpu_pct,
-                    m.peak_rss_mb,
-                    m.duration_secs
-                );
-                results.push(ScenarioResult {
-                    tier: scenario.tier.to_string(),
-                    messages: scenario.messages,
-                    consumers: scenario.consumers,
-                    handler: scenario.handler.to_string(),
-                    throughput_msg_per_sec: m.throughput,
-                    dispatch_p50_ms: m.latencies.dispatch_p50,
-                    dispatch_p95_ms: m.latencies.dispatch_p95,
-                    dispatch_p99_ms: m.latencies.dispatch_p99,
-                    e2e_p50_ms: m.latencies.e2e_p50,
-                    e2e_p95_ms: m.latencies.e2e_p95,
-                    e2e_p99_ms: m.latencies.e2e_p99,
-                    scaling_efficiency: 0.0,
-                    peak_rss_mb: m.peak_rss_mb,
-                    cpu_pct: m.cpu_pct,
-                    duration_secs: m.duration_secs,
-                });
-            }
+        match run_scenario_group(&hcfg, scenario, &cancel, &make_cfg, &connect).await {
+            Ok(m) => push_metrics(&mut results, scenario, m),
             Err(e) => {
                 eprintln!("  -> FAILED: {e}");
                 failures.push(FailedResult {
@@ -822,23 +1046,72 @@ pub async fn run_all_scenarios<B: StressTestBroker>() {
         }
     }
 
-    compute_scaling(&mut results);
+    finalize_report(results, failures, hcfg.backend_name, cli.output);
+}
 
-    let report = Report {
-        backend: B::NAME.to_string(),
-        results,
-        failures,
-    };
+/// Run every scenario against a supervisor-only backend (SQS). See
+/// [`run_all_scenarios`] for the closure contract.
+pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
+    hcfg: HarnessConfig<B>,
+    connect: Connect,
+    make_opts: MkOpts,
+) where
+    B: Backend,
+    MkOpts: Fn(u16, bool) -> ConsumerOptions<B>,
+    Connect: Fn() -> Fut,
+    Fut: Future<Output = Broker<B>>,
+{
+    init_tracing();
 
-    match cli.output {
-        OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&report).unwrap();
-            println!("{json}");
+    let cli = Cli::parse();
+    let scenarios = build_scenarios(&cli);
+
+    let cancel = spawn_ctrlc_watcher();
+
+    eprintln!(
+        "shove stress benchmarks — {}{}",
+        hcfg.backend_name,
+        if cli.concurrent { " (concurrent)" } else { "" }
+    );
+    eprintln!("scenarios: {}\n", scenarios.len());
+
+    let mut results: Vec<ScenarioResult> = Vec::new();
+    let mut failures: Vec<FailedResult> = Vec::new();
+
+    for (i, scenario) in scenarios.iter().enumerate() {
+        if cancel.is_cancelled() {
+            eprintln!("skipping remaining scenarios");
+            break;
         }
-        OutputFormat::Table => {
-            print_table(&report);
+        let prefetch_str = scenario
+            .prefetch
+            .map(|p| format!(" | pf={p}"))
+            .unwrap_or_default();
+        eprintln!(
+            "[{}/{}] {} | {}msg | {}c{} | {} ...",
+            i + 1,
+            scenarios.len(),
+            scenario.tier,
+            scenario.messages,
+            scenario.consumers,
+            prefetch_str,
+            scenario.handler,
+        );
+
+        match run_scenario_supervisor(&hcfg, scenario, &cancel, &make_opts, &connect).await {
+            Ok(m) => push_metrics(&mut results, scenario, m),
+            Err(e) => {
+                eprintln!("  -> FAILED: {e}");
+                failures.push(FailedResult {
+                    tier: scenario.tier.to_string(),
+                    messages: scenario.messages,
+                    consumers: scenario.consumers,
+                    handler: scenario.handler.to_string(),
+                    error: e,
+                });
+            }
         }
     }
 
-    broker.shutdown().await;
+    finalize_report(results, failures, hcfg.backend_name, cli.output);
 }

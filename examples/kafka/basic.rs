@@ -1,22 +1,19 @@
 //! Basic Kafka publish/consume example.
 //!
-//! Run: cargo run -q --example kafka_basic --features kafka
-//! Requires: Kafka broker at localhost:9092
+//! Spins up a Kafka testcontainer automatically (requires a running Docker
+//! daemon):
+//!
+//!     cargo run -q --example kafka_basic --features kafka
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::Topic;
-use shove::consumer::{Consumer, ConsumerOptions};
-use shove::handler::MessageHandler;
-use shove::kafka::{
-    KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisher, KafkaTopologyDeclarer,
+use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
+use shove::{
+    Broker, ConsumerGroupConfig, Kafka, MessageHandler, MessageMetadata, Outcome, TopologyBuilder,
 };
-use shove::metadata::MessageMetadata;
-use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{TopologyBuilder, TopologyDeclarer};
-use tokio_util::sync::CancellationToken;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
@@ -37,7 +34,8 @@ shove::define_topic!(
 struct OrderHandler;
 
 impl MessageHandler<OrderTopic> for OrderHandler {
-    async fn handle(&self, message: OrderCreated, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, message: OrderCreated, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "Processing order {} (${:.2}) [retry={}]",
             message.order_id, message.amount, metadata.retry_count
@@ -50,15 +48,15 @@ impl MessageHandler<OrderTopic> for OrderHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = KafkaConfig::new("localhost:9092");
-    let client = KafkaClient::connect(&config).await?;
+    let container = KafkaImage::default().start().await?;
+    let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
+    let bootstrap = format!("127.0.0.1:{port}");
 
-    // Declare topology
-    let declarer = KafkaTopologyDeclarer::new(client.clone());
-    declarer.declare(OrderTopic::topology()).await?;
+    let broker = Broker::<Kafka>::new(KafkaConfig::new(&bootstrap)).await?;
+    broker.topology().declare::<OrderTopic>().await?;
 
     // Publish
-    let publisher = KafkaPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
     for i in 0..3 {
         publisher
             .publish::<OrderTopic>(&OrderCreated {
@@ -69,19 +67,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Published order ORD-{i}");
     }
 
-    // Consume
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        shutdown_clone.cancel();
-    });
+    // Consume via a coordinated consumer group.
+    let mut group = broker.consumer_group();
+    group
+        .register::<OrderTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            || OrderHandler,
+        )
+        .await?;
 
-    let consumer = KafkaConsumer::new(client.clone());
-    let options = ConsumerOptions::new(shutdown);
-    consumer.run::<OrderTopic>(OrderHandler, options).await?;
+    // Stop after 3 s for demo purposes, or on ctrl-c.
+    let outcome = group
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
 
-    client.shutdown().await;
     println!("Done.");
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

@@ -1,29 +1,30 @@
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner;
 use crate::consumer::{
-    Consumer, ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE,
-    DEFAULT_MAX_PENDING_PER_KEY,
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };
+use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::topology::TopologyDeclarer;
 
 use super::client::InMemoryBroker;
 use super::consumer::InMemoryConsumer;
 use super::topology::InMemoryTopologyDeclarer;
 
-pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
+pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptionsInner) -> JoinHandle<()> + Send + Sync>;
 
 /// Configuration for an [`InMemoryConsumerGroup`].
+#[derive(Clone)]
 pub struct InMemoryConsumerGroupConfig {
     prefetch_count: u16,
     min_consumers: u16,
@@ -32,6 +33,15 @@ pub struct InMemoryConsumerGroupConfig {
     handler_timeout: Option<Duration>,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
+}
+
+impl Default for InMemoryConsumerGroupConfig {
+    /// A single consumer, default tuning. Matches the defaults baked into
+    /// `InMemoryConsumerGroupConfig::new(1..=1)`. Mirrors the
+    /// `HasCoordinatedGroups::ConsumerGroupConfig: Default` bound.
+    fn default() -> Self {
+        Self::new(1..=1)
+    }
 }
 
 impl InMemoryConsumerGroupConfig {
@@ -134,6 +144,10 @@ pub struct InMemoryConsumerGroup {
     pub(crate) spawner: Spawner,
     pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
     pub(crate) group_token: CancellationToken,
+    /// Error count incremented by each spawned task when its inner
+    /// `run_with_inner` returns `Err`. Drained by
+    /// [`InMemoryConsumerGroup::shutdown_with_tally`].
+    pub(crate) error_count: Arc<AtomicUsize>,
 }
 
 impl InMemoryConsumerGroup {
@@ -143,16 +157,22 @@ impl InMemoryConsumerGroup {
         broker: InMemoryBroker,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
-        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptionsInner| {
             let handler = handler_factory();
             let consumer = InMemoryConsumer::new(broker.clone());
+            let ec = ec_for_spawner.clone();
+            let ctx = ctx.clone();
             tokio::spawn(async move {
-                if let Err(e) = consumer.run::<T>(handler, options).await {
+                if let Err(e) = consumer.run_with_inner::<T, H>(handler, ctx, options).await {
+                    ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("in-memory consumer task exited with error: {e}");
                 }
             })
@@ -164,6 +184,7 @@ impl InMemoryConsumerGroup {
             config,
             spawner,
             group_token,
+            error_count,
         }
     }
 
@@ -239,35 +260,47 @@ impl InMemoryConsumerGroup {
 
     /// Cancel every consumer and wait for all tasks to finish.
     pub async fn shutdown(&mut self) {
+        let _ = self.shutdown_with_tally().await;
+    }
+
+    /// Same as [`shutdown`] but returns a tally of how many consumer tasks
+    /// exited with a non-retryable error or panicked. Used by
+    /// `RegistryImpl::run_until_timeout` to surface failures through
+    /// [`SupervisorOutcome`](crate::consumer_supervisor::SupervisorOutcome).
+    pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
         info!(group = %self.queue, consumers = self.consumers.len(), "shutting down in-memory consumer group");
         self.group_token.cancel();
+        let mut panics = 0usize;
         for (_token, _processing, handle) in self.consumers.drain(..) {
-            let _ = handle.await;
+            match handle.await {
+                Ok(()) => {}
+                // Defensive: shutdown is cooperative via `group_token`; no
+                // code path currently calls `JoinHandle::abort()` on these
+                // handles, so this arm is unreachable today. It mirrors the
+                // `ConsumerSupervisor` drain (src/consumer_supervisor.rs)
+                // and keeps parity if a future timeout escalation adds
+                // `abort_all`. Cancelled tasks do not count as panics.
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
+                    panics += 1;
+                }
+            }
         }
-        debug!(group = %self.queue, "in-memory consumer group shutdown complete");
+        let errors = self.error_count.swap(0, Ordering::Relaxed);
+        debug!(group = %self.queue, errors, panics, "in-memory consumer group shutdown complete");
+        ShutdownTally { errors, panics }
     }
 
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
         let processing = Arc::new(AtomicBool::new(false));
-        let mut options = ConsumerOptions::new(child_token.clone())
-            .with_max_retries(self.config.max_retries)
-            .with_prefetch_count(self.config.prefetch_count);
-        if let Some(timeout) = self.config.handler_timeout {
-            options = options.with_handler_timeout(timeout);
-        } else {
-            options = options.without_handler_timeout();
-        }
-        if let Some(max) = self.config.max_message_size {
-            options = options.with_max_message_size(max);
-        } else {
-            options = options.without_message_size_limit();
-        }
-        if let Some(limit) = self.config.max_pending_per_key {
-            options = options.with_max_pending_per_key(limit);
-        } else {
-            options = options.without_max_pending_per_key();
-        }
+        let mut options = ConsumerOptionsInner::defaults_with_shutdown(child_token.clone());
+        options.max_retries = self.config.max_retries;
+        options.prefetch_count = self.config.prefetch_count;
+        options.handler_timeout = self.config.handler_timeout;
+        options.max_message_size = self.config.max_message_size;
+        options.max_pending_per_key = self.config.max_pending_per_key;
         options.processing = processing.clone();
 
         let handle = (self.spawner)(options);
@@ -305,6 +338,7 @@ impl InMemoryConsumerGroupRegistry {
         &mut self,
         config: InMemoryConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
@@ -334,6 +368,7 @@ impl InMemoryConsumerGroupRegistry {
             broker.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())
@@ -349,6 +384,17 @@ impl InMemoryConsumerGroupRegistry {
         }
     }
 
+    /// Broker-wide shutdown token. Used by the `RegistryImpl::run_until_timeout`
+    /// adapter in `backend.rs` to propagate cancellation deterministically
+    /// when the caller-supplied shutdown signal fires. Returns a fresh
+    /// `CancellationToken` for test-only registries that have no broker.
+    pub(crate) fn broker_shutdown_token(&self) -> CancellationToken {
+        self.broker
+            .as_ref()
+            .map(|b| b.shutdown_token().clone())
+            .unwrap_or_default()
+    }
+
     pub fn groups(&self) -> &HashMap<String, InMemoryConsumerGroup> {
         &self.groups
     }
@@ -358,14 +404,27 @@ impl InMemoryConsumerGroupRegistry {
     }
 
     pub async fn shutdown_all(&mut self) {
+        let _ = self.shutdown_all_with_tally().await;
+    }
+
+    /// Same as [`shutdown_all`] but aggregates a per-group tally of task
+    /// errors and panics. Used by `RegistryImpl::run_until_timeout` to
+    /// populate [`SupervisorOutcome`](crate::consumer_supervisor::SupervisorOutcome).
+    pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
         info!(
             count = self.groups.len(),
             "shutting down all in-memory consumer groups"
         );
+        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            group.shutdown().await;
+            tally.add(group.shutdown_with_tally().await);
         }
-        debug!("all in-memory consumer groups shut down");
+        debug!(
+            errors = tally.errors,
+            panics = tally.panics,
+            "all in-memory consumer groups shut down"
+        );
+        tally
     }
 }
 
@@ -379,7 +438,7 @@ mod tests {
 
     fn test_group(config: InMemoryConsumerGroupConfig) -> InMemoryConsumerGroup {
         let group_token = CancellationToken::new();
-        let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
+        let spawner: Spawner = Arc::new(|options: ConsumerOptionsInner| {
             tokio::spawn(async move {
                 options.shutdown.cancelled().await;
             })
@@ -391,6 +450,7 @@ mod tests {
             config,
             spawner,
             group_token,
+            error_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -439,5 +499,66 @@ mod tests {
         assert!(!group.scale_down());
         assert_eq!(group.active_consumers(), 1);
         group.shutdown().await;
+    }
+
+    // --- shutdown_with_tally regression tests for review #1 ---
+    // Prior versions always returned 0/0 regardless of consumer-loop
+    // failures; `RegistryImpl::run_until_timeout` therefore reported
+    // `SupervisorOutcome::default()` even after errors/panics.
+
+    fn panicking_group() -> InMemoryConsumerGroup {
+        let config = InMemoryConsumerGroupConfig::new(2..=2);
+        let group_token = CancellationToken::new();
+        let spawner: Spawner = Arc::new(|_: ConsumerOptionsInner| {
+            tokio::spawn(async move {
+                panic!("simulated consumer-loop panic");
+            })
+        });
+        InMemoryConsumerGroup {
+            queue: "panicky".into(),
+            consumers: Vec::with_capacity(config.max_consumers as usize),
+            config,
+            spawner,
+            group_token,
+            error_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_tally_counts_panicked_tasks() {
+        let mut group = panicking_group();
+        group.start();
+        // Give the spawned tasks a moment to panic before draining.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let tally = group.shutdown_with_tally().await;
+        assert_eq!(tally.panics, 2, "expected both spawned tasks to panic");
+        assert_eq!(tally.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_tally_counts_error_flag() {
+        // Simulate consumer-loop errors by incrementing the group's error
+        // counter directly — this is exactly what the spawner closure in
+        // `InMemoryConsumerGroup::new` does on `Err` from `run_with_inner`.
+        let group = test_group(InMemoryConsumerGroupConfig::new(1..=1));
+        group.error_count.fetch_add(3, Ordering::Relaxed);
+        let mut group = group;
+        let tally = group.shutdown_with_tally().await;
+        assert_eq!(tally.errors, 3);
+        assert_eq!(tally.panics, 0);
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_all_with_tally_aggregates() {
+        let mut registry = InMemoryConsumerGroupRegistry::from_groups(HashMap::new());
+        registry.groups.insert("a".into(), panicking_group());
+        registry.groups.insert("b".into(), panicking_group());
+        for g in registry.groups.values_mut() {
+            g.start();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let tally = registry.shutdown_all_with_tally().await;
+        // 2 groups × 2 panicking consumers = 4 panics.
+        assert_eq!(tally.panics, 4);
     }
 }

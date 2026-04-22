@@ -5,11 +5,12 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use uuid::Uuid;
 
-use crate::ShoveError;
+use crate::backend::PublisherImpl;
 use crate::error::Result;
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
+use crate::{QueueTopology, ShoveError};
 
 use super::client::KafkaClient;
 use super::constants::{MESSAGE_ID_HEADER, RETRY_COUNT_HEADER};
@@ -67,7 +68,7 @@ impl KafkaPublisher {
     }
 
     fn resolve_topic_and_key<T: Topic>(
-        topology: &'static crate::topology::QueueTopology,
+        topology: &'static QueueTopology,
         message: &T::Message,
     ) -> (String, Option<Vec<u8>>) {
         let topic = topology.queue().to_string();
@@ -98,8 +99,8 @@ impl KafkaPublisher {
     }
 }
 
-impl Publisher for KafkaPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl KafkaPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
@@ -116,7 +117,7 @@ impl Publisher for KafkaPublisher {
         .await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
@@ -138,7 +139,9 @@ impl Publisher for KafkaPublisher {
         .await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+        use futures_util::future::try_join_all;
+
         let topology = T::topology();
         #[allow(clippy::type_complexity)]
         let prepared: Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)> = messages
@@ -151,21 +154,53 @@ impl Publisher for KafkaPublisher {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        for (topic, key, headers, payload) in &prepared {
-            let mut record = FutureRecord::to(topic)
-                .payload(payload.as_slice())
-                .headers(headers.clone());
-            if let Some(k) = key {
-                record = record.key(k.as_slice());
-            }
-
-            self.client
-                .producer()
-                .send(record, PRODUCE_TIMEOUT)
-                .await
-                .map_err(|(e, _)| ShoveError::Connection(format!("batch publish failed: {e}")))?;
-        }
+        // Submit every record concurrently so librdkafka's internal batching
+        // (`batch.size` / `linger.ms`) can coalesce them into broker-side
+        // batches. Awaiting each `send` serially forced one round-trip per
+        // message and pinned publish throughput at ~200 msg/s on localhost.
+        let producer = self.client.producer();
+        try_join_all(
+            prepared
+                .into_iter()
+                .map(|(topic, key, headers, payload)| async move {
+                    let mut record = FutureRecord::to(&topic)
+                        .payload(payload.as_slice())
+                        .headers(headers);
+                    if let Some(k) = key.as_deref() {
+                        record = record.key(k);
+                    }
+                    producer
+                        .send(record, PRODUCE_TIMEOUT)
+                        .await
+                        .map_err(|(e, _)| {
+                            ShoveError::Connection(format!("batch publish failed: {e}"))
+                        })?;
+                    Ok::<(), ShoveError>(())
+                }),
+        )
+        .await?;
 
         Ok(())
+    }
+}
+
+impl PublisherImpl for KafkaPublisher {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+        KafkaPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        KafkaPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl Future<Output = Result<()>> + Send {
+        KafkaPublisher::publish_batch::<T>(self, msgs)
     }
 }

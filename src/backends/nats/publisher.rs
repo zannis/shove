@@ -7,11 +7,12 @@ use async_nats::jetstream;
 use bytes::Bytes;
 use uuid::Uuid;
 
-use crate::ShoveError;
+use crate::backend::PublisherImpl;
 use crate::error::Result;
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
+use crate::{QueueTopology, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::RETRY_COUNT_HEADER;
@@ -74,10 +75,7 @@ impl NatsPublisher {
         Ok(Self { client })
     }
 
-    fn resolve_subject<T: Topic>(
-        topology: &'static crate::topology::QueueTopology,
-        message: &T::Message,
-    ) -> String {
+    fn resolve_subject<T: Topic>(topology: &'static QueueTopology, message: &T::Message) -> String {
         if let Some(seq) = topology.sequencing()
             && let Some(key_fn) = T::SEQUENCE_KEY_FN
         {
@@ -114,8 +112,8 @@ impl NatsPublisher {
     }
 }
 
-impl Publisher for NatsPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl NatsPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
@@ -124,7 +122,7 @@ impl Publisher for NatsPublisher {
             .await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
@@ -138,7 +136,7 @@ impl Publisher for NatsPublisher {
             .await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         let prepared: Vec<(String, HeaderMap, Bytes)> = messages
             .iter()
@@ -168,6 +166,27 @@ impl Publisher for NatsPublisher {
         }
 
         Ok(())
+    }
+}
+
+impl PublisherImpl for NatsPublisher {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+        NatsPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        NatsPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl Future<Output = Result<()>> + Send {
+        NatsPublisher::publish_batch::<T>(self, msgs)
     }
 }
 

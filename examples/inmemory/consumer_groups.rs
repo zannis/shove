@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use shove::inmemory::{
-    InMemoryBroker, InMemoryConsumerGroupConfig, InMemoryConsumerGroupRegistry, InMemoryPublisher,
+use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
+use shove::{
+    Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome, Topic,
+    TopologyBuilder,
 };
-use shove::{MessageHandler, MessageMetadata, Outcome, Publisher, Topic, TopologyBuilder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Work {
@@ -31,7 +32,8 @@ struct Worker {
     count: Arc<AtomicUsize>,
 }
 impl MessageHandler<WorkTopic> for Worker {
-    async fn handle(&self, msg: Work, _: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: Work, _: MessageMetadata, _: &()) -> Outcome {
         // Simulate some I/O.
         tokio::time::sleep(Duration::from_millis(5)).await;
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -44,39 +46,57 @@ impl MessageHandler<WorkTopic> for Worker {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let broker = InMemoryBroker::new();
-    let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
-        broker.clone(),
-    )));
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("connect InMemory");
+    broker
+        .topology()
+        .declare::<WorkTopic>()
+        .await
+        .expect("declare");
 
     let count = Arc::new(AtomicUsize::new(0));
-    {
-        let count = count.clone();
-        let factory = move || Worker {
-            count: count.clone(),
-        };
-        let mut reg = registry.lock().await;
-        reg.register::<WorkTopic, _>(
-            InMemoryConsumerGroupConfig::new(3..=6).with_prefetch_count(4),
-            factory,
+
+    let mut group = broker.consumer_group();
+    let c = count.clone();
+    group
+        .register::<WorkTopic, _>(
+            ConsumerGroupConfig::new(
+                InMemoryConsumerGroupConfig::new(3..=6).with_prefetch_count(4),
+            ),
+            move || Worker { count: c.clone() },
         )
         .await
-        .unwrap();
-        reg.start_all();
-    }
+        .expect("register");
 
-    let publisher = InMemoryPublisher::new(broker.clone());
+    let publisher = broker.publisher().await.expect("publisher");
     for i in 0..100u32 {
         publisher
             .publish::<WorkTopic>(&Work { id: i })
             .await
-            .unwrap();
+            .expect("publish");
     }
 
-    while count.load(Ordering::Relaxed) < 100 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // Stop when all 100 messages have been processed, or after a deadline.
+    let stop = CancellationToken::new();
+    let waiter_stop = stop.clone();
+    let waiter_count = count.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while waiter_count.load(Ordering::Relaxed) < 100 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        waiter_stop.cancel();
+    });
 
-    registry.lock().await.shutdown_all().await;
+    let signal_stop = stop.clone();
+    let outcome = group
+        .run_until_timeout(
+            async move { signal_stop.cancelled().await },
+            Duration::from_secs(5),
+        )
+        .await;
+
     println!("processed {} messages", count.load(Ordering::Relaxed));
+    std::process::exit(outcome.exit_code());
 }

@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::SHUTDOWN_GRACE;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
+use crate::retry::Backoff;
 
 /// RabbitMQ connection configuration.
 #[derive(Clone)]
@@ -48,6 +49,18 @@ impl RabbitMqConfig {
     pub fn new(uri: impl Into<String>) -> Self {
         Self { uri: uri.into() }
     }
+
+    /// AMQP connection URI this config was built with.
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
+
+impl Default for RabbitMqConfig {
+    /// Default RabbitMQ endpoint for local development.
+    fn default() -> Self {
+        Self::new("amqp://guest:guest@localhost:5672")
+    }
 }
 
 /// RabbitMQ client with connection management and graceful shutdown.
@@ -85,7 +98,7 @@ impl RabbitMqClient {
     /// Useful for services that start alongside their broker (e.g. in Docker
     /// Compose or Kubernetes) where the broker may not be ready immediately.
     pub async fn connect_with_retry(config: &RabbitMqConfig, max_attempts: u32) -> Result<Self> {
-        let mut backoff = crate::retry::Backoff::default();
+        let mut backoff = Backoff::default();
         let mut last_err = None;
 
         for attempt in 0..max_attempts {
@@ -235,5 +248,11 @@ mod tests {
     fn config_new_stores_uri() {
         let config = RabbitMqConfig::new("amqp://host:1234/%2F");
         assert_eq!(config.uri, "amqp://host:1234/%2F");
+    }
+
+    #[test]
+    fn default_config_is_localhost() {
+        let cfg = RabbitMqConfig::default();
+        assert!(cfg.uri().contains("localhost:5672"));
     }
 }

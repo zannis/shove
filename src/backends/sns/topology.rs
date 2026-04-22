@@ -1,12 +1,11 @@
+use aws_sdk_sqs::types::QueueAttributeName;
 use std::collections::HashMap;
-use std::sync::Arc;
-
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use crate::backends::sns::client::SnsClient;
 use crate::error::{Result, ShoveError};
-use crate::topology::{QueueTopology, TopologyDeclarer};
+use crate::topology::QueueTopology;
 
 /// Default SQS maxReceiveCount for redrive policies.
 /// Messages that exceed this receive count are moved to the DLQ.
@@ -95,28 +94,26 @@ fn sns_topic_name(topology: &QueueTopology) -> String {
 /// Creates standard SNS topics for unsequenced topics and FIFO SNS topics
 /// (with content-based deduplication) for sequenced topics. All create
 /// operations are idempotent — safe to call on every startup.
+///
+/// Registry state is read from the underlying [`SnsClient`], so every
+/// declarer, publisher, and consumer group built from the same client
+/// share a single source of truth for topic ARNs and queue URLs.
 pub struct SnsTopologyDeclarer {
     client: SnsClient,
-    topic_registry: Arc<TopicRegistry>,
-    #[cfg(feature = "aws-sns-sqs")]
-    queue_registry: Option<Arc<QueueRegistry>>,
 }
 
 impl SnsTopologyDeclarer {
-    pub fn new(client: SnsClient, registry: Arc<TopicRegistry>) -> Self {
-        Self {
-            client,
-            topic_registry: registry,
-            #[cfg(feature = "aws-sns-sqs")]
-            queue_registry: None,
-        }
+    pub fn new(client: SnsClient) -> Self {
+        Self { client }
     }
 
-    /// Enable SQS queue creation alongside SNS topics.
+    fn topic_registry(&self) -> &TopicRegistry {
+        self.client.topic_registry()
+    }
+
     #[cfg(feature = "aws-sns-sqs")]
-    pub fn with_queue_registry(mut self, registry: Arc<QueueRegistry>) -> Self {
-        self.queue_registry = Some(registry);
-        self
+    fn queue_registry(&self) -> &QueueRegistry {
+        self.client.queue_registry()
     }
 
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
@@ -145,7 +142,7 @@ impl SnsTopologyDeclarer {
             .to_string();
 
         info!(topic_name, arn, "standard SNS topic declared");
-        self.topic_registry
+        self.topic_registry()
             .insert(topology.queue().to_string(), arn)
             .await;
 
@@ -182,7 +179,7 @@ impl SnsTopologyDeclarer {
             .to_string();
 
         info!(topic_name, arn, "FIFO SNS topic declared");
-        self.topic_registry
+        self.topic_registry()
             .insert(topology.queue().to_string(), arn)
             .await;
 
@@ -202,11 +199,8 @@ impl SnsTopologyDeclarer {
 
         if fifo {
             req = req
-                .attributes(aws_sdk_sqs::types::QueueAttributeName::FifoQueue, "true")
-                .attributes(
-                    aws_sdk_sqs::types::QueueAttributeName::ContentBasedDeduplication,
-                    "true",
-                );
+                .attributes(QueueAttributeName::FifoQueue, "true")
+                .attributes(QueueAttributeName::ContentBasedDeduplication, "true");
         }
 
         if let Some(arn) = dlq_arn {
@@ -215,10 +209,7 @@ impl SnsTopologyDeclarer {
                 "maxReceiveCount": max_receive_count,
             })
             .to_string();
-            req = req.attributes(
-                aws_sdk_sqs::types::QueueAttributeName::RedrivePolicy,
-                redrive,
-            );
+            req = req.attributes(QueueAttributeName::RedrivePolicy, redrive);
         }
 
         let result = req.send().await.map_err(|e| {
@@ -238,7 +229,7 @@ impl SnsTopologyDeclarer {
             .sqs()
             .get_queue_attributes()
             .queue_url(&url)
-            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+            .attribute_names(QueueAttributeName::QueueArn)
             .send()
             .await
             .map_err(|e| {
@@ -249,7 +240,7 @@ impl SnsTopologyDeclarer {
 
         let arn = attrs
             .attributes()
-            .and_then(|m| m.get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn))
+            .and_then(|m| m.get(&QueueAttributeName::QueueArn))
             .ok_or_else(|| {
                 ShoveError::Topology(format!("SQS queue '{name}' has no ARN attribute"))
             })?
@@ -287,7 +278,7 @@ impl SnsTopologyDeclarer {
             .sqs()
             .set_queue_attributes()
             .queue_url(queue_url)
-            .attributes(aws_sdk_sqs::types::QueueAttributeName::Policy, policy)
+            .attributes(QueueAttributeName::Policy, policy)
             .send()
             .await
             .map_err(|e| {
@@ -331,10 +322,9 @@ impl SnsTopologyDeclarer {
         // Create DLQ first if requested
         let dlq_arn = if let Some(dlq_name) = topology.dlq() {
             let (dlq_url, arn) = self.create_sqs_queue(dlq_name, false, None, 0).await?;
-            // Register the DLQ URL
-            if let Some(ref reg) = self.queue_registry {
-                reg.insert(dlq_name.to_string(), dlq_url).await;
-            }
+            self.queue_registry()
+                .insert(dlq_name.to_string(), dlq_url)
+                .await;
             Some(arn)
         } else {
             None
@@ -354,10 +344,9 @@ impl SnsTopologyDeclarer {
         self.subscribe_sqs_to_sns(topic_arn, &arn, &url, None)
             .await?;
 
-        // Register the main queue URL
-        if let Some(ref reg) = self.queue_registry {
-            reg.insert(queue_name.to_string(), url).await;
-        }
+        self.queue_registry()
+            .insert(queue_name.to_string(), url)
+            .await;
 
         Ok(())
     }
@@ -382,9 +371,9 @@ impl SnsTopologyDeclarer {
         let (dlq_url, dlq_arn) = self.create_sqs_queue(&dlq_aws_name, true, None, 0).await?;
 
         // Register DLQ URL using the key without .fifo
-        if let Some(ref reg) = self.queue_registry {
-            reg.insert(dlq_registry_key, dlq_url).await;
-        }
+        self.queue_registry()
+            .insert(dlq_registry_key, dlq_url)
+            .await;
 
         // Create N FIFO shard queues
         for i in 0..shards {
@@ -405,20 +394,18 @@ impl SnsTopologyDeclarer {
             self.subscribe_sqs_to_sns(topic_arn, &arn, &url, Some(filter))
                 .await?;
 
-            if let Some(ref reg) = self.queue_registry {
-                reg.insert(shard_registry_key, url).await;
-            }
+            self.queue_registry().insert(shard_registry_key, url).await;
         }
 
         Ok(())
     }
 }
 
-impl TopologyDeclarer for SnsTopologyDeclarer {
-    async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+impl SnsTopologyDeclarer {
+    pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         // If the registry already has an ARN for this queue (pre-configured),
         // validate it exists and skip creation.
-        if let Some(arn) = self.topic_registry.get(topology.queue()).await {
+        if let Some(arn) = self.topic_registry().get(topology.queue()).await {
             debug!(
                 queue = topology.queue(),
                 arn, "using pre-configured SNS topic ARN"
@@ -436,11 +423,9 @@ impl TopologyDeclarer for SnsTopologyDeclarer {
                     ))
                 })?;
 
-            // Still declare SQS if queue_registry is set and queue not yet registered
+            // Declare SQS queues if not yet registered (idempotent).
             #[cfg(feature = "aws-sns-sqs")]
-            if let Some(ref qr) = self.queue_registry
-                && qr.get(topology.queue()).await.is_none()
-            {
+            if self.queue_registry().get(topology.queue()).await.is_none() {
                 if topology.sequencing().is_some() {
                     self.declare_sqs_sequenced(topology, &arn).await?;
                 } else {
@@ -457,13 +442,11 @@ impl TopologyDeclarer for SnsTopologyDeclarer {
             self.declare_standard(topology).await?;
         }
 
-        // Declare SQS queues if a queue_registry is configured and queue not yet registered
+        // Declare SQS queues if not yet registered (idempotent).
         #[cfg(feature = "aws-sns-sqs")]
-        if let Some(ref qr) = self.queue_registry
-            && qr.get(topology.queue()).await.is_none()
-        {
+        if self.queue_registry().get(topology.queue()).await.is_none() {
             let topic_arn = self
-                .topic_registry
+                .topic_registry()
                 .get(topology.queue())
                 .await
                 .expect("topic ARN must be in registry after declare");
@@ -482,6 +465,7 @@ impl TopologyDeclarer for SnsTopologyDeclarer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SequenceFailure;
     use crate::topology::TopologyBuilder;
     use std::time::Duration;
 
@@ -494,7 +478,7 @@ mod tests {
     #[test]
     fn sns_topic_name_fifo() {
         let topology = TopologyBuilder::new("order-settlement")
-            .sequenced(crate::topology::SequenceFailure::Skip)
+            .sequenced(SequenceFailure::Skip)
             .hold_queue(Duration::from_secs(5))
             .dlq()
             .build();

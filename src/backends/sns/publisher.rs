@@ -1,12 +1,14 @@
+use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::backend::PublisherImpl;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -42,11 +44,11 @@ fn content_dedup_id(payload: &str) -> String {
 /// Convert a `HashMap<String, String>` into SNS message attributes.
 fn hashmap_to_message_attributes(
     headers: HashMap<String, String>,
-) -> HashMap<String, aws_sdk_sns::types::MessageAttributeValue> {
+) -> HashMap<String, MessageAttributeValue> {
     headers
         .into_iter()
         .map(|(k, v)| {
-            let attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+            let attr = MessageAttributeValue::builder()
                 .data_type("String")
                 .string_value(v)
                 .build()
@@ -83,7 +85,7 @@ impl SnsPublisher {
         payload: &str,
         group_id: Option<&str>,
         routing_shards: Option<u16>,
-        attributes: Option<HashMap<String, aws_sdk_sns::types::MessageAttributeValue>>,
+        attributes: Option<HashMap<String, MessageAttributeValue>>,
     ) -> Result<()> {
         let mut req = self
             .client
@@ -99,7 +101,7 @@ impl SnsPublisher {
 
             if let Some(shards) = routing_shards {
                 let shard = compute_shard(gid, shards);
-                let shard_attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+                let shard_attr = MessageAttributeValue::builder()
                     .data_type("String")
                     .string_value(shard.to_string())
                     .build()
@@ -183,12 +185,12 @@ impl SnsPublisher {
     }
 }
 
-impl Publisher for SnsPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl SnsPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.do_publish::<T>(message, None).await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
@@ -197,7 +199,7 @@ impl Publisher for SnsPublisher {
         self.do_publish::<T>(message, Some(headers)).await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         let key_fn = T::SEQUENCE_KEY_FN;
 
@@ -229,11 +231,11 @@ impl Publisher for SnsPublisher {
         );
 
         // Build batch entries
-        let entries: Vec<aws_sdk_sns::types::PublishBatchRequestEntry> = payloads
+        let entries: Vec<PublishBatchRequestEntry> = payloads
             .iter()
             .enumerate()
             .map(|(i, payload)| {
-                let mut entry = aws_sdk_sns::types::PublishBatchRequestEntry::builder()
+                let mut entry = PublishBatchRequestEntry::builder()
                     .id(i.to_string())
                     .message(payload);
 
@@ -244,7 +246,7 @@ impl Publisher for SnsPublisher {
 
                     if let Some(seq) = topology.sequencing() {
                         let shard = compute_shard(&keys[i], seq.routing_shards());
-                        let shard_attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+                        let shard_attr = MessageAttributeValue::builder()
                             .data_type("String")
                             .string_value(shard.to_string())
                             .build()
@@ -309,6 +311,27 @@ impl Publisher for SnsPublisher {
 
         debug!(queue_name, count = payloads.len(), "batch published to SNS");
         Ok(())
+    }
+}
+
+impl PublisherImpl for SnsPublisher {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+        SnsPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        SnsPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl Future<Output = Result<()>> + Send {
+        SnsPublisher::publish_batch::<T>(self, msgs)
     }
 }
 

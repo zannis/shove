@@ -1,10 +1,19 @@
 //! Integration tests for the SNS publisher backend.
 //!
+//! Uses `Broker<Sqs>` + `Publisher<Sqs>` + `TopologyDeclarer<Sqs>`. The broker
+//! owns the single topic/queue registry so tests use
+//! `client.topic_registry()` to look up ARNs for their SQS-subscription
+//! scaffolding — everything (broker, declarer, publisher) consults the same
+//! state.
+//!
 //! Each test spins up a fresh LocalStack container via testcontainers, runs
 //! the test, and drops the container on completion (automatic cleanup).
 //!
 //! Run with: `cargo test --features sns --test sns_integration`
 
+use aws_sdk_sqs::types::{Message, QueueAttributeName};
+use shove::Broker;
+use shove::Sqs;
 use shove::sns::*;
 use shove::*;
 use std::collections::HashMap;
@@ -18,6 +27,32 @@ use tokio::time::Instant;
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
+
+/// Poll SNS and SQS against the LocalStack endpoint until both respond, or
+/// panic after 30s. Eliminates dispatch-failure flakes when the container is
+/// booted concurrently with other tests and the services aren't yet routable.
+async fn wait_for_localstack_ready(endpoint_url: &str) {
+    let aws_config = aws_config::from_env()
+        .region(aws_config::Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .load()
+        .await;
+    let sns = aws_sdk_sns::Client::new(&aws_config);
+    let sqs = aws_sdk_sqs::Client::new(&aws_config);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let sns_ok = sns.list_topics().send().await.is_ok();
+        let sqs_ok = sqs.list_queues().send().await.is_ok();
+        if sns_ok && sqs_ok {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("LocalStack services not ready within 30s at {endpoint_url}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
 struct TestBroker {
     #[allow(dead_code)]
@@ -49,6 +84,8 @@ impl TestBroker {
             .expect("failed to get LocalStack port");
 
         let endpoint_url = format!("http://localhost:{port}");
+
+        wait_for_localstack_ready(&endpoint_url).await;
 
         Self {
             container,
@@ -98,11 +135,8 @@ impl TestBroker {
 
         if queue_name.ends_with(".fifo") {
             create_req = create_req
-                .attributes(aws_sdk_sqs::types::QueueAttributeName::FifoQueue, "true")
-                .attributes(
-                    aws_sdk_sqs::types::QueueAttributeName::ContentBasedDeduplication,
-                    "true",
-                );
+                .attributes(QueueAttributeName::FifoQueue, "true")
+                .attributes(QueueAttributeName::ContentBasedDeduplication, "true");
         }
 
         let sqs_result = create_req.send().await.expect("failed to create SQS queue");
@@ -112,7 +146,7 @@ impl TestBroker {
         let attrs_result = sqs_client
             .get_queue_attributes()
             .queue_url(&queue_url)
-            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+            .attribute_names(QueueAttributeName::QueueArn)
             .send()
             .await
             .expect("failed to get queue attributes");
@@ -120,7 +154,7 @@ impl TestBroker {
         let queue_arn = attrs_result
             .attributes()
             .expect("no attributes map")
-            .get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+            .get(&QueueAttributeName::QueueArn)
             .expect("no queue ARN")
             .to_string();
 
@@ -131,7 +165,7 @@ impl TestBroker {
         sqs_client
             .set_queue_attributes()
             .queue_url(&queue_url)
-            .attributes(aws_sdk_sqs::types::QueueAttributeName::Policy, policy)
+            .attributes(QueueAttributeName::Policy, policy)
             .send()
             .await
             .expect("failed to set queue policy");
@@ -156,7 +190,7 @@ impl TestBroker {
         queue_url: &str,
         expected_count: usize,
         timeout: Duration,
-    ) -> Vec<aws_sdk_sqs::types::Message> {
+    ) -> Vec<Message> {
         let deadline = Instant::now() + timeout;
         let mut all_messages = Vec::new();
 
@@ -176,6 +210,42 @@ impl TestBroker {
         }
 
         all_messages
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestSetup — wires a `Broker<Sqs>` sharing the client-owned registries
+// ---------------------------------------------------------------------------
+//
+// Publishers, declarers, and tests all consult the same client-owned
+// `TopicRegistry`/`QueueRegistry` (exposed via `client.topic_registry()` /
+// `client.queue_registry()`), so a single `broker.topology().declare::<T>()`
+// call is enough to make ARNs visible everywhere.
+
+struct TestSetup {
+    client: SnsClient,
+    broker: Broker<Sqs>,
+}
+
+impl TestSetup {
+    async fn new(broker: &TestBroker) -> Self {
+        let client = SnsClient::new(&broker.sns_config())
+            .await
+            .expect("failed to create SNS client");
+        let broker = Broker::<Sqs>::from_client(client.clone());
+        Self { client, broker }
+    }
+
+    async fn declare<T: Topic>(&self) {
+        self.broker
+            .topology()
+            .declare::<T>()
+            .await
+            .expect("broker topology declaration should succeed");
+    }
+
+    fn topic_registry(&self) -> &Arc<TopicRegistry> {
+        self.client.topic_registry()
     }
 }
 
@@ -220,17 +290,10 @@ define_sequenced_topic!(
 #[tokio::test]
 async fn publish_single_message() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SimpleWork>().await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-    declare_topic::<SimpleWork>(&declarer)
-        .await
-        .expect("failed to declare topology");
-
-    let publisher = SnsPublisher::new(client.clone(), registry.clone());
+    let publisher = setup.broker.publisher().await.expect("publisher");
 
     let msg = SimpleMessage {
         id: "msg-1".into(),
@@ -240,7 +303,11 @@ async fn publish_single_message() {
     // Subscribe an SQS queue for verification
     let sqs_client = broker.sqs_client().await;
     let raw_sns = broker.raw_sns_client().await;
-    let topic_arn = registry.get("simple-work").await.expect("ARN should exist");
+    let topic_arn = setup
+        .topic_registry()
+        .get("simple-work")
+        .await
+        .expect("ARN should exist");
     let queue_url = broker
         .subscribe_sqs_to_sns(&raw_sns, &sqs_client, &topic_arn, "simple-work-verify")
         .await;
@@ -265,21 +332,18 @@ async fn publish_single_message() {
 #[tokio::test]
 async fn publish_with_headers() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SimpleWork>().await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-    declare_topic::<SimpleWork>(&declarer)
-        .await
-        .expect("failed to declare topology");
-
-    let publisher = SnsPublisher::new(client.clone(), registry.clone());
+    let publisher = setup.broker.publisher().await.expect("publisher");
 
     let sqs_client = broker.sqs_client().await;
     let raw_sns = broker.raw_sns_client().await;
-    let topic_arn = registry.get("simple-work").await.expect("ARN should exist");
+    let topic_arn = setup
+        .topic_registry()
+        .get("simple-work")
+        .await
+        .expect("ARN should exist");
     let queue_url = broker
         .subscribe_sqs_to_sns(&raw_sns, &sqs_client, &topic_arn, "headers-verify")
         .await;
@@ -307,21 +371,18 @@ async fn publish_with_headers() {
 #[tokio::test]
 async fn publish_batch_under_limit() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SimpleWork>().await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-    declare_topic::<SimpleWork>(&declarer)
-        .await
-        .expect("failed to declare topology");
-
-    let publisher = SnsPublisher::new(client.clone(), registry.clone());
+    let publisher = setup.broker.publisher().await.expect("publisher");
 
     let sqs_client = broker.sqs_client().await;
     let raw_sns = broker.raw_sns_client().await;
-    let topic_arn = registry.get("simple-work").await.expect("ARN should exist");
+    let topic_arn = setup
+        .topic_registry()
+        .get("simple-work")
+        .await
+        .expect("ARN should exist");
     let queue_url = broker
         .subscribe_sqs_to_sns(&raw_sns, &sqs_client, &topic_arn, "batch-under-verify")
         .await;
@@ -353,21 +414,18 @@ async fn publish_batch_under_limit() {
 #[tokio::test]
 async fn publish_batch_over_limit_chunks() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SimpleWork>().await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-    declare_topic::<SimpleWork>(&declarer)
-        .await
-        .expect("failed to declare topology");
-
-    let publisher = SnsPublisher::new(client.clone(), registry.clone());
+    let publisher = setup.broker.publisher().await.expect("publisher");
 
     let sqs_client = broker.sqs_client().await;
     let raw_sns = broker.raw_sns_client().await;
-    let topic_arn = registry.get("simple-work").await.expect("ARN should exist");
+    let topic_arn = setup
+        .topic_registry()
+        .get("simple-work")
+        .await
+        .expect("ARN should exist");
     let queue_url = broker
         .subscribe_sqs_to_sns(&raw_sns, &sqs_client, &topic_arn, "batch-over-verify")
         .await;
@@ -399,21 +457,18 @@ async fn publish_batch_over_limit_chunks() {
 #[tokio::test]
 async fn publish_sequenced_sets_group_id() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<OrderTopic>().await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-    declare_topic::<OrderTopic>(&declarer)
-        .await
-        .expect("failed to declare FIFO topology");
-
-    let publisher = SnsPublisher::new(client.clone(), registry.clone());
+    let publisher = setup.broker.publisher().await.expect("publisher");
 
     let sqs_client = broker.sqs_client().await;
     let raw_sns = broker.raw_sns_client().await;
-    let topic_arn = registry.get("orders").await.expect("ARN should exist");
+    let topic_arn = setup
+        .topic_registry()
+        .get("orders")
+        .await
+        .expect("ARN should exist");
     let queue_url = broker
         .subscribe_sqs_to_sns(&raw_sns, &sqs_client, &topic_arn, "orders-verify.fifo")
         .await;
@@ -438,18 +493,10 @@ async fn publish_sequenced_sets_group_id() {
 #[tokio::test]
 async fn topology_declares_standard_topic() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SimpleWork>().await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-
-    declare_topic::<SimpleWork>(&declarer)
-        .await
-        .expect("standard topology declaration should succeed");
-
-    let arn = registry.get("simple-work").await;
+    let arn = setup.topic_registry().get("simple-work").await;
     assert!(arn.is_some(), "ARN should be registered after declaration");
     assert!(
         arn.as_ref().unwrap().contains("simple-work"),
@@ -460,18 +507,10 @@ async fn topology_declares_standard_topic() {
 #[tokio::test]
 async fn topology_declares_fifo_topic() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<OrderTopic>().await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-
-    declare_topic::<OrderTopic>(&declarer)
-        .await
-        .expect("FIFO topology declaration should succeed");
-
-    let arn = registry.get("orders").await;
+    let arn = setup.topic_registry().get("orders").await;
     assert!(arn.is_some(), "ARN should be registered after declaration");
     assert!(
         arn.as_ref().unwrap().contains("orders.fifo"),
@@ -482,32 +521,20 @@ async fn topology_declares_fifo_topic() {
 #[tokio::test]
 async fn topology_idempotent_declaration() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    let declarer = SnsTopologyDeclarer::new(client.clone(), registry.clone());
-
-    // Declare twice — should not error
-    declare_topic::<SimpleWork>(&declarer)
-        .await
-        .expect("first declaration");
-    declare_topic::<SimpleWork>(&declarer)
-        .await
-        .expect("second declaration should be idempotent");
+    // Declare twice — should not error.
+    setup.declare::<SimpleWork>().await;
+    setup.declare::<SimpleWork>().await;
 }
 
 #[tokio::test]
 async fn publish_to_undeclared_topic_fails() {
     let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
-        .await
-        .expect("failed to create SNS client");
+    let setup = TestSetup::new(&broker).await;
 
-    let registry = Arc::new(TopicRegistry::new());
-    // Do NOT declare topology
-    let publisher = SnsPublisher::new(client, registry);
+    // Do NOT declare topology — the broker's client-owned registry is empty.
+    let publisher = setup.broker.publisher().await.expect("publisher");
 
     let msg = SimpleMessage {
         id: "msg-fail".into(),

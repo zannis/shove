@@ -1,8 +1,8 @@
+use async_nats::connection::State;
+use async_nats::jetstream;
 use std::fmt;
 use std::process;
 use std::time::Duration;
-
-use async_nats::jetstream;
 use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
@@ -16,6 +16,18 @@ pub struct NatsConfig {
 impl NatsConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
+    }
+
+    /// URL of the NATS server this config connects to.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+impl Default for NatsConfig {
+    /// Default NATS endpoint for local development.
+    fn default() -> Self {
+        Self::new("nats://localhost:4222")
     }
 }
 
@@ -103,15 +115,23 @@ impl NatsClient {
     }
 
     pub fn is_connected(&self) -> bool {
-        matches!(
-            self.client.connection_state(),
-            async_nats::connection::State::Connected
-        )
+        matches!(self.client.connection_state(), State::Connected)
     }
 
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
         let _ = self.client.drain().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_localhost() {
+        let cfg = NatsConfig::default();
+        assert!(cfg.url().contains("localhost:4222"));
     }
 }

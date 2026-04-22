@@ -1,5 +1,5 @@
+use async_nats::jetstream::consumer::pull::Config;
 use std::sync::Arc;
-
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -46,9 +46,7 @@ impl NatsQueueStatsProvider for JetStreamStatsProvider {
             .map_err(|e| ShoveError::Topology(format!("failed to get stream {queue}: {e}")))?;
 
         let consumer_name = super::constants::consumer_name(queue);
-        let consumer_result = stream
-            .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
-            .await;
+        let consumer_result = stream.get_consumer::<Config>(&consumer_name).await;
 
         match consumer_result {
             Ok(mut consumer) => {
@@ -131,12 +129,12 @@ impl<S: NatsQueueStatsProvider> NatsAutoscalerBackend<S> {
 impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
     type GroupId = String;
 
-    async fn list_groups(&self) -> crate::error::Result<Vec<Self::GroupId>> {
+    async fn list_groups(&self) -> Result<Vec<Self::GroupId>> {
         let reg = self.registry.lock().await;
         Ok(reg.groups().keys().cloned().collect())
     }
 
-    async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
+    async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
         let (queue, prefetch, active) = {
             let reg = self.registry.lock().await;
             let g = reg
@@ -169,11 +167,7 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
         ))
     }
 
-    async fn scale(
-        &self,
-        group: &Self::GroupId,
-        decision: ScalingDecision,
-    ) -> crate::error::Result<()> {
+    async fn scale(&self, group: &Self::GroupId, decision: ScalingDecision) -> Result<()> {
         let mut reg = self.registry.lock().await;
         let g = reg
             .groups_mut()
@@ -213,8 +207,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use crate::backend::ConsumerOptionsInner as ConsumerOptions;
     use crate::backends::nats::consumer_group::{NatsConsumerGroup, NatsConsumerGroupConfig};
-    use crate::consumer::ConsumerOptions;
     use tokio_util::sync::CancellationToken;
 
     struct MockNatsStatsProvider {
@@ -258,6 +252,7 @@ mod tests {
             config,
             spawner,
             group_token,
+            error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if started {
             group.start();

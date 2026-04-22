@@ -1,41 +1,33 @@
 #![cfg(feature = "aws-sns-sqs")]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use tracing::{debug, info};
 
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::consumer_group::{SqsConsumerGroup, SqsConsumerGroupConfig};
-use crate::backends::sns::topology::{QueueRegistry, SnsTopologyDeclarer, TopicRegistry};
+use crate::backends::sns::topology::SnsTopologyDeclarer;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::topology::TopologyDeclarer;
 
 /// Registry of all [`SqsConsumerGroup`]s.
 ///
-/// Every group shares the same underlying [`SnsClient`].  Each group gets
-/// its own child [`CancellationToken`] derived from the client so that the
-/// whole registry can be shut down with a single cancellation.
+/// Every group shares the same underlying [`SnsClient`] and therefore the
+/// same client-owned topic/queue registries used by publishers and
+/// topology declarers built from the same client. Each group gets its own
+/// child [`CancellationToken`] derived from the client so that the whole
+/// registry can be shut down with a single cancellation.
 pub struct SqsConsumerGroupRegistry {
     groups: HashMap<String, SqsConsumerGroup>,
     client: SnsClient,
-    topic_registry: Arc<TopicRegistry>,
-    queue_registry: Arc<QueueRegistry>,
 }
 
 impl SqsConsumerGroupRegistry {
-    pub fn new(
-        client: SnsClient,
-        topic_registry: Arc<TopicRegistry>,
-        queue_registry: Arc<QueueRegistry>,
-    ) -> Self {
+    pub fn new(client: SnsClient) -> Self {
         Self {
             groups: HashMap::new(),
             client,
-            topic_registry,
-            queue_registry,
         }
     }
 
@@ -50,6 +42,7 @@ impl SqsConsumerGroupRegistry {
         &mut self,
         config: SqsConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
@@ -64,9 +57,9 @@ impl SqsConsumerGroupRegistry {
             )));
         }
 
-        let declarer = SnsTopologyDeclarer::new(self.client.clone(), self.topic_registry.clone())
-            .with_queue_registry(self.queue_registry.clone());
-        declarer.declare(topology).await?;
+        SnsTopologyDeclarer::new(self.client.clone())
+            .declare(topology)
+            .await?;
 
         info!(group = %name, "registering SQS consumer group");
         let group_token = self.client.shutdown_token().child_token();
@@ -75,9 +68,10 @@ impl SqsConsumerGroupRegistry {
             name.clone(),
             config,
             self.client.clone(),
-            self.queue_registry.clone(),
+            self.client.queue_registry().clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())

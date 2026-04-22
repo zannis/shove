@@ -3,7 +3,7 @@ use lapin::options::{ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptio
 use lapin::types::{AMQPValue, FieldTable};
 
 use crate::error::{Result, ShoveError};
-use crate::topology::{QueueTopology, TopologyDeclarer};
+use crate::topology::QueueTopology;
 
 const X_DEAD_LETTER_EXCHANGE: &str = "x-dead-letter-exchange";
 const X_DEAD_LETTER_ROUTING_KEY: &str = "x-dead-letter-routing-key";
@@ -141,8 +141,8 @@ impl RabbitMqTopologyDeclarer {
     }
 }
 
-impl TopologyDeclarer for RabbitMqTopologyDeclarer {
-    async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+impl RabbitMqTopologyDeclarer {
+    pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {

@@ -20,16 +20,34 @@ Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS JetStream
 
 If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, `async-nats`, or `rdkafka` directly. `shove` is the layer for multi-service event flows that need operational discipline.
 
+## The `Broker<B>` pattern
+
+Every backend is reached through the same generic entry point:
+
+```text
+Broker<B>
+   ├─ .topology()             → TopologyDeclarer<B>
+   ├─ .publisher().await      → Publisher<B>
+   ├─ .consumer_supervisor()  → ConsumerSupervisor<B>        (all backends)
+   └─ .consumer_group()       → ConsumerGroup<B>             (RabbitMQ, NATS, Kafka, InMemory)
+```
+
+`B` is a zero-sized marker (`RabbitMq`, `Sqs`, `Nats`, `Kafka`, `InMemory`) that binds a backend's client/publisher/consumer/topology types together. Swap `B` — the topic definitions, handlers, and call sites stay identical.
+
+SQS has no broker-level coordinated-group primitive; `Broker<Sqs>` exposes `consumer_supervisor()` only. The other four backends expose both: `consumer_supervisor()` for manual per-topic fan-out, `consumer_group()` for min/max-bounded coordinated groups with autoscaling.
+
 ## 30-second tour
 
 No Docker, no credentials, no config — this runs against the in-process backend:
 
 ```rust,no_run
 use serde::{Deserialize, Serialize};
-use shove::inmemory::*;
-use shove::*;
+use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
+use shove::{
+    Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome,
+    TopologyBuilder, define_topic,
+};
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderPaid { order_id: String }
@@ -42,36 +60,47 @@ define_topic!(Orders, OrderPaid,
 
 struct Handler;
 impl MessageHandler<Orders> for Handler {
-    async fn handle(&self, msg: OrderPaid, _: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderPaid, _: MessageMetadata, _: &()) -> Outcome {
         println!("paid: {}", msg.order_id);
         Outcome::Ack
     }
 }
 
-# async fn run() -> Result<(), ShoveError> {
-let broker = InMemoryBroker::new();
-InMemoryTopologyDeclarer::new(broker.clone())
-    .declare(Orders::topology()).await?;
+# async fn run() -> Result<(), shove::ShoveError> {
+let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await?;
+broker.topology().declare::<Orders>().await?;
 
-InMemoryPublisher::new(broker.clone())
-    .publish::<Orders>(&OrderPaid { order_id: "ORD-1".into() }).await?;
+let publisher = broker.publisher().await?;
+publisher.publish::<Orders>(&OrderPaid { order_id: "ORD-1".into() }).await?;
 
-InMemoryConsumer::new(broker)
-    .run::<Orders>(Handler, ConsumerOptions::new(CancellationToken::new())).await?;
-# Ok(()) }
+let mut group = broker.consumer_group();
+group
+    .register::<Orders, _>(
+        ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1)),
+        || Handler,
+    )
+    .await?;
+
+let outcome = group
+    .run_until_timeout(tokio::signal::ctrl_c().map(drop), Duration::from_secs(5))
+    .await;
+std::process::exit(outcome.exit_code());
+# }
+# use futures::FutureExt as _;
 ```
 
-Swap `InMemory*` for `RabbitMq*`, `Sns*`, `Nats*`, or `Kafka*` — the topic definition and handler stay identical.
+Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, or `Kafka` — the topic definition and handler stay identical.
 
 ## Pick your backend
 
-| Backend        | Feature flag    | Durability        | Ordering primitive                   | Autoscale signal       | Ops burden            |
-|----------------|-----------------|-------------------|--------------------------------------|------------------------|-----------------------|
-| RabbitMQ       | `rabbitmq`      | Disk              | Consistent-hash exchange + SAC shards | Queue depth (mgmt API) | Broker + mgmt plugin  |
-| AWS SNS/SQS    | `aws-sns-sqs`   | Managed (AWS)     | FIFO topic + `MessageGroupId`         | Queue depth            | Managed — no infra    |
-| NATS JetStream | `nats`          | Disk (JetStream)  | Subject shard + `max_ack_pending=1`   | Pending messages       | NATS server           |
-| Apache Kafka   | `kafka`         | Disk (log)        | Partition key                        | Consumer lag           | Kafka cluster         |
-| In-process     | `inmemory`      | None (process RAM) | Per-key FIFO shards                  | Queue depth (in-proc)  | None                  |
+| Backend        | Feature flag    | Marker      | Durability         | Ordering primitive                    | Autoscale signal       | Ops burden            |
+|----------------|-----------------|-------------|--------------------|---------------------------------------|------------------------|-----------------------|
+| RabbitMQ       | `rabbitmq`      | `RabbitMq`  | Disk               | Consistent-hash exchange + SAC shards | Queue depth (mgmt API) | Broker + mgmt plugin  |
+| AWS SNS/SQS    | `aws-sns-sqs`   | `Sqs`       | Managed (AWS)      | FIFO topic + `MessageGroupId`         | Queue depth            | Managed — no infra    |
+| NATS JetStream | `nats`          | `Nats`      | Disk (JetStream)   | Subject shard + `max_ack_pending=1`   | Pending messages       | NATS server           |
+| Apache Kafka   | `kafka`         | `Kafka`     | Disk (log)         | Partition key                         | Consumer lag           | Kafka cluster         |
+| In-process     | `inmemory`      | `InMemory`  | None (process RAM) | Per-key FIFO shards                   | Queue depth (in-proc)  | None                  |
 
 Rules of thumb:
 
@@ -81,8 +110,6 @@ Rules of thumb:
 - **Complex routing + retry topologies, existing RabbitMQ** → `rabbitmq`
 - **Lightweight edge deployments, JetStream already in-stack** → `nats`
 
-All backends support typed topics, retry/DLQ, sequenced delivery, consumer groups, autoscaling, and audit — the trait surface is identical.
-
 ## Features
 
 No features are enabled by default.
@@ -91,7 +118,7 @@ No features are enabled by default.
 # RabbitMQ publisher + consumer + consumer groups + autoscaling
 cargo add shove --features rabbitmq
 
-# Transactional RabbitMQ subscribers with exactly-once delivery guarantees (use only when absolutely necessary)
+# Transactional RabbitMQ subscribers (exactly-once routing, slower)
 cargo add shove --features rabbitmq-transactional
 
 # SNS publisher only
@@ -126,17 +153,13 @@ cargo add shove --features rabbitmq,audit
 
 ## Quick start
 
-The repo's `docker-compose.yml` starts every broker needed below: RabbitMQ with the consistent-hash plugin, LocalStack (SNS + SQS on `http://localhost:4566`), NATS JetStream on `localhost:4222`, and Kafka on `localhost:9092`. The `inmemory` backend needs nothing.
-
-```sh
-docker compose up -d
-```
+Every non-`inmemory` example spins up its broker on demand via [testcontainers](https://crates.io/crates/testcontainers) — you just need a running Docker daemon. The SQS/SNS examples additionally need a LocalStack Pro auth token (`LOCALSTACK_AUTH_TOKEN`). The `inmemory` backend needs nothing at all.
 
 Define the topic and handler once — this is identical across every backend:
 
 ```rust,no_run
 use serde::{Deserialize, Serialize};
-use shove::*;
+use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,36 +182,57 @@ define_topic!(
 struct SettlementHandler;
 
 impl MessageHandler<OrderSettlement> for SettlementHandler {
-    async fn handle(&self, msg: SettlementEvent, _metadata: MessageMetadata) -> Outcome {
-        match process(&msg).await {
-            Ok(()) => Outcome::Ack,
-            Err(e) if e.is_transient() => Outcome::Retry,
-            Err(_) => Outcome::Reject,
-        }
+    type Context = ();
+    async fn handle(&self, msg: SettlementEvent, _meta: MessageMetadata, _: &()) -> Outcome {
+        // ... your business logic
+        Outcome::Ack
     }
 }
 ```
 
-Then pick the transport:
+Then pick the transport. Every snippet below uses the same `Broker<B>` pattern.
 
 <details>
 <summary><strong>RabbitMQ</strong></summary>
 
 ```rust,no_run
-use shove::rabbitmq::*;
-use tokio_util::sync::CancellationToken;
+use shove::rabbitmq::RabbitMqConfig;
+use shove::{Broker, ConsumerGroupConfig, RabbitMq};
+use shove::rabbitmq::ConsumerGroupConfig as RabbitMqGroupConfig;
+use std::time::Duration;
 
-let client = RabbitMqClient::connect(&RabbitMqConfig::new("amqp://localhost")).await?;
+# async fn run() -> Result<(), shove::ShoveError> {
+let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new("amqp://guest:guest@localhost:5672")).await?;
 
-// Publish
-let publisher = RabbitMqPublisher::new(client.clone()).await?;
+broker.topology().declare::<OrderSettlement>().await?;
+
+let publisher = broker.publisher().await?;
 publisher.publish::<OrderSettlement>(&event).await?;
 
-// Consume
-let shutdown = CancellationToken::new();
-let consumer = RabbitMqConsumer::new(client);
-let options = ConsumerOptions::new(shutdown).with_prefetch_count(20);
-consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
+let mut group = broker.consumer_group();
+group
+    .register::<OrderSettlement, _>(
+        ConsumerGroupConfig::new(RabbitMqGroupConfig::new(1..=4).with_prefetch_count(20)),
+        || SettlementHandler,
+    )
+    .await?;
+
+let outcome = group
+    .run_until_timeout(tokio::signal::ctrl_c().map(drop), Duration::from_secs(30))
+    .await;
+# Ok(()) }
+# use futures::FutureExt as _;
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String, amount_cents: u64 }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: MessageMetadata, _: &()) -> Outcome { Outcome::Ack }
+# }
+# let event = SettlementEvent { order_id: "x".into(), amount_cents: 0 };
 ```
 
 </details>
@@ -196,29 +240,46 @@ consumer.run::<OrderSettlement>(SettlementHandler, options).await?;
 <details>
 <summary><strong>AWS SNS + SQS</strong></summary>
 
-```rust,no_run
-use shove::sns::*;
-use std::sync::Arc;
+SQS runs N independent pollers on one queue — there is no broker-level coordinated group. Use `consumer_supervisor()` instead of `consumer_group()`.
 
-let client = SnsClient::new(&SnsConfig {
+```rust,no_run
+use shove::sns::SnsConfig;
+use shove::{Broker, ConsumerOptions, Sqs};
+use std::time::Duration;
+
+# async fn run() -> Result<(), shove::ShoveError> {
+let broker = Broker::<Sqs>::new(SnsConfig {
     region: Some("us-east-1".into()),
     endpoint_url: Some("http://localhost:4566".into()), // omit for real AWS
 }).await?;
 
-let topic_registry = Arc::new(TopicRegistry::new());
-let queue_registry = Arc::new(QueueRegistry::new());
+broker.topology().declare::<OrderSettlement>().await?;
 
-let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-    .with_queue_registry(queue_registry.clone());
-declare_topic::<OrderSettlement>(&declarer).await?;
-
-// Publish
-let publisher = SnsPublisher::new(client.clone(), topic_registry);
+let publisher = broker.publisher().await?;
 publisher.publish::<OrderSettlement>(&event).await?;
 
-// Consume
-let consumer = SqsConsumer::new(client, queue_registry);
-consumer.run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
+let mut supervisor = broker.consumer_supervisor();
+supervisor.register::<OrderSettlement, _>(
+    SettlementHandler,
+    ConsumerOptions::<Sqs>::preset(10),
+)?;
+
+let outcome = supervisor
+    .run_until_timeout(tokio::signal::ctrl_c().map(drop), Duration::from_secs(30))
+    .await;
+# Ok(()) }
+# use futures::FutureExt as _;
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String, amount_cents: u64 }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: MessageMetadata, _: &()) -> Outcome { Outcome::Ack }
+# }
+# let event = SettlementEvent { order_id: "x".into(), amount_cents: 0 };
 ```
 
 </details>
@@ -227,19 +288,42 @@ consumer.run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown
 <summary><strong>NATS JetStream</strong></summary>
 
 ```rust,no_run
-use shove::nats::*;
+use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
+use shove::{Broker, ConsumerGroupConfig, Nats};
+use std::time::Duration;
 
-let client = NatsClient::connect(&NatsConfig::new("nats://localhost:4222")).await?;
-NatsTopologyDeclarer::new(client.clone())
-    .declare(OrderSettlement::topology()).await?;
+# async fn run() -> Result<(), shove::ShoveError> {
+let broker = Broker::<Nats>::new(NatsConfig::new("nats://localhost:4222")).await?;
 
-// Publish
-NatsPublisher::new(client.clone()).await?
-    .publish::<OrderSettlement>(&event).await?;
+broker.topology().declare::<OrderSettlement>().await?;
 
-// Consume
-NatsConsumer::new(client)
-    .run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
+let publisher = broker.publisher().await?;
+publisher.publish::<OrderSettlement>(&event).await?;
+
+let mut group = broker.consumer_group();
+group
+    .register::<OrderSettlement, _>(
+        ConsumerGroupConfig::new(NatsConsumerGroupConfig::new(1..=4)),
+        || SettlementHandler,
+    )
+    .await?;
+
+let outcome = group
+    .run_until_timeout(tokio::signal::ctrl_c().map(drop), Duration::from_secs(30))
+    .await;
+# Ok(()) }
+# use futures::FutureExt as _;
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String, amount_cents: u64 }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl shove::MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: shove::MessageMetadata, _: &()) -> shove::Outcome { shove::Outcome::Ack }
+# }
+# let event = SettlementEvent { order_id: "x".into(), amount_cents: 0 };
 ```
 
 </details>
@@ -248,19 +332,42 @@ NatsConsumer::new(client)
 <summary><strong>Apache Kafka</strong></summary>
 
 ```rust,no_run
-use shove::kafka::*;
+use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
+use shove::{Broker, ConsumerGroupConfig, Kafka};
+use std::time::Duration;
 
-let client = KafkaClient::connect(&KafkaConfig::new("localhost:9092")).await?;
-KafkaTopologyDeclarer::new(client.clone())
-    .declare(OrderSettlement::topology()).await?;
+# async fn run() -> Result<(), shove::ShoveError> {
+let broker = Broker::<Kafka>::new(KafkaConfig::new("localhost:9092")).await?;
 
-// Publish
-KafkaPublisher::new(client.clone()).await?
-    .publish::<OrderSettlement>(&event).await?;
+broker.topology().declare::<OrderSettlement>().await?;
 
-// Consume
-KafkaConsumer::new(client)
-    .run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
+let publisher = broker.publisher().await?;
+publisher.publish::<OrderSettlement>(&event).await?;
+
+let mut group = broker.consumer_group();
+group
+    .register::<OrderSettlement, _>(
+        ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=4)),
+        || SettlementHandler,
+    )
+    .await?;
+
+let outcome = group
+    .run_until_timeout(tokio::signal::ctrl_c().map(drop), Duration::from_secs(30))
+    .await;
+# Ok(()) }
+# use futures::FutureExt as _;
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String, amount_cents: u64 }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl shove::MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: shove::MessageMetadata, _: &()) -> shove::Outcome { shove::Outcome::Ack }
+# }
+# let event = SettlementEvent { order_id: "x".into(), amount_cents: 0 };
 ```
 
 </details>
@@ -269,24 +376,78 @@ KafkaConsumer::new(client)
 <summary><strong>In-process (no broker, no Docker)</strong></summary>
 
 ```rust,no_run
-use shove::inmemory::*;
+use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
+use shove::{Broker, ConsumerGroupConfig, InMemory};
+use std::time::Duration;
 
-let broker = InMemoryBroker::new();
-InMemoryTopologyDeclarer::new(broker.clone())
-    .declare(OrderSettlement::topology()).await?;
+# async fn run() -> Result<(), shove::ShoveError> {
+let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await?;
 
-// Publish
-InMemoryPublisher::new(broker.clone())
-    .publish::<OrderSettlement>(&event).await?;
+broker.topology().declare::<OrderSettlement>().await?;
 
-// Consume
-InMemoryConsumer::new(broker)
-    .run::<OrderSettlement>(SettlementHandler, ConsumerOptions::new(shutdown)).await?;
+let publisher = broker.publisher().await?;
+publisher.publish::<OrderSettlement>(&event).await?;
+
+let mut group = broker.consumer_group();
+group
+    .register::<OrderSettlement, _>(
+        ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1)),
+        || SettlementHandler,
+    )
+    .await?;
+
+let outcome = group
+    .run_until_timeout(tokio::signal::ctrl_c().map(drop), Duration::from_secs(5))
+    .await;
+# Ok(()) }
+# use futures::FutureExt as _;
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String, amount_cents: u64 }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl shove::MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: shove::MessageMetadata, _: &()) -> shove::Outcome { shove::Outcome::Ack }
+# }
+# let event = SettlementEvent { order_id: "x".into(), amount_cents: 0 };
 ```
 
 Messages live only in the broker process and are dropped on shutdown — use a durable backend for anything production.
 
 </details>
+
+## Ergonomics
+
+A handful of helpers keep call sites short:
+
+- **`MessageHandlerExt::audited`** — fluent audit wrapping. Write `SettlementHandler.audited(my_audit)` instead of `Audited::new(SettlementHandler, my_audit)`. The wrapped handler is a drop-in replacement that accepts the same `ConsumerGroup`/`ConsumerSupervisor` registration path.
+- **`broker.topology().declare_all::<(A, B, C)>()`** — declare multiple topics in one call via tuple arities 1 through 16, instead of three separate `declare::<_>()` awaits.
+- **`ConsumerOptions::<B>::preset(prefetch)`** — shorthand for `ConsumerOptions::<B>::new().with_prefetch_count(prefetch)`. Composes with the other `with_*` builders.
+- **`SupervisorOutcome::exit_code()`** — canonical process exit code from a consumer group or supervisor: `0` clean, `1` any handler error, `2` any task panic, `3` drain timeout. Call `std::process::exit(outcome.exit_code())` for a uniform shutdown contract across long-running consumer binaries.
+
+```rust,no_run
+use shove::MessageHandlerExt;
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic,
+#             AuditHandler, AuditRecord};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: MessageMetadata, _: &()) -> Outcome { Outcome::Ack }
+# }
+# struct MyAudit;
+# impl AuditHandler<OrderSettlement> for MyAudit {
+#     async fn audit(&self, _: &AuditRecord<SettlementEvent>) -> Result<(), shove::ShoveError> { Ok(()) }
+# }
+
+// `SettlementHandler.audited(MyAudit)` == `Audited::new(SettlementHandler, MyAudit)`.
+let handler = SettlementHandler.audited(MyAudit);
+```
 
 ## Delivery model
 
@@ -313,8 +474,11 @@ Exactly-once mode removes the publish-then-ack race in RabbitMQ by wrapping rout
 Use `define_sequenced_topic!` when messages for the same entity must be processed in order.
 
 ```rust,no_run
-use shove::*;
+use shove::{SequenceFailure, TopologyBuilder, define_sequenced_topic};
 use std::time::Duration;
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct LedgerEntry { account_id: String }
 
 define_sequenced_topic!(
     AccountLedger,
@@ -327,8 +491,6 @@ define_sequenced_topic!(
         .dlq()
         .build()
 );
-
-consumer.run_fifo::<AccountLedger>(handler, options).await?;
 ```
 
 Failure policies:
@@ -351,59 +513,66 @@ RabbitMQ uses consistent-hash routing for this. SNS/SQS uses FIFO topics and que
 
 ## Consumer groups and autoscaling
 
-All backends support named consumer groups with min/max bounds, per-consumer prefetch, retry budget, handler timeouts, and optional concurrent processing inside each consumer.
-
-RabbitMQ:
+All backends with a coordinated-group primitive (RabbitMQ, NATS, Kafka, InMemory) expose `broker.consumer_group()`. SQS uses `broker.consumer_supervisor()` with N parallel pollers instead. Both share the same `run_until_timeout` / `SupervisorOutcome` shutdown contract.
 
 ```rust,no_run
-use shove::rabbitmq::*;
+use shove::rabbitmq::{ConsumerGroupConfig as RabbitMqGroupConfig, ManagementConfig, RabbitMqConfig};
 use shove::autoscaler::AutoscalerConfig;
-use std::sync::Arc;
+use shove::{Broker, ConsumerGroupConfig, RabbitMq};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
-let mut registry = ConsumerGroupRegistry::new(client.clone());
+# async fn run() -> Result<(), shove::ShoveError> {
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct Task;
+# define_topic!(WorkQueue, Task, TopologyBuilder::new("work").build());
+# struct TaskHandler;
+# impl MessageHandler<WorkQueue> for TaskHandler {
+#     type Context = ();
+#     async fn handle(&self, _: Task, _: MessageMetadata, _: &()) -> Outcome { Outcome::Ack }
+# }
 
-registry
-    .register::<WorkQueue, TaskHandler>(
-        ConsumerGroupConfig::new(1..=8)
-            .with_prefetch_count(10)
-            .with_max_retries(5)
-            .with_handler_timeout(Duration::from_secs(30))
-            .with_concurrent_processing(true),
+let broker = Broker::<RabbitMq>::new(RabbitMqConfig::default()).await?;
+broker.topology().declare::<WorkQueue>().await?;
+
+let mut group = broker.consumer_group();
+group
+    .register::<WorkQueue, _>(
+        ConsumerGroupConfig::new(
+            RabbitMqGroupConfig::new(1..=8)
+                .with_prefetch_count(10)
+                .with_max_retries(5)
+                .with_handler_timeout(Duration::from_secs(30))
+                .with_concurrent_processing(true),
+        ),
         || TaskHandler,
     )
     .await?;
 
-registry.start_all();
-
-let registry = Arc::new(Mutex::new(registry));
-
-let mgmt = ManagementConfig::new("http://localhost:15672", "guest", "guest");
-let mut autoscaler = RabbitMqAutoscalerBackend::autoscaler(
-    &mgmt,
-    registry.clone(),
-    AutoscalerConfig {
-        poll_interval: Duration::from_secs(2),
-        scale_up_multiplier: 1.5,
-        scale_down_multiplier: 0.3,
-        hysteresis_duration: Duration::from_secs(4),
-        cooldown_duration: Duration::from_secs(8),
-    },
-);
-autoscaler.run(shutdown_token).await;
+# Ok(()) }
 ```
 
-Every other backend has an identical shape — swap `ConsumerGroupRegistry` / `RabbitMqAutoscalerBackend` for `SqsConsumerGroupRegistry` / `SqsAutoscalerBackend`, `NatsConsumerGroupRegistry` / `NatsAutoscalerBackend`, `KafkaConsumerGroupRegistry` / `KafkaAutoscalerBackend`, or `InMemoryConsumerGroupRegistry` / `InMemoryAutoscalerBackend`. Config constructors (`NatsConsumerGroupConfig::new`, `KafkaConsumerGroupConfig::new`, …) carry the same builder methods.
+The autoscaler harness is wired the same shape on every backend — see `examples/<backend>/consumer_groups.rs` for a full runnable example with `AutoscalerConfig`.
 
 ## Audit logging
 
-Wrap any handler with `Audited<H, A>` to persist a structured `AuditRecord` for each delivery attempt. Records include the trace id, topic, payload, message metadata, outcome, duration, and timestamp.
+Wrap any handler with `MessageHandlerExt::audited` (or `Audited::new`) to persist a structured `AuditRecord` for each delivery attempt. Records include the trace id, topic, payload, message metadata, outcome, duration, and timestamp.
 
 Implement `AuditHandler<T>` for your persistence backend:
 
 ```rust,no_run
-use shove::*;
+use shove::{AuditHandler, AuditRecord, MessageHandlerExt, ShoveError};
+# use shove::{MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: MessageMetadata, _: &()) -> Outcome { Outcome::Ack }
+# }
 
 struct MyAuditSink;
 
@@ -414,22 +583,33 @@ impl AuditHandler<OrderSettlement> for MyAuditSink {
     }
 }
 
-let handler = Audited::new(SettlementHandler, MyAuditSink);
-
-// Drop-in replacement — consumers, consumer groups, and FIFO consumers all accept it.
-consumer.run::<OrderSettlement>(handler, ConsumerOptions::new(shutdown)).await?;
+let handler = SettlementHandler.audited(MyAuditSink);
+// Drop-in — consumer groups, supervisors, and FIFO consumers all accept it.
 ```
 
 If the audit handler returns `Err`, the message is retried — audit failure is never silently dropped.
 
-If you enable `audit`, `ShoveAuditHandler` can publish those records back into a dedicated `shove-audit-log` topic using the same broker:
+With the `audit` feature enabled, `ShoveAuditHandler<B>` publishes those records back into the dedicated `shove-audit-log` topic using any broker's `Publisher<B>`:
 
 ```rust,no_run
-use shove::rabbitmq::*;
-use shove::*;
-
-let audit = ShoveAuditHandler::new(publisher.clone());
-let handler = Audited::new(SettlementHandler, audit);
+use shove::{MessageHandlerExt, ShoveAuditHandler};
+# use shove::{Broker, RabbitMq, MessageHandler, MessageMetadata, Outcome, TopologyBuilder, define_topic};
+# use shove::rabbitmq::RabbitMqConfig;
+# use serde::{Deserialize, Serialize};
+# #[derive(Debug, Clone, Serialize, Deserialize)]
+# struct SettlementEvent { order_id: String }
+# define_topic!(OrderSettlement, SettlementEvent, TopologyBuilder::new("x").build());
+# struct SettlementHandler;
+# impl MessageHandler<OrderSettlement> for SettlementHandler {
+#     type Context = ();
+#     async fn handle(&self, _: SettlementEvent, _: MessageMetadata, _: &()) -> Outcome { Outcome::Ack }
+# }
+# async fn run() -> Result<(), shove::ShoveError> {
+let broker = Broker::<RabbitMq>::new(RabbitMqConfig::default()).await?;
+let publisher = broker.publisher().await?;
+let audit = ShoveAuditHandler::for_publisher(&publisher);
+let handler = SettlementHandler.audited(audit);
+# Ok(()) }
 ```
 
 ## Performance
@@ -468,9 +648,11 @@ The `audit` feature is required on top of the backend flag for any `*_audited_co
 
 Full rustdoc is on [docs.rs/shove](https://docs.rs/shove):
 
+- [`Broker`](https://docs.rs/shove/latest/shove/struct.Broker.html), [`Publisher`](https://docs.rs/shove/latest/shove/struct.Publisher.html), [`TopologyDeclarer`](https://docs.rs/shove/latest/shove/struct.TopologyDeclarer.html)
+- [`ConsumerSupervisor`](https://docs.rs/shove/latest/shove/struct.ConsumerSupervisor.html), [`ConsumerGroup`](https://docs.rs/shove/latest/shove/struct.ConsumerGroup.html), [`SupervisorOutcome`](https://docs.rs/shove/latest/shove/struct.SupervisorOutcome.html)
 - [`Outcome`](https://docs.rs/shove/latest/shove/enum.Outcome.html) — what a handler returns (`Ack`, `Retry`, `Reject`, `Defer`)
 - [`TopologyBuilder`](https://docs.rs/shove/latest/shove/struct.TopologyBuilder.html) — `.hold_queue`, `.sequenced`, `.routing_shards`, `.dlq`
-- [`ConsumerOptions`](https://docs.rs/shove/latest/shove/struct.ConsumerOptions.html), [`MessageHandler`](https://docs.rs/shove/latest/shove/trait.MessageHandler.html), [`Publisher`](https://docs.rs/shove/latest/shove/trait.Publisher.html)
+- [`ConsumerOptions`](https://docs.rs/shove/latest/shove/struct.ConsumerOptions.html), [`MessageHandler`](https://docs.rs/shove/latest/shove/trait.MessageHandler.html), [`MessageHandlerExt`](https://docs.rs/shove/latest/shove/trait.MessageHandlerExt.html)
 - Per-backend modules: [`rabbitmq`](https://docs.rs/shove/latest/shove/rabbitmq/), [`sns`](https://docs.rs/shove/latest/shove/sns/), [`nats`](https://docs.rs/shove/latest/shove/nats/), [`kafka`](https://docs.rs/shove/latest/shove/kafka/), [`inmemory`](https://docs.rs/shove/latest/shove/inmemory/)
 
 Backend-specific sequenced-delivery mapping: RabbitMQ uses a consistent-hash exchange with SAC shards. SNS/SQS uses FIFO topics + `MessageGroupId`. NATS uses subject-based shard routing with `max_ack_pending: 1`. Kafka uses partition-key routing. In-process uses per-key FIFO shards (ordering enforced in-memory, no persistence, no cross-process delivery).

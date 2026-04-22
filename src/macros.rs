@@ -130,7 +130,7 @@ mod tests {
         OrderEvent,
         TopologyBuilder::new("macro-dlq")
             .dlq()
-            .hold_queue(std::time::Duration::from_secs(30))
+            .hold_queue(Duration::from_secs(30))
             .build()
     );
 

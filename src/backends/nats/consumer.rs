@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_nats::HeaderMap;
 use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
 use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
@@ -13,14 +14,16 @@ use futures_util::StreamExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::ShoveError;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::consumer::validate_message_size;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::{
@@ -57,7 +60,7 @@ fn get_retry_count(headers: &Option<HeaderMap>) -> u32 {
 }
 
 /// Extracts message metadata from a JetStream message.
-fn extract_message_metadata(msg: &async_nats::jetstream::Message) -> MessageMetadata {
+fn extract_message_metadata(msg: &Message) -> MessageMetadata {
     let retry_count = get_retry_count(&msg.headers);
 
     let delivery_id = msg
@@ -80,7 +83,7 @@ fn extract_message_metadata(msg: &async_nats::jetstream::Message) -> MessageMeta
 }
 
 /// Extracts dead message metadata from a JetStream message.
-fn extract_dead_metadata(msg: &async_nats::jetstream::Message) -> DeadMessageMetadata {
+fn extract_dead_metadata(msg: &Message) -> DeadMessageMetadata {
     let message = extract_message_metadata(msg);
 
     let reason = msg
@@ -130,7 +133,7 @@ fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
 async fn publish_to_dlq(
     client: &NatsClient,
     topology: &QueueTopology,
-    msg: &async_nats::jetstream::Message,
+    msg: &Message,
     reason: &str,
 ) -> Result<()> {
     let dlq_subject = match topology.dlq() {
@@ -182,12 +185,12 @@ async fn publish_to_dlq(
 /// Dispatches message routing based on the handler's outcome.
 async fn route_outcome(
     client: &NatsClient,
-    msg: &async_nats::jetstream::Message,
+    msg: &Message,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
     max_retries: u32,
-    hold_queues: &[crate::topology::HoldQueue],
+    hold_queues: &[HoldQueue],
 ) {
     let result: Result<()> = match outcome {
         Outcome::Ack => {
@@ -291,23 +294,21 @@ async fn route_outcome(
 // ---------------------------------------------------------------------------
 
 /// Wraps handler.handle() with optional timeout, returns Outcome::Retry on timeout.
-async fn invoke_handler<T: Topic>(
-    handler: &(impl MessageHandler<T> + ?Sized),
+async fn invoke_handler<T: Topic, H: MessageHandler<T> + ?Sized>(
+    handler: &H,
+    ctx: &H::Context,
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
 ) -> Outcome {
     match timeout {
-        Some(duration) => {
-            match tokio::time::timeout(duration, handler.handle(message, metadata)).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    tracing::warn!("handler timed out after {duration:?}, retrying");
-                    Outcome::Retry
-                }
-            }
-        }
-        None => handler.handle(message, metadata).await,
+        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!("handler timed out after {duration:?}, retrying");
+                Outcome::Retry
+            }),
+        None => handler.handle(message, metadata, ctx).await,
     }
 }
 
@@ -340,9 +341,9 @@ async fn run_with_reconnect<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
 {
-    let mut backoff = crate::retry::Backoff::default();
+    let mut backoff = Backoff::default();
     let mut attempts = 0u32;
     loop {
         match f().await {
@@ -380,6 +381,7 @@ where
 // NatsConsumer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct NatsConsumer {
     client: NatsClient,
 }
@@ -390,14 +392,37 @@ impl NatsConsumer {
     }
 }
 
-impl Consumer for NatsConsumer {
-    async fn run<T: Topic>(
+impl NatsConsumer {
+    pub async fn run<T, H>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Nats>,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
+            .await
+    }
+
+    pub(crate) async fn run_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
+        // All tasks in a consumer group bind to the same durable consumer name;
+        // the JetStream server load-balances messages across them. The registry
+        // pre-configures this consumer with an aggregate `max_ack_pending` so
+        // N pullers can actually have N × prefetch messages in flight.
         let consumer_name = super::constants::consumer_name(queue);
 
         let shutdown = options.shutdown.clone();
@@ -411,6 +436,7 @@ impl Consumer for NatsConsumer {
         let max_ack_pending = options.max_ack_pending.unwrap_or(prefetch_count as i64);
 
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         tracing::info!(
@@ -426,6 +452,7 @@ impl Consumer for NatsConsumer {
 
         run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let client = client.clone();
             let processing = processing.clone();
             let shutdown = shutdown.clone();
@@ -438,16 +465,19 @@ impl Consumer for NatsConsumer {
                     .await
                     .map_err(|e| map_get_stream_error(queue, e))?;
 
+                // `create_consumer` upserts the durable consumer — unlike
+                // `get_or_create_consumer`, which returns the pre-existing
+                // config verbatim and silently ignores the caller's config
+                // (including `max_ack_pending`). That path caused N-way
+                // parallel pullers to inherit whatever ack-budget the first
+                // registrant set, bottlenecking the whole group.
                 let pull_consumer = stream
-                    .get_or_create_consumer(
-                        &consumer_name,
-                        PullConsumerConfig {
-                            durable_name: Some(consumer_name.clone()),
-                            ack_policy: AckPolicy::Explicit,
-                            max_ack_pending,
-                            ..Default::default()
-                        },
-                    )
+                    .create_consumer(PullConsumerConfig {
+                        durable_name: Some(consumer_name.clone()),
+                        ack_policy: AckPolicy::Explicit,
+                        max_ack_pending,
+                        ..Default::default()
+                    })
                     .await
                     .map_err(|e| {
                         ShoveError::Connection(format!(
@@ -484,7 +514,7 @@ impl Consumer for NatsConsumer {
                             };
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -542,6 +572,7 @@ impl Consumer for NatsConsumer {
                             })?;
 
                             let task_handler = handler.clone();
+                            let task_ctx = ctx.clone();
                             let task_client = client.clone();
                             let task_processing = processing.clone();
                             let task_semaphore = semaphore.clone();
@@ -551,6 +582,7 @@ impl Consumer for NatsConsumer {
                             tokio::spawn(async move {
                                 let outcome = invoke_handler(
                                     task_handler.as_ref(),
+                                    task_ctx.as_ref(),
                                     payload,
                                     metadata,
                                     handler_timeout,
@@ -592,11 +624,30 @@ impl Consumer for NatsConsumer {
         .await
     }
 
-    async fn run_fifo<T: SequencedTopic>(
+    pub async fn run_fifo<T, H>(
         &self,
-        handler: impl MessageHandler<T>,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Nats>,
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
+            .await
+    }
+
+    pub(crate) async fn run_fifo_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
         options: ConsumerOptions,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
         let seq_config = topology
@@ -619,6 +670,7 @@ impl Consumer for NatsConsumer {
             .map_err(|e| map_get_stream_error(queue, e))?;
 
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         tracing::info!(
@@ -653,6 +705,7 @@ impl Consumer for NatsConsumer {
                 })?;
 
             let shard_handler = handler.clone();
+            let shard_ctx = ctx.clone();
             let shard_client = client.clone();
             let shard_shutdown = shutdown.clone();
             let shard_processing = processing.clone();
@@ -690,7 +743,7 @@ impl Consumer for NatsConsumer {
                             };
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     shard,
@@ -748,8 +801,9 @@ impl Consumer for NatsConsumer {
                             let outcome = {
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let h = shard_handler.clone();
+                                let c = shard_ctx.clone();
                                 tokio::spawn(async move {
-                                    let o = invoke_handler(h.as_ref(), payload, metadata, handler_timeout).await;
+                                    let o = invoke_handler(h.as_ref(), c.as_ref(), payload, metadata, handler_timeout).await;
                                     let _ = tx.send(o);
                                 });
                                 rx.await.unwrap_or_else(|_| {
@@ -785,7 +839,11 @@ impl Consumer for NatsConsumer {
         Ok(())
     }
 
-    async fn run_dlq<T: Topic>(&self, handler: impl MessageHandler<T>) -> Result<()> {
+    pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let dlq = topology.dlq().ok_or_else(|| {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
@@ -794,6 +852,7 @@ impl Consumer for NatsConsumer {
         let dlq_consumer_name = super::constants::dlq_consumer_name(dlq);
         let shutdown = self.client.shutdown_token();
         let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
         let client = self.client.clone();
 
         tracing::info!(
@@ -804,6 +863,7 @@ impl Consumer for NatsConsumer {
 
         run_with_reconnect(&shutdown, dlq, CONNECTION_RETRIES, || {
             let handler = handler.clone();
+            let ctx = ctx.clone();
             let client = client.clone();
             let shutdown = shutdown.clone();
             let dlq_consumer_name = dlq_consumer_name.clone();
@@ -858,10 +918,10 @@ impl Consumer for NatsConsumer {
                             };
 
                             // Discard oversized DLQ messages
-                            if msg.payload.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                            if msg.payload.len() > DEFAULT_MAX_MESSAGE_SIZE {
                                 tracing::warn!(
                                     bytes = msg.payload.len(),
-                                    max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                                    max = DEFAULT_MAX_MESSAGE_SIZE,
                                     dlq,
                                     "oversized DLQ message — discarding"
                                 );
@@ -885,7 +945,7 @@ impl Consumer for NatsConsumer {
 
                             let metadata = extract_dead_metadata(&msg);
 
-                            handler.handle_dead(payload, metadata).await;
+                            handler.handle_dead(payload, metadata, ctx.as_ref()).await;
 
                             // Always ack after handle_dead completes
                             if let Err(e) = msg.ack().await {

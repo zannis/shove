@@ -1,4 +1,5 @@
 pub mod autoscaler;
+pub mod backend;
 pub mod client;
 pub mod consumer;
 pub mod consumer_group;

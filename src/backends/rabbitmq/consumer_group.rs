@@ -2,7 +2,7 @@
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -10,11 +10,13 @@ use tokio_util::sync::CancellationToken;
 
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer_supervisor::ShutdownTally;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 ///
@@ -23,6 +25,7 @@ use crate::topic::Topic;
 type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
 /// Configuration that governs the behaviour of a [`ConsumerGroup`].
+#[derive(Clone)]
 pub struct ConsumerGroupConfig {
     pub(crate) prefetch_count: u16,
     pub(crate) min_consumers: u16,
@@ -61,10 +64,10 @@ impl ConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
-            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
-            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -129,6 +132,12 @@ impl ConsumerGroupConfig {
     }
 }
 
+impl Default for ConsumerGroupConfig {
+    fn default() -> Self {
+        Self::new(1..=4)
+    }
+}
+
 /// A named group of identical consumers all reading from the same queue.
 ///
 /// The group owns the concrete consumers and is responsible for scaling them
@@ -145,6 +154,10 @@ pub struct ConsumerGroup {
     consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
     /// Cancelling this token stops every consumer in the group at once.
     group_token: CancellationToken,
+    /// Non-retryable error count incremented by each spawned task when its
+    /// inner `run_with_inner` returns `Err`. Drained by
+    /// [`ConsumerGroup::shutdown_with_tally`].
+    error_count: Arc<AtomicUsize>,
 }
 
 impl ConsumerGroup {
@@ -165,12 +178,15 @@ impl ConsumerGroup {
         client: RabbitMqClient,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + Clone + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = RabbitMqConsumer::new(client.clone());
@@ -182,10 +198,13 @@ impl ConsumerGroup {
                     ..options
                 }
             };
+            let ec = ec_for_spawner.clone();
+            let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
+                    ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -198,6 +217,7 @@ impl ConsumerGroup {
             config,
             spawner,
             group_token,
+            error_count,
         }
     }
 
@@ -281,12 +301,31 @@ impl ConsumerGroup {
 
     /// Cancel every consumer in the group and wait for all tasks to finish.
     pub async fn shutdown(&mut self) {
+        let _ = self.shutdown_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
         info!(group = %self.name, consumers = self.consumers.len(), "shutting down consumer group");
         self.group_token.cancel();
+        let mut panics = 0usize;
         for (_token, _processing, handle) in self.consumers.drain(..) {
-            let _ = handle.await;
+            match handle.await {
+                Ok(()) => {}
+                // Defensive: shutdown is cooperative via `group_token`; no
+                // code path currently calls `JoinHandle::abort()` on these
+                // handles, so this arm is unreachable today. Mirrors the
+                // `ConsumerSupervisor` drain and keeps parity if a future
+                // timeout escalation adds `abort_all`.
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.name, "consumer task panicked");
+                    panics += 1;
+                }
+            }
         }
-        debug!(group = %self.name, "consumer group shutdown complete");
+        let errors = self.error_count.swap(0, Ordering::Relaxed);
+        debug!(group = %self.name, errors, panics, "consumer group shutdown complete");
+        ShutdownTally { errors, panics }
     }
 
     // ---- private helpers ----
@@ -294,21 +333,13 @@ impl ConsumerGroup {
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
         let processing = Arc::new(AtomicBool::new(false));
-        let options = ConsumerOptions {
-            max_retries: self.config.max_retries,
-            prefetch_count: self.config.prefetch_count,
-            shutdown: child_token.clone(),
-            processing: processing.clone(),
-            handler_timeout: self.config.handler_timeout,
-            max_pending_per_key: self.config.max_pending_per_key,
-            max_message_size: self.config.max_message_size,
-            #[cfg(feature = "rabbitmq-transactional")]
-            exactly_once: false,
-            #[cfg(feature = "aws-sns-sqs")]
-            receive_batch_size: 0,
-            #[cfg(feature = "nats")]
-            max_ack_pending: None,
-        };
+        let mut options = ConsumerOptions::defaults_with_shutdown(child_token.clone());
+        options.max_retries = self.config.max_retries;
+        options.prefetch_count = self.config.prefetch_count;
+        options.processing = processing.clone();
+        options.handler_timeout = self.config.handler_timeout;
+        options.max_pending_per_key = self.config.max_pending_per_key;
+        options.max_message_size = self.config.max_message_size;
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned consumer");
@@ -336,6 +367,7 @@ mod tests {
             config,
             spawner,
             group_token,
+            error_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -575,10 +607,7 @@ mod tests {
         let config = ConsumerGroupConfig::new(1..=4);
         assert_eq!(config.prefetch_count(), 10);
         assert_eq!(config.max_retries(), 10);
-        assert_eq!(
-            config.handler_timeout(),
-            Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT)
-        );
+        assert_eq!(config.handler_timeout(), Some(DEFAULT_HANDLER_TIMEOUT));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::topology::{QueueTopology, TopologyDeclarer};
+use crate::topology::QueueTopology;
 
 use super::client::InMemoryBroker;
 
@@ -20,8 +20,8 @@ impl InMemoryTopologyDeclarer {
     }
 }
 
-impl TopologyDeclarer for InMemoryTopologyDeclarer {
-    async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+impl InMemoryTopologyDeclarer {
+    pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         if let Some(seq) = topology.sequencing() {
             for shard in 0..seq.routing_shards() {
                 let shard_name = Self::shard_queue_name(topology.queue(), shard);

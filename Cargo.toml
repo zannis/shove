@@ -1,6 +1,6 @@
 [package]
 name = "shove"
-version = "0.7.4"
+version = "0.8.0"
 description = "Async tasks via pubsub on steroids. Comes with built-in support for complex queue configurations, audit logs, autoscaling consumer groups and more."
 edition = "2024"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
@@ -8,6 +8,9 @@ license = "MIT"
 repository = "https://github.com/zannis/shove"
 keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
 categories = ["asynchronous"]
+
+[lints.clippy]
+absolute-paths = "deny"
 
 [features]
 default = []
@@ -33,7 +36,7 @@ audit = []
 nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
 
 # Apache Kafka pubsub
-kafka = ["dep:rdkafka"]
+kafka = ["dep:rdkafka", "dep:futures-util"]
 
 # In-process backend
 inmemory = ["dep:dashmap"]
@@ -50,7 +53,7 @@ chrono = { version = "0.4", features = ["serde"] }
 lapin = { version = "4", features = ["rustls--ring"], optional = true }
 futures-lite = { version = "2", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
-aws-config = { version = "1.8.15", features = ["behavior-version-latest"], optional = true }
+aws-config = { version = "1.8.16", features = ["behavior-version-latest"], optional = true }
 aws-sdk-sns = { version = "1", optional = true }
 aws-sdk-sqs = { version = "1", optional = true }
 rand = "0.10"

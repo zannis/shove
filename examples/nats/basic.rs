@@ -1,20 +1,20 @@
 //! Basic NATS JetStream publish/consume example.
 //!
-//! Run: cargo run -q --example nats_basic --features nats
-//! Requires: NATS server with JetStream enabled at localhost:4222
+//! Spins up a NATS JetStream testcontainer automatically (requires a running
+//! Docker daemon):
+//!
+//!     cargo run -q --example nats_basic --features nats
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::Topic;
-use shove::consumer::{Consumer, ConsumerOptions};
-use shove::handler::MessageHandler;
-use shove::metadata::MessageMetadata;
-use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsPublisher, NatsTopologyDeclarer};
-use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{TopologyBuilder, TopologyDeclarer};
-use tokio_util::sync::CancellationToken;
+use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
+use shove::{
+    Broker, ConsumerGroupConfig, MessageHandler, MessageMetadata, Nats, Outcome, TopologyBuilder,
+};
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderCreated {
@@ -35,7 +35,8 @@ shove::define_topic!(
 struct OrderHandler;
 
 impl MessageHandler<OrderTopic> for OrderHandler {
-    async fn handle(&self, message: OrderCreated, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, message: OrderCreated, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "Processing order {} (${:.2}) [retry={}]",
             message.order_id, message.amount, metadata.retry_count
@@ -48,15 +49,16 @@ impl MessageHandler<OrderTopic> for OrderHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = NatsConfig::new("nats://localhost:4222");
-    let client = NatsClient::connect(&config).await?;
+    let cmd = NatsServerCmd::default().with_jetstream();
+    let container = NatsImage::default().with_cmd(&cmd).start().await?;
+    let port = container.get_host_port_ipv4(4222).await?;
+    let url = format!("nats://localhost:{port}");
 
-    // Declare topology
-    let declarer = NatsTopologyDeclarer::new(client.clone());
-    declarer.declare(OrderTopic::topology()).await?;
+    let broker = Broker::<Nats>::new(NatsConfig::new(&url)).await?;
+    broker.topology().declare::<OrderTopic>().await?;
 
     // Publish
-    let publisher = NatsPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
     for i in 0..3 {
         publisher
             .publish::<OrderTopic>(&OrderCreated {
@@ -67,19 +69,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Published order ORD-{i}");
     }
 
-    // Consume
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        shutdown_clone.cancel();
-    });
+    // Consume via a coordinated consumer group.
+    let mut group = broker.consumer_group();
+    group
+        .register::<OrderTopic, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::new(1..=1)),
+            || OrderHandler,
+        )
+        .await?;
 
-    let consumer = NatsConsumer::new(client.clone());
-    let options = ConsumerOptions::new(shutdown);
-    consumer.run::<OrderTopic>(OrderHandler, options).await?;
+    let outcome = group
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
 
-    client.shutdown().await;
     println!("Done.");
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

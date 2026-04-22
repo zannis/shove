@@ -11,11 +11,12 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+use crate::backend::PublisherImpl;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
@@ -240,8 +241,8 @@ impl RabbitMqPublisher {
     }
 }
 
-impl Publisher for RabbitMqPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl RabbitMqPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
 
@@ -258,7 +259,7 @@ impl Publisher for RabbitMqPublisher {
         }
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
@@ -284,7 +285,7 @@ impl Publisher for RabbitMqPublisher {
         }
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         let topology = T::topology();
         let sequencing = topology.sequencing();
         let key_fn = T::SEQUENCE_KEY_FN;
@@ -320,6 +321,27 @@ impl Publisher for RabbitMqPublisher {
                 self.publish_batch_raw("", &items).await
             }
         }
+    }
+}
+
+impl PublisherImpl for RabbitMqPublisher {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+        RabbitMqPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        RabbitMqPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl Future<Output = Result<()>> + Send {
+        RabbitMqPublisher::publish_batch::<T>(self, msgs)
     }
 }
 

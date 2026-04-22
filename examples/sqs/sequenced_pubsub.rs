@@ -3,6 +3,10 @@
 //! Demonstrates: `define_sequenced_topic!`, `SequenceFailure::Skip` vs
 //! `SequenceFailure::FailAll`, `run_fifo`, and custom `routing_shards`.
 //!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` wrappers — this example
+//! therefore keeps using the backend-specific `SqsConsumer::run_fifo` directly.
+//!
 //! Each handler sums the `amount_cents` of successfully processed messages per
 //! account. After shutdown the totals are compared against expected values to
 //! verify that the failure policies work correctly.
@@ -17,18 +21,24 @@
 //!   FailAll: ACC-A = 100+200         = 300   (seq 3 + subsequent DLQ'd)
 //!            ACC-B = 50+100+150      = 300   (independent key, unaffected)
 //!
-//! Requires a running LocalStack instance (see docker-compose.yml):
+//! Spins up a LocalStack testcontainer automatically. Requires a running
+//! Docker daemon and the `LOCALSTACK_AUTH_TOKEN` environment variable:
 //!
-//!     docker compose up -d
-//!     cargo run --example sqs_sequenced_pubsub --features aws-sns-sqs
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run --example sqs_sequenced_pubsub --features aws-sns-sqs
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use shove::sns::*;
-use shove::*;
+use shove::sns::{SnsClient, SnsConfig, SnsPublisher, SnsTopologyDeclarer, SqsConsumer};
+use shove::{
+    ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure, SequencedTopic,
+    Sqs, Topic, TopologyBuilder, define_sequenced_topic,
+};
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -43,8 +53,6 @@ struct LedgerEntry {
 
 // ─── Topic definitions ──────────────────────────────────────────────────────
 
-// Skip policy: if one entry fails, DLQ it and continue the sequence.
-// Good for independent events that happen to need ordering (e.g. audit logs).
 define_sequenced_topic!(
     SkipLedger,
     LedgerEntry,
@@ -57,8 +65,6 @@ define_sequenced_topic!(
         .build()
 );
 
-// FailAll policy: if one entry fails, DLQ it AND all subsequent entries for
-// the same key. Good for causally dependent sequences (e.g. financial ledger).
 define_sequenced_topic!(
     StrictLedger,
     LedgerEntry,
@@ -75,15 +81,14 @@ define_sequenced_topic!(
 
 type Totals = Arc<Mutex<HashMap<String, i64>>>;
 
-// Rejects ACC-A seq 3 to demonstrate failure policies.
-// Sums amount_cents per account for successfully acked messages.
 struct LedgerHandler {
     label: &'static str,
     totals: Totals,
 }
 
 impl MessageHandler<SkipLedger> for LedgerHandler {
-    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(Duration::from_millis(50)).await;
         println!(
             "[{}] account={} seq={} amount={} attempt={}",
@@ -104,7 +109,8 @@ impl MessageHandler<SkipLedger> for LedgerHandler {
 }
 
 impl MessageHandler<StrictLedger> for LedgerHandler {
-    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: LedgerEntry, metadata: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(Duration::from_millis(50)).await;
         println!(
             "[{}] account={} seq={} amount={} attempt={}",
@@ -129,48 +135,49 @@ impl MessageHandler<StrictLedger> for LedgerHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_localstack() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
-        _ => {
-            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "LOCALSTACK_AUTH_TOKEN is not set. This example requires a LocalStack Pro auth \
+                 token:\n\n    export LOCALSTACK_AUTH_TOKEN=...\n"
+            );
             std::process::exit(1);
         }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_localstack();
+    };
 
     // SAFETY: called before any concurrent env access in this process.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
     }
+
+    let container = LocalStack::default()
+        .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+        .start()
+        .await?;
+    let port = container.get_host_port_ipv4(4566).await?;
+    let endpoint = format!("http://localhost:{port}");
 
     let config = SnsConfig {
         region: Some("us-east-1".into()),
-        endpoint_url: Some("http://localhost:4566".into()),
+        endpoint_url: Some(endpoint),
     };
     let client = SnsClient::new(&config).await?;
 
-    // ── Registries ──
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
-
     // ── Declare topologies ──
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
-    declare_topic::<SkipLedger>(&declarer).await?;
-    declare_topic::<StrictLedger>(&declarer).await?;
+    // The declarer reads the client-owned topic/queue registries shared with
+    // every publisher and consumer built from the same client.
+    let declarer = SnsTopologyDeclarer::new(client.clone());
+    declarer.declare(SkipLedger::topology()).await?;
+    declarer.declare(StrictLedger::topology()).await?;
     println!("sequenced topologies declared\n");
 
     // ── Publish ordered entries for account ACC-A ──
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = SnsPublisher::new(client.clone(), client.topic_registry().clone());
 
     for seq in 1..=5 {
         let entry = LedgerEntry {
@@ -183,7 +190,6 @@ async fn main() -> Result<(), ShoveError> {
     }
     println!("published 5 entries per topic for ACC-A");
 
-    // Also publish for an independent account to show cross-key concurrency.
     for seq in 1..=3 {
         let entry = LedgerEntry {
             account_id: "ACC-B".into(),
@@ -203,7 +209,7 @@ async fn main() -> Result<(), ShoveError> {
 
     let s = shutdown.clone();
     let c = client.clone();
-    let qr = queue_registry.clone();
+    let qr = client.queue_registry().clone();
     let t = skip_totals.clone();
     let skip_task = tokio::spawn(async move {
         let handler = LedgerHandler {
@@ -211,9 +217,11 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         SqsConsumer::new(c, qr)
-            .run_fifo::<SkipLedger>(
+            .run_fifo::<SkipLedger, _>(
                 handler,
-                ConsumerOptions::new(s)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(s)
                     .with_max_retries(2)
                     .with_prefetch_count(8),
             )
@@ -222,7 +230,7 @@ async fn main() -> Result<(), ShoveError> {
 
     let s = shutdown.clone();
     let c = client.clone();
-    let qr = queue_registry.clone();
+    let qr = client.queue_registry().clone();
     let t = strict_totals.clone();
     let strict_task = tokio::spawn(async move {
         let handler = LedgerHandler {
@@ -230,9 +238,11 @@ async fn main() -> Result<(), ShoveError> {
             totals: t,
         };
         SqsConsumer::new(c, qr)
-            .run_fifo::<StrictLedger>(
+            .run_fifo::<StrictLedger, _>(
                 handler,
-                ConsumerOptions::new(s)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(s)
                     .with_max_retries(2)
                     .with_prefetch_count(8),
             )
@@ -285,5 +295,6 @@ async fn main() -> Result<(), ShoveError> {
         "strict ACC-B"
     );
 
+    drop(container);
     Ok(())
 }

@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
-use crate::consumer::{Consumer, ConsumerOptions};
+use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::topology::TopologyDeclarer;
+use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
@@ -24,6 +25,7 @@ pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send +
 // KafkaConsumerGroupConfig
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct KafkaConsumerGroupConfig {
     prefetch_count: u16,
     min_consumers: u16,
@@ -33,6 +35,15 @@ pub struct KafkaConsumerGroupConfig {
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
+}
+
+impl Default for KafkaConsumerGroupConfig {
+    /// A single consumer, default tuning. Matches the defaults baked into
+    /// `KafkaConsumerGroupConfig::new(1..=1)`. Mirrors the
+    /// `HasCoordinatedGroups::ConsumerGroupConfig: Default` bound.
+    fn default() -> Self {
+        Self::new(1..=1)
+    }
 }
 
 impl KafkaConsumerGroupConfig {
@@ -53,10 +64,10 @@ impl KafkaConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
-            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
-            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -119,6 +130,7 @@ pub struct KafkaConsumerGroup {
     pub(crate) spawner: Spawner,
     pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
     pub(crate) group_token: CancellationToken,
+    pub(crate) error_count: Arc<AtomicUsize>,
 }
 
 impl KafkaConsumerGroup {
@@ -128,12 +140,15 @@ impl KafkaConsumerGroup {
         client: KafkaClient,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Self
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + Clone + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
             let consumer = KafkaConsumer::new(client.clone());
@@ -145,10 +160,13 @@ impl KafkaConsumerGroup {
                     ..options
                 }
             };
+            let ec = ec_for_spawner.clone();
+            let ctx = ctx.clone();
 
             tokio::spawn(async move {
-                let result = consumer.run::<T>(handler, options).await;
+                let result = consumer.run_with_inner::<T, H>(handler, ctx, options).await;
                 if let Err(e) = result {
+                    ec.fetch_add(1, Ordering::Relaxed);
                     tracing::error!("consumer task exited with error: {e}");
                 }
             })
@@ -160,6 +178,7 @@ impl KafkaConsumerGroup {
             config,
             spawner,
             group_token,
+            error_count,
         }
     }
 
@@ -233,32 +252,47 @@ impl KafkaConsumerGroup {
     }
 
     pub async fn shutdown(&mut self) {
+        let _ = self.shutdown_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
         info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
         self.group_token.cancel();
+        let mut panics = 0usize;
         for (_token, _processing, handle) in self.consumers.drain(..) {
-            let _ = handle.await;
+            match handle.await {
+                Ok(()) => {}
+                // Defensive: shutdown is cooperative via `group_token`; no
+                // code path currently calls `JoinHandle::abort()` on these
+                // handles, so this arm is unreachable today. Mirrors the
+                // `ConsumerSupervisor` drain and keeps parity if a future
+                // timeout escalation adds `abort_all`.
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
+                    panics += 1;
+                }
+            }
         }
-        debug!(group = %self.queue, "consumer group shutdown complete");
+        let errors = self.error_count.swap(0, Ordering::Relaxed);
+        debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
+        ShutdownTally { errors, panics }
     }
 
     fn spawn_one(&mut self) {
         let child_token = self.group_token.child_token();
         let processing = Arc::new(AtomicBool::new(false));
-        let mut options = ConsumerOptions::new(child_token.clone())
-            .with_max_retries(self.config.max_retries)
-            .with_prefetch_count(self.config.prefetch_count);
+        let mut options = ConsumerOptions::defaults_with_shutdown(child_token.clone());
+        options.max_retries = self.config.max_retries;
+        options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
         if let Some(timeout) = self.config.handler_timeout {
-            options = options.with_handler_timeout(timeout);
+            options.handler_timeout = Some(timeout);
         }
         if let Some(limit) = self.config.max_pending_per_key {
-            options = options.with_max_pending_per_key(limit);
+            options.max_pending_per_key = Some(limit);
         }
-        if let Some(max) = self.config.max_message_size {
-            options = options.with_max_message_size(max);
-        } else {
-            options = options.without_message_size_limit();
-        }
+        options.max_message_size = self.config.max_message_size;
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
@@ -291,14 +325,26 @@ impl KafkaConsumerGroupRegistry {
         }
     }
 
+    /// Return the client's shutdown token.
+    ///
+    /// Used by `RegistryImpl::cancellation_token` and `run_until_timeout`
+    /// to coordinate graceful shutdown with the broker's lifecycle.
+    pub(crate) fn client_shutdown_token(&self) -> CancellationToken {
+        self.client
+            .as_ref()
+            .map(|c| c.shutdown_token())
+            .unwrap_or_default()
+    }
+
     pub async fn register<T, H>(
         &mut self,
         config: KafkaConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + Clone + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -325,6 +371,7 @@ impl KafkaConsumerGroupRegistry {
             client.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())
@@ -346,14 +393,24 @@ impl KafkaConsumerGroupRegistry {
     }
 
     pub async fn shutdown_all(&mut self) {
+        let _ = self.shutdown_all_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
+        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            group.shutdown().await;
+            tally.add(group.shutdown_with_tally().await);
         }
-        debug!("all consumer groups shut down");
+        debug!(
+            errors = tally.errors,
+            panics = tally.panics,
+            "all consumer groups shut down"
+        );
+        tally
     }
 }
 
@@ -379,6 +436,7 @@ mod tests {
             config,
             spawner,
             group_token,
+            error_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 

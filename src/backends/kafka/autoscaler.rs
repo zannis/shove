@@ -268,8 +268,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use crate::backend::ConsumerOptionsInner as ConsumerOptions;
     use crate::backends::kafka::consumer_group::{KafkaConsumerGroup, KafkaConsumerGroupConfig};
-    use crate::consumer::ConsumerOptions;
     use tokio_util::sync::CancellationToken;
 
     struct MockKafkaStatsProvider {
@@ -313,6 +313,7 @@ mod tests {
             config,
             spawner,
             group_token,
+            error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if started {
             group.start();

@@ -1,10 +1,27 @@
 //! Integration tests for the SNS/SQS pub-sub backend.
 //!
+//! Uses `Broker<Sqs>` + `Publisher<Sqs>` + `TopologyDeclarer<Sqs>` +
+//! `ConsumerSupervisor<Sqs>`. SQS does **not** implement
+//! `HasCoordinatedGroups`, so tests that exercise the SQS-specific
+//! `SqsConsumerGroup[Registry]` / `SqsAutoscalerBackend` plumbing use those
+//! types directly — they share the same client-owned registries as the
+//! broker.
+//!
+//! All registries are owned by `SnsClient` and reachable via
+//! `client.topic_registry()` / `client.queue_registry()`. Publishers,
+//! declarers, consumer groups, and tests all read from the same state, so a
+//! single `broker.topology().declare::<T>()` call is enough to make ARNs
+//! visible everywhere.
+//!
 //! Each test spins up a fresh LocalStack container via testcontainers, runs
 //! the test, and drops the container on completion (automatic cleanup).
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
+use aws_sdk_sqs::types::Message;
+use shove::Broker;
+use shove::Sqs;
+use shove::publisher::Publisher as PublisherV2;
 use shove::sns::{SqsQueueStatsProviderTrait, *};
 use shove::*;
 use std::collections::HashMap;
@@ -17,7 +34,7 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -69,6 +86,32 @@ impl WaitableCounter {
 // Test harness
 // ---------------------------------------------------------------------------
 
+/// Poll SNS and SQS against the LocalStack endpoint until both respond, or
+/// panic after 30s. Eliminates dispatch-failure flakes when the container is
+/// booted concurrently with other tests and the services aren't yet routable.
+async fn wait_for_localstack_ready(endpoint_url: &str) {
+    let aws_config = aws_config::from_env()
+        .region(aws_config::Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .load()
+        .await;
+    let sns = aws_sdk_sns::Client::new(&aws_config);
+    let sqs = aws_sdk_sqs::Client::new(&aws_config);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let sns_ok = sns.list_topics().send().await.is_ok();
+        let sqs_ok = sqs.list_queues().send().await.is_ok();
+        if sns_ok && sqs_ok {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("LocalStack services not ready within 30s at {endpoint_url}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 struct TestBroker {
     #[allow(dead_code)]
     container: testcontainers::ContainerAsync<LocalStack>,
@@ -100,8 +143,7 @@ impl TestBroker {
 
         let endpoint_url = format!("http://localhost:{port}");
 
-        // Give LocalStack a moment to finish initializing SNS/SQS services
-        sleep(Duration::from_secs(1)).await;
+        wait_for_localstack_ready(&endpoint_url).await;
 
         Self {
             container,
@@ -133,7 +175,7 @@ impl TestBroker {
         queue_url: &str,
         expected_count: usize,
         timeout: Duration,
-    ) -> Vec<aws_sdk_sqs::types::Message> {
+    ) -> Vec<Message> {
         let deadline = Instant::now() + timeout;
         let mut all_messages = Vec::new();
 
@@ -159,12 +201,22 @@ impl TestBroker {
 // ---------------------------------------------------------------------------
 // TestSetup — creates a fully wired SNS/SQS setup
 // ---------------------------------------------------------------------------
+//
+// Exposes:
+//   - `sns_client` — raw client for bespoke consumer construction; owns the
+//     single topic/queue registry shared with every publisher, declarer,
+//     and consumer group built from the same client
+//   - `broker`     — `Broker<Sqs>::from_client(sns_client.clone())`
+//   - `publisher`  — `Publisher<Sqs>` built via `broker.publisher()`
+//
+// `topic_registry()` / `queue_registry()` accessors forward to the
+// client-owned registries so tests can look up ARNs/URLs without maintaining
+// a divergent copy.
 
 struct TestSetup {
     sns_client: SnsClient,
-    topic_registry: Arc<TopicRegistry>,
-    queue_registry: Arc<QueueRegistry>,
-    publisher: SnsPublisher,
+    broker: Broker<Sqs>,
+    publisher: PublisherV2<Sqs>,
 }
 
 impl TestSetup {
@@ -175,31 +227,32 @@ impl TestSetup {
             .await
             .expect("failed to create SNS client");
 
-        let topic_registry = Arc::new(TopicRegistry::new());
-        let queue_registry = Arc::new(QueueRegistry::new());
-
-        let publisher = SnsPublisher::new(sns_client.clone(), topic_registry.clone());
+        let broker = Broker::<Sqs>::from_client(sns_client.clone());
+        let publisher = broker.publisher().await.expect("publisher construction");
 
         Self {
             sns_client,
-            topic_registry,
-            queue_registry,
+            broker,
             publisher,
         }
     }
 
-    /// Returns an `SnsTopologyDeclarer` with queue registry attached.
-    fn declarer(&self) -> SnsTopologyDeclarer {
-        SnsTopologyDeclarer::new(self.sns_client.clone(), self.topic_registry.clone())
-            .with_queue_registry(self.queue_registry.clone())
+    fn topic_registry(&self) -> &Arc<TopicRegistry> {
+        self.sns_client.topic_registry()
     }
 
-    /// Declare the full topology for topic `T`.
+    fn queue_registry(&self) -> &Arc<QueueRegistry> {
+        self.sns_client.queue_registry()
+    }
+
+    /// Declare the full topology for topic `T` via the broker. SNS/SQS
+    /// topology creation is idempotent so this is safe to call repeatedly.
     async fn declare<T: Topic>(&self) {
-        self.declarer()
-            .declare(T::topology())
+        self.broker
+            .topology()
+            .declare::<T>()
             .await
-            .expect("topology declaration should succeed");
+            .expect("broker topology declaration should succeed");
     }
 }
 
@@ -278,7 +331,8 @@ define_sequenced_topic!(
 struct FixedOutcomeHandler(Outcome);
 
 impl MessageHandler<WorkTopic> for FixedOutcomeHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.0.clone()
     }
 }
@@ -306,14 +360,16 @@ impl CountingHandler {
 }
 
 impl MessageHandler<WorkTopic> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
         Outcome::Ack
     }
 }
 
 impl MessageHandler<NoDlqTopic> for CountingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
         Outcome::Ack
     }
@@ -336,7 +392,8 @@ impl RetryThenAckHandler {
 }
 
 impl MessageHandler<WorkTopic> for RetryThenAckHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.attempt_counter.get();
         self.attempt_counter.increment();
         if attempt < self.retry_until {
@@ -368,7 +425,8 @@ impl SlowHandler {
 }
 
 impl MessageHandler<WorkTopic> for SlowHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         tokio::time::sleep(self.delay).await;
         self.counter.increment();
         Outcome::Ack
@@ -400,7 +458,8 @@ impl OrderRecordingHandler {
 }
 
 impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.records.lock().await.push((msg.order_id, msg.amount));
         self.counter.increment();
         Outcome::Ack
@@ -408,7 +467,8 @@ impl MessageHandler<SeqSkipTopic> for OrderRecordingHandler {
 }
 
 impl MessageHandler<SeqFailAllTopic> for OrderRecordingHandler {
-    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.records.lock().await.push((msg.order_id, msg.amount));
         self.counter.increment();
         Outcome::Ack
@@ -438,11 +498,12 @@ impl DlqRecordingHandler {
 }
 
 impl MessageHandler<WorkTopic> for DlqRecordingHandler {
-    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
     }
 
-    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, _msg: SimpleMessage, _meta: DeadMessageMetadata, _: &()) {
         self.counter.increment();
     }
 }
@@ -453,17 +514,18 @@ impl MessageHandler<WorkTopic> for DlqRecordingHandler {
 
 #[tokio::test]
 async fn client_connect_and_shutdown() {
-    let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
+    let tb = TestBroker::start().await;
+    let client = SnsClient::new(&tb.sns_config())
         .await
         .expect("client should connect");
+    let broker = Broker::<Sqs>::from_client(client.clone());
 
     assert!(
         !client.shutdown_token().is_cancelled(),
         "shutdown token should not be cancelled before shutdown"
     );
 
-    client.shutdown().await;
+    broker.close().await;
 
     assert!(
         client.shutdown_token().is_cancelled(),
@@ -473,15 +535,16 @@ async fn client_connect_and_shutdown() {
 
 #[tokio::test]
 async fn client_shutdown_cancels_token() {
-    let broker = TestBroker::start().await;
-    let client = SnsClient::new(&broker.sns_config())
+    let tb = TestBroker::start().await;
+    let client = SnsClient::new(&tb.sns_config())
         .await
         .expect("client should connect");
+    let broker = Broker::<Sqs>::from_client(client.clone());
 
     let token = client.shutdown_token();
     assert!(!token.is_cancelled());
 
-    client.shutdown().await;
+    broker.close().await;
     assert!(token.is_cancelled());
 }
 
@@ -496,21 +559,21 @@ async fn topology_declares_standard_queue_and_dlq() {
     setup.declare::<WorkTopic>().await;
 
     let main_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work")
         .await
         .expect("main queue URL should be registered");
     assert!(!main_url.is_empty());
 
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should be registered");
     assert!(!dlq_url.is_empty());
 
     let arn = setup
-        .topic_registry
+        .topic_registry()
         .get("sqs-work")
         .await
         .expect("topic ARN should be registered");
@@ -524,7 +587,7 @@ async fn topology_declares_fifo_shard_queues() {
     setup.declare::<SeqSkipTopic>().await;
 
     let arn = setup
-        .topic_registry
+        .topic_registry()
         .get("sqs-seq-skip")
         .await
         .expect("FIFO topic ARN should be registered");
@@ -533,7 +596,7 @@ async fn topology_declares_fifo_shard_queues() {
     for i in 0..2 {
         let shard_name = format!("sqs-seq-skip-seq-{i}");
         let url = setup
-            .queue_registry
+            .queue_registry()
             .get(&shard_name)
             .await
             .unwrap_or_else(|| panic!("shard queue '{shard_name}' should be registered"));
@@ -541,7 +604,7 @@ async fn topology_declares_fifo_shard_queues() {
     }
 
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-seq-skip-dlq")
         .await
         .expect("DLQ for sequenced topic should be registered");
@@ -557,7 +620,7 @@ async fn topology_idempotent_with_queues() {
     setup.declare::<WorkTopic>().await;
 
     let url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work")
         .await
         .expect("queue should still be registered");
@@ -590,12 +653,15 @@ async fn publish_and_consume_simple_message() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(shutdown_clone).with_prefetch_count(1),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown_clone)
+                    .with_prefetch_count(1),
             )
             .await
     });
@@ -615,7 +681,8 @@ async fn publish_and_consume_with_headers() {
     struct HeaderCapture(Arc<Mutex<HashMap<String, String>>>);
 
     impl MessageHandler<WorkTopic> for HeaderCapture {
-        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
             *self.0.lock().await = meta.headers;
             Outcome::Ack
         }
@@ -645,12 +712,15 @@ async fn publish_and_consume_with_headers() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(shutdown_clone).with_prefetch_count(1),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown_clone)
+                    .with_prefetch_count(1),
             )
             .await
     });
@@ -705,12 +775,15 @@ async fn publish_and_consume_batch() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(shutdown_clone).with_prefetch_count(10),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown_clone)
+                    .with_prefetch_count(10),
             )
             .await
     });
@@ -749,12 +822,14 @@ async fn rejected_message_lands_in_dlq() {
     let shutdown = CancellationToken::new();
     let shutdown_clone = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(shutdown_clone)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown_clone)
                     .with_prefetch_count(1)
                     .with_max_retries(1),
             )
@@ -763,7 +838,7 @@ async fn rejected_message_lands_in_dlq() {
 
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -803,12 +878,14 @@ async fn dlq_consumer_handles_dead_message() {
     let shutdown1 = CancellationToken::new();
     let shutdown1_clone = shutdown1.clone();
 
-    let consumer1 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer1 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle1 = tokio::spawn(async move {
         consumer1
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 reject_handler,
-                ConsumerOptions::new(shutdown1_clone)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(shutdown1_clone)
                     .with_prefetch_count(1)
                     .with_max_retries(1),
             )
@@ -818,7 +895,7 @@ async fn dlq_consumer_handles_dead_message() {
     // Wait for message to reach DLQ
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -855,8 +932,12 @@ async fn dlq_consumer_handles_dead_message() {
     let dlq_handler = DlqRecordingHandler::new();
     let dlq_handler_clone = dlq_handler.clone();
 
-    let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
-    let h2 = tokio::spawn(async move { consumer2.run_dlq::<WorkTopic>(dlq_handler_clone).await });
+    let consumer2 = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let h2 = tokio::spawn(async move {
+        consumer2
+            .run_dlq::<WorkTopic, _>(dlq_handler_clone, ())
+            .await
+    });
 
     let reached = dlq_handler.wait_for_count(1, Duration::from_secs(15)).await;
 
@@ -893,12 +974,14 @@ async fn retry_then_ack_succeeds() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -940,12 +1023,14 @@ async fn max_retries_sends_to_dlq() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(2)
                     .with_prefetch_count(1),
             )
@@ -954,7 +1039,7 @@ async fn max_retries_sends_to_dlq() {
 
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -981,7 +1066,8 @@ async fn defer_redelivers_message() {
     struct DeferThenAck(Arc<AtomicU32>);
 
     impl MessageHandler<WorkTopic> for DeferThenAck {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let prev = self.0.fetch_add(1, Ordering::Relaxed);
             if prev == 0 {
                 Outcome::Defer
@@ -1011,12 +1097,14 @@ async fn defer_redelivers_message() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -1076,12 +1164,15 @@ async fn concurrent_consume_processes_all_messages() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(10),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
             )
             .await
     });
@@ -1116,12 +1207,14 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(1)
                     .with_prefetch_count(5),
             )
@@ -1130,7 +1223,7 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
 
     let sqs_client = broker.sqs_client().await;
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should exist");
@@ -1173,12 +1266,15 @@ async fn concurrent_consume_graceful_shutdown_drains_inflight() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(3),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(3),
             )
             .await
     });
@@ -1211,7 +1307,8 @@ async fn handler_timeout_triggers_retry() {
     }
 
     impl MessageHandler<WorkTopic> for InvocationCountingSlowHandler {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.count.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(self.delay).await;
             Outcome::Ack
@@ -1243,12 +1340,14 @@ async fn handler_timeout_triggers_retry() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_handler_timeout(Duration::from_millis(200))
                     .with_max_retries(5),
             )
@@ -1308,12 +1407,15 @@ async fn sequenced_consume_preserves_order() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(10),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
             )
             .await
     });
@@ -1343,7 +1445,8 @@ async fn sequenced_skip_continues_after_rejection() {
     }
 
     impl MessageHandler<SeqSkipTopic> for SkipRejectHandler {
-        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             if msg.amount == 2 {
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.signal.notify_waiters();
@@ -1385,12 +1488,14 @@ async fn sequenced_skip_continues_after_rejection() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_prefetch_count(10)
                     .with_max_retries(1),
             )
@@ -1398,7 +1503,7 @@ async fn sequenced_skip_continues_after_rejection() {
     });
 
     // Wait for at least 2 acked records (amounts 1 and 3)
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if records.lock().await.len() >= 2 {
                 break;
@@ -1433,7 +1538,8 @@ async fn sequenced_failall_poisons_key() {
     }
 
     impl MessageHandler<SeqFailAllTopic> for FailAllRejectHandler {
-        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             if msg.amount == 2 {
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.signal.notify_waiters();
@@ -1475,12 +1581,14 @@ async fn sequenced_failall_poisons_key() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqFailAllTopic>(
+            .run_fifo::<SeqFailAllTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_prefetch_count(10)
                     .with_max_retries(1),
             )
@@ -1554,12 +1662,15 @@ async fn sequenced_multiple_keys_processed_concurrently() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(10),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
             )
             .await
     });
@@ -1623,12 +1734,15 @@ async fn fifo_topic_deduplicates_identical_payloads() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc).with_prefetch_count(5),
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(5),
             )
             .await
     });
@@ -1683,7 +1797,7 @@ async fn stats_provider_fetches_queue_depth() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let stats = provider
         .get_queue_stats("sqs-work")
         .await
@@ -1703,7 +1817,7 @@ async fn stats_provider_missing_queue_errors() {
     // Do NOT declare any topology — queue_registry is empty.
 
     let provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let result = provider.get_queue_stats("nonexistent-queue").await;
 
     assert!(
@@ -1750,9 +1864,10 @@ async fn consumer_group_processes_messages() {
         "sqs-work",
         config,
         setup.sns_client.clone(),
-        setup.queue_registry.clone(),
+        setup.queue_registry().clone(),
         group_token.clone(),
         move || template_handler.clone(),
+        (),
     );
 
     group.start();
@@ -1784,9 +1899,10 @@ async fn consumer_group_scales_up_and_down() {
         "sqs-work",
         config,
         setup.sns_client.clone(),
-        setup.queue_registry.clone(),
+        setup.queue_registry().clone(),
         group_token.clone(),
         CountingHandler::new,
+        (),
     );
 
     group.start();
@@ -1841,26 +1957,34 @@ async fn registry_register_declares_topology_and_starts() {
 
     let config = SqsConsumerGroupConfig::new(1..=2).with_prefetch_count(5);
 
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     registry
-        .register::<WorkTopic, CountingHandler>(config, move || template_handler.clone())
+        .register::<WorkTopic, CountingHandler>(config, move || template_handler.clone(), ())
         .await
         .expect("register should succeed");
 
-    // Topology should now be declared.
+    // Topology should now be declared on the external registries (populated
+    // by `SqsConsumerGroupRegistry.register`).
     assert!(
-        setup.topic_registry.get("sqs-work").await.is_some(),
+        setup.topic_registry().get("sqs-work").await.is_some(),
         "topic_registry should have 'sqs-work' entry"
     );
     assert!(
-        setup.queue_registry.get("sqs-work").await.is_some(),
+        setup.queue_registry().get("sqs-work").await.is_some(),
         "queue_registry should have 'sqs-work' entry"
     );
+
+    // `setup.publisher` (a `Publisher<Sqs>`) resolves ARNs against the
+    // client-owned registry, which the registry above did NOT populate.
+    // Declare through the broker to populate it — SNS topic creation is
+    // idempotent.
+    setup
+        .broker
+        .topology()
+        .declare::<WorkTopic>()
+        .await
+        .expect("broker topology declaration should succeed");
 
     // Publish 1 message before starting.
     let msg = SimpleMessage {
@@ -1893,22 +2017,18 @@ async fn registry_duplicate_registration_fails() {
 
     let config = SqsConsumerGroupConfig::new(1..=2);
 
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     // First registration should succeed.
     registry
-        .register::<WorkTopic, CountingHandler>(config, CountingHandler::new)
+        .register::<WorkTopic, CountingHandler>(config, CountingHandler::new, ())
         .await
         .expect("first registration should succeed");
 
     // Second registration for the same topic should fail.
     let config2 = SqsConsumerGroupConfig::new(1..=2);
     let result = registry
-        .register::<WorkTopic, CountingHandler>(config2, CountingHandler::new)
+        .register::<WorkTopic, CountingHandler>(config2, CountingHandler::new, ())
         .await;
 
     assert!(result.is_err(), "duplicate registration should return Err");
@@ -1934,7 +2054,7 @@ async fn deserialization_failure_rejects_to_dlq() {
     // Send a malformed message directly via SQS (bypasses SNS publisher/serialization).
     let sqs_client = broker.sqs_client().await;
     let queue_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work")
         .await
         .expect("sqs-work queue URL should be registered");
@@ -1953,12 +2073,14 @@ async fn deserialization_failure_rejects_to_dlq() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler_clone,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(1)
                     .with_prefetch_count(1),
             )
@@ -1966,7 +2088,7 @@ async fn deserialization_failure_rejects_to_dlq() {
     });
 
     let dlq_url = setup
-        .queue_registry
+        .queue_registry()
         .get("sqs-work-dlq")
         .await
         .expect("DLQ URL should be registered");
@@ -2011,7 +2133,8 @@ impl StickySignal {
     }
 }
 impl<T: Topic> MessageHandler<T> for StickyHandler {
-    async fn handle(&self, _: T::Message, _: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, _: T::Message, _: MessageMetadata, _: &()) -> Outcome {
         let mut rx = self.rx.clone();
         rx.wait_for(|&v| v).await.ok();
         Outcome::Ack
@@ -2047,21 +2170,21 @@ async fn sqs_autoscaler_scales_group_on_load() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // 2. Setup Registry and Group.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky, sticky_signal) = StickyHandler::new();
 
     let config = SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1);
 
     registry
-        .register::<WorkTopic, _>(config, {
-            let h = sticky.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopic, _>(
+            config,
+            {
+                let h = sticky.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register should succeed");
 
@@ -2071,7 +2194,7 @@ async fn sqs_autoscaler_scales_group_on_load() {
 
     // 3. Setup Autoscaler.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
 
     let auto_config = AutoscalerConfig {
         poll_interval: Duration::from_millis(100),
@@ -2094,7 +2217,7 @@ async fn sqs_autoscaler_scales_group_on_load() {
     // Wait for scale up.
     let mut scaled_up = false;
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     for i in 0..50 {
         let stats = stats_provider.get_queue_stats("sqs-work").await.unwrap();
         let reg = registry_arc.lock().await;
@@ -2216,28 +2339,32 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Build a registry with two groups — one per topic.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky_a, signal_a) = StickyHandler::new();
     let (sticky_b, signal_b) = StickyHandler::new();
 
     registry
-        .register::<WorkTopicA, _>(SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1), {
-            let h = sticky_a.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopicA, _>(
+            SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1),
+            {
+                let h = sticky_a.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register A should succeed");
 
     registry
-        .register::<WorkTopicB, _>(SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1), {
-            let h = sticky_b.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopicB, _>(
+            SqsConsumerGroupConfig::new(1..=3).with_prefetch_count(1),
+            {
+                let h = sticky_b.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register B should succeed");
 
@@ -2247,7 +2374,7 @@ async fn sqs_autoscaler_scales_multiple_groups_independently() {
 
     // Autoscaler with fast polling and no hysteresis/cooldown.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let auto_config = AutoscalerConfig {
         poll_interval: Duration::from_millis(100),
         scale_up_multiplier: 0.5,
@@ -2319,9 +2446,13 @@ async fn consumer_run_on_undeclared_queue_fails() {
     let handler = CountingHandler::new();
     let shutdown = CancellationToken::new();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let result = consumer
-        .run::<WorkTopic>(handler, ConsumerOptions::new(shutdown))
+        .run::<WorkTopic, _>(
+            handler,
+            (),
+            ConsumerOptions::<Sqs>::new().with_shutdown(shutdown),
+        )
         .await;
 
     assert!(
@@ -2343,8 +2474,8 @@ async fn run_dlq_on_topic_without_dlq_fails() {
 
     let handler = CountingHandler::new();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
-    let result = consumer.run_dlq::<NoDlqTopic>(handler).await;
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let result = consumer.run_dlq::<NoDlqTopic, _>(handler, ()).await;
 
     assert!(
         result.is_err(),
@@ -2366,7 +2497,8 @@ async fn defer_without_hold_queues_redelivers() {
     struct DeferThenAck(Arc<AtomicU32>);
 
     impl MessageHandler<DeferNoHoldTopic> for DeferThenAck {
-        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let prev = self.0.fetch_add(1, Ordering::Relaxed);
             if prev == 0 {
                 Outcome::Defer
@@ -2396,12 +2528,14 @@ async fn defer_without_hold_queues_redelivers() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<DeferNoHoldTopic>(
+            .run::<DeferNoHoldTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -2444,7 +2578,8 @@ async fn defer_preserves_retry_count() {
     }
 
     impl MessageHandler<WorkTopic> for RetryThenDefer {
-        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             self.retry_counts.lock().unwrap().push(meta.retry_count);
             match call {
@@ -2479,12 +2614,14 @@ async fn defer_preserves_retry_count() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run::<WorkTopic>(
+            .run::<WorkTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -2527,7 +2664,8 @@ async fn sequenced_defer_redelivers() {
     }
 
     impl MessageHandler<SeqSkipTopic> for SeqDeferThenAck {
-        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             let prev = self.calls.fetch_add(1, Ordering::Relaxed);
             if prev == 0 {
                 Outcome::Defer
@@ -2562,12 +2700,14 @@ async fn sequenced_defer_redelivers() {
     let shutdown = CancellationToken::new();
     let sc = shutdown.clone();
 
-    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry.clone());
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqSkipTopic>(
+            .run_fifo::<SeqSkipTopic, _>(
                 handler,
-                ConsumerOptions::new(sc)
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
                     .with_max_retries(5)
                     .with_prefetch_count(1),
             )
@@ -2640,20 +2780,20 @@ async fn autoscaler_custom_strategy_with_sqs() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Set up registry with prefetch=5 so threshold would be 10 (3 remaining < 10).
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky, sticky_signal) = StickyHandler::new();
     let config = SqsConsumerGroupConfig::new(1..=4).with_prefetch_count(5);
 
     registry
-        .register::<WorkTopic, _>(config, {
-            let h = sticky.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopic, _>(
+            config,
+            {
+                let h = sticky.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register should succeed");
 
@@ -2663,7 +2803,7 @@ async fn autoscaler_custom_strategy_with_sqs() {
 
     // Build autoscaler with custom strategy — NO Stabilized wrapper.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let backend = SqsAutoscalerBackend::new(stats_provider, registry_arc.clone());
     let mut autoscaler =
         Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(200));
@@ -2742,20 +2882,20 @@ async fn autoscaler_scale_magnitude_with_sqs() {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Set up registry: min=1, max=5, prefetch=5. Starts with 1 consumer.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        setup.sns_client.clone(),
-        setup.topic_registry.clone(),
-        setup.queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(setup.sns_client.clone());
 
     let (sticky, sticky_signal) = StickyHandler::new();
     let config = SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5);
 
     registry
-        .register::<WorkTopic, _>(config, {
-            let h = sticky.clone();
-            move || h.clone()
-        })
+        .register::<WorkTopic, _>(
+            config,
+            {
+                let h = sticky.clone();
+                move || h.clone()
+            },
+            (),
+        )
         .await
         .expect("register should succeed");
 
@@ -2765,7 +2905,7 @@ async fn autoscaler_scale_magnitude_with_sqs() {
 
     // Build autoscaler with ScaleByTwoStrategy — NO Stabilized wrapper.
     let stats_provider =
-        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry.clone());
+        SqsQueueStatsProvider::new(setup.sns_client.clone(), setup.queue_registry().clone());
     let backend = SqsAutoscalerBackend::new(stats_provider, registry_arc.clone());
     let mut autoscaler = Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(200));
 

@@ -1,7 +1,8 @@
 //! Exactly-once delivery example (RabbitMQ backend).
 //!
-//! Demonstrates: `ConsumerOptions::with_exactly_once()`, the AMQP transaction
-//! mode path (tx_select / tx_commit), retry via hold queue, and rejection to DLQ.
+//! Demonstrates: `ConsumerOptions::<RabbitMq>::with_exactly_once()`, the AMQP
+//! transaction mode path (tx_select / tx_commit), retry via hold queue, and
+//! rejection to DLQ.
 //!
 //! Under exactly-once mode every routing decision (publish-to-hold-queue + ack)
 //! is wrapped in a single AMQP transaction, eliminating the publish-then-ack
@@ -10,9 +11,9 @@
 //! Trade-off: expect ~10-15× lower throughput per channel compared to the
 //! default confirm-mode consumer.
 //!
-//! Requires a running RabbitMQ instance (see docker-compose.yml):
+//! Spins up a RabbitMQ testcontainer automatically (requires a running
+//! Docker daemon):
 //!
-//!     docker compose up -d
 //!     cargo run --example rabbitmq_exactly_once --features rabbitmq-transactional
 
 use std::sync::Arc;
@@ -20,9 +21,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::*;
-use shove::*;
-use tokio_util::sync::CancellationToken;
+use shove::rabbitmq::RabbitMqConfig;
+use shove::{
+    Broker, ConsumerOptions, DeadMessageMetadata, MessageHandler, MessageMetadata, Outcome,
+    RabbitMq, TopologyBuilder, define_topic,
+};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -76,7 +81,8 @@ impl AckHandler {
 }
 
 impl MessageHandler<PaymentTopic> for AckHandler {
-    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata, _: &()) -> Outcome {
         let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         println!(
             "[ack]    payment={} amount=${:.2}  (processed: {n})",
@@ -100,7 +106,8 @@ impl RetryThenAckHandler {
 }
 
 impl MessageHandler<RetryPaymentTopic> for RetryThenAckHandler {
-    async fn handle(&self, msg: PaymentEvent, meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, meta: MessageMetadata, _: &()) -> Outcome {
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
         println!(
             "[retry]  payment={} attempt={} retry_count={}",
@@ -131,12 +138,13 @@ impl RejectHandler {
 }
 
 impl MessageHandler<RejectPaymentTopic> for RejectHandler {
-    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, _meta: MessageMetadata, _: &()) -> Outcome {
         println!("[reject] payment={} → routing to DLQ", msg.payment_id);
         Outcome::Reject
     }
 
-    async fn handle_dead(&self, msg: PaymentEvent, meta: DeadMessageMetadata) {
+    async fn handle_dead(&self, msg: PaymentEvent, meta: DeadMessageMetadata, _: &()) {
         let n = self.dead_count.fetch_add(1, Ordering::Relaxed) + 1;
         println!(
             "[dlq]    payment={} reason={} deaths={} (dlq total: {n})",
@@ -147,26 +155,10 @@ impl MessageHandler<RejectPaymentTopic> for RejectHandler {
     }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-fn require_rabbitmq() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("rabbitmq") => {}
-        _ => {
-            eprintln!("RabbitMQ is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_rabbitmq();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -174,19 +166,20 @@ async fn main() -> Result<(), ShoveError> {
         )
         .init();
 
-    let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5673/%2f");
-    let client = RabbitMqClient::connect(&config).await?;
+    let container = RabbitMqImage::default().start().await?;
+    let port = container.get_host_port_ipv4(5672).await?;
+    let uri = format!("amqp://guest:guest@localhost:{port}/%2f");
+    let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new(&uri)).await?;
 
     // ── Declare topologies ──
-    let channel = client.create_channel().await?;
-    let declarer = RabbitMqTopologyDeclarer::new(channel);
-    declare_topic::<PaymentTopic>(&declarer).await?;
-    declare_topic::<RetryPaymentTopic>(&declarer).await?;
-    declare_topic::<RejectPaymentTopic>(&declarer).await?;
+    let topology = broker.topology();
+    topology.declare::<PaymentTopic>().await?;
+    topology.declare::<RetryPaymentTopic>().await?;
+    topology.declare::<RejectPaymentTopic>().await?;
     println!("topologies declared\n");
 
     // ── Publish messages ──
-    let publisher = RabbitMqPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
 
     for i in 1..=5 {
         publisher
@@ -220,60 +213,35 @@ async fn main() -> Result<(), ShoveError> {
     // exactly once and retries use the hold queue — but without the small
     // window in confirm-mode where a broker restart between publish and ack
     // could produce a duplicate.
-    let shutdown = CancellationToken::new();
-
-    let c = client.clone();
-    let s = shutdown.clone();
-    let ack_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<PaymentTopic>(
-                AckHandler::new(),
-                ConsumerOptions::new(s).with_exactly_once(),
-            )
-            .await
-    });
-
-    let c = client.clone();
-    let s = shutdown.clone();
-    let retry_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<RetryPaymentTopic>(
-                RetryThenAckHandler::new(),
-                ConsumerOptions::new(s)
-                    .with_max_retries(3)
-                    .with_exactly_once(),
-            )
-            .await
-    });
-
-    let c = client.clone();
-    let s = shutdown.clone();
-    let reject_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run::<RejectPaymentTopic>(
-                RejectHandler::new(),
-                ConsumerOptions::new(s).with_exactly_once(),
-            )
-            .await
-    });
-
-    // DLQ consumer for the reject topic (not exactly-once — DLQ consumers
-    // are always at-most-once since messages are acked unconditionally).
-    let c = client.clone();
-    let dlq_task = tokio::spawn(async move {
-        RabbitMqConsumer::new(c)
-            .run_dlq::<RejectPaymentTopic>(RejectHandler::new())
-            .await
-    });
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor.register::<PaymentTopic, _>(
+        AckHandler::new(),
+        ConsumerOptions::<RabbitMq>::new().with_exactly_once(),
+    )?;
+    supervisor.register::<RetryPaymentTopic, _>(
+        RetryThenAckHandler::new(),
+        ConsumerOptions::<RabbitMq>::new()
+            .with_max_retries(3)
+            .with_exactly_once(),
+    )?;
+    supervisor.register::<RejectPaymentTopic, _>(
+        RejectHandler::new(),
+        ConsumerOptions::<RabbitMq>::new().with_exactly_once(),
+    )?;
 
     // Let the system run long enough for the retry hold queue (2 s TTL) to fire.
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    println!("\nshutting down…");
-    shutdown.cancel();
-    client.shutdown().await;
+    let outcome = supervisor
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(8)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-    let _ = tokio::join!(ack_task, retry_task, reject_task, dlq_task);
     println!("done");
-
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

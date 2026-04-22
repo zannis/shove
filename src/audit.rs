@@ -85,12 +85,19 @@ where
     H: MessageHandler<T>,
     A: AuditHandler<T>,
 {
-    async fn handle(&self, message: T::Message, metadata: MessageMetadata) -> Outcome {
+    type Context = H::Context;
+
+    async fn handle(
+        &self,
+        message: T::Message,
+        metadata: MessageMetadata,
+        ctx: &H::Context,
+    ) -> Outcome {
         // Guard against infinite recursion: skip auditing on the audit-log topic itself.
         #[cfg(feature = "audit")]
         {
             if T::topology().queue() == AuditLog::topology().queue() {
-                return self.handler.handle(message, metadata).await;
+                return self.handler.handle(message, metadata, ctx).await;
             }
         }
 
@@ -105,7 +112,7 @@ where
         let metadata_clone = metadata.clone();
 
         let start = Instant::now();
-        let outcome = self.handler.handle(message, metadata).await;
+        let outcome = self.handler.handle(message, metadata, ctx).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let record = AuditRecord {
@@ -152,8 +159,9 @@ where
         &self,
         message: T::Message,
         metadata: DeadMessageMetadata,
+        ctx: &H::Context,
     ) -> impl Future<Output = ()> + Send {
-        self.handler.handle_dead(message, metadata)
+        self.handler.handle_dead(message, metadata, ctx)
     }
 }
 
@@ -165,6 +173,7 @@ mod shove_backend {
     use serde_json::Value;
 
     use crate::audit::{AuditHandler, AuditRecord};
+    use crate::backend::Backend;
     use crate::define_topic;
     use crate::error::{Result, ShoveError};
     use crate::publisher::Publisher;
@@ -178,22 +187,29 @@ mod shove_backend {
     );
 
     /// An `AuditHandler` that publishes audit records as messages to the
-    /// `shove-audit-log` topic using any `Publisher` implementation.
-    pub struct ShoveAuditHandler<P: Publisher> {
-        publisher: P,
+    /// `shove-audit-log` topic using any backend's `Publisher<B>`.
+    pub struct ShoveAuditHandler<B: Backend> {
+        publisher: Publisher<B>,
     }
 
-    impl<P: Publisher> ShoveAuditHandler<P> {
-        pub fn new(publisher: P) -> Self {
+    impl<B: Backend> ShoveAuditHandler<B> {
+        pub fn new(publisher: Publisher<B>) -> Self {
             Self { publisher }
+        }
+
+        /// Convenience constructor that clones the borrowed publisher.
+        pub fn for_publisher(publisher: &Publisher<B>) -> Self {
+            Self {
+                publisher: publisher.clone(),
+            }
         }
     }
 
-    impl<T, P> AuditHandler<T> for ShoveAuditHandler<P>
+    impl<T, B> AuditHandler<T> for ShoveAuditHandler<B>
     where
         T: Topic,
         T::Message: Serialize,
-        P: Publisher,
+        B: Backend,
     {
         async fn audit(&self, record: &AuditRecord<T::Message>) -> Result<()> {
             let value_record = AuditRecord {
@@ -212,6 +228,7 @@ mod shove_backend {
 }
 
 #[cfg(feature = "audit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "audit")))]
 pub use shove_backend::{AuditLog, ShoveAuditHandler};
 
 #[cfg(test)]
@@ -243,7 +260,8 @@ mod tests {
 
     struct FixedOutcomeHandler(Outcome);
     impl MessageHandler<TestTopic> for FixedOutcomeHandler {
-        async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             self.0.clone()
         }
     }
@@ -318,10 +336,11 @@ mod tests {
         }
     }
     impl MessageHandler<TestTopic> for Arc<TrackingDeadHandler> {
-        async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata) -> Outcome {
+        type Context = ();
+        async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata, _: &()) -> Outcome {
             Outcome::Ack
         }
-        async fn handle_dead(&self, _msg: TestMessage, _meta: DeadMessageMetadata) {
+        async fn handle_dead(&self, _msg: TestMessage, _meta: DeadMessageMetadata, _: &()) {
             self.called.store(true, Ordering::Relaxed);
         }
     }
@@ -331,35 +350,35 @@ mod tests {
     #[tokio::test]
     async fn audited_propagates_ack_outcome() {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), OkAuditHandler);
-        let outcome = audited.handle(test_message(), test_metadata()).await;
+        let outcome = audited.handle(test_message(), test_metadata(), &()).await;
         assert!(matches!(outcome, Outcome::Ack));
     }
 
     #[tokio::test]
     async fn audited_propagates_reject_outcome() {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Reject), OkAuditHandler);
-        let outcome = audited.handle(test_message(), test_metadata()).await;
+        let outcome = audited.handle(test_message(), test_metadata(), &()).await;
         assert!(matches!(outcome, Outcome::Reject));
     }
 
     #[tokio::test]
     async fn audited_propagates_retry_outcome() {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Retry), OkAuditHandler);
-        let outcome = audited.handle(test_message(), test_metadata()).await;
+        let outcome = audited.handle(test_message(), test_metadata(), &()).await;
         assert!(matches!(outcome, Outcome::Retry));
     }
 
     #[tokio::test]
     async fn audited_propagates_defer_outcome() {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Defer), OkAuditHandler);
-        let outcome = audited.handle(test_message(), test_metadata()).await;
+        let outcome = audited.handle(test_message(), test_metadata(), &()).await;
         assert!(matches!(outcome, Outcome::Defer));
     }
 
     #[tokio::test]
     async fn audited_returns_retry_when_audit_fails() {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), FailingAuditHandler);
-        let outcome = audited.handle(test_message(), test_metadata()).await;
+        let outcome = audited.handle(test_message(), test_metadata(), &()).await;
         assert!(matches!(outcome, Outcome::Retry));
     }
 
@@ -367,7 +386,7 @@ mod tests {
     async fn audited_calls_audit_handler() {
         let tracker = TrackingAuditHandler::new();
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), tracker.clone());
-        audited.handle(test_message(), test_metadata()).await;
+        audited.handle(test_message(), test_metadata(), &()).await;
         assert_eq!(tracker.call_count.load(Ordering::Relaxed), 1);
     }
 
@@ -380,7 +399,7 @@ mod tests {
         meta.headers
             .insert("x-trace-id".into(), "my-trace-123".into());
 
-        audited.handle(test_message(), meta).await;
+        audited.handle(test_message(), meta, &()).await;
         let captured: tokio::sync::MutexGuard<'_, Option<String>> = tracker.trace_id.lock().await;
         assert_eq!(captured.as_deref(), Some("my-trace-123"));
     }
@@ -390,7 +409,7 @@ mod tests {
         let tracker = TrackingAuditHandler::new();
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), tracker.clone());
 
-        audited.handle(test_message(), test_metadata()).await;
+        audited.handle(test_message(), test_metadata(), &()).await;
 
         let captured: tokio::sync::MutexGuard<'_, Option<String>> = tracker.trace_id.lock().await;
         let trace_id = captured.as_ref().expect("trace_id should be set");
@@ -406,10 +425,12 @@ mod tests {
 
         struct AuditLogHandler;
         impl MessageHandler<AuditLog> for AuditLogHandler {
+            type Context = ();
             async fn handle(
                 &self,
                 _msg: <AuditLog as Topic>::Message,
                 _meta: MessageMetadata,
+                _: &(),
             ) -> Outcome {
                 Outcome::Ack
             }
@@ -446,7 +467,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = audited.handle(msg, meta).await;
+        let outcome = audited.handle(msg, meta, &()).await;
         assert!(matches!(outcome, Outcome::Ack));
     }
 
@@ -462,7 +483,7 @@ mod tests {
     async fn audited_returns_original_outcome_on_audit_timeout() {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), SlowAuditHandler)
             .with_audit_timeout(Duration::from_millis(10));
-        let outcome = audited.handle(test_message(), test_metadata()).await;
+        let outcome = audited.handle(test_message(), test_metadata(), &()).await;
         // Should return the original Ack, not Retry, because audit timed out.
         assert!(matches!(outcome, Outcome::Ack));
     }
@@ -471,7 +492,7 @@ mod tests {
     async fn audited_no_timeout_blocks_on_slow_audit() {
         // Without a timeout, a failing audit handler returns Retry.
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), FailingAuditHandler);
-        let outcome = audited.handle(test_message(), test_metadata()).await;
+        let outcome = audited.handle(test_message(), test_metadata(), &()).await;
         assert!(matches!(outcome, Outcome::Retry));
     }
 
@@ -479,7 +500,7 @@ mod tests {
     async fn audited_handle_dead_does_not_panic() {
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), OkAuditHandler);
         audited
-            .handle_dead(test_message(), test_dead_metadata())
+            .handle_dead(test_message(), test_dead_metadata(), &())
             .await;
     }
 
@@ -488,8 +509,52 @@ mod tests {
         let tracker = TrackingDeadHandler::new();
         let audited = Audited::new(tracker.clone(), OkAuditHandler);
         audited
-            .handle_dead(test_message(), test_dead_metadata())
+            .handle_dead(test_message(), test_dead_metadata(), &())
             .await;
         assert!(tracker.called.load(Ordering::Relaxed));
+    }
+
+    /// `Audited<H, A>::handle` forwards the caller-supplied `ctx` reference unchanged to the
+    /// inner handler on the success path.
+    #[tokio::test]
+    async fn audited_handle_forwards_context() {
+        struct CtxHandler;
+        impl MessageHandler<TestTopic> for CtxHandler {
+            type Context = u32;
+            async fn handle(
+                &self,
+                _msg: TestMessage,
+                _meta: MessageMetadata,
+                ctx: &u32,
+            ) -> Outcome {
+                assert_eq!(*ctx, 11);
+                Outcome::Ack
+            }
+        }
+
+        let audited = Audited::new(CtxHandler, OkAuditHandler);
+        let outcome = audited.handle(test_message(), test_metadata(), &11).await;
+        assert!(matches!(outcome, Outcome::Ack));
+    }
+
+    /// `Audited<H, A>::handle_dead` forwards the caller-supplied `ctx` reference unchanged to
+    /// the inner handler.
+    #[tokio::test]
+    async fn audited_handle_dead_forwards_context() {
+        struct CtxDeadHandler;
+        impl MessageHandler<TestTopic> for CtxDeadHandler {
+            type Context = u32;
+            async fn handle(&self, _msg: TestMessage, _meta: MessageMetadata, _: &u32) -> Outcome {
+                Outcome::Ack
+            }
+            async fn handle_dead(&self, _msg: TestMessage, _meta: DeadMessageMetadata, ctx: &u32) {
+                assert_eq!(*ctx, 13);
+            }
+        }
+
+        let audited = Audited::new(CtxDeadHandler, OkAuditHandler);
+        audited
+            .handle_dead(test_message(), test_dead_metadata(), &13)
+            .await;
     }
 }

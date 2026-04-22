@@ -1,19 +1,26 @@
 //! Sequenced NATS JetStream example — per-key ordering.
 //!
-//! Run: cargo run -q --example nats_sequenced --features nats
-//! Requires: NATS server with JetStream enabled at localhost:4222
+//! Spins up a NATS JetStream testcontainer automatically (requires a running
+//! Docker daemon):
+//!
+//!     cargo run -q --example nats_sequenced --features nats
+//!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` / `ConsumerGroup<B>`
+//! wrappers — this example therefore keeps using the backend-specific
+//! `NatsConsumer::run_fifo` directly.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::consumer::{Consumer, ConsumerOptions};
-use shove::handler::MessageHandler;
-use shove::metadata::MessageMetadata;
 use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsPublisher, NatsTopologyDeclarer};
-use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
-use shove::{SequencedTopic, Topic};
+use shove::{
+    ConsumerOptions, MessageHandler, MessageMetadata, Nats, Outcome, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
+};
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +45,8 @@ shove::define_sequenced_topic!(
 struct UserEventHandler;
 
 impl MessageHandler<UserEventTopic> for UserEventHandler {
-    async fn handle(&self, message: UserEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, message: UserEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[user={}] action={} seq={} (retry={})",
             message.user_id, message.action, message.seq, metadata.retry_count
@@ -51,7 +59,12 @@ impl MessageHandler<UserEventTopic> for UserEventHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = NatsConfig::new("nats://localhost:4222");
+    let cmd = NatsServerCmd::default().with_jetstream();
+    let container = NatsImage::default().with_cmd(&cmd).start().await?;
+    let port = container.get_host_port_ipv4(4222).await?;
+    let url = format!("nats://localhost:{port}");
+
+    let config = NatsConfig::new(&url);
     let client = NatsClient::connect(&config).await?;
 
     // Declare topology
@@ -82,12 +95,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let consumer = NatsConsumer::new(client.clone());
-    let options = ConsumerOptions::new(shutdown);
+    let options = ConsumerOptions::<Nats>::new().with_shutdown(shutdown);
     consumer
-        .run_fifo::<UserEventTopic>(UserEventHandler, options)
+        .run_fifo::<UserEventTopic, _>(UserEventHandler, (), options)
         .await?;
 
     client.shutdown().await;
     println!("Done.");
+    drop(container);
     Ok(())
 }

@@ -1,14 +1,14 @@
 use std::collections::HashMap;
-
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
+use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::topology::TopologyDeclarer;
 
 /// Registry of all [`ConsumerGroup`]s managed by the autoscaler.
 ///
@@ -39,10 +39,11 @@ impl ConsumerGroupRegistry {
         &mut self,
         config: ConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
     ) -> Result<()>
     where
         T: Topic + 'static,
-        H: MessageHandler<T> + Clone + 'static,
+        H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -66,6 +67,7 @@ impl ConsumerGroupRegistry {
             self.client.clone(),
             group_token,
             handler_factory,
+            ctx,
         );
         self.groups.insert(name, group);
         Ok(())
@@ -89,15 +91,33 @@ impl ConsumerGroupRegistry {
         &mut self.groups
     }
 
+    /// Return a clone of the client's shutdown token.
+    ///
+    /// Used by `RegistryImpl::cancellation_token` to surface a
+    /// backend-independent shutdown signal.
+    pub fn client_shutdown_token(&self) -> CancellationToken {
+        self.client.shutdown_token()
+    }
+
     /// Shut down every consumer group and wait for all tasks to complete.
     pub async fn shutdown_all(&mut self) {
+        let _ = self.shutdown_all_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
+        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            group.shutdown().await;
+            tally.add(group.shutdown_with_tally().await);
         }
-        debug!("all consumer groups shut down");
+        debug!(
+            errors = tally.errors,
+            panics = tally.panics,
+            "all consumer groups shut down"
+        );
+        tally
     }
 }

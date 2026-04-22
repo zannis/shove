@@ -3,10 +3,15 @@
 //! Demonstrates: `SqsConsumerGroupRegistry`, `SqsConsumerGroupConfig`,
 //! `SqsQueueStatsProvider`, and dynamic queue depth monitoring.
 //!
-//! Requires a running LocalStack instance (see docker-compose.yml):
+//! Note: SQS has no broker-level coordinated-group primitive — the SQS
+//! registry spawns independent poll workers. The generic `Broker<Sqs>`
+//! deliberately exposes only a supervisor (see `Sqs`'s doctest), so this
+//! example stays on the backend-specific `SqsConsumerGroupRegistry` path.
 //!
-//!     docker compose up -d
-//!     cargo run --example sqs_consumer_groups --features aws-sns-sqs
+//! Spins up a LocalStack testcontainer automatically. Requires a running
+//! Docker daemon and the `LOCALSTACK_AUTH_TOKEN` environment variable:
+//!
+//!     LOCALSTACK_AUTH_TOKEN=... cargo run --example sqs_consumer_groups --features aws-sns-sqs
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +19,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use shove::sns::*;
 use shove::*;
+use testcontainers::ImageExt;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::localstack::LocalStack;
 use tokio::sync::Mutex;
 
 // ─── Message type ───────────────────────────────────────────────────────────
@@ -39,7 +47,8 @@ define_topic!(
 struct TaskHandler;
 
 impl MessageHandler<WorkQueue> for TaskHandler {
-    async fn handle(&self, msg: TaskEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: TaskEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[worker] task={} attempt={}",
             msg.task_id,
@@ -53,22 +62,8 @@ impl MessageHandler<WorkQueue> for TaskHandler {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn require_localstack() {
-    let output = std::process::Command::new("docker")
-        .args(["compose", "ps", "--services", "--filter", "status=running"])
-        .output();
-    match output {
-        Ok(o) if String::from_utf8_lossy(&o.stdout).contains("localstack") => {}
-        _ => {
-            eprintln!("LocalStack is not running. Start it with:\n\n    docker compose up -d\n");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    require_localstack();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -76,29 +71,46 @@ async fn main() -> Result<(), ShoveError> {
         )
         .init();
 
+    let auth_token = match std::env::var("LOCALSTACK_AUTH_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!(
+                "LOCALSTACK_AUTH_TOKEN is not set. This example requires a LocalStack Pro auth \
+                 token:\n\n    export LOCALSTACK_AUTH_TOKEN=...\n"
+            );
+            std::process::exit(1);
+        }
+    };
+
     // SAFETY: called before any concurrent env access in this process.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
     }
+
+    let container = LocalStack::default()
+        .with_env_var("LOCALSTACK_AUTH_TOKEN", auth_token)
+        .start()
+        .await?;
+    let port = container.get_host_port_ipv4(4566).await?;
+    let endpoint = format!("http://localhost:{port}");
 
     let config = SnsConfig {
         region: Some("us-east-1".into()),
-        endpoint_url: Some("http://localhost:4566".into()),
+        endpoint_url: Some(endpoint),
     };
     let client = SnsClient::new(&config).await?;
-
-    let topic_registry = Arc::new(TopicRegistry::new());
-    let queue_registry = Arc::new(QueueRegistry::new());
 
     // ── Publish an initial burst of tasks ──
     //
     // We declare topology manually here so the publisher can resolve the SNS ARN.
-    let declarer = SnsTopologyDeclarer::new(client.clone(), topic_registry.clone())
-        .with_queue_registry(queue_registry.clone());
-    declare_topic::<WorkQueue>(&declarer).await?;
+    // The declarer reads the client-owned topic/queue registries shared with
+    // every publisher and consumer group built from the same client.
+    let declarer = SnsTopologyDeclarer::new(client.clone());
+    declarer.declare(WorkQueue::topology()).await?;
 
-    let publisher = SnsPublisher::new(client.clone(), topic_registry.clone());
+    let publisher = SnsPublisher::new(client.clone(), client.topic_registry().clone());
     let burst_size = 50;
     for i in 0..burst_size {
         let event = TaskEvent {
@@ -115,11 +127,7 @@ async fn main() -> Result<(), ShoveError> {
     // It automatically declares the topology and starts consumers at their
     // minimum count. Each group reads from a single SQS queue and can be
     // scaled up/down manually or via a custom autoscaler.
-    let mut registry = SqsConsumerGroupRegistry::new(
-        client.clone(),
-        topic_registry.clone(),
-        queue_registry.clone(),
-    );
+    let mut registry = SqsConsumerGroupRegistry::new(client.clone());
 
     registry
         .register::<WorkQueue, TaskHandler>(
@@ -127,6 +135,7 @@ async fn main() -> Result<(), ShoveError> {
                 .with_prefetch_count(10) // messages per consumer
                 .with_max_retries(3),
             || TaskHandler, // factory — called once per spawned consumer
+            (),             // handler context (unit for this example)
         )
         .await?;
 
@@ -139,7 +148,8 @@ async fn main() -> Result<(), ShoveError> {
     // ── Monitor queue depth using SqsQueueStatsProvider ──
     //
     // Poll queue attributes to observe the backlog draining.
-    let stats_provider = SqsQueueStatsProvider::new(client.clone(), queue_registry.clone());
+    let stats_provider =
+        SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
 
     println!("monitoring queue depth — watching backlog drain\n");
 
@@ -164,5 +174,6 @@ async fn main() -> Result<(), ShoveError> {
     client.shutdown().await;
     println!("done");
 
+    drop(container);
     Ok(())
 }

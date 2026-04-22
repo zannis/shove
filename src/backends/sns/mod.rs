@@ -5,6 +5,8 @@ pub mod topology;
 #[cfg(feature = "aws-sns-sqs")]
 pub mod autoscaler;
 #[cfg(feature = "aws-sns-sqs")]
+mod backend;
+#[cfg(feature = "aws-sns-sqs")]
 pub mod consumer;
 #[cfg(feature = "aws-sns-sqs")]
 pub mod consumer_group;

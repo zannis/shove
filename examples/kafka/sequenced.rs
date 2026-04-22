@@ -1,21 +1,27 @@
 //! Sequenced Kafka example — per-key ordering.
 //!
-//! Run: cargo run -q --example kafka_sequenced --features kafka
-//! Requires: Kafka broker at localhost:9092
+//! Spins up a Kafka testcontainer automatically (requires a running Docker
+//! daemon):
+//!
+//!     cargo run -q --example kafka_sequenced --features kafka
+//!
+//! Note: per-key FIFO consumption (`run_fifo`) isn't yet surfaced on the
+//! generic `Broker<B>` / `ConsumerSupervisor<B>` / `ConsumerGroup<B>`
+//! wrappers — this example therefore keeps using the backend-specific
+//! `KafkaConsumer::run_fifo` directly.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::consumer::{Consumer, ConsumerOptions};
-use shove::handler::MessageHandler;
 use shove::kafka::{
     KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisher, KafkaTopologyDeclarer,
 };
-use shove::metadata::MessageMetadata;
-use shove::outcome::Outcome;
-use shove::publisher::Publisher;
-use shove::topology::{SequenceFailure, TopologyBuilder, TopologyDeclarer};
-use shove::{SequencedTopic, Topic};
+use shove::{
+    ConsumerOptions, Kafka, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
+};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +46,8 @@ shove::define_sequenced_topic!(
 struct UserEventHandler;
 
 impl MessageHandler<UserEventTopic> for UserEventHandler {
-    async fn handle(&self, message: UserEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, message: UserEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[user={}] action={} seq={} (retry={})",
             message.user_id, message.action, message.seq, metadata.retry_count
@@ -53,7 +60,11 @@ impl MessageHandler<UserEventTopic> for UserEventHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = KafkaConfig::new("localhost:9092");
+    let container = KafkaImage::default().start().await?;
+    let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
+    let bootstrap = format!("127.0.0.1:{port}");
+
+    let config = KafkaConfig::new(&bootstrap);
     let client = KafkaClient::connect(&config).await?;
 
     // Declare topology
@@ -84,12 +95,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let consumer = KafkaConsumer::new(client.clone());
-    let options = ConsumerOptions::new(shutdown);
+    let options = ConsumerOptions::<Kafka>::new().with_shutdown(shutdown);
     consumer
-        .run_fifo::<UserEventTopic>(UserEventHandler, options)
+        .run_fifo::<UserEventTopic, _>(UserEventHandler, (), options)
         .await?;
 
     client.shutdown().await;
     println!("Done.");
+    drop(container);
     Ok(())
 }

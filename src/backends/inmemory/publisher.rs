@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::Topic;
+use crate::backend::PublisherImpl;
 use crate::error::{Result, ShoveError};
-use crate::publisher::{Publisher, validate_headers};
+use crate::publisher_internal::validate_headers;
 
 use super::client::{Envelope, InMemoryBroker};
 use super::constants::{X_MESSAGE_ID, X_SEQUENCE_KEY};
@@ -57,12 +58,12 @@ impl InMemoryPublisher {
     }
 }
 
-impl Publisher for InMemoryPublisher {
-    async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+impl InMemoryPublisher {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.publish_one::<T>(message, HashMap::new()).await
     }
 
-    async fn publish_with_headers<T: Topic>(
+    pub async fn publish_with_headers<T: Topic>(
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
@@ -71,11 +72,32 @@ impl Publisher for InMemoryPublisher {
         self.publish_one::<T>(message, headers).await
     }
 
-    async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         for message in messages {
             self.publish_one::<T>(message, HashMap::new()).await?;
         }
         Ok(())
+    }
+}
+
+impl PublisherImpl for InMemoryPublisher {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+        InMemoryPublisher::publish::<T>(self, msg)
+    }
+
+    fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> impl Future<Output = Result<()>> + Send {
+        InMemoryPublisher::publish_with_headers::<T>(self, msg, headers)
+    }
+
+    fn publish_batch<T: Topic>(
+        &self,
+        msgs: &[T::Message],
+    ) -> impl Future<Output = Result<()>> + Send {
+        InMemoryPublisher::publish_batch::<T>(self, msgs)
     }
 }
 
@@ -106,7 +128,6 @@ mod tests {
     use crate::topology::{QueueTopology, SequenceFailure, TopologyBuilder};
 
     use crate::backends::inmemory::topology::InMemoryTopologyDeclarer as Declarer;
-    use crate::topology::TopologyDeclarer;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct Msg {

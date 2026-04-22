@@ -25,8 +25,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+use mach2::traps::mach_task_self;
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
+// Disambiguate against the generic `shove::ConsumerGroupConfig<B>` wrapper
+// in favour of the rabbitmq-specific config this bench uses.
+use shove::rabbitmq::ConsumerGroupConfig;
 use shove::*;
 use testcontainers::ImageExt;
 use testcontainers::core::ExecCommand;
@@ -293,7 +297,7 @@ fn current_cpu_secs() -> f64 {
         let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
         let kr = unsafe {
             task_info(
-                mach2::traps::mach_task_self(),
+                mach_task_self(),
                 MACH_TASK_BASIC_INFO as task_flavor_t,
                 &mut info as *mut _ as *mut i32,
                 &mut count,
@@ -337,7 +341,7 @@ fn current_rss_bytes() -> u64 {
         let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
         let kr = unsafe {
             task_info(
-                mach2::traps::mach_task_self(),
+                mach_task_self(),
                 MACH_TASK_BASIC_INFO as task_flavor_t,
                 &mut info as *mut _ as *mut i32,
                 &mut count,
@@ -376,7 +380,8 @@ struct BenchHandler {
 }
 
 impl MessageHandler<OverheadTopic> for BenchHandler {
-    async fn handle(&self, msg: BenchMsg, _meta: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: BenchMsg, _meta: MessageMetadata, _: &()) -> Outcome {
         // No simulated work — measures pure framework dispatch overhead.
         let received_at = self.epoch.elapsed().as_nanos() as u64;
         self.recorder
@@ -424,6 +429,7 @@ async fn measure_rss(broker: &Broker, consumers: u16) -> Result<f64, String> {
                 processed: pc.clone(),
                 recorder: rec.clone(),
             },
+            (),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -466,6 +472,7 @@ async fn run_once(
                 processed: pc.clone(),
                 recorder: rec.clone(),
             },
+            (),
         )
         .await
         .map_err(|e| e.to_string())?;

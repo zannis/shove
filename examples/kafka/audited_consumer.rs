@@ -1,19 +1,20 @@
 //! Audited consumer example — custom `AuditHandler` that writes to stdout (Kafka backend).
 //!
-//! Demonstrates: `Audited` wrapper, custom `AuditHandler` implementation,
-//! trace ID propagation across retries.
+//! Demonstrates: `MessageHandlerExt::audited` wrapper, custom `AuditHandler`
+//! implementation, trace ID propagation across retries.
 //!
-//! Requires a running Kafka broker:
+//! Spins up a Kafka testcontainer automatically (requires a running Docker
+//! daemon):
 //!
-//!     docker compose up -d
 //!     cargo run --example kafka_audited_consumer --features kafka,audit
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use shove::kafka::*;
+use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
 use shove::*;
-use tokio_util::sync::CancellationToken;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 // ─── Message type ───────────────────────────────────────────────────────────
 
@@ -39,7 +40,8 @@ define_topic!(
 struct PaymentHandler;
 
 impl MessageHandler<Payments> for PaymentHandler {
-    async fn handle(&self, msg: PaymentEvent, metadata: MessageMetadata) -> Outcome {
+    type Context = ();
+    async fn handle(&self, msg: PaymentEvent, metadata: MessageMetadata, _: &()) -> Outcome {
         println!(
             "[handler] payment={} amount=${:.2} attempt={}",
             msg.payment_id,
@@ -58,7 +60,9 @@ impl MessageHandler<Payments> for PaymentHandler {
 
 // ─── Custom audit handler ───────────────────────────────────────────────────
 
-/// Prints every audit record to stdout as JSON.
+/// Prints every audit record to stdout as JSON. Clone-able so a fresh
+/// instance can be handed to each spawned consumer.
+#[derive(Clone, Default)]
 struct StdoutAuditHandler;
 
 impl AuditHandler<Payments> for StdoutAuditHandler {
@@ -72,17 +76,17 @@ impl AuditHandler<Payments> for StdoutAuditHandler {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 #[tokio::main]
-async fn main() -> Result<(), ShoveError> {
-    let config = KafkaConfig::new("localhost:9092");
-    let client = KafkaClient::connect(&config).await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let container = KafkaImage::default().start().await?;
+    let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
+    let bootstrap = format!("127.0.0.1:{port}");
 
-    // ── Declare topology ──
-    let declarer = KafkaTopologyDeclarer::new(client.clone());
-    declarer.declare(Payments::topology()).await?;
+    let broker = Broker::<Kafka>::new(KafkaConfig::new(&bootstrap)).await?;
+    broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");
 
     // ── Publish a payment ──
-    let publisher = KafkaPublisher::new(client.clone()).await?;
+    let publisher = broker.publisher().await?;
     let event = PaymentEvent {
         payment_id: "PAY-001".into(),
         amount_cents: 4999,
@@ -90,27 +94,32 @@ async fn main() -> Result<(), ShoveError> {
     publisher.publish::<Payments>(&event).await?;
     println!("published payment\n");
 
-    // ── Start audited consumer ──
+    // ── Start audited consumer via a consumer group ──
     //
-    // Wrap the handler with `Audited` — the consumer sees a normal
-    // `MessageHandler<Payments>`, no API changes needed.
-    let audited_handler = Audited::new(PaymentHandler, StdoutAuditHandler);
-    let shutdown = CancellationToken::new();
+    // `audited(audit)` wraps the handler in the `Audited` decorator — the
+    // group sees a normal `MessageHandler<Payments>`, no API changes needed.
+    // The audit handler is cloned once per spawned consumer (min_consumers=1 here).
+    let mut group = broker.consumer_group();
+    group
+        .register::<Payments, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            || PaymentHandler.audited(StdoutAuditHandler),
+        )
+        .await?;
 
-    let s = shutdown.clone();
-    let consumer_task = tokio::spawn(async move {
-        KafkaConsumer::new(client.clone())
-            .run::<Payments>(audited_handler, ConsumerOptions::new(s).with_max_retries(3))
-            .await
-    });
+    // Let it process (first attempt retries, second acks), then shut down.
+    let outcome = group
+        .run_until_timeout(
+            async {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
 
-    // ── Let it process (first attempt retries, second acks) ──
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    println!("\nshutting down...");
-    shutdown.cancel();
-    let _ = consumer_task.await;
     println!("done");
-
-    Ok(())
+    std::process::exit(outcome.exit_code());
 }

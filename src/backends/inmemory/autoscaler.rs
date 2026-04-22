@@ -181,10 +181,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::backend::ConsumerOptionsInner;
     use crate::backends::inmemory::consumer_group::{
         InMemoryConsumerGroup, InMemoryConsumerGroupConfig, Spawner,
     };
-    use crate::consumer::ConsumerOptions;
     use tokio_util::sync::CancellationToken;
 
     struct MockStats {
@@ -206,7 +206,7 @@ mod tests {
         started: bool,
     ) -> InMemoryConsumerGroup {
         let group_token = CancellationToken::new();
-        let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
+        let spawner: Spawner = Arc::new(|options: ConsumerOptionsInner| {
             tokio::spawn(async move {
                 options.shutdown.cancelled().await;
             })
@@ -217,6 +217,7 @@ mod tests {
             config,
             spawner,
             group_token,
+            error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if started {
             group.start();

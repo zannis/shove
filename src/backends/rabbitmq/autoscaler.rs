@@ -1,9 +1,9 @@
+use crate::error::Result;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::ShoveError;
 use crate::autoscaler::{
     AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics, Stabilized,
     ThresholdStrategy,
@@ -12,6 +12,7 @@ use crate::backends::rabbitmq::management::{
     ManagementClient, ManagementConfig, QueueStatsProvider,
 };
 use crate::backends::rabbitmq::registry::ConsumerGroupRegistry;
+use crate::{Autoscaler, ShoveError};
 
 /// Backend that adapts a [`ConsumerGroupRegistry`] to the generic [`AutoscalerBackend`] trait.
 ///
@@ -39,7 +40,7 @@ impl RabbitMqAutoscalerBackend<ManagementClient> {
         mgmt_config: &ManagementConfig,
         registry: Arc<Mutex<ConsumerGroupRegistry>>,
         config: AutoscalerConfig,
-    ) -> crate::autoscaler::Autoscaler<Self, Stabilized<ThresholdStrategy>> {
+    ) -> Autoscaler<Self, Stabilized<ThresholdStrategy>> {
         let strategy = Stabilized::new(
             ThresholdStrategy {
                 scale_up_multiplier: config.scale_up_multiplier,
@@ -49,7 +50,7 @@ impl RabbitMqAutoscalerBackend<ManagementClient> {
             config.cooldown_duration,
         );
         let backend = Self::new(mgmt_config, registry);
-        crate::autoscaler::Autoscaler::new(backend, strategy, config.poll_interval)
+        Autoscaler::new(backend, strategy, config.poll_interval)
     }
 }
 
@@ -69,12 +70,12 @@ impl<S: QueueStatsProvider> RabbitMqAutoscalerBackend<S> {
 impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
     type GroupId = String;
 
-    async fn list_groups(&self) -> crate::error::Result<Vec<Self::GroupId>> {
+    async fn list_groups(&self) -> Result<Vec<Self::GroupId>> {
         let reg = self.registry.lock().await;
         Ok(reg.groups().keys().cloned().collect())
     }
 
-    async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
+    async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
         let (queue, prefetch, active) = {
             let reg = self.registry.lock().await;
             let g = reg
@@ -107,11 +108,7 @@ impl<S: QueueStatsProvider> AutoscalerBackend for RabbitMqAutoscalerBackend<S> {
         ))
     }
 
-    async fn scale(
-        &self,
-        group: &Self::GroupId,
-        decision: ScalingDecision,
-    ) -> crate::error::Result<()> {
+    async fn scale(&self, group: &Self::GroupId, decision: ScalingDecision) -> Result<()> {
         let mut reg = self.registry.lock().await;
         let g = reg
             .groups_mut()
