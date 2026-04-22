@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerImpl};
@@ -139,7 +139,7 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         }
 
         fn tally(
-            res: std::result::Result<Result<()>, tokio::task::JoinError>,
+            res: std::result::Result<Result<()>, JoinError>,
             errors: &mut usize,
             panics: &mut usize,
         ) {

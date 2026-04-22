@@ -1,5 +1,6 @@
 use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_sqs::types::{Message, MessageAttributeValue, MessageSystemAttributeName};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -20,6 +21,7 @@ use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
 
 /// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
 ///
@@ -84,7 +86,7 @@ impl SqsConsumer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_metadata(msg: &aws_sdk_sqs::types::Message) -> MessageMetadata {
+fn extract_metadata(msg: &Message) -> MessageMetadata {
     let retry_count = router::get_retry_count(msg);
     MessageMetadata {
         retry_count,
@@ -123,10 +125,7 @@ fn extract_payload(body: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(body)
 }
 
-fn extract_dead_metadata(
-    msg: &aws_sdk_sqs::types::Message,
-    queue_name: &str,
-) -> DeadMessageMetadata {
+fn extract_dead_metadata(msg: &Message, queue_name: &str) -> DeadMessageMetadata {
     let metadata = extract_metadata(msg);
     let death_count = metadata.retry_count;
     DeadMessageMetadata {
@@ -220,7 +219,7 @@ where
 struct PendingMessage {
     receipt_handle: String,
     body: String,
-    message_attributes: HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: HashMap<String, MessageAttributeValue>,
     retry_count: u32,
     outcome_rx: oneshot::Receiver<Outcome>,
 }
@@ -259,8 +258,7 @@ where
     let mut in_flight: VecDeque<PendingMessage> = VecDeque::with_capacity(max_in_flight);
     // Received from SQS but not yet dispatched to a handler.  Populated when
     // the receive batch is larger than `max_in_flight`.
-    let mut local_buffer: VecDeque<aws_sdk_sqs::types::Message> =
-        VecDeque::with_capacity(receive_batch);
+    let mut local_buffer: VecDeque<Message> = VecDeque::with_capacity(receive_batch);
 
     // Ack receipt handles accumulated across loop iterations.
     //
@@ -506,9 +504,7 @@ where
                 .queue_url(queue_url)
                 .wait_time_seconds(0)
                 .max_number_of_messages(max_messages)
-                .message_system_attribute_names(
-                    aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount,
-                )
+                .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
                 .message_attribute_names("All")
                 .send()
                 .await
@@ -556,7 +552,7 @@ async fn route_outcome(
     queue_url: &str,
     receipt_handle: &str,
     body: &str,
-    message_attributes: &HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+    message_attributes: &HashMap<String, MessageAttributeValue>,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
@@ -602,7 +598,7 @@ enum KeyState {
     InFlight {
         receipt_handle: String,
         body: String,
-        message_attributes: HashMap<String, aws_sdk_sqs::types::MessageAttributeValue>,
+        message_attributes: HashMap<String, MessageAttributeValue>,
         retry_count: u32,
         outcome_rx: oneshot::Receiver<Outcome>,
     },
@@ -612,11 +608,9 @@ enum KeyState {
 }
 
 /// Extract the sequence key from SQS MessageGroupId system attribute.
-fn extract_sequence_key(msg: &aws_sdk_sqs::types::Message) -> Option<String> {
+fn extract_sequence_key(msg: &Message) -> Option<String> {
     msg.attributes()
-        .and_then(|attrs| {
-            attrs.get(&aws_sdk_sqs::types::MessageSystemAttributeName::MessageGroupId)
-        })
+        .and_then(|attrs| attrs.get(&MessageSystemAttributeName::MessageGroupId))
         .map(|s| s.to_string())
 }
 
@@ -669,8 +663,7 @@ where
     H: MessageHandler<T>,
 {
     let mut poisoned_keys = HashSet::new();
-    let mut pending_deliveries: HashMap<String, VecDeque<aws_sdk_sqs::types::Message>> =
-        HashMap::new();
+    let mut pending_deliveries: HashMap<String, VecDeque<Message>> = HashMap::new();
     let mut backoff = Backoff::default();
 
     loop {
@@ -727,7 +720,7 @@ async fn consume_loop_sequenced<T, H>(
     options: &ConsumerOptions,
     on_failure: SequenceFailure,
     poisoned_keys: &mut HashSet<String>,
-    pending_deliveries: &mut HashMap<String, VecDeque<aws_sdk_sqs::types::Message>>,
+    pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
 ) -> Result<()>
 where
     T: Topic,
@@ -942,8 +935,8 @@ where
                     .queue_url(queue_url)
                     .wait_time_seconds(5)
                     .max_number_of_messages(prefetch.saturating_sub(in_flight_count).min(10) as i32)
-                    .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
-                    .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::MessageGroupId)
+                    .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+                    .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
                     .message_attribute_names("All")
                     .send()
                     .await
@@ -1178,7 +1171,7 @@ async fn drain_pending_for_key<T, H>(
     completed_tx: &mpsc::UnboundedSender<String>,
     key_states: &mut HashMap<String, KeyState>,
     in_flight_count: &mut usize,
-    pending_deliveries: &mut HashMap<String, VecDeque<aws_sdk_sqs::types::Message>>,
+    pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
 ) where
     T: Topic,
     H: MessageHandler<T>,
@@ -1337,7 +1330,7 @@ where
                 .queue_url(queue_url)
                 .wait_time_seconds(5)
                 .max_number_of_messages(10)
-                .message_system_attribute_names(aws_sdk_sqs::types::MessageSystemAttributeName::ApproximateReceiveCount)
+                .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
                 .message_attribute_names("All")
                 .send() => {
                 let output = result.map_err(|e| {
@@ -1352,10 +1345,10 @@ where
                     let body = extract_payload(msg.body().unwrap_or_default());
                     let metadata = extract_dead_metadata(&msg, original_queue);
 
-                    if body.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                    if body.len() > DEFAULT_MAX_MESSAGE_SIZE {
                         warn!(
                             bytes = body.len(),
-                            max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                            max = DEFAULT_MAX_MESSAGE_SIZE,
                             delivery_id = %metadata.message.delivery_id,
                             "oversized DLQ message — discarding"
                         );
@@ -1398,7 +1391,7 @@ impl SqsConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::Sqs>,
+        options: crate::ConsumerOptions<Sqs>,
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
@@ -1440,7 +1433,7 @@ impl SqsConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::Sqs>,
+        options: crate::ConsumerOptions<Sqs>,
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,

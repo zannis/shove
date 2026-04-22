@@ -14,7 +14,6 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::QueueTopology;
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::{
@@ -29,6 +28,7 @@ use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
+use crate::{QueueTopology, RabbitMq};
 
 use super::map_lapin_error;
 
@@ -1205,7 +1205,7 @@ impl RabbitMqConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::RabbitMq>,
+        options: crate::ConsumerOptions<RabbitMq>,
     ) -> Result<()>
     where
         T: Topic,
@@ -1238,7 +1238,7 @@ impl RabbitMqConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::RabbitMq>,
+        options: crate::ConsumerOptions<RabbitMq>,
     ) -> Result<()>
     where
         T: SequencedTopic,

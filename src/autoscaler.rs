@@ -1,5 +1,9 @@
+use crate::error::Result;
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::hash::Hash;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// Tuning knobs for the autoscaler's polling and scaling decisions.
 #[derive(Debug, Clone)]
@@ -196,18 +200,18 @@ impl<S: ScalingStrategy> ScalingStrategy for Stabilized<S> {
 /// A backend that provides group discovery, metric fetching, and scaling
 /// operations for the generic `Autoscaler`.
 pub trait AutoscalerBackend: Send + Sync {
-    type GroupId: Clone + Eq + std::hash::Hash + std::fmt::Display + Send + Sync;
+    type GroupId: Clone + Eq + Hash + Display + Send + Sync;
 
-    fn list_groups(&self) -> impl Future<Output = crate::error::Result<Vec<Self::GroupId>>> + Send;
+    fn list_groups(&self) -> impl Future<Output = Result<Vec<Self::GroupId>>> + Send;
     fn fetch_metrics(
         &self,
         group: &Self::GroupId,
-    ) -> impl Future<Output = crate::error::Result<ScalingMetrics>> + Send;
+    ) -> impl Future<Output = Result<ScalingMetrics>> + Send;
     fn scale(
         &self,
         group: &Self::GroupId,
         decision: ScalingDecision,
-    ) -> impl Future<Output = crate::error::Result<()>> + Send;
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// A generic autoscaler that polls a backend and applies a scaling strategy.
@@ -227,7 +231,7 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
     }
 
     /// Run the autoscaler loop until the `shutdown` token is cancelled.
-    pub async fn run(&mut self, shutdown: tokio_util::sync::CancellationToken) {
+    pub async fn run(&mut self, shutdown: CancellationToken) {
         tracing::info!("autoscaler started");
         loop {
             tokio::select! {
@@ -278,6 +282,7 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ShoveError;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -291,24 +296,18 @@ mod tests {
     impl AutoscalerBackend for MockBackend {
         type GroupId = String;
 
-        async fn list_groups(&self) -> crate::error::Result<Vec<Self::GroupId>> {
+        async fn list_groups(&self) -> Result<Vec<Self::GroupId>> {
             Ok(self.groups.clone())
         }
 
-        async fn fetch_metrics(
-            &self,
-            group: &Self::GroupId,
-        ) -> crate::error::Result<ScalingMetrics> {
-            self.metrics.get(group).cloned().ok_or_else(|| {
-                crate::error::ShoveError::Topology(format!("no metrics for {group}"))
-            })
+        async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
+            self.metrics
+                .get(group)
+                .cloned()
+                .ok_or_else(|| ShoveError::Topology(format!("no metrics for {group}")))
         }
 
-        async fn scale(
-            &self,
-            group: &Self::GroupId,
-            decision: ScalingDecision,
-        ) -> crate::error::Result<()> {
+        async fn scale(&self, group: &Self::GroupId, decision: ScalingDecision) -> Result<()> {
             self.scale_log.lock().await.push((group.clone(), decision));
             Ok(())
         }
@@ -414,7 +413,7 @@ mod tests {
             Duration::from_secs(0),
             Duration::from_secs(0),
         );
-        let token = tokio_util::sync::CancellationToken::new();
+        let token = CancellationToken::new();
         token.cancel();
 
         let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(60));

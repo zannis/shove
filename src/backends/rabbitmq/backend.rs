@@ -10,9 +10,6 @@
 //! `rabbitmq` feature at the parent (`crate::backends`); no per-file cfg
 //! is needed here.
 
-use std::future::Future;
-use std::time::Duration;
-
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
@@ -23,6 +20,9 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::markers::RabbitMq;
 use crate::topic::{SequencedTopic, Topic};
+use std::future::Future;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use super::autoscaler::RabbitMqAutoscalerBackend;
 use super::client::{RabbitMqClient, RabbitMqConfig};
@@ -219,7 +219,7 @@ impl RegistryImpl for ConsumerGroupRegistry {
         ConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
     }
 
-    fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+    fn cancellation_token(&self) -> CancellationToken {
         self.client_shutdown_token()
     }
 

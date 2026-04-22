@@ -9,6 +9,7 @@
 #[path = "../common/stress_test.rs"]
 mod harness;
 
+use async_nats::jetstream;
 use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
 use shove::{Broker, Nats};
 use testcontainers::ImageExt;
@@ -44,7 +45,7 @@ async fn main() {
             let Ok(client) = async_nats::connect(&url).await else {
                 return;
             };
-            let js = async_nats::jetstream::new(client);
+            let js = jetstream::new(client);
             let _ = js.delete_stream(STREAM_NAME).await;
         })
     });

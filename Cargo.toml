@@ -9,6 +9,9 @@ repository = "https://github.com/zannis/shove"
 keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
 categories = ["asynchronous"]
 
+[lints.clippy]
+absolute-paths = "deny"
+
 [features]
 default = []
 

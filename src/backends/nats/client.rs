@@ -1,8 +1,8 @@
+use async_nats::connection::State;
+use async_nats::jetstream;
 use std::fmt;
 use std::process;
 use std::time::Duration;
-
-use async_nats::jetstream;
 use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
@@ -115,10 +115,7 @@ impl NatsClient {
     }
 
     pub fn is_connected(&self) -> bool {
-        matches!(
-            self.client.connection_state(),
-            async_nats::connection::State::Connected
-        )
+        matches!(self.client.connection_state(), State::Connected)
     }
 
     pub async fn shutdown(&self) {

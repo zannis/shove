@@ -15,7 +15,8 @@ use shove::consumer::ConsumerOptions;
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::kafka::{
-    KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig, KafkaTopologyDeclarer,
+    KafkaClient, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig, KafkaQueueStats,
+    KafkaTopologyDeclarer,
 };
 use shove::markers::Kafka;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -1615,7 +1616,7 @@ async fn lag_stats_provider_reports_pending_messages() {
     }
 
     let stats_provider = KafkaLagStatsProvider::new(client.clone());
-    let stats: shove::kafka::KafkaQueueStats = stats_provider
+    let stats: KafkaQueueStats = stats_provider
         .get_queue_stats("kafka-work")
         .await
         .expect("get_queue_stats should succeed");
@@ -1694,7 +1695,7 @@ async fn lag_stats_provider_reports_zero_after_consumption() {
     let stats_provider = KafkaLagStatsProvider::new(client.clone());
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let stats: shove::kafka::KafkaQueueStats = stats_provider
+        let stats: KafkaQueueStats = stats_provider
             .get_queue_stats("kafka-lag-test")
             .await
             .expect("get_queue_stats should succeed");

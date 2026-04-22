@@ -16,6 +16,7 @@ use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
 use crate::consumer_supervisor::ShutdownTally;
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 ///
@@ -63,10 +64,10 @@ impl ConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             concurrent_processing: false,
-            max_pending_per_key: Some(crate::consumer::DEFAULT_MAX_PENDING_PER_KEY),
-            max_message_size: Some(crate::consumer::DEFAULT_MAX_MESSAGE_SIZE),
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -606,10 +607,7 @@ mod tests {
         let config = ConsumerGroupConfig::new(1..=4);
         assert_eq!(config.prefetch_count(), 10);
         assert_eq!(config.max_retries(), 10);
-        assert_eq!(
-            config.handler_timeout(),
-            Some(crate::consumer::DEFAULT_HANDLER_TIMEOUT)
-        );
+        assert_eq!(config.handler_timeout(), Some(DEFAULT_HANDLER_TIMEOUT));
     }
 
     #[test]

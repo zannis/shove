@@ -1,5 +1,5 @@
+use aws_sdk_sqs::types::QueueAttributeName;
 use std::collections::HashMap;
-
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
@@ -199,11 +199,8 @@ impl SnsTopologyDeclarer {
 
         if fifo {
             req = req
-                .attributes(aws_sdk_sqs::types::QueueAttributeName::FifoQueue, "true")
-                .attributes(
-                    aws_sdk_sqs::types::QueueAttributeName::ContentBasedDeduplication,
-                    "true",
-                );
+                .attributes(QueueAttributeName::FifoQueue, "true")
+                .attributes(QueueAttributeName::ContentBasedDeduplication, "true");
         }
 
         if let Some(arn) = dlq_arn {
@@ -212,10 +209,7 @@ impl SnsTopologyDeclarer {
                 "maxReceiveCount": max_receive_count,
             })
             .to_string();
-            req = req.attributes(
-                aws_sdk_sqs::types::QueueAttributeName::RedrivePolicy,
-                redrive,
-            );
+            req = req.attributes(QueueAttributeName::RedrivePolicy, redrive);
         }
 
         let result = req.send().await.map_err(|e| {
@@ -235,7 +229,7 @@ impl SnsTopologyDeclarer {
             .sqs()
             .get_queue_attributes()
             .queue_url(&url)
-            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+            .attribute_names(QueueAttributeName::QueueArn)
             .send()
             .await
             .map_err(|e| {
@@ -246,7 +240,7 @@ impl SnsTopologyDeclarer {
 
         let arn = attrs
             .attributes()
-            .and_then(|m| m.get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn))
+            .and_then(|m| m.get(&QueueAttributeName::QueueArn))
             .ok_or_else(|| {
                 ShoveError::Topology(format!("SQS queue '{name}' has no ARN attribute"))
             })?
@@ -284,7 +278,7 @@ impl SnsTopologyDeclarer {
             .sqs()
             .set_queue_attributes()
             .queue_url(queue_url)
-            .attributes(aws_sdk_sqs::types::QueueAttributeName::Policy, policy)
+            .attributes(QueueAttributeName::Policy, policy)
             .send()
             .await
             .map_err(|e| {
@@ -377,7 +371,9 @@ impl SnsTopologyDeclarer {
         let (dlq_url, dlq_arn) = self.create_sqs_queue(&dlq_aws_name, true, None, 0).await?;
 
         // Register DLQ URL using the key without .fifo
-        self.queue_registry().insert(dlq_registry_key, dlq_url).await;
+        self.queue_registry()
+            .insert(dlq_registry_key, dlq_url)
+            .await;
 
         // Create N FIFO shard queues
         for i in 0..shards {
@@ -469,6 +465,7 @@ impl SnsTopologyDeclarer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SequenceFailure;
     use crate::topology::TopologyBuilder;
     use std::time::Duration;
 
@@ -481,7 +478,7 @@ mod tests {
     #[test]
     fn sns_topic_name_fifo() {
         let topology = TopologyBuilder::new("order-settlement")
-            .sequenced(crate::topology::SequenceFailure::Skip)
+            .sequenced(SequenceFailure::Skip)
             .hold_queue(Duration::from_secs(5))
             .dlq()
             .build();

@@ -20,6 +20,7 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
+use crate::{ConsumerOptions, InMemory};
 
 /// Consumes messages from an [`InMemoryBroker`] queue.
 #[derive(Clone)]
@@ -38,7 +39,7 @@ impl InMemoryConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::InMemory>,
+        options: ConsumerOptions<InMemory>,
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
@@ -51,7 +52,7 @@ impl InMemoryConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::InMemory>,
+        options: ConsumerOptions<InMemory>,
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,

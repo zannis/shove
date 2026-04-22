@@ -148,7 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Monitor queue depth using SqsQueueStatsProvider ──
     //
     // Poll queue attributes to observe the backlog draining.
-    let stats_provider = SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
+    let stats_provider =
+        SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
 
     println!("monitoring queue depth — watching backlog drain\n");
 

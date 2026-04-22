@@ -1,3 +1,4 @@
+use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,11 +44,11 @@ fn content_dedup_id(payload: &str) -> String {
 /// Convert a `HashMap<String, String>` into SNS message attributes.
 fn hashmap_to_message_attributes(
     headers: HashMap<String, String>,
-) -> HashMap<String, aws_sdk_sns::types::MessageAttributeValue> {
+) -> HashMap<String, MessageAttributeValue> {
     headers
         .into_iter()
         .map(|(k, v)| {
-            let attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+            let attr = MessageAttributeValue::builder()
                 .data_type("String")
                 .string_value(v)
                 .build()
@@ -84,7 +85,7 @@ impl SnsPublisher {
         payload: &str,
         group_id: Option<&str>,
         routing_shards: Option<u16>,
-        attributes: Option<HashMap<String, aws_sdk_sns::types::MessageAttributeValue>>,
+        attributes: Option<HashMap<String, MessageAttributeValue>>,
     ) -> Result<()> {
         let mut req = self
             .client
@@ -100,7 +101,7 @@ impl SnsPublisher {
 
             if let Some(shards) = routing_shards {
                 let shard = compute_shard(gid, shards);
-                let shard_attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+                let shard_attr = MessageAttributeValue::builder()
                     .data_type("String")
                     .string_value(shard.to_string())
                     .build()
@@ -230,11 +231,11 @@ impl SnsPublisher {
         );
 
         // Build batch entries
-        let entries: Vec<aws_sdk_sns::types::PublishBatchRequestEntry> = payloads
+        let entries: Vec<PublishBatchRequestEntry> = payloads
             .iter()
             .enumerate()
             .map(|(i, payload)| {
-                let mut entry = aws_sdk_sns::types::PublishBatchRequestEntry::builder()
+                let mut entry = PublishBatchRequestEntry::builder()
                     .id(i.to_string())
                     .message(payload);
 
@@ -245,7 +246,7 @@ impl SnsPublisher {
 
                     if let Some(seq) = topology.sequencing() {
                         let shard = compute_shard(&keys[i], seq.routing_shards());
-                        let shard_attr = aws_sdk_sns::types::MessageAttributeValue::builder()
+                        let shard_attr = MessageAttributeValue::builder()
                             .data_type("String")
                             .string_value(shard.to_string())
                             .build()

@@ -2,6 +2,7 @@
 //! prints each record to stdout; swap in `ShoveAuditHandler` to publish to a
 //! dedicated audit topic.
 
+use shove::error::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -45,7 +46,7 @@ impl MessageHandler<EventTopic> for Inner {
 #[derive(Clone, Default)]
 struct StdoutAudit;
 impl AuditHandler<EventTopic> for StdoutAudit {
-    async fn audit(&self, record: &AuditRecord<Event>) -> shove::error::Result<()> {
+    async fn audit(&self, record: &AuditRecord<Event>) -> Result<()> {
         println!(
             "audit trace_id={} outcome={:?} duration_ms={}",
             record.trace_id, record.outcome, record.duration_ms

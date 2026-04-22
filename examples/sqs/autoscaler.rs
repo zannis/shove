@@ -158,7 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `hysteresis_duration` before action is taken.
     // Cooldown prevents back-to-back scaling: at least `cooldown_duration`
     // must elapse between two scaling actions for the same group.
-    let stats_provider = SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
+    let stats_provider =
+        SqsQueueStatsProvider::new(client.clone(), client.queue_registry().clone());
 
     let auto_config = AutoscalerConfig {
         poll_interval: Duration::from_secs(2),

@@ -1,10 +1,10 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-
 use tokio_util::sync::CancellationToken;
 
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::Result;
+use crate::sns::QueueRegistry;
 
 /// AWS SNS connection configuration.
 #[derive(Clone)]
@@ -40,7 +40,7 @@ pub struct SnsClient {
     sqs_client: aws_sdk_sqs::Client,
     topic_registry: Arc<TopicRegistry>,
     #[cfg(feature = "aws-sns-sqs")]
-    queue_registry: Arc<crate::backends::sns::topology::QueueRegistry>,
+    queue_registry: Arc<QueueRegistry>,
     shutdown_token: CancellationToken,
 }
 
@@ -72,7 +72,7 @@ impl SnsClient {
             sqs_client,
             topic_registry: Arc::new(TopicRegistry::new()),
             #[cfg(feature = "aws-sns-sqs")]
-            queue_registry: Arc::new(crate::backends::sns::topology::QueueRegistry::new()),
+            queue_registry: Arc::new(QueueRegistry::new()),
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -81,6 +81,7 @@ impl SnsClient {
     #[cfg(test)]
     pub(crate) fn mock() -> Self {
         let behavior_version = aws_config::BehaviorVersion::latest();
+        #[allow(clippy::absolute_paths)]
         let sns_conf = aws_sdk_sns::config::Config::builder()
             .behavior_version(behavior_version)
             .region(aws_config::Region::new("us-east-1"))
@@ -89,6 +90,7 @@ impl SnsClient {
 
         #[cfg(feature = "aws-sns-sqs")]
         let sqs_client = {
+            #[allow(clippy::absolute_paths)]
             let sqs_conf = aws_sdk_sqs::config::Config::builder()
                 .behavior_version(behavior_version)
                 .region(aws_config::Region::new("us-east-1"))
@@ -102,7 +104,7 @@ impl SnsClient {
             sqs_client,
             topic_registry: Arc::new(TopicRegistry::new()),
             #[cfg(feature = "aws-sns-sqs")]
-            queue_registry: Arc::new(crate::backends::sns::topology::QueueRegistry::new()),
+            queue_registry: Arc::new(QueueRegistry::new()),
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -130,7 +132,7 @@ impl SnsClient {
 
     /// Client-owned SQS queue-URL registry.
     #[cfg(feature = "aws-sns-sqs")]
-    pub fn queue_registry(&self) -> &Arc<crate::backends::sns::topology::QueueRegistry> {
+    pub fn queue_registry(&self) -> &Arc<QueueRegistry> {
         &self.queue_registry
     }
 

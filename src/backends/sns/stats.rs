@@ -1,5 +1,5 @@
+use aws_sdk_sqs::types::QueueAttributeName;
 use std::sync::Arc;
-
 use tracing::debug;
 
 use crate::backends::sns::client::SnsClient;
@@ -48,10 +48,8 @@ impl SqsQueueStatsProviderTrait for SqsQueueStatsProvider {
             .sqs()
             .get_queue_attributes()
             .queue_url(&queue_url)
-            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
-            .attribute_names(
-                aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
-            )
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
             .send()
             .await
             .map_err(|e| {
@@ -62,19 +60,13 @@ impl SqsQueueStatsProviderTrait for SqsQueueStatsProvider {
 
         let ready = result
             .attributes()
-            .and_then(|m| {
-                m.get(&aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
-            })
+            .and_then(|m| m.get(&QueueAttributeName::ApproximateNumberOfMessages))
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
 
         let not_visible = result
             .attributes()
-            .and_then(|m| {
-                m.get(
-                    &aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
-                )
-            })
+            .and_then(|m| m.get(&QueueAttributeName::ApproximateNumberOfMessagesNotVisible))
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
 

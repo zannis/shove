@@ -1,5 +1,5 @@
+use async_nats::jetstream::consumer::pull::Config;
 use std::sync::Arc;
-
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -46,9 +46,7 @@ impl NatsQueueStatsProvider for JetStreamStatsProvider {
             .map_err(|e| ShoveError::Topology(format!("failed to get stream {queue}: {e}")))?;
 
         let consumer_name = super::constants::consumer_name(queue);
-        let consumer_result = stream
-            .get_consumer::<async_nats::jetstream::consumer::pull::Config>(&consumer_name)
-            .await;
+        let consumer_result = stream.get_consumer::<Config>(&consumer_name).await;
 
         match consumer_result {
             Ok(mut consumer) => {

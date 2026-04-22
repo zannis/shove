@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, ConsumerOptionsInner};
 use crate::error::{Result, ShoveError};
+use crate::markers::*;
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -233,13 +234,13 @@ impl<B: Backend> ConsumerOptions<B> {
     /// is `false`, the effective prefetch is clamped to `1` so the consumer
     /// processes one message at a time — matching the semantic of the
     /// per-backend `ConsumerGroupConfig::with_concurrent_processing`.
-    pub(crate) fn into_inner(self) -> crate::backend::ConsumerOptionsInner {
+    pub(crate) fn into_inner(self) -> ConsumerOptionsInner {
         let effective_prefetch = if self.concurrent_processing {
             self.prefetch_count
         } else {
             1
         };
-        crate::backend::ConsumerOptionsInner {
+        ConsumerOptionsInner {
             max_retries: self.max_retries,
             prefetch_count: effective_prefetch,
             handler_timeout: self.handler_timeout,
@@ -289,7 +290,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
 
 #[cfg(feature = "aws-sns-sqs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
-impl ConsumerOptions<crate::markers::Sqs> {
+impl ConsumerOptions<Sqs> {
     /// Number of messages requested per SQS `ReceiveMessage` poll.
     ///
     /// Zero (the default) means "use `prefetch_count`".
@@ -301,7 +302,7 @@ impl ConsumerOptions<crate::markers::Sqs> {
 
 #[cfg(feature = "nats")]
 #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
-impl ConsumerOptions<crate::markers::Nats> {
+impl ConsumerOptions<Nats> {
     /// Override the durable consumer's `max_ack_pending`.
     pub fn with_max_ack_pending(mut self, n: i64) -> Self {
         self.max_ack_pending = Some(n);
@@ -311,7 +312,7 @@ impl ConsumerOptions<crate::markers::Nats> {
 
 #[cfg(feature = "rabbitmq-transactional")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq-transactional")))]
-impl ConsumerOptions<crate::markers::RabbitMq> {
+impl ConsumerOptions<RabbitMq> {
     /// Enable exactly-once delivery via AMQP transactions.
     ///
     /// See [`ConsumerOptions::exactly_once`] for the full trade-off description.
@@ -328,7 +329,7 @@ mod tests {
     // Tests use the InMemory marker when available; otherwise fall back to
     // any enabled backend marker.
     #[cfg(feature = "inmemory")]
-    type TestBackend = crate::markers::InMemory;
+    type TestBackend = InMemory;
 
     #[cfg(all(not(feature = "inmemory"), feature = "kafka"))]
     type TestBackend = crate::markers::Kafka;
@@ -515,21 +516,21 @@ mod tests {
     #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn exactly_once_defaults_to_false() {
-        let opts = ConsumerOptions::<crate::markers::RabbitMq>::new();
+        let opts = ConsumerOptions::<RabbitMq>::new();
         assert!(!opts.exactly_once);
     }
 
     #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn with_exactly_once_sets_flag() {
-        let opts = ConsumerOptions::<crate::markers::RabbitMq>::new().with_exactly_once();
+        let opts = ConsumerOptions::<RabbitMq>::new().with_exactly_once();
         assert!(opts.exactly_once);
     }
 
     #[cfg(feature = "rabbitmq-transactional")]
     #[test]
     fn exactly_once_chains_with_other_builders() {
-        let opts = ConsumerOptions::<crate::markers::RabbitMq>::new()
+        let opts = ConsumerOptions::<RabbitMq>::new()
             .with_max_retries(5)
             .with_exactly_once()
             .with_prefetch_count(1);
@@ -634,14 +635,14 @@ mod tests {
     #[cfg(feature = "aws-sns-sqs")]
     #[test]
     fn sqs_with_receive_batch_size_sets_value() {
-        let opts = ConsumerOptions::<crate::markers::Sqs>::new().with_receive_batch_size(7);
+        let opts = ConsumerOptions::<Sqs>::new().with_receive_batch_size(7);
         assert_eq!(opts.receive_batch_size, 7);
     }
 
     #[cfg(feature = "nats")]
     #[test]
     fn nats_with_max_ack_pending_sets_value() {
-        let opts = ConsumerOptions::<crate::markers::Nats>::new().with_max_ack_pending(128);
+        let opts = ConsumerOptions::<Nats>::new().with_max_ack_pending(128);
         assert_eq!(opts.max_ack_pending, Some(128));
     }
 }

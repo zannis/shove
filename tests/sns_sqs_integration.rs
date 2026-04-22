@@ -18,6 +18,7 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
+use aws_sdk_sqs::types::Message;
 use shove::Broker;
 use shove::Sqs;
 use shove::publisher::Publisher as PublisherV2;
@@ -174,7 +175,7 @@ impl TestBroker {
         queue_url: &str,
         expected_count: usize,
         timeout: Duration,
-    ) -> Vec<aws_sdk_sqs::types::Message> {
+    ) -> Vec<Message> {
         let deadline = Instant::now() + timeout;
         let mut all_messages = Vec::new();
 

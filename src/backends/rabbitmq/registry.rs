@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
@@ -95,7 +95,7 @@ impl ConsumerGroupRegistry {
     ///
     /// Used by `RegistryImpl::cancellation_token` to surface a
     /// backend-independent shutdown signal.
-    pub fn client_shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+    pub fn client_shutdown_token(&self) -> CancellationToken {
         self.client.shutdown_token()
     }
 

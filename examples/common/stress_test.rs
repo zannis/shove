@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+use mach2::traps::mach_task_self;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use shove::{
@@ -297,7 +298,7 @@ fn current_cpu_secs() -> f64 {
         let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
         let kr = unsafe {
             task_info(
-                mach2::traps::mach_task_self(),
+                mach_task_self(),
                 MACH_TASK_BASIC_INFO as task_flavor_t,
                 &mut info as *mut _ as *mut i32,
                 &mut count,
@@ -341,7 +342,7 @@ fn current_rss_bytes() -> u64 {
         let mut count = (size_of::<mach_task_basic_info>() / size_of::<u32>()) as u32;
         let kr = unsafe {
             task_info(
-                mach2::traps::mach_task_self(),
+                mach_task_self(),
                 MACH_TASK_BASIC_INFO as task_flavor_t,
                 &mut info as *mut _ as *mut i32,
                 &mut count,

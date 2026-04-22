@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_nats::HeaderMap;
 use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
 use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
@@ -13,14 +14,16 @@ use futures_util::StreamExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::ShoveError;
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::consumer::validate_message_size;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::{
@@ -57,7 +60,7 @@ fn get_retry_count(headers: &Option<HeaderMap>) -> u32 {
 }
 
 /// Extracts message metadata from a JetStream message.
-fn extract_message_metadata(msg: &async_nats::jetstream::Message) -> MessageMetadata {
+fn extract_message_metadata(msg: &Message) -> MessageMetadata {
     let retry_count = get_retry_count(&msg.headers);
 
     let delivery_id = msg
@@ -80,7 +83,7 @@ fn extract_message_metadata(msg: &async_nats::jetstream::Message) -> MessageMeta
 }
 
 /// Extracts dead message metadata from a JetStream message.
-fn extract_dead_metadata(msg: &async_nats::jetstream::Message) -> DeadMessageMetadata {
+fn extract_dead_metadata(msg: &Message) -> DeadMessageMetadata {
     let message = extract_message_metadata(msg);
 
     let reason = msg
@@ -130,7 +133,7 @@ fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
 async fn publish_to_dlq(
     client: &NatsClient,
     topology: &QueueTopology,
-    msg: &async_nats::jetstream::Message,
+    msg: &Message,
     reason: &str,
 ) -> Result<()> {
     let dlq_subject = match topology.dlq() {
@@ -182,12 +185,12 @@ async fn publish_to_dlq(
 /// Dispatches message routing based on the handler's outcome.
 async fn route_outcome(
     client: &NatsClient,
-    msg: &async_nats::jetstream::Message,
+    msg: &Message,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
     max_retries: u32,
-    hold_queues: &[crate::topology::HoldQueue],
+    hold_queues: &[HoldQueue],
 ) {
     let result: Result<()> = match outcome {
         Outcome::Ack => {
@@ -340,7 +343,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let mut backoff = crate::retry::Backoff::default();
+    let mut backoff = Backoff::default();
     let mut attempts = 0u32;
     loop {
         match f().await {
@@ -394,7 +397,7 @@ impl NatsConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::Nats>,
+        options: crate::ConsumerOptions<Nats>,
     ) -> Result<()>
     where
         T: Topic,
@@ -511,7 +514,7 @@ impl NatsConsumer {
                             };
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -625,7 +628,7 @@ impl NatsConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::Nats>,
+        options: crate::ConsumerOptions<Nats>,
     ) -> Result<()>
     where
         T: SequencedTopic,
@@ -740,7 +743,7 @@ impl NatsConsumer {
                             };
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(msg.payload.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     shard,
@@ -915,10 +918,10 @@ impl NatsConsumer {
                             };
 
                             // Discard oversized DLQ messages
-                            if msg.payload.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                            if msg.payload.len() > DEFAULT_MAX_MESSAGE_SIZE {
                                 tracing::warn!(
                                     bytes = msg.payload.len(),
-                                    max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                                    max = DEFAULT_MAX_MESSAGE_SIZE,
                                     dlq,
                                     "oversized DLQ message — discarding"
                                 );

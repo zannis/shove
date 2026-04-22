@@ -1,14 +1,15 @@
+use crate::error::{Result, ShoveError};
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
-
+use crate::Autoscaler;
 use crate::autoscaler::{
     AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics, Stabilized,
     ThresholdStrategy,
 };
 use crate::backends::sns::registry::SqsConsumerGroupRegistry;
 use crate::backends::sns::stats::{SqsQueueStatsProvider, SqsQueueStatsProviderTrait};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 /// Backend that adapts a [`SqsConsumerGroupRegistry`] to the generic [`AutoscalerBackend`] trait.
 ///
@@ -36,7 +37,7 @@ impl SqsAutoscalerBackend<SqsQueueStatsProvider> {
         stats_provider: SqsQueueStatsProvider,
         registry: Arc<Mutex<SqsConsumerGroupRegistry>>,
         config: AutoscalerConfig,
-    ) -> crate::autoscaler::Autoscaler<Self, Stabilized<ThresholdStrategy>> {
+    ) -> Autoscaler<Self, Stabilized<ThresholdStrategy>> {
         let strategy = Stabilized::new(
             ThresholdStrategy {
                 scale_up_multiplier: config.scale_up_multiplier,
@@ -46,7 +47,7 @@ impl SqsAutoscalerBackend<SqsQueueStatsProvider> {
             config.cooldown_duration,
         );
         let backend = Self::new(stats_provider, registry);
-        crate::autoscaler::Autoscaler::new(backend, strategy, config.poll_interval)
+        Autoscaler::new(backend, strategy, config.poll_interval)
     }
 }
 
@@ -66,17 +67,18 @@ impl<S: SqsQueueStatsProviderTrait> SqsAutoscalerBackend<S> {
 impl<S: SqsQueueStatsProviderTrait> AutoscalerBackend for SqsAutoscalerBackend<S> {
     type GroupId = String;
 
-    async fn list_groups(&self) -> crate::error::Result<Vec<Self::GroupId>> {
+    async fn list_groups(&self) -> Result<Vec<Self::GroupId>> {
         let reg = self.registry.lock().await;
         Ok(reg.groups().keys().cloned().collect())
     }
 
-    async fn fetch_metrics(&self, group: &Self::GroupId) -> crate::error::Result<ScalingMetrics> {
+    async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
         let (queue, prefetch, active) = {
             let reg = self.registry.lock().await;
-            let g = reg.groups().get(group).ok_or_else(|| {
-                crate::error::ShoveError::Topology(format!("group not found: {group}"))
-            })?;
+            let g = reg
+                .groups()
+                .get(group)
+                .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
             (
                 g.queue().to_owned(),
                 g.config().prefetch_count(),
@@ -103,15 +105,12 @@ impl<S: SqsQueueStatsProviderTrait> AutoscalerBackend for SqsAutoscalerBackend<S
         ))
     }
 
-    async fn scale(
-        &self,
-        group: &Self::GroupId,
-        decision: ScalingDecision,
-    ) -> crate::error::Result<()> {
+    async fn scale(&self, group: &Self::GroupId, decision: ScalingDecision) -> Result<()> {
         let mut reg = self.registry.lock().await;
-        let g = reg.groups_mut().get_mut(group).ok_or_else(|| {
-            crate::error::ShoveError::Connection(format!("group not found: {group}"))
-        })?;
+        let g = reg
+            .groups_mut()
+            .get_mut(group)
+            .ok_or_else(|| ShoveError::Connection(format!("group not found: {group}")))?;
 
         match decision {
             ScalingDecision::ScaleUp(n) => {
@@ -142,9 +141,12 @@ impl<S: SqsQueueStatsProviderTrait> AutoscalerBackend for SqsAutoscalerBackend<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TopologyBuilder;
     use crate::autoscaler::{Autoscaler, Stabilized, ThresholdStrategy};
     use crate::backends::sns::stats::SqsQueueStats;
     use crate::error::ShoveError;
+    use crate::sns::SqsConsumerGroup;
+    use crate::{MessageMetadata, Outcome};
     use std::collections::HashMap;
     use std::sync::OnceLock;
     use std::time::Duration;
@@ -162,7 +164,7 @@ mod tests {
     }
 
     impl SqsQueueStatsProviderTrait for MockSqsStatsProvider {
-        async fn get_queue_stats(&self, queue_name: &str) -> crate::error::Result<SqsQueueStats> {
+        async fn get_queue_stats(&self, queue_name: &str) -> Result<SqsQueueStats> {
             self.stats
                 .get(queue_name)
                 .cloned()
@@ -193,25 +195,20 @@ mod tests {
             type Message = Msg;
             fn topology() -> &'static QueueTopology {
                 static TOPO: OnceLock<QueueTopology> = OnceLock::new();
-                TOPO.get_or_init(|| crate::topology::TopologyBuilder::new("test-queue").build())
+                TOPO.get_or_init(|| TopologyBuilder::new("test-queue").build())
             }
         }
         #[derive(Clone)]
         struct H;
         impl MessageHandler<T> for H {
             type Context = ();
-            async fn handle(
-                &self,
-                _: Msg,
-                _: crate::metadata::MessageMetadata,
-                _: &(),
-            ) -> crate::outcome::Outcome {
-                crate::outcome::Outcome::Ack
+            async fn handle(&self, _: Msg, _: MessageMetadata, _: &()) -> Outcome {
+                Outcome::Ack
             }
         }
 
         let token = client.shutdown_token().child_token();
-        let mut group = crate::backends::sns::consumer_group::SqsConsumerGroup::new::<T, H>(
+        let mut group = SqsConsumerGroup::new::<T, H>(
             "test-group",
             "test-queue",
             SqsConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ struct OrdersTopic;
 impl Topic for OrdersTopic {
     type Message = Order;
     fn topology() -> &'static shove::QueueTopology {
-        static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
             TopologyBuilder::new("orders-int")
                 .hold_queue(Duration::from_millis(20))
@@ -62,7 +63,7 @@ struct LedgerFailAllTopic;
 impl Topic for LedgerFailAllTopic {
     type Message = Event;
     fn topology() -> &'static shove::QueueTopology {
-        static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
             TopologyBuilder::new("ledger-failall-int")
                 .sequenced(SequenceFailure::FailAll)
@@ -84,7 +85,7 @@ struct LedgerSkipTopic;
 impl Topic for LedgerSkipTopic {
     type Message = Event;
     fn topology() -> &'static shove::QueueTopology {
-        static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
             TopologyBuilder::new("ledger-skip-int")
                 .sequenced(SequenceFailure::Skip)
@@ -109,7 +110,7 @@ struct GroupTopic;
 impl Topic for GroupTopic {
     type Message = Ping;
     fn topology() -> &'static shove::QueueTopology {
-        static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("group-int").dlq().build())
     }
 }
@@ -658,7 +659,7 @@ struct BigTopic;
 impl Topic for BigTopic {
     type Message = BigPayload;
     fn topology() -> &'static shove::QueueTopology {
-        static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("big-int").dlq().build())
     }
 }

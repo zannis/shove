@@ -7,11 +7,7 @@
 //!
 //! Run with: `cargo test --features rabbitmq,audit --test rabbitmq_integration`
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
-
+use lapin::options::BasicPublishOptions;
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::handler::MessageHandler;
@@ -19,6 +15,10 @@ use shove::markers::RabbitMq as RabbitMqMarker;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::outcome::Outcome;
 use shove::rabbitmq::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 // Explicit import to disambiguate from shove::consumer_group::ConsumerGroupConfig (the wrapper).
 use shove::rabbitmq::ConsumerGroupConfig;
 use shove::*;
@@ -3435,7 +3435,7 @@ async fn deserialization_failure_rejects_to_dlq() {
         .basic_publish(
             "".into(),
             "test-strict".into(),
-            lapin::options::BasicPublishOptions::default(),
+            BasicPublishOptions::default(),
             b"{\"wrong_field\": \"not a number\"}",
             lapin::BasicProperties::default()
                 .with_delivery_mode(2)
@@ -3994,7 +3994,7 @@ async fn dlq_consumer_handles_deserialization_failure() {
         .basic_publish(
             "".into(),
             "test-simple-dlq".into(),
-            lapin::options::BasicPublishOptions::default(),
+            BasicPublishOptions::default(),
             b"not valid json at all {{{",
             lapin::BasicProperties::default()
                 .with_delivery_mode(2)
@@ -4010,7 +4010,7 @@ async fn dlq_consumer_handles_deserialization_failure() {
         .basic_publish(
             "".into(),
             "test-simple-dlq".into(),
-            lapin::options::BasicPublishOptions::default(),
+            BasicPublishOptions::default(),
             b"{\"body\": \"valid-dlq-msg\"}",
             lapin::BasicProperties::default()
                 .with_delivery_mode(2)

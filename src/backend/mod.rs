@@ -77,6 +77,9 @@ mod bounds_smoke {
 
     use super::*;
     use crate::backend::capability::HasCoordinatedGroups;
+    use crate::markers::*;
+    use crate::{MessageMetadata, QueueTopology, SupervisorOutcome};
+    use tokio_util::sync::CancellationToken;
 
     fn _require_backend<B: Backend>() {
         fn needs_send_sync_static<T: Send + Sync + 'static>() {}
@@ -98,26 +101,26 @@ mod bounds_smoke {
     // at compile time instead of only at monomorphization.
     #[cfg(feature = "inmemory")]
     fn _anchor_inmemory() {
-        _require_backend::<crate::markers::InMemory>();
-        _require_has_coordinated_groups::<crate::markers::InMemory>();
+        _require_backend::<InMemory>();
+        _require_has_coordinated_groups::<InMemory>();
     }
 
     #[cfg(feature = "kafka")]
     fn _anchor_kafka() {
-        _require_backend::<crate::markers::Kafka>();
-        _require_has_coordinated_groups::<crate::markers::Kafka>();
+        _require_backend::<Kafka>();
+        _require_has_coordinated_groups::<Kafka>();
     }
 
     #[cfg(feature = "nats")]
     fn _anchor_nats() {
-        _require_backend::<crate::markers::Nats>();
-        _require_has_coordinated_groups::<crate::markers::Nats>();
+        _require_backend::<Nats>();
+        _require_has_coordinated_groups::<Nats>();
     }
 
     #[cfg(feature = "rabbitmq")]
     fn _anchor_rabbitmq() {
-        _require_backend::<crate::markers::RabbitMq>();
-        _require_has_coordinated_groups::<crate::markers::RabbitMq>();
+        _require_backend::<RabbitMq>();
+        _require_has_coordinated_groups::<RabbitMq>();
     }
 
     // SQS deliberately does NOT implement `HasCoordinatedGroups` — its
@@ -125,7 +128,7 @@ mod bounds_smoke {
     // `ConsumerSupervisor<Sqs>`). Anchor only the `Backend` bound.
     #[cfg(feature = "aws-sns-sqs")]
     fn _anchor_sqs() {
-        _require_backend::<crate::markers::Sqs>();
+        _require_backend::<Sqs>();
     }
 
     // Per-method anchoring: exercise every internal trait method once
@@ -134,12 +137,12 @@ mod bounds_smoke {
     // functions are `#[cfg(test)]`-only and never called; their bodies
     // just need to type-check.
     #[cfg(feature = "inmemory")]
-    async fn _anchor_publisher_impl(p: &<crate::markers::InMemory as Backend>::PublisherImpl) {
+    async fn _anchor_publisher_impl(p: &<InMemory as Backend>::PublisherImpl) {
         use crate::topic::Topic;
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
-            fn topology() -> &'static crate::topology::QueueTopology {
+            fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }
         }
@@ -154,7 +157,7 @@ mod bounds_smoke {
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_consumer_impl(c: &<crate::markers::InMemory as Backend>::ConsumerImpl) {
+    async fn _anchor_consumer_impl(c: &<InMemory as Backend>::ConsumerImpl) {
         use crate::handler::MessageHandler;
         use crate::outcome::Outcome;
         use crate::topic::{SequencedTopic, Topic};
@@ -162,7 +165,7 @@ mod bounds_smoke {
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
-            fn topology() -> &'static crate::topology::QueueTopology {
+            fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }
         }
@@ -174,12 +177,7 @@ mod bounds_smoke {
         struct DummyHandler;
         impl MessageHandler<Dummy> for DummyHandler {
             type Context = ();
-            async fn handle(
-                &self,
-                _m: (),
-                _meta: crate::metadata::MessageMetadata,
-                _ctx: &(),
-            ) -> Outcome {
+            async fn handle(&self, _m: (), _meta: MessageMetadata, _ctx: &()) -> Outcome {
                 Outcome::Ack
             }
         }
@@ -190,7 +188,7 @@ mod bounds_smoke {
             handler_timeout: None,
             max_pending_per_key: None,
             max_message_size: None,
-            shutdown: tokio_util::sync::CancellationToken::new(),
+            shutdown: CancellationToken::new(),
             processing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
@@ -208,12 +206,12 @@ mod bounds_smoke {
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_topology_impl(t: &<crate::markers::InMemory as Backend>::TopologyImpl) {
+    async fn _anchor_topology_impl(t: &<InMemory as Backend>::TopologyImpl) {
         use crate::topic::Topic;
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
-            fn topology() -> &'static crate::topology::QueueTopology {
+            fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }
         }
@@ -221,19 +219,17 @@ mod bounds_smoke {
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_autoscaler_impl(_a: &<crate::markers::InMemory as Backend>::AutoscalerImpl) {
+    async fn _anchor_autoscaler_impl(_a: &<InMemory as Backend>::AutoscalerImpl) {
         // AutoscalerBackendImpl has no methods in Phase 4.
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_stats_impl(s: &<crate::markers::InMemory as Backend>::QueueStatsImpl) {
+    async fn _anchor_stats_impl(s: &<InMemory as Backend>::QueueStatsImpl) {
         let _ = <_ as QueueStatsProviderImpl>::snapshot(s, "q").await;
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_registry_impl(
-        r: &mut <crate::markers::InMemory as HasCoordinatedGroups>::RegistryImpl,
-    ) {
+    async fn _anchor_registry_impl(r: &mut <InMemory as HasCoordinatedGroups>::RegistryImpl) {
         use crate::handler::MessageHandler;
         use crate::outcome::Outcome;
         use crate::topic::Topic;
@@ -241,30 +237,25 @@ mod bounds_smoke {
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
-            fn topology() -> &'static crate::topology::QueueTopology {
+            fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }
         }
         struct DummyHandler;
         impl MessageHandler<Dummy> for DummyHandler {
             type Context = ();
-            async fn handle(
-                &self,
-                _m: (),
-                _meta: crate::metadata::MessageMetadata,
-                _ctx: &(),
-            ) -> Outcome {
+            async fn handle(&self, _m: (), _meta: MessageMetadata, _ctx: &()) -> Outcome {
                 Outcome::Ack
             }
         }
         let _ = <_ as RegistryImpl>::register::<Dummy, DummyHandler>(
             r,
-            <<crate::markers::InMemory as HasCoordinatedGroups>::ConsumerGroupConfig>::default(),
+            <<InMemory as HasCoordinatedGroups>::ConsumerGroupConfig>::default(),
             || DummyHandler,
             (),
         )
         .await;
-        let _: tokio_util::sync::CancellationToken = <_ as RegistryImpl>::cancellation_token(r);
+        let _: CancellationToken = <_ as RegistryImpl>::cancellation_token(r);
     }
 
     // The `run_until_timeout` consumer of the registry can't be anchored
@@ -273,9 +264,9 @@ mod bounds_smoke {
     // dedicated anchor.
     #[cfg(feature = "inmemory")]
     async fn _anchor_registry_run_until_timeout(
-        r: <crate::markers::InMemory as HasCoordinatedGroups>::RegistryImpl,
+        r: <InMemory as HasCoordinatedGroups>::RegistryImpl,
     ) {
-        let _: crate::consumer_supervisor::SupervisorOutcome =
+        let _: SupervisorOutcome =
             <_ as RegistryImpl>::run_until_timeout::<std::future::Pending<()>>(
                 r,
                 std::future::pending(),

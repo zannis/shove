@@ -7,12 +7,12 @@ use async_nats::jetstream;
 use bytes::Bytes;
 use uuid::Uuid;
 
-use crate::ShoveError;
 use crate::backend::PublisherImpl;
 use crate::error::Result;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
+use crate::{QueueTopology, ShoveError};
 
 use super::client::NatsClient;
 use super::constants::RETRY_COUNT_HEADER;
@@ -75,10 +75,7 @@ impl NatsPublisher {
         Ok(Self { client })
     }
 
-    fn resolve_subject<T: Topic>(
-        topology: &'static crate::topology::QueueTopology,
-        message: &T::Message,
-    ) -> String {
+    fn resolve_subject<T: Topic>(topology: &'static QueueTopology, message: &T::Message) -> String {
         if let Some(seq) = topology.sequencing()
             && let Some(key_fn) = T::SEQUENCE_KEY_FN
         {

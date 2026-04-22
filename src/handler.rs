@@ -216,10 +216,11 @@ mod tests {
     #[tokio::test]
     async fn audited_extension_wraps_handler() {
         use crate::audit::{AuditHandler, AuditRecord};
+        use crate::error::Result;
 
         struct NullAudit;
         impl AuditHandler<TestTopic> for NullAudit {
-            async fn audit(&self, _rec: &AuditRecord<TestMessage>) -> crate::error::Result<()> {
+            async fn audit(&self, _rec: &AuditRecord<TestMessage>) -> Result<()> {
                 Ok(())
             }
         }

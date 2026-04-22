@@ -529,7 +529,7 @@ mod tests {
         let mut group = panicking_group();
         group.start();
         // Give the spawned tasks a moment to panic before draining.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let tally = group.shutdown_with_tally().await;
         assert_eq!(tally.panics, 2, "expected both spawned tasks to panic");
         assert_eq!(tally.errors, 0);
@@ -556,7 +556,7 @@ mod tests {
         for g in registry.groups.values_mut() {
             g.start();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let tally = registry.shutdown_all_with_tally().await;
         // 2 groups × 2 panicking consumers = 4 panics.
         assert_eq!(tally.panics, 4);

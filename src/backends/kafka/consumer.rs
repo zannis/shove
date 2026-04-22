@@ -11,14 +11,16 @@ use rdkafka::{Offset, TopicPartitionList};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::ShoveError;
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::consumer::validate_message_size;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
 
 use super::client::KafkaClient;
 use super::constants::{
@@ -292,7 +294,7 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     retry_count: u32,
     max_retries: u32,
-    hold_queues: &[crate::topology::HoldQueue],
+    hold_queues: &[HoldQueue],
 ) -> bool {
     match outcome {
         Outcome::Ack => true,
@@ -489,7 +491,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let mut backoff = crate::retry::Backoff::default();
+    let mut backoff = Backoff::default();
     let mut attempts = 0u32;
     loop {
         match f().await {
@@ -543,7 +545,7 @@ impl KafkaConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::Kafka>,
+        options: crate::ConsumerOptions<Kafka>,
     ) -> Result<()>
     where
         T: Topic,
@@ -663,7 +665,7 @@ impl KafkaConsumer {
                             }
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -783,7 +785,7 @@ impl KafkaConsumer {
         &self,
         handler: H,
         ctx: H::Context,
-        options: crate::ConsumerOptions<crate::markers::Kafka>,
+        options: crate::ConsumerOptions<Kafka>,
     ) -> Result<()>
     where
         T: SequencedTopic,
@@ -865,7 +867,7 @@ impl KafkaConsumer {
                             let key = msg.key().map(|k| k.to_vec());
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = crate::consumer::validate_message_size(payload_bytes.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -1011,10 +1013,10 @@ impl KafkaConsumer {
                             let headers = extract_string_headers(&msg);
 
                             // Discard oversized DLQ messages
-                            if payload_bytes.len() > crate::consumer::DEFAULT_MAX_MESSAGE_SIZE {
+                            if payload_bytes.len() > DEFAULT_MAX_MESSAGE_SIZE {
                                 tracing::warn!(
                                     bytes = payload_bytes.len(),
-                                    max = crate::consumer::DEFAULT_MAX_MESSAGE_SIZE,
+                                    max = DEFAULT_MAX_MESSAGE_SIZE,
                                     dlq,
                                     "oversized DLQ message — discarding"
                                 );

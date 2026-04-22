@@ -7,11 +7,7 @@
 
 #![cfg(feature = "nats")]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
-
+use async_nats::header::NATS_MESSAGE_ID;
 use serde::{Deserialize, Serialize};
 use shove::SequencedTopic as _;
 use shove::broker::Broker;
@@ -23,6 +19,10 @@ use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
 use shove::outcome::Outcome;
 use shove::topology::{SequenceFailure, TopologyBuilder};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats as NatsContainer, NatsServerCmd};
@@ -1379,7 +1379,7 @@ async fn deserialization_failure_rejects_to_dlq() {
 
     // Publish raw invalid JSON directly to the stream
     let mut headers = async_nats::HeaderMap::new();
-    headers.insert(async_nats::header::NATS_MESSAGE_ID, "bad-json-1");
+    headers.insert(NATS_MESSAGE_ID, "bad-json-1");
     client
         .jetstream()
         .publish_with_headers(

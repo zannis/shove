@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::SHUTDOWN_GRACE;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
+use crate::retry::Backoff;
 
 /// RabbitMQ connection configuration.
 #[derive(Clone)]
@@ -97,7 +98,7 @@ impl RabbitMqClient {
     /// Useful for services that start alongside their broker (e.g. in Docker
     /// Compose or Kubernetes) where the broker may not be ready immediately.
     pub async fn connect_with_retry(config: &RabbitMqConfig, max_attempts: u32) -> Result<Self> {
-        let mut backoff = crate::retry::Backoff::default();
+        let mut backoff = Backoff::default();
         let mut last_err = None;
 
         for attempt in 0..max_attempts {

@@ -5,12 +5,12 @@ use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use uuid::Uuid;
 
-use crate::ShoveError;
 use crate::backend::PublisherImpl;
 use crate::error::Result;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
+use crate::{QueueTopology, ShoveError};
 
 use super::client::KafkaClient;
 use super::constants::{MESSAGE_ID_HEADER, RETRY_COUNT_HEADER};
@@ -68,7 +68,7 @@ impl KafkaPublisher {
     }
 
     fn resolve_topic_and_key<T: Topic>(
-        topology: &'static crate::topology::QueueTopology,
+        topology: &'static QueueTopology,
         message: &T::Message,
     ) -> (String, Option<Vec<u8>>) {
         let topic = topology.queue().to_string();

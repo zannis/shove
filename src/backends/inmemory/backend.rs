@@ -10,9 +10,6 @@
 //! `inmemory` feature at the parent (`crate::backends`); no per-file cfg
 //! is needed here.
 
-use std::future::Future;
-use std::time::Duration;
-
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
@@ -23,6 +20,9 @@ use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::markers::InMemory;
 use crate::topic::{SequencedTopic, Topic};
+use std::future::Future;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 // `InMemoryQueueStatsProvider` is imported only for its trait-method-in-scope
 // effect: the `BrokerStatsProvider::get_queue_stats` inherent name is the
@@ -202,7 +202,7 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
         InMemoryConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
     }
 
-    fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+    fn cancellation_token(&self) -> CancellationToken {
         self.broker_shutdown_token()
     }
 

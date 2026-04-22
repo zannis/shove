@@ -11,6 +11,7 @@
 //!
 //! Run with: `cargo test --features sns --test sns_integration`
 
+use aws_sdk_sqs::types::{Message, QueueAttributeName};
 use shove::Broker;
 use shove::Sqs;
 use shove::sns::*;
@@ -134,11 +135,8 @@ impl TestBroker {
 
         if queue_name.ends_with(".fifo") {
             create_req = create_req
-                .attributes(aws_sdk_sqs::types::QueueAttributeName::FifoQueue, "true")
-                .attributes(
-                    aws_sdk_sqs::types::QueueAttributeName::ContentBasedDeduplication,
-                    "true",
-                );
+                .attributes(QueueAttributeName::FifoQueue, "true")
+                .attributes(QueueAttributeName::ContentBasedDeduplication, "true");
         }
 
         let sqs_result = create_req.send().await.expect("failed to create SQS queue");
@@ -148,7 +146,7 @@ impl TestBroker {
         let attrs_result = sqs_client
             .get_queue_attributes()
             .queue_url(&queue_url)
-            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+            .attribute_names(QueueAttributeName::QueueArn)
             .send()
             .await
             .expect("failed to get queue attributes");
@@ -156,7 +154,7 @@ impl TestBroker {
         let queue_arn = attrs_result
             .attributes()
             .expect("no attributes map")
-            .get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+            .get(&QueueAttributeName::QueueArn)
             .expect("no queue ARN")
             .to_string();
 
@@ -167,7 +165,7 @@ impl TestBroker {
         sqs_client
             .set_queue_attributes()
             .queue_url(&queue_url)
-            .attributes(aws_sdk_sqs::types::QueueAttributeName::Policy, policy)
+            .attributes(QueueAttributeName::Policy, policy)
             .send()
             .await
             .expect("failed to set queue policy");
@@ -192,7 +190,7 @@ impl TestBroker {
         queue_url: &str,
         expected_count: usize,
         timeout: Duration,
-    ) -> Vec<aws_sdk_sqs::types::Message> {
+    ) -> Vec<Message> {
         let deadline = Instant::now() + timeout;
         let mut all_messages = Vec::new();
 
