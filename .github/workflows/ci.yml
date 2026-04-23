@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev
+      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -34,7 +34,7 @@ jobs:
       LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
     steps:
       - uses: actions/checkout@v6
-      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev
+      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
