@@ -45,13 +45,13 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
         let queue = queue.to_string();
 
         let stats = tokio::task::spawn_blocking(move || -> Result<KafkaQueueStats> {
-            let consumer: BaseConsumer = base
-                .clone()
-                .set("group.id", &group_id)
-                .create()
-                .map_err(|e| {
-                    ShoveError::Topology(format!("failed to create stats consumer: {e}"))
-                })?;
+            let consumer: BaseConsumer =
+                base.clone()
+                    .set("group.id", &group_id)
+                    .create()
+                    .map_err(|e| {
+                        ShoveError::Topology(format!("failed to create stats consumer: {e}"))
+                    })?;
 
             // Get topic metadata to find all partitions
             let metadata = consumer

@@ -1,7 +1,7 @@
 use std::fmt;
-use std::process;
 #[cfg(feature = "kafka-ssl")]
 use std::path::PathBuf;
+use std::process;
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
@@ -59,8 +59,14 @@ impl fmt::Debug for KafkaTls {
             )
             .field("key_location", &self.key_location)
             .field("key_pem", &self.key_pem.as_ref().map(|_| "<redacted>"))
-            .field("key_password", &self.key_password.as_ref().map(|_| "<redacted>"))
-            .field("skip_hostname_verification", &self.skip_hostname_verification)
+            .field(
+                "key_password",
+                &self.key_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "skip_hostname_verification",
+                &self.skip_hostname_verification,
+            )
             .finish()
     }
 }
