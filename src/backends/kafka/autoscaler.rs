@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rdkafka::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer as RdkafkaConsumer};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -42,12 +41,12 @@ impl KafkaLagStatsProvider {
 impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
     async fn get_queue_stats(&self, queue: &str) -> Result<KafkaQueueStats> {
         let group_id = super::constants::consumer_group_id(queue);
-        let brokers = self.client.brokers().to_string();
+        let base = self.client.base_config();
         let queue = queue.to_string();
 
         let stats = tokio::task::spawn_blocking(move || -> Result<KafkaQueueStats> {
-            let consumer: BaseConsumer = ClientConfig::new()
-                .set("bootstrap.servers", &brokers)
+            let consumer: BaseConsumer = base
+                .clone()
                 .set("group.id", &group_id)
                 .create()
                 .map_err(|e| {

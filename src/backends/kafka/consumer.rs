@@ -447,14 +447,13 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 // Consumer helper
 // ---------------------------------------------------------------------------
 
-fn create_stream_consumer(brokers: &str, group_id: &str) -> Result<StreamConsumer> {
+fn create_stream_consumer(mut base: ClientConfig, group_id: &str) -> Result<StreamConsumer> {
     // Each consumer task within a group gets a distinct `client.id` so
     // librdkafka treats them as separate members. Without this, group
     // rebalances across repeated join attempts can produce stale
     // "group generation id is not valid" commit errors.
     let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
-    let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", brokers)
+    let consumer: StreamConsumer = base
         .set("group.id", group_id)
         .set("client.id", client_id)
         // Cooperative-sticky assignment performs incremental rebalance so that
@@ -600,7 +599,7 @@ impl KafkaConsumer {
             let group_id = group_id.clone();
             let semaphore = semaphore.clone();
             async move {
-                let consumer = create_stream_consumer(client.brokers(), &group_id)?;
+                let consumer = create_stream_consumer(client.base_config(), &group_id)?;
                 consumer
                     .subscribe(&[queue])
                     .map_err(|e| map_kafka_error("failed to subscribe", e))?;
@@ -837,7 +836,7 @@ impl KafkaConsumer {
             let processing = processing.clone();
             let group_id = group_id.clone();
             async move {
-                let consumer = create_stream_consumer(client.brokers(), &group_id)?;
+                let consumer = create_stream_consumer(client.base_config(), &group_id)?;
                 consumer
                     .subscribe(&[queue])
                     .map_err(|e| {
@@ -982,11 +981,11 @@ impl KafkaConsumer {
         run_with_reconnect(&shutdown, dlq, CONNECTION_RETRIES, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
-            let _client = client.clone();
+            let client_clone = client.clone();
             let shutdown = shutdown.clone();
             let dlq_group_id = dlq_group_id.clone();
             async move {
-                let consumer = create_stream_consumer(_client.brokers(), &dlq_group_id)?;
+                let consumer = create_stream_consumer(client_clone.base_config(), &dlq_group_id)?;
                 consumer
                     .subscribe(&[dlq])
                     .map_err(|e| map_kafka_error("failed to subscribe to DLQ", e))?;

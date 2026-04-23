@@ -38,6 +38,11 @@ nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
 # Apache Kafka pubsub
 kafka = ["dep:rdkafka", "dep:futures-util"]
 
+# TLS + SASL support for Kafka. Pulls in rdkafka's `ssl` (OpenSSL) and `sasl`
+# (Cyrus SASL) features. For GSSAPI/Kerberos or a vendored OpenSSL, users can
+# additionally enable `rdkafka/gssapi` or `rdkafka/ssl-vendored` downstream.
+kafka-ssl = ["kafka", "rdkafka?/ssl", "rdkafka?/sasl"]
+
 # In-process backend
 inmemory = ["dep:dashmap"]
 

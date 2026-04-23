@@ -135,6 +135,9 @@ cargo add shove --features nats
 # Apache Kafka
 cargo add shove --features kafka
 
+# Apache Kafka with TLS + SASL (PLAIN, SCRAM-SHA-256/512)
+cargo add shove --features kafka-ssl
+
 # In-memory broker
 cargo add shove --features inmemory
 
@@ -150,6 +153,7 @@ cargo add shove --features rabbitmq,audit
 | `aws-sns-sqs` | Full SNS + SQS publisher/consumer stack, consumer groups, autoscaling                  |
 | `nats` | NATS JetStream publisher, consumer, topology declaration, consumer groups, autoscaling |
 | `kafka` | Kafka publisher, consumer, topology declaration, consumer groups, autoscaling          |
+| `kafka-ssl` | `kafka` + TLS (SSL) and SASL (PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512) via `KafkaTls` / `KafkaSasl` |
 | `inmemory` | In-memory broker — publisher, consumer, topology, consumer groups, autoscaling         |
 | `audit` | Built-in `ShoveAuditHandler` and `AuditLog` topic                                      |
 

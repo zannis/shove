@@ -264,6 +264,9 @@ pub mod kafka {
         KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry, KafkaPublisher,
         KafkaTopologyDeclarer,
     };
+    #[cfg(feature = "kafka-ssl")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]
+    pub use crate::backends::kafka::{KafkaSasl, KafkaTls};
 }
 
 /// In-process, non-durable broker backend.
