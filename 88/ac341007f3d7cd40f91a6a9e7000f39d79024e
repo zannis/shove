@@ -1,0 +1,29 @@
+docs/pages/backends/nats/examples/audited.mdx
+  54214397c9f7db40 3-71
+docs/pages/backends/nats/examples/stress.mdx
+  54214397c9f7db40 3-82
+docs/pages/backends/nats/examples/sequenced.mdx
+  54214397c9f7db40 3-59
+docs/pages/backends/nats/examples/basic.mdx
+  54214397c9f7db40 3-57
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "88ac341007f3d7cd40f91a6a9e7000f39d79024e",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 25010,
+      "total_deletions": 4,
+      "accepted_lines": 27820,
+      "overriden_lines": 68
+    }
+  }
+}
