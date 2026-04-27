@@ -7,7 +7,6 @@ import { HomePage } from 'vocs/components'
 <HomePage.Root>
   <HomePage.Logo />
   <HomePage.Tagline>Type-safe async pub/sub for Rust</HomePage.Tagline>
-  <HomePage.InstallPackage name="shove" type="add" />
   <HomePage.Description>
     One typed-topic API across RabbitMQ, AWS SNS+SQS, NATS JetStream, Apache Kafka, and an in-process backend. Retries, hold queues, DLQs, sequenced delivery, consumer groups, autoscaling, and audit logging — built in.
   </HomePage.Description>
@@ -16,6 +15,14 @@ import { HomePage } from 'vocs/components'
     <HomePage.Button href="https://github.com/zannis/shove">GitHub</HomePage.Button>
   </HomePage.Buttons>
 </HomePage.Root>
+
+<div style={{ display: 'flex', justifyContent: 'center', marginTop: '1.5rem', marginBottom: '3rem' }}>
+
+```sh
+cargo add shove --features inmemory
+```
+
+</div>
 
 ## Why shove
 
