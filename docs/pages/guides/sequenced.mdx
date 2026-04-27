@@ -1,3 +1,193 @@
 # Sequenced Topics
 
-Coming soon.
+Most pub/sub messages don't need ordering. When they do — e.g. ledger entries for the same account, state transitions for the same order, audit events for the same entity — `shove` lets you mark a topic as **sequenced** so messages with the same key are delivered in strict publish order. Messages sharing the same sequence key are consumed one at a time: the next delivery only happens after the previous one has been successfully acked.
+
+## When to use sequenced topics
+
+Use a sequenced topic when messages for the same logical entity have **causal dependencies** — when processing message N assumes message N−1 has already been applied:
+
+- **Financial ledgers** — an account balance is updated by a stream of debit/credit entries. Applying them out of order corrupts the balance.
+- **State machines** — an order moving through `placed → confirmed → shipped → delivered`. A `shipped` event arriving before `confirmed` is processed leaves the state machine in an inconsistent state.
+- **Per-entity audit chains** — each audit entry references the previous state. Reordering entries breaks the chain.
+- **Event sourcing** — replaying an entity's event log in the wrong order produces the wrong aggregate state.
+
+Not every topic needs sequencing. Independent events don't benefit from it — and strict per-key ordering costs throughput. Good counter-examples:
+
+- **Search-hit events** — each hit is independent. Order between different users' search events is meaningless.
+- **Page-view analytics** — each view is self-contained. Ordering across millions of concurrent sessions is unnecessary and expensive.
+- **Notification fan-outs** — sending an email to many recipients is embarrassingly parallel. FIFO ordering per recipient adds no value.
+
+When in doubt: if you can process message B without knowing the result of message A, ordering probably doesn't matter.
+
+## define\_sequenced\_topic!
+
+The `define_sequenced_topic!` macro is the recommended way to define a sequenced topic. It generates a unit struct, implements both `Topic` and `SequencedTopic`, and wires the sequence-key function into `Topic::SEQUENCE_KEY_FN` so the publisher can route messages correctly without requiring a `SequencedTopic` bound.
+
+```rust,ignore
+use shove::{define_sequenced_topic, SequenceFailure, TopologyBuilder};
+use std::time::Duration;
+
+define_sequenced_topic!(
+    AccountLedger,
+    LedgerEntry,
+    |msg| msg.account_id.clone(),
+    TopologyBuilder::new("account-ledger")
+        .sequenced(SequenceFailure::FailAll)
+        .routing_shards(16)
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+```
+
+The four macro arguments are:
+
+1. **Name** — the unit struct identifier (`AccountLedger`).
+2. **Message type** — the payload type that flows through the topic (`LedgerEntry`).
+3. **Key function** — a non-capturing closure or bare function pointer `fn(&Message) -> String` that extracts the sequence key from a message.
+4. **Topology** — a `QueueTopology` built with `TopologyBuilder`.
+
+What the macro generates — equivalent hand-written code:
+
+```rust,ignore
+pub struct AccountLedger;
+
+impl Topic for AccountLedger {
+    type Message = LedgerEntry;
+
+    fn topology() -> &'static QueueTopology {
+        static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("account-ledger")
+                .sequenced(SequenceFailure::FailAll)
+                .routing_shards(16)
+                .hold_queue(Duration::from_secs(5))
+                .dlq()
+                .build()
+        })
+    }
+
+    // Wired automatically — lets publishers route without SequencedTopic bound.
+    const SEQUENCE_KEY_FN: Option<fn(&LedgerEntry) -> String> = Some(Self::sequence_key);
+}
+
+impl SequencedTopic for AccountLedger {
+    fn sequence_key(message: &LedgerEntry) -> String {
+        message.account_id.clone()
+    }
+}
+```
+
+The `OnceLock` ensures the topology expression runs once and the same `&'static QueueTopology` is returned on every call. The macro accepts an optional visibility modifier (`pub`, `pub(crate)`, etc.); omitting it gives module-private visibility.
+
+The key function must be non-capturing. A closure that captures environment variables cannot be coerced to `fn(&Message) -> String` and will produce a compile error. If you need access to external state for key extraction, encode it into the message type instead.
+
+## Sequence keys
+
+A sequence key is a `String` that identifies a logical entity. All messages with the same key form a strictly ordered stream. Messages with different keys are completely independent and can be processed concurrently across different shards.
+
+Guidelines for choosing a key:
+
+- **One key per logical entity.** Use `account_id`, `order_id`, `user_id`, `entity_id`. The key should identify the thing whose state you're trying to keep consistent.
+- **High cardinality is fine.** More distinct keys = more concurrency. A ledger with a million accounts and 16 shards distributes across all 16 simultaneously.
+- **Low cardinality causes hot spots.** If all messages share the same key (e.g. you accidentally use a constant), every message serializes through one shard, defeating the purpose of multiple consumers.
+- **Keys are hashed to shards.** Different keys can land on the same shard — that's expected. The consumer enforces per-key ordering within each shard, not global per-shard ordering. Two different keys on the same shard are still processed independently as long as they don't depend on each other.
+
+Avoid composite keys unless you genuinely need joint ordering. `account_id:transaction_type` serializes all transaction types for an account together, which may be unnecessary if only debits and credits need to be ordered relative to each other.
+
+## Failure policies — Skip vs FailAll
+
+When a message is permanently rejected (the handler returns `Outcome::Reject`, or the retry budget is exhausted), the remaining messages in the same sequence are in a difficult position. The system cannot know whether they are still valid without the context of the failed message. `SequenceFailure` controls what happens next.
+
+Given a sequence for key `ACC-A` with messages `[1, 2, 3, 4, 5]` where message 3 is permanently rejected:
+
+| Policy | Acked | DLQed |
+|--------|-------|-------|
+| `Skip` | 1, 2, 4, 5 | 3 |
+| `FailAll` | 1, 2 | 3, 4, 5 |
+
+**`SequenceFailure::Skip`** — dead-letters the failed message and continues processing subsequent messages in the sequence as normal. The failed message is skipped; messages 4 and 5 are delivered to the handler as if message 3 never existed.
+
+Use `Skip` when messages are **independently valid** but happen to require ordered delivery. Audit log entries are a good example: if entry 3 is malformed and cannot be processed, entries 4 and 5 are still valid records that should be stored. The audit trail has a gap, but it continues.
+
+**`SequenceFailure::FailAll`** — dead-letters the failed message AND all subsequent messages for the same key ("poisons" the key). The key stays poisoned for the lifetime of the consumer process.
+
+Use `FailAll` when messages are **causally dependent** — each message assumes every prior message in the sequence was applied successfully. Financial ledger entries are the canonical example: if a debit entry fails, the account balance is unknown. Applying subsequent credits or debits against an unknown balance produces incorrect results. It's safer to quarantine everything to the DLQ for manual inspection.
+
+Both policies only affect the failing sequence key. Other keys (e.g. `ACC-B`) are completely unaffected — they continue to be processed normally regardless of what happens to `ACC-A`.
+
+## Per-backend mapping
+
+The sequenced topic abstraction maps to different broker primitives depending on the backend in use. The consumer-visible contract is identical across all backends — per-key strict ordering with the configured failure policy — but the underlying mechanism differs.
+
+| Backend | Primitive | Ordering enforcement |
+|---------|-----------|----------------------|
+| RabbitMQ | Consistent-hash exchange + sub-queues | Single Active Consumer + `prefetch=1` per sub-queue |
+| AWS SNS+SQS | FIFO topic + `MessageGroupId` | Native SQS FIFO ordering |
+| NATS JetStream | Subject shard | `max_ack_pending=1` per subject |
+| Apache Kafka | Partition key | Consumer-group partition assignment |
+| In-process | Per-key FIFO shards | `tokio::sync::Mutex` per key |
+
+For RabbitMQ, the consistent-hash exchange name is derived from the queue name as `{queue}-seq-hash` (visible in `SequenceConfig::exchange()`). Each routing shard gets its own sub-queue. The hold-queue names for sequenced topics use the shard index: `{queue}-seq-{shard_index}-hold-{N}s`.
+
+For AWS SNS+SQS FIFO topics, `shove` sets the `MessageGroupId` to the sequence key returned by `SequencedTopic::sequence_key`. The broker enforces ordering natively.
+
+## Routing shards
+
+Call `.routing_shards(N)` on the `TopologyBuilder` (before `.build()`, after `.sequenced()`) to override the default shard count of **8**. It panics if called before `.sequenced()`.
+
+```rust,ignore
+TopologyBuilder::new("account-ledger")
+    .sequenced(SequenceFailure::FailAll)
+    .routing_shards(16)   // 16 concurrent shards instead of 8
+    .hold_queue(Duration::from_secs(5))
+    .dlq()
+    .build()
+```
+
+Trade-offs:
+
+- **More shards** — more cross-key concurrency, because more keys can be processed simultaneously. Costs more broker resources (more queues, more consumers, more connections).
+- **Fewer shards** — lower broker overhead, but more keys share a shard, reducing concurrency.
+- **Default (8)** — suitable for most workloads. Change only after profiling.
+
+For Kafka, the "routing shard" concept maps to partition count. Partition count is set at topic creation time and is operationally expensive to change later (it requires partition reassignment). Think carefully before choosing a low number for a Kafka-backed sequenced topic in production.
+
+A routing shard count of 0 panics at `build()` time. The builder enforces this guard.
+
+## Consuming sequenced topics
+
+Sequenced topics require a backend-specific `run_fifo` consumer call. The `ConsumerSupervisor::register` method explicitly rejects sequenced topics at runtime — it returns an error explaining that FIFO ordering cannot be preserved through the generic `register` API:
+
+```rust,ignore
+// This will return Err for sequenced topics:
+supervisor.register::<AccountLedger, _>(handler, options)?;
+// ^ error: use run_fifo instead
+```
+
+For the in-memory backend, use `InMemoryConsumer::run_fifo`:
+
+```rust,ignore
+consumer.run_fifo::<LedgerTopic, _>(handler, ctx, opts).await
+```
+
+The type signature enforces the `SequencedTopic` bound — the call will not compile if `LedgerTopic` does not implement `SequencedTopic`.
+
+Other backends have equivalent per-backend sequenced consumer entry points. The `ConsumerGroup` harness for coordinated backends handles sequenced topics through their backend-specific group implementations.
+
+`ConsumerOptions::max_pending_per_key` (default: 1,000) limits how many messages can be locally buffered per key in concurrent-sequenced consumers. When exceeded, new deliveries for that key are rejected to the DLQ. Adjust with `.with_max_pending_per_key(N)` or disable with `.without_max_pending_per_key()`.
+
+Note also that `Outcome::Defer` is not supported on sequenced consumers. A handler returning `Defer` on a sequenced consumer is treated as `Retry` and a warning is logged, because deferring a message without incrementing the retry counter would block all subsequent messages for that key indefinitely.
+
+## Full walkthrough
+
+[!include ~/examples/inmemory/sequenced.rs]
+
+The example hand-implements `Topic` and `SequencedTopic` directly (instead of using `define_sequenced_topic!`) to show what the macro produces. The handler simply acks every message — the interesting part is the `run_fifo` call on line 88, which selects the sequenced code path, and the four routing shards in the topology that allow `alice`, `bob`, and `carol` to be processed concurrently while their individual sequences remain ordered.
+
+## What's next
+
+- [InMemory sequenced example](/backends/inmemory/examples/sequenced)
+- [RabbitMQ sequenced example](/backends/rabbitmq/examples/sequenced)
+- [Topics & Topology](/concepts/topics)
+- [Retries, Hold Queues & DLQs](/guides/retries)
