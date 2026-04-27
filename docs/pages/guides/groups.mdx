@@ -1,3 +1,156 @@
 # Consumer Groups & Autoscaling
 
-Coming soon.
+Running N consumers on a topic is the most common scaling pattern. `shove` exposes two shapes for this: **`consumer_group()`** — broker-coordinated, available on RabbitMQ, NATS JetStream, Apache Kafka, and InMemory — and **`consumer_supervisor()`** — independent pollers, used on SQS or when broker-level coordination is not needed. Both shapes share the same shutdown contract and expose `run_until_timeout` for clean process lifecycle management.
+
+## Group vs Supervisor
+
+The practical difference comes down to whether the broker participates in coordination:
+
+**Coordinated group (`broker.consumer_group()`)** — the broker enforces "one message → one consumer in the group at a time". Backends that provide the primitive natively (RabbitMQ Single Active Consumer, Kafka consumer groups, NATS pull consumers, InMemory queue locking) use it to guarantee that a message is not delivered to two consumers simultaneously. The group tracks a minimum and maximum consumer count; the autoscaler adjusts the live count within that range based on queue depth. Use this for all backends except SQS.
+
+**Supervisor (`broker.consumer_supervisor()`)** — N independent pollers on the same queue. No broker-level coordination: each consumer polls the queue independently and processes whatever it receives. If the same message becomes visible to two pollers simultaneously, the broker handles deduplication via its own semantics (SQS visibility timeouts, etc.). The supervisor is simpler but requires the broker to provide at-most-once-visible semantics. Note that `ConsumerSupervisor::register` explicitly rejects sequenced topics at runtime — sequenced topics require the coordinated group path.
+
+Both shapes:
+- Accept the same handler registration pattern.
+- Use `run_until_timeout(signal, drain_timeout)` for shutdown.
+- Return `SupervisorOutcome` with the same `exit_code()` contract.
+
+## ConsumerGroupConfig shape
+
+Each backend has its own concrete `ConsumerGroupConfig` type. The generic `ConsumerGroupConfig\<B\>` wrapper in the top-level API holds the backend-specific inner config:
+
+```rust,ignore
+ConsumerGroupConfig::new(inner_config)
+```
+
+For the InMemory backend:
+
+```rust,ignore
+use shove::inmemory::InMemoryConsumerGroupConfig;
+use shove::ConsumerGroupConfig;
+
+ConsumerGroupConfig::new(
+    InMemoryConsumerGroupConfig::new(1..=8)   // min=1, max=8 consumers
+        .with_prefetch_count(10)
+        .with_max_retries(5)
+        .with_handler_timeout(Duration::from_secs(30)),
+)
+```
+
+For the RabbitMQ backend:
+
+```rust,ignore
+use shove::rabbitmq::ConsumerGroupConfig as RabbitMqConsumerGroupConfig;
+
+ConsumerGroupConfig::new(
+    RabbitMqConsumerGroupConfig::new(1..=8)
+        .with_prefetch_count(20)
+        .with_max_retries(5)
+        .with_handler_timeout(Duration::from_secs(30))
+        .with_concurrent_processing(true),
+)
+```
+
+Methods available on all backend configs:
+
+- **`.new(min..=max)`** — sets the consumer count range. The group starts at `min` consumers and the autoscaler can add up to `max`. Panics if `min > max`.
+- **`.with_prefetch_count(N)`** — number of unacknowledged messages the broker delivers to each consumer. Default: 10.
+- **`.with_max_retries(N)`** — retry budget per message. Default: 10.
+- **`.with_handler_timeout(Duration)`** — maximum time a handler may run before the message is retried. Default: 30s.
+- **`.with_concurrent_processing(bool)`** — when `true`, each consumer processes up to `prefetch_count` messages concurrently. When `false`, one message at a time. Default varies by backend (RabbitMQ defaults to `false`; InMemory defaults to sequential via prefetch clamping).
+
+## Autoscaling — the signal
+
+The autoscaler polls queue/consumer metrics on a configurable interval and adjusts the consumer count within the configured range. The metric used as the scaling signal differs by backend:
+
+| Backend | Autoscale signal |
+|---------|-----------------|
+| RabbitMQ | Queue depth via management HTTP API |
+| SQS | `ApproximateNumberOfMessages` attribute |
+| NATS JetStream | Pending messages on the durable consumer |
+| Apache Kafka | Consumer lag (committed offset behind tip offset) |
+| InMemory | In-process queue length |
+
+The autoscaler uses a `ThresholdStrategy` by default, wrapped in `Stabilized` to prevent flapping:
+
+- **Scale up** when `messages_ready > capacity × scale_up_multiplier` (default: 2.0) and the condition has been sustained for at least `hysteresis_duration` (default: 10s).
+- **Scale down** when `messages_ready < capacity × scale_down_multiplier` (default: 0.5) and the condition has been sustained for `hysteresis_duration`.
+- A scaling action is not taken again until `cooldown_duration` (default: 30s) has elapsed since the last action.
+
+`capacity` is `active_consumers × prefetch_count`.
+
+## AutoscalerConfig
+
+`AutoscalerConfig` controls the polling and decision-making behavior:
+
+```rust,ignore
+use shove::autoscaler::AutoscalerConfig;
+
+let config = AutoscalerConfig {
+    poll_interval: Duration::from_secs(5),       // how often to check queue depths
+    scale_up_multiplier: 2.0,                    // scale up when ready > capacity × 2.0
+    scale_down_multiplier: 0.5,                  // scale down when ready < capacity × 0.5
+    hysteresis_duration: Duration::from_secs(10), // condition must hold for 10s
+    cooldown_duration: Duration::from_secs(30),  // wait 30s between scaling actions
+};
+```
+
+Reasonable defaults work for most workloads. When to tune:
+
+- **Lower `poll_interval`** — if queue depths spike and drain quickly (bursty workloads). Lower values increase autoscaler overhead but improve responsiveness.
+- **Higher `scale_up_multiplier`** — if you're scaling up too aggressively for shallow spikes. Higher values require a proportionally larger queue depth before adding consumers.
+- **Lower `scale_down_multiplier`** — if you want to keep more consumers alive during lulls (avoids scale-up latency). Set it to 0.0 to never scale down automatically.
+- **Longer `hysteresis_duration`** — if the autoscaler is flapping (scaling up then immediately down). Longer hysteresis requires sustained conditions before acting.
+- **Longer `cooldown_duration`** — if scaling actions are happening too frequently. Prevents rapid oscillation.
+
+The autoscaler is a separate `Autoscaler\<B, S\>` struct that runs alongside the consumer group. It does not own the group — it calls the group's scale up/down methods via the `AutoscalerBackend` trait. Each backend wires this together differently; see the backend overview pages for the exact setup.
+
+## Shutdown semantics
+
+Both `ConsumerGroup` and `ConsumerSupervisor` expose `run_until_timeout`:
+
+```rust,ignore
+let outcome = group
+    .run_until_timeout(
+        tokio::signal::ctrl_c().map(drop),
+        Duration::from_secs(30),
+    )
+    .await;
+
+std::process::exit(outcome.exit_code());
+```
+
+- **`signal_future`** — when this future resolves, the group stops accepting new deliveries and begins draining in-flight handlers.
+- **`drain_timeout`** — how long to wait for in-flight handlers to finish before forcibly aborting them. Handlers still running at the deadline are abandoned (the tokio task is aborted, not cancelled).
+- **`SupervisorOutcome`** — captures errors, panics, and whether a timeout occurred. `.exit_code()` maps these to `0` (clean), `1` (errors), `2` (panics), `3` (drain timeout).
+
+Pick a drain timeout longer than your longest-expected handler. If handlers routinely take up to 10 seconds, use 30 seconds. Too short a drain timeout results in abandoned in-flight messages that the broker will redeliver — handlers must be idempotent. See [Shutdown & Exit Codes](/guides/shutdown) for the full contract.
+
+## Per-backend config knob differences
+
+Each backend's consumer group config has backend-specific knobs beyond the shared set:
+
+**RabbitMQ (`rabbitmq::ConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`. When `true`, each consumer processes up to `prefetch_count` messages concurrently. RabbitMQ's Single Active Consumer mode is enabled automatically for sequenced topics.
+
+**NATS (`nats::NatsConsumerGroupConfig`)** — see `NatsConsumerGroupConfig` for NATS-specific options. NATS pull consumers use the `max_ack_pending` setting derived from `prefetch_count`.
+
+**Kafka (`kafka::KafkaConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`. Kafka's consumer-group protocol handles partition assignment across instances automatically.
+
+**InMemory (`inmemory::InMemoryConsumerGroupConfig`)** — adds knobs for `max_pending_per_key` (for sequenced topics) and `max_message_size`. Useful for test-environment configuration.
+
+**SQS (`sns::SqsConsumerGroupConfig`)** — used with `ConsumerSupervisor` (SQS uses the supervisor model, not coordinated groups). Refer to the [SQS overview](/backends/sqs) for the correct wiring.
+
+For exact method signatures and backend-specific options, refer to the sidebar links to each backend's overview page.
+
+## Full walkthrough
+
+[!include ~/examples/inmemory/consumer_groups.rs]
+
+The key lines are 63–70: `group.register::<WorkTopic, _>(...)` wraps the config in `ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(3..=6).with_prefetch_count(4))` — three to six consumers, each with a prefetch of four. The factory closure `move || Worker { count: c.clone() }` runs once per consumer instance, returning a fresh (but `Clone`-cheap) handler each time. Lines 93–99 show the canonical shutdown: a `CancellationToken` flipped by a background waiter task, passed into `run_until_timeout`, followed by `std::process::exit(outcome.exit_code())`.
+
+## What's next
+
+- [The Broker\<B\> Pattern](/concepts/broker)
+- [Shutdown & Exit Codes](/guides/shutdown)
+- [InMemory consumer groups example](/backends/inmemory/examples/consumer-groups)
+- [SQS autoscaler example](/backends/sqs/examples/autoscaler)
