@@ -1,0 +1,23 @@
+docs/pages/concepts/handlers.mdx
+  54214397c9f7db40 3-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "990e30c1e95e2b87ec1ab4fd7bd61c534c9ee53a",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24880,
+      "total_deletions": 2,
+      "accepted_lines": 25970,
+      "overriden_lines": 54
+    }
+  }
+}
