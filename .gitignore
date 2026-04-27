@@ -1,3 +1,7 @@
 /target
 /.idea
 /.worktrees
+node_modules/
+dist/
+docs/dist/
+.env
