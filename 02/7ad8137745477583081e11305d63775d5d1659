@@ -1,0 +1,23 @@
+docs/pages/backends/kafka.mdx
+  54214397c9f7db40 3-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "027ad8137745477583081e11305d63775d5d1659",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 25086,
+      "total_deletions": 54,
+      "accepted_lines": 27719,
+      "overriden_lines": 0
+    }
+  }
+}
