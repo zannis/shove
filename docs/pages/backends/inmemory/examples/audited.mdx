@@ -1,3 +1,59 @@
 # InMemory — Audited Consumer
 
-Coming soon.
+This example shows how to wrap any `MessageHandler` in the `Audited` decorator, which calls a secondary `AuditHandler` after every message — capturing trace IDs, outcomes, and handler duration without modifying the primary handler. It uses the in-memory backend so you can experiment with the audit path without running any external services.
+
+## Prerequisites
+
+No external services required. The in-memory backend runs entirely in-process.
+
+- Cargo features: `inmemory,audit`
+
+## Run
+
+```sh
+cargo run --example inmemory_audited_consumer --features inmemory,audit
+```
+
+## Expected output
+
+Each message produces two lines — one from the primary handler and one from the audit handler:
+
+```text
+handled event 0
+audit trace_id=<uuid> outcome=Ack duration_ms=0
+handled event 1
+audit trace_id=<uuid> outcome=Ack duration_ms=0
+handled event 2
+audit trace_id=<uuid> outcome=Ack duration_ms=0
+```
+
+## Source
+
+```rust
+// [!include ~/examples/inmemory/audited_consumer.rs]
+```
+
+## Walkthrough
+
+### Primary handler
+
+`Inner` is a straightforward `MessageHandler\<EventTopic\>` that increments a shared `Arc<AtomicUsize>` counter and prints the event id. It has no knowledge of auditing — it simply processes the message and returns `Outcome::Ack`.
+
+### Audit handler
+
+`StdoutAudit` implements `AuditHandler\<EventTopic\>`. Its single method `audit` receives an `AuditRecord\<Event\>` that carries the `trace_id` (a UUID assigned per message by the framework), the `outcome` returned by the inner handler, and `duration_ms` (wall-clock time the inner handler spent). In this example the record is printed to stdout; in production you would typically publish it to a dedicated audit topic using `ShoveAuditHandler`.
+
+### Wiring with `.audited()`
+
+The factory passed to `group.register` calls `Inner { count: c.clone() }.audited(StdoutAudit)`. The `.audited()` method comes from the `MessageHandlerExt` trait and wraps `Inner` in the framework's `Audited\<Inner, StdoutAudit\>` combinator. The consumer group sees only a single `MessageHandler` — the auditing happens transparently inside.
+
+### Consumer group configuration
+
+`InMemoryConsumerGroupConfig::new(1..=1).with_prefetch_count(1)` runs a single worker with no pipelining. With `prefetch_count(1)` only one message at a time is dispatched to the handler, which makes the output strictly ordered and easier to read in this demonstration.
+
+## What to try next
+
+- Replace `StdoutAudit` with a struct that publishes to a second topic via `broker.publisher()` — this is the pattern `ShoveAuditHandler` follows on real deployments.
+- Set `with_prefetch_count(4)` and `new(1..=2)` — verify that audit records are still emitted for every message even under concurrent processing.
+- Return `Outcome::Nack` from `Inner::handle` — confirm that `AuditRecord::outcome` reflects the nack and the message is requeued.
+- See [Guides: Audit](/guides/audit) for a full description of the `AuditRecord` fields.

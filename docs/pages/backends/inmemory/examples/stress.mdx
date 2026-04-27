@@ -1,3 +1,87 @@
 # InMemory — Stress
 
-Coming soon.
+This example runs the shared stress-benchmark harness against the in-memory backend, sweeping through combinations of message counts, consumer counts, and handler profiles to measure raw framework throughput, dispatch latency, and memory overhead. Because everything runs in-process it represents the upper-bound performance ceiling for shove — results here isolate framework overhead from network and broker costs.
+
+## Prerequisites
+
+No external services required. The in-memory backend runs entirely in-process.
+
+- Cargo feature: `inmemory`
+
+## Run
+
+```sh
+cargo run --example inmemory_stress --features inmemory
+```
+
+You can narrow the run with CLI flags:
+
+```sh
+# Single tier, single handler profile
+cargo run --example inmemory_stress --features inmemory -- --tier moderate --handler fast
+
+# JSON output
+cargo run --example inmemory_stress --features inmemory -- --output json
+```
+
+Run in release mode for representative numbers:
+
+```sh
+cargo run -q --release --example inmemory_stress --features inmemory
+```
+
+## Expected output
+
+Output is non-deterministic and machine-dependent. Look for the scenario progress lines on stderr and the final table on stdout:
+
+```text
+shove stress benchmarks — inmemory
+scenarios: 60
+
+[1/60] moderate | 50000msg | 1c | zero (no-op) ...
+  -> 285000.4 msg/s | dispatch p50=0.0ms p99=0.1ms | e2e p50=0.0ms p99=0.1ms | cpu=98% rss=12.3MB | 0.2s
+[2/60] moderate | 50000msg | 4c | zero (no-op) ...
+  -> 512000.1 msg/s | ...
+...
+
+Backend: inmemory
+TIER         MSGS     C  HANDLER  MSG/SEC  disp p50  disp p95  disp p99   e2e p50   e2e p95   e2e p99  SCALE  RSS(MB)  CPU%
+...
+```
+
+Characteristic markers to look for:
+
+- `zero (no-op)` handler throughput in the hundreds of thousands of msg/s — this is the raw scheduling cost.
+- `scaling_efficiency` column approaching `1.0x` as consumer count grows for CPU-bound profiles.
+- `peak_rss_mb` staying well under 100 MB even at extreme tiers.
+
+## Source
+
+```rust
+// [!include ~/examples/inmemory/stress.rs]
+```
+
+## Walkthrough
+
+### Thin backend wrapper
+
+`inmemory/stress.rs` is intentionally minimal — it constructs a `HarnessConfig::<InMemory>` with the backend name `"inmemory"`, then calls `run_all_scenarios` from the shared harness in `examples/common/stress_test.rs`. The `make_cfg` closure maps `(consumers, prefetch, _concurrent)` directly to `InMemoryConsumerGroupConfig::new(consumers..=consumers).with_prefetch_count(prefetch)`. Because in-memory has no concurrent-mode distinction, the `_concurrent` parameter is intentionally ignored.
+
+### Harness configuration
+
+`HarnessConfig::<InMemory>::new("inmemory")` leaves all defaults: `prefetch_cap` of 100, `publish_chunk_size` of 1000, and a no-op `purge` function. The in-memory backend does not need purging between scenarios because a fresh `Broker\<InMemory\>` is created for each scenario — previous messages cannot bleed across.
+
+### Scenario matrix
+
+The harness defines three tiers (`moderate`, `high`, `extreme`) and four handler profiles (`zero`, `fast`, `slow`, `heavy`). The `moderate` tier uses consumer counts `[1, 4, 8, 16, 32]`; the `extreme` tier goes up to 256 consumers. Handler latencies range from 0 ms (`zero`) to 1–5 s (`heavy`). Each combination is one scenario, run sequentially — a full `--tier all --handler all` sweep is 60 scenarios on the moderate tier alone.
+
+### Metrics collected
+
+For each scenario the harness records per-message dispatch latency (`published_at_ns` to handler entry) and end-to-end latency (`published_at_ns` to handler completion), then reports p50/p95/p99 percentiles. It also samples peak RSS and CPU% via platform-specific APIs (`mach_task_basic_info` on macOS, `/proc/self/statm` on Linux). The `scaling_efficiency` column divides each throughput by the baseline (lowest consumer count for the same tier/handler combination) — a value of `4.0x` with 4 consumers indicates linear scaling.
+
+## What to try next
+
+- Run with `--tier extreme --handler zero` to stress-test the scheduler at 1 M messages and 256 consumers.
+- Add `--concurrent` to enable pipeline processing within each consumer and compare throughput against the default sequential mode.
+- Pipe output through `--output json` and import into a spreadsheet to plot scaling curves.
+- Compare numbers against the RabbitMQ or Kafka stress examples to quantify the network + broker overhead relative to this in-process baseline.

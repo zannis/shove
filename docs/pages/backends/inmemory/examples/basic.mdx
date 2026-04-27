@@ -1,3 +1,60 @@
 # InMemory — Basic
 
-Coming soon.
+This example demonstrates the complete publish/consume cycle using the in-memory backend: declare a topic, publish five messages, consume them with a single handler, and exit cleanly. It brings together the [Topic](/concepts/topics) and [Outcome](/concepts/outcomes) primitives in their simplest form — no Docker, no network, no configuration.
+
+## Prerequisites
+
+No external services required. The in-memory backend runs entirely in-process.
+
+- Cargo feature: `inmemory`
+
+## Run
+
+```sh
+cargo run --example inmemory_basic --features inmemory
+```
+
+## Expected output
+
+```text
+received #0: hello 0
+received #1: hello 1
+received #2: hello 2
+received #3: hello 3
+received #4: hello 4
+```
+
+## Source
+
+```rust
+// [!include ~/examples/inmemory/basic.rs]
+```
+
+## Walkthrough
+
+### Topic definition
+
+`PingTopic` is the type-level identifier for the queue. It implements the `Topic` trait, which associates the topic with its message type (`Ping`) and its `QueueTopology`. The topology is built once via `OnceLock` and describes the queue name (`"ping"`) along with a dead-letter queue (`.dlq()`). Every shove backend consults this topology to provision the necessary queues on startup.
+
+### Connecting and declaring
+
+`Broker::<InMemory>::new(InMemoryConfig::default())` creates the in-process broker. Calling `broker.topology().declare::<PingTopic>()` then materialises the `"ping"` queue (and its DLQ) inside the broker's in-memory store. Declaration is idempotent — safe to call more than once.
+
+### Handler and consumer group
+
+`PingHandler` wraps an `Arc<AtomicUsize>` counter so the main thread can observe how many messages have been processed. The handler always returns `Outcome::Ack`, which tells the broker to remove the message from the queue. `broker.consumer_group()` creates a `ConsumerGroup\<InMemory\>`, and `group.register` binds the handler factory to `PingTopic` with a worker range of `1..=1` and a prefetch of 4. The factory closure is called once per spawned worker.
+
+### Publishing
+
+Five `Ping` messages are published in a loop via `publisher.publish::<PingTopic>`. The in-memory backend delivers them immediately into the in-process queue — no serialisation round-trip to a remote broker.
+
+### Graceful shutdown
+
+A background task polls `count` every 10 ms and cancels a `CancellationToken` once all five messages are processed (or after a 5-second safety deadline). The consumer group's `run_until_timeout` call drives the event loop until that token fires, then allows in-flight handlers to drain before returning. `std::process::exit(outcome.exit_code())` propagates a non-zero code if the drain timed out.
+
+## What to try next
+
+- Change `InMemoryConsumerGroupConfig::new(1..=1)` to `new(1..=4)` — observe how the consumer group scales workers automatically as the queue grows.
+- Change `Outcome::Ack` to `Outcome::Nack` in `PingHandler::handle` — watch messages loop back into the queue and eventually land in the DLQ.
+- Swap the `InMemory` marker for another backend (e.g. `RabbitMq`) and supply the matching config — the handler code remains unchanged.
+- See [Concepts: Outcomes](/concepts/outcomes) for the full list of outcome variants and their retry semantics.
