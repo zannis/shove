@@ -1,3 +1,116 @@
 # RabbitMQ
 
-Coming soon.
+RabbitMQ is shove's most full-featured backend — it's the default for shops that already run RabbitMQ and need complex retry topologies. It supports coordinated consumer groups with queue-depth autoscaling, consistent-hash exchange routing for sequenced delivery, and optional AMQP transactional exactly-once delivery.
+
+## What you need
+
+A RabbitMQ broker 3.13+ with the **management plugin** enabled. The autoscaler reads queue depth from the management HTTP API, so the plugin is required for `consumer_group()` autoscaling.
+
+For local dev:
+
+```sh
+docker run --rm -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+This exposes AMQP on `5672` and the management UI / API on `15672`.
+
+## Install
+
+```sh
+cargo add shove --features rabbitmq
+```
+
+For exactly-once transactional routing (see below):
+
+```sh
+cargo add shove --features rabbitmq-transactional
+```
+
+## Connect
+
+```rust
+// [!include ~/examples/rabbitmq/basic_pubsub.rs:connect]
+```
+
+`RabbitMqConfig::new` takes a standard AMQP URL. TLS and authentication are configured via the URL (e.g. `amqps://user:pass@host:5671`).
+
+## Declare topology
+
+```rust
+// [!include ~/examples/rabbitmq/basic_pubsub.rs:declare]
+```
+
+`topology().declare::<T>()` creates the main queue, any hold queues, and the DLQ on the broker. Idempotent — safe to call on every startup.
+
+## Publish
+
+```rust
+// [!include ~/examples/rabbitmq/basic_pubsub.rs:publish]
+```
+
+`publisher().await?` returns a `Publisher<RabbitMq>` that can publish single messages, messages with custom headers, or batches.
+
+## Consume
+
+```rust
+// [!include ~/examples/rabbitmq/basic_pubsub.rs:consume]
+```
+
+`consumer_supervisor()` fans out one consumer task per registered topic. For coordinated groups with autoscaling, use `consumer_group()` instead — see the section below.
+
+## Sequenced delivery
+
+RabbitMQ enforces per-key ordering via a consistent-hash exchange and single-active-consumer (SAC) sub-queues. When you declare a sequenced topic, shove provisions a consistent-hash exchange (`{queue}-seq-hash`) and N sub-queues each configured with SAC and `prefetch=1`. The publisher routes each message by `T::sequence_key()`; the consumer processes one message at a time per shard, which guarantees that messages for the same key are never processed concurrently.
+
+The shard count is configurable via `routing_shards(N)` in `TopologyBuilder` (default 8). More shards increase parallelism across different keys at the cost of more queues on the broker.
+
+See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced Pubsub example](/backends/rabbitmq/examples/sequenced) for a runnable walkthrough.
+
+## Consumer groups + autoscaling
+
+RabbitMQ consumer groups are coordinated via SAC. Call `broker.consumer_group()` and register topics with a `ConsumerGroupConfig`:
+
+```rust,ignore
+use shove::rabbitmq::ConsumerGroupConfig as RabbitMqGroupConfig;
+use shove::{Broker, ConsumerGroupConfig, RabbitMq};
+
+let mut group = broker.consumer_group();
+group
+    .register::<OrderTopic, _>(
+        ConsumerGroupConfig::new(
+            RabbitMqGroupConfig::new(1..=8)
+                .with_prefetch_count(20)
+                .with_max_retries(5),
+        ),
+        || MyHandler,
+    )
+    .await?;
+```
+
+The autoscaler reads queue depth from the RabbitMQ management HTTP API and scales the number of active consumers within the `min..=max` range. The management plugin must be running and reachable for autoscaling to work.
+
+See the [Consumer Groups example](/backends/rabbitmq/examples/consumer-groups) for a full runnable walkthrough.
+
+## Exactly-once mode
+
+Enable with `--features rabbitmq-transactional`. This wraps the publish-to-hold-queue + ack in an AMQP transaction (`tx_select` / `tx_commit`), eliminating the publish-then-ack race condition. The trade-off is approximately 10–15× lower throughput per channel. Reserve this for handlers with irreversible side effects where duplicate delivery is unacceptable.
+
+See the [Exactly-Once example](/backends/rabbitmq/examples/exactly-once) and the [Exactly-Once guide](/guides/exactly-once).
+
+## Gotchas
+
+- **Management plugin is required** for autoscaler queue-depth polling. If the plugin is missing or unreachable, `consumer_group()` autoscaling will not function.
+- **TLS and authentication** are configured via the AMQP URL passed to `RabbitMqConfig::new(...)`. Use `amqps://` for TLS; embed credentials in the URL or configure them via environment variables before constructing the config.
+- **`lapin` handles the AMQP connection.** `rustls--ring` is the default TLS feature pulled in by shove. Downstream crates that need a different TLS stack (e.g. vendored OpenSSL) can activate alternative `rdkafka` or `lapin` feature flags without changing shove's API.
+- **Auto-reconnect** is built in at the consumer level. Transient broker failures — network blips, broker restarts — recover automatically without operator intervention.
+- **Exactly-once throughput cost** (~10–15×) means it should only be enabled for topics that genuinely require it. The standard at-least-once mode is far faster and handlers should be made idempotent instead where possible.
+
+## Examples
+
+- [Basic Pubsub](/backends/rabbitmq/examples/basic) — all `Outcome` variants, hold queues, DLQ, batch publish
+- [Sequenced Pubsub](/backends/rabbitmq/examples/sequenced) — consistent-hash exchange + SAC ordering
+- [Consumer Groups](/backends/rabbitmq/examples/consumer-groups) — coordinated groups with autoscaling
+- [Audited Consumer](/backends/rabbitmq/examples/audited) — `MessageHandlerExt::audited` wrapping
+- [Concurrent Pubsub](/backends/rabbitmq/examples/concurrent) — high-concurrency publish patterns
+- [Exactly-Once](/backends/rabbitmq/examples/exactly-once) — transactional AMQP delivery
+- [Stress](/backends/rabbitmq/examples/stress) — throughput benchmarking
