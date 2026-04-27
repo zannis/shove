@@ -1,3 +1,62 @@
 # Getting Started
 
-Coming soon.
+You can run a real `shove` publisher and consumer in 60 seconds against the **in-process backend** — no Docker, no AWS credentials, no config. This page is a copy-paste walkthrough.
+
+## Add the dependency
+
+```sh
+cargo add shove --features inmemory
+cargo add tokio --features full
+cargo add serde --features derive
+cargo add tracing-subscriber
+cargo add tokio-util --features rt
+```
+
+## Define a topic
+
+A topic binds a Rust message type to a queue topology. The `define_topic!` macro is the fast path; this example shows the manual `Topic` impl for clarity.
+
+```rust
+// [!include ~/examples/inmemory/basic.rs:topic]
+```
+
+Reference: [Topics & Topology](/concepts/topics).
+
+## Write a handler
+
+```rust
+// [!include ~/examples/inmemory/basic.rs:handler]
+```
+
+The handler returns an [`Outcome`](/concepts/outcomes). `Ack` removes the message from the queue.
+
+## Wire it up
+
+```rust
+// [!include ~/examples/inmemory/basic.rs:main]
+```
+
+This connects to the in-process broker, declares the topology, registers a one-worker consumer group, publishes five messages, and exits cleanly when all five are processed.
+
+## Run it
+
+```sh
+cargo run --example inmemory_basic --features inmemory
+```
+
+Expected output:
+
+```text
+received #0: hello 0
+received #1: hello 1
+received #2: hello 2
+received #3: hello 3
+received #4: hello 4
+```
+
+## What's next
+
+- **[Core concepts](/concepts/topics)** — what `Topic`, `Outcome`, and `Broker<B>` mean.
+- **[Pick a real backend](/backends/choosing)** — RabbitMQ, SNS+SQS, NATS, or Kafka. Same handler, swap one marker.
+- **[Sequenced topics](/guides/sequenced)** — strict per-key ordering when message order matters.
+- **[Audit logging](/guides/audit)** — wrap any handler with structured per-delivery records.
