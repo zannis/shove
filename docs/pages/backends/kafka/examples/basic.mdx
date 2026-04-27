@@ -1,3 +1,57 @@
 # Kafka — Basic
 
-Coming soon.
+This example demonstrates the core publish/consume loop against a Kafka broker: declare a topic (which provisions Kafka topics for the main queue, hold queues, and DLQ), publish three `OrderCreated` messages, and consume them via a coordinated consumer group. It is the Kafka counterpart to the [NATS basic example](/backends/nats/examples/basic) and shows how shove's generic `Broker\<Kafka\>` API maps to rdkafka producers, consumer groups, and partition assignment.
+
+## Prerequisites
+
+- Docker (an Apache Kafka testcontainer is started automatically — no manual `docker run` needed)
+- Cargo feature: `kafka`
+
+## Run
+
+```sh
+cargo run --example kafka_basic --features kafka
+```
+
+## Expected output
+
+```text
+Published order ORD-0
+Published order ORD-1
+Published order ORD-2
+Processing order ORD-0 ($99.99) [retry=0]
+Processing order ORD-1 ($100.99) [retry=0]
+Processing order ORD-2 ($101.99) [retry=0]
+Done.
+```
+
+## Source
+
+```rust
+// [!include ~/examples/kafka/basic.rs]
+```
+
+## Walkthrough
+
+### Kafka topic provisioning on declare
+
+`broker.topology().declare::<OrderTopic>()` creates the Kafka topics that back the topology: one main topic (`kafka-orders`), two hold-queue topics (`kafka-orders-hold-1s`, `kafka-orders-hold-5s`), and a DLQ topic (`kafka-orders-dlq`). On Kafka, each logical shove queue is a separate Kafka topic. The number of partitions is determined by the consumer group's `max_consumers` setting — a partition count less than the consumer count would leave some consumers idle.
+
+### `KafkaConfig` and bootstrap servers
+
+`Broker::<Kafka>::new(KafkaConfig::new(&bootstrap))` initialises the rdkafka producer and consumer configuration pointing at the single-broker testcontainer. In production `bootstrap` would be a comma-separated list of broker addresses. `KafkaConfig` exposes additional methods for TLS (`with_ssl`) and SASL authentication (`with_sasl`) — see the [Kafka backend overview](/backends/kafka) for the `kafka-ssl` feature.
+
+### Consumer group with coordinated partition assignment
+
+`broker.consumer_group()` creates a `ConsumerGroup\<Kafka\>`. `group.register::<OrderTopic, _>(ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)), || OrderHandler)` binds the handler factory to `OrderTopic` with a fixed pool of one consumer. On Kafka, the consumer group registers a standard rdkafka consumer group; when multiple consumers are active they receive distinct partition assignments from the Kafka coordinator — messages within a partition remain ordered.
+
+### Hold queues as separate Kafka topics
+
+Unlike RabbitMQ (which uses AMQP dead-letter routing) or NATS (which uses JetStream subjects), Kafka hold queues are separate topics. When a handler returns `Outcome::Retry`, shove publishes the message to the appropriate hold-queue topic and acknowledges the original. A separate consumer (run internally by the framework) reads from the hold-queue topic after the TTL and republishes to the main topic. This approach keeps messages durable across broker restarts at the cost of one additional produce+consume round-trip per retry.
+
+## What to try next
+
+- Change `new(1..=1)` to `new(1..=4)` and publish 20 messages — the consumer group assigns partitions dynamically; observe rebalance log lines during the 3-second run window.
+- Return `Outcome::Retry` from `OrderHandler` and verify the 1-second hold queue fires and redelivers before the 3-second window closes.
+- Add TLS by enabling the `kafka-ssl` feature and configuring `KafkaConfig::with_ssl` — no handler code changes needed.
+- See [Guides: Retries](/guides/retries) for how hold queues and retry limits interact on Kafka.
