@@ -1,3 +1,72 @@
 # SQS — Audited Consumer
 
-Coming soon.
+This example shows the `Audited` decorator applied to an SQS consumer, proving that the `trace_id` in the `AuditRecord` is the same UUID on both the initial `Outcome::Retry` delivery and the successful second delivery. It is the SQS counterpart to the [RabbitMQ audited example](/backends/rabbitmq/examples/audited) — the `AuditHandler` API is identical across backends.
+
+## Prerequisites
+
+- Docker with a running daemon
+- `LOCALSTACK_AUTH_TOKEN` environment variable set to a valid LocalStack Pro token
+- Cargo features: `aws-sns-sqs,audit`
+
+## Run
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_audited_consumer --features aws-sns-sqs,audit
+```
+
+## Expected output
+
+```text
+topology declared
+
+published payment
+
+[handler] payment=PAY-001 amount=$49.99 attempt=1
+[audit] {
+  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "outcome": "Retry",
+  "duration_ms": 0,
+  ...
+}
+[handler] payment=PAY-001 amount=$49.99 attempt=2
+[audit] {
+  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "outcome": "Ack",
+  "duration_ms": 0,
+  ...
+}
+done
+```
+
+The same `trace_id` UUID appears on both delivery attempts. The 15-second run window allows the hold-queue TTL (5 s) to expire before the second delivery arrives.
+
+## Source
+
+```rust
+// [!include ~/examples/sqs/audited_consumer.rs]
+```
+
+## Walkthrough
+
+### Handler with deliberate retry
+
+`PaymentHandler` returns `Outcome::Retry` when `metadata.retry_count == 0` and `Outcome::Ack` on subsequent attempts. On SQS, `Outcome::Retry` extends the message's visibility timeout and routes it through the hold queue (5 s TTL), then redelivers it. The second delivery has `retry_count == 1`, so the handler acks.
+
+### `StdoutAuditHandler` serialises the full record
+
+`StdoutAuditHandler` implements `AuditHandler\<Payments\>` and serialises the complete `AuditRecord\<PaymentEvent\>` to pretty JSON. The record carries `trace_id` — a UUID that the framework assigns once per original message and propagates across hold-queue round-trips via the SQS message attribute `shove-trace-id`. This is what allows the same `trace_id` to appear on both the retry and the final ack delivery.
+
+### 15-second run window
+
+The supervisor runs for 15 seconds (longer than the 10-second RabbitMQ equivalent) to ensure the 5-second hold queue TTL fires and the retried message arrives before shutdown. On SQS, LocalStack's polling latency adds additional overhead beyond the bare queue TTL.
+
+### Wiring: `.audited()` unchanged
+
+`PaymentHandler.audited(StdoutAuditHandler)` — the call is identical to the RabbitMQ version. `MessageHandlerExt::audited` is backend-agnostic: it wraps any `MessageHandler` with any `AuditHandler` into a combined `MessageHandler` that the supervisor accepts without modification.
+
+## What to try next
+
+- Add `.with_max_retries(1)` to `ConsumerOptions` and make `PaymentHandler` always return `Retry` — observe the audit record show `outcome: "Reject"` when the retry limit is hit.
+- Replace `StdoutAuditHandler` with one that writes to a database or publishes to a second SQS topic.
+- Check the `duration_ms` field in the audit record and confirm it measures the handler's wall-clock time by adding a `tokio::time::sleep` inside `PaymentHandler::handle`.
+- See [Guides: Audit](/guides/audit) for the complete `AuditRecord` schema.

@@ -1,3 +1,67 @@
 # SQS — Sequenced Pubsub
 
-Coming soon.
+This example runs the same `SkipLedger` vs `StrictLedger` comparison found in the [RabbitMQ sequenced example](/backends/rabbitmq/examples/sequenced), but against an SQS backend via LocalStack. Messages for two accounts are published in interleaved order; `SequenceFailure::Skip` lets the sequence continue after a single poisoned entry while `SequenceFailure::FailAll` quarantines all subsequent entries for the same key. The example asserts exact totals to prove the policies behave correctly.
+
+## Prerequisites
+
+- Docker with a running daemon
+- `LOCALSTACK_AUTH_TOKEN` environment variable set to a valid LocalStack Pro token
+- Cargo feature: `aws-sns-sqs`
+
+## Run
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_sequenced_pubsub --features aws-sns-sqs
+```
+
+## Expected output
+
+```text
+sequenced topologies declared
+
+published 5 entries per topic for ACC-A
+published 3 entries per topic for ACC-B
+
+[skip error and continue] account=ACC-A seq=1 amount=100 attempt=1
+...
+[skip error and continue] account=ACC-A seq=3 amount=300 attempt=1
+[skip error and continue]   → Reject (seq=3 is poison for ACC-A)
+...
+
+── Results (elapsed: 15.3s) ──
+skip   ACC-A = 1200 (expected 1200)
+skip   ACC-B = 300 (expected 300)
+strict ACC-A = 300 (expected 300)
+strict ACC-B = 300 (expected 300)
+```
+
+## Source
+
+```rust
+// [!include ~/examples/sqs/sequenced_pubsub.rs]
+```
+
+## Walkthrough
+
+### SQS client and registry sharing
+
+Rather than using the `Broker\<Sqs\>` facade, the example uses `SnsClient::new(&config)` directly to obtain a shareable client handle. `SnsTopologyDeclarer::new(client.clone())` declares queues against the same client instance that the publisher and consumers will use. This is necessary because the declarer populates the topic and queue registries (`client.topic_registry()`, `client.queue_registry()`) that `SnsPublisher` and `SqsConsumer` read at runtime to resolve ARNs and queue URLs.
+
+### `SqsConsumer::run_fifo` for per-key FIFO
+
+Per-key FIFO is not yet available through the generic `Broker\<Sqs\>` API, so the example uses `SqsConsumer::new(client, queue_registry).run_fifo::<Topic, _>(handler, ctx, opts)`. Both topics use `.routing_shards(2)` — smaller than the RabbitMQ equivalent (which defaults to 8) because LocalStack's overhead per FIFO queue is higher and two shards are sufficient for two accounts. `with_prefetch_count(8)` allows up to 8 messages to be in-flight per consumer, but only one per key at a time.
+
+### Longer processing window
+
+The shutdown timer is 15 seconds (vs 5 seconds in the RabbitMQ equivalent) to account for SQS visibility timeout behaviour. When a message is retried on SQS, the hold queue is implemented as a separate SQS queue with a matching visibility timeout extension — the round-trip to LocalStack adds latency that requires a longer window.
+
+### Totals verification
+
+The same assertion pattern used in the RabbitMQ sequenced example applies here: both consumers accumulate per-account totals in `Arc<Mutex<HashMap>>` and the main task asserts exact values after shutdown. The expected values are identical: `skip ACC-A = 1200`, `strict ACC-A = 300`, both `ACC-B = 300`.
+
+## What to try next
+
+- Swap `SequenceFailure::FailAll` for `SequenceFailure::Skip` on `StrictLedger` — confirm the `strict ACC-A` total rises from 300 to 1200.
+- Change `.routing_shards(2)` to `.routing_shards(4)` — more FIFO queues improve parallelism for workloads with many distinct keys.
+- Add a third account to the publish loop to verify cross-key independence.
+- Read [Guides: Sequenced](/guides/sequenced) for how shards, FIFO ordering, and failure modes interact.

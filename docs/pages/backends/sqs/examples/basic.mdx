@@ -1,3 +1,73 @@
 # SQS — Basic Pubsub
 
-Coming soon.
+This example covers every non-sequenced topology shape on the SQS backend: a minimal queue, a queue with a DLQ, and a queue with escalating hold-queue retry backoff. It exercises all three SQS-compatible `Outcome` variants (`Ack`, `Retry`, `Reject`) and all three publish variants (`publish`, `publish_with_headers`, `publish_batch`). It is the SQS counterpart to the [RabbitMQ basic example](/backends/rabbitmq/examples/basic) — the same programming model, different infrastructure.
+
+## Prerequisites
+
+- Docker with a running daemon
+- `LOCALSTACK_AUTH_TOKEN` environment variable set to a valid LocalStack Pro token (LocalStack Pro is required for SNS+SQS FIFO queues)
+- Cargo feature: `aws-sns-sqs`
+
+```sh
+export LOCALSTACK_AUTH_TOKEN=<your-token>
+```
+
+A LocalStack testcontainer is started automatically — no manual `docker run` needed.
+
+## Run
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_basic_pubsub --features aws-sns-sqs
+```
+
+## Expected output
+
+```text
+topologies declared
+
+messages published
+
+[minimal] order=ORD-001 amount=$50.00 attempt=1
+[minimal] order=ORD-002 amount=$99.00 attempt=1
+[minimal] order=ORD-003 amount=$10.00 attempt=1
+[minimal] order=ORD-004 amount=$25.00 attempt=1
+[minimal] order=ORD-005 amount=$77.77 attempt=1
+[dlq] rejecting order=ORD-001 → DLQ
+[dlq] dead-letter: order=ORD-001 reason=rejected deaths=1
+[retry] order=ORD-001 attempt=1
+[retry]   → transient failure, will Retry
+[retry] order=ORD-001 attempt=2
+[retry]   → success on retry
+done
+```
+
+## Source
+
+```rust
+// [!include ~/examples/sqs/basic_pubsub.rs]
+```
+
+## Walkthrough
+
+### LocalStack setup
+
+The example reads `LOCALSTACK_AUTH_TOKEN` from the environment and exits with a clear message if it is missing. Dummy AWS credentials (`test`/`test`) are set via `std::env::set_var` before any AWS SDK calls — LocalStack accepts these without validation. The container exposes the LocalStack endpoint on port 4566, which is fed into `SnsConfig { endpoint_url: Some(endpoint) }`.
+
+### `SnsConfig` and `Broker<Sqs>`
+
+`Broker::<Sqs>::new(SnsConfig { region, endpoint_url })` initialises the SNS/SQS client. Providing `endpoint_url` redirects all AWS API calls to LocalStack instead of the real AWS endpoints. In production you omit `endpoint_url` and rely on standard AWS credential/region resolution.
+
+### Three topology shapes
+
+`MinimalOrder` has no DLQ — rejected messages are discarded. `DlqOrder` adds `.dlq()` so `Outcome::Reject` lands messages in a dead-letter queue; `RejectHandler` implements `handle_dead` to process those entries. `RetryOrder` chains `.hold_queue(5s)`, `.hold_queue(30s)`, and `.hold_queue(120s)` — on the SQS backend each stage maps to a separate SQS queue with a corresponding visibility timeout extension. `with_max_retries(3)` on the supervisor registration caps retry loops before DLQ routing.
+
+### Consumer supervisor on SQS
+
+`broker.consumer_supervisor()` returns a `ConsumerSupervisor\<Sqs\>`. Each `register` call spawns a long-poll SQS consumer for that topic. Unlike AMQP, SQS consumers poll `ReceiveMessage` in a loop — there is no broker-push delivery. The supervisor handles the polling loop, visibility timeout management, and graceful drain on shutdown.
+
+## What to try next
+
+- Increase `with_max_retries(3)` to `with_max_retries(0)` — messages go directly to the DLQ on first failure.
+- Change `Outcome::Retry` to `Outcome::Reject` in `RetryHandler` — the message bypasses hold queues and goes straight to the DLQ.
+- Inspect the LocalStack management UI at `http://localhost:4566/_localstack/health` to see queues, message counts, and DLQ contents while the example runs.
+- See [Guides: Retries](/guides/retries) for how hold queues and max-retries interact on SQS.

@@ -1,3 +1,79 @@
 # SQS — Stress
 
-Coming soon.
+This example runs the shared stress-benchmark harness against a live LocalStack SQS endpoint, sweeping handler profiles and consumer counts to measure throughput and latency through the real SNS/SQS HTTP API. Because SQS uses `run_supervisor_scenarios` instead of `run_all_scenarios`, each consumer is an independent poll worker rather than a member of a coordinated group — reflecting the fact that SQS has no broker-side consumer-group primitive.
+
+## Prerequisites
+
+- Docker with a running daemon
+- `LOCALSTACK_AUTH_TOKEN` environment variable set to a valid LocalStack Pro token
+- Cargo feature: `aws-sns-sqs`
+
+## Run
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_stress --features aws-sns-sqs
+```
+
+Narrow to one tier or handler profile:
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_stress --features aws-sns-sqs -- --tier moderate --handler fast
+```
+
+Release mode for representative numbers:
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run -q --release --example sqs_stress --features aws-sns-sqs
+```
+
+## Expected output
+
+Non-deterministic. Look for these characteristic markers:
+
+```text
+shove stress benchmarks — sqs
+scenarios: 60
+
+[1/60] moderate | 20000msg | 1c | fast (1-5ms) ...
+  -> 450.2 msg/s | dispatch p50=3.1ms p99=12.8ms | e2e p50=5.2ms p99=18.4ms | cpu=30% rss=45.2MB | 44.4s
+...
+
+Backend: sqs
+TIER         MSGS     C  HANDLER   MSG/SEC  ...
+moderate    20000     1  fast        450    ...
+moderate    20000     4  fast       1600    ...
+...
+```
+
+SQS throughput is significantly lower than RabbitMQ or NATS because every `ReceiveMessage`, `DeleteMessage`, and hold-queue publish is an independent HTTP round-trip to LocalStack.
+
+## Source
+
+```rust
+// [!include ~/examples/sqs/stress.rs]
+```
+
+## Walkthrough
+
+### `run_supervisor_scenarios` instead of `run_all_scenarios`
+
+The SQS stress binary calls `run_supervisor_scenarios` from the shared harness, not `run_all_scenarios`. The distinction is architectural: `run_all_scenarios` drives a `ConsumerGroup\<B\>` (a coordinated group backed by a `HasCoordinatedGroups` capability), while `run_supervisor_scenarios` drives independent `ConsumerOptions\<B\>` workers registered one by one on a `ConsumerSupervisor\<B\>`. SQS does not implement `HasCoordinatedGroups`, so the supervisor path is the only option.
+
+### Prefetch cap at 10
+
+`HarnessConfig::<Sqs>::new("sqs").with_prefetch_cap(SQS_PREFETCH_CAP)` sets the maximum prefetch to 10, matching SQS's `ReceiveMessage` batch limit. The harness computes a default prefetch as `(messages / consumers).clamp(1, cap)`, so any scenario with more than 10 messages per consumer will hit the cap. This is why SQS throughput does not scale linearly with prefetch the way AMQP-backed backends do.
+
+### Queue purge between scenarios
+
+`with_purge(purge)` injects a purge closure that calls `PurgeQueue` on the main queue, the DLQ, and the FIFO shard queue between scenarios. SQS enforces a 60-second rate limit on `PurgeQueue`, so the closure ignores errors — if purge fails, the next scenario's messages are published on top of leftovers, but the harness still counts correctly once `scenario.messages` are processed. This is a deliberate trade-off: deleting and recreating queues would trigger SQS's 60-second queue-name reuse restriction, which is worse.
+
+### `SnsConfig` for LocalStack
+
+`SnsConfig { region: Some("us-east-1".into()), endpoint_url: Some(endpoint) }` redirects all AWS SDK calls to the LocalStack container. In production remove `endpoint_url` and rely on the AWS SDK's standard credential and region resolution.
+
+## What to try next
+
+- Compare `--tier moderate --handler zero` throughput here against the RabbitMQ and InMemory stress results to quantify HTTP vs AMQP vs in-process costs.
+- Add `--concurrent` for the `slow` handler profile — I/O overlap within each consumer reduces the impact of SQS's per-request latency.
+- Use `--output json` and import results into a spreadsheet to plot scaling curves across consumer counts.
+- See the [SQS autoscaler example](/backends/sqs/examples/autoscaler) for how to autoscale based on the queue depth metrics this harness measures.

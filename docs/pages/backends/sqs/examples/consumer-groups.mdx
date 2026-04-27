@@ -1,3 +1,67 @@
 # SQS — Consumer Groups
 
-Coming soon.
+This example shows how `SqsConsumerGroupRegistry` — the SQS equivalent of a consumer group — manages a pool of independent SQS poll workers reading from a single queue. Because SQS has no broker-level coordinated-group primitive, the registry spawns independent consumers rather than a single coordinated group; the result is the same: multiple workers sharing load from one queue. It also demonstrates `SqsQueueStatsProvider` for observing `messages_ready` and `messages_not_visible` counts as the backlog drains.
+
+## Prerequisites
+
+- Docker with a running daemon
+- `LOCALSTACK_AUTH_TOKEN` environment variable set to a valid LocalStack Pro token
+- Cargo feature: `aws-sns-sqs`
+
+## Run
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_consumer_groups --features aws-sns-sqs
+```
+
+## Expected output
+
+```text
+published 50 tasks
+
+consumer group started (min_consumers=1)
+
+monitoring queue depth — watching backlog drain
+
+[monitor] messages_ready=48 in_flight=2
+[monitor] messages_ready=38 in_flight=10
+[monitor] messages_ready=10 in_flight=10
+[monitor] messages_ready=0 in_flight=4
+[monitor] messages_ready=0 in_flight=0
+...
+shutting down...
+done
+```
+
+Exact numbers vary by system speed and LocalStack latency.
+
+## Source
+
+```rust
+// [!include ~/examples/sqs/consumer_groups.rs]
+```
+
+## Walkthrough
+
+### SQS supervisors vs consumer groups
+
+SQS has no broker-side queue consumer-group primitive (unlike Kafka consumer groups or RabbitMQ coordinated groups). `SqsConsumerGroupRegistry` fills this role by spawning independent poll workers that each run their own `ReceiveMessage` loop. From the application's perspective the API mirrors the RabbitMQ `ConsumerGroupRegistry`: `registry.register(config, factory, ctx)` followed by `registry.start_all()`. The key difference is that each registered consumer is fully independent — there is no broker-side coordination when adding or removing workers.
+
+### `SqsConsumerGroupConfig` and worker range
+
+`SqsConsumerGroupConfig::new(1..=5)` sets the minimum to 1 and the maximum to 5 consumers. `.with_prefetch_count(10)` lets each consumer hold up to 10 in-flight messages (capped by SQS's batch size limit of 10). `.with_max_retries(3)` caps hold-queue retry cycles before DLQ routing. `registry.start_all()` starts one consumer (the minimum); autoscaling would add more, but this example keeps the count fixed to focus on monitoring.
+
+### Shared SNS client and registries
+
+`SnsClient::new(&config)` returns a client that owns the topic and queue registries. `SnsTopologyDeclarer::new(client.clone())` declares the `WorkQueue` topology and populates these registries. `SnsPublisher::new(client.clone(), client.topic_registry().clone())` and `SqsConsumerGroupRegistry::new(client.clone())` both share the same underlying registry, so the publisher can resolve the SNS topic ARN and the consumers can resolve the SQS queue URL without a second declaration step.
+
+### Queue depth monitoring with `SqsQueueStatsProvider`
+
+`SqsQueueStatsProvider::new(client, queue_registry)` wraps the `GetQueueAttributes` API. `stats_provider.get_queue_stats(queue_name)` returns `messages_ready` (visible messages waiting to be consumed) and `messages_not_visible` (in-flight messages currently held by a consumer). Polling these every 2 seconds gives a live view of the drain rate — a production monitoring setup would feed these values to a metrics system and drive autoscaling decisions.
+
+## What to try next
+
+- Wire `SqsAutoscalerBackend` to the registry (see the [autoscaler example](/backends/sqs/examples/autoscaler)) to scale the consumer count automatically based on `messages_ready`.
+- Reduce the handler delay to 20 ms — observe how quickly `messages_ready` drops to 0 with even one consumer.
+- Call `registry.lock().await.add_consumers::<WorkQueue>(2)` after the initial burst to manually scale up mid-flight.
+- See [Guides: Groups](/guides/groups) for an explanation of how independent SQS workers relate to coordinated consumer groups on other backends.

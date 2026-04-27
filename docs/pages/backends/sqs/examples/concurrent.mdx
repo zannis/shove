@@ -1,3 +1,74 @@
 # SQS — Concurrent Pubsub
 
-Coming soon.
+This example benchmarks sequential versus concurrent message processing on the SQS backend, using a 100 ms I/O-bound handler and 20 messages to make the speedup clearly visible. It mirrors the [RabbitMQ concurrent example](/backends/rabbitmq/examples/concurrent) but highlights an important SQS-specific constraint: the `prefetch_count` interacts with SQS's `ReceiveMessage` batch size cap of 10, so the maximum useful prefetch is lower than for AMQP backends.
+
+## Prerequisites
+
+- Docker with a running daemon
+- `LOCALSTACK_AUTH_TOKEN` environment variable set to a valid LocalStack Pro token
+- Cargo feature: `aws-sns-sqs`
+
+## Run
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_concurrent_pubsub --features aws-sns-sqs
+```
+
+## Expected output
+
+```text
+--- Sequential (prefetch_count=1) ---
+  20 messages, 100ms handler delay, prefetch=1
+  processed task 0
+  processed task 1
+  ...
+  done: 2.3s (9 msg/s)
+
+--- Concurrent (prefetch_count=20) ---
+  20 messages, 100ms handler delay, prefetch=20
+  processed task 0
+  processed task 5
+  ...
+  done: 0.3s (68 msg/s)
+
+--- Summary ---
+  sequential:  2.3s (9 msg/s)
+  concurrent:  0.3s (68 msg/s)
+  speedup:     7.5x
+
+  Messages are always acked in delivery order.
+  Concurrent mode overlaps handler I/O within a single consumer.
+```
+
+Speedup will be lower than the RabbitMQ equivalent because SQS's `ReceiveMessage` returns at most 10 messages per call even when `prefetch=20`.
+
+## Source
+
+```rust
+// [!include ~/examples/sqs/concurrent_pubsub.rs]
+```
+
+## Walkthrough
+
+### Handler with notification signal
+
+`SlowTaskHandler` uses an `Arc<tokio::sync::Notify>` to wake up the waiting main task as each message completes. The `wait_for(target, timeout)` method loops, checking the atomic counter on each `notify_waiters()` signal. This avoids a busy-poll or a fixed sleep, and its 120-second timeout (longer than the RabbitMQ version's 60 s) accounts for SQS polling overhead.
+
+### Sequential vs concurrent modes
+
+`run_round` registers a consumer with `ConsumerOptions::<Sqs>::new().with_prefetch_count(prefetch).with_concurrent_processing(concurrent)`. For the sequential round `prefetch=1` and `concurrent=false`. For the concurrent round `prefetch=20` and `concurrent=true`. Enabling `concurrent_processing` causes the consumer to dispatch each handler invocation as a separate tokio task, overlapping the 100 ms sleeps rather than serialising them.
+
+### No queue purge between rounds
+
+Unlike the RabbitMQ example, which calls the Management HTTP API to purge the queue between rounds, this example simply re-publishes a fresh batch. The first round's consumer drains the first batch fully before the supervisor stops; then a second batch is published for the concurrent round. This avoids SQS's strict 60-second rate limit on `PurgeQueue`.
+
+### SQS prefetch and batch size
+
+SQS's `ReceiveMessage` API returns at most 10 messages per request regardless of the requested batch size. `prefetch_count=20` will therefore fetch two batches of 10 in parallel, giving an effective in-flight window of 20 — but each batch requires a separate API call. This is why throughput improvements taper off above `prefetch=10` on SQS compared to AMQP backends where larger prefetch counts have a flatter cost curve.
+
+## What to try next
+
+- Set `prefetch=10` for the concurrent round — this matches SQS's natural batch size; further increases provide diminishing returns.
+- Increase `msg_count` to 100 — the sequential time grows proportionally while concurrent time stays nearly flat.
+- Set `handler_delay` to `Duration::ZERO` — sequential and concurrent perform identically because there is no I/O to overlap.
+- See the [SQS stress example](/backends/sqs/examples/stress) for higher-volume concurrency measurements.
