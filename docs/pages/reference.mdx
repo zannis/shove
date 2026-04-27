@@ -1,3 +1,31 @@
 # Reference
 
-Coming soon.
+The full API reference for `shove` is auto-generated rustdoc on **[docs.rs/shove](https://docs.rs/shove)**.
+
+## Headline types
+
+- [`Broker`](https://docs.rs/shove/latest/shove/struct.Broker.html) — generic entry point parameterized on the backend marker
+- [`Publisher`](https://docs.rs/shove/latest/shove/struct.Publisher.html) — typed publish API
+- [`TopologyDeclarer`](https://docs.rs/shove/latest/shove/struct.TopologyDeclarer.html) — idempotent topology setup
+- [`ConsumerSupervisor`](https://docs.rs/shove/latest/shove/struct.ConsumerSupervisor.html) — N-poller fan-out (SQS, all backends)
+- [`ConsumerGroup`](https://docs.rs/shove/latest/shove/struct.ConsumerGroup.html) — coordinated min/max-bounded groups
+- [`SupervisorOutcome`](https://docs.rs/shove/latest/shove/struct.SupervisorOutcome.html) — shutdown result with `exit_code()`
+
+## Core enums and traits
+
+- [`Outcome`](https://docs.rs/shove/latest/shove/enum.Outcome.html) — `Ack`, `Retry`, `Reject`, `Defer`
+- [`MessageHandler`](https://docs.rs/shove/latest/shove/trait.MessageHandler.html) — handler trait, parameterized on `Topic`
+- [`MessageHandlerExt`](https://docs.rs/shove/latest/shove/trait.MessageHandlerExt.html) — fluent helpers (`.audited(...)`)
+- [`Topic`](https://docs.rs/shove/latest/shove/trait.Topic.html), [`SequencedTopic`](https://docs.rs/shove/latest/shove/trait.SequencedTopic.html) — topic traits
+- [`TopologyBuilder`](https://docs.rs/shove/latest/shove/struct.TopologyBuilder.html) — `.hold_queue`, `.sequenced`, `.routing_shards`, `.dlq`
+- [`ConsumerOptions`](https://docs.rs/shove/latest/shove/struct.ConsumerOptions.html) — per-consumer tuning
+
+## Per-backend modules
+
+- [`shove::rabbitmq`](https://docs.rs/shove/latest/shove/rabbitmq/) — RabbitMQ backend
+- [`shove::sns`](https://docs.rs/shove/latest/shove/sns/) — AWS SNS+SQS backend
+- [`shove::nats`](https://docs.rs/shove/latest/shove/nats/) — NATS JetStream backend
+- [`shove::kafka`](https://docs.rs/shove/latest/shove/kafka/) — Apache Kafka backend
+- [`shove::inmemory`](https://docs.rs/shove/latest/shove/inmemory/) — in-process backend
+
+> Docs on this site follow `main`. For pinned versions, use the version dropdown on docs.rs.
