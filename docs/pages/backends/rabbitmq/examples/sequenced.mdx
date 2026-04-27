@@ -1,3 +1,70 @@
 # RabbitMQ — Sequenced Pubsub
 
-Coming soon.
+This example puts two failure policies for per-key FIFO delivery head-to-head: `SequenceFailure::Skip` (DLQ one bad message, continue the sequence) versus `SequenceFailure::FailAll` (DLQ the bad message and all subsequent messages for the same key). Ledger entries for two accounts are published and the example asserts the resulting totals match the expected values for each policy — making it a concrete end-to-end test of [sequenced delivery](/guides/sequenced) semantics on RabbitMQ.
+
+## Prerequisites
+
+- Docker (a RabbitMQ testcontainer is spun up automatically with the `rabbitmq_consistent_hash_exchange` plugin enabled)
+- Cargo feature: `rabbitmq`
+
+## Run
+
+```sh
+cargo run --example rabbitmq_sequenced_pubsub --features rabbitmq
+```
+
+## Expected output
+
+```text
+sequenced topologies declared
+
+published 5 entries per topic for ACC-A
+published 3 entries per topic for ACC-B
+
+[skip error and continue] account=ACC-A seq=1 amount=100 attempt=1
+[skip error and continue] account=ACC-B seq=1 amount=50 attempt=1
+...
+[skip error and continue] account=ACC-A seq=3 amount=300 attempt=1
+[skip error and continue]   → Reject (seq=3 is poison for ACC-A)
+...
+[fail all after error] account=ACC-A seq=3 amount=300 attempt=1
+[fail all after error]   → Reject (FailAll: seq=3 + all subsequent for ACC-A will DLQ)
+...
+
+── Results (elapsed: 5.2s) ──
+skip   ACC-A = 1200 (expected 1200)
+skip   ACC-B = 300 (expected 300)
+strict ACC-A = 300 (expected 300)
+strict ACC-B = 300 (expected 300)
+```
+
+## Source
+
+```rust
+// [!include ~/examples/rabbitmq/sequenced_pubsub.rs]
+```
+
+## Walkthrough
+
+### Two topics, two failure policies
+
+`SkipLedger` uses `SequenceFailure::Skip`: when `ACC-A seq=3` is rejected, it goes to the DLQ and consumption of `ACC-A seq=4` and `seq=5` resumes normally. The total for `ACC-A` is `100+200+400+500 = 1200`. `StrictLedger` uses `SequenceFailure::FailAll`: the same rejection causes `seq=4` and `seq=5` to be automatically DLQ'd without reaching the handler. The total for `ACC-A` drops to `100+200 = 300`. In both cases `ACC-B` is unaffected — keys are independent.
+
+### `define_sequenced_topic!` and routing shards
+
+Both topics are created with `define_sequenced_topic!(Name, MsgType, key_fn, topology)`. The key function `|msg| msg.account_id.clone()` is captured inline and used by the broker to route each `LedgerEntry` to the correct FIFO shard. `StrictLedger` adds `.routing_shards(4)` to reduce the default of 8 shards — useful when the number of distinct keys is small and you want to pack them into fewer exchanges. The consistent-hash exchange plugin (enabled at container start) is required for shard routing to work on RabbitMQ.
+
+### Backend-specific `run_fifo`
+
+Per-key FIFO is not yet available through the generic `Broker\<B\>` API, so the example uses `RabbitMqConsumer::new(client).run_fifo::<Topic, _>(handler, ctx, opts)` directly. `with_prefetch_count(8)` means up to 8 messages may be in-flight at once, but only one per key at a time — the consumer holds back messages for a key while the current one is being processed.
+
+### Assertion-based verification
+
+After a 5-second processing window the example reads the `totals` maps collected by `LedgerHandler` and asserts exact values. This pattern (accumulate totals in a shared `Arc<Mutex<HashMap>>`, assert after shutdown) is the cleanest way to write an integration test that also runs as a runnable example.
+
+## What to try next
+
+- Swap `SequenceFailure::FailAll` for `SequenceFailure::Skip` on `StrictLedger` — the `ACC-A` total should rise from 300 to 1200.
+- Increase `routing_shards` to 16 on `SkipLedger` — measure whether latency changes for two-key workloads.
+- Add a third account `ACC-C` to the publish loop with no poison entry — confirm it processes all entries regardless of which policy is active.
+- Read [Guides: Sequenced](/guides/sequenced) for the full explanation of shard routing and cross-key concurrency.
