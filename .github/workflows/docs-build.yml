@@ -1,0 +1,22 @@
+name: Docs build
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'examples/**'
+      - 'vocs.config.ts'
+      - 'package.json'
+      - 'package-lock.json'
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
