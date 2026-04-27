@@ -153,20 +153,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = container.get_host_port_ipv4(4566).await?;
     let endpoint = format!("http://localhost:{port}");
 
+    // [!region connect]
     let broker = Broker::<Sqs>::new(SnsConfig {
         region: Some("us-east-1".into()),
         endpoint_url: Some(endpoint),
     })
     .await?;
+    // [!endregion connect]
 
     // ── Declare all topologies ──
+    // [!region declare]
     let topology = broker.topology();
     topology.declare::<MinimalOrder>().await?;
     topology.declare::<DlqOrder>().await?;
     topology.declare::<RetryOrder>().await?;
+    // [!endregion declare]
     println!("topologies declared\n");
 
     // ── Publish ──
+    // [!region publish]
     let publisher = broker.publisher().await?;
 
     // Single publish
@@ -206,9 +211,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
     publisher.publish_batch::<MinimalOrder>(&batch).await?;
+    // [!endregion publish]
     println!("messages published\n");
 
     // ── Start consumers ──
+    // [!region consume]
     let mut supervisor = broker.consumer_supervisor();
     supervisor.register::<MinimalOrder, _>(AckHandler, ConsumerOptions::<Sqs>::new())?;
     supervisor.register::<DlqOrder, _>(RejectHandler, ConsumerOptions::<Sqs>::new())?;
@@ -229,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(5),
         )
         .await;
+    // [!endregion consume]
 
     println!("done");
     std::process::exit(outcome.exit_code());
