@@ -172,17 +172,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = container.get_host_port_ipv4(5672).await?;
     let uri = format!("amqp://guest:guest@localhost:{port}/%2f");
 
+    // [!region connect]
     let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new(&uri)).await?;
+    // [!endregion connect]
 
     // ── Declare all topologies ──
+    // [!region declare]
     let topology = broker.topology();
     topology.declare::<MinimalOrder>().await?;
     topology.declare::<DlqOrder>().await?;
     topology.declare::<RetryOrder>().await?;
     topology.declare::<ScheduledOrder>().await?;
+    // [!endregion declare]
     println!("topologies declared\n");
 
     // ── Publish ──
+    // [!region publish]
     let publisher = broker.publisher().await?;
 
     // Single publish
@@ -223,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
     publisher.publish_batch::<MinimalOrder>(&batch).await?;
+    // [!endregion publish]
     println!("messages published\n");
 
     // ── Start consumers via a single supervisor ──
@@ -230,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Each `register` spawns one tokio task running that topic's consumer.
     // The supervisor owns a shared shutdown token so ctrl-c or our timeout
     // stops every consumer in lock-step.
+    // [!region consume]
     let mut supervisor = broker.consumer_supervisor();
     supervisor.register::<MinimalOrder, _>(AckHandler, ConsumerOptions::<RabbitMq>::new())?;
     supervisor.register::<DlqOrder, _>(RejectHandler, ConsumerOptions::<RabbitMq>::new())?;
@@ -251,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(5),
         )
         .await;
+    // [!endregion consume]
 
     println!("done");
     std::process::exit(outcome.exit_code());
