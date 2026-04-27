@@ -22,7 +22,40 @@ export default defineConfig({
     { icon: 'github', link: 'https://github.com/zannis/shove' },
   ],
   editLink: {
-    pattern: 'https://github.com/zannis/shove/edit/main/docs/pages/:path',
+    pattern: (pageData) => {
+      const fp = pageData.filePath ?? ''
+      const exampleMap: Record<string, string> = {
+        'backends/rabbitmq/examples/basic.mdx': 'examples/rabbitmq/basic_pubsub.rs',
+        'backends/rabbitmq/examples/sequenced.mdx': 'examples/rabbitmq/sequenced_pubsub.rs',
+        'backends/rabbitmq/examples/consumer-groups.mdx': 'examples/rabbitmq/consumer_groups.rs',
+        'backends/rabbitmq/examples/audited.mdx': 'examples/rabbitmq/audited_consumer.rs',
+        'backends/rabbitmq/examples/concurrent.mdx': 'examples/rabbitmq/concurrent_pubsub.rs',
+        'backends/rabbitmq/examples/exactly-once.mdx': 'examples/rabbitmq/exactly_once.rs',
+        'backends/rabbitmq/examples/stress.mdx': 'examples/rabbitmq/stress.rs',
+        'backends/sqs/examples/basic.mdx': 'examples/sqs/basic_pubsub.rs',
+        'backends/sqs/examples/sequenced.mdx': 'examples/sqs/sequenced_pubsub.rs',
+        'backends/sqs/examples/concurrent.mdx': 'examples/sqs/concurrent_pubsub.rs',
+        'backends/sqs/examples/consumer-groups.mdx': 'examples/sqs/consumer_groups.rs',
+        'backends/sqs/examples/audited.mdx': 'examples/sqs/audited_consumer.rs',
+        'backends/sqs/examples/autoscaler.mdx': 'examples/sqs/autoscaler.rs',
+        'backends/sqs/examples/stress.mdx': 'examples/sqs/stress.rs',
+        'backends/nats/examples/basic.mdx': 'examples/nats/basic.rs',
+        'backends/nats/examples/sequenced.mdx': 'examples/nats/sequenced.rs',
+        'backends/nats/examples/audited.mdx': 'examples/nats/audited_consumer.rs',
+        'backends/nats/examples/stress.mdx': 'examples/nats/stress.rs',
+        'backends/kafka/examples/basic.mdx': 'examples/kafka/basic.rs',
+        'backends/kafka/examples/sequenced.mdx': 'examples/kafka/sequenced.rs',
+        'backends/kafka/examples/audited.mdx': 'examples/kafka/audited_consumer.rs',
+        'backends/kafka/examples/stress.mdx': 'examples/kafka/stress.rs',
+        'backends/inmemory/examples/basic.mdx': 'examples/inmemory/basic.rs',
+        'backends/inmemory/examples/sequenced.mdx': 'examples/inmemory/sequenced.rs',
+        'backends/inmemory/examples/consumer-groups.mdx': 'examples/inmemory/consumer_groups.rs',
+        'backends/inmemory/examples/audited.mdx': 'examples/inmemory/audited_consumer.rs',
+        'backends/inmemory/examples/stress.mdx': 'examples/inmemory/stress.rs',
+      }
+      const target = exampleMap[fp] ?? `docs/pages/${fp}`
+      return `https://github.com/zannis/shove/edit/main/${target}`
+    },
     text: 'Edit on GitHub',
   },
   sidebar: [
