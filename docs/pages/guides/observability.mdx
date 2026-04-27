@@ -1,3 +1,156 @@
 # Observability
 
-Coming soon.
+`shove` integrates with the standard Rust `tracing` ecosystem. Every interesting event — handler invocation outcomes, retry routing, DLQ routing, group scaling, autoscaler decisions, connection errors — is emitted as a structured `tracing` event with named fields. Add a subscriber and you have a full observability trail without any instrumentation code in your handlers.
+
+## tracing integration
+
+The recommended subscriber setup for a consumer binary:
+
+```rust,ignore
+use tracing_subscriber::{EnvFilter, fmt};
+
+tracing_subscriber::registry()
+    .with(EnvFilter::from_default_env())
+    .with(fmt::layer())
+    .init();
+```
+
+Run with `RUST_LOG=info,shove=debug` to get per-message delivery traces. For production, use `RUST_LOG=info,shove=info` to get group scaling events and errors without per-message noise.
+
+Available log levels used by `shove`:
+
+| Level | Used for |
+|-------|---------|
+| `error` | Consumer task panics, unrecoverable broker errors, failed acks/nacks |
+| `warn` | Handler timeouts, deserialization failures, oversized messages, DLQ routing, missing DLQ, deprecated fallbacks |
+| `info` | Consumer group start/stop, scale up/down, autoscaler start/shutdown |
+| `debug` | Per-message handled (with outcome), individual scale decisions, consumer spawn |
+
+## Key events emitted
+
+`shove` does not use structured span names in the `tracing::span!()` form. All observability is through event macros (`debug!`, `info!`, `warn!`, `error!`) with named fields. The following are the most useful events to watch for, with their actual field names from the source:
+
+**Consumer events:**
+
+- `"handler task panicked — retrying message"` (`warn`) — a handler future panicked. Fields: `error`, `ticket`. The message is retried.
+- `"handler timed out — retrying"` (`warn`) — handler exceeded `handler_timeout`. Fields: `timeout`. The message is retried.
+- `"rejecting oversized message"` (`warn`) — payload exceeds `max_message_size`. Fields: `error`. Routed to DLQ.
+- `"failed to deserialize message — rejecting"` (`warn`) — JSON deserialization failed. Fields: `error`. Routed to DLQ.
+- `"message handled (concurrent)"` (`debug`) — a concurrent consumer processed a message. Fields: `queue`, `outcome`.
+- `"message handled (concurrent-sequenced)"` (`debug`) — a concurrent-sequenced consumer processed a message. Fields: `queue`, `sequence_key`, `outcome`.
+- `"DLQ declared but not found in broker"` (`error`) — topic has a DLQ in the topology but the broker queue was not found. Fields: `queue`. Indicates a topology declaration failure.
+
+**Consumer group / scale events:**
+
+- `"starting consumer group"` (`info`) — group starts its initial consumers. Fields: `group`, `queue`, `initial_consumers`.
+- `"scaled up: spawned new consumer"` (`info`) — autoscaler or manual call added a consumer. Fields: `group`, `consumers`.
+- `"scaled down: cancelled an idle consumer"` (`info`) — autoscaler or manual call removed a consumer. Fields: `group`, `consumers`.
+- `"scale_up rejected: at max capacity"` (`debug`) — scale-up attempted but already at `max_consumers`. Fields: `group`, `max`.
+- `"scale_down rejected: at min capacity"` (`debug`) — scale-down attempted but already at `min_consumers`. Fields: `group`, `min`.
+- `"scale_down rejected: all consumers are busy"` (`warn`) — tried to scale down but every consumer is processing a message. Fields: `group`.
+- `"shutting down consumer group"` (`info`) — drain started. Fields: `group`, `consumers`.
+
+**Autoscaler events:**
+
+- `"autoscaler started"` (`info`) — autoscaler loop entered.
+- `"autoscaler shutting down"` (`info`) — shutdown token was cancelled.
+- `"failed to list groups: {e}"` (`error`) — autoscaler could not enumerate consumer groups (backend error).
+- `"failed to fetch metrics for {group}: {e}"` (`error`) — metrics fetch failed for one group; others continue.
+- `"failed to scale {group}: {e}"` (`error`) — scaling command failed.
+
+**Audit events:**
+
+- `"audit handler failed, retrying message"` (`error`) — `AuditHandler::audit()` returned `Err`. Fields: `error`, `delivery_id`. The message will be retried.
+- `"audit handler timed out, returning original outcome"` (`error`) — audit exceeded `audit_timeout`. Fields: `delivery_id`, `timeout_ms`. Original outcome is preserved.
+
+**Drain timeout event:**
+
+- `"drain timeout elapsed; aborting surviving tasks"` (`warn`) — `run_until_timeout` deadline elapsed. Fields: `timeout_ms`.
+
+## Header propagation
+
+`MessageMetadata::headers` is a `HashMap<String, String>` carrying broker-level headers that survive hold-queue hops. Notable headers:
+
+- **`x-trace-id`** — set by publishers at publish time. Used by `Audited` as the `trace_id` in audit records. Preserved across retries (hold-queue hops forward headers).
+- **`x-shove-retry-count`** — the internal retry counter maintained by `shove`'s consumer routing layer.
+- Backend-specific identifiers (see the table below).
+
+To set `x-trace-id` at publish time:
+
+```rust,ignore
+use std::collections::HashMap;
+
+let mut headers = HashMap::new();
+headers.insert("x-trace-id".to_string(), your_trace_id.to_string());
+
+publisher.publish_with_headers::<Orders>(&msg, headers).await?;
+```
+
+The consumer surfaces this via `metadata.headers.get("x-trace-id")` in the handler. The audit wrapper reads it automatically.
+
+## Connecting to OpenTelemetry
+
+Use the `tracing-opentelemetry` bridge to route `shove`'s structured events into your OTel pipeline:
+
+```toml
+[dependencies]
+tracing-opentelemetry = "0.x"
+opentelemetry = "0.x"
+```
+
+```rust,ignore
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_opentelemetry::OpenTelemetryLayer;
+
+let tracer = init_otel_tracer(); // your OpenTelemetry tracer setup
+let otel_layer = OpenTelemetryLayer::new(tracer);
+
+tracing_subscriber::registry()
+    .with(EnvFilter::from_default_env())
+    .with(fmt::layer())      // keep local logging too
+    .with(otel_layer)        // forward to OTel
+    .init();
+```
+
+All named fields on `shove` events (`group`, `queue`, `outcome`, `error`, `timeout_ms`, etc.) become OTel span attributes automatically via the bridge. Scale events, panics, and audit failures all become searchable attributes in your OTel backend (Jaeger, Tempo, Honeycomb, etc.).
+
+## Per-backend identifier headers
+
+Each backend stamps deliveries with a stable per-message identifier. Access these through `MessageMetadata::headers`:
+
+| Backend | Header / identifier | Use |
+|---------|---------------------|-----|
+| RabbitMQ | `x-message-id` header | Stable UUID per logical message, preserved through hold-queue hops. Useful for deduplication. External messages get it stamped on first retry. |
+| NATS JetStream | `Nats-Msg-Id` header | JetStream dedup window (120s default). Use for publisher-side idempotency. |
+| Apache Kafka | Partition + offset (in metadata) | Stable position in the partition log. Useful for replay and audit correlation. |
+| SQS | SQS Message ID (in `delivery_id`) | AWS-assigned per-message ID. Stable for the lifetime of the message. |
+| InMemory | Internal counter (in `delivery_id`) | Process-local, monotonically increasing. Not stable across restarts. |
+
+For RabbitMQ specifically: `x-message-id` is stamped by `RabbitMqPublisher` on every outgoing message. Handlers can read it for deduplication:
+
+```rust,ignore
+if let Some(mid) = metadata.headers.get("x-message-id") {
+    if store.already_processed(mid).await? {
+        return Outcome::Ack;
+    }
+    store.mark_processed(mid).await?;
+}
+// ... business logic ...
+```
+
+## Audit as observability
+
+Audit records are a high-resolution observability stream complementary to `tracing` events. Every delivery produces one record with the full payload, outcome, duration in milliseconds, and trace ID. Where `tracing` events are best for operational monitoring (scale events, error rates), audit records are best for business-level visibility (which messages were processed, what the outcome was, how long each one took).
+
+Wire `ShoveAuditHandler` (see [Audit Logging](/guides/audit)) and consume the `shove-audit-log` topic to build:
+
+- Per-topic outcome histograms (ratio of Ack / Retry / Reject).
+- Handler latency percentiles (p50 / p99 from `duration_ms`).
+- Per-entity message history (all records for a given `trace_id` or entity ID in the payload).
+- Alerting on sustained rejection spikes.
+
+## What's next
+
+- [Audit Logging](/guides/audit)
+- [Handlers & Context](/concepts/handlers)
+- [Shutdown & Exit Codes](/guides/shutdown)
