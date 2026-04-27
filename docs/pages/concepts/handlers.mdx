@@ -1,3 +1,133 @@
 # Handlers & Context
 
-Coming soon.
+A handler is user code that processes a single message from a topic's queue. The library calls `handle()` for each delivered message and routes the message based on the returned `Outcome`. Handlers are parameterized on a `Topic` — not on a message type directly. This binding prevents accidentally sharing a handler between two topics that happen to carry the same message type, since two different topics with the same message type represent two distinct event flows with distinct semantics.
+
+## The MessageHandler trait
+
+Every handler implements `MessageHandler<T>` where `T: Topic`:
+
+```rust,ignore
+pub trait MessageHandler<T: Topic>: Send + Sync + 'static {
+    type Context: Clone + Send + Sync + 'static;
+
+    fn handle(
+        &self,
+        message: T::Message,
+        metadata: MessageMetadata,
+        ctx: &Self::Context,
+    ) -> impl Future<Output = Outcome> + Send;
+
+    fn handle_dead(
+        &self,
+        message: T::Message,
+        metadata: DeadMessageMetadata,
+        ctx: &Self::Context,
+    ) -> impl Future<Output = ()> + Send {
+        // default: log a warning and ack
+    }
+}
+```
+
+The `handle` method is required. `handle_dead` has a default implementation that logs a warning at `WARN` level and acks the dead-lettered message. Override it if you need alerting or investigation logic.
+
+## Context — shared state without a registry
+
+`Context` is shared state injected into every `handle()` invocation. You supply it once when registering the handler; the harness clones it into each consumer task. Because `Clone` is required, the idiomatic pattern is `Arc<AppState>` where cloning is a cheap reference-count increment.
+
+When there is no shared state to inject, use `()`:
+
+```rust,ignore
+struct Handler;
+
+impl MessageHandler<Orders> for Handler {
+    type Context = ();
+
+    async fn handle(&self, msg: Order, _: MessageMetadata, _: &()) -> Outcome {
+        println!("order received: {:?}", msg.id);
+        Outcome::Ack
+    }
+}
+```
+
+When your handler depends on a database pool or other shared resource, declare a `Context` type:
+
+```rust,ignore
+#[derive(Clone)]
+struct AppState {
+    db: Arc<Pool>,
+}
+
+struct Handler;
+
+impl MessageHandler<Orders> for Handler {
+    type Context = AppState;
+
+    async fn handle(&self, msg: Order, _: MessageMetadata, ctx: &AppState) -> Outcome {
+        match ctx.db.insert(&msg).await {
+            Ok(_) => Outcome::Ack,
+            Err(_) => Outcome::Retry,
+        }
+    }
+}
+
+// Registration:
+let mut group = broker.consumer_group().with_context(state.clone());
+group.register::<Orders, _>(cfg, || Handler).await?;
+```
+
+`Context` should be cheap to clone. `Arc<AppState>` is the canonical pattern; the clone is a refcount bump and does not copy any data.
+
+## MessageMetadata
+
+Every `handle()` invocation receives a `MessageMetadata` describing the delivery:
+
+- `retry_count: u32` — how many times this message has been retried; `0` on first delivery.
+- `delivery_id: String` — opaque delivery identifier (AMQP delivery tag, SQS receipt handle, etc.). Useful for logging.
+- `redelivered: bool` — whether the broker flagged this as a redelivery at the transport layer.
+- `headers: HashMap<String, String>` — string-valued headers attached to the delivery.
+
+Most handlers ignore all of these fields. They become useful when you need to trace a message (`headers["x-trace-id"]`), implement idempotency checks (`headers["x-message-id"]` on RabbitMQ), or adjust behavior on redelivery. The `retry_count` in particular is more reliable than `redelivered` for detecting retries because `shove` increments it explicitly, whereas `redelivered` reflects the broker's view of the transport.
+
+## Dead-letter handling
+
+`handle_dead` is invoked when a message is consumed from the DLQ via `consumer.run_dlq::<T>()`. The default implementation logs a warning. Override it to send alerts, push to an investigation queue, or write to a quarantine store:
+
+```rust,ignore
+impl MessageHandler<Orders> for Handler {
+    type Context = AppState;
+
+    async fn handle(&self, msg: Order, _: MessageMetadata, _: &AppState) -> Outcome {
+        // ... normal processing ...
+        Outcome::Ack
+    }
+
+    async fn handle_dead(&self, msg: Order, meta: DeadMessageMetadata, ctx: &AppState) {
+        tracing::error!(
+            order_id = %msg.id,
+            reason = meta.reason.as_deref().unwrap_or("unknown"),
+            death_count = meta.death_count,
+            "dead-lettered order",
+        );
+        // alert, write to quarantine table, etc.
+    }
+}
+```
+
+`DeadMessageMetadata` wraps the base `MessageMetadata` (accessible via `meta.message`) and adds `reason`, `original_queue`, and `death_count`.
+
+The dead-letter consumer loop is driven separately from the main consumer loop: `consumer.run_dlq::<T>()`. The message is always acked from the DLQ after `handle_dead` returns.
+
+## Audited handlers
+
+`MessageHandlerExt::audited(audit_handler)` wraps any handler in an audit layer. The wrapped handler has the same `Outcome` contract and the same `Context` type as the original. Auditing is purely compositional — it does not change behaviour, only adds a side-channel write per invocation.
+
+```rust,ignore
+use shove::MessageHandlerExt;
+
+let handler = OrderHandler.audited(MyAuditSink);
+group.register::<Orders, _>(cfg, move || handler.clone()).await?;
+```
+
+See [Audit Logging](/guides/audit) for a full explanation of the `AuditHandler` trait and audit record schema.
+
+For the other side of the registration — how `broker.consumer_group()` and `with_context` work — see [The Broker\<B\> Pattern](/concepts/broker).
