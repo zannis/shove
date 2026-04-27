@@ -1,0 +1,26 @@
+name: Docs preview
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'examples/**'
+      - 'vocs.config.ts'
+      - 'package.json'
+      - 'package-lock.json'
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Comment preview URL
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: docs-preview
+          message: |
+            📖 **Docs preview:** https://${{ github.event.pull_request.head.ref }}.shove-docs.pages.dev
+
+            Cloudflare Pages will deploy this branch automatically (~1–2 min after push).
+            Re-run if the URL is stale.
