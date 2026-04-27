@@ -13,6 +13,7 @@ use shove::{
     TopologyBuilder,
 };
 
+// [!region topic]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ping {
     id: u32,
@@ -27,7 +28,9 @@ impl Topic for PingTopic {
         T.get_or_init(|| TopologyBuilder::new("ping").dlq().build())
     }
 }
+// [!endregion topic]
 
+// [!region handler]
 #[derive(Clone)]
 struct PingHandler {
     count: Arc<AtomicUsize>,
@@ -40,9 +43,11 @@ impl MessageHandler<PingTopic> for PingHandler {
         Outcome::Ack
     }
 }
+// [!endregion handler]
 
 #[tokio::main]
 async fn main() {
+    // [!region main]
     tracing_subscriber::fmt::init();
 
     let broker = Broker::<InMemory>::new(InMemoryConfig::default())
@@ -100,4 +105,5 @@ async fn main() {
         .await;
 
     std::process::exit(outcome.exit_code());
+    // [!endregion main]
 }
