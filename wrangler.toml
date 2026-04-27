@@ -1,0 +1,9 @@
+name = "shove-docs"
+compatibility_date = "2026-04-27"
+
+[build]
+command = "npm install && npm run build"
+publish = "docs/dist"
+
+[build.environment]
+NODE_VERSION = "22"
