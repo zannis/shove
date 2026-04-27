@@ -1,0 +1,23 @@
+.github/workflows/docs-build.yml
+  54214397c9f7db40 1-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "79f16cdc56a6b67ec0b8562def063d3b2ae7a525",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24797,
+      "total_deletions": 0,
+      "accepted_lines": 26299,
+      "overriden_lines": 0
+    }
+  }
+}
