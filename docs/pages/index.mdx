@@ -1,3 +1,49 @@
-# shove
+---
+layout: landing
+---
 
-Coming soon.
+import { HomePage } from 'vocs/components'
+
+<HomePage.Root>
+  <HomePage.Logo />
+  <HomePage.Tagline>Type-safe async pub/sub for Rust</HomePage.Tagline>
+  <HomePage.InstallPackage name="shove" type="add" />
+  <HomePage.Description>
+    One typed-topic API across RabbitMQ, AWS SNS+SQS, NATS JetStream, Apache Kafka, and an in-process backend. Retries, hold queues, DLQs, sequenced delivery, consumer groups, autoscaling, and audit logging — built in.
+  </HomePage.Description>
+  <HomePage.Buttons>
+    <HomePage.Button href="/getting-started" variant="accent">Get started</HomePage.Button>
+    <HomePage.Button href="https://github.com/zannis/shove">GitHub</HomePage.Button>
+  </HomePage.Buttons>
+</HomePage.Root>
+
+## Why shove
+
+- **Typed topics** — define a topic once as a Rust type; queue names, DLQs, and hold queues all derive from it.
+- **Retry topologies without glue code** — escalating backoff through hold queues, DLQ routing, retry budgets, handler timeouts.
+- **Strict per-key ordering** — `SequencedTopic` with pluggable failure policies (`Skip` or `FailAll`), enforced by the broker.
+- **Consumer groups + autoscaling** — min/max bounds driven by queue depth (or consumer lag on Kafka), with optional structured audit trails.
+- **One API across five backends** — swap the transport without changing topic definitions or handlers.
+
+If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, `async-nats`, or `rdkafka` directly. `shove` is the layer for multi-service event flows that need operational discipline.
+
+## Pick your backend
+
+| Backend         | Feature flag    | Marker      | Durability         | Ordering primitive                    |
+|-----------------|-----------------|-------------|--------------------|---------------------------------------|
+| RabbitMQ        | `rabbitmq`      | `RabbitMq`  | Disk               | Consistent-hash exchange + SAC shards |
+| AWS SNS/SQS     | `aws-sns-sqs`   | `Sqs`       | Managed (AWS)      | FIFO topic + `MessageGroupId`         |
+| NATS JetStream  | `nats`          | `Nats`      | Disk (JetStream)   | Subject shard + `max_ack_pending=1`   |
+| Apache Kafka    | `kafka`         | `Kafka`     | Disk (log)         | Partition key                         |
+| In-process      | `inmemory`      | `InMemory`  | None (process RAM) | Per-key FIFO shards                   |
+
+[Choose a backend →](/backends/choosing)
+
+## What's next
+
+- **[Get started in 60 seconds](/getting-started)** — the in-process backend needs no Docker, no AWS, no config.
+- **[Core concepts](/concepts/topics)** — the mental model: topics, outcomes, handlers, the `Broker<B>` pattern.
+- **[Backend deep-dives](/backends/choosing)** — production patterns for each transport.
+- **[Full API reference](https://docs.rs/shove)** — auto-generated rustdoc on docs.rs.
+
+> Docs follow `main`. For pinned versions see [`docs.rs/shove/<version>`](https://docs.rs/shove).
