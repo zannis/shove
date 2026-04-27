@@ -1,0 +1,23 @@
+examples/inmemory/basic.rs
+  54214397c9f7db40 53,57-58,64,68,81,92,113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "358d5bca2150bb8e39f50c65e5882c085866651d",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24757,
+      "total_deletions": 0,
+      "accepted_lines": 27626,
+      "overriden_lines": 0
+    }
+  }
+}
