@@ -1,3 +1,88 @@
 # The Broker\<B\> Pattern
 
-Coming soon.
+`shove` exposes a single entry point for every backend: `Broker<B>`. The type parameter `B` is a zero-sized marker struct — `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `InMemory` — that ties together the backend's connection type, publisher, consumer, and topology implementations.
+
+Topic definitions, handler implementations, and all business logic are written against the generic `Broker<B>` API. Swapping backends means changing the marker and the connection config. Nothing else changes.
+
+## The four-corner API
+
+Every `Broker<B>` exposes the same four methods:
+
+```text
+Broker<B>
+   ├─ .topology()              → TopologyDeclarer<B>
+   ├─ .publisher().await       → Publisher<B>
+   ├─ .consumer_supervisor()   → ConsumerSupervisor<B>     (all backends)
+   └─ .consumer_group()        → ConsumerGroup<B>          (all except Sqs)
+```
+
+- `topology()` — declare queues, exchanges, and streams idempotently at startup.
+- `publisher().await` — obtain a typed publisher; each `publish::<T>(&msg)` call is bound to a topic.
+- `consumer_supervisor()` — fire N independent pollers on the same queue, each running its own handler loop.
+- `consumer_group()` — register handlers into a coordinated, min/max-bounded consumer group with autoscaling.
+
+## consumer_group vs consumer_supervisor
+
+Both primitives run handler loops and both drain cleanly on shutdown. They differ in coordination:
+
+**`consumer_group()`** — one logical group per topic. Consumers coordinate through the broker: RabbitMQ Single Active Consumer, Kafka consumer groups, NATS pull consumers, in-process channel registry. The group has configurable min/max bounds and can autoscale. Available on `RabbitMq`, `Nats`, `Kafka`, and `InMemory`.
+
+**`consumer_supervisor()`** — N independent pollers on the same queue with no coordination. Each poller is a separate task competing for messages. This is the right primitive when the broker has no group concept (`Sqs`), or when you want fan-out without autoscaling overhead. Available on all backends.
+
+Both share the same shutdown contract: `run_until_timeout(signal_future, drain_timeout)` returning a `SupervisorOutcome`. See [Consumer Groups & Autoscaling](/guides/groups) for the coordination details.
+
+## Backend-swap demo
+
+The same topic definition and handler compiles and runs against any backend. Only the marker and the config change:
+
+```rust,ignore
+// Topic and handler defined once, backend-agnostic
+define_topic!(Orders, OrderEvent, TopologyBuilder::new("orders").dlq().build());
+
+struct Handler;
+impl MessageHandler<Orders> for Handler {
+    type Context = ();
+    async fn handle(&self, msg: OrderEvent, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+// In-process for tests
+let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await?;
+
+// RabbitMQ for production
+let broker = Broker::<RabbitMq>::new(
+    RabbitMqConfig::new("amqp://guest:guest@rabbitmq:5672"),
+).await?;
+
+// Everything else is identical across backends:
+broker.topology().declare::<Orders>().await?;
+let publisher = broker.publisher().await?;
+publisher.publish::<Orders>(&event).await?;
+```
+
+This symmetry is the central value of the `Broker<B>` pattern. Tests run against `InMemory` with no external dependencies; production runs against the real broker; the application code does not notice the difference.
+
+## SupervisorOutcome and exit codes
+
+Every consumer group and supervisor returns a `SupervisorOutcome` after all tasks have drained. The `exit_code()` method maps the outcome to a uniform process exit code:
+
+- `0` — clean shutdown; all messages processed and no tasks failed.
+- `1` — at least one consumer task returned an error.
+- `2` — at least one consumer task panicked.
+- `3` — drain timeout elapsed; in-flight messages were abandoned.
+
+The canonical shutdown pattern in a long-running binary:
+
+```rust,ignore
+let outcome = group.run_until_timeout(
+    tokio::signal::ctrl_c().map(drop),
+    Duration::from_secs(30),
+).await;
+
+std::process::exit(outcome.exit_code());
+```
+
+This integrates cleanly with Kubernetes `preStop` hooks, systemd `ExecStop`, and `&&`-chained shell scripts. See [Shutdown & Exit Codes](/guides/shutdown) for the full shutdown lifecycle.
+
+For choosing between backends, see [Choosing a Backend](/backends/choosing). For handler registration and context injection, see [Handlers & Context](/concepts/handlers).
