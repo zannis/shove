@@ -1,3 +1,71 @@
 # NATS — Audited Consumer
 
-Coming soon.
+This example applies the `Audited` decorator to a NATS JetStream consumer group, proving that the `trace_id` in the `AuditRecord` is preserved across a hold-queue retry round-trip. `PaymentHandler` returns `Outcome::Retry` on the first delivery; the `StdoutAuditHandler` prints a JSON audit record for each attempt — both with the same UUID. This is the NATS counterpart to the [RabbitMQ audited example](/backends/rabbitmq/examples/audited).
+
+## Prerequisites
+
+- Docker (a NATS JetStream testcontainer is started automatically)
+- Cargo features: `nats,audit`
+
+## Run
+
+```sh
+cargo run --example nats_audited_consumer --features nats,audit
+```
+
+## Expected output
+
+```text
+topology declared
+
+published payment
+
+[handler] payment=PAY-001 amount=$49.99 attempt=1
+[audit] {
+  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "outcome": "Retry",
+  "duration_ms": 0,
+  ...
+}
+[handler] payment=PAY-001 amount=$49.99 attempt=2
+[audit] {
+  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "outcome": "Ack",
+  "duration_ms": 0,
+  ...
+}
+done
+```
+
+The same UUID appears in both audit records. The 10-second run window allows the 5-second hold queue to fire and redeliver before shutdown.
+
+## Source
+
+```rust
+// [!include ~/examples/nats/audited_consumer.rs]
+```
+
+## Walkthrough
+
+### Consumer group path for audited consumers
+
+Unlike the NATS sequenced example (which drops to `NatsConsumer::run_fifo`), this example uses the generic `Broker\<Nats\>` consumer group API. `broker.consumer_group()` creates a `ConsumerGroup\<Nats\>`, and `group.register` binds the audited factory `|| PaymentHandler.audited(StdoutAuditHandler)` to `Payments`. The `NatsConsumerGroupConfig::new(1..=1)` starts exactly one worker, keeping output strictly ordered for readability.
+
+### `StdoutAuditHandler` as a `Clone` type
+
+`StdoutAuditHandler` derives `Clone` and `Default` because `group.register` calls the factory closure once per worker, and audited handlers must be cloneable so each worker gets its own instance. The `Clone` impl here is trivially cheap — `StdoutAuditHandler` holds no state. A handler that writes to a database connection pool would clone an `Arc` instead.
+
+### Trace ID propagation on NATS
+
+On NATS, shove embeds the `trace_id` in a JetStream message header (`shove-trace-id`) before publishing to the hold queue. When the hold queue delivers the message back, the consumer reads the header and restores the trace ID into the `AuditRecord`. This round-trip through JetStream's metadata system is what allows the same UUID to appear on both delivery attempts.
+
+### 10-second window and hold queue TTL
+
+The supervisor runs for 10 seconds — long enough for the 5-second hold queue TTL to expire and the retried message to arrive. `run_until_timeout` then drains for up to 10 additional seconds. If you shorten the run window below 5 seconds, the second delivery will not arrive and the example will exit with only one audit record.
+
+## What to try next
+
+- Return `Outcome::Retry` for three consecutive attempts and confirm the `trace_id` stays the same across all three deliveries.
+- Add a `.with_max_retries(1)` to the consumer group config and make the handler always retry — observe the final delivery with `outcome: "Reject"` after the retry limit.
+- Replace `StdoutAuditHandler` with a struct that appends to a `Vec` and assert after shutdown that each payment has exactly two records (one retry, one ack).
+- See [Guides: Audit](/guides/audit) for the complete `AuditRecord` schema and production wiring patterns.

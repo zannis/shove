@@ -1,3 +1,59 @@
 # NATS — Sequenced
 
-Coming soon.
+This example demonstrates per-key FIFO delivery on NATS JetStream using subject-shard routing. Events for two users are published in interleaved order; the `UserEventTopic` routes each event to a per-user shard and the consumer processes each user's events strictly in sequence. It uses `NatsConsumer::run_fifo` directly because per-key FIFO is not yet exposed through the generic `Broker\<Nats\>` API.
+
+## Prerequisites
+
+- Docker (a NATS JetStream testcontainer is started automatically)
+- Cargo feature: `nats`
+
+## Run
+
+```sh
+cargo run --example nats_sequenced --features nats
+```
+
+## Expected output
+
+Events for each user arrive in `seq` order (0 before 1 before 2…), but events for different users may interleave:
+
+```text
+Published 10 events (5 per user)
+[user=alice] action=action-0 seq=0 (retry=0)
+[user=bob] action=action-0 seq=0 (retry=0)
+[user=alice] action=action-1 seq=1 (retry=0)
+[user=bob] action=action-1 seq=1 (retry=0)
+...
+Done.
+```
+
+## Source
+
+```rust
+// [!include ~/examples/nats/sequenced.rs]
+```
+
+## Walkthrough
+
+### `define_sequenced_topic!` with subject-shard routing
+
+`UserEventTopic` is declared with `define_sequenced_topic!(Name, MsgType, key_fn, topology)`. The key function `|msg: &UserEvent| msg.user_id.clone()` maps each event to its per-user FIFO lane. The topology uses `.sequenced(SequenceFailure::Skip)` — if one event for a user is rejected, it is DLQ'd and the sequence for that user continues. `.routing_shards(4)` provisions four JetStream subjects (`user-events.0` through `user-events.3`) using consistent hashing; each user always hashes to the same shard, ensuring ordering within the shard.
+
+### Subject-shard routing on NATS
+
+On NATS, shove's sequenced delivery uses JetStream subjects as shards. Each shard is backed by a durable consumer with `max_ack_pending: 1` — only one message per shard can be in-flight at a time, guaranteeing that the next message for a key is not dispatched until the current one is acknowledged or rejected. With four shards and two users, each user lands on a different shard and their events are processed concurrently (but each user's events are strictly ordered within their shard).
+
+### Backend-specific `NatsConsumer::run_fifo`
+
+Because `run_fifo` is not yet available on the generic `ConsumerGroup\<Nats\>` API, the example constructs `NatsConsumer::new(client)` and calls `run_fifo::<UserEventTopic, _>(handler, ctx, opts)` directly. `ConsumerOptions::<Nats>::new().with_shutdown(shutdown)` carries the cancellation token that stops the consumer after the 5-second timer fires.
+
+### Deduplication window
+
+NATS JetStream supports a `Nats-Msg-Id` header for server-side deduplication within a configurable time window. The shove publisher sets this header on every publish, so messages published within the dedup window (default 2 minutes) with the same ID are deduplicated by the broker — useful for at-least-once publisher retries. This example does not exercise dedup explicitly, but the header is always present.
+
+## What to try next
+
+- Change `SequenceFailure::Skip` to `SequenceFailure::FailAll` and make the handler reject `user=alice seq=2` — confirm that `seq=3` and `seq=4` for Alice are automatically DLQ'd while Bob's sequence is unaffected.
+- Increase `routing_shards(4)` to `routing_shards(8)` — more subjects spread keys more evenly but add stream setup overhead.
+- Replace the 5-second fixed timer with a counter-based shutdown (see [InMemory sequenced](/backends/inmemory/examples/sequenced)) to stop as soon as all 10 events are processed.
+- Read [Guides: Sequenced](/guides/sequenced) for the full explanation of shard routing and failure modes.

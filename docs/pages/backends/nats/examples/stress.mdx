@@ -1,3 +1,82 @@
 # NATS — Stress
 
-Coming soon.
+This example runs the shared stress-benchmark harness against a live NATS JetStream server, measuring throughput, latency percentiles, and memory overhead across handler profiles and consumer counts. Comparing results against the [InMemory stress example](/backends/inmemory/examples/stress) isolates the JetStream persistence and acknowledgement cost; comparing against [RabbitMQ stress](/backends/rabbitmq/examples/stress) reveals the relative overhead of AMQP vs NATS wire protocols.
+
+## Prerequisites
+
+- Docker (a NATS JetStream testcontainer is started automatically)
+- Cargo feature: `nats`
+
+## Run
+
+```sh
+cargo run --example nats_stress --features nats
+```
+
+Narrow to one tier or handler profile:
+
+```sh
+cargo run --example nats_stress --features nats -- --tier moderate --handler fast
+```
+
+Release mode for representative numbers:
+
+```sh
+cargo run -q --release --example nats_stress --features nats
+```
+
+## Expected output
+
+Non-deterministic. Look for these characteristic markers:
+
+```text
+shove stress benchmarks — nats
+scenarios: 60
+
+[1/60] moderate | 20000msg | 1c | fast (1-5ms) ...
+  -> 12500.3 msg/s | dispatch p50=0.4ms p99=2.1ms | e2e p50=2.8ms p99=5.3ms | cpu=55% rss=38.2MB | 1.6s
+...
+
+Backend: nats
+TIER         MSGS     C  HANDLER   MSG/SEC  ...
+moderate    20000     1  fast      12500    ...
+moderate    20000     4  fast      42000    ...
+...
+```
+
+NATS JetStream typically achieves higher throughput than RabbitMQ (lower protocol overhead) but lower than in-memory (no persistence or network round-trip).
+
+## Source
+
+```rust
+// [!include ~/examples/nats/stress.rs]
+```
+
+## Walkthrough
+
+### Stream purge strategy
+
+`with_purge(purge)` injects a closure that drops and recreates the entire JetStream stream between scenarios using `js.delete_stream(STREAM_NAME)`. This is necessary because changing `max_ack_pending` on an existing durable consumer requires an explicit `UpdateConsumer` call, which the current harness does not perform — cleanest to drop the stream and let the next scenario's `declare` recreate it fresh. The scenario boot overhead is small compared to the processing time for even the `moderate` tier.
+
+### `NatsConsumerGroupConfig` with `with_concurrent_processing`
+
+The `make_cfg` closure produces `NatsConsumerGroupConfig::new(consumers..=consumers).with_prefetch_count(prefetch).with_concurrent_processing(concurrent)`. The `prefetch_count` maps to JetStream's `max_ack_pending` — how many messages the JetStream server will push to the consumer before requiring acknowledgements. When `--concurrent` is passed, `with_concurrent_processing(true)` enables parallel handler invocations within a single consumer, which is especially effective for `slow` and `heavy` profiles.
+
+### Interpreting the results
+
+Key metrics to compare across backends:
+
+- `disp p50/p99` — the latency from publish timestamp to handler entry. For NATS this includes JetStream replication and push-delivery overhead. Typically 0.2–2 ms at moderate load, compared to 1–5 ms for RabbitMQ.
+- `scaling_efficiency` — how closely throughput scales with consumer count. NATS JetStream push consumers scale well up to the stream's partition count; above that point the bottleneck shifts to the JetStream server.
+- `RSS(MB)` — messages are held in the JetStream server's storage, so in-process memory stays lower than for in-memory backends at equivalent message counts.
+
+### `run_all_scenarios` — coordinated group path
+
+NATS implements `HasCoordinatedGroups`, so `run_all_scenarios` is used (not `run_supervisor_scenarios`). Each scenario creates a fresh `Broker\<Nats\>`, which provisions a new JetStream connection and durable consumer. The purge closure ensures the stream is empty before each scenario's publish phase.
+
+## What to try next
+
+- Compare `--tier moderate --handler zero` throughput here against the InMemory and RabbitMQ stress results to quantify NATS's overhead relative to both extremes.
+- Run `--concurrent --handler slow` — the throughput improvement will be pronounced because NATS's push delivery already fills the `max_ack_pending` window; concurrent processing consumes that window faster.
+- Try `--tier extreme` in release mode — NATS typically sustains hundreds of thousands of msg/s for `zero` handlers before JetStream becomes the bottleneck.
+- See the [NATS backend overview](/backends/nats) for JetStream stream configuration options not covered by this harness.
