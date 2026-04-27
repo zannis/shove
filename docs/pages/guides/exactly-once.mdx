@@ -1,3 +1,119 @@
 # Exactly-Once (RabbitMQ)
 
-Coming soon.
+`shove` is at-least-once by default on every backend. RabbitMQ has an **opt-in transactional mode** that makes routing decisions atomic, eliminating the publish-then-ack race that produces duplicates. It is slower — expect roughly 10–15× lower throughput per channel compared to the default confirm-mode consumer — so reserve it for handlers with irreversible side effects where duplicates cause real harm.
+
+## The publish-then-ack race
+
+Under default at-least-once semantics, `shove`'s consumer uses two separate broker operations to route a message that needs to be retried:
+
+1. Handler returns `Outcome::Retry`.
+2. Consumer publishes the message (with incremented retry count header) to the appropriate hold queue.
+3. Consumer sends ack for the original delivery — removing it from the main queue.
+
+These two operations are not atomic. If the consumer process crashes, restarts, or loses connection between steps 2 and 3:
+
+- The broker redelivers the original message (it was never acked).
+- The copy in the hold queue is also in flight.
+
+Both copies will eventually be processed by the handler. The handler runs **twice** for the same logical message. For idempotent handlers, this is harmless. For handlers with irreversible side effects — charging a payment card, sending an email, calling an external API that doesn't support idempotency tokens — it produces a duplicate.
+
+The same race applies to `Outcome::Defer` and `Outcome::Reject` (reject-to-DLQ also involves a publish + ack pair).
+
+## When you need exactly-once routing
+
+Consider enabling transactional mode when:
+
+- **Ledger writes without idempotency keys** — a double-write produces two distinct entries and corrupts the balance.
+- **Outbound email or SMS without dedup** — the recipient receives the message twice.
+- **Calls to APIs that don't support idempotency tokens** — the API has no way to detect or reject a duplicate request.
+- **State-machine transitions where a duplicate transition is invalid** — e.g. `approved → shipped` should happen exactly once; a duplicate ships the order again.
+
+Do NOT enable it for:
+
+- **Already-idempotent handlers** — the overhead is wasted if duplicates are safe.
+- **High-throughput topics** — the 10–15× throughput reduction may be unacceptable. Profile first.
+- **Backends other than RabbitMQ** — the feature only exists on RabbitMQ in `shove` today.
+
+## rabbitmq-transactional feature
+
+Enable the feature in `Cargo.toml`:
+
+```toml
+[dependencies]
+shove = { version = "0.x", features = ["rabbitmq-transactional"] }
+```
+
+With the feature enabled, `ConsumerOptions\<RabbitMq\>` gains the `.with_exactly_once()` builder method. When set, the consumer channel is put in AMQP transaction mode (`tx_select`) before the first delivery. Every routing decision — publish-to-hold-queue AND ack/nack of the original — is wrapped in a `tx_commit`. The broker either applies both operations or neither. The publish-then-ack race is gone.
+
+The transactional code path is implemented in the RabbitMQ consumer and router. The observable behavior is identical to the default confirm-mode consumer: messages are acked exactly once, retries use hold queues, rejections go to the DLQ. The only difference is that these operations are now atomically grouped.
+
+## Why RabbitMQ only
+
+Other backends don't expose equivalent broker-level transactions in `shove` today:
+
+- **SQS** has some transactional semantics via FIFO deduplication tokens, but the model is different: dedup happens at the publisher side, not the consumer routing layer.
+- **Kafka** has transactional producers (cross-partition atomic writes), but they are scoped to producer batches, not the consumer ack/publish pair that `shove` needs to make atomic.
+- **NATS JetStream** does not expose transactions.
+- **InMemory** is single-process; there is no network-level race to eliminate.
+
+If exactly-once routing is a hard requirement for a non-RabbitMQ backend, you must implement idempotency in the handler using a distributed store (Redis, database). Track the `delivery_id` (from `MessageMetadata::delivery_id`) and skip processing if you've already seen it.
+
+## Wiring
+
+Once the feature is enabled, opt in per-topic via `ConsumerOptions::<RabbitMq>::with_exactly_once()`:
+
+```rust,ignore
+use shove::{ConsumerOptions, RabbitMq};
+
+let opts = ConsumerOptions::<RabbitMq>::new()
+    .with_max_retries(3)
+    .with_exactly_once();
+
+supervisor.register::<PaymentTopic, _>(PaymentHandler::new(), opts)?;
+```
+
+No other changes are required. The feature flag gates the method: if `rabbitmq-transactional` is not enabled, `with_exactly_once()` does not exist and code that calls it will not compile.
+
+`with_exactly_once()` can be combined with all other `ConsumerOptions` builder methods. The transactional mode applies only to the routing layer — prefetch count, handler timeout, and max retries work as usual.
+
+## What it does NOT give you
+
+Transactional mode fixes the **routing race** in `shove`'s consumer layer. It does not make your business handler idempotent.
+
+Consider a handler that:
+
+1. Charges a payment card.
+2. Publishes a confirmation event to another queue.
+3. Returns `Outcome::Ack`.
+
+With transactional mode, step 3 (the ack) is atomic with any hold-queue routing. But there is no transaction spanning step 1 (the card charge) and step 3 (the ack). If the handler crashes after charging the card but before returning `Outcome::Ack`, the broker redelivers the message. The card is charged again on the next attempt.
+
+**Idempotent handlers are still required.** Store idempotency keys in your payment processor or use the `delivery_id` to track which messages have already been processed:
+
+```rust,ignore
+async fn handle(&self, msg: Payment, meta: MessageMetadata, ctx: &State) -> Outcome {
+    // Idempotency check — skip if already processed.
+    if ctx.payments.is_processed(&meta.delivery_id).await {
+        return Outcome::Ack;
+    }
+
+    // Charge the card.
+    ctx.payments.charge(&msg, &meta.delivery_id).await?;
+
+    Outcome::Ack
+}
+```
+
+Transactional mode and idempotent handlers are complementary, not alternatives. Use both for the strongest guarantee.
+
+## Full walkthrough
+
+[!include ~/examples/rabbitmq/exactly_once.rs]
+
+The opt-in is on lines where `ConsumerOptions::<RabbitMq>::new().with_exactly_once()` is passed to `supervisor.register`. Three topics demonstrate the three paths: ack, retry-then-ack, and reject-to-DLQ — all under transactional mode. The hold queue on `RetryPaymentTopic` has a 2-second TTL; the example waits 8 seconds to let the retry fire before draining.
+
+## What's next
+
+- [Retries, Hold Queues & DLQs](/guides/retries)
+- [RabbitMQ overview](/backends/rabbitmq)
+- [RabbitMQ exactly-once example](/backends/rabbitmq/examples/exactly-once)
