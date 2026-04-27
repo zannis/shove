@@ -1,0 +1,23 @@
+docs/pages/concepts/topics.mdx
+  54214397c9f7db40 3-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "8ab6a062465459b6e87089acb1fe977a68610d53",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24862,
+      "total_deletions": 2,
+      "accepted_lines": 25950,
+      "overriden_lines": 54
+    }
+  }
+}
