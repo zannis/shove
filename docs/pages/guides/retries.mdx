@@ -1,3 +1,203 @@
 # Retries, Hold Queues & DLQs
 
-Coming soon.
+Pub/sub ack/reject is binary at the broker level: a message is either accepted or it isn't. `shove` adds a richer vocabulary on top: **hold queues** for delayed retry with escalating backoff, a **DLQ** for permanent failure, retry budgets to bound how many times a message can be retried, and `Outcome::Defer` for messages that are "not yet ready" — valid but premature. Understanding how these pieces fit together lets you build consumer pipelines that are resilient to transient failures without silently losing messages.
+
+## The retry lifecycle
+
+Every message delivery follows the same path. The handler receives the message and returns an `Outcome`. The consumer then routes the message based on that outcome and the current retry count:
+
+```text
+┌─────────────────┐
+│   Main queue    │
+└────────┬────────┘
+         │ deliver
+         ▼
+┌─────────────────┐         Ack ────────────► removed from queue
+│  handler.handle │
+└────────┬────────┘         Reject ──────────► DLQ (or discard if no DLQ)
+         │ Outcome
+         │                  Retry ──────────► hold_queues[min(retry_count, len-1)]
+         │                                            │
+         │                                            │ after delay
+         │                                            ▼
+         │                               main queue (retry_count+1)
+         │
+         └──────────────►   Defer ──────────► hold_queues[0] (no counter increment)
+                                                       │
+                                                       │ after delay
+                                                       ▼
+                                            main queue (retry_count unchanged)
+```
+
+When `retry_count >= max_retries`, the consumer routes to the DLQ instead of a hold queue. If no DLQ is configured and the message hits its retry limit, it is discarded with a warning log.
+
+## Configuring hold queues
+
+Add hold queues to a topology by calling `.hold_queue(Duration)` on the builder. Each call appends one hold queue with the given delay. Order matters: the first call defines the shortest delay, the last call defines the longest.
+
+```rust,ignore
+TopologyBuilder::new("orders")
+    .hold_queue(Duration::from_secs(5))   // hold_queues[0] → orders-hold-5s
+    .hold_queue(Duration::from_secs(30))  // hold_queues[1] → orders-hold-30s
+    .hold_queue(Duration::from_secs(120)) // hold_queues[2] → orders-hold-120s
+    .dlq()
+    .build()
+```
+
+The hold queue selected on each retry attempt is `hold_queues[min(retry_count, len - 1)]`. This gives automatic escalating backoff:
+
+| Retry count | Hold queue selected | Delay |
+|-------------|---------------------|-------|
+| 0 | hold_queues[0] | 5s |
+| 1 | hold_queues[1] | 30s |
+| 2+ | hold_queues[2] | 120s (clamped to last) |
+
+Hold-queue names are derived from the queue name and delay: `{queue}-hold-{N}s`. For the example above, the queues are `orders-hold-5s`, `orders-hold-30s`, and `orders-hold-120s`.
+
+If no hold queues are configured but the handler returns `Outcome::Retry`, the consumer falls back to broker-level nack-with-requeue (immediate redelivery, no delay). This is usually not what you want — configure at least one hold queue for any topic where transient failures are expected.
+
+If a topic has hold queues but no DLQ, a warning is logged at build time: messages that exhaust `max_retries` will be silently discarded. If a topic has a DLQ but no hold queues, another warning is logged: retries will use broker redelivery with no delay.
+
+## max\_retries
+
+`ConsumerOptions::with_max_retries(N)` sets how many times a message can be retried before being routed to the DLQ. The default is **10**.
+
+```rust,ignore
+let opts = ConsumerOptions::<InMemory>::new()
+    .with_max_retries(5); // DLQ after 5 retries
+```
+
+When `retry_count >= max_retries`, the consumer routes to the DLQ regardless of the handler's `Outcome::Retry` return. The handler is not invoked again.
+
+If the topic has no DLQ and `max_retries` is exhausted, the message is discarded (nack without requeue) and a warning is logged. `shove` does not silently drop messages — you will see the warning.
+
+## The retry counter is best-effort
+
+The retry counter is stored in a broker-level header (`x-shove-retry-count` or the backend equivalent). The publish-to-hold-queue and ack-of-original-delivery are two separate broker operations. There is a small window between them where a crash can produce a duplicate:
+
+1. Handler returns `Outcome::Retry`.
+2. Consumer publishes the message to the hold queue (counter incremented in the header).
+3. Consumer sends ack for the original delivery.
+4. **If the consumer crashes between steps 2 and 3:** the broker redelivers the original message with the OLD retry count. The hold-queue copy is also in flight. Both will eventually be delivered to the handler.
+
+For idempotent handlers — those that produce the same result regardless of how many times they are invoked for the same logical message — this is harmless. For handlers with irreversible side effects, the RabbitMQ `rabbitmq-transactional` feature makes steps 2 and 3 atomic, eliminating this race. See [Exactly-Once (RabbitMQ)](/guides/exactly-once) for details.
+
+## Defer vs Retry
+
+`Outcome::Defer` is for messages that are **not yet ready** — the message itself is valid, but the time or conditions to process it haven't arrived. Unlike `Retry`, `Defer`:
+
+- Does NOT increment the retry counter.
+- Always routes to `hold_queues[0]` (the shortest delay), regardless of retry count. There is no escalating backoff for deferred messages.
+- Will never exhaust `max_retries` and will never be routed to the DLQ as a result of deferral alone.
+
+Use cases for `Defer`:
+
+- **Scheduled delivery** — the message carries a "not-before" timestamp that hasn't arrived yet.
+- **Missing dependency** — a prerequisite event or resource isn't available yet (e.g. waiting for a payment to clear before fulfilling an order).
+- **External rate-limiting** — an upstream API returned 429 / "retry after". The message is valid; you just can't act on it right now.
+
+Use `Retry` (not `Defer`) for genuine transient failures — network errors, database timeouts, temporary unavailability. `Retry` increments the counter and escalates through the hold queues. `Defer` is specifically for "the message is fine but not yet actionable."
+
+**Caution:** because `Defer` never increments the retry counter, a handler that always returns `Defer` will bounce the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. Ensure your handler has a condition (e.g. a deadline or a maximum deferral count tracked in the message body) that eventually resolves to `Ack`, `Retry`, or `Reject`.
+
+If no hold queues are configured, `Defer` falls back to nack-with-requeue (broker-level immediate redelivery) and a warning is logged.
+
+On **sequenced consumers**, `Defer` is not supported because it would block all subsequent messages for the same key indefinitely. If a handler returns `Defer` on a sequenced consumer, it is treated as `Retry` and a warning is logged.
+
+## DLQ as a queue
+
+Dead-letter queues are first-class queues, not black holes. You can consume them like any other queue. The `MessageHandler::handle_dead` method is the hook for DLQ processing:
+
+```rust,ignore
+impl MessageHandler<Orders> for OrderHandler {
+    type Context = AppState;
+
+    async fn handle(&self, msg: Order, meta: MessageMetadata, ctx: &AppState) -> Outcome {
+        // ... main processing ...
+        Outcome::Ack
+    }
+
+    // Override to do something useful with dead messages.
+    async fn handle_dead(&self, msg: Order, meta: DeadMessageMetadata, ctx: &AppState) {
+        tracing::error!(
+            order_id = %msg.order_id,
+            reason = meta.reason.as_deref().unwrap_or("unknown"),
+            deaths = meta.death_count,
+            "Order permanently failed — alerting on-call",
+        );
+        ctx.pagerduty.alert(&msg).await;
+    }
+}
+```
+
+The default `handle_dead` implementation logs a warning with the delivery ID, reason, original queue, and death count. Override it for alerting, manual replay queues, quarantine workflows, or metrics.
+
+`DeadMessageMetadata` carries:
+- `message` — the base `MessageMetadata` (retry count, delivery ID, headers).
+- `reason` — why the message was dead-lettered (e.g. `"rejected"`, `"expired"`).
+- `original_queue` — which queue the message came from.
+- `death_count` — how many times this message has been dead-lettered.
+
+The message is always acked from the DLQ after `handle_dead` returns, regardless of what the handler does. DLQ messages are not retried.
+
+## No DLQ behavior
+
+If a topic has no DLQ configured:
+
+- A handler returning `Outcome::Reject` causes the message to be discarded (nack without requeue) and a warning is logged.
+- A message that exhausts `max_retries` is also discarded with a warning log.
+
+`shove` does NOT silently drop messages. Every discard produces a log line. Check your logs if messages seem to be disappearing.
+
+This is an explicit design choice: if you haven't configured a DLQ, you've accepted that permanently-failing messages will be lost. Make that decision consciously. For production topics with any business significance, configure a DLQ.
+
+## Worked example
+
+Consider a topic with three hold queues and a DLQ, and `max_retries = 10` (the default):
+
+```rust,ignore
+TopologyBuilder::new("orders")
+    .hold_queue(Duration::from_secs(5))
+    .hold_queue(Duration::from_secs(30))
+    .hold_queue(Duration::from_secs(120))
+    .dlq()
+    .build()
+```
+
+**Scenario 1 — transient failure that recovers on attempt 4:**
+
+| Attempt | retry_count | Hold queue used | Outcome |
+|---------|-------------|-----------------|---------|
+| 1 | 0 | — | Retry → orders-hold-5s |
+| 2 | 1 | orders-hold-5s (5s delay) | Retry → orders-hold-30s |
+| 3 | 2 | orders-hold-30s (30s delay) | Retry → orders-hold-120s |
+| 4 | 3 | orders-hold-120s (120s delay) | Ack ✓ |
+
+The message succeeds on the fourth attempt. Total hold time: 5s + 30s + 120s = 155s.
+
+**Scenario 2 — message that always fails (11 attempts, then DLQ):**
+
+Attempts 1–10 follow the escalating pattern: 5s → 30s → 120s → 120s → 120s → ... (clamped to `orders-hold-120s` from attempt 3 onward). On attempt 11, `retry_count = 10 >= max_retries = 10`, so the message is routed to `orders-dlq` instead of another hold queue. `handle_dead` is invoked on the DLQ consumer.
+
+**Scenario 3 — Defer mid-stream:**
+
+A handler checks a "not-before" timestamp and returns `Outcome::Defer` on the first two deliveries because the scheduled time hasn't arrived yet. On the third delivery the timestamp has passed and it returns `Outcome::Ack`.
+
+| Attempt | retry_count | Hold queue used | Outcome |
+|---------|-------------|-----------------|---------|
+| 1 | 0 | — | Defer → orders-hold-5s (counter unchanged) |
+| 2 | 0 | orders-hold-5s | Defer → orders-hold-5s (counter unchanged) |
+| 3 | 0 | orders-hold-5s | Ack ✓ |
+
+The retry counter stayed at 0 throughout. The `max_retries` budget was never consumed.
+
+**Scenario 4 — deserialization failure (bad bytes):**
+
+A message arrives with a malformed payload that cannot be deserialized into the expected type. The consumer rejects it **before invoking the handler** — straight to the DLQ (or discards it with a warning if no DLQ is configured). `max_retries` is irrelevant here: the handler never runs, so the retry counter is never consulted. This prevents poison-pill messages from burning through the retry budget indefinitely. A message that is too large (exceeds `ConsumerOptions::max_message_size`, default 10 MiB) is handled the same way.
+
+## What's next
+
+- [Outcomes & Delivery](/concepts/outcomes)
+- [Topics & Topology](/concepts/topics)
+- [Exactly-Once (RabbitMQ)](/guides/exactly-once)
+- [Sequenced Topics](/guides/sequenced)
