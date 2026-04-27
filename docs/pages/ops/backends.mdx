@@ -1,3 +1,100 @@
 # Backend Ops Notes
 
-Coming soon.
+The per-backend Overview pages cover setup: installing the crate, configuring a local broker, and wiring up your first consumer. This page covers what tends to bite in production: knobs to set early, surprises to avoid, and monitoring to put in place. One section per backend.
+
+## RabbitMQ
+
+**Management plugin required for autoscaler.** The autoscaler queries the RabbitMQ HTTP management API (`/api/queues`) for queue depth. Without the plugin, the autoscaler errors at startup. Enable it with:
+
+```sh
+rabbitmq-plugins enable rabbitmq_management
+```
+
+The management API is available on port `15672` by default. If you run RabbitMQ behind a network policy that blocks that port, the autoscaler will not start.
+
+**Auto-reconnect is automatic at the consumer level.** Transient broker failures — network blips, broker restarts — recover without operator intervention. The consumer reconnects and resumes processing. Don't add wrapping retry loops at the application level; they interfere with shove's internal reconnect logic and can cause duplicate deliveries.
+
+**TLS via `rustls-ring`** is the default `lapin` feature used by shove. For environments that require OpenSSL (e.g. FIPS-compliant infrastructure) or vendored alternatives, configure the TLS backend downstream in your own `Cargo.toml` feature selection.
+
+**Cluster setups.** Point `RabbitMqConfig` at a load-balanced cluster URL (e.g. via HAProxy or a DNS-based round-robin). shove uses a single AMQP connection per `Broker\<RabbitMq\>`. For HA with automatic failover, use a clustered broker with quorum queues — the connection layer handles reconnect, but the queue must be replicated to survive a node failure.
+
+**Hold queue dead-letter exchange (DLX) is configured at topology declaration.** shove sets queue arguments (including `x-dead-letter-exchange` and `x-message-ttl`) when it declares hold queues. RabbitMQ does not allow modifying queue arguments in place after creation. If you need to change hold-queue delays, you must delete and recreate the queues — or use a different queue name to force a fresh declaration.
+
+## AWS SNS + SQS
+
+**Visibility timeout MUST exceed handler timeout.** If your handler can take 30 s, set the SQS visibility timeout to at least 60 s. If the handler is still running when the visibility timeout expires, the message becomes visible again and another consumer picks it up — producing duplicate work. Configure via the SQS console, Terraform, or CloudFormation:
+
+```text
+VisibilityTimeout: 60   # seconds — set to 2× your worst-case handler time
+```
+
+**FIFO queues have a 300 msg/s default cap.** High-throughput sequenced topics that need sequenced delivery via FIFO will hit this limit before exhausting hardware capacity. Request a quota increase via AWS Support, or switch to standard SQS queues (no ordering guarantee) if ordering is not required.
+
+**`endpoint_url` is for local dev only.** The `endpoint_url` field on `SnsConfig` points shove at a custom SQS/SNS endpoint (typically LocalStack on `http://localhost:4566`). Omit it in production, or you will point all traffic at localhost.
+
+**Region matters.** SQS queues are regional. Consuming a queue in a different region than your application's default region requires explicit configuration. Cross-region fanout is handled at the SNS topic ARN level, not in shove.
+
+**Dead-letter queues are configured at the SQS resource level.** shove does not manage DLQ wiring for SQS. Configure `maxReceiveCount` and the DLQ ARN on your SQS queue resource (Terraform, CloudFormation, or console). shove's internal retry logic (hold queues, `Retry` outcome) works alongside — but independently of — the SQS redrive policy.
+
+**IAM permissions.** The consumer role needs the following permissions on each queue it reads from:
+
+```text
+sqs:ReceiveMessage
+sqs:DeleteMessage
+sqs:ChangeMessageVisibility
+sqs:GetQueueUrl
+sqs:GetQueueAttributes
+```
+
+If the same role publishes, add `sns:Publish` on each SNS topic it publishes to.
+
+## NATS JetStream
+
+**Stream provisioning happens at topology declaration.** When `declare_topology` runs, shove creates the JetStream stream if it does not already exist. For policy-driven setups — limits-based retention, interest-based retention, work-queue retention — pre-create the stream with the correct policy before starting the application. shove will detect the existing stream and use it as-is without overwriting configuration.
+
+**`Nats-Msg-Id` dedup window is 120 s.** shove sets this header on retried publishes to prevent JetStream from re-delivering a message that has already been acked. If your handler routinely takes longer than 120 s, configure the stream's `duplicate_window` to match:
+
+```text
+duplicate_window: 600s  # example: 10-minute dedup window
+```
+
+**JetStream limits are server-side.** Storage size limits, per-message size limits, and `max_ack_pending` are set in the stream configuration, not in shove. The NATS defaults are conservative for high-throughput workloads — tune `max_ack_pending` and `max_bytes` for your expected message volume.
+
+**Subject naming.** shove uses `{queue}.shard.{N}` subjects for sequenced topics. Do not reuse these subjects for other applications or publishers outside of shove — you will interfere with sequencing semantics.
+
+**Consumer durability.** shove uses durable pull consumers. The consumer name is derived from the topic and group configuration. On restart, the NATS server remembers the consumer's last acknowledged sequence number, so processing resumes where it left off rather than re-reading from the start of the stream.
+
+## Apache Kafka
+
+**Partition count is set at provisioning time** and is rarely changed after the fact. It caps the maximum group concurrency: a 4-partition topic can have at most 4 active consumers in a consumer group simultaneously. Over-partitioning wastes broker resources; under-partitioning limits scale. Plan partition count for peak load plus headroom before creating the topic.
+
+**Consumer-group rebalances during scale events cause brief delivery pauses.** When a consumer joins or leaves the group — including during autoscaling — Kafka triggers a group rebalance, during which no consumer in the group processes messages. Rebalances typically complete in under 1 s, but aggressive autoscaling that adds and removes consumers rapidly can cause near-continuous rebalance churn. Set scale cooldowns to allow the group to stabilize between scale events.
+
+**`cmake` is required on Windows.** The `rdkafka` crate links `librdkafka`, which requires `cmake` during the build on Windows. Linux and macOS use the standard `librdkafka` build path without additional prerequisites.
+
+**SASL/TLS.** Enable the `kafka-ssl` feature for TLS transport. `KafkaSasl` configuration supports SCRAM-SHA-256 and SCRAM-SHA-512. GSSAPI/Kerberos requires activating the `rdkafka/gssapi` feature downstream in your own `Cargo.toml`.
+
+**`librdkafka` system dependency.** On Debian/Ubuntu CI runners, install the SASL development headers before building:
+
+```sh
+apt-get install -y libsasl2-dev
+```
+
+On macOS, the dependency is typically satisfied via Homebrew. `librdkafka` is a runtime dependency — it is not statically bundled.
+
+**Consumer offsets are committed asynchronously.** `librdkafka` commits offsets in the background. On clean shutdown, shove flushes pending commits before exiting. On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts. Design handlers to be idempotent or use the dedup layer to handle this.
+
+## In-process
+
+**No durability.** Messages live entirely in process memory. Process exit — whether clean or via a crash — means message loss. State this explicitly on every internal review of "should we use the in-process backend in production?" — the answer is almost always no for distributed or stateful workloads.
+
+**No cross-process delivery.** Only consumers running in the same OS process see messages published to an in-process broker. There is no IPC, no network transport, no persistence layer. Two separate service instances cannot share an in-process topic.
+
+**Use cases:** integration tests (fast, no broker required), single-process CLI tools that use pub/sub internally for decoupling, and prototyping before wiring up a real broker. Not suitable for distributed services or anything that must survive process restart.
+
+**Memory footprint.** Each topic holds undelivered messages in memory. A publisher that outpaces its consumers will grow the backlog without bound. shove does not enforce backpressure on publishers in the in-process backend — if this is a concern, add an external rate limiter or switch to a broker-backed backend.
+
+## What's next
+
+- [Performance Tuning](/ops/performance) — throughput levers and measurement methodology
+- [Choosing a Backend](/backends/choosing) — comparison of all backends by feature and operational profile
