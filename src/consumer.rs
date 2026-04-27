@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerOptionsInner};
 use crate::error::{Result, ShoveError};
-use crate::markers::*;
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -290,7 +289,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
 
 #[cfg(feature = "aws-sns-sqs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
-impl ConsumerOptions<Sqs> {
+impl ConsumerOptions<crate::markers::Sqs> {
     /// Number of messages requested per SQS `ReceiveMessage` poll.
     ///
     /// Zero (the default) means "use `prefetch_count`".
@@ -302,7 +301,7 @@ impl ConsumerOptions<Sqs> {
 
 #[cfg(feature = "nats")]
 #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
-impl ConsumerOptions<Nats> {
+impl ConsumerOptions<crate::markers::Nats> {
     /// Override the durable consumer's `max_ack_pending`.
     pub fn with_max_ack_pending(mut self, n: i64) -> Self {
         self.max_ack_pending = Some(n);
@@ -312,7 +311,7 @@ impl ConsumerOptions<Nats> {
 
 #[cfg(feature = "rabbitmq-transactional")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq-transactional")))]
-impl ConsumerOptions<RabbitMq> {
+impl ConsumerOptions<crate::markers::RabbitMq> {
     /// Enable exactly-once delivery via AMQP transactions.
     ///
     /// See [`ConsumerOptions::exactly_once`] for the full trade-off description.
