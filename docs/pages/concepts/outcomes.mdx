@@ -1,3 +1,72 @@
 # Outcomes & Delivery
 
-Coming soon.
+Handlers in `shove` do not write to queues directly. They return one of four `Outcome` values after processing a message, and the consumer routes the message accordingly. The `Outcome` is the only mechanism a handler has to influence what happens next.
+
+## The four Outcome variants
+
+The `Outcome` enum has four variants, each mapping to a distinct delivery action:
+
+**`Ack`** — the message was handled successfully. The consumer removes it from the queue and moves on.
+
+**`Retry`** — a transient failure occurred. The consumer routes the message to a hold queue whose index corresponds to the current retry count, waits for the configured delay, then redelivers the message to the main queue. The retry counter increments on each `Retry`.
+
+**`Reject`** — a permanent failure. The consumer routes the message to the DLQ if one is configured, or discards it with a warning log if not. The message is never retried.
+
+**`Defer`** — the message is not failed, just not yet ready. The consumer routes it to `hold_queues[0]` (the shortest delay) without incrementing the retry counter. This does not burn the retry budget. See [Defer — the special case](#defer--the-special-case) below.
+
+## At-least-once and idempotency
+
+`shove` guarantees at-least-once delivery by default. Under normal conditions each message is delivered once, but redeliveries can occur after a crash, a network blip, or an unacked timeout. Handlers must be idempotent.
+
+Per-backend deduplication aids exist — RabbitMQ stamped with `x-message-id`, NATS `Nats-Msg-Id`, Kafka offset tracking — but these are aids, not guarantees. A fully idempotent handler is the only reliable defence.
+
+## Retry math
+
+Hold queue selection is automatic. When a handler returns `Retry`, the consumer picks:
+
+```text
+index = min(retry_count, hold_queues.len() - 1)
+```
+
+With hold queues configured at `[5s, 30s, 120s]` and `max_retries = 10`:
+
+- 1st retry (`retry_count = 0`) → 5s hold queue
+- 2nd retry (`retry_count = 1`) → 30s hold queue
+- 3rd–10th retry (`retry_count = 2..9`) → 120s hold queue (clamped at last index)
+- 11th attempt exhausted → routed to DLQ (or discarded if no DLQ)
+
+The topic topology defines the hold queues; the consumer options define `max_retries`. See [Retries, Hold Queues & DLQs](/guides/retries) for a deeper dive.
+
+## Reject vs Retry
+
+Choose `Reject` when the message will never succeed regardless of when it is retried: a malformed payload, a business-rule violation, a foreign-key constraint that will never be satisfied. Retrying those messages wastes resources and burns through the retry budget before the inevitable DLQ routing.
+
+Choose `Retry` when the failure is transient: a network blip, a downstream service that is temporarily down, a database deadlock. The message is valid and the handler will likely succeed once conditions improve.
+
+When in doubt, ask: "Would this handler succeed if I called it again in five minutes?" If yes, `Retry`. If no, `Reject`.
+
+## Defer — the special case
+
+`Defer` exists for messages that are not failed — they are simply not ready yet. Examples:
+
+- A scheduled-for-the-future event that arrived early.
+- An order awaiting payment confirmation that has not yet appeared.
+- An upstream API that returned 429 (rate limited); the payload is valid, just the timing is wrong.
+
+`Defer` routes the message to `hold_queues[0]` (shortest delay) with the same retry count. It does not increment the counter and will never trigger DLQ routing as a result of deferral alone.
+
+One caution: because `Defer` never increments the retry counter, a handler that always defers will loop the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
+
+If no hold queues are configured on the topic, `Defer` falls back to broker nack-with-requeue and logs a warning.
+
+`Defer` is not supported on sequenced consumers. If a handler returns `Defer` in that context it is treated as `Retry` and a warning is logged, because deferral would violate ordering guarantees.
+
+## Handler timeouts and deserialization failures
+
+Two failure modes bypass the handler entirely:
+
+**Handler timeout.** Configured via `ConsumerOptions::with_handler_timeout`. If the handler future does not complete within the timeout, the consumer aborts it and treats the result as `Outcome::Retry`. The message will be retried according to normal retry math.
+
+**Deserialization failure.** A message whose bytes cannot be deserialized into `T::Message` is permanently broken — no amount of retrying will fix a corrupt payload. The consumer treats it as `Outcome::Reject` without invoking the handler at all. The message goes to the DLQ (or is discarded with a warning) and is never retried. This is by design.
+
+For more on handler registration and context, see [Handlers & Context](/concepts/handlers).
