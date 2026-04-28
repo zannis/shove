@@ -1,0 +1,25 @@
+docs/pages/backends/nats.mdx
+  54214397c9f7db40 35,85
+docs/pages/ops/backends.mdx
+  54214397c9f7db40 55,61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "09ca088b2d777d4755176eb7178c08a68309c097",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 4,
+      "accepted_lines": 6,
+      "overriden_lines": 0
+    }
+  }
+}
