@@ -244,6 +244,10 @@ required-features = ["kafka", "audit"]
 name = "inmemory_integration"
 required-features = ["inmemory"]
 
+[[test]]
+name = "metrics_inmemory"
+required-features = ["inmemory", "metrics"]
+
 [[example]]
 name = "inmemory_basic"
 path = "examples/inmemory/basic.rs"
