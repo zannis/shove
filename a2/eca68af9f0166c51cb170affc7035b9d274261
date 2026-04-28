@@ -1,0 +1,23 @@
+Cargo.toml
+  8e14c028f601a158 60-64,86,99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a2eca68af9f0166c51cb170affc7035b9d274261",
+  "prompts": {
+    "8e14c028f601a158": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "157627df-f3e2-49e0-97d5-234336bc2834",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 8,
+      "total_deletions": 1,
+      "accepted_lines": 7,
+      "overriden_lines": 0
+    }
+  }
+}
