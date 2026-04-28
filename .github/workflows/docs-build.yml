@@ -7,8 +7,16 @@ on:
       - 'vocs.config.ts'
       - 'package.json'
       - 'pnpm-lock.yaml'
+      - '.github/workflows/docs-build.yml'
   push:
     branches: [main]
+    paths:
+      - 'docs/**'
+      - 'examples/**'
+      - 'vocs.config.ts'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/docs-build.yml'
 permissions:
   contents: read
 jobs:
