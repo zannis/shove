@@ -1,6 +1,5 @@
 name = "shove-docs"
 compatibility_date = "2026-04-27"
-pages_build_output_dir = "docs/dist"
 
-[build]
-command = "pnpm install --frozen-lockfile && pnpm build"
+[assets]
+directory = "./docs/dist"
