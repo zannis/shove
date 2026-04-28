@@ -136,6 +136,7 @@ pub mod handler;
 pub mod macros;
 pub mod markers;
 pub mod metadata;
+pub mod metrics;
 pub mod outcome;
 pub mod publisher;
 pub(crate) mod publisher_internal;
