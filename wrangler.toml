@@ -1,9 +1,6 @@
 name = "shove-docs"
 compatibility_date = "2026-04-27"
+pages_build_output_dir = "docs/dist"
 
 [build]
-command = "npm install && npm run build"
-publish = "docs/dist"
-
-[build.environment]
-NODE_VERSION = "22"
+command = "pnpm install --frozen-lockfile && pnpm build"
