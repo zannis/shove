@@ -7,12 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerOptionsInner};
 use crate::error::{Result, ShoveError};
-#[cfg(feature = "aws-sns-sqs")]
-use crate::markers::Sqs;
 #[cfg(feature = "nats")]
 use crate::markers::Nats;
 #[cfg(feature = "rabbitmq-transactional")]
 use crate::markers::RabbitMq;
+#[cfg(feature = "aws-sns-sqs")]
+use crate::markers::Sqs;
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;

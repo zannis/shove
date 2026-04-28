@@ -32,7 +32,7 @@ cargo add shove --features nats
 // [!include ~/examples/nats/basic.rs:declare]
 ```
 
-`topology().declare::<T>()` provisions the JetStream stream and durable consumer for the topic, including hold streams and DLQ. Idempotent — safe to call on every startup.
+`topology().declare::<T>()` provisions JetStream streams for the topic: the main stream, plus a DLQ stream when `.dlq()` is configured. Sequenced topics declare a single main stream with subject shards (`{queue}.shard.{N}`). Durable consumers are not created here — the consumer runtime creates them on demand when you start consuming. The call is idempotent and safe to invoke on every startup.
 
 ## Publish
 
@@ -82,7 +82,7 @@ See the [Basic example](/backends/nats/examples/basic) for a complete runnable w
 ## Gotchas
 
 - **Stream provisioning at declaration time.** `topology().declare::<T>()` creates JetStream streams with default storage limits. Ensure stream limits (max bytes, max messages, max message size) match your expected load — streams that hit their limits drop or reject new messages depending on the retention policy.
-- **De-duplication via `Nats-Msg-Id`.** shove automatically sets the `Nats-Msg-Id` header on every message delivery. JetStream de-duplicates within a configurable window (default 120 seconds) — if a consumer crashes and replays messages, JetStream will reject exact duplicates within that window.
+- **De-duplication via `Nats-Msg-Id`.** shove sets the `Nats-Msg-Id` header on every publish (a fresh UUID per call). JetStream de-duplicates within a configurable window (default 120 seconds) — if a publisher retries the same logical message inside that window, JetStream rejects the duplicate. Note that the header is generated per-publish-call, so deduplicating across application-level retries requires the caller to pass a stable id via `publish_with_headers`.
 - **Work-queue semantics assumed.** shove provisions JetStream streams with work-queue (interest-based delete-on-ack) semantics. Streams are not shared across consumer groups with different group names — each `consumer_group()` registration gets its own durable consumer on the shared stream.
 - **JetStream must be enabled on the server.** Connecting to a server without JetStream and calling `topology().declare::<T>()` will return an error. The `-js` flag is required on the NATS server.
 

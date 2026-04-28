@@ -52,13 +52,13 @@ If the same role publishes, add `sns:Publish` on each SNS topic it publishes to.
 
 **Stream provisioning happens at topology declaration.** When `declare_topology` runs, shove creates the JetStream stream if it does not already exist. For policy-driven setups — limits-based retention, interest-based retention, work-queue retention — pre-create the stream with the correct policy before starting the application. shove will detect the existing stream and use it as-is without overwriting configuration.
 
-**`Nats-Msg-Id` dedup window is 120 s.** shove sets this header on retried publishes to prevent JetStream from re-delivering a message that has already been acked. If your handler routinely takes longer than 120 s, configure the stream's `duplicate_window` to match:
+**`Nats-Msg-Id` dedup window is 120 s.** shove stamps this header on every publish (a fresh UUID per call). JetStream de-duplicates within the stream's `duplicate_window` (default 120 seconds), so a publisher that retries the same logical message inside that window will not produce a duplicate delivery. If you need deduplication across application-level retries, pass a stable id via `publish_with_headers` so each retry sets the same `Nats-Msg-Id`. If your handler routinely takes longer than 120 s, raise the stream's `duplicate_window` to match:
 
 ```text
 duplicate_window: 600s  # example: 10-minute dedup window
 ```
 
-**JetStream limits are server-side.** Storage size limits, per-message size limits, and `max_ack_pending` are set in the stream configuration, not in shove. The NATS defaults are conservative for high-throughput workloads — tune `max_ack_pending` and `max_bytes` for your expected message volume.
+**Stream-side vs consumer-side limits.** Storage size and per-message size are set on the JetStream stream itself (configured outside shove). `max_ack_pending`, however, is set by shove on the durable pull consumer at consumer-creation time, derived from `prefetch_count` (and from `max_consumers × prefetch_count` for groups). To override per-consumer, use `ConsumerOptions::<Nats>::with_max_ack_pending(...)`.
 
 **Subject naming.** shove uses `{queue}.shard.{N}` subjects for sequenced topics. Do not reuse these subjects for other applications or publishers outside of shove — you will interfere with sequencing semantics.
 
