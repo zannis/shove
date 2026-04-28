@@ -177,7 +177,7 @@ The type signature enforces the `SequencedTopic` bound — the call will not com
 
 Other backends have equivalent per-backend sequenced consumer entry points: `RabbitMqConsumer::run_fifo`, `NatsConsumer::run_fifo`, `KafkaConsumer::run_fifo`, and `SqsConsumer::run_fifo`.
 
-**The generic `broker.consumer_group()` harness does not currently route to the FIFO path.** Spawned workers call the unsequenced `run` regardless of whether the topic implements `SequencedTopic`, so per-key ordering is silently dropped. To preserve ordering on a coordinated backend, drive the consumer through `run_fifo` directly. `ConsumerSupervisor::register` rejects sequenced topics at runtime to surface the same trap loudly; `consumer_group()` does not yet, so prefer `run_fifo` for any topic declared with `.sequenced(...)`.
+**The generic `broker.consumer_group()` harness does not currently route to the FIFO path** — spawned workers call the unsequenced `run`. To prevent per-key ordering being silently dropped, both `ConsumerGroup::register` and `ConsumerSupervisor::register` reject any topic whose topology has `.sequenced(...)` configured: registration returns `ShoveError::Topology(...)` at runtime. To preserve ordering on a coordinated backend, drive the consumer through `run_fifo` directly until FIFO registration is surfaced on the harness.
 
 `ConsumerOptions::max_pending_per_key` (default: 1,000) limits how many messages can be locally buffered per key in concurrent-sequenced consumers. When exceeded, new deliveries for that key are rejected to the DLQ. Adjust with `.with_max_pending_per_key(N)` or disable with `.without_max_pending_per_key()`.
 
