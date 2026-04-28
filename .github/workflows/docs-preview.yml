@@ -6,7 +6,7 @@ on:
       - 'examples/**'
       - 'vocs.config.ts'
       - 'package.json'
-      - 'package-lock.json'
+      - 'pnpm-lock.yaml'
 permissions:
   contents: read
   pull-requests: write
