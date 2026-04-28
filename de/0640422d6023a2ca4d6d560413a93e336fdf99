@@ -1,0 +1,35 @@
+docs/pages/guides/groups.mdx
+  54214397c9f7db40 3,97,128,143
+docs/pages/guides/audit.mdx
+  54214397c9f7db40 3,74,193
+docs/pages/guides/observability.mdx
+  54214397c9f7db40 3-5,145,158
+docs/pages/guides/shutdown.mdx
+  54214397c9f7db40 3-5,174
+docs/pages/guides/retries.mdx
+  54214397c9f7db40 3,109,203
+docs/pages/guides/sequenced.mdx
+  54214397c9f7db40 3-5,9,111,113,117,195
+docs/pages/guides/exactly-once.mdx
+  54214397c9f7db40 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "de0640422d6023a2ca4d6d560413a93e336fdf99",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 28,
+      "total_deletions": 71,
+      "accepted_lines": 1548,
+      "overriden_lines": 0
+    }
+  }
+}
