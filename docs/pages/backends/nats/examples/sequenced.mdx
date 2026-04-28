@@ -1,6 +1,6 @@
 # NATS — Sequenced
 
-This example demonstrates per-key FIFO delivery on NATS JetStream using subject-shard routing. Events for two users are published in interleaved order; the `UserEventTopic` routes each event to a per-user shard and the consumer processes each user's events strictly in sequence. It uses `NatsConsumer::run_fifo` directly because per-key FIFO is not yet exposed through the generic `Broker\<Nats\>` API.
+Use this when you need per-user (or per-entity) FIFO ordering on NATS. Events for two users are published in interleaved order; each user's events arrive strictly in sequence while the two users are processed concurrently across different shards. Shows the `NatsConsumer::run_fifo` path for sequenced delivery.
 
 ## Prerequisites
 

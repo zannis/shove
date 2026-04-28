@@ -1,12 +1,14 @@
 # Shutdown & Exit Codes
 
-Long-running consumer binaries need a clean shutdown contract: stop accepting new work, finish in-flight handlers, surface the result as a process exit code that operators — Kubernetes, systemd, shell scripts, CI pipelines — can read and act on. `shove` ships one. `SupervisorOutcome` is a `#[must_use]` struct returned by `run_until_timeout` on both `ConsumerGroup\<B\>` and `ConsumerSupervisor\<B\>`, and its `.exit_code()` method maps the drain result to a conventional integer.
+Rolling deploys, Kubernetes preStop hooks, systemd `ExecStop`, CI pipelines — all of them send a signal and expect the process to finish cleanly before they terminate it. `shove` ships a shutdown contract that fits all of these: stop accepting new work, finish in-flight handlers, and surface the result as a process exit code that operators can read and act on.
+
+`SupervisorOutcome` is a `#[must_use]` struct returned by `run_until_timeout` on both `ConsumerGroup\<B\>` and `ConsumerSupervisor\<B\>`, and its `.exit_code()` method maps the drain result to a conventional integer.
 
 ## The shutdown contract
 
 The canonical pattern for a `shove` consumer binary:
 
-```rust,ignore
+```rust,no_run
 use std::time::Duration;
 use futures::FutureExt;
 
@@ -31,7 +33,7 @@ What happens step by step:
 
 The `CancellationToken` from `group.cancellation_token()` (or `supervisor.cancellation_token()`) can also be used to trigger shutdown from other parts of your application — e.g. when an unrecoverable error occurs in a non-consumer task:
 
-```rust,ignore
+```rust,no_run
 let token = group.cancellation_token();
 // ... elsewhere in your app ...
 token.cancel(); // triggers graceful drain
@@ -41,7 +43,7 @@ token.cancel(); // triggers graceful drain
 
 `SupervisorOutcome` is a simple struct (not an enum) with three fields:
 
-```rust,ignore
+```rust,no_run
 pub struct SupervisorOutcome {
     pub errors: usize,   // count of consumer tasks that returned Err
     pub panics: usize,   // count of consumer tasks that panicked
@@ -51,7 +53,7 @@ pub struct SupervisorOutcome {
 
 And two methods:
 
-```rust,ignore
+```rust,no_run
 impl SupervisorOutcome {
     pub fn exit_code(&self) -> i32 { ... }
     pub fn is_clean(&self) -> bool { ... }
@@ -92,7 +94,7 @@ Too long a drain timeout slows rolling deploys. In Kubernetes, a pod's `terminat
 terminationGracePeriodSeconds: 90   # longer than drain_timeout
 ```
 
-```rust,ignore
+```rust,no_run
 group.run_until_timeout(signal, Duration::from_secs(60)).await
 ```
 
@@ -100,7 +102,7 @@ group.run_until_timeout(signal, Duration::from_secs(60)).await
 
 **Local development:**
 
-```rust,ignore
+```rust,no_run
 use futures::FutureExt;
 
 group.run_until_timeout(
@@ -111,7 +113,7 @@ group.run_until_timeout(
 
 **Kubernetes preStop / SIGTERM** — the kubelet sends SIGTERM before SIGKILL. Wire it with `tokio::signal::unix`:
 
-```rust,ignore
+```rust,no_run
 use tokio::signal::unix::{signal, SignalKind};
 
 let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
@@ -123,7 +125,7 @@ group.run_until_timeout(
 
 **Multiple signals (Ctrl-C + SIGTERM)** — use `tokio::select!` to race them:
 
-```rust,ignore
+```rust,no_run
 use tokio::signal::unix::{signal, SignalKind};
 use futures::FutureExt;
 
@@ -142,7 +144,7 @@ group.run_until_timeout(signal_future, Duration::from_secs(30)).await
 
 **Internal cancellation** — if another part of your application detects an unrecoverable condition and wants to trigger a clean shutdown, use the cancellation token:
 
-```rust,ignore
+```rust,no_run
 let token = group.cancellation_token();
 let shutdown_handle = tokio::spawn(async move {
     if let Err(e) = health_check().await {

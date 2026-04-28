@@ -1,12 +1,12 @@
 # Handlers & Context
 
-A handler is user code that processes a single message from a topic's queue. The library calls `handle()` for each delivered message and routes the message based on the returned `Outcome`. Handlers are parameterized on a `Topic` — not on a message type directly. This binding prevents accidentally sharing a handler between two topics that happen to carry the same message type, since two different topics with the same message type represent two distinct event flows with distinct semantics.
+A handler is your business logic. It receives a message, does work — writes a record, calls an API, updates state — and returns an `Outcome` that tells the consumer what to do next. The library calls `handle()` for each delivered message and routes the message based on the returned `Outcome`. Handlers are parameterized on a `Topic`, which prevents accidentally sharing a handler between two topics that happen to carry the same message type.
 
 ## The MessageHandler trait
 
 Every handler implements `MessageHandler<T>` where `T: Topic`:
 
-```rust,ignore
+```rust,no_run
 pub trait MessageHandler<T: Topic>: Send + Sync + 'static {
     type Context: Clone + Send + Sync + 'static;
 
@@ -32,11 +32,13 @@ The `handle` method is required. `handle_dead` has a default implementation that
 
 ## Context — shared state without a registry
 
-`Context` is shared state injected into every `handle()` invocation. You supply it once when registering the handler; the harness clones it into each consumer task. Because `Clone` is required, the idiomatic pattern is `Arc<AppState>` where cloning is a cheap reference-count increment.
+Most handlers need access to shared resources: a database connection pool, an HTTP client, a cache, a reference to application configuration. `Context` is how you inject those resources cleanly.
+
+You supply the context once when registering the handler; the harness clones it into each consumer task. Because `Clone` is required, the idiomatic pattern is `Arc<AppState>` where cloning is a cheap reference-count increment rather than a deep copy.
 
 When there is no shared state to inject, use `()`:
 
-```rust,ignore
+```rust,no_run
 struct Handler;
 
 impl MessageHandler<Orders> for Handler {
@@ -51,7 +53,7 @@ impl MessageHandler<Orders> for Handler {
 
 When your handler depends on a database pool or other shared resource, declare a `Context` type:
 
-```rust,ignore
+```rust,no_run
 #[derive(Clone)]
 struct AppState {
     db: Arc<Pool>,
@@ -90,9 +92,9 @@ Most handlers ignore all of these fields. They become useful when you need to tr
 
 ## Dead-letter handling
 
-`handle_dead` is invoked when a message is consumed from the DLQ via `consumer.run_dlq::<T>()`. The default implementation logs a warning. Override it to send alerts, push to an investigation queue, or write to a quarantine store:
+When a message exhausts its retries or is permanently rejected, it lands in the DLQ. The `handle_dead` method is your hook for what happens next: send an alert, write to a quarantine store, push to an investigation queue, page an on-call engineer.
 
-```rust,ignore
+```rust,no_run
 impl MessageHandler<Orders> for Handler {
     type Context = AppState;
 
@@ -119,9 +121,9 @@ The dead-letter consumer loop is driven separately from the main consumer loop: 
 
 ## Audited handlers
 
-`MessageHandlerExt::audited(audit_handler)` wraps any handler in an audit layer. The wrapped handler has the same `Outcome` contract and the same `Context` type as the original. Auditing is purely compositional — it does not change behaviour, only adds a side-channel write per invocation.
+For compliance, debugging, or fraud investigation, you may need a record of every message delivery: what it contained, how long the handler ran, what the outcome was. `MessageHandlerExt::audited(audit_handler)` wraps any handler in an audit layer. The wrapped handler has the same `Outcome` contract and the same `Context` type as the original. Auditing is purely compositional — it does not change behaviour, only adds a side-channel write per invocation.
 
-```rust,ignore
+```rust,no_run
 use shove::MessageHandlerExt;
 
 let handler = OrderHandler.audited(MyAuditSink);

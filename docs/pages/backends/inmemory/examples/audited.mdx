@@ -1,6 +1,6 @@
 # InMemory — Audited Consumer
 
-This example shows how to wrap any `MessageHandler` in the `Audited` decorator, which calls a secondary `AuditHandler` after every message — capturing trace IDs, outcomes, and handler duration without modifying the primary handler. It uses the in-memory backend so you can experiment with the audit path without running any external services.
+Use this when you want to add audit logging — trace IDs, outcomes, handler duration — to an existing handler without changing its logic. The `Audited` decorator wraps any `MessageHandler` transparently; this example shows the wiring with no external services required.
 
 ## Prerequisites
 

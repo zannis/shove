@@ -1,6 +1,6 @@
 # Kafka — Sequenced
 
-This example demonstrates per-key FIFO delivery on Kafka using partition-key routing. Events for two users are published in interleaved order; the `UserEventTopic` routes each `UserEvent` to a per-user partition shard and the `KafkaConsumer::run_fifo` consumer processes each user's events strictly in sequence. It is the Kafka counterpart to the [NATS sequenced example](/backends/nats/examples/sequenced) and highlights a critical Kafka constraint: the partition count must be at least as large as the number of active consumers.
+Use this when you need per-entity FIFO ordering on Kafka. Events for two users are published in interleaved order; each user's events arrive strictly in sequence. The example also highlights the key Kafka constraint: partition count caps the maximum number of active consumers, so partition count must be planned before topic creation.
 
 ## Prerequisites
 

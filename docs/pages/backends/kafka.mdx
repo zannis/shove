@@ -1,6 +1,6 @@
 # Apache Kafka
 
-Kafka is the high-throughput, replayable, partition-ordered choice. Best when you already have a Kafka cluster or need streaming semantics — partition-key ordering, native consumer groups with consumer-lag autoscaling, and log retention for replay.
+If you already have a Kafka cluster or need streaming semantics — replayable log, partition-key ordering, consumer-lag autoscaling — this backend fits naturally. Best for high-throughput pipelines where log retention and replay matter.
 
 ## What you need
 
@@ -58,7 +58,7 @@ cargo add shove --features kafka-ssl
 
 ## Sequenced delivery
 
-Kafka uses partition-key routing for per-key ordering. `T::sequence_key()` becomes the Kafka message key — messages with the same key always land on the same partition. A single consumer in the group handles each partition at a time, which guarantees that messages for the same key are never processed concurrently.
+Messages for the same key stay in order. Kafka uses partition-key routing: `T::sequence_key()` becomes the Kafka message key, so messages with the same key always land on the same partition. A single consumer handles each partition at a time, guaranteeing that messages for the same key are never processed concurrently.
 
 Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is fixed at topic creation time and caps the maximum degree of parallelism across the consumer group.
 
@@ -68,7 +68,7 @@ See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequ
 
 Kafka consumer groups are native — `broker.consumer_group()` creates a standard Kafka consumer group. Call `register` to associate a topic with handlers and bounds:
 
-```rust,ignore
+```rust,no_run
 use shove::kafka::KafkaConsumerGroupConfig;
 use shove::{Broker, ConsumerGroupConfig, Kafka};
 

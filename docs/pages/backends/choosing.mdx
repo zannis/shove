@@ -1,48 +1,17 @@
-# Choosing a Backend
+# Integrate with your existing stack
 
-shove exposes five backends through one API. The differences between them are durability, ordering primitive, autoscale signal, and operational burden. Pick the one that fits your infrastructure — the topic definitions, handlers, and call sites stay identical regardless of which backend you choose.
+`shove` sits on top of the broker you already run. Drop it into your code, point it at your broker, and your handlers get retries, ordering, consumer groups, and audit logging without rewriting the rest of your service.
 
-## Comparison
+## Per-broker setup
 
-| Backend | Feature flag | Marker | Durability | Ordering primitive | Autoscale signal | Ops burden |
-|---|---|---|---|---|---|---|
-| RabbitMQ | `rabbitmq` | `RabbitMq` | Disk | Consistent-hash exchange + SAC shards | Queue depth (mgmt API) | Broker + mgmt plugin |
-| AWS SNS/SQS | `aws-sns-sqs` | `Sqs` | Managed (AWS) | FIFO topic + `MessageGroupId` | Queue depth | Managed — no infra |
-| NATS JetStream | `nats` | `Nats` | Disk (JetStream) | Subject shard + `max_ack_pending=1` | Pending messages | NATS server |
-| Apache Kafka | `kafka` | `Kafka` | Disk (log) | Partition key | Consumer lag | Kafka cluster |
-| In-process | `inmemory` | `InMemory` | None (process RAM) | Per-key FIFO shards | Queue depth (in-proc) | None |
+- **[RabbitMQ →](/backends/rabbitmq)** — consistent-hash routing, ordering shards via single-active-consumer, optional exactly-once via AMQP transactions.
+- **[AWS SNS + SQS →](/backends/sqs)** — fully managed; SNS fanout, SQS polling. Uses `consumer_supervisor()` since SQS has no coordinated-group primitive.
+- **[NATS JetStream →](/backends/nats)** — subject-based shard routing for per-key ordering, JetStream-backed durability.
+- **[Apache Kafka →](/backends/kafka)** — partition-key routing, native consumer groups with consumer-lag autoscaling, log retention for replay.
+- **[In-process →](/backends/inmemory)** — zero-dependency, in-RAM. For tests and single-process apps; same API as the durable backends.
 
-## Decision tree
+## Same code, every broker
 
-Start here and follow the first branch that matches:
+The `Topic` definition, the `MessageHandler` impl, and the call sites stay identical no matter which broker you point your `Broker\<B\>` at. Tests run against `InMemory`; production runs against your real broker; the application code doesn't change.
 
-- **No broker available, or doing local dev / writing tests?**
-  → [In-process](/backends/inmemory). Zero dependencies, nothing to run, works offline.
-
-- **Already on AWS, prefer fully-managed infra?**
-  → [AWS SNS + SQS](/backends/sqs). No servers to provision; pay AWS for what you use. Note: SQS has no broker-level coordinated consumer group — use `consumer_supervisor()` instead of `consumer_group()`.
-
-- **Need replay, partitioned storage, or very high throughput at scale?**
-  → [Apache Kafka](/backends/kafka). Partition-key ordering, consumer-lag autoscaling, log retention for replay. Assumes you already run or are willing to operate a Kafka cluster.
-
-- **Already running RabbitMQ, or need complex retry topologies and exactly-once routing?**
-  → [RabbitMQ](/backends/rabbitmq). Consistent-hash exchanges, single-active-consumer shards, optional AMQP transactional delivery. Requires the management plugin for autoscaling.
-
-- **JetStream already in your stack, want lightweight subject-routed messaging?**
-  → [NATS JetStream](/backends/nats). Fast, simple, JetStream-backed durability. Coordinated pull consumers with per-shard ordering.
-
-## Backend pages
-
-**RabbitMQ** is shove's most full-featured durable backend — consistent-hash routing, single-active-consumer ordering shards, optional exactly-once transactional delivery, and queue-depth autoscaling via the management HTTP API. [RabbitMQ →](/backends/rabbitmq)
-
-**AWS SNS + SQS** is the managed-AWS path. No broker process to run; SNS fans out to SQS queues and shove handles polling, retries, and DLQ routing. Best when you're already in the AWS ecosystem. [AWS SNS + SQS →](/backends/sqs)
-
-**NATS JetStream** is the lightweight-broker option — a single NATS server with JetStream enabled is all you need. Subject-based shard routing delivers per-key ordering; coordinated pull consumers with pending-message autoscaling. [NATS JetStream →](/backends/nats)
-
-**Apache Kafka** is the high-throughput, replayable, partition-ordered choice. Partition-key routing guarantees per-key ordering; native consumer groups with consumer-lag autoscaling. Best when you need streaming semantics or already operate a Kafka cluster. [Apache Kafka →](/backends/kafka)
-
-**In-process** is the zero-dependency backend — no Docker, no AWS, no broker process. Per-key FIFO shards in process RAM. The right default for tests, prototypes, and single-process applications. [In-process →](/backends/inmemory)
-
-## Mixing backends
-
-It is normal to have multiple `Broker\<B\>` instances in one process. A common pattern is `Broker\<InMemory\>` in tests and `Broker\<RabbitMq\>` (or another durable backend) in production. The same `Topic` definition — the `define_topic!` call, the message struct, and the handler — can be declared on each broker without modification. The type parameter `B` is the only thing that changes.
+It is normal to have multiple `Broker\<B\>` instances in one process. A common pattern is `Broker\<InMemory\>` in tests and `Broker\<RabbitMq\>` (or another durable backend) in production, with the same `define_topic!` and handler code feeding both.

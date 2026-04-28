@@ -1,6 +1,6 @@
 # SQS — Stress
 
-This example runs the shared stress-benchmark harness against a live LocalStack SQS endpoint, sweeping handler profiles and consumer counts to measure throughput and latency through the real SNS/SQS HTTP API. Because SQS uses `run_supervisor_scenarios` instead of `run_all_scenarios`, each consumer is an independent poll worker rather than a member of a coordinated group — reflecting the fact that SQS has no broker-side consumer-group primitive.
+Use this to measure SQS throughput on your workload profile and compare it against the [InMemory baseline](/backends/inmemory/examples/stress) and [RabbitMQ results](/backends/rabbitmq/examples/stress) to quantify the HTTP round-trip cost. Each consumer is an independent poll worker, reflecting SQS's architecture — the numbers here set realistic expectations before sizing a production SQS deployment.
 
 ## Prerequisites
 

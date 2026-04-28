@@ -1,6 +1,6 @@
 # SQS — Autoscaler
 
-This example shows how `SqsAutoscalerBackend` uses `GetQueueAttributes` to scale `SqsConsumerGroupRegistry` workers up and down based on real queue depth. Sixty tasks are published at once; with one initial consumer processing 500 ms per task, the queue fills faster than it drains — triggering scale-up to a maximum of five consumers. Once the queue empties, the autoscaler scales back to the minimum. This is the SQS-native path for dynamic scaling (see also the [RabbitMQ consumer groups example](/backends/rabbitmq/examples/consumer-groups) for the AMQP equivalent).
+Use this when you want to see queue-depth-based autoscaling on SQS end-to-end. Sixty tasks are published at once; with one slow consumer the queue fills faster than it drains, triggering scale-up to five consumers. The autoscaler then scales back once the queue is empty. Run this before production to tune the hysteresis and cooldown settings for your traffic pattern.
 
 ## Prerequisites
 

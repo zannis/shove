@@ -4,13 +4,13 @@ Handlers in `shove` do not write to queues directly. They return one of four `Ou
 
 ## The four Outcome variants
 
-The `Outcome` enum has four variants, each mapping to a distinct delivery action:
+The `Outcome` enum has four variants, each mapped to a distinct delivery action:
 
-**`Ack`** — the message was handled successfully. The consumer removes it from the queue and moves on.
+**`Ack`** — the message was handled successfully. The consumer removes it from the queue and moves on. Use this when your handler has done its work: the record was written, the email was sent, the downstream API responded correctly.
 
-**`Retry`** — a transient failure occurred. The consumer routes the message to a hold queue whose index corresponds to the current retry count, waits for the configured delay, then redelivers the message to the main queue. The retry counter increments on each `Retry`.
+**`Retry`** — a transient failure occurred. Network blip, downstream service temporarily down, database deadlock — something went wrong that is likely to resolve itself. The consumer routes the message to a hold queue whose index corresponds to the current retry count, waits for the configured delay, then redelivers the message to the main queue. The retry counter increments on each `Retry`.
 
-**`Reject`** — a permanent failure. The consumer routes the message to the DLQ if one is configured, or discards it with a warning log if not. The message is never retried.
+**`Reject`** — a permanent failure. The message is malformed, violates a business rule, or references data that will never exist. No amount of waiting will fix it. The consumer routes the message to the DLQ if one is configured, or discards it with a warning log if not. The message is never retried.
 
 **`Defer`** — the message is not failed, just not yet ready. The consumer routes it to `hold_queues[0]` (the shortest delay) without incrementing the retry counter. This does not burn the retry budget. See [Defer — the special case](#defer--the-special-case) below.
 
@@ -67,6 +67,6 @@ Two failure modes bypass the handler entirely:
 
 **Handler timeout.** Configured via `ConsumerOptions::with_handler_timeout`. If the handler future does not complete within the timeout, the consumer aborts it and treats the result as `Outcome::Retry`. The message will be retried according to normal retry math.
 
-**Deserialization failure.** A message whose bytes cannot be deserialized into `T::Message` is permanently broken — no amount of retrying will fix a corrupt payload. The consumer treats it as `Outcome::Reject` without invoking the handler at all. The message goes to the DLQ (or is discarded with a warning) and is never retried. This is by design.
+**Deserialization failure.** A message whose bytes cannot be deserialized into `T::Message` is permanently broken — no amount of retrying will fix a corrupt payload. The consumer treats it as `Outcome::Reject` without invoking the handler at all. The message goes to the DLQ (or is discarded with a warning) and is never retried. This is by design: poison-pill messages should not burn through the retry budget indefinitely.
 
 For more on handler registration and context, see [Handlers & Context](/concepts/handlers).

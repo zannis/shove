@@ -1,6 +1,6 @@
 # RabbitMQ — Stress
 
-This example runs the shared stress-benchmark harness against a live RabbitMQ broker (spun up as a testcontainer), sweeping handler profiles and consumer counts to measure throughput, latency percentiles, and memory overhead through a real AMQP connection. Comparing these numbers against the [InMemory stress results](/backends/inmemory/examples/stress) quantifies the broker round-trip cost.
+Use this to measure RabbitMQ throughput on your own hardware and compare it against the [InMemory baseline](/backends/inmemory/examples/stress) to quantify the AMQP round-trip cost. The harness sweeps handler profiles and consumer counts, making it straightforward to find the prefetch and concurrency configuration that maximises throughput for your workload.
 
 ## Prerequisites
 
@@ -64,7 +64,15 @@ The RabbitMQ testcontainer is started with `RabbitMqImage::default().start()`. A
 
 ### `ConsumerGroupConfig` with concurrent processing
 
-The `make_cfg` closure passed to `run_all_scenarios` produces `rmq::ConsumerGroupConfig::new(consumers..=consumers).with_prefetch_count(prefetch).with_concurrent_processing(concurrent)`. When `--concurrent` is passed on the command line, `concurrent=true` enables the overlap mode from the [concurrent example](/backends/rabbitmq/examples/concurrent); this is especially effective for `slow` and `heavy` handler profiles where I/O dominates.
+The `make_cfg` closure passed to `run_all_scenarios` produces:
+
+```rust,no_run
+rmq::ConsumerGroupConfig::new(consumers..=consumers)
+    .with_prefetch_count(prefetch)
+    .with_concurrent_processing(concurrent)
+```
+
+When `--concurrent` is passed on the command line, `concurrent=true` enables the overlap mode from the [concurrent example](/backends/rabbitmq/examples/concurrent); this is especially effective for `slow` and `heavy` handler profiles where I/O dominates.
 
 ### Interpreting the results
 

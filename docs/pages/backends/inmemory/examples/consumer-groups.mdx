@@ -1,6 +1,6 @@
 # InMemory — Consumer Groups
 
-This example shows how to run multiple concurrent workers against a single queue using a `ConsumerGroup\<InMemory\>` with a dynamic worker range. One hundred `Work` messages are published and processed by three to six workers in parallel, each simulating 5 ms of I/O per message — a practical demonstration of horizontal scaling within a single process.
+Use this when you want to see how consumer groups scale workers to match queue depth. One hundred messages are published and processed by three to six workers in parallel, each simulating 5 ms of I/O — a practical demonstration of the min/max worker range and prefetch configuration, all in-process.
 
 ## Prerequisites
 

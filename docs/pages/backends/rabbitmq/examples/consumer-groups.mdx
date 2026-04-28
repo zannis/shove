@@ -1,6 +1,6 @@
 # RabbitMQ — Consumer Groups
 
-This example shows how the RabbitMQ backend's `ConsumerGroupRegistry` and autoscaler work together to process a burst of tasks: start at one consumer, scale up as queue depth rises, and scale back down once the queue drains. It exercises `ConsumerGroupRegistry`, `ConsumerGroupConfig`, `RabbitMqAutoscalerBackend`, `AutoscalerConfig`, and the `ManagementClient` — features not yet surfaced on the generic `Broker\<B\>` wrapper.
+Use this when you want to see the RabbitMQ autoscaler in action: start at one consumer, watch the count climb as queue depth rises, and watch it fall once the queue drains. The example exercises the full autoscaler stack — registry, config, management client, and scale signals — showing how `shove` adapts consumer count to actual load.
 
 ## Prerequisites
 

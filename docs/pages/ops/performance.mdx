@@ -1,6 +1,6 @@
 # Performance Tuning
 
-Most `shove` performance questions resolve to four levers: prefetch count, worker count, the concurrent-processing flag, and (negatively) transactional mode. Numbers below are from a single-node setup and intended as a baseline; tune for your workload.
+Most `shove` performance questions resolve to four levers: prefetch count, worker count, the concurrent-processing flag, and (negatively) transactional mode. Knowing which lever to pull first — and which to ignore — is what this page is for. Numbers below are from a single-node setup and intended as a starting baseline; always measure on your own hardware and workload.
 
 ## Headline numbers
 
@@ -38,7 +38,7 @@ Why too high is also a problem: if one consumer holds a large unacked backlog, o
 
 ## Workers — when to add them
 
-Add workers when the topic backlog grows faster than the consumer drains it. That's the signal that the handler is the bottleneck — not the broker, not the network.
+Add workers when the topic backlog grows faster than the consumer drains it. That's the signal that the handler is the bottleneck.
 
 A single shove consumer rarely saturates the network or broker on its own. The bottleneck is almost always handler latency × concurrency. Each additional worker adds a parallel handler goroutine; throughput scales linearly until you hit:
 

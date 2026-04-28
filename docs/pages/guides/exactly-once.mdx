@@ -1,6 +1,6 @@
 # Exactly-Once (RabbitMQ)
 
-`shove` is at-least-once by default on every backend. RabbitMQ has an **opt-in transactional mode** that makes routing decisions atomic, eliminating the publish-then-ack race that produces duplicates. It is slower — expect roughly 10–15× lower throughput per channel compared to the default confirm-mode consumer — so reserve it for handlers with irreversible side effects where duplicates cause real harm.
+Charging a payment card twice, sending a confirmation email to a customer twice, triggering an external API that has no idempotency tokens — these are the cases where at-least-once delivery causes real harm and exactly-once delivery matters. `shove` is at-least-once by default on every backend. RabbitMQ has an **opt-in transactional mode** that makes routing decisions atomic, eliminating the publish-then-ack race that produces duplicates. It is slower — expect roughly 10–15× lower throughput per channel compared to the default confirm-mode consumer — so reserve it for handlers with irreversible side effects where duplicates cause real harm.
 
 ## The publish-then-ack race
 
@@ -62,7 +62,7 @@ If exactly-once routing is a hard requirement for a non-RabbitMQ backend, you mu
 
 Once the feature is enabled, opt in per-topic via `ConsumerOptions::<RabbitMq>::with_exactly_once()`:
 
-```rust,ignore
+```rust,no_run
 use shove::{ConsumerOptions, RabbitMq};
 
 let opts = ConsumerOptions::<RabbitMq>::new()
@@ -90,7 +90,7 @@ With transactional mode, step 3 (the ack) is atomic with any hold-queue routing.
 
 **Idempotent handlers are still required.** Store idempotency keys in your payment processor or use the `delivery_id` to track which messages have already been processed:
 
-```rust,ignore
+```rust,no_run
 async fn handle(&self, msg: Payment, meta: MessageMetadata, ctx: &State) -> Outcome {
     // Idempotency check — skip if already processed.
     if ctx.payments.is_processed(&meta.delivery_id).await {

@@ -1,6 +1,6 @@
 # RabbitMQ — Concurrent Pubsub
 
-This example measures the throughput difference between sequential and concurrent message processing for a slow handler (100 ms per message). By running both modes against the same `SlowTasks` topic and printing a speedup ratio, it makes the cost of I/O-bound sequential processing tangible and shows how `ConsumerOptions::with_concurrent_processing` eliminates that cost while preserving in-order acknowledgement.
+Use this when deciding whether to enable concurrent processing for I/O-bound handlers. A 100 ms handler processes 20 messages sequentially in ~2 s; the same handler with `with_concurrent_processing` processes them in ~0.2 s — a 10x speedup visible in the printed summary. The example also confirms that acknowledgements remain in-order regardless of which mode is active.
 
 ## Prerequisites
 
@@ -55,7 +55,14 @@ Exact numbers vary by system; expect a speedup close to the prefetch count (20x 
 
 ### Sequential vs concurrent modes
 
-The example calls `run_round` twice. For the sequential round: `prefetch=1` (at most one message in-flight) and `concurrent=false`. For the concurrent round: `prefetch=20` and `concurrent=true`. The key option is `ConsumerOptions::<RabbitMq>::new().with_concurrent_processing(concurrent)` — when `true`, the consumer spawns each handler invocation as a separate tokio task, allowing up to `prefetch` handlers to run simultaneously. Acknowledgements are still sent in delivery order, so the broker's message ordering guarantees are maintained.
+The example calls `run_round` twice. For the sequential round: `prefetch=1` (at most one message in-flight) and `concurrent=false`. For the concurrent round: `prefetch=20` and `concurrent=true`. The key option is:
+
+```rust,no_run
+ConsumerOptions::<RabbitMq>::new()
+    .with_concurrent_processing(concurrent)
+```
+
+When `true`, the consumer spawns each handler invocation as a separate tokio task, allowing up to `prefetch` handlers to run simultaneously. Acknowledgements are still sent in delivery order, so the broker's message ordering guarantees are maintained.
 
 ### Queue management between rounds
 

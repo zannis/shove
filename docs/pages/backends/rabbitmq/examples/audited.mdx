@@ -1,6 +1,6 @@
 # RabbitMQ — Audited Consumer
 
-This example shows how the `Audited` decorator keeps a complete audit trail across retries: when `PaymentHandler` returns `Outcome::Retry` on the first delivery, the trace ID emitted by `StdoutAuditHandler` on that attempt is the same UUID that appears on the successful second attempt — proving that trace identity is preserved across the hold-queue round-trip. It demonstrates [Guides: Audit](/guides/audit) applied to a real RabbitMQ consumer.
+Use this when you want to verify that trace IDs are preserved across retries on RabbitMQ. The handler returns `Outcome::Retry` on the first delivery; both delivery attempts emit an audit record with the same UUID — proving that trace identity survives the hold-queue round-trip. The pattern directly applies to payment processing, compliance logging, and any workflow where correlating retries to the original delivery matters.
 
 ## Prerequisites
 

@@ -1,6 +1,6 @@
 # Kafka — Audited Consumer
 
-This example applies the `Audited` decorator to a Kafka consumer group, proving that the `trace_id` in the `AuditRecord` is the same UUID across a hold-queue retry cycle. `PaymentHandler` returns `Outcome::Retry` on the first delivery; `StdoutAuditHandler` emits a JSON audit record for each attempt — both carry the same `trace_id`. It is the Kafka counterpart to the [NATS audited example](/backends/nats/examples/audited); the `AuditHandler` API is identical across backends.
+Use this when you need to confirm that audit trace IDs survive Kafka hold-queue retries. The handler returns `Outcome::Retry` on first delivery; both delivery attempts emit a JSON audit record with the same UUID, demonstrating that the `trace_id` propagates correctly through Kafka record headers across the hold-queue topic round-trip.
 
 ## Prerequisites
 

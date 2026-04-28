@@ -1,6 +1,6 @@
 # AWS SNS + SQS
 
-AWS SNS + SQS is the managed-AWS path. No broker process to run, no infra to provision — SNS fans messages out to SQS queues and shove handles polling, retries, DLQ routing, and consumer supervision. Pay AWS for what you use.
+If you're already on AWS and don't want to run a broker, this is your path. SNS fans messages out to SQS queues; shove handles polling, retries, DLQ routing, and consumer supervision. No broker process to provision or maintain — pay AWS for what you use.
 
 ## What you need
 
@@ -54,7 +54,7 @@ SQS uses `consumer_supervisor()` — N independent pollers per registered topic.
 
 ## Sequenced delivery
 
-SQS supports FIFO topics and queues with `MessageGroupId`. When you declare a sequenced topic, shove provisions FIFO SNS topics and SQS queues. The publisher sets the `MessageGroupId` from `T::sequence_key()`; SQS FIFO delivers messages in order within each group.
+Messages for the same group key stay in order. SQS FIFO topics enforce ordering natively: when you declare a sequenced topic, shove provisions FIFO SNS topics and SQS queues and sets the `MessageGroupId` from `T::sequence_key()`; SQS delivers messages in publish order within each group.
 
 FIFO queue names must end in `.fifo` — shove appends this suffix automatically when sequenced topology is declared. The default SQS FIFO throughput quota is 300 messages/second per queue; for higher throughput, contact AWS to raise the quota or switch to a standard (unordered) topic.
 
@@ -64,7 +64,7 @@ See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequ
 
 SQS has no broker-level coordinated-group primitive. Use `broker.consumer_supervisor()` to fan out N parallel pollers per topic:
 
-```rust,ignore
+```rust,no_run
 use shove::{Broker, ConsumerOptions, Sqs};
 
 let mut supervisor = broker.consumer_supervisor();

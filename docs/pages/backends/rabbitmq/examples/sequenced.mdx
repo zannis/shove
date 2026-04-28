@@ -1,6 +1,6 @@
 # RabbitMQ — Sequenced Pubsub
 
-This example puts two failure policies for per-key FIFO delivery head-to-head: `SequenceFailure::Skip` (DLQ one bad message, continue the sequence) versus `SequenceFailure::FailAll` (DLQ the bad message and all subsequent messages for the same key). Ledger entries for two accounts are published and the example asserts the resulting totals match the expected values for each policy — making it a concrete end-to-end test of [sequenced delivery](/guides/sequenced) semantics on RabbitMQ.
+Use this when you need to decide between `SequenceFailure::Skip` and `SequenceFailure::FailAll` for your ordering policy. Ledger entries for two accounts are published, one entry is deliberately rejected, and the example asserts the resulting totals — making the behavioral difference between the two policies concrete and verifiable against a real RabbitMQ broker.
 
 ## Prerequisites
 

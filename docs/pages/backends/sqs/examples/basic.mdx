@@ -1,6 +1,6 @@
 # SQS — Basic Pubsub
 
-This example covers every non-sequenced topology shape on the SQS backend: a minimal queue, a queue with a DLQ, and a queue with escalating hold-queue retry backoff. It exercises all three SQS-compatible `Outcome` variants (`Ack`, `Retry`, `Reject`) and all three publish variants (`publish`, `publish_with_headers`, `publish_batch`). It is the SQS counterpart to the [RabbitMQ basic example](/backends/rabbitmq/examples/basic) — the same programming model, different infrastructure.
+Use this as your starting point for SQS integration: it covers the three non-sequenced topology shapes (minimal queue, DLQ, escalating retry backoff), all three SQS-compatible `Outcome` variants, and all three publish variants against a LocalStack backend. The SQS counterpart to the [RabbitMQ basic example](/backends/rabbitmq/examples/basic) — same programming model, different infrastructure.
 
 ## Prerequisites
 

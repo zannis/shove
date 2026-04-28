@@ -1,10 +1,12 @@
 # Sequenced Topics
 
-Most pub/sub messages don't need ordering. When they do — e.g. ledger entries for the same account, state transitions for the same order, audit events for the same entity — `shove` lets you mark a topic as **sequenced** so messages with the same key are delivered in strict publish order. Messages sharing the same sequence key are consumed one at a time: the next delivery only happens after the previous one has been successfully acked.
+Some messages depend on each other. A ledger entry assumes the previous balance was applied. A state-machine transition assumes the entity is in the right prior state. An audit record references the preceding record's hash. When processing message N assumes message N−1 has already been applied, you need `shove`'s sequenced delivery: messages with the same key arrive one at a time, in strict publish order.
+
+Messages sharing the same sequence key are consumed one at a time: the next delivery only happens after the previous one has been successfully acked.
 
 ## When to use sequenced topics
 
-Use a sequenced topic when messages for the same logical entity have **causal dependencies** — when processing message N assumes message N−1 has already been applied:
+Use a sequenced topic when messages for the same logical entity have **causal dependencies**:
 
 - **Financial ledgers** — an account balance is updated by a stream of debit/credit entries. Applying them out of order corrupts the balance.
 - **State machines** — an order moving through `placed → confirmed → shipped → delivered`. A `shipped` event arriving before `confirmed` is processed leaves the state machine in an inconsistent state.
@@ -23,7 +25,7 @@ When in doubt: if you can process message B without knowing the result of messag
 
 The `define_sequenced_topic!` macro is the recommended way to define a sequenced topic. It generates a unit struct, implements both `Topic` and `SequencedTopic`, and wires the sequence-key function into `Topic::SEQUENCE_KEY_FN` so the publisher can route messages correctly without requiring a `SequencedTopic` bound.
 
-```rust,ignore
+```rust,no_run
 use shove::{define_sequenced_topic, SequenceFailure, TopologyBuilder};
 use std::time::Duration;
 
@@ -49,7 +51,7 @@ The four macro arguments are:
 
 What the macro generates — equivalent hand-written code:
 
-```rust,ignore
+```rust,no_run
 pub struct AccountLedger;
 
 impl Topic for AccountLedger {
@@ -106,13 +108,13 @@ Given a sequence for key `ACC-A` with messages `[1, 2, 3, 4, 5]` where message 3
 | `Skip` | 1, 2, 4, 5 | 3 |
 | `FailAll` | 1, 2 | 3, 4, 5 |
 
-**`SequenceFailure::Skip`** — dead-letters the failed message and continues processing subsequent messages in the sequence as normal. The failed message is skipped; messages 4 and 5 are delivered to the handler as if message 3 never existed.
+**`SequenceFailure::Skip`** — dead-letters the failed message and continues processing subsequent messages in the sequence as normal.
 
-Use `Skip` when messages are **independently valid** but happen to require ordered delivery. Audit log entries are a good example: if entry 3 is malformed and cannot be processed, entries 4 and 5 are still valid records that should be stored. The audit trail has a gap, but it continues.
+Use `Skip` when messages are **independently valid** but happen to require ordered delivery. Audit log entries are a good example: if entry 3 is malformed and cannot be processed, entries 4 and 5 are still valid records that should be stored. The audit trail has a gap, but it continues. `Skip` is the right choice when gaps in the sequence are preferable to stopping cold.
 
 **`SequenceFailure::FailAll`** — dead-letters the failed message AND all subsequent messages for the same key ("poisons" the key). The key stays poisoned for the lifetime of the consumer process.
 
-Use `FailAll` when messages are **causally dependent** — each message assumes every prior message in the sequence was applied successfully. Financial ledger entries are the canonical example: if a debit entry fails, the account balance is unknown. Applying subsequent credits or debits against an unknown balance produces incorrect results. It's safer to quarantine everything to the DLQ for manual inspection.
+Use `FailAll` when messages are **causally dependent** — each message assumes every prior message in the sequence was applied successfully. Financial ledger entries are the canonical example: if a debit entry fails, the account balance is unknown. Applying subsequent credits or debits against an unknown balance produces incorrect results. `FailAll` is the right choice when processing on a corrupted baseline would cause more damage than stopping and surfacing the problem for manual review.
 
 Both policies only affect the failing sequence key. Other keys (e.g. `ACC-B`) are completely unaffected — they continue to be processed normally regardless of what happens to `ACC-A`.
 
@@ -136,7 +138,7 @@ For AWS SNS+SQS FIFO topics, `shove` sets the `MessageGroupId` to the sequence k
 
 Call `.routing_shards(N)` on the `TopologyBuilder` (before `.build()`, after `.sequenced()`) to override the default shard count of **8**. It panics if called before `.sequenced()`.
 
-```rust,ignore
+```rust,no_run
 TopologyBuilder::new("account-ledger")
     .sequenced(SequenceFailure::FailAll)
     .routing_shards(16)   // 16 concurrent shards instead of 8
@@ -159,7 +161,7 @@ A routing shard count of 0 panics at `build()` time. The builder enforces this g
 
 Sequenced topics require a backend-specific `run_fifo` consumer call. The `ConsumerSupervisor::register` method explicitly rejects sequenced topics at runtime — it returns an error explaining that FIFO ordering cannot be preserved through the generic `register` API:
 
-```rust,ignore
+```rust,no_run
 // This will return Err for sequenced topics:
 supervisor.register::<AccountLedger, _>(handler, options)?;
 // ^ error: use run_fifo instead
@@ -167,7 +169,7 @@ supervisor.register::<AccountLedger, _>(handler, options)?;
 
 For the in-memory backend, use `InMemoryConsumer::run_fifo`:
 
-```rust,ignore
+```rust,no_run
 consumer.run_fifo::<LedgerTopic, _>(handler, ctx, opts).await
 ```
 

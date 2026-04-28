@@ -1,6 +1,6 @@
 # NATS — Basic
 
-This example demonstrates the full publish/consume cycle using NATS JetStream: declare a topic backed by a JetStream stream, publish three `OrderCreated` events, and consume them with a coordinated consumer group. It is the canonical starting point for NATS JetStream integration, showing how shove's generic `Broker\<Nats\>` API maps to JetStream streams and durable consumers.
+Use this as your starting point for NATS JetStream integration. Three `OrderCreated` events are published and consumed via a coordinated consumer group, showing how `shove`'s generic `Broker\<Nats\>` API maps to JetStream streams and durable consumers with hold queues and DLQ.
 
 ## Prerequisites
 

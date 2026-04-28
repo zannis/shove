@@ -1,6 +1,6 @@
 # In-process
 
-In-process is shove's zero-dependency backend — no Docker, no AWS, no broker process. Suitable for tests, prototypes, and single-process applications where you want the full pub/sub API without any external infrastructure.
+The fastest way to get started with `shove` and the right choice for tests. No Docker, no AWS, no broker process — the broker lives in process RAM. Suitable for unit tests, integration tests, and single-process applications where you want the full pub/sub API without external infrastructure.
 
 ## What you need
 
@@ -56,7 +56,7 @@ In-process queue-depth tracking drives the autoscaler. The autoscale signal work
 
 Configure via `InMemoryConsumerGroupConfig`:
 
-```rust,ignore
+```rust,no_run
 use shove::inmemory::InMemoryConsumerGroupConfig;
 use shove::{Broker, ConsumerGroupConfig, InMemory};
 

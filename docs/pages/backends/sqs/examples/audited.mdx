@@ -1,6 +1,6 @@
 # SQS — Audited Consumer
 
-This example shows the `Audited` decorator applied to an SQS consumer, proving that the `trace_id` in the `AuditRecord` is the same UUID on both the initial `Outcome::Retry` delivery and the successful second delivery. It is the SQS counterpart to the [RabbitMQ audited example](/backends/rabbitmq/examples/audited) — the `AuditHandler` API is identical across backends.
+Use this when you want to confirm that trace IDs survive the SQS hold-queue round-trip. The same UUID appears on both the initial `Outcome::Retry` delivery and the successful second attempt — exactly the property you need when correlating retries in a payment audit log or compliance record. The `AuditHandler` API is identical across backends.
 
 ## Prerequisites
 

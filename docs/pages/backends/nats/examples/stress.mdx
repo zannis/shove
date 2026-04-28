@@ -1,6 +1,6 @@
 # NATS — Stress
 
-This example runs the shared stress-benchmark harness against a live NATS JetStream server, measuring throughput, latency percentiles, and memory overhead across handler profiles and consumer counts. Comparing results against the [InMemory stress example](/backends/inmemory/examples/stress) isolates the JetStream persistence and acknowledgement cost; comparing against [RabbitMQ stress](/backends/rabbitmq/examples/stress) reveals the relative overhead of AMQP vs NATS wire protocols.
+Use this to measure NATS JetStream throughput and compare it against the [InMemory baseline](/backends/inmemory/examples/stress) and [RabbitMQ results](/backends/rabbitmq/examples/stress). The numbers reveal JetStream's persistence cost versus in-process, and the protocol efficiency difference versus AMQP — useful data before choosing a backend or sizing a deployment.
 
 ## Prerequisites
 
@@ -60,7 +60,15 @@ NATS JetStream typically achieves higher throughput than RabbitMQ (lower protoco
 
 ### `NatsConsumerGroupConfig` with `with_concurrent_processing`
 
-The `make_cfg` closure produces `NatsConsumerGroupConfig::new(consumers..=consumers).with_prefetch_count(prefetch).with_concurrent_processing(concurrent)`. The `prefetch_count` maps to JetStream's `max_ack_pending` — how many messages the JetStream server will push to the consumer before requiring acknowledgements. When `--concurrent` is passed, `with_concurrent_processing(true)` enables parallel handler invocations within a single consumer, which is especially effective for `slow` and `heavy` profiles.
+The `make_cfg` closure produces:
+
+```rust
+NatsConsumerGroupConfig::new(consumers..=consumers)
+    .with_prefetch_count(prefetch)
+    .with_concurrent_processing(concurrent)
+```
+
+The `prefetch_count` maps to JetStream's `max_ack_pending` — how many messages the JetStream server will push to the consumer before requiring acknowledgements. When `--concurrent` is passed, `with_concurrent_processing(true)` enables parallel handler invocations within a single consumer, which is especially effective for `slow` and `heavy` profiles.
 
 ### Interpreting the results
 

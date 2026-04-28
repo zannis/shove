@@ -1,6 +1,6 @@
 # Retries, Hold Queues & DLQs
 
-Pub/sub ack/reject is binary at the broker level: a message is either accepted or it isn't. `shove` adds a richer vocabulary on top: **hold queues** for delayed retry with escalating backoff, a **DLQ** for permanent failure, retry budgets to bound how many times a message can be retried, and `Outcome::Defer` for messages that are "not yet ready" — valid but premature. Understanding how these pieces fit together lets you build consumer pipelines that are resilient to transient failures without silently losing messages.
+Transient failures recover. Permanent failures don't. `shove` gives you the vocabulary to express the difference: **hold queues** park a message for a configurable delay before redelivering it, giving downstream services time to recover; a **DLQ** catches messages that have exhausted all retries or are permanently invalid, so they don't disappear silently but instead wait for human inspection and replay. Together they turn a binary ack/reject model into a resilient, observable pipeline.
 
 ## The retry lifecycle
 
@@ -35,7 +35,7 @@ When `retry_count >= max_retries`, the consumer routes to the DLQ instead of a h
 
 Add hold queues to a topology by calling `.hold_queue(Duration)` on the builder. Each call appends one hold queue with the given delay. Order matters: the first call defines the shortest delay, the last call defines the longest.
 
-```rust,ignore
+```rust,no_run
 TopologyBuilder::new("orders")
     .hold_queue(Duration::from_secs(5))   // hold_queues[0] → orders-hold-5s
     .hold_queue(Duration::from_secs(30))  // hold_queues[1] → orders-hold-30s
@@ -62,7 +62,7 @@ If a topic has hold queues but no DLQ, a warning is logged at build time: messag
 
 `ConsumerOptions::with_max_retries(N)` sets how many times a message can be retried before being routed to the DLQ. The default is **10**.
 
-```rust,ignore
+```rust,no_run
 let opts = ConsumerOptions::<InMemory>::new()
     .with_max_retries(5); // DLQ after 5 retries
 ```
@@ -106,9 +106,9 @@ On **sequenced consumers**, `Defer` is not supported because it would block all 
 
 ## DLQ as a queue
 
-Dead-letter queues are first-class queues, not black holes. You can consume them like any other queue. The `MessageHandler::handle_dead` method is the hook for DLQ processing:
+Dead-letter queues exist so that permanently-failed messages don't disappear. You can consume the DLQ to alert on failures, write to a quarantine store, trigger a pager, or replay messages after a fix. Override `handle_dead` in your handler to act on dead-lettered messages:
 
-```rust,ignore
+```rust,no_run
 impl MessageHandler<Orders> for OrderHandler {
     type Context = AppState;
 
@@ -155,7 +155,7 @@ This is an explicit design choice: if you haven't configured a DLQ, you've accep
 
 Consider a topic with three hold queues and a DLQ, and `max_retries = 10` (the default):
 
-```rust,ignore
+```rust,no_run
 TopologyBuilder::new("orders")
     .hold_queue(Duration::from_secs(5))
     .hold_queue(Duration::from_secs(30))

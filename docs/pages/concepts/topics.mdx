@@ -1,6 +1,6 @@
 # Topics & Topology
 
-A topic is the fundamental unit of design in `shove`. It is a unit struct that binds exactly one message type to one queue topology. Every publisher call, every consumer registration, and every topology declaration is anchored to a topic — not to a raw queue name and not to a message type alone.
+A topic is how you express a domain event as a type. When you define `OrderSettlement`, you're declaring that these events flow through a specific queue, carry a specific message shape, and obey specific retry rules. Publishers, consumer registrations, and topology declarations all reference the topic; queue names and message types are derived from it.
 
 One topic always carries one message type. Two topics may share the same message type if two independent event flows happen to share a schema, but a single topic never carries mixed types. The type system enforces this: publishing `MyEvent` via the wrong topic is a compile error, not a runtime surprise.
 
@@ -10,7 +10,7 @@ Think of topics as the unit of design: one topic per logical event flow.
 
 Every topic implements the `Topic` trait from `src/topic.rs`:
 
-```rust,ignore
+```rust,no_run
 pub trait Topic: Send + Sync + 'static {
     type Message: Serialize + DeserializeOwned + Send + Sync + 'static;
     fn topology() -> &'static QueueTopology;
@@ -24,7 +24,7 @@ pub trait Topic: Send + Sync + 'static {
 
 In practice, you almost never implement `Topic` by hand. The `define_topic!` macro handles the boilerplate:
 
-```rust,ignore
+```rust,no_run
 define_topic!(
     OrderSettlement,
     SettlementEvent,
@@ -37,7 +37,7 @@ define_topic!(
 
 The macro accepts an optional visibility modifier (`pub`, `pub(crate)`, etc.) before the name. To understand what it generates, here is the equivalent manual implementation:
 
-```rust,ignore
+```rust,no_run
 struct OrderSettlement;
 
 impl Topic for OrderSettlement {
@@ -73,7 +73,7 @@ The full chain of methods, in the order you would typically call them:
 
 Consider this topology:
 
-```rust,ignore
+```rust,no_run
 TopologyBuilder::new("order-settlement")
     .hold_queue(Duration::from_secs(5))
     .hold_queue(Duration::from_secs(30))
@@ -92,15 +92,17 @@ The builder derives all queue names from the primary name:
 
 ## Hold queues
 
-Hold queues are delayed-redelivery queues. When a handler returns `Outcome::Retry`, the consumer routes the message to the hold queue that matches the current retry count, holds it for the configured delay, then redelivers it to the main queue.
+Hold queues give a message a second chance. When a handler returns `Outcome::Retry`, the consumer routes the message to a hold queue and parks it there for the configured duration before redelivering it to the main queue. This is how you recover from transient failures — a downstream service that momentarily times out, a database deadlock, a third-party API that returns 503 — without immediately sending messages to the DLQ.
 
-The index is selected automatically: `min(retry_count, hold_queues.len() - 1)`. This means the first retry uses the first (shortest) hold queue, the second retry uses the second, and all subsequent retries stay on the last (longest) hold queue. Ordering matters: define hold queues from shortest to longest.
+The hold queue selected on each retry is `min(retry_count, hold_queues.len() - 1)`. This means the first retry uses the first (shortest) hold queue, the second retry uses the second, and all subsequent retries stay on the last (longest) hold queue. Ordering matters: define hold queues from shortest to longest.
 
 For a detailed walkthrough of retry mechanics and worked examples, see [Retries, Hold Queues & DLQs](/guides/retries).
 
 ## DLQ
 
-The DLQ is optional. When present, messages that are permanently rejected (via `Outcome::Reject`, or because `max_retries` is exhausted) are routed there. When absent, rejected messages are discarded and a warning is logged — they are not silently dropped, but they are gone.
+The DLQ is where permanently-failed messages go for human inspection or some specific handling. When a message is rejected (via `Outcome::Reject`, or because `max_retries` is exhausted), it is routed to the DLQ rather than discarded. This lets an operator investigate why messages failed, fix the root cause, and replay them without needing to re-publish from the source.
+
+When no DLQ is configured, rejected messages are discarded and a warning is logged — they are not silently dropped, but they are gone. For production topics with any business significance, configure a DLQ.
 
 A DLQ is itself consumable. Call `consumer.run_dlq::<T>()` to start a loop that processes dead-lettered messages. The [Outcomes & Delivery](/concepts/outcomes) page explains the `handle_dead` hook.
 

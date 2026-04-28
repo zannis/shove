@@ -1,12 +1,14 @@
 # Observability
 
-`shove` integrates with the standard Rust `tracing` ecosystem. Every interesting event — handler invocation outcomes, retry routing, DLQ routing, group scaling, autoscaler decisions, connection errors — is emitted as a structured `tracing` event with named fields. Add a subscriber and you have a full observability trail without any instrumentation code in your handlers.
+When something goes wrong — a handler is slow, a topic is backing up, a retry loop is burning through the budget — you need to know where to look. `shove` integrates with the standard Rust `tracing` ecosystem. Every interesting event — handler invocation outcomes, retry routing, DLQ routing, group scaling, autoscaler decisions, connection errors — is emitted as a structured `tracing` event with named fields. Add a subscriber and you have a full observability trail without any instrumentation code in your handlers.
+
+Native Prometheus metrics support is planned for a future release.
 
 ## tracing integration
 
 The recommended subscriber setup for a consumer binary:
 
-```rust,ignore
+```rust,no_run
 use tracing_subscriber::{EnvFilter, fmt};
 
 tracing_subscriber::registry()
@@ -77,7 +79,7 @@ Available log levels used by `shove`:
 
 To set `x-trace-id` at publish time:
 
-```rust,ignore
+```rust,no_run
 use std::collections::HashMap;
 
 let mut headers = HashMap::new();
@@ -98,7 +100,7 @@ tracing-opentelemetry = "0.x"
 opentelemetry = "0.x"
 ```
 
-```rust,ignore
+```rust,no_run
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_opentelemetry::OpenTelemetryLayer;
 
@@ -128,7 +130,7 @@ Each backend stamps deliveries with a stable per-message identifier. Access thes
 
 For RabbitMQ specifically: `x-message-id` is stamped by `RabbitMqPublisher` on every outgoing message. Handlers can read it for deduplication:
 
-```rust,ignore
+```rust,no_run
 if let Some(mid) = metadata.headers.get("x-message-id") {
     if store.already_processed(mid).await? {
         return Outcome::Ack;
@@ -140,7 +142,7 @@ if let Some(mid) = metadata.headers.get("x-message-id") {
 
 ## Audit as observability
 
-Audit records are a high-resolution observability stream complementary to `tracing` events. Every delivery produces one record with the full payload, outcome, duration in milliseconds, and trace ID. Where `tracing` events are best for operational monitoring (scale events, error rates), audit records are best for business-level visibility (which messages were processed, what the outcome was, how long each one took).
+Audit records are a high-resolution observability stream complementary to `tracing` events. Every delivery produces one record with the full payload, outcome, duration in milliseconds, and trace ID. Where `tracing` events are best for operational monitoring (scale events, error rates), audit records are best for business-level visibility: which messages were processed, what the outcome was, how long each one took.
 
 Wire `ShoveAuditHandler` (see [Audit Logging](/guides/audit)) and consume the `shove-audit-log` topic to build:
 

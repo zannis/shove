@@ -1,6 +1,6 @@
 # SQS — Concurrent Pubsub
 
-This example benchmarks sequential versus concurrent message processing on the SQS backend, using a 100 ms I/O-bound handler and 20 messages to make the speedup clearly visible. It mirrors the [RabbitMQ concurrent example](/backends/rabbitmq/examples/concurrent) but highlights an important SQS-specific constraint: the `prefetch_count` interacts with SQS's `ReceiveMessage` batch size cap of 10, so the maximum useful prefetch is lower than for AMQP backends.
+Use this when sizing the prefetch and concurrency configuration for SQS I/O-bound handlers. The example shows the throughput improvement from enabling concurrent processing, and highlights the SQS-specific constraint: `ReceiveMessage` returns at most 10 messages per call, so the maximum useful prefetch is lower than for AMQP backends.
 
 ## Prerequisites
 
@@ -56,7 +56,15 @@ Speedup will be lower than the RabbitMQ equivalent because SQS's `ReceiveMessage
 
 ### Sequential vs concurrent modes
 
-`run_round` registers a consumer with `ConsumerOptions::<Sqs>::new().with_prefetch_count(prefetch).with_concurrent_processing(concurrent)`. For the sequential round `prefetch=1` and `concurrent=false`. For the concurrent round `prefetch=20` and `concurrent=true`. Enabling `concurrent_processing` causes the consumer to dispatch each handler invocation as a separate tokio task, overlapping the 100 ms sleeps rather than serialising them.
+`run_round` registers a consumer with:
+
+```rust,no_run
+ConsumerOptions::<Sqs>::new()
+    .with_prefetch_count(prefetch)
+    .with_concurrent_processing(concurrent)
+```
+
+For the sequential round `prefetch=1` and `concurrent=false`. For the concurrent round `prefetch=20` and `concurrent=true`. Enabling `concurrent_processing` causes the consumer to dispatch each handler invocation as a separate tokio task, overlapping the 100 ms sleeps rather than serialising them.
 
 ### No queue purge between rounds
 

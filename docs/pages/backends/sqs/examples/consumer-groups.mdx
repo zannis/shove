@@ -1,6 +1,6 @@
 # SQS — Consumer Groups
 
-This example shows how `SqsConsumerGroupRegistry` — the SQS equivalent of a consumer group — manages a pool of independent SQS poll workers reading from a single queue. Because SQS has no broker-level coordinated-group primitive, the registry spawns independent consumers rather than a single coordinated group; the result is the same: multiple workers sharing load from one queue. It also demonstrates `SqsQueueStatsProvider` for observing `messages_ready` and `messages_not_visible` counts as the backlog drains.
+Use this when you want to observe how a pool of SQS poll workers drains a queue over time. Because SQS has no broker-side coordinated-group primitive, the registry spawns independent consumers; the example shows how to monitor `messages_ready` and `messages_not_visible` as the backlog drains — useful for sizing your worker pool before adding the autoscaler.
 
 ## Prerequisites
 

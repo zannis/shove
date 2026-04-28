@@ -1,6 +1,6 @@
 # Kafka — Basic
 
-This example demonstrates the core publish/consume loop against a Kafka broker: declare a topic (which provisions Kafka topics for the main queue, hold queues, and DLQ), publish three `OrderCreated` messages, and consume them via a coordinated consumer group. It is the Kafka counterpart to the [NATS basic example](/backends/nats/examples/basic) and shows how shove's generic `Broker\<Kafka\>` API maps to rdkafka producers, consumer groups, and partition assignment.
+Use this as your starting point for Kafka integration. Three `OrderCreated` messages are published and consumed via a coordinated consumer group, showing how `shove`'s generic `Broker\<Kafka\>` API maps to rdkafka producers, consumer groups, and partition assignment — including how hold queues are implemented as separate Kafka topics.
 
 ## Prerequisites
 

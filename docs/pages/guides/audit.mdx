@@ -1,12 +1,12 @@
 # Audit Logging
 
-Every message delivery is a candidate for an audit record: who published it, what it contained, how long the handler ran, what the outcome was, and when. `shove` provides a transparent wrapper — `Audited\<H, A\>` — that captures this for every handler invocation, regardless of backend. The wrapper is a drop-in: it implements `MessageHandler\<T\>` with the same associated `Context` type as the inner handler, so it fits anywhere a handler fits.
+Compliance requirements, fraud investigation, and debugging all share the same need: a durable record of what happened, when, and what the outcome was. `shove` provides a transparent wrapper — `Audited\<H, A\>` — that captures this for every handler invocation, regardless of backend. The wrapper is a drop-in: it implements `MessageHandler\<T\>` with the same associated `Context` type as the inner handler, so it fits anywhere a handler fits.
 
 ## What audit logging captures
 
 `AuditRecord\<M\>` is the struct emitted to your audit sink on every delivery:
 
-```rust,ignore
+```rust,no_run
 pub struct AuditRecord<M: Serialize> {
     pub trace_id: String,
     pub topic: String,
@@ -32,7 +32,7 @@ Field by field:
 
 Implement `AuditHandler\<T\>` for your chosen persistence sink:
 
-```rust,ignore
+```rust,no_run
 pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
     async fn audit(&self, record: &AuditRecord<T::Message>) -> Result<(), ShoveError>;
 }
@@ -40,7 +40,7 @@ pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
 
 The trait is async and takes a shared reference — your implementation can use an `Arc`-wrapped client internally. Implementations for common sinks:
 
-```rust,ignore
+```rust,no_run
 // Write to a database (e.g. PostgreSQL).
 struct PostgresAudit {
     pool: Arc<PgPool>,
@@ -71,11 +71,11 @@ The `AuditHandler` bound is per-topic: a different implementation can be used fo
 
 Returning `Err` from `audit()` causes the consumer to **retry the message** — the outcome of the business handler is discarded and replaced with `Outcome::Retry`. Audit records are never silently dropped.
 
-This is the right default for "every action must be logged" requirements. If the audit sink is unavailable (database outage, network partition), message processing halts rather than proceeding without a record. The message will retry (with backoff if hold queues are configured) until the sink recovers.
+This is the right default for "every action must be logged" requirements — particularly relevant for regulated industries where a gap in the audit trail is a compliance violation, not just an inconvenience. If the audit sink is unavailable (database outage, network partition), message processing halts rather than proceeding without a record. The message will retry (with backoff if hold queues are configured) until the sink recovers.
 
 If you need **lossy auditing** — where a sink failure should not block processing — catch internal errors in your `audit()` implementation, log them, and return `Ok(())`:
 
-```rust,ignore
+```rust,no_run
 impl AuditHandler<Orders> for BestEffortAudit {
     async fn audit(&self, record: &AuditRecord<Order>) -> Result<(), ShoveError> {
         if let Err(e) = self.inner_write(record).await {
@@ -90,7 +90,7 @@ Because `Err` causes a retry, **handlers wrapped with `Audited` must be idempote
 
 `Audited` also supports an optional audit timeout via `Audited::with_audit_timeout(duration)`. If the audit handler takes longer than the timeout, the original handler outcome is returned and the audit failure is logged — the message is not retried due to a slow sink:
 
-```rust,ignore
+```rust,no_run
 let handler = OrderHandler.audited(SlowSink).with_audit_timeout(Duration::from_secs(2));
 ```
 
@@ -98,7 +98,7 @@ let handler = OrderHandler.audited(SlowSink).with_audit_timeout(Duration::from_s
 
 The `MessageHandlerExt` trait provides a fluent `.audited(sink)` method on any `MessageHandler`:
 
-```rust,ignore
+```rust,no_run
 use shove::MessageHandlerExt;
 
 let handler = OrderHandler::new(state).audited(PostgresAudit { pool: pool.clone() });
@@ -110,7 +110,7 @@ This is equivalent to `Audited::new(OrderHandler::new(state), PostgresAudit { po
 
 By default, the audit wrapper generates a fresh UUID v4 as the `trace_id` on each delivery. To propagate a trace ID from the publisher across retries — so all retries of the same message share one trace ID with the original delivery — set the `x-trace-id` header at publish time:
 
-```rust,ignore
+```rust,no_run
 use std::collections::HashMap;
 
 let mut headers = HashMap::new();
@@ -134,7 +134,7 @@ shove = { version = "0.x", features = ["audit"] }
 
 Use it:
 
-```rust,ignore
+```rust,no_run
 use shove::audit::ShoveAuditHandler;
 
 let audit = ShoveAuditHandler::new(publisher.clone());
@@ -146,7 +146,7 @@ let handler = OrderHandler::new(state).audited(audit);
 
 `ShoveAuditHandler` erases the payload type to `serde_json::Value` (via `serde_json::to_value`) so that a single `shove-audit-log` topic can carry records from all topics without needing a different message type per topic. The `AuditLog` topic definition:
 
-```rust,ignore
+```rust,no_run
 // Defined in shove::audit when the `audit` feature is enabled.
 define_topic!(
     pub AuditLog,
@@ -163,7 +163,7 @@ One guard is in place to prevent infinite recursion: `Audited` skips its audit h
 
 Wrapping a handler with `Audited` requires no changes on the consumer group side. The wrapped handler is still a `MessageHandler\<T\>`, and it's registered identically:
 
-```rust,ignore
+```rust,no_run
 let mut group = broker.consumer_group();
 let pool = pool.clone();
 

@@ -1,6 +1,6 @@
 # RabbitMQ
 
-RabbitMQ is shove's most full-featured backend — it's the default for shops that already run RabbitMQ and need complex retry topologies. It supports coordinated consumer groups with queue-depth autoscaling, consistent-hash exchange routing for sequenced delivery, and optional AMQP transactional exactly-once delivery.
+If you already run RabbitMQ, this backend slots in with zero infrastructure changes. It covers the full feature surface: hold-queue retry topologies, dead-letter routing, coordinated consumer groups with queue-depth autoscaling, per-key FIFO delivery via consistent-hash exchange routing, and optional AMQP transactional mode for exactly-once routing on handlers with irreversible side effects.
 
 ## What you need
 
@@ -60,7 +60,7 @@ cargo add shove --features rabbitmq-transactional
 
 ## Sequenced delivery
 
-RabbitMQ enforces per-key ordering via a consistent-hash exchange and single-active-consumer (SAC) sub-queues. When you declare a sequenced topic, shove provisions a consistent-hash exchange (`{queue}-seq-hash`) and N sub-queues each configured with SAC and `prefetch=1`. The publisher routes each message by `T::sequence_key()`; the consumer processes one message at a time per shard, which guarantees that messages for the same key are never processed concurrently.
+Messages for the same key stay in order. RabbitMQ enforces per-key ordering via a consistent-hash exchange and single-active-consumer (SAC) sub-queues. When you declare a sequenced topic, shove provisions a consistent-hash exchange (`{queue}-seq-hash`) and N sub-queues each configured with SAC and `prefetch=1`. The publisher routes each message by `T::sequence_key()`; the consumer processes one message at a time per shard, which guarantees that messages for the same key are never processed concurrently.
 
 The shard count is configurable via `routing_shards(N)` in `TopologyBuilder` (default 8). More shards increase parallelism across different keys at the cost of more queues on the broker.
 
@@ -70,7 +70,7 @@ See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequ
 
 RabbitMQ consumer groups are coordinated via SAC. Call `broker.consumer_group()` and register topics with a `ConsumerGroupConfig`:
 
-```rust,ignore
+```rust,no_run
 use shove::rabbitmq::ConsumerGroupConfig as RabbitMqGroupConfig;
 use shove::{Broker, ConsumerGroupConfig, RabbitMq};
 

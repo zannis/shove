@@ -1,6 +1,6 @@
 # Kafka — Stress
 
-This example runs the shared stress-benchmark harness against a live Apache Kafka broker, sweeping handler profiles and consumer counts to measure throughput, latency percentiles, and memory overhead through the real rdkafka producer/consumer stack. Comparing results against the [InMemory stress example](/backends/inmemory/examples/stress) and [NATS stress example](/backends/nats/examples/stress) quantifies Kafka's write-ahead log persistence cost relative to other backends.
+Use this to measure Kafka throughput on your workload and compare it against the [InMemory baseline](/backends/inmemory/examples/stress) and [NATS results](/backends/nats/examples/stress). The numbers quantify Kafka's write-ahead log cost relative to lighter backends — useful data when choosing between Kafka and NATS, or when sizing partitions and consumer counts for a production deployment.
 
 ## Prerequisites
 
@@ -60,7 +60,14 @@ Throughput is typically in the thousands to tens of thousands of msg/s — highe
 
 ### Partition count and consumer ceiling
 
-The `make_cfg` closure produces `KafkaConsumerGroupConfig::new(consumers..=consumers).with_prefetch_count(prefetch)`. On Kafka, `declare` provisions exactly `consumers` partitions for the main topic. When the stress harness steps through consumer counts like `[1, 4, 8, 16, 32]`, each scenario first purges and then redeclares with the correct partition count for that scenario's consumer level. The consumer count ceiling for `scaling_efficiency` is thus the partition count — adding more consumers than partitions would leave some idle and cap throughput.
+The `make_cfg` closure produces:
+
+```rust
+KafkaConsumerGroupConfig::new(consumers..=consumers)
+    .with_prefetch_count(prefetch)
+```
+
+On Kafka, `declare` provisions exactly `consumers` partitions for the main topic. When the stress harness steps through consumer counts like `[1, 4, 8, 16, 32]`, each scenario first purges and then redeclares with the correct partition count for that scenario's consumer level. The consumer count ceiling for `scaling_efficiency` is thus the partition count — adding more consumers than partitions would leave some idle and cap throughput.
 
 ### `KafkaConsumerGroupConfig` with concurrent processing
 

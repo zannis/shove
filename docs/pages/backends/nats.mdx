@@ -1,6 +1,6 @@
 # NATS JetStream
 
-NATS JetStream is shove's lightweight-broker option — fast, simple, JetStream-backed durability. If NATS is already in your stack, this backend gives you subject-routed messaging with per-key ordering, coordinated pull consumers, and pending-message autoscaling without running a heavier broker.
+If NATS is already in your stack, this backend gives you everything you need: subject-routed messaging with per-key ordering, JetStream-backed durability, coordinated pull consumers, and pending-message autoscaling. Fast, simple, and lighter to operate than AMQP brokers.
 
 ## What you need
 
@@ -52,7 +52,7 @@ cargo add shove --features nats
 
 ## Sequenced delivery
 
-NATS uses subject-based shard routing for per-key ordering. When you declare a sequenced topic, the publisher derives a subject suffix from `T::sequence_key()` and routes to a dedicated shard subject. Each shard consumer is configured with `max_ack_pending: 1`, meaning at most one message per shard is in-flight at any time. This guarantees that messages for the same key are never processed concurrently.
+Messages for the same key stay in order. NATS uses subject-based shard routing: the publisher derives a subject suffix from `T::sequence_key()` and routes to a dedicated shard subject. Each shard consumer is configured with `max_ack_pending: 1`, meaning at most one message per shard is in-flight at a time. Messages for the same key are never processed concurrently.
 
 Different keys map to different shards and are entirely independent — one stuck key does not block others.
 
@@ -62,7 +62,7 @@ See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequ
 
 NATS consumer groups are coordinated via JetStream pull consumers with a deliver group name. Call `broker.consumer_group()` and register topics with a `ConsumerGroupConfig`:
 
-```rust,ignore
+```rust,no_run
 use shove::nats::NatsConsumerGroupConfig;
 use shove::{Broker, ConsumerGroupConfig, Nats};
 

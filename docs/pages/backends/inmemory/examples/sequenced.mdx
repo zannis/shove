@@ -1,6 +1,6 @@
 # InMemory — Sequenced
 
-This example shows per-key FIFO delivery using the in-memory backend's `run_fifo` path. Messages for three accounts (`alice`, `bob`, `carol`) are interleaved in publication order, yet each account's entries are consumed strictly in sequence — demonstrating [sequenced delivery](/guides/sequenced) and the `SequenceFailure::FailAll` error policy without any external infrastructure.
+Use this when you want to verify per-key ordering before wiring a real broker. Messages for three accounts are published in interleaved order; each account's entries arrive in strict sequence, proving that ledger-style FIFO delivery works correctly. No external infrastructure required.
 
 ## Prerequisites
 

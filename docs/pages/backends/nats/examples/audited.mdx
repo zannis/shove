@@ -1,6 +1,6 @@
 # NATS — Audited Consumer
 
-This example applies the `Audited` decorator to a NATS JetStream consumer group, proving that the `trace_id` in the `AuditRecord` is preserved across a hold-queue retry round-trip. `PaymentHandler` returns `Outcome::Retry` on the first delivery; the `StdoutAuditHandler` prints a JSON audit record for each attempt — both with the same UUID. This is the NATS counterpart to the [RabbitMQ audited example](/backends/rabbitmq/examples/audited).
+Use this when you need to confirm that audit trace IDs survive hold-queue retries on NATS. The handler returns `Outcome::Retry` on first delivery; both attempts emit an audit record with the same UUID, demonstrating that the `trace_id` propagates correctly through JetStream's header mechanism.
 
 ## Prerequisites
 

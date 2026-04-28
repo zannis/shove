@@ -75,7 +75,7 @@ export default defineConfig({
       text: 'Backends',
       collapsed: false,
       items: [
-        { text: 'Choosing a Backend', link: '/backends/choosing' },
+        { text: 'Integrate with your stack', link: '/backends/choosing' },
         {
           text: 'RabbitMQ',
           collapsed: true,

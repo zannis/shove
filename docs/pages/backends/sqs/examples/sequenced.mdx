@@ -1,6 +1,6 @@
 # SQS — Sequenced Pubsub
 
-This example runs the same `SkipLedger` vs `StrictLedger` comparison found in the [RabbitMQ sequenced example](/backends/rabbitmq/examples/sequenced), but against an SQS backend via LocalStack. Messages for two accounts are published in interleaved order; `SequenceFailure::Skip` lets the sequence continue after a single poisoned entry while `SequenceFailure::FailAll` quarantines all subsequent entries for the same key. The example asserts exact totals to prove the policies behave correctly.
+Use this when you need to verify sequenced delivery semantics on SQS: `SequenceFailure::Skip` lets a sequence continue after one bad message; `SequenceFailure::FailAll` quarantines the rest. The example asserts exact totals for both policies, giving you a concrete end-to-end test you can run against LocalStack before deploying to AWS.
 
 ## Prerequisites
 

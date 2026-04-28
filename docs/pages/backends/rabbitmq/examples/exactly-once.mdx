@@ -1,6 +1,6 @@
 # RabbitMQ — Exactly-Once
 
-This example demonstrates how `ConsumerOptions::<RabbitMq>::with_exactly_once()` wraps every routing decision in an AMQP transaction, closing the window between the hold-queue publish and the ack that can produce duplicate deliveries under at-least-once semantics. Three topics exercise the three routing outcomes in transactional mode: ack, retry-then-ack, and reject-to-DLQ.
+Use this when you need to eliminate duplicate deliveries for handlers with irreversible side effects — payment charges, outbound notifications, external API calls without idempotency tokens. The example shows how a single `with_exactly_once()` call wraps every routing decision in an AMQP transaction, covering all three routing paths: ack, retry-then-ack, and reject-to-DLQ.
 
 ## Prerequisites
 
