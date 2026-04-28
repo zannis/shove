@@ -5,7 +5,10 @@ layout: landing
 import { HomePage } from 'vocs/components'
 
 <HomePage.Root>
-  <HomePage.Logo />
+  <div className="vocs_HomePage_logo">
+    <img alt="shove" className="vocs_Logo vocs_Logo_logoLight" src="/shove-hero.svg" />
+    <img alt="shove" className="vocs_Logo vocs_Logo_logoDark" src="/shove-hero-dark.svg" />
+  </div>
   <HomePage.Tagline>Type-safe async pub/sub for Rust</HomePage.Tagline>
   <HomePage.Description>
     One typed-topic API across RabbitMQ, AWS SNS+SQS, NATS JetStream, Apache Kafka, and an in-process backend. Retries, hold queues, DLQs, sequenced delivery, consumer groups, autoscaling, and audit logging — built in.
