@@ -67,6 +67,253 @@ pub(crate) fn names() -> &'static MetricNames {
     })
 }
 
+use crate::outcome::Outcome;
+
+/// Stable string label for an [`Outcome`]. Stays low-cardinality (4 values).
+#[allow(dead_code)]
+pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
+    match o {
+        Outcome::Ack => "ack",
+        Outcome::Retry => "retry",
+        Outcome::Reject => "reject",
+        Outcome::Defer => "defer",
+    }
+}
+
+/// Reason categories for messages that failed before reaching the handler.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum FailReason {
+    Oversize,
+    Deserialize,
+    PendingFull,
+    Timeout,
+}
+
+#[allow(dead_code)]
+impl FailReason {
+    pub(crate) fn as_label(self) -> &'static str {
+        match self {
+            FailReason::Oversize => "oversize",
+            FailReason::Deserialize => "deserialize",
+            FailReason::PendingFull => "pending_full",
+            FailReason::Timeout => "timeout",
+        }
+    }
+}
+
+/// Backend identifier label values used in `backend_errors_total`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum BackendLabel {
+    InMemory,
+    RabbitMq,
+    Kafka,
+    Nats,
+    SnsSqs,
+}
+
+#[allow(dead_code)]
+impl BackendLabel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            BackendLabel::InMemory => "inmemory",
+            BackendLabel::RabbitMq => "rabbitmq",
+            BackendLabel::Kafka => "kafka",
+            BackendLabel::Nats => "nats",
+            BackendLabel::SnsSqs => "sns_sqs",
+        }
+    }
+}
+
+/// Backend error category for `backend_errors_total{kind}`.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum BackendErrorKind {
+    Connection,
+    Publish,
+    Consume,
+    Topology,
+    Ack,
+}
+
+#[allow(dead_code)]
+impl BackendErrorKind {
+    pub(crate) fn as_label(self) -> &'static str {
+        match self {
+            BackendErrorKind::Connection => "connection",
+            BackendErrorKind::Publish => "publish",
+            BackendErrorKind::Consume => "consume",
+            BackendErrorKind::Topology => "topology",
+            BackendErrorKind::Ack => "ack",
+        }
+    }
+}
+
+const DEFAULT_GROUP: &str = "default";
+
+#[allow(dead_code)]
+pub(crate) fn group_label(group: Option<&str>) -> &str {
+    group.unwrap_or(DEFAULT_GROUP)
+}
+
+// ---------------------------------------------------------------------------
+// Emission helpers — `#[cfg(feature = "metrics")]` real bodies; no-op stubs
+// when the feature is off.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_consumed(topic: &str, group: Option<&str>, outcome: &Outcome) {
+    ::metrics::counter!(
+        names().messages_consumed_total,
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "outcome" => outcome_label(outcome),
+    )
+    .increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason) {
+    ::metrics::counter!(
+        names().messages_failed_total,
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "reason" => reason.as_label(),
+    )
+    .increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_failed(_: &str, _: Option<&str>, _: FailReason) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_published(topic: &str, ok: bool) {
+    let outcome = if ok { "success" } else { "error" };
+    ::metrics::counter!(
+        names().messages_published_total,
+        "topic" => topic.to_string(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_published(_: &str, _: bool) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_processing_duration(
+    topic: &str,
+    group: Option<&str>,
+    outcome: &Outcome,
+    elapsed_secs: f64,
+) {
+    ::metrics::histogram!(
+        names().message_processing_duration_seconds,
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "outcome" => outcome_label(outcome),
+    )
+    .record(elapsed_secs);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_processing_duration(_: &str, _: Option<&str>, _: &Outcome, _: f64) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_publish_duration(topic: &str, ok: bool, elapsed_secs: f64) {
+    let outcome = if ok { "success" } else { "error" };
+    ::metrics::histogram!(
+        names().message_publish_duration_seconds,
+        "topic" => topic.to_string(),
+        "outcome" => outcome,
+    )
+    .record(elapsed_secs);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_publish_duration(_: &str, _: bool, _: f64) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize) {
+    ::metrics::histogram!(
+        names().message_size_bytes,
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+    )
+    .record(bytes as f64);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_message_size(_: &str, _: Option<&str>, _: usize) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn inc_inflight(topic: &str, group: Option<&str>) {
+    ::metrics::gauge!(
+        names().messages_inflight,
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+    )
+    .increment(1.0);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn inc_inflight(_: &str, _: Option<&str>) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn dec_inflight(topic: &str, group: Option<&str>) {
+    ::metrics::gauge!(
+        names().messages_inflight,
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+    )
+    .decrement(1.0);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn dec_inflight(_: &str, _: Option<&str>) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn set_consumer_workers(group: &str, workers: i64) {
+    ::metrics::gauge!(
+        names().consumer_workers,
+        "consumer_group" => group.to_string(),
+    )
+    .set(workers as f64);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn set_consumer_workers(_: &str, _: i64) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_autoscaler_decision(group: &str, direction: &'static str) {
+    ::metrics::counter!(
+        names().autoscaler_decisions_total,
+        "consumer_group" => group.to_string(),
+        "direction" => direction,
+    )
+    .increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_autoscaler_decision(_: &str, _: &'static str) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_backend_error(backend: BackendLabel, kind: BackendErrorKind) {
+    ::metrics::counter!(
+        names().backend_errors_total,
+        "backend" => backend.as_str(),
+        "kind" => kind.as_label(),
+    )
+    .increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_backend_error(_: BackendLabel, _: BackendErrorKind) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
