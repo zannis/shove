@@ -799,14 +799,17 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
+    let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
+        Ok(pair) => pair,
+        Err(o) => return o,
+    };
+
     crate::metrics::inc_inflight(topic, group);
     let start = std::time::Instant::now();
-    let outcome = match prepare_message::<T>(env, max_size, topic, group) {
-        Ok((message, metadata)) => {
-            run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt, topic, group).await
-        }
-        Err(o) => o,
-    };
+    let outcome = run_handler::<T, H>(
+        handler, ctx, message, metadata, timeout_opt, topic, group,
+    )
+    .await;
     let elapsed = start.elapsed().as_secs_f64();
     crate::metrics::record_consumed(topic, group, &outcome);
     crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
