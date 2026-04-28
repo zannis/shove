@@ -8,6 +8,17 @@ license = "MIT"
 repository = "https://github.com/zannis/shove"
 keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
 categories = ["asynchronous"]
+exclude = [
+    "docs/",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "vocs.config.ts",
+    "wrangler.toml",
+    ".github/workflows/docs-build.yml",
+    ".github/workflows/docs-preview.yml",
+    "node_modules/",
+]
 
 [lints.clippy]
 absolute-paths = "deny"

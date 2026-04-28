@@ -1,0 +1,17 @@
+# Integrate with your existing stack
+
+`shove` sits on top of the broker you already run. Drop it into your code, point it at your broker, and your handlers get retries, ordering, consumer groups, and audit logging without rewriting the rest of your service.
+
+## Per-broker setup
+
+- **[RabbitMQ →](/backends/rabbitmq)** — consistent-hash routing, ordering shards via single-active-consumer, optional exactly-once via AMQP transactions.
+- **[AWS SNS + SQS →](/backends/sqs)** — fully managed; SNS fanout, SQS polling. Uses `consumer_supervisor()` since SQS has no coordinated-group primitive.
+- **[NATS JetStream →](/backends/nats)** — subject-based shard routing for per-key ordering, JetStream-backed durability.
+- **[Apache Kafka →](/backends/kafka)** — partition-key routing, native consumer groups with consumer-lag autoscaling, log retention for replay.
+- **[In-process →](/backends/inmemory)** — zero-dependency, in-RAM. For tests and single-process apps; same API as the durable backends.
+
+## Same code, every broker
+
+The `Topic` definition, the `MessageHandler` impl, and the call sites stay identical no matter which broker you point your `Broker\<B\>` at. Tests run against `InMemory`; production runs against your real broker; the application code doesn't change.
+
+It is normal to have multiple `Broker\<B\>` instances in one process. A common pattern is `Broker\<InMemory\>` in tests and `Broker\<RabbitMq\>` (or another durable backend) in production, with the same `define_topic!` and handler code feeding both.

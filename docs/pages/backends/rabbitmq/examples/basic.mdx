@@ -1,0 +1,73 @@
+# RabbitMQ — Basic Pubsub
+
+Use this as your starting point for RabbitMQ integration: it covers every non-sequenced topology shape (minimal queue, DLQ, escalating retry backoff, deferred delivery), all four `Outcome` variants, and all three publish variants against a real broker. The canonical reference for how [topic definitions](/concepts/topics) and [handler outcomes](/concepts/outcomes) map to RabbitMQ.
+
+## Prerequisites
+
+- Docker (a RabbitMQ testcontainer is spun up automatically — no manual `docker run` needed)
+- Cargo feature: `rabbitmq`
+
+## Run
+
+```sh
+cargo run --example rabbitmq_basic_pubsub --features rabbitmq
+```
+
+## Expected output
+
+```text
+topologies declared
+
+messages published
+
+[minimal] order=ORD-001 amount=$50.00 attempt=1
+[minimal] order=ORD-002 amount=$99.00 attempt=1
+[minimal] order=ORD-003 amount=$10.00 attempt=1
+[minimal] order=ORD-004 amount=$25.00 attempt=1
+[minimal] order=ORD-005 amount=$77.77 attempt=1
+[dlq] rejecting order=ORD-001 → DLQ
+[dlq] dead-letter: order=ORD-001 reason=rejected deaths=1
+[retry] order=ORD-001 attempt=1
+[retry]   → transient failure, will Retry
+[retry] order=ORD-001 attempt=2
+[retry]   → success on retry
+[defer] order=ORD-001 attempt=1 redelivered=false
+[defer]   → not ready yet, deferring to hold queue
+[defer] order=ORD-001 attempt=1 redelivered=true
+[defer]   → processing now
+done
+```
+
+## Source
+
+```rust
+// [!include ~/examples/rabbitmq/basic_pubsub.rs]
+```
+
+## Walkthrough
+
+### Four topic shapes with `define_topic!`
+
+The example defines four topics using two different approaches. `MinimalOrder`, `DlqOrder`, and `RetryOrder` all use the `define_topic!` macro — a shorthand that generates the `Topic` impl, the `OnceLock` topology cell, and a zero-sized struct in one call. `ScheduledOrder` is declared manually to show the `OnceLock` pattern explicitly; this form is needed when the topic needs to use `Outcome::Defer` (which requires the hold queue TTL to be read from the topology). The `RetryOrder` topology chains three `.hold_queue()` calls to create escalating backoff stages: 5 s → 30 s → 120 s.
+
+### All four `Outcome` variants in action
+
+- `AckHandler` always returns `Outcome::Ack` — the message is removed from the queue.
+- `RejectHandler` returns `Outcome::Reject` — the message is immediately routed to the DLQ without using up a retry slot. It also implements `handle_dead` to process messages that arrive on the DLQ itself.
+- `RetryHandler` checks `metadata.retry_count`: on the first attempt it returns `Outcome::Retry`, which sends the message through the hold queue and back. On the second attempt it acks.
+- `DeferHandler` returns `Outcome::Defer` on first delivery when `metadata.redelivered == false`. Unlike `Retry`, `Defer` routes through the hold queue without incrementing the retry counter — the message comes back as if it were a fresh delivery.
+
+### Consumer supervisor
+
+`broker.consumer_supervisor()` creates a `ConsumerSupervisor\<RabbitMq\>`. Each `supervisor.register(handler, options)` call spawns one AMQP channel/consumer for that topic. The supervisor owns a shared shutdown token, so `run_until_timeout` stops every registered consumer in lock-step and drains in-flight messages before returning. `with_max_retries(3)` on `RetryOrder` ensures messages that exhaust their retries are sent to the DLQ rather than looping indefinitely.
+
+### Publish variants
+
+`publisher.publish::<T>(&msg)` sends a single message. `publish_with_headers::<T>(&msg, headers)` attaches custom AMQP headers (the example uses `x-source` and `x-priority`). `publish_batch::<T>(&[msg])` sends multiple messages in a single channel operation — more efficient for bursts. All three variants share the same type-checked routing; the compiler rejects publishing the wrong message type for a given topic.
+
+## What to try next
+
+- Change `Outcome::Retry` to `Outcome::Defer` in `RetryHandler` — notice that `metadata.retry_count` no longer increments on re-delivery.
+- Add a fourth `.hold_queue(Duration::from_secs(300))` to `RetryOrder` — messages get a fourth retry stage at 5 minutes.
+- Remove `.dlq()` from `MinimalOrder` — rejected messages are silently discarded (you will see a warning log from the framework).
+- See [Guides: Retries](/guides/retries) for a full explanation of hold queues and retry limits.

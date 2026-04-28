@@ -13,6 +13,7 @@ use shove::{
     TopologyBuilder,
 };
 
+// [!region topic]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ping {
     id: u32,
@@ -27,7 +28,9 @@ impl Topic for PingTopic {
         T.get_or_init(|| TopologyBuilder::new("ping").dlq().build())
     }
 }
+// [!endregion topic]
 
+// [!region handler]
 #[derive(Clone)]
 struct PingHandler {
     count: Arc<AtomicUsize>,
@@ -40,22 +43,29 @@ impl MessageHandler<PingTopic> for PingHandler {
         Outcome::Ack
     }
 }
+// [!endregion handler]
 
 #[tokio::main]
 async fn main() {
+    // [!region main]
     tracing_subscriber::fmt::init();
 
+    // [!region connect]
     let broker = Broker::<InMemory>::new(InMemoryConfig::default())
         .await
         .expect("connect InMemory");
+    // [!endregion connect]
+    // [!region declare]
     broker
         .topology()
         .declare::<PingTopic>()
         .await
         .expect("declare");
+    // [!endregion declare]
 
     let count = Arc::new(AtomicUsize::new(0));
 
+    // [!region consume]
     let mut group = broker.consumer_group();
     let c = count.clone();
     group
@@ -68,6 +78,7 @@ async fn main() {
         .await
         .expect("register");
 
+    // [!region publish]
     let publisher = broker.publisher().await.expect("publisher");
     for i in 0..5 {
         publisher
@@ -78,6 +89,7 @@ async fn main() {
             .await
             .expect("publish");
     }
+    // [!endregion publish]
 
     // Stop when all five messages have been processed (or after 5 s).
     let stop = CancellationToken::new();
@@ -98,6 +110,8 @@ async fn main() {
             Duration::from_secs(5),
         )
         .await;
+    // [!endregion consume]
 
     std::process::exit(outcome.exit_code());
+    // [!endregion main]
 }

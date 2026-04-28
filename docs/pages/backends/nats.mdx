@@ -1,0 +1,94 @@
+# NATS JetStream
+
+If NATS is already in your stack, this backend gives you everything you need: subject-routed messaging with per-key ordering, JetStream-backed durability, coordinated pull consumers, and pending-message autoscaling. Fast, simple, and lighter to operate than AMQP brokers.
+
+## What you need
+
+A NATS server with JetStream enabled. For local dev:
+
+```sh
+docker run --rm -p 4222:4222 nats:latest -js
+```
+
+The `-js` flag enables JetStream on the server. JetStream streams are provisioned automatically when you call `topology().declare::<T>()`.
+
+## Install
+
+```sh
+cargo add shove --features nats
+```
+
+## Connect
+
+```rust
+// [!include ~/examples/nats/basic.rs:connect]
+```
+
+`NatsConfig::new` takes a NATS server URL. Authentication (user/password, token, NKey, credentials file) is configured via the `async-nats` connection options — extend `NatsConfig` with the relevant builder if your server requires auth.
+
+## Declare topology
+
+```rust
+// [!include ~/examples/nats/basic.rs:declare]
+```
+
+`topology().declare::<T>()` provisions JetStream streams for the topic: the main stream, plus a DLQ stream when `.dlq()` is configured. Sequenced topics declare a single main stream with subject shards (`{queue}.shard.{N}`). Durable consumers are not created here — the consumer runtime creates them on demand when you start consuming. The call is idempotent and safe to invoke on every startup.
+
+## Publish
+
+```rust
+// [!include ~/examples/nats/basic.rs:publish]
+```
+
+`publisher().await?` returns a `Publisher<Nats>` that publishes to the JetStream stream. Each message is acknowledged by JetStream before `publish` returns.
+
+## Consume
+
+```rust
+// [!include ~/examples/nats/basic.rs:consume]
+```
+
+`consumer_group()` creates a coordinated pull consumer backed by a JetStream durable deliver-group. `NatsConsumerGroupConfig::new(min..=max)` sets the autoscale bounds. The group coordinates via JetStream — only one consumer processes a given message at a time.
+
+## Sequenced delivery
+
+Messages for the same key stay in order. NATS uses subject-based shard routing: the publisher derives a subject suffix from `T::sequence_key()` and routes to a dedicated shard subject. Each shard consumer is configured with `max_ack_pending: 1`, meaning at most one message per shard is in-flight at a time. Messages for the same key are never processed concurrently.
+
+Different keys map to different shards and are entirely independent — one stuck key does not block others.
+
+See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/nats/examples/sequenced) for a runnable walkthrough.
+
+## Consumer groups + autoscaling
+
+NATS consumer groups are coordinated via JetStream pull consumers with a deliver group name. Call `broker.consumer_group()` and register topics with a `ConsumerGroupConfig`:
+
+```rust,no_run
+use shove::nats::NatsConsumerGroupConfig;
+use shove::{Broker, ConsumerGroupConfig, Nats};
+
+let mut group = broker.consumer_group();
+group
+    .register::<OrderTopic, _>(
+        ConsumerGroupConfig::new(NatsConsumerGroupConfig::new(1..=4)),
+        || MyHandler,
+    )
+    .await?;
+```
+
+The autoscaler reads the JetStream pending message count and adjusts the number of active pull consumers within the `min..=max` range.
+
+See the [Basic example](/backends/nats/examples/basic) for a complete runnable walkthrough.
+
+## Gotchas
+
+- **Stream provisioning at declaration time.** `topology().declare::<T>()` creates JetStream streams with default storage limits. Ensure stream limits (max bytes, max messages, max message size) match your expected load — streams that hit their limits drop or reject new messages depending on the retention policy.
+- **De-duplication via `Nats-Msg-Id`.** shove sets the `Nats-Msg-Id` header on every publish (a fresh UUID per call). JetStream de-duplicates within a configurable window (default 120 seconds) — if a publisher retries the same logical message inside that window, JetStream rejects the duplicate. Note that the header is generated per-publish-call, so deduplicating across application-level retries requires the caller to pass a stable id via `publish_with_headers`.
+- **Work-queue semantics assumed.** shove provisions JetStream streams with work-queue (interest-based delete-on-ack) semantics. Streams are not shared across consumer groups with different group names — each `consumer_group()` registration gets its own durable consumer on the shared stream.
+- **JetStream must be enabled on the server.** Connecting to a server without JetStream and calling `topology().declare::<T>()` will return an error. The `-js` flag is required on the NATS server.
+
+## Examples
+
+- [Basic](/backends/nats/examples/basic) — publish/consume round trip with hold queues and DLQ
+- [Sequenced](/backends/nats/examples/sequenced) — subject-shard ordering
+- [Audited Consumer](/backends/nats/examples/audited) — `MessageHandlerExt::audited` wrapping
+- [Stress](/backends/nats/examples/stress) — throughput benchmarking

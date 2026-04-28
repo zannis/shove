@@ -52,10 +52,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
     let bootstrap = format!("127.0.0.1:{port}");
 
+    // [!region connect]
     let broker = Broker::<Kafka>::new(KafkaConfig::new(&bootstrap)).await?;
+    // [!endregion connect]
+    // [!region declare]
     broker.topology().declare::<OrderTopic>().await?;
+    // [!endregion declare]
 
     // Publish
+    // [!region publish]
     let publisher = broker.publisher().await?;
     for i in 0..3 {
         publisher
@@ -66,8 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         println!("Published order ORD-{i}");
     }
+    // [!endregion publish]
 
     // Consume via a coordinated consumer group.
+    // [!region consume]
     let mut group = broker.consumer_group();
     group
         .register::<OrderTopic, _>(
@@ -88,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(10),
         )
         .await;
+    // [!endregion consume]
 
     println!("Done.");
     std::process::exit(outcome.exit_code());

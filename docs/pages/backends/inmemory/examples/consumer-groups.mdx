@@ -1,0 +1,59 @@
+# InMemory — Consumer Groups
+
+Use this when you want to see how consumer groups scale workers to match queue depth. One hundred messages are published and processed by three to six workers in parallel, each simulating 5 ms of I/O — a practical demonstration of the min/max worker range and prefetch configuration, all in-process.
+
+## Prerequisites
+
+No external services required. The in-memory backend runs entirely in-process.
+
+- Cargo feature: `inmemory`
+
+## Run
+
+```sh
+cargo run --example inmemory_consumer_groups --features inmemory
+```
+
+## Expected output
+
+Lines arrive in non-deterministic order because workers process messages concurrently. After all 100 messages are consumed you will see a final summary:
+
+```text
+processed work id=0
+processed work id=3
+processed work id=1
+...
+processed work id=99
+processed 100 messages
+```
+
+## Source
+
+```rust
+// [!include ~/examples/inmemory/consumer_groups.rs]
+```
+
+## Walkthrough
+
+### Topic and worker definition
+
+`WorkTopic` has a minimal topology: a `"work"` queue with a DLQ and no sequencing. `Worker` simulates realistic I/O with `tokio::time::sleep(Duration::from_millis(5))` before returning `Outcome::Ack`. The `Arc<AtomicUsize>` counter is shared across all worker instances so the main thread can observe the running total.
+
+### Dynamic worker range
+
+`InMemoryConsumerGroupConfig::new(3..=6)` declares a minimum of 3 and a maximum of 6 concurrent workers. The consumer group starts workers up to the minimum immediately and may spawn additional workers (up to the maximum) as queue depth warrants. With 100 messages and 5 ms per handler, the group has meaningful work to justify scaling toward 6 workers. `with_prefetch_count(4)` lets each worker hold up to 4 messages at a time, reducing per-message scheduling overhead.
+
+### Shutdown pattern
+
+A background task polls the `count` AtomicUsize every 20 ms and cancels the `CancellationToken` once all 100 messages have been processed — or after a 30-second hard deadline. The final `println!` reports the actual count consumed, which should always be 100 on a successful run.
+
+### Factory closure and `Clone`
+
+`group.register` takes a factory `move || Worker { count: c.clone() }`. The closure is called once per spawned worker, so each worker gets its own `Worker` instance with a cloned `Arc` pointing to the shared counter. The `Clone` derive on `Worker` is what enables this — each call to the factory produces a fresh value, but all share the same underlying atomic.
+
+## What to try next
+
+- Narrow the range to `new(1..=1)` — all 100 messages are processed sequentially and total wall-clock time grows to roughly 500 ms.
+- Widen the range to `new(1..=32)` — measure how throughput scales as more workers saturate the queue.
+- Increase `with_prefetch_count(4)` to `with_prefetch_count(16)` — observe fewer scheduling round-trips per message at the cost of head-of-line blocking if a slow message stalls a worker.
+- See [Guides: Groups](/guides/groups) for how the group adapts its worker count at runtime.

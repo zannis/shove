@@ -1,0 +1,80 @@
+# RabbitMQ — Concurrent Pubsub
+
+Use this when deciding whether to enable concurrent processing for I/O-bound handlers. A 100 ms handler processes 20 messages sequentially in ~2 s; the same handler with `with_concurrent_processing` processes them in ~0.2 s — a 10x speedup visible in the printed summary. The example also confirms that acknowledgements remain in-order regardless of which mode is active.
+
+## Prerequisites
+
+- Docker (a RabbitMQ testcontainer is spun up automatically)
+- Cargo feature: `rabbitmq`
+
+## Run
+
+```sh
+cargo run --example rabbitmq_concurrent_pubsub --features rabbitmq
+```
+
+## Expected output
+
+```text
+--- Sequential (prefetch_count=1) ---
+  20 messages, 100ms handler delay, prefetch=1
+  processed task 0
+  processed task 1
+  ...
+  done: 2.1s (10 msg/s)
+
+--- Concurrent (prefetch_count=20) ---
+  20 messages, 100ms handler delay, prefetch=20
+  processed task 0
+  processed task 3
+  ...
+  done: 0.2s (107 msg/s)
+
+--- Summary ---
+  sequential:  2.1s (10 msg/s)
+  concurrent:  0.2s (107 msg/s)
+  speedup:     10.1x
+
+  Messages are always acked in delivery order.
+  Concurrent mode overlaps handler I/O within a single consumer.
+```
+
+Exact numbers vary by system; expect a speedup close to the prefetch count (20x theoretical).
+
+## Source
+
+```rust
+// [!include ~/examples/rabbitmq/concurrent_pubsub.rs]
+```
+
+## Walkthrough
+
+### Handler design
+
+`SlowTaskHandler` wraps an `Arc<AtomicU32>` counter and an `Arc<tokio::sync::Notify>` signal. The handler sleeps for `self.delay` (100 ms) to simulate an I/O operation, then increments the counter and notifies any waiters. The `wait_for(target, timeout)` method polls the counter and wakes on `Notify`, letting the main task stop the supervisor as soon as the last message is processed rather than waiting on a fixed timer.
+
+### Sequential vs concurrent modes
+
+The example calls `run_round` twice. For the sequential round: `prefetch=1` (at most one message in-flight) and `concurrent=false`. For the concurrent round: `prefetch=20` and `concurrent=true`. The key option is:
+
+```rust,no_run
+ConsumerOptions::<RabbitMq>::new()
+    .with_concurrent_processing(concurrent)
+```
+
+When `true`, the consumer spawns each handler invocation as a separate tokio task, allowing up to `prefetch` handlers to run simultaneously. Acknowledgements are still sent in delivery order, so the broker's message ordering guarantees are maintained.
+
+### Queue management between rounds
+
+`purge_queue` calls the RabbitMQ Management HTTP API (`DELETE /api/queues/%2F/{name}/contents`) between the two rounds to ensure the second round starts from a clean slate. The hold queue (named `{queue}-hold-5s`) is also purged to avoid stale retries bleeding into the concurrent run.
+
+### Speedup calculation
+
+After both rounds complete, the example computes `speedup = sequential_duration / concurrent_duration`. With 20 messages at 100 ms each and prefetch 20, theoretical peak is 20x; real numbers are slightly lower due to tokio scheduling overhead. `assert!(outcome.is_clean())` verifies the supervisor drained cleanly (no error exits) after each round.
+
+## What to try next
+
+- Lower `prefetch` to 5 while keeping `concurrent=true` — the speedup should converge toward 5x since at most 5 handlers run at once.
+- Increase `msg_count` to 200 — the sequential time grows linearly while concurrent time stays roughly constant until the prefetch window fills.
+- Set `handler_delay` to 0 ms — the speedup collapses to ~1x because there is no I/O to overlap; sequential and concurrent modes perform identically for CPU-bound handlers.
+- See [Concepts: Handlers](/concepts/handlers) for the in-order acknowledgement guarantee and how concurrent mode interacts with prefetch.

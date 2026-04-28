@@ -7,7 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerOptionsInner};
 use crate::error::{Result, ShoveError};
-use crate::markers::*;
+#[cfg(feature = "nats")]
+use crate::markers::Nats;
+#[cfg(feature = "rabbitmq-transactional")]
+use crate::markers::RabbitMq;
+#[cfg(feature = "aws-sns-sqs")]
+use crate::markers::Sqs;
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -329,7 +334,7 @@ mod tests {
     // Tests use the InMemory marker when available; otherwise fall back to
     // any enabled backend marker.
     #[cfg(feature = "inmemory")]
-    type TestBackend = InMemory;
+    type TestBackend = crate::markers::InMemory;
 
     #[cfg(all(not(feature = "inmemory"), feature = "kafka"))]
     type TestBackend = crate::markers::Kafka;

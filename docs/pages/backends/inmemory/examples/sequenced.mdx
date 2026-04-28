@@ -1,0 +1,59 @@
+# InMemory — Sequenced
+
+Use this when you want to verify per-key ordering before wiring a real broker. Messages for three accounts are published in interleaved order; each account's entries arrive in strict sequence, proving that ledger-style FIFO delivery works correctly. No external infrastructure required.
+
+## Prerequisites
+
+No external services required. The in-memory backend runs entirely in-process.
+
+- Cargo feature: `inmemory`
+
+## Run
+
+```sh
+cargo run --example inmemory_sequenced --features inmemory
+```
+
+## Expected output
+
+Output order within a single account is always ascending (`seq=0` before `seq=1`), but entries for different accounts may interleave:
+
+```text
+applied entry account=alice seq=0 amount=+100
+applied entry account=bob seq=0 amount=+100
+applied entry account=carol seq=0 amount=+100
+applied entry account=alice seq=1 amount=+100
+applied entry account=bob seq=1 amount=+100
+...
+```
+
+## Source
+
+```rust
+// [!include ~/examples/inmemory/sequenced.rs]
+```
+
+## Walkthrough
+
+### Topic definition with sequence key
+
+`LedgerTopic` implements both `Topic` and `SequencedTopic`. The topology is built with `.sequenced(SequenceFailure::FailAll)` — if any message for an account fails, all subsequent messages for that account are also failed immediately rather than left queued. `.routing_shards(4)` tells the broker to spread keys across four in-memory shard channels, which improves parallelism when many distinct keys are in flight. `.hold_queue(Duration::from_millis(50))` configures a 50 ms retry delay before a failed message is redelivered.
+
+### Sequence key function
+
+`SEQUENCE_KEY_FN` is set to `Some(Self::sequence_key)`, which extracts `msg.account` as a `String`. The broker uses this function to route each `LedgerEntry` to the correct FIFO lane — messages with the same account name always land in the same shard and are processed one at a time.
+
+### Backend-specific consumer path
+
+Because per-key FIFO (`run_fifo`) is not yet exposed on the generic `Broker\<B\>` / `ConsumerGroup\<B\>` API, this example drops down to the concrete `InMemoryConsumer` type directly. `ConsumerOptions::<InMemory>::new().with_prefetch_count(1)` keeps exactly one message in-flight per consumer, which is the correct setting for strict FIFO — allowing more would let the consumer pick up a later message for the same key before finishing the earlier one.
+
+### Shutdown after all messages land
+
+The main thread busy-loops on `acked.load(Ordering::Relaxed) < 15` (five sequence numbers × three accounts) before calling `shutdown.cancel()`. This pattern is simple for a bounded benchmark; in production you would instead react to an external signal (see [Guides: Shutdown](/guides/shutdown)).
+
+## What to try next
+
+- Change `SequenceFailure::FailAll` to `SequenceFailure::FailOne` — observe that only the individual failing message is retried; subsequent messages for the same account are not held back.
+- Remove `.routing_shards(4)` — all keys collapse into a single shard; per-key parallelism disappears and throughput drops proportionally.
+- Add a second hold queue stage with `.hold_queue(Duration::from_secs(1))` — failed entries wait longer before redelivery.
+- Read [Guides: Sequenced](/guides/sequenced) for a deeper explanation of shard routing and failure modes.

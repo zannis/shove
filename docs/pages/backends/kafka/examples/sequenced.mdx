@@ -1,0 +1,59 @@
+# Kafka — Sequenced
+
+Use this when you need per-entity FIFO ordering on Kafka. Events for two users are published in interleaved order; each user's events arrive strictly in sequence. The example also highlights the key Kafka constraint: partition count caps the maximum number of active consumers, so partition count must be planned before topic creation.
+
+## Prerequisites
+
+- Docker (an Apache Kafka testcontainer is started automatically)
+- Cargo feature: `kafka`
+
+## Run
+
+```sh
+cargo run --example kafka_sequenced --features kafka
+```
+
+## Expected output
+
+Events for each user arrive in `seq` order, but events for different users may interleave across shards:
+
+```text
+Published 10 events (5 per user)
+[user=alice] action=action-0 seq=0 (retry=0)
+[user=bob] action=action-0 seq=0 (retry=0)
+[user=alice] action=action-1 seq=1 (retry=0)
+[user=bob] action=action-1 seq=1 (retry=0)
+...
+Done.
+```
+
+## Source
+
+```rust
+// [!include ~/examples/kafka/sequenced.rs]
+```
+
+## Walkthrough
+
+### Partition-key routing on Kafka
+
+`UserEventTopic` uses `.routing_shards(4)` which on Kafka means 4 Kafka partitions on the main topic. The key function `|msg: &UserEvent| msg.user_id.clone()` is hashed (consistent hashing) to select a partition; all events for the same user always land on the same partition. Within a Kafka partition messages are stored in strict append order — this is the mechanism that gives shove its per-key ordering guarantee. Changing the partition count requires deleting and recreating the topic; Kafka can only expand, not shrink.
+
+### `KafkaConsumer::run_fifo` and the partition constraint
+
+`KafkaConsumer::new(client).run_fifo::<UserEventTopic, _>(handler, ctx, opts)` is the backend-specific path for per-key FIFO (not yet exposed on the generic `ConsumerGroup\<Kafka\>` API). With 4 partitions and 1 consumer, the consumer owns all 4 partitions. Adding a second consumer triggers a Kafka rebalance and each consumer is assigned 2 partitions. If the consumer count exceeds the partition count, some consumers receive no partitions and sit idle — a Kafka-specific constraint that does not apply to AMQP or JetStream backends.
+
+### `SequenceFailure::Skip` and DLQ routing
+
+`.sequenced(SequenceFailure::Skip)` means that if a message for `alice` is rejected, only that message goes to the DLQ; subsequent messages for `alice` continue to be processed. The rejected message is published to the DLQ topic by the framework before the consumer commits its offset, ensuring at-least-once delivery for the DLQ entry even across consumer restarts.
+
+### Cancellation token shutdown
+
+`CancellationToken::new()` is cancelled after 5 seconds by a spawned task. `ConsumerOptions::<Kafka>::new().with_shutdown(shutdown)` passes the token to `run_fifo`, which stops polling and drains when the token fires. `client.shutdown().await` then closes the rdkafka connections cleanly.
+
+## What to try next
+
+- Change `routing_shards(4)` to `routing_shards(8)` and `consumers` to 8 in `KafkaConsumerGroupConfig` — each partition gets exactly one consumer, maximising parallelism with no idle consumers.
+- Switch `SequenceFailure::Skip` to `SequenceFailure::FailAll` and make the handler reject `alice seq=2` — all subsequent messages for Alice are DLQ'd while Bob's sequence continues.
+- Increase the consumer count beyond the partition count — observe that the extra consumers sit idle (no partitions assigned) and log a warning.
+- Read [Guides: Sequenced](/guides/sequenced) for a full explanation of shard routing and failure modes across backends.

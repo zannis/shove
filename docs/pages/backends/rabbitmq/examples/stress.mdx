@@ -1,0 +1,90 @@
+# RabbitMQ — Stress
+
+Use this to measure RabbitMQ throughput on your own hardware and compare it against the [InMemory baseline](/backends/inmemory/examples/stress) to quantify the AMQP round-trip cost. The harness sweeps handler profiles and consumer counts, making it straightforward to find the prefetch and concurrency configuration that maximises throughput for your workload.
+
+## Prerequisites
+
+- Docker (a RabbitMQ testcontainer with the `rabbitmq_consistent_hash_exchange` plugin is started automatically)
+- Cargo feature: `rabbitmq`
+
+## Run
+
+```sh
+cargo run --example rabbitmq_stress --features rabbitmq
+```
+
+Narrow to a single tier or handler profile:
+
+```sh
+cargo run --example rabbitmq_stress --features rabbitmq -- --tier moderate --handler fast
+```
+
+Run in release mode for representative numbers:
+
+```sh
+cargo run -q --release --example rabbitmq_stress --features rabbitmq
+```
+
+## Expected output
+
+Non-deterministic. Look for these characteristic markers:
+
+```text
+shove stress benchmarks — rabbitmq
+scenarios: 60
+
+[1/60] moderate | 20000msg | 1c | fast (1-5ms) ...
+  -> 3200.5 msg/s | dispatch p50=1.2ms p99=4.8ms | e2e p50=3.1ms p99=6.2ms | cpu=45% rss=28.4MB | 6.3s
+...
+
+Backend: rabbitmq
+TIER         MSGS     C  HANDLER   MSG/SEC  ...
+moderate    20000     1  fast       3200    ...
+moderate    20000     4  fast      11500    ...
+...
+```
+
+Throughput is typically in the thousands of msg/s for `fast` handlers (compared to hundreds of thousands for in-memory), reflecting AMQP round-trip cost.
+
+## Source
+
+```rust
+// [!include ~/examples/rabbitmq/stress.rs]
+```
+
+## Walkthrough
+
+### Container setup and plugin enabling
+
+The RabbitMQ testcontainer is started with `RabbitMqImage::default().start()`. After obtaining the AMQP port, the example runs `rabbitmq-plugins enable rabbitmq_consistent_hash_exchange` inside the container via `exec(ExecCommand::new([...]))` and waits 2 seconds for the plugin to activate. The consistent-hash plugin is required for the `StressTestTopic` topology declared by the shared harness, which uses sequenced shards.
+
+### Queue purge between scenarios
+
+`HarnessConfig::<RabbitMq>::new("rabbitmq").with_purge(purge)` injects a purge closure that connects a fresh AMQP connection and calls `channel.queue_purge(QUEUE_NAME)` between scenarios. Unlike in-memory (where a new `Broker\<InMemory\>` is created per scenario from scratch), RabbitMQ reuses the same broker-level topology and only clears messages. This keeps scenario boot cost low — re-declaring exchanges and bindings for every scenario would add seconds of overhead.
+
+### `ConsumerGroupConfig` with concurrent processing
+
+The `make_cfg` closure passed to `run_all_scenarios` produces:
+
+```rust,no_run
+rmq::ConsumerGroupConfig::new(consumers..=consumers)
+    .with_prefetch_count(prefetch)
+    .with_concurrent_processing(concurrent)
+```
+
+When `--concurrent` is passed on the command line, `concurrent=true` enables the overlap mode from the [concurrent example](/backends/rabbitmq/examples/concurrent); this is especially effective for `slow` and `heavy` handler profiles where I/O dominates.
+
+### Interpreting the results
+
+Key columns to watch:
+
+- `disp p50/p99` — the AMQP round-trip from publish to handler entry; this reflects broker and network latency, not handler work.
+- `scaling_efficiency` — how close to linear throughput scales. RabbitMQ often exceeds 1.0x at low consumer counts because AMQP channels parallelize well; at high counts the broker becomes the bottleneck.
+- `RSS(MB)` — in-process memory. RabbitMQ messages are held in the broker, so RSS stays lower than in-memory backends at equivalent message counts.
+
+## What to try next
+
+- Compare `--tier moderate --handler zero` throughput here against `inmemory_stress` — the difference is the AMQP round-trip cost per message.
+- Add `--concurrent` for `--handler slow` — watch the speedup in the `MSG/SEC` column as I/O is overlapped within each consumer.
+- Run `--output json` and load results into a spreadsheet to plot latency percentiles across consumer counts.
+- See the [InMemory stress example](/backends/inmemory/examples/stress) for in-process baseline numbers.

@@ -1,0 +1,70 @@
+# RabbitMQ — Exactly-Once
+
+Use this when you need to eliminate duplicate deliveries for handlers with irreversible side effects — payment charges, outbound notifications, external API calls without idempotency tokens. The example shows how a single `with_exactly_once()` call wraps every routing decision in an AMQP transaction, covering all three routing paths: ack, retry-then-ack, and reject-to-DLQ.
+
+## Prerequisites
+
+- Docker (a RabbitMQ testcontainer is spun up automatically)
+- Cargo feature: `rabbitmq-transactional`
+
+## Run
+
+```sh
+cargo run --example rabbitmq_exactly_once --features rabbitmq-transactional
+```
+
+## Expected output
+
+```text
+topologies declared
+
+messages published
+
+[ack]    payment=PAY-001 amount=$10.00  (processed: 1)
+[ack]    payment=PAY-002 amount=$20.00  (processed: 2)
+[ack]    payment=PAY-003 amount=$30.00  (processed: 3)
+[ack]    payment=PAY-004 amount=$40.00  (processed: 4)
+[ack]    payment=PAY-005 amount=$50.00  (processed: 5)
+[retry]  payment=PAY-RETRY attempt=1 retry_count=0
+[retry]    → simulated transient failure, retrying…
+[retry]  payment=PAY-RETRY attempt=2 retry_count=1
+[retry]    → succeeded on retry
+[reject] payment=PAY-BAD-1 → routing to DLQ
+[dlq]    payment=PAY-BAD-1 reason=rejected deaths=1 (dlq total: 1)
+[reject] payment=PAY-BAD-2 → routing to DLQ
+[dlq]    payment=PAY-BAD-2 reason=rejected deaths=1 (dlq total: 2)
+[reject] payment=PAY-BAD-3 → routing to DLQ
+[dlq]    payment=PAY-BAD-3 reason=rejected deaths=1 (dlq total: 3)
+done
+```
+
+## Source
+
+```rust
+// [!include ~/examples/rabbitmq/exactly_once.rs]
+```
+
+## Walkthrough
+
+### What exactly-once means here
+
+AMQP's `tx_select` / `tx_commit` mode makes every channel operation part of an atomic transaction. In confirm-mode (the default), publishing to the hold queue and acking the original delivery are two separate network round-trips — a broker restart between them can cause the original message to be redelivered without the hold-queue copy. Transactional mode collapses both into a single commit that either fully succeeds or fully rolls back. The observable behaviour is identical; the guarantee is stronger at the cost of roughly 10–15x lower throughput per channel.
+
+### Three topics, three outcomes
+
+`PaymentTopic` receives five payments that `AckHandler` acks immediately — the simplest case. `RetryPaymentTopic` receives one payment that `RetryThenAckHandler` retries once via its hold queue (TTL 2 s) before acking on the second delivery. `RejectPaymentTopic` receives three payments that `RejectHandler` sends straight to the DLQ via `Outcome::Reject`; `handle_dead` then processes each dead-letter and prints the `death_count`.
+
+### Enabling transactional mode
+
+`ConsumerOptions::<RabbitMq>::new().with_exactly_once()` is the only API change. The framework swaps the confirm-mode channel for a transactional channel and wraps the ack/nack/publish sequence in `tx_select → ... → tx_commit`. The `PaymentEvent` message type, the `Outcome` variants, and the topology declarations are all unchanged — exactly-once is an opt-in delivery guarantee, not a different programming model.
+
+### Hold queue interaction
+
+`RetryPaymentTopic` uses a 2-second hold queue. Under transactional mode, publishing to the hold queue and acking the original delivery are committed atomically, so the consumer will not re-receive a partial state even if the broker restarts mid-commit. The example's 8-second run window is chosen to ensure the 2-second TTL fires and the retry delivery arrives before shutdown.
+
+## What to try next
+
+- Remove `.with_exactly_once()` from one consumer and use `RUST_LOG=shove=debug` to compare how confirm-mode and transactional-mode channel lifecycles differ in the log output.
+- Raise the hold queue TTL to 30 s — the retry consumer will not see the second delivery within the 8-second window, and the message stays in the hold queue.
+- Benchmark throughput with and without `with_exactly_once()` — the ~10–15x slowdown becomes visible with hundreds of messages.
+- See [Guides: Exactly-once](/guides/exactly-once) for the full explanation of the transactional path and when to use it.

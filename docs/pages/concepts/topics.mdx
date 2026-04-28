@@ -1,0 +1,117 @@
+# Topics & Topology
+
+A topic is how you express a domain event as a type. When you define `OrderSettlement`, you're declaring that these events flow through a specific queue, carry a specific message shape, and obey specific retry rules. Publishers, consumer registrations, and topology declarations all reference the topic; queue names and message types are derived from it.
+
+One topic always carries one message type. Two topics may share the same message type if two independent event flows happen to share a schema, but a single topic never carries mixed types. The type system enforces this: publishing `MyEvent` via the wrong topic is a compile error, not a runtime surprise.
+
+Think of topics as the unit of design: one topic per logical event flow.
+
+## The Topic trait
+
+Every topic implements the `Topic` trait from `src/topic.rs`:
+
+```rust,no_run
+pub trait Topic: Send + Sync + 'static {
+    type Message: Serialize + DeserializeOwned + Send + Sync + 'static;
+    fn topology() -> &'static QueueTopology;
+    const SEQUENCE_KEY_FN: Option<fn(&Self::Message) -> String> = None;
+}
+```
+
+`topology()` returns `&'static QueueTopology` — computed once via `OnceLock` and returned cheaply on every subsequent call. The default value of `SEQUENCE_KEY_FN` is `None`; `define_sequenced_topic!` overrides it automatically.
+
+## define_topic! — the fast path
+
+In practice, you almost never implement `Topic` by hand. The `define_topic!` macro handles the boilerplate:
+
+```rust,no_run
+define_topic!(
+    OrderSettlement,
+    SettlementEvent,
+    TopologyBuilder::new("order-settlement")
+        .hold_queue(Duration::from_secs(5))
+        .dlq()
+        .build()
+);
+```
+
+The macro accepts an optional visibility modifier (`pub`, `pub(crate)`, etc.) before the name. To understand what it generates, here is the equivalent manual implementation:
+
+```rust,no_run
+struct OrderSettlement;
+
+impl Topic for OrderSettlement {
+    type Message = SettlementEvent;
+    fn topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("order-settlement")
+                .hold_queue(Duration::from_secs(5))
+                .dlq()
+                .build()
+        })
+    }
+}
+```
+
+The macro and the manual form are identical in behaviour. Use the macro; it is less error-prone.
+
+## TopologyBuilder
+
+`TopologyBuilder` is a chained builder that describes the queues a topic needs. Call `.build()` at the end to produce a `QueueTopology`.
+
+The full chain of methods, in the order you would typically call them:
+
+- `.new(name)` — required; the primary queue name.
+- `.hold_queue(Duration)` — add a delayed-redelivery queue; callable multiple times for escalating backoff.
+- `.dlq()` — add a dead-letter queue named `{name}-dlq`.
+- `.dlq_named(name)` — add a dead-letter queue with a custom name.
+- `.sequenced(SequenceFailure)` — enable strict per-key ordering; see [Sequenced Topics](/guides/sequenced).
+- `.routing_shards(N)` — override the number of consistent-hash shards (default 8); must be called after `.sequenced()`.
+- `.allow_message_loss()` — suppress the DLQ/hold-queue guards for sequenced topics where message loss is acceptable.
+- `.build()` — produce the `QueueTopology`.
+
+Consider this topology:
+
+```rust,no_run
+TopologyBuilder::new("order-settlement")
+    .hold_queue(Duration::from_secs(5))
+    .hold_queue(Duration::from_secs(30))
+    .dlq()
+    .build()
+```
+
+The builder derives all queue names from the primary name:
+
+| Component | Generated name |
+|-----------|----------------|
+| Main queue | `order-settlement` |
+| Hold (5s) | `order-settlement-hold-5s` |
+| Hold (30s) | `order-settlement-hold-30s` |
+| DLQ | `order-settlement-dlq` |
+
+## Hold queues
+
+Hold queues give a message a second chance. When a handler returns `Outcome::Retry`, the consumer routes the message to a hold queue and parks it there for the configured duration before redelivering it to the main queue. This is how you recover from transient failures — a downstream service that momentarily times out, a database deadlock, a third-party API that returns 503 — without immediately sending messages to the DLQ.
+
+The hold queue selected on each retry is `min(retry_count, hold_queues.len() - 1)`. This means the first retry uses the first (shortest) hold queue, the second retry uses the second, and all subsequent retries stay on the last (longest) hold queue. Ordering matters: define hold queues from shortest to longest.
+
+For a detailed walkthrough of retry mechanics and worked examples, see [Retries, Hold Queues & DLQs](/guides/retries).
+
+## DLQ
+
+The DLQ is where permanently-failed messages go for human inspection or some specific handling. When a message is rejected (via `Outcome::Reject`, or because `max_retries` is exhausted), it is routed to the DLQ rather than discarded. This lets an operator investigate why messages failed, fix the root cause, and replay them without needing to re-publish from the source.
+
+When no DLQ is configured, rejected messages are discarded and a warning is logged — they are not silently dropped, but they are gone. For production topics with any business significance, configure a DLQ.
+
+A DLQ is itself consumable. Call `consumer.run_dlq::<T>()` to start a loop that processes dead-lettered messages. The [Outcomes & Delivery](/concepts/outcomes) page explains the `handle_dead` hook.
+
+## Sequenced topics — quick mention
+
+When message order matters per-key — for example, all ledger entries for a given account must be processed in publish order — use `define_sequenced_topic!` and the `SequencedTopic` trait instead of `define_topic!`. The macro wires a key-extraction function into the `SEQUENCE_KEY_FN` constant, and the publisher routes messages with the same key to the same shard.
+
+See [Sequenced Topics](/guides/sequenced) for the full story.
+
+## Topology declaration
+
+Before publishing or consuming, call `broker.topology().declare::<MyTopic>().await?` once at startup. This call is idempotent — the backend creates queues, exchanges, streams, and any other infrastructure the topology requires, and does nothing if they already exist. It is safe to call on every restart.

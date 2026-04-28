@@ -1,0 +1,71 @@
+# RabbitMQ — Audited Consumer
+
+Use this when you want to verify that trace IDs are preserved across retries on RabbitMQ. The handler returns `Outcome::Retry` on the first delivery; both delivery attempts emit an audit record with the same UUID — proving that trace identity survives the hold-queue round-trip. The pattern directly applies to payment processing, compliance logging, and any workflow where correlating retries to the original delivery matters.
+
+## Prerequisites
+
+- Docker (a RabbitMQ testcontainer is spun up automatically)
+- Cargo features: `rabbitmq,audit`
+
+## Run
+
+```sh
+cargo run --example rabbitmq_audited_consumer --features rabbitmq,audit
+```
+
+## Expected output
+
+```text
+topology declared
+
+published payment
+
+[handler] payment=PAY-001 amount=$49.99 attempt=1
+[audit] {
+  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "outcome": "Retry",
+  "duration_ms": 0,
+  ...
+}
+[handler] payment=PAY-001 amount=$49.99 attempt=2
+[audit] {
+  "trace_id": "550e8400-e29b-41d4-a716-446655440000",
+  "outcome": "Ack",
+  "duration_ms": 0,
+  ...
+}
+done
+```
+
+The `trace_id` is the same UUID on both delivery attempts.
+
+## Source
+
+```rust
+// [!include ~/examples/rabbitmq/audited_consumer.rs]
+```
+
+## Walkthrough
+
+### Handler with deliberate retry
+
+`PaymentHandler` inspects `metadata.retry_count`: when it is 0 (first delivery) it returns `Outcome::Retry`, simulating a transient failure. On the second delivery (`retry_count >= 1`) it returns `Outcome::Ack`. This two-attempt lifecycle is the minimal setup needed to observe trace-ID continuity across a retry cycle.
+
+### `StdoutAuditHandler` and `AuditRecord`
+
+`StdoutAuditHandler` implements `AuditHandler\<Payments\>` and serialises the full `AuditRecord\<PaymentEvent\>` to pretty-printed JSON. The record includes `trace_id` (a UUID assigned when the message is first dispatched and carried through retries via AMQP headers), `outcome` (the value returned by the inner handler), `duration_ms` (wall-clock time the inner handler spent), and a copy of the original message. Printing the whole record as JSON makes it easy to inspect every field during development; swap in a DB writer or `ShoveAuditHandler` for production.
+
+### Wiring with `.audited()`
+
+The call `PaymentHandler.audited(StdoutAuditHandler)` comes from `MessageHandlerExt`, which is blanket-implemented for all `MessageHandler` types when the `audit` feature is enabled. The resulting combinator satisfies `MessageHandler\<Payments\>`, so `supervisor.register` sees a single opaque handler — no API changes needed to add auditing.
+
+### Supervisor with `max_retries`
+
+`ConsumerOptions::<RabbitMq>::new().with_max_retries(3)` ensures the consumer will retry up to three times before sending a message to the DLQ. In this example only one retry is needed, but setting a limit guards against runaway retry loops if the handler logic changes.
+
+## What to try next
+
+- Remove `.with_max_retries(3)` and change `PaymentHandler` to always `Retry` — the message loops until `max_retries` is reached (broker default), then lands in the DLQ; verify the audit record's `outcome` changes to `"Reject"` on the final delivery.
+- Replace `StdoutAuditHandler` with a struct that publishes to a second topic — this is the `ShoveAuditHandler` pattern for production audit pipelines.
+- Add a second payment with a different `payment_id` and observe that each gets a distinct `trace_id`.
+- See [Guides: Audit](/guides/audit) for the full `AuditRecord` schema and production wiring patterns.

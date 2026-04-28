@@ -1,0 +1,82 @@
+# Performance Tuning
+
+Most `shove` performance questions resolve to four levers: prefetch count, worker count, the concurrent-processing flag, and (negatively) transactional mode. Knowing which lever to pull first — and which to ignore — is what this page is for. Numbers below are from a single-node setup and intended as a starting baseline; always measure on your own hardware and workload.
+
+## Headline numbers
+
+Measured on a MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91.
+
+| Handler | 1 worker, prefetch=1 | 1 worker, prefetch=20 | 8 workers, prefetch=20 | 32 workers, prefetch=40 |
+|---------|----------------------|-----------------------|------------------------|-------------------------|
+| Fast (1–5 ms) | 179 msg/s | 2,866 msg/s | 19,669 msg/s | 29,207 msg/s |
+| Slow (50–300 ms) | 6 msg/s | 75 msg/s | 544 msg/s | 4,076 msg/s |
+| Heavy (1–5 s) | 0.4 msg/s | 5 msg/s | 21 msg/s | 199 msg/s |
+
+Reproducible via `cargo run -q --example rabbitmq_stress --features rabbitmq`. Results vary by hardware and broker config.
+
+## The throughput levers
+
+In order of impact:
+
+- **`prefetch_count`** (largest lever): how many unacked messages the broker pre-delivers to a consumer. Higher values mean more in-flight work and fewer round-trips waiting for acks.
+- **Worker count** (linear scaling on handler-bound workloads): more concurrent handlers means more throughput when handlers are CPU- or I/O-bound. Scaling is close to linear until you hit a broker or partition limit.
+- **`concurrent_processing` flag**: `true` allows multiple handler invocations to run concurrently within a single worker, bounded by `prefetch_count`. `false` (default) processes one message at a time per worker.
+- **Transactional mode** (negative lever): the `rabbitmq-transactional` feature reduces throughput roughly 10–15× per channel compared to non-transactional. The trade-off is routing safety — every ack and publish land in the same AMQP transaction.
+
+## prefetch_count deep-dive
+
+`prefetch_count` tells the broker how many unacked messages it may deliver to a single consumer before waiting for acks. With `prefetch_count = 1`, the broker waits for an ack before sending the next message — every handler invocation pays a full network round-trip. With higher values, the consumer has a local buffer of pre-delivered messages and can begin processing the next one immediately after finishing the previous.
+
+Why too high is also a problem: if one consumer holds a large unacked backlog, other consumers in the same group receive less work — distribution becomes uneven. Very high values also increase per-consumer memory usage and slow graceful shutdown (all unacked messages must drain).
+
+**Recommended starting point: 10–40.** Tune based on handler latency: short-latency handlers benefit more from high prefetch; long-latency handlers (where the bottleneck is the handler itself) need high worker counts instead.
+
+**Worked example.** Handler average latency 10 ms, network RTT 1 ms:
+
+- `prefetch_count = 1`: throughput capped at 1000 / (10 + 1) ≈ 90 msg/s — the handler is idle while waiting for the next delivery.
+- `prefetch_count = 20`: the consumer always has work ready; the handler runs at close to its maximum rate (~100 msg/s).
+
+## Workers — when to add them
+
+Add workers when the topic backlog grows faster than the consumer drains it. That's the signal that the handler is the bottleneck.
+
+A single shove consumer rarely saturates the network or broker on its own. The bottleneck is almost always handler latency × concurrency. Each additional worker adds a parallel handler goroutine; throughput scales linearly until you hit:
+
+- **Broker quota** — e.g. RabbitMQ per-connection channel limits.
+- **Partition count** (Kafka) — a 4-partition topic can only be consumed by 4 group members simultaneously.
+- **Sub-queue count** (RabbitMQ sequenced) — the number of consistent-hash shards limits sequenced consumer parallelism.
+
+## with_concurrent_processing(true)
+
+When `concurrent_processing` is `true`, a single worker can have multiple handler invocations in-flight simultaneously, limited by `prefetch_count`. The benefit is full utilization of the pre-fetched buffer: while one handler is awaiting a database response, another can start.
+
+**Use when:** handlers are pure I/O-bound — waiting on a database query, an HTTP call, an external API. The async runtime multiplexes tasks efficiently.
+
+**Don't use when:** handlers are CPU-bound. Concurrent tasks without additional OS threads don't add parallelism — they compete for the same thread pool and can increase latency without improving throughput. For CPU-bound work, increase worker count instead.
+
+## Measurement methodology
+
+Reproduce locally:
+
+```sh
+cargo run -q --example rabbitmq_stress --features rabbitmq
+```
+
+The benchmark publishes 10,000 messages, measures elapsed time per (worker, prefetch) configuration, and prints msg/s for each combination. Vary the parameters in source and re-run.
+
+Hardware, broker version, network setup, and OS scheduler all affect results. The numbers in the headline table are a starting reference — measure on your own setup before committing to a configuration.
+
+## What NOT to tune first
+
+Ranked by typical impact:
+
+- **Serde format** — JSON serialization overhead is negligible compared to network round-trip. Switching to bincode or MessagePack rarely moves the needle for normal message sizes.
+- **Connection pool size** — a single AMQP channel or Kafka producer handles thousands of msg/s. Pooling is for fault-tolerance (connection failover), not raw throughput.
+- **TLS** — modern TLS handshake and record overhead is negligible for the message sizes and rates shove handles. Disable only if profiling shows it in a hot path.
+- **Tracing** — structured logging at `info` level adds less than 1% overhead. Disable only at `debug` level if profiling shows it dominates.
+
+## What's next
+
+- [Backend Ops Notes](/ops/backends) — per-backend production knobs and gotchas
+- [Consumer Groups & Autoscaling](/guides/groups) — autoscaler configuration and scaling policies
+- [RabbitMQ stress example](/backends/rabbitmq/examples/stress) — walk through the benchmark harness

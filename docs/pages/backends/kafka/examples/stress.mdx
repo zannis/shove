@@ -1,0 +1,89 @@
+# Kafka — Stress
+
+Use this to measure Kafka throughput on your workload and compare it against the [InMemory baseline](/backends/inmemory/examples/stress) and [NATS results](/backends/nats/examples/stress). The numbers quantify Kafka's write-ahead log cost relative to lighter backends — useful data when choosing between Kafka and NATS, or when sizing partitions and consumer counts for a production deployment.
+
+## Prerequisites
+
+- Docker (an Apache Kafka testcontainer is started automatically)
+- Cargo feature: `kafka`
+
+## Run
+
+```sh
+cargo run --example kafka_stress --features kafka
+```
+
+Narrow to one tier or handler profile:
+
+```sh
+cargo run --example kafka_stress --features kafka -- --tier moderate --handler fast
+```
+
+Release mode for representative numbers:
+
+```sh
+cargo run -q --release --example kafka_stress --features kafka
+```
+
+## Expected output
+
+Non-deterministic. Look for these characteristic markers:
+
+```text
+shove stress benchmarks — kafka
+scenarios: 60
+
+[1/60] moderate | 20000msg | 1c | fast (1-5ms) ...
+  -> 8200.4 msg/s | dispatch p50=0.3ms p99=1.8ms | e2e p50=2.9ms p99=5.1ms | cpu=62% rss=44.1MB | 2.4s
+...
+
+Backend: kafka
+TIER         MSGS     C  HANDLER   MSG/SEC  ...
+moderate    20000     1  fast       8200    ...
+moderate    20000     4  fast      25000    ...
+...
+```
+
+Throughput is typically in the thousands to tens of thousands of msg/s — higher than RabbitMQ for `zero` handlers due to Kafka's batch-oriented producer, but with a hard ceiling at the partition count.
+
+## Source
+
+```rust
+// [!include ~/examples/kafka/stress.rs]
+```
+
+## Walkthrough
+
+### Topic delete-and-recreate between scenarios
+
+`with_purge(purge)` injects a closure that uses an rdkafka `AdminClient` to delete the main topic and DLQ topic between scenarios. Unlike NATS (which deletes the stream) or RabbitMQ (which purges the queue), Kafka deletes and recreates topics because `ensure_partitions` can only expand partition counts, not shrink them. Each scenario declares its own topology with a partition count matched to `consumers`, so the previous scenario's partition layout must be cleared to avoid idle consumers.
+
+### Partition count and consumer ceiling
+
+The `make_cfg` closure produces:
+
+```rust
+KafkaConsumerGroupConfig::new(consumers..=consumers)
+    .with_prefetch_count(prefetch)
+```
+
+On Kafka, `declare` provisions exactly `consumers` partitions for the main topic. When the stress harness steps through consumer counts like `[1, 4, 8, 16, 32]`, each scenario first purges and then redeclares with the correct partition count for that scenario's consumer level. The consumer count ceiling for `scaling_efficiency` is thus the partition count — adding more consumers than partitions would leave some idle and cap throughput.
+
+### `KafkaConsumerGroupConfig` with concurrent processing
+
+`with_concurrent_processing(concurrent)` enables parallel handler dispatch within a single consumer partition assignment. When `--concurrent` is passed, each consumed record spawns a tokio task, allowing up to `prefetch` records to be processed simultaneously within one Kafka consumer instance. This is effective for `slow` and `heavy` handler profiles but provides little benefit for `zero` (no-op) handlers where CPU is the bottleneck.
+
+### Interpreting the results
+
+Key metrics:
+
+- `disp p50` — time from `published_at_ns` (embedded in the message) to handler entry. For Kafka this includes batch accumulation in the rdkafka producer, network transmission, and consumer fetch latency. Typically 0.2–2 ms at moderate load with default batch settings.
+- `scaling_efficiency` — near-linear scaling up to the partition count; flat beyond it because additional consumers get no partition assignment.
+- `CPU%` — Kafka's log-structured storage and zero-copy reads keep CPU lower than AMQP backends for high-throughput scenarios.
+
+## What to try next
+
+- Compare `--tier moderate --handler zero` throughput here against NATS and InMemory results to see how Kafka's write-ahead log affects raw scheduling cost.
+- Add `--concurrent --handler slow` — measure the throughput improvement as concurrent dispatch overlaps the handler I/O within each partition.
+- Try `--tier extreme` with 256 consumers — throughput will plateau far below the InMemory extreme because the partition count per scenario is also 256, and Kafka consumer-group rebalance overhead becomes significant.
+- See the [Kafka backend overview](/backends/kafka) for TLS and SASL configuration options relevant to production deployments.

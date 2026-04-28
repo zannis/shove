@@ -1,0 +1,69 @@
+# RabbitMQ — Consumer Groups
+
+Use this when you want to see the RabbitMQ autoscaler in action: start at one consumer, watch the count climb as queue depth rises, and watch it fall once the queue drains. The example exercises the full autoscaler stack — registry, config, management client, and scale signals — showing how `shove` adapts consumer count to actual load.
+
+## Prerequisites
+
+- Docker (a RabbitMQ testcontainer with the management plugin is spun up automatically)
+- Cargo feature: `rabbitmq`
+
+## Run
+
+```sh
+cargo run --example rabbitmq_consumer_groups --features rabbitmq
+```
+
+## Expected output
+
+Consumer count will climb from 1 toward 5 as the queue fills, then fall back after the queue drains. The monitor loop prints active consumer count every 3 seconds:
+
+```text
+published 100 tasks
+
+consumer group started (min_consumers=1)
+
+autoscaler running — watch consumer count change
+
+[monitor] active_consumers=1 queue=ex-work-queue
+[monitor] active_consumers=3 queue=ex-work-queue
+[monitor] active_consumers=5 queue=ex-work-queue
+[monitor] active_consumers=5 queue=ex-work-queue
+[monitor] active_consumers=2 queue=ex-work-queue
+[monitor] active_consumers=1 queue=ex-work-queue
+...
+shutting down...
+done
+```
+
+Exact counts and timing depend on system load and the autoscaler's poll interval.
+
+## Source
+
+```rust
+// [!include ~/examples/rabbitmq/consumer_groups.rs]
+```
+
+## Walkthrough
+
+### `ConsumerGroupRegistry` and `ConsumerGroupConfig`
+
+`ConsumerGroupRegistry::new(client)` manages named groups of identical consumers. `registry.register::<WorkQueue, TaskHandler>(config, factory, ctx)` wires `TaskHandler` to `WorkQueue` with `ConsumerGroupConfig::new(1..=5)` — a range from one minimum to five maximum consumers. `.with_prefetch_count(10)` lets each consumer hold up to 10 messages at a time, giving a capacity of `consumers × 10` at any given scale. `registry.start_all()` spawns the minimum number of consumers immediately.
+
+### Autoscaler wiring
+
+`RabbitMqAutoscalerBackend::autoscaler(&mgmt_config, registry, autoscaler_config)` creates an autoscaler that polls the RabbitMQ Management HTTP API every `poll_interval` (2 s). The scaling logic is pure arithmetic: scale up when `messages_ready > capacity × scale_up_multiplier` (1.5), scale down when `messages_ready < capacity × scale_down_multiplier` (0.3). `hysteresis_duration` (4 s) prevents flapping by requiring the condition to hold before acting; `cooldown_duration` (8 s) prevents consecutive scale events from interfering.
+
+### Management API configuration
+
+`ManagementConfig::new(url, username, password)` points the autoscaler at the RabbitMQ Management API running on port 15672. The management plugin is enabled by default in the `testcontainers-modules` RabbitMQ image. In production this URL and credentials would come from environment variables.
+
+### Monitor loop and shutdown
+
+The main task loops 20 times at 3-second intervals, locking the registry and calling `group.active_consumers()` to print the current scale. After the loop `registry.shutdown_all()` gracefully stops every consumer group (draining in-flight messages), then `client.shutdown()` closes the AMQP connection. The autoscaler task is joined last to ensure it does not attempt to poll after the connection closes.
+
+## What to try next
+
+- Lower `handler_delay` to 50 ms — the queue drains faster and the autoscaler may not have time to scale up before it triggers scale-down.
+- Raise `scale_up_multiplier` to 5.0 — the autoscaler requires a much deeper backlog before adding consumers.
+- Set `min..=max` to `3..=3` — disables autoscaling and processes with a fixed pool of 3 workers.
+- See [Guides: Groups](/guides/groups) for an explanation of how consumer groups distribute load across workers.

@@ -1,0 +1,74 @@
+# SQS — Autoscaler
+
+Use this when you want to see queue-depth-based autoscaling on SQS end-to-end. Sixty tasks are published at once; with one slow consumer the queue fills faster than it drains, triggering scale-up to five consumers. The autoscaler then scales back once the queue is empty. Run this before production to tune the hysteresis and cooldown settings for your traffic pattern.
+
+## Prerequisites
+
+- Docker with a running daemon
+- `LOCALSTACK_AUTH_TOKEN` environment variable set to a valid LocalStack Pro token
+- Cargo feature: `aws-sns-sqs`
+
+## Run
+
+```sh
+LOCALSTACK_AUTH_TOKEN=<token> cargo run --example sqs_autoscaler --features aws-sns-sqs
+```
+
+## Expected output
+
+Consumer count climbs from 1 to 5 as the queue fills, then falls back as it drains. Exact timing depends on LocalStack latency and system load:
+
+```text
+published 60 tasks
+
+consumer group started (min=1, max=5)
+
+autoscaler running — watching consumer count change
+
+[monitor] consumers=1 messages_ready=58 in_flight=2
+[monitor] consumers=3 messages_ready=40 in_flight=15
+[monitor] consumers=5 messages_ready=18 in_flight=25
+[monitor] consumers=5 messages_ready=0 in_flight=5
+[monitor] consumers=2 messages_ready=0 in_flight=0
+[monitor] consumers=1 messages_ready=0 in_flight=0
+...
+shutting down…
+done
+```
+
+## Source
+
+```rust
+// [!include ~/examples/sqs/autoscaler.rs]
+```
+
+## Walkthrough
+
+### Consumer group registry
+
+`SqsConsumerGroupRegistry::new(client)` manages a pool of independent SQS poll workers. `registry.register` configures `WorkQueue` with `SqsConsumerGroupConfig::new(1..=5).with_prefetch_count(5)` — a capacity of `consumers × prefetch = 5–25` messages in-flight. `registry.start_all()` spawns the minimum number of consumers (1); the autoscaler adds workers as needed.
+
+### `SqsAutoscalerBackend` and `AutoscalerConfig`
+
+`SqsAutoscalerBackend::autoscaler(stats_provider, registry, config)` wires the autoscaler to the registry. It polls `SqsQueueStatsProvider::get_queue_stats` on each `poll_interval` (2 s) and computes:
+
+- `capacity = active_consumers × prefetch_count`
+- scale up when `messages_ready > capacity × scale_up_multiplier` (1.5)
+- scale down when `messages_ready < capacity × scale_down_multiplier` (0.3)
+
+`hysteresis_duration` (4 s) requires the condition to hold across multiple polls before acting, preventing flapping caused by momentary spikes. `cooldown_duration` (8 s) enforces a minimum gap between consecutive scale actions for the same group.
+
+### `SqsQueueStatsProvider` for dual monitoring
+
+The example creates two `SqsQueueStatsProvider` instances: one inside the autoscaler and one in the monitor loop. Both call `GetQueueAttributes` independently — the autoscaler uses the stats to make scaling decisions, while the monitor loop prints `messages_ready` and `messages_not_visible` (in-flight) so you can correlate queue depth with consumer count changes in the output.
+
+### Shutdown sequence
+
+The autoscaler task runs on a `CancellationToken`. After the monitor loop completes, `shutdown.cancel()` stops the autoscaler, then `registry.shutdown_all()` drains all consumer workers, then `client.shutdown()` closes the AWS client connections. This ordering ensures the autoscaler does not attempt to scale the registry after its workers are already shutting down.
+
+## What to try next
+
+- Raise `scale_up_multiplier` to 5.0 — the autoscaler waits for a much deeper backlog before adding consumers; observe the queue draining more slowly during the initial burst.
+- Set `hysteresis_duration` to `Duration::ZERO` — the autoscaler reacts on every poll cycle; watch for flapping between consecutive scaling decisions.
+- Increase `burst_size` to 200 — the drain phase becomes longer and the scale-down step is more visible in the monitor output.
+- See the [SQS consumer groups example](/backends/sqs/examples/consumer-groups) for the same registry without autoscaling.

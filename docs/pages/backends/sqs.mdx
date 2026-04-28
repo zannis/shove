@@ -1,0 +1,98 @@
+# AWS SNS + SQS
+
+If you're already on AWS and don't want to run a broker, this is your path. SNS fans messages out to SQS queues; shove handles polling, retries, DLQ routing, and consumer supervision. No broker process to provision or maintain — pay AWS for what you use.
+
+## What you need
+
+An AWS account with IAM credentials that have SNS and SQS permissions, and a region selected. For local dev, [LocalStack Pro](https://localstack.cloud/) emulates both services:
+
+```sh
+docker run --rm -p 4566:4566 \
+  -e LOCALSTACK_AUTH_TOKEN=$LOCALSTACK_AUTH_TOKEN \
+  localstack/localstack-pro
+```
+
+Set the `endpoint_url` field in `SnsConfig` to `http://localhost:4566` when targeting LocalStack. Omit it entirely for real AWS.
+
+## Install
+
+```sh
+cargo add shove --features aws-sns-sqs
+```
+
+## Connect
+
+```rust
+// [!include ~/examples/sqs/basic_pubsub.rs:connect]
+```
+
+`SnsConfig` holds the AWS region and an optional `endpoint_url` override for local dev. AWS credentials are loaded from the standard environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`) or from the default credential chain.
+
+## Declare topology
+
+```rust
+// [!include ~/examples/sqs/basic_pubsub.rs:declare]
+```
+
+`topology().declare::<T>()` creates the SNS topic and SQS queue(s), including hold queues and the DLQ. Idempotent — safe to call on every startup.
+
+## Publish
+
+```rust
+// [!include ~/examples/sqs/basic_pubsub.rs:publish]
+```
+
+`publisher().await?` returns a `Publisher<Sqs>` that publishes via SNS. SNS fans the message out to all subscribed SQS queues.
+
+## Consume
+
+```rust
+// [!include ~/examples/sqs/basic_pubsub.rs:consume]
+```
+
+SQS uses `consumer_supervisor()` — N independent pollers per registered topic. There is no broker-level coordinated-group primitive on SQS, so `consumer_group()` is not available on `Broker\<Sqs\>`. Use `ConsumerOptions::<Sqs>::new()` or `ConsumerOptions::<Sqs>::preset(prefetch_count)` to configure polling behavior.
+
+## Sequenced delivery
+
+Messages for the same group key stay in order. SQS FIFO topics enforce ordering natively: when you declare a sequenced topic, shove provisions FIFO SNS topics and SQS queues and sets the `MessageGroupId` from `T::sequence_key()`; SQS delivers messages in publish order within each group.
+
+FIFO queue names must end in `.fifo` — shove appends this suffix automatically when sequenced topology is declared. The default SQS FIFO throughput quota is 300 messages/second per queue; for higher throughput, contact AWS to raise the quota or switch to a standard (unordered) topic.
+
+See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced Pubsub example](/backends/sqs/examples/sequenced) for a runnable walkthrough.
+
+## Consumer supervision + autoscaling
+
+SQS has no broker-level coordinated-group primitive, so `Broker\<Sqs\>` only exposes `consumer_supervisor()` (not `consumer_group()`). The supervisor fans out one polling task per registered topic with a fixed `ConsumerOptions<Sqs>`:
+
+```rust,no_run
+use shove::{Broker, ConsumerOptions, Sqs};
+
+let mut supervisor = broker.consumer_supervisor();
+supervisor.register::<OrderTopic, _>(
+    MyHandler,
+    ConsumerOptions::<Sqs>::preset(10),
+)?;
+let outcome = supervisor.run_until_timeout(signal, drain_timeout).await;
+```
+
+`consumer_supervisor()` does not scale poller count on its own — `register` accepts one set of `ConsumerOptions` and runs exactly one consumer per topic.
+
+For autoscaling within a `min..=max` range driven by `ApproximateNumberOfMessages`, use the backend-specific `SqsConsumerGroupRegistry` directly. It accepts an `SqsConsumerGroupConfig::new(min..=max)` and spawns/retires independent pollers within that range as queue depth changes. See the [Consumer Groups example](/backends/sqs/examples/consumer-groups) for the full path.
+
+## Gotchas
+
+- **Visibility timeout must be greater than handler timeout.** If the handler takes longer than the visibility timeout, the message becomes re-visible on the queue and will be delivered again while the original handler is still running. Set both values consciously.
+- **FIFO 300 msg/s default cap.** High-throughput sequenced topics may require quota increases via the AWS console. Standard (non-FIFO) SQS queues have no ordering guarantee and much higher throughput limits.
+- **LocalStack endpoint is for local dev only.** The `SnsConfig::endpoint_url` field should be omitted in production; it exists solely to redirect traffic to a local emulator.
+- **Region matters.** SQS queues are regional. Cross-region fan-out requires explicit SNS topic ARN configuration — shove does not automatically route across regions.
+- **IAM permissions required:** `sns:CreateTopic`, `sns:Subscribe`, `sns:Publish`, `sqs:CreateQueue`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`, and `sqs:SetQueueAttributes` at minimum.
+
+## Examples
+
+- [Basic Pubsub](/backends/sqs/examples/basic) — all `Outcome` variants, hold queues, DLQ, batch publish
+- [Sequenced Pubsub](/backends/sqs/examples/sequenced) — FIFO topics + `MessageGroupId` ordering
+- [Concurrent Pubsub](/backends/sqs/examples/concurrent) — high-concurrency publish patterns
+- [Consumer Groups](/backends/sqs/examples/consumer-groups) — supervisor with autoscaling
+- [Audited Consumer](/backends/sqs/examples/audited) — `MessageHandlerExt::audited` wrapping
+- [Autoscaler](/backends/sqs/examples/autoscaler) — full autoscaler configuration walkthrough
+- [Stress](/backends/sqs/examples/stress) — throughput benchmarking

@@ -1,0 +1,92 @@
+# The Broker\<B\> Pattern
+
+The central value of `shove` is portability: write your topic definitions, handler logic, and consumer registrations once — then run the same code against an in-process broker in tests and a real broker in production. Swapping backends means changing one marker type and one config struct. Nothing else changes.
+
+`Broker<B>` is the single entry point for every backend. The type parameter `B` is a zero-sized marker struct — `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `InMemory` — that ties together the backend's connection type, publisher, consumer, and topology implementations.
+
+## The four-corner API
+
+Every `Broker<B>` exposes the same four methods:
+
+```text
+Broker<B>
+   ├─ .topology()              → TopologyDeclarer<B>
+   ├─ .publisher().await       → Publisher<B>
+   ├─ .consumer_supervisor()   → ConsumerSupervisor<B>     (all backends)
+   └─ .consumer_group()        → ConsumerGroup<B>          (all except Sqs)
+```
+
+- `topology()` — declare queues, exchanges, and streams idempotently at startup.
+- `publisher().await` — obtain a typed publisher; each `publish::<T>(&msg)` call is bound to a topic.
+- `consumer_supervisor()` — register multiple topic consumers in one process and manage their lifecycle together: shared shutdown signal, unified exit code, graceful drain.
+- `consumer_group()` — register handlers into a coordinated, min/max-bounded consumer group with autoscaling.
+
+## consumer_supervisor
+
+`consumer_supervisor()` is the harness for running multiple topic consumers inside a single application process. You register each topic's handler independently, and the supervisor gives you one place to start them all, one shutdown signal, and one `SupervisorOutcome` at the end.
+
+This is the right primitive when your application consumes several topics and you want them to start and stop together — for example, an order-processing service that simultaneously listens to `OrderCreated`, `PaymentConfirmed`, and `ShipmentRequested`. The supervisor handles fan-in: wait for all registered consumers to drain before returning.
+
+One constraint: `ConsumerSupervisor::register` explicitly rejects sequenced topics at runtime — sequenced topics require the coordinated group path to preserve ordering guarantees.
+
+## consumer_group
+
+`consumer_group()` is for horizontal scaling of a single topic. It registers a handler with a minimum and maximum consumer count; the autoscaler adjusts the live count within that range based on queue depth. Consumers coordinate through the broker (RabbitMQ Single Active Consumer, Kafka consumer groups, NATS pull consumers, in-process channel registry) so messages are not delivered to two consumers simultaneously. Available on `RabbitMq`, `Nats`, `Kafka`, and `InMemory`.
+
+Both primitives share the same shutdown contract: `run_until_timeout(signal_future, drain_timeout)` returning a `SupervisorOutcome`. See [Consumer Groups & Autoscaling](/guides/groups) for the coordination details.
+
+## Backend-swap demo
+
+The same topic definition and handler compiles and runs against any backend. Only the marker and the config change:
+
+```rust,no_run
+// Topic and handler defined once, backend-agnostic
+define_topic!(Orders, OrderEvent, TopologyBuilder::new("orders").dlq().build());
+
+struct Handler;
+impl MessageHandler<Orders> for Handler {
+    type Context = ();
+    async fn handle(&self, msg: OrderEvent, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+// In-process for tests
+let broker = Broker::<InMemory>::new(InMemoryConfig::default()).await?;
+
+// RabbitMQ for production
+let broker = Broker::<RabbitMq>::new(
+    RabbitMqConfig::new("amqp://guest:guest@rabbitmq:5672"),
+).await?;
+
+// Everything else is identical across backends:
+broker.topology().declare::<Orders>().await?;
+let publisher = broker.publisher().await?;
+publisher.publish::<Orders>(&event).await?;
+```
+
+Tests run against `InMemory` with no external dependencies; production runs against the real broker; the application code does not notice the difference. This makes it practical to test retry logic, sequencing, and DLQ routing in fast unit tests without a running broker.
+
+## SupervisorOutcome and exit codes
+
+Every consumer group and supervisor returns a `SupervisorOutcome` after all tasks have drained. The `exit_code()` method maps the outcome to a uniform process exit code that Kubernetes, systemd, and shell pipelines can read:
+
+- `0` — clean shutdown; all messages processed and no tasks failed.
+- `1` — at least one consumer task returned an error.
+- `2` — at least one consumer task panicked.
+- `3` — drain timeout elapsed; in-flight messages were abandoned.
+
+The canonical shutdown pattern in a long-running binary:
+
+```rust,no_run
+let outcome = group.run_until_timeout(
+    tokio::signal::ctrl_c().map(drop),
+    Duration::from_secs(30),
+).await;
+
+std::process::exit(outcome.exit_code());
+```
+
+This integrates cleanly with Kubernetes `preStop` hooks, systemd `ExecStop`, and `&&`-chained shell scripts. See [Shutdown & Exit Codes](/guides/shutdown) for the full shutdown lifecycle.
+
+For per-broker setup, see [Integrate with your stack](/backends/choosing). For handler registration and context injection, see [Handlers & Context](/concepts/handlers).

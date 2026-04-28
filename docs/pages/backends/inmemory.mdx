@@ -1,0 +1,86 @@
+# In-process
+
+The fastest way to get started with `shove` and the right choice for tests. No Docker, no AWS, no broker process — the broker lives in process RAM. Suitable for unit tests, integration tests, and single-process applications where you want the full pub/sub API without external infrastructure.
+
+## What you need
+
+Nothing. No services to start, no credentials to configure.
+
+## Install
+
+```sh
+cargo add shove --features inmemory
+```
+
+## Connect
+
+```rust
+// [!include ~/examples/inmemory/basic.rs:connect]
+```
+
+`InMemoryConfig::default()` is the only config needed. The broker lives in process RAM and is dropped when the variable goes out of scope.
+
+## Declare topology
+
+```rust
+// [!include ~/examples/inmemory/basic.rs:declare]
+```
+
+`topology().declare::<T>()` registers the topic with the in-process broker. Idempotent — safe to call multiple times.
+
+## Publish
+
+```rust
+// [!include ~/examples/inmemory/basic.rs:publish]
+```
+
+`publisher().await?` returns a `Publisher<InMemory>`. Messages are delivered to consumers in the same process synchronously via in-memory channels.
+
+## Consume
+
+```rust
+// [!include ~/examples/inmemory/basic.rs:consume]
+```
+
+`consumer_group()` creates an in-process consumer group. `InMemoryConsumerGroupConfig::new(min..=max)` sets the concurrency bounds. The `run_until_timeout` call blocks until the shutdown signal fires or the drain timeout elapses.
+
+## Sequenced delivery
+
+Per-key FIFO shards in process memory. The same `T::sequence_key()` semantics as durable backends — messages for the same key are processed in order, and different keys are independent and may run concurrently. No persistence: ordering is enforced in-memory only and is lost on shutdown.
+
+See [Sequenced Topics](/guides/sequenced) for the full ordering model.
+
+## Consumer groups + autoscaling
+
+In-process queue-depth tracking drives the autoscaler. The autoscale signal works the same shape as on durable backends — queue depth within the in-process channels drives scale-up and scale-down.
+
+Configure via `InMemoryConsumerGroupConfig`:
+
+```rust,no_run
+use shove::inmemory::InMemoryConsumerGroupConfig;
+use shove::{Broker, ConsumerGroupConfig, InMemory};
+
+let mut group = broker.consumer_group();
+group
+    .register::<PingTopic, _>(
+        ConsumerGroupConfig::new(
+            InMemoryConsumerGroupConfig::new(1..=4).with_prefetch_count(8),
+        ),
+        || MyHandler,
+    )
+    .await?;
+```
+
+## Gotchas
+
+- **No durability.** Messages live in process RAM and are dropped on shutdown. Do not use the in-process backend for production business-critical flows.
+- **No cross-process delivery.** Only consumers registered in the same process see messages. This is by design — the in-process backend is not a substitute for a real broker.
+- **Intended for tests and single-process apps.** It is the right default for unit tests, integration tests that don't need a broker, and single-binary applications where all producers and consumers run in the same process.
+
+## Examples
+
+- [Basic](/backends/inmemory/examples/basic) — publish/consume round trip with hold queues and DLQ
+- [Sequenced](/backends/inmemory/examples/sequenced) — per-key FIFO ordering
+- [Consumer Groups](/backends/inmemory/examples/consumer-groups) — coordinated groups with autoscaling
+- [Audited Consumer](/backends/inmemory/examples/audited) — `MessageHandlerExt::audited` wrapping
+- [Stress](/backends/inmemory/examples/stress) — throughput benchmarking

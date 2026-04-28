@@ -1,0 +1,57 @@
+# NATS — Basic
+
+Use this as your starting point for NATS JetStream integration. Three `OrderCreated` events are published and consumed via a coordinated consumer group, showing how `shove`'s generic `Broker\<Nats\>` API maps to JetStream streams and durable consumers with hold queues and DLQ.
+
+## Prerequisites
+
+- Docker (a NATS JetStream testcontainer is started automatically — no manual `docker run` needed)
+- Cargo feature: `nats`
+
+## Run
+
+```sh
+cargo run --example nats_basic --features nats
+```
+
+## Expected output
+
+```text
+Published order ORD-0
+Published order ORD-1
+Published order ORD-2
+Processing order ORD-0 ($99.99) [retry=0]
+Processing order ORD-1 ($100.99) [retry=0]
+Processing order ORD-2 ($101.99) [retry=0]
+Done.
+```
+
+## Source
+
+```rust
+// [!include ~/examples/nats/basic.rs]
+```
+
+## Walkthrough
+
+### JetStream testcontainer
+
+`NatsServerCmd::default().with_jetstream()` enables the JetStream persistence layer inside the NATS server. Without JetStream the broker is a pure pub-sub bus with no durability or consumer-group semantics — shove requires JetStream for all its delivery guarantees. The container starts on the default NATS port 4222 and is torn down when the `container` variable is dropped.
+
+### Topic with hold queues
+
+`OrderTopic` uses `TopologyBuilder::new("orders").hold_queue(Duration::from_secs(1)).hold_queue(Duration::from_secs(5)).dlq()`. On NATS, shove provisions one JetStream stream per topic name and separate durable consumers for the main queue, each hold queue, and the DLQ. The hold queue durations determine how long a retried message waits before redelivery — 1 s then 5 s in this example.
+
+### Consumer group via `Broker<Nats>`
+
+`broker.consumer_group()` returns a `ConsumerGroup\<Nats\>`. `group.register::<OrderTopic, _>(ConsumerGroupConfig::new(NatsConsumerGroupConfig::new(1..=1)), || OrderHandler)` wires the handler factory to the topic with a fixed pool of one worker. The `NatsConsumerGroupConfig` maps to a JetStream durable consumer with `max_ack_pending` set from the computed prefetch count. The factory closure `|| OrderHandler` is called once per spawned worker.
+
+### Run until timeout
+
+`group.run_until_timeout(signal, drain_timeout)` drives the consumer group event loop. The signal future resolves after either 3 seconds or Ctrl-C, whichever comes first; after the signal the group drains in-flight messages for up to 10 seconds before returning. `outcome.exit_code()` is 0 if the drain completed cleanly.
+
+## What to try next
+
+- Add a second `group.register` call for a different topic to consume from multiple streams in the same process.
+- Change `NatsConsumerGroupConfig::new(1..=1)` to `new(1..=4)` and publish 20 messages — observe how the group scales workers to match queue depth.
+- Return `Outcome::Retry` from `OrderHandler` and watch the 1-second hold queue delay before redelivery.
+- See [Guides: Groups](/guides/groups) for how `ConsumerGroup` distributes work across workers.

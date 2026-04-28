@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="340" height="128" viewBox="0 0 340 128" role="img" aria-label="shove">
+  <title>shove</title>
+  <g fill="none" stroke="#F97316" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M28 32 L60 64 L28 96"/>
+    <path d="M76 32 L108 64 L76 96"/>
+  </g>
+  <text x="140" y="86" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="60" font-weight="600" fill="#F8FAFC">shove</text>
+</svg>

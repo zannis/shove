@@ -1,0 +1,45 @@
+---
+layout: landing
+---
+
+import { HomePage } from 'vocs/components'
+
+<HomePage.Root>
+  <div className="vocs_HomePage_logo">
+    <img alt="shove" className="vocs_Logo vocs_Logo_logoLight" src="/shove-hero.svg" />
+    <img alt="shove" className="vocs_Logo vocs_Logo_logoDark" src="/shove-hero-dark.svg" />
+  </div>
+  <HomePage.Tagline>Superpowers for Rust message consumers</HomePage.Tagline>
+  <HomePage.Description>
+    Production-ready retries, DLQs, ordering, audit logs, and autoscaling for your existing messaging stack.
+  </HomePage.Description>
+  <HomePage.Buttons>
+    <HomePage.Button href="/getting-started" variant="accent">Get started</HomePage.Button>
+    <HomePage.Button href="https://github.com/zannis/shove">GitHub</HomePage.Button>
+  </HomePage.Buttons>
+</HomePage.Root>
+
+<div style={{ display: 'flex', justifyContent: 'center', marginTop: '1.5rem', marginBottom: '3rem' }}>
+
+```sh
+cargo add shove --features inmemory
+```
+
+</div>
+
+## What you get
+
+A small API on top of the brokers you already run. Three pillars:
+
+- **Strongly typed topics** — bind a message type to a queue topology once; the compiler keeps publishers and consumers in sync.
+- **Managed consumer groups with autoscaling** — min/max worker bounds driven by queue depth or consumer lag.
+- **Delivery ordering** — strict per-key ordering with a single `.sequenced()` switch.
+
+Plugs into **RabbitMQ**, **AWS SNS+SQS**, **NATS JetStream**, and **Apache Kafka**.
+
+## What's next
+
+- **[Get started in 60 seconds](/getting-started)** — runs in-process, no Docker required.
+- **[Core concepts](/concepts/topics)** — topics, outcomes, handlers, the `Broker<B>` pattern.
+- **[Per-broker setup](/backends/choosing)** — production patterns for RabbitMQ, SNS+SQS, NATS, and Kafka.
+- **[Full API reference](https://docs.rs/shove)** — auto-generated rustdoc on docs.rs.

@@ -1,0 +1,174 @@
+# Shutdown & Exit Codes
+
+Rolling deploys, Kubernetes preStop hooks, systemd `ExecStop`, CI pipelines — all of them send a signal and expect the process to finish cleanly before they terminate it. `shove` ships a shutdown contract that fits all of these: stop accepting new work, finish in-flight handlers, and surface the result as a process exit code that operators can read and act on.
+
+`SupervisorOutcome` is a `#[must_use]` struct returned by `run_until_timeout` on both `ConsumerGroup\<B\>` and `ConsumerSupervisor\<B\>`, and its `.exit_code()` method maps the drain result to a conventional integer.
+
+## The shutdown contract
+
+The canonical pattern for a `shove` consumer binary:
+
+```rust,no_run
+use std::time::Duration;
+use futures::FutureExt;
+
+let outcome = group
+    .run_until_timeout(
+        tokio::signal::ctrl_c().map(|_| ()),
+        Duration::from_secs(30),
+    )
+    .await;
+
+std::process::exit(outcome.exit_code());
+```
+
+What happens step by step:
+
+1. `run_until_timeout` starts the group's consumer tasks and blocks until either `signal_future` resolves or the group's internal `CancellationToken` is cancelled.
+2. When `signal_future` resolves, the shutdown token is cancelled. Consumers stop accepting new deliveries from the broker.
+3. Already-in-flight handlers are given up to `drain_timeout` to complete naturally.
+4. Any handler still running at the deadline is abandoned — the tokio task is aborted (not gracefully cancelled). The broker will eventually redeliver those messages.
+5. `run_until_timeout` returns a `SupervisorOutcome` describing what happened.
+6. `std::process::exit(outcome.exit_code())` sets the process exit code and terminates.
+
+The `CancellationToken` from `group.cancellation_token()` (or `supervisor.cancellation_token()`) can also be used to trigger shutdown from other parts of your application — e.g. when an unrecoverable error occurs in a non-consumer task:
+
+```rust,no_run
+let token = group.cancellation_token();
+// ... elsewhere in your app ...
+token.cancel(); // triggers graceful drain
+```
+
+## SupervisorOutcome variants
+
+`SupervisorOutcome` is a simple struct (not an enum) with three fields:
+
+```rust,no_run
+pub struct SupervisorOutcome {
+    pub errors: usize,   // count of consumer tasks that returned Err
+    pub panics: usize,   // count of consumer tasks that panicked
+    pub timed_out: bool, // true if drain_timeout elapsed before all handlers finished
+}
+```
+
+And two methods:
+
+```rust,no_run
+impl SupervisorOutcome {
+    pub fn exit_code(&self) -> i32 { ... }
+    pub fn is_clean(&self) -> bool { ... }
+}
+```
+
+- **Clean** (`errors == 0 && panics == 0 && !timed_out`) — all in-flight handlers completed and acked within the drain window. `exit_code()` returns `0`. `is_clean()` returns `true`.
+- **Errors** (`errors > 0`) — at least one consumer task returned a `ShoveError` from its run loop (distinct from `Outcome::Reject`, which is normal business logic). `exit_code()` returns `1`.
+- **Panics** (`panics > 0`) — at least one consumer task or handler panicked. Panics outrank errors. `exit_code()` returns `2` even if there are also errors.
+- **Drain timeout** (`timed_out == true`) — the drain deadline elapsed before all handlers finished. Drain timeout outranks everything. `exit_code()` returns `3` even if there are also errors or panics.
+
+The priority ordering for `exit_code()` is: `timed_out` (3) > `panics` (2) > `errors` (1) > clean (0).
+
+## exit\_code() mapping
+
+| Field state | exit_code() | Meaning |
+|-------------|-------------|---------|
+| All zero / false | 0 | Clean drain — all in-flight messages were acked, retried, or rejected |
+| `errors > 0` | 1 | At least one consumer task returned a framework-level error |
+| `panics > 0` | 2 | At least one task panicked (errors may also be present) |
+| `timed_out == true` | 3 | Drain deadline elapsed; in-flight messages were abandoned |
+
+Exit code `1` is a consumer task error, not a handler-returned `Outcome::Reject`. An `Outcome::Reject` that routes a message to the DLQ is normal operation — it does not increment `errors`. Only unrecoverable infrastructure errors (failed broker connection during drain, serialization bugs that `shove` surfaces as `Err`) increment the error count.
+
+## Picking a drain timeout
+
+Set the drain timeout to **longer than your longest-expected handler**. Guidelines:
+
+- If your handlers complete in under 1 second, 10 seconds is plenty.
+- If handlers make external API calls with up to 10-second timeouts, use 30 seconds.
+- If handlers do complex database transactions that can take up to 30 seconds in the worst case, use 60–90 seconds.
+
+Too short a drain timeout results in `timed_out = true` and abandoned in-flight messages. Those messages are not lost — the broker will redeliver them — but they cause an extra delivery and your handlers must be idempotent to handle it correctly.
+
+Too long a drain timeout slows rolling deploys. In Kubernetes, a pod's `terminationGracePeriodSeconds` must be longer than your drain timeout, or the kubelet will SIGKILL the process before the drain finishes. A common setup:
+
+```yaml
+terminationGracePeriodSeconds: 90   # longer than drain_timeout
+```
+
+```rust,no_run
+group.run_until_timeout(signal, Duration::from_secs(60)).await
+```
+
+## Signal sources
+
+**Local development:**
+
+```rust,no_run
+use futures::FutureExt;
+
+group.run_until_timeout(
+    tokio::signal::ctrl_c().map(|_| ()),
+    Duration::from_secs(10),
+).await
+```
+
+**Kubernetes preStop / SIGTERM** — the kubelet sends SIGTERM before SIGKILL. Wire it with `tokio::signal::unix`:
+
+```rust,no_run
+use tokio::signal::unix::{signal, SignalKind};
+
+let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+group.run_until_timeout(
+    async move { sigterm.recv().await; },
+    Duration::from_secs(60),
+).await
+```
+
+**Multiple signals (Ctrl-C + SIGTERM)** — use `tokio::select!` to race them:
+
+```rust,no_run
+use tokio::signal::unix::{signal, SignalKind};
+use futures::FutureExt;
+
+let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM");
+let signal_future = async move {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+};
+
+group.run_until_timeout(signal_future, Duration::from_secs(30)).await
+```
+
+**GitHub Actions / systemd** — both send SIGTERM. The SIGTERM handler above covers these cases.
+
+**Internal cancellation** — if another part of your application detects an unrecoverable condition and wants to trigger a clean shutdown, use the cancellation token:
+
+```rust,no_run
+let token = group.cancellation_token();
+let shutdown_handle = tokio::spawn(async move {
+    if let Err(e) = health_check().await {
+        tracing::error!("health check failed: {e} — initiating shutdown");
+        token.cancel();
+    }
+});
+```
+
+## What "clean" actually means
+
+A `SupervisorOutcome` with `exit_code() == 0` means every in-flight message at signal time was one of:
+
+- **Acked** — handler returned `Outcome::Ack`. Removed from the queue.
+- **Retried** — handler returned `Outcome::Retry` or `Outcome::Defer`. Published to hold queue and acked from main queue.
+- **Rejected** — handler returned `Outcome::Reject` or exhausted `max_retries`. Routed to DLQ (or discarded with warning if no DLQ) and acked from main queue.
+- **Discarded with warning** — message was malformed (deserialization failure, size limit exceeded). Acked from main queue after routing to DLQ or discarding.
+
+Critically: `Clean` means NO message was left partially-processed mid-flight. If you see exit code `3` (`DrainTimeout`), the handler was still running when the deadline elapsed and the tokio task was aborted. The broker will redeliver that message. Your handler must be idempotent to handle the redelivery correctly.
+
+For handlers with irreversible side effects, consider increasing the drain timeout or reducing handler latency before a rolling deploy. Abandoned in-flight messages under `DrainTimeout` are the most common source of production incidents involving `shove` consumers.
+
+## What's next
+
+- [Consumer Groups & Autoscaling](/guides/groups)
+- [The Broker\<B\> Pattern](/concepts/broker)
+- [Retries, Hold Queues & DLQs](/guides/retries)

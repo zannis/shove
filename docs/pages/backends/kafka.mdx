@@ -1,0 +1,103 @@
+# Apache Kafka
+
+If you already have a Kafka cluster or need streaming semantics — replayable log, partition-key ordering, consumer-lag autoscaling — this backend fits naturally. Best for high-throughput pipelines where log retention and replay matter.
+
+## What you need
+
+A Kafka cluster in KRaft mode or with Zookeeper. For local dev:
+
+```sh
+docker run --rm -p 9092:9092 confluentinc/cp-kafka:latest
+```
+
+The integration tests use [testcontainers](https://crates.io/crates/testcontainers) with the Apache Kafka module, so any runnable example also spins up a container automatically.
+
+## Install
+
+```sh
+cargo add shove --features kafka
+```
+
+For TLS + SASL (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512):
+
+```sh
+cargo add shove --features kafka-ssl
+```
+
+## Connect
+
+```rust
+// [!include ~/examples/kafka/basic.rs:connect]
+```
+
+`KafkaConfig::new` takes a bootstrap server address (e.g. `localhost:9092`). TLS and SASL are configured via `KafkaTls` and `KafkaSasl` on the config — available when the `kafka-ssl` feature is enabled.
+
+## Declare topology
+
+```rust
+// [!include ~/examples/kafka/basic.rs:declare]
+```
+
+`topology().declare::<T>()` creates the Kafka topics for the main topic, hold topics, and DLQ. Idempotent — safe to call on every startup.
+
+## Publish
+
+```rust
+// [!include ~/examples/kafka/basic.rs:publish]
+```
+
+`publisher().await?` returns a `Publisher<Kafka>`. Messages are produced via `rdkafka`. The message key is derived from the topic's partition-key logic (or from `T::sequence_key()` for sequenced topics).
+
+## Consume
+
+```rust
+// [!include ~/examples/kafka/basic.rs:consume]
+```
+
+`consumer_group()` registers a native Kafka consumer group. `KafkaConsumerGroupConfig::new(min..=max)` sets the autoscale bounds. Kafka handles partition assignment and rebalance automatically when the group membership changes.
+
+## Sequenced delivery
+
+Messages for the same key stay in order. Kafka uses partition-key routing: `T::sequence_key()` becomes the Kafka message key, so messages with the same key always land on the same partition. A single consumer handles each partition at a time, guaranteeing that messages for the same key are never processed concurrently.
+
+Ordering is partition-scoped: two messages with different keys may land on different partitions and be processed concurrently. The partition count is fixed at topic creation time and caps the maximum degree of parallelism across the consumer group.
+
+See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequenced example](/backends/kafka/examples/sequenced) for a runnable walkthrough.
+
+## Consumer groups + autoscaling
+
+Kafka consumer groups are native — `broker.consumer_group()` creates a standard Kafka consumer group. Call `register` to associate a topic with handlers and bounds:
+
+```rust,no_run
+use shove::kafka::KafkaConsumerGroupConfig;
+use shove::{Broker, ConsumerGroupConfig, Kafka};
+
+let mut group = broker.consumer_group();
+group
+    .register::<OrderTopic, _>(
+        ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=4)),
+        || MyHandler,
+    )
+    .await?;
+```
+
+The autoscaler measures consumer lag (the offset gap between the latest produced message and the latest committed offset) and adjusts the number of active consumers within the `min..=max` range.
+
+Note: consumer-group rebalances occur during scale-up and scale-down events. Rebalances cause a brief delivery pause while Kafka reassigns partitions. Plan for this when setting autoscale bounds and drain timeouts.
+
+See the [Basic example](/backends/kafka/examples/basic) for a full runnable walkthrough.
+
+## Gotchas
+
+- **Partition count is set at topic creation time** and is rarely changed after the fact. Choose carefully — partition count caps the maximum degree of parallelism a consumer group can achieve (one consumer per partition maximum).
+- **Consumer-group rebalances** during scale events cause brief delivery pauses. The larger the group and the more topics, the longer the rebalance. Tune `session.timeout.ms` and `max.poll.interval.ms` in `KafkaConfig` if handlers are slow.
+- **On Windows**, the `cmake-build` feature is required for `rdkafka` (the underlying C library). This is handled automatically via the `[target.'cfg(windows)'.dependencies]` entry in `Cargo.toml`.
+- **SASL and TLS** require the `kafka-ssl` feature. SCRAM-SHA-256 and SCRAM-SHA-512 are supported out of the box. GSSAPI/Kerberos requires downstream activation of `rdkafka/gssapi`.
+- **`librdkafka` system dependencies** on Debian/Ubuntu CI runners: `libsasl2-dev` is required when using `kafka-ssl`. Add it to your CI runner setup (the shove `ci.yml` already does this).
+
+## Examples
+
+- [Basic](/backends/kafka/examples/basic) — publish/consume round trip with hold queues and DLQ
+- [Sequenced](/backends/kafka/examples/sequenced) — partition-key ordering
+- [Audited Consumer](/backends/kafka/examples/audited) — `MessageHandlerExt::audited` wrapping
+- [Stress](/backends/kafka/examples/stress) — throughput benchmarking
