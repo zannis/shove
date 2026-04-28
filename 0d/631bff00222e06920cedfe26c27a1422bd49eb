@@ -1,0 +1,25 @@
+wrangler.toml
+  54214397c9f7db40 1-9
+DEPLOYMENT.md
+  54214397c9f7db40 1-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "0d631bff00222e06920cedfe26c27a1422bd49eb",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24842,
+      "total_deletions": 0,
+      "accepted_lines": 45,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,23 @@
+src/consumer.rs
+  54214397c9f7db40 10-15,298,310,320
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "7c55cddddc9a9b8155e7d45ae3f43c7020dfed81",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 49566,
+      "total_deletions": 5,
+      "accepted_lines": 9,
+      "overriden_lines": 0
+    }
+  }
+}

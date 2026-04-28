@@ -1,0 +1,23 @@
+examples/nats/basic.rs
+  54214397c9f7db40 57,59-60,62,65,76,79,99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "ba0d08a6fe912d4736c039d3552f9f33dd3526c3",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24757,
+      "total_deletions": 0,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    }
+  }
+}

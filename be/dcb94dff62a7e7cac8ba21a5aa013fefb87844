@@ -1,0 +1,23 @@
+docs/pages/guides/sequenced.mdx
+  54214397c9f7db40 1-193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "bedcb94dff62a7e7cac8ba21a5aa013fefb87844",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 191,
+      "total_deletions": 1,
+      "accepted_lines": 191,
+      "overriden_lines": 0
+    }
+  }
+}
