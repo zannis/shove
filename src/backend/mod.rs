@@ -190,6 +190,7 @@ mod bounds_smoke {
             max_message_size: None,
             shutdown: CancellationToken::new(),
             processing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            consumer_group: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

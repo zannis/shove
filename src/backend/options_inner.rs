@@ -23,6 +23,8 @@ pub(crate) struct ConsumerOptionsInner {
     pub max_message_size: Option<usize>,
     pub shutdown: CancellationToken,
     pub processing: Arc<AtomicBool>,
+    /// Consumer-group name for metrics labels. `None` is treated as `"default"`.
+    pub consumer_group: Option<Arc<str>>,
 
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
@@ -45,6 +47,7 @@ impl ConsumerOptionsInner {
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
+            consumer_group: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
