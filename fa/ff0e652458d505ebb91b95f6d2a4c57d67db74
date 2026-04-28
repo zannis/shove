@@ -1,0 +1,33 @@
+docs/pages/backends/rabbitmq/examples/concurrent.mdx
+  54214397c9f7db40 58-65
+docs/pages/backends/sqs/examples/concurrent.mdx
+  54214397c9f7db40 59-67
+docs/pages/backends/nats/examples/stress.mdx
+  54214397c9f7db40 63-71
+docs/pages/guides/retries.mdx
+  54214397c9f7db40 109
+docs/pages/backends/inmemory/examples/stress.mdx
+  54214397c9f7db40 68-75
+docs/pages/backends/kafka/examples/stress.mdx
+  54214397c9f7db40 63-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "faff0e652458d505ebb91b95f6d2a4c57d67db74",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 43,
+      "total_deletions": 6,
+      "accepted_lines": 1563,
+      "overriden_lines": 0
+    }
+  }
+}
