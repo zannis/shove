@@ -34,7 +34,7 @@ VisibilityTimeout: 60   # seconds — set to 2× your worst-case handler time
 
 **Region matters.** SQS queues are regional. Consuming a queue in a different region than your application's default region requires explicit configuration. Cross-region fanout is handled at the SNS topic ARN level, not in shove.
 
-**Dead-letter queues are configured at the SQS resource level.** shove does not manage DLQ wiring for SQS. Configure `maxReceiveCount` and the DLQ ARN on your SQS queue resource (Terraform, CloudFormation, or console). shove's internal retry logic (hold queues, `Retry` outcome) works alongside — but independently of — the SQS redrive policy.
+**Dead-letter queues are wired at topology-declaration time.** When you declare a topic with `.dlq()`, shove creates the DLQ queue (or its FIFO equivalent for sequenced topics), attaches a `RedrivePolicy` with `maxReceiveCount` set to shove's default (`DEFAULT_MAX_RECEIVE_COUNT`), and points the main queue at it. You don't need to provision the DLQ separately in Terraform/CloudFormation. If you want a different `maxReceiveCount` or a pre-existing DLQ ARN, configure it via the SQS console or IaC tooling AFTER `declare` runs — but the default wiring is automatic.
 
 **IAM permissions.** The consumer role needs the following permissions on each queue it reads from:
 

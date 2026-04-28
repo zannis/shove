@@ -73,7 +73,7 @@ Available log levels used by `shove`:
 
 `MessageMetadata::headers` is a `HashMap<String, String>` carrying broker-level headers that survive hold-queue hops. Notable headers:
 
-- **`x-trace-id`** — set by publishers at publish time. Used by `Audited` as the `trace_id` in audit records. Preserved across retries (hold-queue hops forward headers).
+- **`x-trace-id`** — used by `Audited` as the `trace_id` on audit records. Publishers do not set it automatically; if absent on delivery, `Audited` generates a fresh UUID per message. Set it explicitly via `publish_with_headers` (shown below) when you want a trace ID that connects to upstream/downstream systems. Once set, it is preserved across retries — hold-queue hops forward headers.
 - **`x-shove-retry-count`** — the internal retry counter maintained by `shove`'s consumer routing layer.
 - Backend-specific identifiers (see the table below).
 

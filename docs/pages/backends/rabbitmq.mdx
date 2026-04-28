@@ -68,7 +68,7 @@ See [Sequenced Topics](/guides/sequenced) for the full ordering model, and [Sequ
 
 ## Consumer groups + autoscaling
 
-RabbitMQ consumer groups are coordinated via SAC. Call `broker.consumer_group()` and register topics with a `ConsumerGroupConfig`:
+For non-sequenced topics, a RabbitMQ consumer group is N consumers competing on the main queue under standard work-queue semantics — the broker hands each message to one consumer. (Single-active-consumer is reserved for sequenced sub-queues, where one consumer per shard is required to preserve ordering — see [Sequenced delivery](#sequenced-delivery) above.) Call `broker.consumer_group()` and register topics with a `ConsumerGroupConfig`:
 
 ```rust,no_run
 use shove::rabbitmq::ConsumerGroupConfig as RabbitMqGroupConfig;
