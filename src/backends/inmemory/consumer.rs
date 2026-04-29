@@ -113,6 +113,19 @@ impl InMemoryConsumer {
         run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options)
     }
 
+    pub(crate) fn spawn_fifo_shards_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        spawn_fifo_shards::<T, H>(self.broker.clone(), handler, ctx, options)
+    }
+
     pub fn run_dlq<T, H>(
         &self,
         handler: H,
