@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `RabbitMqConsumer::run_fifo_until_timeout`, `KafkaConsumer::run_fifo_until_timeout`, `NatsConsumer::run_fifo_until_timeout`, `InMemoryConsumer::run_fifo_until_timeout`, and `SqsConsumer::run_fifo_until_timeout`. FIFO-equivalent of `ConsumerGroup::run_until_timeout` for sequenced topics — races a `signal` future against shards finishing on their own, cancels `options.shutdown` on signal, drains within `drain_timeout`, and returns a `SupervisorOutcome`. Process-level exit-code rollups across coordinated groups and sequenced topics now use one type:
+
+  ```rust,no_run
+  let outcome = consumer
+      .run_fifo_until_timeout::<MyTopic, _, _>(handler, ctx, opts, signal, Duration::from_secs(30))
+      .await;
+  std::process::exit(outcome.exit_code());
+  ```
+
+  Handler panics are absorbed at the `tokio::spawn` + `oneshot` boundary on RabbitMQ, Kafka, NATS, and InMemory — they map to `Outcome::Retry` and don't increment `outcome.panics`. SQS awaits the handler directly, so handler panics propagate to the shard task. `outcome.panics > 0` consistently reflects shard-infrastructure panics or aborted-during-drain shards across all backends.
+
+- `ConsumerSupervisor::register_fifo<T: SequencedTopic, H>` and `ConsumerGroup::register_fifo<T: SequencedTopic, H>`. Sequenced topics now register on the same harness as regular topics and drain through the same `run_until_timeout`, returning one `SupervisorOutcome` for the entire harness:
+
+  ```rust,no_run
+  let mut sup = broker.consumer_supervisor().with_context(ctx);
+  sup.register::<RegularTopic, _>(handler_a, options_a)?;
+  sup.register_fifo::<SequencedTopic, _>(handler_b, options_b).await?;
+  let outcome = sup.run_until_timeout(signal, Duration::from_secs(30)).await;
+  ```
+
+  `ConsumerGroup::register_fifo` takes only the handler factory — FIFO concurrency is fixed by the topology's `routing_shards`, so there is no `ConsumerGroupConfig` parameter and the autoscaler is bypassed (more replicas would break per-key ordering). The existing `register` rejection messages now point at `register_fifo` instead of the older `run_fifo` advice; per-shard panics surface as `SupervisorOutcome::panics` via a new internal `panic_count` counter on each backend's group struct.
+
 ## 0.8.0 — shove v2 (breaking)
 
 Collapses the per-backend public API behind a single generic `Broker<B>` facade parameterized by a sealed `Backend` marker. Every backend-specific type (`KafkaPublisher`, `NatsConsumerGroupRegistry`, `SqsConsumer`, …) is now reached through the same wrappers: `Broker<B>`, `Publisher<B>`, `TopologyDeclarer<B>`, `ConsumerSupervisor<B>`, `ConsumerGroup<B>`, `ConsumerOptions<B>`.

@@ -215,6 +215,8 @@ Available on `RabbitMqConsumer`, `KafkaConsumer`, `NatsConsumer`, `InMemoryConsu
 
 **Handler-panic counting note.** Most backends (RabbitMQ, Kafka, NATS, InMemory) wrap each handler invocation in a `tokio::spawn` + `oneshot` boundary that catches panics and maps them to `Outcome::Retry`. As a result `outcome.panics` does not increment for panics inside `MessageHandler::handle` — those land in your retry/DLQ path instead. `outcome.panics > 0` is reserved for panics in shard-infrastructure code or aborted-during-drain shards. SQS is the exception: its FIFO shard awaits the handler directly, so handler panics propagate to the shard task and increment `outcome.panics`.
 
+**Harness path.** If your binary already runs other consumers through `ConsumerSupervisor` / `ConsumerGroup`, prefer `register_fifo` over `run_fifo_until_timeout` — sequenced topics drain through the same `run_until_timeout` as regular topics, returning a single `SupervisorOutcome` for the entire harness. See [Sequenced consumers → Harness path](/guides/sequenced#harness-path-register_fifo).
+
 ## What's next
 
 - [Consumer Groups & Autoscaling](/guides/groups)
