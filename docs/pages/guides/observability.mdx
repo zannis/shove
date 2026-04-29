@@ -54,7 +54,7 @@ shove::metrics::set_prefix("billing_shove");
 // ... then install your recorder ...
 ```
 
-The prefix is set-once: subsequent calls are silently ignored, matching the semantics of `metrics::set_global_recorder`.
+**Important**: `set_prefix` must be called *before any metric emission*, not just before installing the recorder. The metric-name cache is materialised on first use, so any backend or publisher activity locks in the default `shove` prefix; calling `set_prefix` after that point panics rather than silently produce mis-named metrics. The prefix string itself must match Prometheus' name grammar (`[a-zA-Z_][a-zA-Z0-9_]*`); hyphens or other special characters produce invalid metric names that the exporter will reject.
 
 ### Metric reference
 
@@ -67,7 +67,6 @@ The prefix is set-once: subsequent calls are silently ignored, matching the sema
 | `shove_message_publish_duration_seconds` | histogram | `topic`, `outcome` |
 | `shove_message_size_bytes` | histogram | `topic`, `consumer_group` |
 | `shove_messages_inflight` | gauge | `topic`, `consumer_group` |
-| `shove_consumer_workers` | gauge | `consumer_group` |
 | `shove_autoscaler_decisions_total` | counter | `consumer_group`, `direction` |
 | `shove_backend_errors_total` | counter | `backend`, `kind` |
 
@@ -81,6 +80,10 @@ The prefix is set-once: subsequent calls are silently ignored, matching the sema
 - `kind` on `backend_errors_total`: `connection`, `publish`, `consume`, `topology`, `ack`.
 - `topic`: the queue name from the topology (`QueueTopology::queue()`).
 - `consumer_group`: the group name set by a coordinated group registry, or `"default"` when the consumer was registered through `ConsumerSupervisor` directly.
+
+`shove_backend_errors_total` covers the most operationally-meaningful error sites (connection drops, topology conflicts, broker NACKs, consume-stream closures, ack failures); not every possible internal `Err` propagation produces a counter increment. Treat the counter as a "something is wrong with backend X" signal rather than an exhaustive error count.
+
+`shove_messages_published_total` increments once per message in a batch publish, matching what consumers see downstream. `shove_message_publish_duration_seconds` records one sample per batch (the user-observable call latency). Empty batches are no-ops and emit no events.
 
 ### Histogram buckets
 

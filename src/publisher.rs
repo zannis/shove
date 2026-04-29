@@ -46,15 +46,14 @@ impl<B: Backend> Publisher<B> {
         let start = Instant::now();
         let res = self.inner.publish_batch::<T>(msgs).await;
         let elapsed = start.elapsed().as_secs_f64();
-        let count = msgs.len() as u64;
-        if count > 0 {
-            for _ in 0..count {
-                metrics::record_published(topic, res.is_ok());
-            }
-        } else {
-            metrics::record_published(topic, res.is_ok());
+        // One counter event per message so totals line up with what consumers
+        // increment downstream; empty batches emit nothing (the call was a no-op).
+        metrics::record_published_n(topic, res.is_ok(), msgs.len() as u64);
+        // Duration is one sample for the whole batch — that's the user-observable
+        // call latency, regardless of how many messages were inside.
+        if !msgs.is_empty() {
+            metrics::record_publish_duration(topic, res.is_ok(), elapsed);
         }
-        metrics::record_publish_duration(topic, res.is_ok(), elapsed);
         res
     }
 }

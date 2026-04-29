@@ -13,17 +13,36 @@ const DEFAULT_PREFIX: &str = "shove";
 static PREFIX: OnceLock<&'static str> = OnceLock::new();
 static NAMES: OnceLock<MetricNames> = OnceLock::new();
 
-/// Override the prefix applied to every emitted metric name. Call once,
-/// before any metric emission and before installing the recorder.
+/// Override the prefix applied to every emitted metric name.
 ///
-/// Subsequent calls are silently ignored (the prefix is set-once, matching
-/// `metrics::set_global_recorder`). Defaults to `"shove"` if never called.
+/// Call once at startup, **before** any metric emission and before installing
+/// the recorder. The prefix is materialised into the [`MetricNames`] cache the
+/// first time any helper emits, so calling `set_prefix` after that point
+/// silently has no effect — and rather than mask the misconfiguration, this
+/// function panics in that case. Calling twice in a row also panics.
 ///
-/// The provided string is leaked so we can hand `&'static str` names to
-/// the `metrics` macros without per-emit allocation.
+/// The prefix must match Prometheus' metric-name grammar
+/// (`[a-zA-Z_][a-zA-Z0-9_]*`); names are formatted as `{prefix}_<suffix>` so
+/// hyphens or other special characters in the prefix produce invalid metric
+/// names that exporters will reject.
+///
+/// The provided string is leaked so we can hand `&'static str` names to the
+/// `metrics` macros without per-emit allocation.
+///
+/// # Panics
+///
+/// - If `set_prefix` has already been called.
+/// - If any metric has already been emitted (the cache is locked).
 pub fn set_prefix(prefix: impl Into<String>) {
+    assert!(
+        NAMES.get().is_none(),
+        "shove::metrics::set_prefix called after metric emission already initialized \
+         the name cache; call set_prefix at startup before any broker/publisher work",
+    );
     let leaked: &'static str = Box::leak(prefix.into().into_boxed_str());
-    let _ = PREFIX.set(leaked);
+    PREFIX.set(leaked).expect(
+        "shove::metrics::set_prefix called twice; the prefix is set-once at startup",
+    );
 }
 
 fn prefix() -> &'static str {
@@ -38,7 +57,6 @@ pub(crate) struct MetricNames {
     pub message_publish_duration_seconds: &'static str,
     pub message_size_bytes: &'static str,
     pub messages_inflight: &'static str,
-    pub consumer_workers: &'static str,
     pub autoscaler_decisions_total: &'static str,
     pub backend_errors_total: &'static str,
 }
@@ -60,7 +78,6 @@ pub(crate) fn names() -> &'static MetricNames {
             )),
             message_size_bytes: leak(format!("{p}_message_size_bytes")),
             messages_inflight: leak(format!("{p}_messages_inflight")),
-            consumer_workers: leak(format!("{p}_consumer_workers")),
             autoscaler_decisions_total: leak(format!("{p}_autoscaler_decisions_total")),
             backend_errors_total: leak(format!("{p}_backend_errors_total")),
         }
@@ -192,17 +209,28 @@ pub(crate) fn record_failed(_: &str, _: Option<&str>, _: FailReason) {}
 
 #[cfg(feature = "metrics")]
 pub(crate) fn record_published(topic: &str, ok: bool) {
+    record_published_n(topic, ok, 1);
+}
+
+#[cfg(not(feature = "metrics"))]
+pub(crate) fn record_published(_: &str, _: bool) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_published_n(topic: &str, ok: bool, count: u64) {
+    if count == 0 {
+        return;
+    }
     let outcome = if ok { "success" } else { "error" };
     ::metrics::counter!(
         names().messages_published_total,
         "topic" => topic.to_string(),
         "outcome" => outcome,
     )
-    .increment(1);
+    .increment(count);
 }
 
 #[cfg(not(feature = "metrics"))]
-pub(crate) fn record_published(_: &str, _: bool) {}
+pub(crate) fn record_published_n(_: &str, _: bool, _: u64) {}
 
 #[cfg(feature = "metrics")]
 pub(crate) fn record_processing_duration(
@@ -317,18 +345,6 @@ impl Drop for InflightGuard {
 }
 
 #[cfg(feature = "metrics")]
-pub(crate) fn set_consumer_workers(group: &str, workers: i64) {
-    ::metrics::gauge!(
-        names().consumer_workers,
-        "consumer_group" => group.to_string(),
-    )
-    .set(workers as f64);
-}
-
-#[cfg(not(feature = "metrics"))]
-pub(crate) fn set_consumer_workers(_: &str, _: i64) {}
-
-#[cfg(feature = "metrics")]
 pub(crate) fn record_autoscaler_decision(group: &str, direction: &'static str) {
     ::metrics::counter!(
         names().autoscaler_decisions_total,
@@ -382,7 +398,6 @@ mod tests {
         );
         assert_eq!(n.message_size_bytes, "shove_message_size_bytes");
         assert_eq!(n.messages_inflight, "shove_messages_inflight");
-        assert_eq!(n.consumer_workers, "shove_consumer_workers");
         assert_eq!(
             n.autoscaler_decisions_total,
             "shove_autoscaler_decisions_total"
