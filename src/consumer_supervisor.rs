@@ -65,6 +65,36 @@ impl ShutdownTally {
 }
 
 // ---------------------------------------------------------------------------
+// Shared drain helper
+// ---------------------------------------------------------------------------
+
+/// Map a `JoinSet::join_next` result onto running `errors` / `panics`
+/// counters. Shared by `ConsumerSupervisor::run_until_timeout` and each
+/// backend's `run_fifo_until_timeout`.
+///
+/// `Ok(Err(ShoveError))` → `errors += 1`
+/// Cancellation (`JoinError::is_cancelled`) → ignored
+/// Other `JoinError` → `panics += 1`
+pub(crate) fn tally_join_result(
+    res: std::result::Result<Result<()>, JoinError>,
+    errors: &mut usize,
+    panics: &mut usize,
+) {
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "consumer task failed");
+            *errors += 1;
+        }
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => {
+            tracing::error!(error = %e, "consumer task panicked");
+            *panics += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ConsumerSupervisor<B, Ctx>
 // ---------------------------------------------------------------------------
 
@@ -138,25 +168,6 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
             _ = self.shutdown.cancelled() => {}
         }
 
-        fn tally(
-            res: std::result::Result<Result<()>, JoinError>,
-            errors: &mut usize,
-            panics: &mut usize,
-        ) {
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "consumer task failed");
-                    *errors += 1;
-                }
-                Err(e) if e.is_cancelled() => {}
-                Err(e) => {
-                    tracing::error!(error = %e, "consumer task panicked");
-                    *panics += 1;
-                }
-            }
-        }
-
         let mut errors = 0usize;
         let mut panics = 0usize;
 
@@ -166,17 +177,13 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
             let panics = &mut panics;
             async move {
                 while let Some(res) = tasks.join_next().await {
-                    tally(res, errors, panics);
+                    tally_join_result(res, errors, panics);
                 }
             }
         };
 
         match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(()) => SupervisorOutcome {
-                errors,
-                panics,
-                timed_out: false,
-            },
+            Ok(()) => SupervisorOutcome { errors, panics, timed_out: false },
             Err(_) => {
                 tracing::warn!(
                     timeout_ms = drain_timeout.as_millis() as u64,
@@ -184,13 +191,9 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
                 );
                 self.tasks.abort_all();
                 while let Some(res) = self.tasks.join_next().await {
-                    tally(res, &mut errors, &mut panics);
+                    tally_join_result(res, &mut errors, &mut panics);
                 }
-                SupervisorOutcome {
-                    errors,
-                    panics,
-                    timed_out: true,
-                }
+                SupervisorOutcome { errors, panics, timed_out: true }
             }
         }
     }
