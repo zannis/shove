@@ -184,6 +184,10 @@ impl KafkaPublisher {
                     .send(record, PRODUCE_TIMEOUT)
                     .await
                     .map_err(|(e, _)| {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Kafka,
+                            metrics::BackendErrorKind::Publish,
+                        );
                         ShoveError::Connection(format!("batch publish failed: {e}"))
                     })?;
                 Ok::<(), ShoveError>(())

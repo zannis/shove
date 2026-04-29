@@ -561,6 +561,10 @@ where
                 .send()
                 .await
                 .map_err(|e| {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::SnsSqs,
+                        metrics::BackendErrorKind::Consume,
+                    );
                     map_sqs_error(&format!("SQS ReceiveMessage failed on {queue_url}"), e)
                 })?;
 
@@ -1010,6 +1014,10 @@ where
             }, if can_accept => {
                 let messages = result
                     .map_err(|e| {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::SnsSqs,
+                            metrics::BackendErrorKind::Consume,
+                        );
                         map_sqs_error(
                             &format!("SQS ReceiveMessage failed on {queue_url}"),
                             e,
@@ -1433,6 +1441,10 @@ where
                 .message_attribute_names("All")
                 .send() => {
                 let output = result.map_err(|e| {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::SnsSqs,
+                        metrics::BackendErrorKind::Consume,
+                    );
                     map_sqs_error(&format!("SQS ReceiveMessage failed on DLQ {queue_url}"), e)
                 })?;
 

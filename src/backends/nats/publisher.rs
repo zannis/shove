@@ -176,6 +176,10 @@ impl NatsPublisher {
             {
                 Ok(ack) => ack_futures.push(ack),
                 Err(e) => {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Nats,
+                        metrics::BackendErrorKind::Publish,
+                    );
                     first_err = Some(ShoveError::Connection(format!("batch publish failed: {e}")));
                     break;
                 }
@@ -188,6 +192,10 @@ impl NatsPublisher {
                 match ack.await {
                     Ok(_) => succeeded += 1,
                     Err(e) => {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Nats,
+                            metrics::BackendErrorKind::Publish,
+                        );
                         first_err = Some(ShoveError::Connection(format!(
                             "batch publish ack failed: {e}"
                         )));

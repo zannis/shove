@@ -8,6 +8,7 @@ use crate::backend::PublisherImpl;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
+use crate::metrics;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
@@ -116,9 +117,13 @@ impl SnsPublisher {
             }
         }
 
-        req.send()
-            .await
-            .map_err(|e| ShoveError::Connection(format!("SNS publish failed: {e}")))?;
+        req.send().await.map_err(|e| {
+            metrics::record_backend_error(
+                metrics::BackendLabel::SnsSqs,
+                metrics::BackendErrorKind::Publish,
+            );
+            ShoveError::Connection(format!("SNS publish failed: {e}"))
+        })?;
 
         Ok(())
     }
@@ -295,6 +300,10 @@ impl SnsPublisher {
                         let failed = result.failed();
                         chunk_succeeded = (chunk.len() - failed.len()) as u64;
                         if !failed.is_empty() {
+                            metrics::record_backend_error(
+                                metrics::BackendLabel::SnsSqs,
+                                metrics::BackendErrorKind::Publish,
+                            );
                             chunk_err = Some(ShoveError::Connection(format!(
                                 "SNS batch publish: {} of {} messages failed. First error: {} (code: {})",
                                 failed.len(),
@@ -309,6 +318,10 @@ impl SnsPublisher {
                         break;
                     }
                     Err(e) => {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::SnsSqs,
+                            metrics::BackendErrorKind::Publish,
+                        );
                         let err = ShoveError::Connection(format!("SNS batch publish failed: {e}"));
                         warn!(queue_name, attempt, error = %err, "SNS batch chunk failed, retrying");
                         chunk_err = Some(err);
