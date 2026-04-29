@@ -5189,3 +5189,48 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     client.shutdown().await;
     broker.stop().await;
 }
+
+/// Consumer group `register_fifo` drains all messages via `run_until_timeout`.
+#[tokio::test]
+async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let b = broker.broker_from(client.clone());
+    b.topology().declare::<OrderTopic>().await.unwrap();
+
+    let publisher = b.publisher().await.unwrap();
+    for seq in 0..5u32 {
+        publisher
+            .publish::<OrderTopic>(&OrderMessage {
+                account: "A".into(),
+                seq,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let mut group = b.consumer_group();
+    group
+        .register_fifo::<OrderTopic, _>({
+            let h = handler.clone();
+            move || h.clone()
+        })
+        .await
+        .unwrap();
+
+    let counter = handler.clone();
+    let signal = async move {
+        let _ = counter.wait_for_count(5, Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome was {outcome:?}");
+    assert_eq!(handler.count(), 5);
+
+    client.shutdown().await;
+    broker.stop().await;
+}
