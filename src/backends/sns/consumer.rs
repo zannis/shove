@@ -174,16 +174,25 @@ async fn invoke_handler<T: Topic, H: MessageHandler<T>>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    topic: &str,
+    group: Option<&str>,
 ) -> Outcome {
-    match timeout {
+    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
+    let start = std::time::Instant::now();
+    let outcome = match timeout {
         Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
             .await
             .unwrap_or_else(|_| {
                 warn!("handler exceeded timeout ({duration:?}), retrying message");
+                crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Timeout);
                 Outcome::Retry
             }),
         None => handler.handle(message, metadata, ctx).await,
-    }
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    crate::metrics::record_consumed(topic, group, &outcome);
+    crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    outcome
 }
 
 /// Spawns a handler task for a deserialized message.
@@ -195,6 +204,8 @@ fn spawn_handler<T, H>(
     metadata: MessageMetadata,
     timeout: Option<Duration>,
     notify: &Arc<Notify>,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
@@ -205,7 +216,16 @@ where
     let c = ctx.clone();
     let n = notify.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
+        let outcome = invoke_handler::<T, H>(
+            &h,
+            c.as_ref(),
+            message,
+            metadata,
+            timeout,
+            &topic,
+            group.as_deref(),
+        )
+        .await;
         let _ = tx.send(outcome);
         n.notify_one();
     });
@@ -237,6 +257,8 @@ where
     H: MessageHandler<T>,
 {
     let notify = Arc::new(Notify::new());
+    let topic: Arc<str> = Arc::from(topology.queue());
+    let group: Option<Arc<str>> = options.consumer_group.as_deref().map(Arc::from);
 
     // Max number of handlers running concurrently (1 = serial / non-concurrent mode).
     let max_in_flight = options.prefetch_count as usize;
@@ -427,9 +449,16 @@ where
 
             let body = extract_payload(msg.body().unwrap_or_default());
 
+            crate::metrics::record_message_size(&topic, group.as_deref(), body.len());
+
             // Reject oversized messages before deserialization
             if let Err(e) = options.validate_payload_message_size(body.len()) {
                 warn!(error = %e, queue_url, "rejecting oversized message");
+                crate::metrics::record_failed(
+                    &topic,
+                    group.as_deref(),
+                    crate::metrics::FailReason::Oversize,
+                );
                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
             }
@@ -438,6 +467,11 @@ where
                 Ok(m) => m,
                 Err(err) => {
                     error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting");
+                    crate::metrics::record_failed(
+                        &topic,
+                        group.as_deref(),
+                        crate::metrics::FailReason::Deserialize,
+                    );
                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     continue;
                 }
@@ -457,6 +491,8 @@ where
                 metadata,
                 options.handler_timeout,
                 &notify,
+                Arc::clone(&topic),
+                group.clone(),
             );
             in_flight.push_back(PendingMessage {
                 receipt_handle,
@@ -624,6 +660,8 @@ fn spawn_handler_keyed<T, H>(
     timeout: Option<Duration>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key: String,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
@@ -634,7 +672,16 @@ where
     let c = ctx.clone();
     let completed = completed_tx.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
+        let outcome = invoke_handler::<T, H>(
+            &h,
+            c.as_ref(),
+            message,
+            metadata,
+            timeout,
+            &topic,
+            group.as_deref(),
+        )
+        .await;
         let _ = tx.send(outcome);
         let _ = completed.send(key);
     });
@@ -728,6 +775,8 @@ where
 {
     let prefetch = options.prefetch_count as usize;
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<String>();
+    let topic: Arc<str> = Arc::from(topology.queue());
+    let group: Option<Arc<str>> = options.consumer_group.as_deref().map(Arc::from);
 
     let mut key_states: HashMap<String, KeyState> = HashMap::new();
     let mut in_flight_count: usize = 0;
@@ -793,6 +842,8 @@ where
                         &mut key_states,
                         &mut in_flight_count,
                         pending_deliveries,
+                        &topic,
+                        &group,
                     )
                     .await;
                 }
@@ -821,6 +872,8 @@ where
                         &mut key_states,
                         &mut in_flight_count,
                         pending_deliveries,
+                        &topic,
+                        &group,
                     )
                     .await;
                 }
@@ -1023,6 +1076,11 @@ where
                                         limit,
                                         "per-key pending buffer full, rejecting"
                                     );
+                                    crate::metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        crate::metrics::FailReason::PendingFull,
+                                    );
                                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                     continue;
                                 }
@@ -1062,6 +1120,11 @@ where
                                             limit,
                                             "per-key pending buffer full, rejecting"
                                         );
+                                        crate::metrics::record_failed(
+                                            &topic,
+                                            group.as_deref(),
+                                            crate::metrics::FailReason::PendingFull,
+                                        );
                                         router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                         continue;
                                     }
@@ -1084,6 +1147,8 @@ where
                     // ── Spawn handler for this key ──
                     let body = extract_payload(msg.body().unwrap_or_default());
 
+                    crate::metrics::record_message_size(&topic, group.as_deref(), body.len());
+
                     // Reject oversized messages before deserialization
                     if let Err(e) = options.validate_payload_message_size(body.len()) {
                         warn!(
@@ -1091,6 +1156,11 @@ where
                             queue_url,
                             sequence_key = %seq_key,
                             "rejecting oversized message"
+                        );
+                        crate::metrics::record_failed(
+                            &topic,
+                            group.as_deref(),
+                            crate::metrics::FailReason::Oversize,
                         );
                         if on_failure == SequenceFailure::FailAll {
                             poisoned_keys.insert(seq_key.clone());
@@ -1107,6 +1177,11 @@ where
                                 queue_url,
                                 sequence_key = %seq_key,
                                 "failed to deserialize SQS message, rejecting"
+                            );
+                            crate::metrics::record_failed(
+                                &topic,
+                                group.as_deref(),
+                                crate::metrics::FailReason::Deserialize,
                             );
                             if on_failure == SequenceFailure::FailAll {
                                 poisoned_keys.insert(seq_key.clone());
@@ -1132,6 +1207,8 @@ where
                         options.handler_timeout,
                         &completed_tx,
                         seq_key.clone(),
+                        Arc::clone(&topic),
+                        group.clone(),
                     );
 
                     key_states.insert(
@@ -1172,6 +1249,8 @@ async fn drain_pending_for_key<T, H>(
     key_states: &mut HashMap<String, KeyState>,
     in_flight_count: &mut usize,
     pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
+    topic: &Arc<str>,
+    group: &Option<Arc<str>>,
 ) where
     T: Topic,
     H: MessageHandler<T>,
@@ -1221,6 +1300,8 @@ async fn drain_pending_for_key<T, H>(
 
         let body = extract_payload(msg.body().unwrap_or_default());
 
+        crate::metrics::record_message_size(topic, group.as_deref(), body.len());
+
         // Reject oversized messages before deserialization
         if let Err(e) = options.validate_payload_message_size(body.len()) {
             warn!(
@@ -1228,6 +1309,11 @@ async fn drain_pending_for_key<T, H>(
                 queue_url,
                 sequence_key = %key,
                 "rejecting oversized buffered message"
+            );
+            crate::metrics::record_failed(
+                topic,
+                group.as_deref(),
+                crate::metrics::FailReason::Oversize,
             );
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
@@ -1250,6 +1336,11 @@ async fn drain_pending_for_key<T, H>(
                     queue_url,
                     sequence_key = %key,
                     "failed to deserialize buffered SQS message, rejecting"
+                );
+                crate::metrics::record_failed(
+                    topic,
+                    group.as_deref(),
+                    crate::metrics::FailReason::Deserialize,
                 );
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
@@ -1275,6 +1366,8 @@ async fn drain_pending_for_key<T, H>(
             options.handler_timeout,
             completed_tx,
             key.to_string(),
+            Arc::clone(topic),
+            group.clone(),
         );
 
         key_states.insert(
