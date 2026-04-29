@@ -2959,7 +2959,10 @@ async fn run_fifo_until_timeout_clean_drain() {
     for i in 0..5u64 {
         setup
             .publisher
-            .publish::<SeqSkipTopic>(&OrderMessage { order_id: "A".into(), amount: i })
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "A".into(),
+                amount: i,
+            })
             .await
             .expect("publish should succeed");
     }
@@ -2996,7 +2999,10 @@ async fn run_fifo_until_timeout_clean_drain() {
         )
         .await;
 
-    assert!(outcome.is_clean(), "expected clean outcome, got {outcome:?}");
+    assert!(
+        outcome.is_clean(),
+        "expected clean outcome, got {outcome:?}"
+    );
     assert_eq!(counter.get(), 5);
 }
 
@@ -3017,7 +3023,10 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
 
     setup
         .publisher
-        .publish::<SeqSkipTopic>(&OrderMessage { order_id: "A".into(), amount: 0 })
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
         .await
         .expect("publish should succeed");
 
@@ -3048,9 +3057,18 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
     // boundary and maps them to `Outcome::Retry` — the panic never escapes
     // the consume loop. So the harness sees a clean shutdown when the
     // signal fires: no panics, no errors, no timeout.
-    assert!(!outcome.timed_out, "harness must not hang on handler panics; got {outcome:?}");
-    assert_eq!(outcome.panics, 0, "handler panics are absorbed at the shard boundary; got {outcome:?}");
-    assert_eq!(outcome.errors, 0, "handler panics are absorbed at the shard boundary; got {outcome:?}");
+    assert!(
+        !outcome.timed_out,
+        "harness must not hang on handler panics; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.panics, 0,
+        "handler panics are absorbed at the shard boundary; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "handler panics are absorbed at the shard boundary; got {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -3067,7 +3085,10 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
 
     setup
         .publisher
-        .publish::<SeqSkipTopic>(&OrderMessage { order_id: "A".into(), amount: 0 })
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
         .await
         .expect("publish should succeed");
 
@@ -3107,7 +3128,11 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
 
     let outcome = consumer
         .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
-            SlowSeqHandler(started), (), opts, signal, drain,
+            SlowSeqHandler(started),
+            (),
+            opts,
+            signal,
+            drain,
         )
         .await;
 

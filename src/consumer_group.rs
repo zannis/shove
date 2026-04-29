@@ -178,7 +178,11 @@ mod tests {
         let broker = Broker::<InMemory>::new(InMemoryConfig::default())
             .await
             .expect("broker");
-        broker.topology().declare::<Ledger>().await.expect("declare");
+        broker
+            .topology()
+            .declare::<Ledger>()
+            .await
+            .expect("declare");
 
         let mut group = broker.consumer_group();
         group

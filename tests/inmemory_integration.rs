@@ -1188,7 +1188,11 @@ async fn consumer_group_distributes_load_across_workers() {
 async fn run_fifo_until_timeout_clean_drain() {
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
-    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+    broker
+        .topology()
+        .declare::<LedgerSkipTopic>()
+        .await
+        .unwrap();
 
     struct H;
     impl MessageHandler<LedgerSkipTopic> for H {
@@ -1204,7 +1208,11 @@ async fn run_fifo_until_timeout_clean_drain() {
 
     let outcome = consumer
         .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
-            H, (), opts, signal, Duration::from_secs(5),
+            H,
+            (),
+            opts,
+            signal,
+            Duration::from_secs(5),
         )
         .await;
 
@@ -1222,11 +1230,18 @@ async fn run_fifo_until_timeout_counts_panics() {
     // because InMemory absorbs handler-level panics internally.
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
-    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+    broker
+        .topology()
+        .declare::<LedgerSkipTopic>()
+        .await
+        .unwrap();
 
     let publisher = broker.publisher().await.unwrap();
     publisher
-        .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq: 0 })
+        .publish::<LedgerSkipTopic>(&Event {
+            account: "A".into(),
+            seq: 0,
+        })
         .await
         .unwrap();
 
@@ -1248,13 +1263,20 @@ async fn run_fifo_until_timeout_counts_panics() {
 
     let outcome = consumer
         .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
-            PanicHandler, (), opts, signal, Duration::from_secs(5),
+            PanicHandler,
+            (),
+            opts,
+            signal,
+            Duration::from_secs(5),
         )
         .await;
 
     // InMemory absorbs handler panics as Retry; the harness returns cleanly.
     // Other backends (RabbitMQ/Kafka/NATS/SQS) may surface panics differently.
-    assert!(!outcome.timed_out, "harness must not hang on handler panics; got {outcome:?}");
+    assert!(
+        !outcome.timed_out,
+        "harness must not hang on handler panics; got {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -1268,11 +1290,18 @@ async fn run_fifo_until_timeout_drain_does_not_hang_on_slow_handler() {
     // is set to 100 ms, which is more than enough for InMemory.
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
-    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+    broker
+        .topology()
+        .declare::<LedgerSkipTopic>()
+        .await
+        .unwrap();
 
     let publisher = broker.publisher().await.unwrap();
     publisher
-        .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq: 0 })
+        .publish::<LedgerSkipTopic>(&Event {
+            account: "A".into(),
+            seq: 0,
+        })
         .await
         .unwrap();
 
@@ -1291,14 +1320,15 @@ async fn run_fifo_until_timeout_drain_does_not_hang_on_slow_handler() {
     let opts = ConsumerOptions::<InMemory>::new().with_prefetch_count(1);
 
     let outcome = consumer
-        .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
-            SlowHandler, (), opts, signal, drain,
-        )
+        .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(SlowHandler, (), opts, signal, drain)
         .await;
 
     // InMemory shards respond to shutdown immediately, so drain finishes
     // well within the 100 ms window — timed_out must be false.
-    assert!(!outcome.timed_out, "InMemory drain must not time out; got {outcome:?}");
+    assert!(
+        !outcome.timed_out,
+        "InMemory drain must not time out; got {outcome:?}"
+    );
     assert_eq!(outcome.exit_code(), 0);
 }
 
@@ -1306,12 +1336,19 @@ async fn run_fifo_until_timeout_drain_does_not_hang_on_slow_handler() {
 async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
-    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+    broker
+        .topology()
+        .declare::<LedgerSkipTopic>()
+        .await
+        .unwrap();
 
     let publisher = broker.publisher().await.unwrap();
     for seq in 0..3u64 {
         publisher
-            .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq })
+            .publish::<LedgerSkipTopic>(&Event {
+                account: "A".into(),
+                seq,
+            })
             .await
             .unwrap();
     }
@@ -1342,7 +1379,11 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
 async fn run_fifo_until_timeout_returns_clean_when_shards_finish_first() {
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
-    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+    broker
+        .topology()
+        .declare::<LedgerSkipTopic>()
+        .await
+        .unwrap();
 
     struct H;
     impl MessageHandler<LedgerSkipTopic> for H {
@@ -1399,12 +1440,19 @@ async fn run_fifo_until_timeout_does_not_invoke_handlers_after_return() {
 
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
-    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+    broker
+        .topology()
+        .declare::<LedgerSkipTopic>()
+        .await
+        .unwrap();
 
     let publisher = broker.publisher().await.unwrap();
     for seq in 0..5u64 {
         publisher
-            .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq })
+            .publish::<LedgerSkipTopic>(&Event {
+                account: "A".into(),
+                seq,
+            })
             .await
             .unwrap();
     }
@@ -1431,7 +1479,11 @@ async fn run_fifo_until_timeout_does_not_invoke_handlers_after_return() {
 
     let outcome = consumer
         .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
-            handler, (), opts, signal, Duration::from_millis(100),
+            handler,
+            (),
+            opts,
+            signal,
+            Duration::from_millis(100),
         )
         .await;
 

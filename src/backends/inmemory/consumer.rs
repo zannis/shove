@@ -420,16 +420,15 @@ where
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
-            return SupervisorOutcome { errors: 1, panics: 0, timed_out: false };
+            return SupervisorOutcome {
+                errors: 1,
+                panics: 0,
+                timed_out: false,
+            };
         }
     };
-    crate::consumer_supervisor::drive_fifo_until_timeout(
-        handles,
-        shutdown,
-        signal,
-        drain_timeout,
-    )
-    .await
+    crate::consumer_supervisor::drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

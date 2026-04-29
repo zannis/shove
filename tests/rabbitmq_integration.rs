@@ -5032,7 +5032,10 @@ async fn run_fifo_until_timeout_clean_drain() {
     let publisher = b.publisher().await.unwrap();
     for seq in 0..5u32 {
         publisher
-            .publish::<OrderTopic>(&OrderMessage { account: "A".into(), seq })
+            .publish::<OrderTopic>(&OrderMessage {
+                account: "A".into(),
+                seq,
+            })
             .await
             .unwrap();
     }
@@ -5062,7 +5065,10 @@ async fn run_fifo_until_timeout_clean_drain() {
         )
         .await;
 
-    assert!(outcome.is_clean(), "expected clean outcome, got {outcome:?}");
+    assert!(
+        outcome.is_clean(),
+        "expected clean outcome, got {outcome:?}"
+    );
     assert_eq!(handler.count(), 5);
 
     client.shutdown().await;
@@ -5087,7 +5093,10 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
 
     let publisher = b.publisher().await.unwrap();
     publisher
-        .publish::<OrderTopic>(&OrderMessage { account: "A".into(), seq: 0 })
+        .publish::<OrderTopic>(&OrderMessage {
+            account: "A".into(),
+            seq: 0,
+        })
         .await
         .unwrap();
 
@@ -5112,7 +5121,11 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
 
     let outcome = consumer
         .run_fifo_until_timeout::<OrderTopic, _, _>(
-            PanicHandler, (), opts, signal, Duration::from_secs(10),
+            PanicHandler,
+            (),
+            opts,
+            signal,
+            Duration::from_secs(10),
         )
         .await;
 
@@ -5150,7 +5163,10 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
 
     let publisher = b.publisher().await.unwrap();
     publisher
-        .publish::<OrderTopic>(&OrderMessage { account: "A".into(), seq: 0 })
+        .publish::<OrderTopic>(&OrderMessage {
+            account: "A".into(),
+            seq: 0,
+        })
         .await
         .unwrap();
 
@@ -5177,9 +5193,7 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     let drain = Duration::from_millis(500);
 
     let outcome = consumer
-        .run_fifo_until_timeout::<OrderTopic, _, _>(
-            SlowHandler, (), opts, signal, drain,
-        )
+        .run_fifo_until_timeout::<OrderTopic, _, _>(SlowHandler, (), opts, signal, drain)
         .await;
 
     // STRICT — handler ignores shutdown, drain budget runs out, shards aborted.

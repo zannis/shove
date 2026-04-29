@@ -2007,7 +2007,10 @@ async fn run_fifo_until_timeout_clean_drain() {
     let publisher = broker.publisher().await.unwrap();
     for i in 0..5u64 {
         publisher
-            .publish::<SeqSkipTopic>(&OrderMessage { order_id: "A".into(), amount: i })
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "A".into(),
+                amount: i,
+            })
             .await
             .unwrap();
     }
@@ -2044,7 +2047,10 @@ async fn run_fifo_until_timeout_clean_drain() {
         )
         .await;
 
-    assert!(outcome.is_clean(), "expected clean outcome, got {outcome:?}");
+    assert!(
+        outcome.is_clean(),
+        "expected clean outcome, got {outcome:?}"
+    );
     assert_eq!(counter.get(), 5);
 
     broker.close().await;
@@ -2067,7 +2073,10 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
 
     let publisher = broker.publisher().await.unwrap();
     publisher
-        .publish::<SeqSkipTopic>(&OrderMessage { order_id: "A".into(), amount: 0 })
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
         .await
         .unwrap();
 
@@ -2090,7 +2099,11 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
 
     let outcome = consumer
         .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
-            PanicHandler, (), opts, signal, Duration::from_secs(10),
+            PanicHandler,
+            (),
+            opts,
+            signal,
+            Duration::from_secs(10),
         )
         .await;
 
@@ -2127,7 +2140,10 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
 
     let publisher = broker.publisher().await.unwrap();
     publisher
-        .publish::<SeqSkipTopic>(&OrderMessage { order_id: "A".into(), amount: 0 })
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
         .await
         .unwrap();
 
@@ -2168,9 +2184,7 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     let drain = Duration::from_millis(500);
 
     let outcome = consumer
-        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
-            SlowHandler(started), (), opts, signal, drain,
-        )
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(SlowHandler(started), (), opts, signal, drain)
         .await;
 
     // STRICT — handler ignores shutdown, drain budget runs out, shard aborted.

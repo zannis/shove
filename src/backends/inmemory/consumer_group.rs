@@ -224,7 +224,8 @@ impl InMemoryConsumerGroup {
             let pc = pc_for_spawner.clone();
             let ctx = ctx.clone();
             tokio::spawn(async move {
-                let handles = match consumer.spawn_fifo_shards_inner::<T, H>(handler, ctx, options) {
+                let handles = match consumer.spawn_fifo_shards_inner::<T, H>(handler, ctx, options)
+                {
                     Ok(h) => h,
                     Err(e) => {
                         ec.fetch_add(1, Ordering::Relaxed);
@@ -471,9 +472,11 @@ impl InMemoryConsumerGroupRegistry {
         }
         let queue = name.clone();
 
-        let broker = self.broker.as_ref().ok_or_else(|| {
-            ShoveError::Topology("registry not initialized".into())
-        })?.clone();
+        let broker = self
+            .broker
+            .as_ref()
+            .ok_or_else(|| ShoveError::Topology("registry not initialized".into()))?
+            .clone();
 
         let group_token = broker.shutdown_token().child_token();
         let group = InMemoryConsumerGroup::new_fifo::<T, H>(

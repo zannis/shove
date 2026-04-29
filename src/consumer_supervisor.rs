@@ -175,7 +175,11 @@ where
     };
 
     if !signal_won {
-        return SupervisorOutcome { errors, panics, timed_out: false };
+        return SupervisorOutcome {
+            errors,
+            panics,
+            timed_out: false,
+        };
     }
 
     shutdown.cancel();
@@ -185,7 +189,11 @@ where
         }
     };
     match tokio::time::timeout(drain_timeout, drain).await {
-        Ok(()) => SupervisorOutcome { errors, panics, timed_out: false },
+        Ok(()) => SupervisorOutcome {
+            errors,
+            panics,
+            timed_out: false,
+        },
         Err(_) => {
             tracing::warn!(
                 timeout_ms = drain_timeout.as_millis() as u64,
@@ -195,7 +203,11 @@ where
             while let Some(res) = joinset.join_next().await {
                 tally_join_result(res, &mut errors, &mut panics);
             }
-            SupervisorOutcome { errors, panics, timed_out: true }
+            SupervisorOutcome {
+                errors,
+                panics,
+                timed_out: true,
+            }
         }
     }
 }
@@ -346,7 +358,11 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         };
 
         match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(()) => SupervisorOutcome { errors, panics, timed_out: false },
+            Ok(()) => SupervisorOutcome {
+                errors,
+                panics,
+                timed_out: false,
+            },
             Err(_) => {
                 tracing::warn!(
                     timeout_ms = drain_timeout.as_millis() as u64,
@@ -356,7 +372,11 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
                 while let Some(res) = self.tasks.join_next().await {
                     tally_join_result(res, &mut errors, &mut panics);
                 }
-                SupervisorOutcome { errors, panics, timed_out: true }
+                SupervisorOutcome {
+                    errors,
+                    panics,
+                    timed_out: true,
+                }
             }
         }
     }
@@ -431,11 +451,10 @@ mod tests {
 
     #[tokio::test]
     async fn tally_ignores_cancellation() {
-        let handle: tokio::task::JoinHandle<crate::error::Result<()>> =
-            tokio::spawn(async {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                Ok(())
-            });
+        let handle: tokio::task::JoinHandle<crate::error::Result<()>> = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
         handle.abort();
         let join_err = handle.await.unwrap_err();
         assert!(join_err.is_cancelled());
@@ -535,8 +554,7 @@ mod inmemory_tests {
             .expect("declare");
 
         let mut sup = broker.consumer_supervisor();
-        let result =
-            sup.register::<Ledger, _>(NoopHandler, ConsumerOptions::<InMemory>::new());
+        let result = sup.register::<Ledger, _>(NoopHandler, ConsumerOptions::<InMemory>::new());
         match result {
             Err(ShoveError::Topology(msg)) => {
                 assert!(msg.contains("register_fifo"), "unexpected msg: {msg}");
@@ -566,10 +584,7 @@ mod inmemory_tests {
             .await;
         match result {
             Err(ShoveError::Topology(msg)) => {
-                assert!(
-                    msg.contains("already registered"),
-                    "unexpected msg: {msg}"
-                );
+                assert!(msg.contains("already registered"), "unexpected msg: {msg}");
             }
             other => panic!("expected Topology error, got {other:?}"),
         }

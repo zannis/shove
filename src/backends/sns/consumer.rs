@@ -1596,7 +1596,11 @@ impl SqsConsumer {
             Ok(h) => h,
             Err(e) => {
                 error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
-                return SupervisorOutcome { errors: 1, panics: 0, timed_out: false };
+                return SupervisorOutcome {
+                    errors: 1,
+                    panics: 0,
+                    timed_out: false,
+                };
             }
         };
         crate::consumer_supervisor::drive_fifo_until_timeout(
@@ -1618,7 +1622,9 @@ impl SqsConsumer {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options).await?;
+        let handles = self
+            .spawn_fifo_shards::<T, H>(handler, ctx, options)
+            .await?;
         for handle in handles {
             match handle.await {
                 Ok(Ok(())) => {}
@@ -1640,9 +1646,9 @@ impl SqsConsumer {
         H: MessageHandler<T>,
     {
         let topology = T::topology();
-        let seq = topology.sequencing().ok_or_else(|| {
-            ShoveError::Topology("run_fifo requires a sequenced topic".into())
-        })?;
+        let seq = topology
+            .sequencing()
+            .ok_or_else(|| ShoveError::Topology("run_fifo requires a sequenced topic".into()))?;
 
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);

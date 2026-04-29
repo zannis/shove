@@ -222,7 +222,10 @@ impl NatsConsumerGroup {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 // `spawn_fifo_shards` is async for NATS — `.await` is required.
-                let handles = match consumer.spawn_fifo_shards::<T, H>(handler, ctx, options).await {
+                let handles = match consumer
+                    .spawn_fifo_shards::<T, H>(handler, ctx, options)
+                    .await
+                {
                     Ok(h) => h,
                     Err(e) => {
                         ec.fetch_add(1, Ordering::Relaxed);

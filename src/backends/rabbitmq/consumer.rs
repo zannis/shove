@@ -1493,7 +1493,11 @@ impl RabbitMqConsumer {
             Ok(h) => h,
             Err(e) => {
                 error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
-                return SupervisorOutcome { errors: 1, panics: 0, timed_out: false };
+                return SupervisorOutcome {
+                    errors: 1,
+                    panics: 0,
+                    timed_out: false,
+                };
             }
         };
         crate::consumer_supervisor::drive_fifo_until_timeout(
