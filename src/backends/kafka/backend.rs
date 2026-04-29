@@ -197,6 +197,18 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
         KafkaConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
     }
 
+    async fn register_fifo<T, H>(
+        &mut self,
+        factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        KafkaConsumerGroupRegistry::register_fifo::<T, H>(self, factory, ctx).await
+    }
+
     fn cancellation_token(&self) -> CancellationToken {
         // Kafka consumer group registry doesn't expose a single
         // `broker_shutdown_token()` like InMemory. The canonical shutdown
