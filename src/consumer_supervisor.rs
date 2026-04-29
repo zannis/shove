@@ -9,7 +9,7 @@ use crate::backend::{Backend, ConsumerImpl};
 use crate::consumer::ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
-use crate::topic::Topic;
+use crate::topic::{SequencedTopic, Topic};
 
 /// Result of draining a supervisor or consumer group.
 #[must_use]
@@ -221,9 +221,7 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         if T::topology().sequencing().is_some() {
             return Err(ShoveError::Topology(format!(
                 "topic '{}' has a sequencing config; `ConsumerSupervisor::register` \
-                 would silently drop FIFO ordering. Use the backend-specific \
-                 consumer's `run_fifo` for sequenced topics until FIFO registration \
-                 is surfaced on the harness.",
+                 would silently drop FIFO ordering. Use `register_fifo` instead.",
                 T::topology().queue(),
             )));
         }
@@ -232,6 +230,39 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
         self.tasks
             .spawn(async move { consumer.run::<T, H>(handler, ctx, inner).await });
+        Ok(())
+    }
+
+    pub async fn register_fifo<T, H>(
+        &mut self,
+        handler: H,
+        options: ConsumerOptions<B>,
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T, Context = Ctx>,
+    {
+        if T::topology().sequencing().is_none() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{}' has no sequencing config; use `register` for unsequenced topics.",
+                T::topology().queue(),
+            )));
+        }
+        let ctx = self.ctx.clone();
+        let inner = options.with_shutdown(self.shutdown.clone()).into_inner();
+        let handles = self
+            .consumer
+            .spawn_fifo_shards::<T, H>(handler, ctx, inner)
+            .await?;
+        for handle in handles {
+            self.tasks.spawn(async move {
+                match handle.await {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => Ok(()),
+                    Err(e) => std::panic::resume_unwind(e.into_panic()),
+                }
+            });
+        }
         Ok(())
     }
 
@@ -370,5 +401,95 @@ mod tests {
         tally_join_result(Ok(Ok(())), &mut errors, &mut panics);
         assert_eq!(errors, 0);
         assert_eq!(panics, 0);
+    }
+}
+
+#[cfg(all(test, feature = "inmemory"))]
+mod inmemory_tests {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Serialize};
+
+    use crate::consumer::ConsumerOptions;
+    use crate::define_sequenced_topic;
+    use crate::error::ShoveError;
+    use crate::inmemory::InMemoryConfig;
+    use crate::markers::InMemory;
+    use crate::topic::SequencedTopic;
+    use crate::topology::{SequenceFailure, TopologyBuilder};
+    use crate::{Broker, MessageHandler, MessageMetadata, Outcome};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct LedgerEntry {
+        account_id: String,
+    }
+
+    define_sequenced_topic!(
+        Ledger,
+        LedgerEntry,
+        |msg| msg.account_id.clone(),
+        TopologyBuilder::new("supervisor-ledger-test")
+            .sequenced(SequenceFailure::FailAll)
+            .hold_queue(Duration::from_millis(50))
+            .dlq()
+            .build()
+    );
+
+    struct NoopHandler;
+    impl MessageHandler<Ledger> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: LedgerEntry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn register_fifo_runs_cleanly() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker
+            .topology()
+            .declare::<Ledger>()
+            .await
+            .expect("declare");
+
+        let mut sup = broker.consumer_supervisor();
+        sup.register_fifo::<Ledger, _>(NoopHandler, ConsumerOptions::<InMemory>::new())
+            .await
+            .expect("register_fifo");
+
+        let token = sup.cancellation_token();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let outcome = sup
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
+            .await;
+        assert!(outcome.is_clean(), "unexpected outcome: {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn register_rejection_points_at_register_fifo() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker
+            .topology()
+            .declare::<Ledger>()
+            .await
+            .expect("declare");
+
+        let mut sup = broker.consumer_supervisor();
+        let result =
+            sup.register::<Ledger, _>(NoopHandler, ConsumerOptions::<InMemory>::new());
+        match result {
+            Err(ShoveError::Topology(msg)) => {
+                assert!(msg.contains("register_fifo"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Topology error, got {other:?}"),
+        }
     }
 }
