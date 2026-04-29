@@ -143,6 +143,9 @@ cargo add shove --features inmemory
 
 # Optional built-in audit publisher
 cargo add shove --features rabbitmq,audit
+
+# Optional Prometheus/StatsD/OTel metrics emission via the `metrics` facade
+cargo add shove --features rabbitmq,metrics
 ```
 
 | Feature | What it enables                                                                        |
@@ -156,6 +159,7 @@ cargo add shove --features rabbitmq,audit
 | `kafka-ssl` | `kafka` + TLS (SSL) and SASL (PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512) via `KafkaTls` / `KafkaSasl` |
 | `inmemory` | In-memory broker — publisher, consumer, topology, consumer groups, autoscaling         |
 | `audit` | Built-in `ShoveAuditHandler` and `AuditLog` topic                                      |
+| `metrics` | Operational metrics (counters, histograms, gauges) via the [`metrics`](https://docs.rs/metrics) facade — wire your own exporter |
 
 ## Quick start
 
@@ -539,6 +543,23 @@ let publisher = broker.publisher().await?;
 let audit = ShoveAuditHandler::for_publisher(&publisher);
 let handler = SettlementHandler.audited(audit);
 ```
+
+## Observability
+
+`shove` emits structured `tracing` events for every interesting state change (handler outcomes, retry routing, DLQ routing, group scaling, autoscaler decisions, connection errors) — wire any `tracing-subscriber` to get a full operational trail.
+
+Enable the `metrics` feature to also emit operational metrics through the [`metrics`](https://docs.rs/metrics) facade. Counters, histograms, and gauges cover messages consumed/published/failed (with topic + consumer-group + outcome labels), processing/publish latency, in-flight depth, autoscaler decisions, and backend errors. `shove` is a library so it does not open a port — install your own recorder (`metrics-exporter-prometheus`, `metrics-exporter-statsd`, OpenTelemetry, etc.) and expose the endpoint from your service:
+
+```rust,ignore
+use metrics_exporter_prometheus::PrometheusBuilder;
+use std::net::Ipv4Addr;
+
+PrometheusBuilder::new()
+    .with_http_listener((Ipv4Addr::UNSPECIFIED, 9100))
+    .install()?;
+```
+
+Override the `shove_` metric prefix with `shove::metrics::set_prefix("my_service")` once at startup, before any broker activity. The full schema, label values, and histogram bucket recommendations live in the [Observability guide](https://shove.rs/guides/observability).
 
 ## Performance
 

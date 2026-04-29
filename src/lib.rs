@@ -111,6 +111,23 @@
 //!   consumer group or supervisor: `0` clean, `1` any handler error,
 //!   `2` any task panic, `3` drain timeout.
 //!
+//! # Observability
+//!
+//! Every interesting state change is emitted as a structured `tracing` event,
+//! so wiring any `tracing-subscriber` gives a full operational trail without
+//! handler-side instrumentation.
+//!
+//! Enable the `metrics` cargo feature to also emit operational counters,
+//! histograms, and gauges through the [`metrics`](https://docs.rs/metrics)
+//! facade — `messages_consumed_total`, `message_processing_duration_seconds`,
+//! `messages_inflight`, `backend_errors_total`, and friends. `shove` is a
+//! library, so it does not open a port: install your own recorder
+//! ([`metrics-exporter-prometheus`](https://docs.rs/metrics-exporter-prometheus),
+//! `metrics-exporter-statsd`, OpenTelemetry, etc.) and expose the endpoint
+//! from your service. Override the `shove_` metric prefix with
+//! [`metrics::set_prefix`] once at startup, before any broker activity. See
+//! the module docs and the Observability guide for the full schema.
+//!
 //! # See also
 //!
 //! - [`TopologyBuilder`] for hold queues, DLQs, and sequenced routing.
