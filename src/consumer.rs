@@ -343,17 +343,18 @@ impl ConsumerOptions<RabbitMq> {
 #[allow(clippy::absolute_paths)]
 mod tests {
     use super::*;
+    use crate::markers::*;
 
     // Tests use the InMemory marker when available; otherwise fall back to
     // any enabled backend marker.
     #[cfg(feature = "inmemory")]
-    type TestBackend = crate::markers::InMemory;
+    type TestBackend = InMemory;
 
     #[cfg(all(not(feature = "inmemory"), feature = "kafka"))]
-    type TestBackend = crate::markers::Kafka;
+    type TestBackend = Kafka;
 
     #[cfg(all(not(feature = "inmemory"), not(feature = "kafka"), feature = "nats"))]
-    type TestBackend = crate::markers::Nats;
+    type TestBackend = Nats;
 
     #[cfg(all(
         not(feature = "inmemory"),
@@ -361,7 +362,7 @@ mod tests {
         not(feature = "nats"),
         feature = "rabbitmq"
     ))]
-    type TestBackend = crate::markers::RabbitMq;
+    type TestBackend = RabbitMq;
 
     #[cfg(any(
         feature = "inmemory",

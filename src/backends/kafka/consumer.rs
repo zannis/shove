@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::consumer::validate_message_size;
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -1140,13 +1140,7 @@ impl KafkaConsumer {
                 };
             }
         };
-        crate::consumer_supervisor::drive_fifo_until_timeout(
-            handles,
-            shutdown,
-            signal,
-            drain_timeout,
-        )
-        .await
+        drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>

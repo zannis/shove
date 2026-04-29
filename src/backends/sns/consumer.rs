@@ -15,7 +15,7 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -1603,13 +1603,7 @@ impl SqsConsumer {
                 };
             }
         };
-        crate::consumer_supervisor::drive_fifo_until_timeout(
-            handles,
-            shutdown,
-            signal,
-            drain_timeout,
-        )
-        .await
+        drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
     pub(crate) async fn run_fifo_with_inner<T, H>(

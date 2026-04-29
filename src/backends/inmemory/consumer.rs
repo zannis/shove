@@ -14,7 +14,7 @@ use super::constants::{
 use super::topology::InMemoryTopologyDeclarer;
 use crate::backend::ConsumerOptionsInner;
 use crate::consumer::validate_message_size;
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -427,8 +427,7 @@ where
             };
         }
     };
-    crate::consumer_supervisor::drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout)
-        .await
+    drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
 }
 
 #[allow(clippy::too_many_arguments)]

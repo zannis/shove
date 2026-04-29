@@ -21,7 +21,7 @@ use crate::backends::rabbitmq::headers::{
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
@@ -1500,13 +1500,7 @@ impl RabbitMqConsumer {
                 };
             }
         };
-        crate::consumer_supervisor::drive_fifo_until_timeout(
-            handles,
-            shutdown,
-            signal,
-            drain_timeout,
-        )
-        .await
+        drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
