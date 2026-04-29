@@ -111,7 +111,7 @@ pub(crate) fn tally_join_result(
 /// timeout, mirroring [`ConsumerSupervisor::run_until_timeout`] for
 /// sequenced topics.
 ///
-/// Each handle is wrapped in a [`tokio::task::JoinSet`] entry that maps
+/// Each handle is wrapped in a [`JoinSet`] entry that maps
 /// abort-cancellation to `Ok(())` and re-panics on real panics, so the
 /// outer drain can use [`tally_join_result`] uniformly.
 ///
@@ -130,14 +130,14 @@ pub(crate) fn tally_join_result(
 ///   `signal` fires" (no grace period); this is honored verbatim.
 pub(crate) async fn drive_fifo_until_timeout<S>(
     handles: Vec<tokio::task::JoinHandle<Result<()>>>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: CancellationToken,
     signal: S,
-    drain_timeout: std::time::Duration,
+    drain_timeout: Duration,
 ) -> SupervisorOutcome
 where
     S: Future<Output = ()> + Send + 'static,
 {
-    let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+    let mut joinset: JoinSet<Result<()>> = JoinSet::new();
     for handle in handles {
         let abort_guard = AbortOnDrop(handle.abort_handle());
         joinset.spawn(async move {
@@ -451,8 +451,8 @@ mod tests {
 
     #[tokio::test]
     async fn tally_ignores_cancellation() {
-        let handle: tokio::task::JoinHandle<crate::error::Result<()>> = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
             Ok(())
         });
         handle.abort();
