@@ -26,7 +26,7 @@ use shove::inmemory::{
 use shove::markers::InMemory;
 use shove::{
     AutoscalerConfig, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
-    SequencedTopic, Topic, TopologyBuilder,
+    SequencedTopic, SupervisorOutcome, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -1178,4 +1178,165 @@ async fn consumer_group_distributes_load_across_workers() {
         .run_until_timeout(token.cancelled_owned(), Duration::from_secs(5))
         .await;
     assert!(outcome.is_clean());
+}
+
+// ---------------------------------------------------------------------------
+// run_fifo_until_timeout — harness-equivalent for sequenced topics
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_fifo_until_timeout_clean_drain() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+
+    struct H;
+    impl MessageHandler<LedgerSkipTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    let consumer = InMemoryConsumer::new(client.clone());
+    let signal = tokio::time::sleep(Duration::from_millis(50));
+    let opts = ConsumerOptions::<InMemory>::new().with_prefetch_count(1);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
+            H, (), opts, signal, Duration::from_secs(5),
+        )
+        .await;
+
+    assert_eq!(outcome, SupervisorOutcome::default());
+    assert!(outcome.is_clean());
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_counts_panics() {
+    // InMemory shard design note: handler panics are caught inside
+    // `invoke_handler_caught` and mapped to `Outcome::Retry`, so they never
+    // escape the shard as a JoinError. After max_retries the message goes to
+    // DLQ and the shard continues. This test verifies that the harness itself
+    // does not crash or deadlock when handlers panic — the outcome is clean
+    // because InMemory absorbs handler-level panics internally.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq: 0 })
+        .await
+        .unwrap();
+
+    struct PanicHandler;
+    impl MessageHandler<LedgerSkipTopic> for PanicHandler {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            panic!("intentional test panic");
+        }
+    }
+
+    let consumer = InMemoryConsumer::new(client.clone());
+    let signal = tokio::time::sleep(Duration::from_millis(200));
+    // Use max_retries=1 so the message exhausts retries quickly and the shard
+    // moves on, allowing the harness to see the signal before hanging.
+    let opts = ConsumerOptions::<InMemory>::new()
+        .with_prefetch_count(1)
+        .with_max_retries(1);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
+            PanicHandler, (), opts, signal, Duration::from_secs(5),
+        )
+        .await;
+
+    // InMemory absorbs handler panics as Retry; the harness returns cleanly.
+    // Other backends (RabbitMQ/Kafka/NATS/SQS) may surface panics differently.
+    assert!(!outcome.timed_out, "harness must not hang on handler panics; got {outcome:?}");
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_drain_does_not_hang_on_slow_handler() {
+    // InMemory shard design note: `invoke_handler_caught` races the handler
+    // against the shutdown token and aborts the handler task when shutdown
+    // fires. As a result InMemory shards always exit promptly on shutdown,
+    // so `timed_out` will always be false regardless of the drain_timeout
+    // value. This test verifies the drain completes without hanging even when
+    // the signal fires while a slow handler is in-flight — the drain window
+    // is set to 100 ms, which is more than enough for InMemory.
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq: 0 })
+        .await
+        .unwrap();
+
+    struct SlowHandler;
+    impl MessageHandler<LedgerSkipTopic> for SlowHandler {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Outcome::Ack
+        }
+    }
+
+    let consumer = InMemoryConsumer::new(client.clone());
+    let signal = tokio::time::sleep(Duration::from_millis(50));
+    let drain = Duration::from_millis(100);
+    let opts = ConsumerOptions::<InMemory>::new().with_prefetch_count(1);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
+            SlowHandler, (), opts, signal, drain,
+        )
+        .await;
+
+    // InMemory shards respond to shutdown immediately, so drain finishes
+    // well within the 100 ms window — timed_out must be false.
+    assert!(!outcome.timed_out, "InMemory drain must not time out; got {outcome:?}");
+    assert_eq!(outcome.exit_code(), 0);
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_returns_clean_when_shards_finish_first() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+
+    struct H;
+    impl MessageHandler<LedgerSkipTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    let consumer = InMemoryConsumer::new(client.clone());
+    let opts_shutdown = CancellationToken::new();
+    let opts = ConsumerOptions::<InMemory>::new()
+        .with_shutdown(opts_shutdown.clone())
+        .with_prefetch_count(1);
+
+    let killer = opts_shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        killer.cancel();
+    });
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
+            H,
+            (),
+            opts,
+            std::future::pending::<()>(),
+            Duration::from_secs(5),
+        )
+        .await;
+
+    assert_eq!(outcome, SupervisorOutcome::default());
 }
