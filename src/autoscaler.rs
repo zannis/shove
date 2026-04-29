@@ -266,14 +266,27 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
                 }
             };
 
-            let decision = self.strategy.evaluate(&group.to_string(), &metrics);
+            let group_str = group.to_string();
+            let decision = self.strategy.evaluate(&group_str, &metrics);
+
+            let (direction, target_workers): (&'static str, Option<u16>) = match &decision {
+                ScalingDecision::ScaleUp(n) => ("up", Some(*n)),
+                ScalingDecision::ScaleDown(n) => ("down", Some(*n)),
+                ScalingDecision::Hold => ("hold", None),
+            };
+            crate::metrics::record_autoscaler_decision(&group_str, direction);
 
             if decision == ScalingDecision::Hold {
                 continue;
             }
 
-            if let Err(e) = self.backend.scale(&group, decision).await {
-                tracing::error!("failed to scale {group}: {e}");
+            match self.backend.scale(&group, decision).await {
+                Ok(()) => {
+                    if let Some(target) = target_workers {
+                        crate::metrics::set_consumer_workers(&group_str, target as i64);
+                    }
+                }
+                Err(e) => tracing::error!("failed to scale {group}: {e}"),
             }
         }
     }
