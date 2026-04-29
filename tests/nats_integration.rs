@@ -213,6 +213,14 @@ impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
     }
 }
 
+impl MessageHandler<SeqSkipTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
 struct FixedOutcomeHandler(Outcome);
 
 impl MessageHandler<WorkTopic> for FixedOutcomeHandler {
@@ -2084,6 +2092,53 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     // STRICT — handler ignores shutdown, drain budget runs out, shard aborted.
     assert!(outcome.timed_out, "expected timed_out, got {outcome:?}");
     assert_eq!(outcome.exit_code(), 3);
+
+    broker.close().await;
+}
+
+// ===========================================================================
+// ConsumerGroup::register_fifo
+// ===========================================================================
+
+/// Consumer group `register_fifo` drains all messages via `run_until_timeout`.
+#[tokio::test]
+async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..5u64 {
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "A".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<SeqSkipTopic, _>({
+            let h = handler.clone();
+            move || h.clone()
+        })
+        .await
+        .unwrap();
+
+    let counter = handler.counter.clone();
+    let signal = async move {
+        counter.wait_for(5, Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome was {outcome:?}");
+    assert_eq!(handler.counter.get(), 5);
 
     broker.close().await;
 }
