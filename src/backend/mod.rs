@@ -77,8 +77,14 @@ mod bounds_smoke {
 
     use super::*;
     use crate::backend::capability::HasCoordinatedGroups;
+    // Imports below feed the per-backend `_anchor_*` functions, which are
+    // each gated behind their backend's feature flag — so without any
+    // backend feature enabled these imports go unused.
+    #[allow(unused_imports)]
     use crate::markers::*;
+    #[allow(unused_imports)]
     use crate::{MessageMetadata, QueueTopology, SupervisorOutcome};
+    #[allow(unused_imports)]
     use tokio_util::sync::CancellationToken;
 
     fn _require_backend<B: Backend>() {

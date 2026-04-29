@@ -1152,24 +1152,46 @@ async fn nack_requeue_all_pending(
 }
 
 /// Run the handler future with an optional timeout, emitting inflight/consumed/duration metrics.
-/// Returns `Outcome::Retry` if the timeout is exceeded.
-async fn invoke_handler(
-    fut: impl Future<Output = Outcome>,
+/// Returns `Outcome::Retry` if the timeout is exceeded or the handler panics.
+///
+/// The future is run inside a child `tokio::spawn` so a panic inside the
+/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
+/// `Outcome::Retry` with metrics recorded — without this, the spawned task
+/// aborts before the metric calls and panicked handlers disappear from the
+/// consumed/latency series even though the caller still requeues them.
+async fn invoke_handler<F>(
+    fut: F,
     timeout: Option<Duration>,
     topic: &str,
     group: Option<&str>,
-) -> Outcome {
+) -> Outcome
+where
+    F: Future<Output = Outcome> + Send + 'static,
+{
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
+    let mut join = tokio::spawn(fut);
     let outcome = match timeout {
-        Some(duration) => tokio::time::timeout(duration, fut)
-            .await
-            .unwrap_or_else(|_elapsed| {
+        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                warn!(error = %e, "handler task panicked, retrying message");
+                Outcome::Retry
+            }
+            Err(_) => {
+                join.abort();
                 warn!("handler exceeded timeout ({duration:?}), retrying message");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
-            }),
-        None => fut.await,
+            }
+        },
+        None => match join.await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(error = %e, "handler task panicked, retrying message");
+                Outcome::Retry
+            }
+        },
     };
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
@@ -1450,6 +1472,22 @@ mod tests {
                 Outcome::Ack
             },
             timeout,
+            "test-topic",
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    #[tokio::test]
+    async fn invoke_handler_returns_retry_on_panic() {
+        // The handler panics inside the spawned task. Without panic catching,
+        // the task aborts before `record_consumed`/`record_processing_duration`
+        // run and the caller sees a dropped channel; we surface `Retry` so
+        // metrics are recorded for the requeued message.
+        let outcome = invoke_handler::<std::pin::Pin<Box<dyn Future<Output = Outcome> + Send>>>(
+            Box::pin(async { panic!("boom") }),
+            None,
             "test-topic",
             None,
         )

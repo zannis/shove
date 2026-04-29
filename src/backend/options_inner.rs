@@ -15,6 +15,7 @@ use crate::consumer::{
 use crate::error::Result;
 
 #[derive(Clone)]
+#[allow(dead_code)] // Fields are read by backend consumers behind feature gates.
 pub(crate) struct ConsumerOptionsInner {
     pub max_retries: u32,
     pub prefetch_count: u16,
@@ -38,6 +39,7 @@ impl ConsumerOptionsInner {
     /// Crate-internal constructor used by per-backend fallback paths
     /// (e.g. DLQ consumer loops) that need a plain `ConsumerOptionsInner`
     /// with library defaults bound to a supplied shutdown token.
+    #[allow(dead_code)] // Used only by feature-gated backend consumers.
     pub(crate) fn defaults_with_shutdown(shutdown: CancellationToken) -> Self {
         Self {
             max_retries: 10,

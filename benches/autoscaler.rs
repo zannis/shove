@@ -113,10 +113,8 @@ impl Rabbit {
 
     async fn publish_batch(&self, n: u64) {
         let msgs: Vec<Msg> = (0..n).map(|id| Msg { id }).collect();
-        self.publisher
-            .publish_batch::<BenchTopic>(&msgs)
-            .await
-            .unwrap();
+        let (_succeeded, res) = self.publisher.publish_batch::<BenchTopic>(&msgs).await;
+        res.unwrap();
     }
 
     fn mgmt_config(&self) -> ManagementConfig {

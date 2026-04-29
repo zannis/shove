@@ -44,11 +44,21 @@ impl<B: Backend> Publisher<B> {
     pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> Result<()> {
         let topic = T::topology().queue();
         let start = Instant::now();
-        let res = self.inner.publish_batch::<T>(msgs).await;
+        let (succeeded, res) = self.inner.publish_batch::<T>(msgs).await;
         let elapsed = start.elapsed().as_secs_f64();
-        // One counter event per message so totals line up with what consumers
-        // increment downstream; empty batches emit nothing (the call was a no-op).
-        metrics::record_published_n(topic, res.is_ok(), msgs.len() as u64);
+        // The backend reports how many messages it actually accepted —
+        // backends like SNS, Kafka, and RabbitMQ can partially succeed
+        // before surfacing an `Err`, so counting `msgs.len()` against the
+        // overall outcome would either overcount failures or undercount
+        // successes. We split on the reported count.
+        let total = msgs.len() as u64;
+        let failed = total.saturating_sub(succeeded);
+        if succeeded > 0 {
+            metrics::record_published_n(topic, true, succeeded);
+        }
+        if failed > 0 {
+            metrics::record_published_n(topic, false, failed);
+        }
         // Duration is one sample for the whole batch — that's the user-observable
         // call latency, regardless of how many messages were inside.
         if !msgs.is_empty() {

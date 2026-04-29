@@ -406,24 +406,46 @@ async fn route_outcome(
 // ---------------------------------------------------------------------------
 
 /// Invoke the handler future with an optional timeout, emitting inflight /
-/// consumed / duration metrics. Returns `Outcome::Retry` on timeout.
-async fn invoke_handler(
-    fut: impl std::future::Future<Output = Outcome>,
+/// consumed / duration metrics. Returns `Outcome::Retry` on timeout or panic.
+///
+/// The future is run inside a child `tokio::spawn` so a panic inside the
+/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
+/// `Outcome::Retry` with metrics recorded — without this, the spawned task
+/// aborts before the metric calls and panicked handlers disappear from the
+/// consumed/latency series even though the caller still requeues them.
+async fn invoke_handler<F>(
+    fut: F,
     timeout: Option<Duration>,
     topic: &str,
     group: Option<&str>,
-) -> Outcome {
+) -> Outcome
+where
+    F: std::future::Future<Output = Outcome> + Send + 'static,
+{
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
+    let mut join = tokio::spawn(fut);
     let outcome = match timeout {
-        Some(duration) => tokio::time::timeout(duration, fut)
-            .await
-            .unwrap_or_else(|_| {
+        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "handler task panicked, retrying message");
+                Outcome::Retry
+            }
+            Err(_) => {
+                join.abort();
                 tracing::warn!("handler timed out after {duration:?}, retrying");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
-            }),
-        None => fut.await,
+            }
+        },
+        None => match join.await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, "handler task panicked, retrying message");
+                Outcome::Retry
+            }
+        },
     };
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);

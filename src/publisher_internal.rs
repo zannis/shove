@@ -4,10 +4,12 @@ use crate::error::{Result, ShoveError};
 
 /// Header prefixes reserved for internal use. Callers may not set headers
 /// that start with any of these via `Publisher::publish_with_headers`.
+#[allow(dead_code)] // Used by feature-gated backend publishers.
 const RESERVED_HEADER_PREFIXES: &[&str] =
     &["x-retry-count", "x-message-id", "x-death", "x-sequence-key"];
 
 /// Rejects user-supplied headers that collide with internal header keys.
+#[allow(dead_code)] // Used by feature-gated backend publishers.
 pub(crate) fn validate_headers(headers: &HashMap<String, String>) -> Result<()> {
     for key in headers.keys() {
         if RESERVED_HEADER_PREFIXES.iter().any(|prefix| {

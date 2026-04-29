@@ -4161,10 +4161,8 @@ async fn sequenced_batch_publish_with_pool() {
             seq: i,
         })
         .collect();
-    publisher
-        .publish_batch::<OrderTopic>(&messages)
-        .await
-        .unwrap();
+    let (_succeeded, res) = publisher.publish_batch::<OrderTopic>(&messages).await;
+    res.unwrap();
 
     let handler = CountingHandler::new();
     let shutdown = CancellationToken::new();

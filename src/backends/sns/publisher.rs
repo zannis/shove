@@ -199,7 +199,7 @@ impl SnsPublisher {
         self.do_publish::<T>(message, Some(headers)).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         let topology = T::topology();
         let key_fn = T::SEQUENCE_KEY_FN;
 
@@ -212,16 +212,25 @@ impl SnsPublisher {
         // Pre-compute routing keys while we still have access to messages.
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
 
-        let payloads = serialized?;
+        let payloads = match serialized {
+            Ok(v) => v,
+            Err(e) => return (0, Err(e)),
+        };
         let queue_name = topology.queue();
-        let topic_arn = self.resolve_arn(queue_name).await?;
+        let topic_arn = match self.resolve_arn(queue_name).await {
+            Ok(arn) => arn,
+            Err(e) => return (0, Err(e)),
+        };
 
         let has_sequencing = topology.sequencing().is_some();
 
         if has_sequencing && routing_keys.is_none() {
-            return Err(ShoveError::Topology(
-                "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
-            ));
+            return (
+                0,
+                Err(ShoveError::Topology(
+                    "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
+                )),
+            );
         }
 
         debug!(
@@ -261,10 +270,16 @@ impl SnsPublisher {
             })
             .collect();
 
-        // Chunk into groups of 10 and send
+        // Chunk into groups of 10 and send. Track the per-chunk outcome so
+        // the wrapper can record accurate per-message counters even on partial
+        // failure — the API-level `Result<()>` collapses the success/failure
+        // split that SNS actually reports.
+        let mut succeeded: u64 = 0;
+        let mut first_err: Option<ShoveError> = None;
         for chunk in entries.chunks(SNS_BATCH_LIMIT) {
             let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
-            let mut last_err = None;
+            let mut chunk_err: Option<ShoveError> = None;
+            let mut chunk_succeeded: u64 = 0;
 
             for attempt in 0..3u32 {
                 match self
@@ -278,8 +293,9 @@ impl SnsPublisher {
                 {
                     Ok(result) => {
                         let failed = result.failed();
+                        chunk_succeeded = (chunk.len() - failed.len()) as u64;
                         if !failed.is_empty() {
-                            last_err = Some(ShoveError::Connection(format!(
+                            chunk_err = Some(ShoveError::Connection(format!(
                                 "SNS batch publish: {} of {} messages failed. First error: {} (code: {})",
                                 failed.len(),
                                 chunk.len(),
@@ -289,13 +305,14 @@ impl SnsPublisher {
                             // Partial failures are not transient — don't retry
                             break;
                         }
-                        last_err = None;
+                        chunk_err = None;
                         break;
                     }
                     Err(e) => {
                         let err = ShoveError::Connection(format!("SNS batch publish failed: {e}"));
                         warn!(queue_name, attempt, error = %err, "SNS batch chunk failed, retrying");
-                        last_err = Some(err);
+                        chunk_err = Some(err);
+                        chunk_succeeded = 0;
                         if attempt < 2 {
                             let delay = backoff.next().expect("backoff is infinite");
                             tokio::time::sleep(delay).await;
@@ -304,13 +321,20 @@ impl SnsPublisher {
                 }
             }
 
-            if let Some(err) = last_err {
-                return Err(err);
+            succeeded += chunk_succeeded;
+            if let Some(err) = chunk_err {
+                first_err = Some(err);
+                break;
             }
         }
 
-        debug!(queue_name, count = payloads.len(), "batch published to SNS");
-        Ok(())
+        match first_err {
+            Some(err) => (succeeded, Err(err)),
+            None => {
+                debug!(queue_name, count = payloads.len(), "batch published to SNS");
+                (succeeded, Ok(()))
+            }
+        }
     }
 }
 
@@ -330,7 +354,7 @@ impl PublisherImpl for SnsPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         SnsPublisher::publish_batch::<T>(self, msgs)
     }
 }

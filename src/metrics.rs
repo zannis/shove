@@ -49,6 +49,7 @@ fn prefix() -> &'static str {
     PREFIX.get().copied().unwrap_or(DEFAULT_PREFIX)
 }
 
+#[allow(dead_code)] // Fields are read by emission helpers behind the `metrics` feature.
 pub(crate) struct MetricNames {
     pub messages_consumed_total: &'static str,
     pub messages_failed_total: &'static str,
@@ -189,6 +190,7 @@ pub(crate) fn record_consumed(topic: &str, group: Option<&str>, outcome: &Outcom
 }
 
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
 
 #[cfg(feature = "metrics")]
@@ -203,6 +205,7 @@ pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason
 }
 
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_failed(_: &str, _: Option<&str>, _: FailReason) {}
 
 #[cfg(feature = "metrics")]
@@ -228,6 +231,7 @@ pub(crate) fn record_published_n(topic: &str, ok: bool, count: u64) {
 }
 
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_published_n(_: &str, _: bool, _: u64) {}
 
 #[cfg(feature = "metrics")]
@@ -247,6 +251,7 @@ pub(crate) fn record_processing_duration(
 }
 
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_processing_duration(_: &str, _: Option<&str>, _: &Outcome, _: f64) {}
 
 #[cfg(feature = "metrics")]
@@ -274,6 +279,7 @@ pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize
 }
 
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_message_size(_: &str, _: Option<&str>, _: usize) {}
 
 #[cfg(feature = "metrics")]
@@ -363,6 +369,7 @@ pub(crate) fn record_backend_error(backend: BackendLabel, kind: BackendErrorKind
 }
 
 #[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_backend_error(_: BackendLabel, _: BackendErrorKind) {}
 
 #[cfg(test)]
