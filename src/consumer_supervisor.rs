@@ -209,6 +209,11 @@ pub struct ConsumerSupervisor<B: Backend, Ctx: Clone + Send + Sync + 'static = (
     ctx: Ctx,
     shutdown: CancellationToken,
     tasks: JoinSet<Result<()>>,
+    /// Queue names of every topic registered through `register` /
+    /// `register_fifo`, used to reject duplicate registrations on the same
+    /// supervisor (which would silently double-spawn consumer or shard
+    /// tasks on the same broker queue).
+    registered: std::collections::HashSet<&'static str>,
 }
 
 impl<B: Backend> ConsumerSupervisor<B, ()> {
@@ -218,6 +223,7 @@ impl<B: Backend> ConsumerSupervisor<B, ()> {
             ctx: (),
             shutdown: CancellationToken::new(),
             tasks: JoinSet::new(),
+            registered: std::collections::HashSet::new(),
         }
     }
 
@@ -230,6 +236,7 @@ impl<B: Backend> ConsumerSupervisor<B, ()> {
             ctx,
             shutdown: self.shutdown,
             tasks: self.tasks,
+            registered: self.registered,
         }
     }
 }
@@ -244,11 +251,16 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         T: Topic,
         H: MessageHandler<T, Context = Ctx>,
     {
+        let queue = T::topology().queue();
         if T::topology().sequencing().is_some() {
             return Err(ShoveError::Topology(format!(
-                "topic '{}' has a sequencing config; `ConsumerSupervisor::register` \
-                 would silently drop FIFO ordering. Use `register_fifo` instead.",
-                T::topology().queue(),
+                "topic '{queue}' has a sequencing config; `ConsumerSupervisor::register` \
+                 would silently drop FIFO ordering. Use `register_fifo` instead."
+            )));
+        }
+        if !self.registered.insert(queue) {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}' is already registered on this supervisor"
             )));
         }
         let consumer = self.consumer.clone();
@@ -268,10 +280,18 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         T: SequencedTopic,
         H: MessageHandler<T, Context = Ctx>,
     {
+        let queue = T::topology().queue();
         if T::topology().sequencing().is_none() {
             return Err(ShoveError::Topology(format!(
-                "topic '{}' has no sequencing config; use `register` for unsequenced topics.",
-                T::topology().queue(),
+                "topic '{queue}' implements `SequencedTopic` but its topology has no \
+                 sequencing config; `ConsumerSupervisor::register_fifo` would attach to \
+                 FIFO shard queues that were never declared. Use `register` for \
+                 unsequenced topics, or add `.sequenced(...)` to the topology."
+            )));
+        }
+        if !self.registered.insert(queue) {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}' is already registered on this supervisor"
             )));
         }
         let ctx = self.ctx.clone();
@@ -520,6 +540,36 @@ mod inmemory_tests {
         match result {
             Err(ShoveError::Topology(msg)) => {
                 assert!(msg.contains("register_fifo"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Topology error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_fifo_rejects_duplicate_topic() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker
+            .topology()
+            .declare::<Ledger>()
+            .await
+            .expect("declare");
+
+        let mut sup = broker.consumer_supervisor();
+        sup.register_fifo::<Ledger, _>(NoopHandler, ConsumerOptions::<InMemory>::new())
+            .await
+            .expect("first register_fifo should succeed");
+
+        let result = sup
+            .register_fifo::<Ledger, _>(NoopHandler, ConsumerOptions::<InMemory>::new())
+            .await;
+        match result {
+            Err(ShoveError::Topology(msg)) => {
+                assert!(
+                    msg.contains("already registered"),
+                    "unexpected msg: {msg}"
+                );
             }
             other => panic!("expected Topology error, got {other:?}"),
         }

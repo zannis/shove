@@ -75,7 +75,10 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     {
         if T::topology().sequencing().is_none() {
             return Err(ShoveError::Topology(format!(
-                "topic '{}' has no sequencing config; use `register` for unsequenced topics.",
+                "topic '{}' implements `SequencedTopic` but its topology has no \
+                 sequencing config; `ConsumerGroup::register_fifo` would attach to \
+                 FIFO shard queues that were never declared. Use `register` for \
+                 unsequenced topics, or add `.sequenced(...)` to the topology.",
                 T::topology().queue(),
             )));
         }
