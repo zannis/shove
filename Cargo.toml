@@ -248,6 +248,10 @@ required-features = ["inmemory"]
 name = "metrics_inmemory"
 required-features = ["inmemory", "metrics"]
 
+[[test]]
+name = "metrics_inmemory_group"
+required-features = ["inmemory", "metrics"]
+
 [[example]]
 name = "inmemory_basic"
 path = "examples/inmemory/basic.rs"

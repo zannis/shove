@@ -293,6 +293,7 @@ impl KafkaConsumerGroup {
             options.max_pending_per_key = Some(limit);
         }
         options.max_message_size = self.config.max_message_size;
+        options.consumer_group = Some(Arc::from(self.queue.as_str()));
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");

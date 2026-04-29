@@ -302,6 +302,7 @@ impl InMemoryConsumerGroup {
         options.max_message_size = self.config.max_message_size;
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.processing = processing.clone();
+        options.consumer_group = Some(Arc::from(self.queue.as_str()));
 
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
