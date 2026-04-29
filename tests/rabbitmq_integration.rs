@@ -5016,3 +5016,176 @@ async fn sequenced_defer_without_hold_queue_requeues() {
     client.shutdown().await;
     broker.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// run_fifo_until_timeout — drain semantics for sequenced topics
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_fifo_until_timeout_clean_drain() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let b = broker.broker_from(client.clone());
+    b.topology().declare::<OrderTopic>().await.unwrap();
+
+    // Publish a small batch.
+    let publisher = b.publisher().await.unwrap();
+    for seq in 0..5u32 {
+        publisher
+            .publish::<OrderTopic>(&OrderMessage { account: "A".into(), seq })
+            .await
+            .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+
+    // Wait until the handler has acked all 5, then send the signal.
+    let counter = handler.clone();
+    let signal = async move {
+        let _ = counter.wait_for_count(5, Duration::from_secs(15)).await;
+        // Brief grace period to let the shard finish its ack round trip.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let opts = ConsumerOptions::<RabbitMqMarker>::new()
+        .with_max_retries(3)
+        .with_prefetch_count(1);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<OrderTopic, _, _>(
+            handler.clone(),
+            (),
+            opts,
+            signal,
+            Duration::from_secs(10),
+        )
+        .await;
+
+    assert!(outcome.is_clean(), "expected clean outcome, got {outcome:?}");
+    assert_eq!(handler.count(), 5);
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_observes_handler_panic() {
+    // Shard-level panic boundary: the RabbitMQ concurrent-sequenced consume
+    // loop spawns each handler via `spawn_handler_keyed`, which sends the
+    // outcome through a oneshot channel. When the handler panics, the task
+    // panics before sending, the receiver closes, and the consume loop treats
+    // `TryRecvError::Closed` as `Outcome::Retry`. The panic never escapes
+    // `run_internal_concurrent_sequenced` — it always returns `Ok(())`.
+    // As a result, `outcome.panics` and `outcome.errors` will both be zero.
+    // This test documents and verifies that contract: the harness does not
+    // crash or deadlock when handlers panic, and the outcome is clean.
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let b = broker.broker_from(client.clone());
+    b.topology().declare::<OrderTopic>().await.unwrap();
+
+    let publisher = b.publisher().await.unwrap();
+    publisher
+        .publish::<OrderTopic>(&OrderMessage { account: "A".into(), seq: 0 })
+        .await
+        .unwrap();
+
+    #[derive(Clone)]
+    struct PanicHandler;
+    impl MessageHandler<OrderTopic> for PanicHandler {
+        type Context = ();
+        async fn handle(&self, _: OrderMessage, _: MessageMetadata, _: &()) -> Outcome {
+            panic!("intentional test panic");
+        }
+    }
+
+    let consumer = RabbitMqConsumer::new(client.clone());
+    // max_retries=1 so the message is dispatched once (retry_count 0 < 1),
+    // panics (Retry), then redelivered with retry_count=1 >= max_retries -> DLQ.
+    let opts = ConsumerOptions::<RabbitMqMarker>::new()
+        .with_max_retries(1)
+        .with_prefetch_count(1);
+
+    // Generous signal — give the shard time to pull the message, panic, and DLQ it.
+    let signal = tokio::time::sleep(Duration::from_secs(10));
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<OrderTopic, _, _>(
+            PanicHandler, (), opts, signal, Duration::from_secs(10),
+        )
+        .await;
+
+    // The shard absorbs handler panics at the oneshot channel level (see above),
+    // so neither panics nor errors are incremented. The harness returns cleanly.
+    assert!(
+        !outcome.timed_out,
+        "harness must not hang on handler panics; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.panics, 0,
+        "RabbitMQ shards absorb handler panics internally; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "RabbitMQ shards absorb handler panics as Retry; got {outcome:?}"
+    );
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
+    // RabbitMQ's consume loop drains in-flight handlers on shutdown by awaiting
+    // their oneshot receiver (see consume_loop_concurrent_sequenced shutdown arm).
+    // A handler currently in-flight when shutdown fires keeps running until it
+    // completes. With a slow handler (60 s sleep) and a short drain budget
+    // (500 ms), the timeout fires before the shard finishes, the JoinSet
+    // abort_all's the handles, and timed_out is set to true.
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let b = broker.broker_from(client.clone());
+    b.topology().declare::<OrderTopic>().await.unwrap();
+
+    let publisher = b.publisher().await.unwrap();
+    publisher
+        .publish::<OrderTopic>(&OrderMessage { account: "A".into(), seq: 0 })
+        .await
+        .unwrap();
+
+    #[derive(Clone)]
+    struct SlowHandler;
+    impl MessageHandler<OrderTopic> for SlowHandler {
+        type Context = ();
+        async fn handle(&self, _: OrderMessage, _: MessageMetadata, _: &()) -> Outcome {
+            // Block beyond drain timeout.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Outcome::Ack
+        }
+    }
+
+    let consumer = RabbitMqConsumer::new(client.clone());
+    // max_retries=1 so the initial delivery (retry_count=0) passes the
+    // max-retries check and the handler is actually dispatched.
+    let opts = ConsumerOptions::<RabbitMqMarker>::new()
+        .with_max_retries(1)
+        .with_prefetch_count(1);
+
+    // Signal fires after handler is in-flight; drain budget << handler sleep.
+    let signal = tokio::time::sleep(Duration::from_secs(2));
+    let drain = Duration::from_millis(500);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<OrderTopic, _, _>(
+            SlowHandler, (), opts, signal, drain,
+        )
+        .await;
+
+    // STRICT — handler ignores shutdown, drain budget runs out, shards aborted.
+    assert!(outcome.timed_out, "expected timed_out, got {outcome:?}");
+    assert_eq!(outcome.exit_code(), 3);
+
+    client.shutdown().await;
+    broker.stop().await;
+}
