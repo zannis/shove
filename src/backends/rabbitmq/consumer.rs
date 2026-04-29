@@ -1146,7 +1146,7 @@ async fn invoke_handler(
     topic: &str,
     group: Option<&str>,
 ) -> Outcome {
-    crate::metrics::inc_inflight(topic, group);
+    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = match timeout {
         Some(duration) => tokio::time::timeout(duration, fut)
@@ -1161,7 +1161,6 @@ async fn invoke_handler(
     let elapsed = start.elapsed().as_secs_f64();
     crate::metrics::record_consumed(topic, group, &outcome);
     crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
-    crate::metrics::dec_inflight(topic, group);
     outcome
 }
 

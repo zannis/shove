@@ -276,6 +276,46 @@ pub(crate) fn dec_inflight(topic: &str, group: Option<&str>) {
 #[cfg(not(feature = "metrics"))]
 pub(crate) fn dec_inflight(_: &str, _: Option<&str>) {}
 
+/// RAII handle that increments the inflight gauge on construction and
+/// decrements it on drop. Use this instead of paired `inc_inflight` /
+/// `dec_inflight` calls so the decrement runs even on panic, early
+/// return, or `?`-shortcircuit.
+#[allow(dead_code)]
+pub(crate) struct InflightGuard {
+    topic: std::sync::Arc<str>,
+    group: Option<std::sync::Arc<str>>,
+}
+
+#[allow(dead_code)]
+impl InflightGuard {
+    pub(crate) fn new(topic: std::sync::Arc<str>, group: Option<std::sync::Arc<str>>) -> Self {
+        inc_inflight(&topic, group.as_deref());
+        Self { topic, group }
+    }
+
+    /// Convenience constructor for borrowed inputs.
+    pub(crate) fn from_refs(topic: &str, group: Option<&str>) -> Self {
+        Self::new(
+            std::sync::Arc::from(topic),
+            group.map(std::sync::Arc::from),
+        )
+    }
+
+    pub(crate) fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub(crate) fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        dec_inflight(&self.topic, self.group.as_deref());
+    }
+}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn set_consumer_workers(group: &str, workers: i64) {
     ::metrics::gauge!(

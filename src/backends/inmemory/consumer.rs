@@ -804,7 +804,7 @@ where
         Err(o) => return o,
     };
 
-    crate::metrics::inc_inflight(topic, group);
+    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = run_handler::<T, H>(
         handler, ctx, message, metadata, timeout_opt, topic, group,
@@ -813,7 +813,6 @@ where
     let elapsed = start.elapsed().as_secs_f64();
     crate::metrics::record_consumed(topic, group, &outcome);
     crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
-    crate::metrics::dec_inflight(topic, group);
     outcome
 }
 
@@ -843,11 +842,10 @@ where
         Err(o) => return Some(o),
     };
 
-    crate::metrics::inc_inflight(topic, group);
-    let start = std::time::Instant::now();
-
     let topic_owned: std::sync::Arc<str> = std::sync::Arc::from(topic);
     let group_owned: Option<std::sync::Arc<str>> = group.map(std::sync::Arc::from);
+    let _inflight = crate::metrics::InflightGuard::new(topic_owned.clone(), group_owned.clone());
+    let start = std::time::Instant::now();
 
     let mut join = tokio::spawn({
         let topic_owned = topic_owned.clone();
@@ -886,7 +884,6 @@ where
             elapsed,
         );
     }
-    crate::metrics::dec_inflight(&topic_owned, group_owned.as_deref());
     outcome_opt
 }
 
