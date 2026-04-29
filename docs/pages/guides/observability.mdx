@@ -2,7 +2,93 @@
 
 When something goes wrong — a handler is slow, a topic is backing up, a retry loop is burning through the budget — you need to know where to look. `shove` integrates with the standard Rust `tracing` ecosystem. Every interesting event — handler invocation outcomes, retry routing, DLQ routing, group scaling, autoscaler decisions, connection errors — is emitted as a structured `tracing` event with named fields. Add a subscriber and you have a full observability trail without any instrumentation code in your handlers.
 
-Native Prometheus metrics support is planned for a future release.
+For dashboards and alerting, `shove` also emits operational metrics through the [`metrics`](https://docs.rs/metrics) facade. See [Metrics](#metrics) below.
+
+## Metrics
+
+`shove` is a library, not a service, so it does not expose its own scrape endpoint. Instead it emits operational metrics through the [`metrics`](https://docs.rs/metrics) facade crate. The consuming service installs a recorder of its choice — `metrics-exporter-prometheus`, `metrics-exporter-statsd`, OpenTelemetry, etc. — and exposes the endpoint itself.
+
+### Enabling
+
+Add the `metrics` feature in your `Cargo.toml`:
+
+```toml
+[dependencies]
+shove = { version = "0.8", features = ["rabbitmq", "metrics"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+```
+
+### Recorder setup
+
+A minimal Prometheus exporter that exposes `/metrics` on `:9100`:
+
+```rust,no_run
+use metrics_exporter_prometheus::PrometheusBuilder;
+use std::net::Ipv4Addr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    PrometheusBuilder::new()
+        .with_http_listener((Ipv4Addr::UNSPECIFIED, 9100))
+        // Histogram bucket recommendations for shove's two duration histograms.
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Suffix(
+                "_duration_seconds".to_string(),
+            ),
+            &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+        )?
+        .install()?;
+
+    // ... your shove broker / publisher / supervisor setup ...
+    Ok(())
+}
+```
+
+### Custom prefix
+
+By default every metric name starts with `shove_`. To override (for example to namespace under your service name) call `shove::metrics::set_prefix` once before installing the recorder:
+
+```rust,no_run
+shove::metrics::set_prefix("billing_shove");
+// ... then install your recorder ...
+```
+
+The prefix is set-once: subsequent calls are silently ignored, matching the semantics of `metrics::set_global_recorder`.
+
+### Metric reference
+
+| Name | Type | Labels |
+|---|---|---|
+| `shove_messages_consumed_total` | counter | `topic`, `consumer_group`, `outcome` |
+| `shove_messages_failed_total` | counter | `topic`, `consumer_group`, `reason` |
+| `shove_messages_published_total` | counter | `topic`, `outcome` |
+| `shove_message_processing_duration_seconds` | histogram | `topic`, `consumer_group`, `outcome` |
+| `shove_message_publish_duration_seconds` | histogram | `topic`, `outcome` |
+| `shove_message_size_bytes` | histogram | `topic`, `consumer_group` |
+| `shove_messages_inflight` | gauge | `topic`, `consumer_group` |
+| `shove_consumer_workers` | gauge | `consumer_group` |
+| `shove_autoscaler_decisions_total` | counter | `consumer_group`, `direction` |
+| `shove_backend_errors_total` | counter | `backend`, `kind` |
+
+**Label values:**
+
+- `outcome` on `messages_consumed_total` and `message_processing_duration_seconds`: `ack`, `retry`, `reject`, `defer`. These mirror the `Outcome` enum returned by handlers.
+- `outcome` on `messages_published_total` and `message_publish_duration_seconds`: `success`, `error`.
+- `reason` on `messages_failed_total`: `oversize`, `deserialize`, `pending_full`, `timeout`. These cover failures that happen *before* the handler runs.
+- `direction` on `autoscaler_decisions_total`: `up`, `down`, `hold`.
+- `backend` on `backend_errors_total`: `inmemory`, `rabbitmq`, `kafka`, `nats`, `sns_sqs`.
+- `kind` on `backend_errors_total`: `connection`, `publish`, `consume`, `topology`, `ack`.
+- `topic`: the queue name from the topology (`QueueTopology::queue()`).
+- `consumer_group`: the group name set by a coordinated group registry, or `"default"` when the consumer was registered through `ConsumerSupervisor` directly.
+
+### Histogram buckets
+
+`shove` does not configure histogram buckets. Set them at the recorder, as shown above. Reasonable starting points:
+
+- `shove_message_processing_duration_seconds`: `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
+- `shove_message_publish_duration_seconds`: same as processing — most publishes are sub-100 ms but tail latency under broker stress is the interesting region.
+- `shove_message_size_bytes`: `[256, 1024, 4096, 16384, 65536, 262144, 1048576, 10485760]` — covers the path from tiny envelopes up to the default 10 MiB ceiling.
 
 ## tracing integration
 
