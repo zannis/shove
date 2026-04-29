@@ -72,6 +72,7 @@ impl ShutdownTally {
 /// counters. Shared by `ConsumerSupervisor::run_until_timeout` and each
 /// backend's `run_fifo_until_timeout`.
 ///
+/// `Ok(Ok(()))` → success, ignored
 /// `Ok(Err(ShoveError))` → `errors += 1`
 /// Cancellation (`JoinError::is_cancelled`) → ignored
 /// Other `JoinError` → `panics += 1`
@@ -237,5 +238,58 @@ mod tests {
             timed_out: true,
         };
         assert_eq!(o.exit_code(), 3);
+    }
+
+    use crate::error::ShoveError;
+
+    #[tokio::test]
+    async fn tally_increments_errors_on_task_failure() {
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+        tally_join_result(
+            Ok(Err(ShoveError::Topology("test".into()))),
+            &mut errors,
+            &mut panics,
+        );
+        assert_eq!(errors, 1);
+        assert_eq!(panics, 0);
+    }
+
+    #[tokio::test]
+    async fn tally_increments_panics_on_join_panic() {
+        let handle = tokio::spawn(async { panic!("boom") });
+        let join_err = handle.await.unwrap_err();
+        assert!(join_err.is_panic());
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+        tally_join_result(Err(join_err), &mut errors, &mut panics);
+        assert_eq!(panics, 1);
+        assert_eq!(errors, 0);
+    }
+
+    #[tokio::test]
+    async fn tally_ignores_cancellation() {
+        let handle: tokio::task::JoinHandle<crate::error::Result<()>> =
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(())
+            });
+        handle.abort();
+        let join_err = handle.await.unwrap_err();
+        assert!(join_err.is_cancelled());
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+        tally_join_result(Err(join_err), &mut errors, &mut panics);
+        assert_eq!(errors, 0);
+        assert_eq!(panics, 0);
+    }
+
+    #[test]
+    fn tally_does_not_count_success() {
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+        tally_join_result(Ok(Ok(())), &mut errors, &mut panics);
+        assert_eq!(errors, 0);
+        assert_eq!(panics, 0);
     }
 }
