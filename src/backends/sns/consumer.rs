@@ -17,6 +17,7 @@ use crate::backends::sns::topology::QueueRegistry;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
@@ -168,26 +169,57 @@ where
     }
 }
 
-async fn invoke_handler<T: Topic, H: MessageHandler<T>>(
-    handler: &H,
-    ctx: &H::Context,
-    message: T::Message,
-    metadata: MessageMetadata,
+/// Run the handler future with optional timeout, emitting inflight/consumed/duration metrics.
+/// Returns `Outcome::Retry` on timeout or panic.
+///
+/// The future is run inside a child `tokio::spawn` so a panic inside the
+/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
+/// `Outcome::Retry` with metrics recorded — without this, the spawned task
+/// aborts before the metric calls and panicked handlers disappear from the
+/// consumed/latency series even though the caller still requeues them.
+async fn invoke_handler<F>(
+    fut: F,
     timeout: Option<Duration>,
-) -> Outcome {
-    match timeout {
-        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
-            .await
-            .unwrap_or_else(|_| {
-                warn!("handler exceeded timeout ({duration:?}), retrying message");
+    topic: &str,
+    group: Option<&str>,
+) -> Outcome
+where
+    F: std::future::Future<Output = Outcome> + Send + 'static,
+{
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
+    let start = std::time::Instant::now();
+    let mut join = tokio::spawn(fut);
+    let outcome = match timeout {
+        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                warn!(error = %e, "handler task panicked, retrying message");
                 Outcome::Retry
-            }),
-        None => handler.handle(message, metadata, ctx).await,
-    }
+            }
+            Err(_) => {
+                join.abort();
+                warn!("handler exceeded timeout ({duration:?}), retrying message");
+                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
+                Outcome::Retry
+            }
+        },
+        None => match join.await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(error = %e, "handler task panicked, retrying message");
+                Outcome::Retry
+            }
+        },
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    outcome
 }
 
 /// Spawns a handler task for a deserialized message.
 /// Returns the oneshot receiver that will resolve with the handler's outcome.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -195,6 +227,8 @@ fn spawn_handler<T, H>(
     metadata: MessageMetadata,
     timeout: Option<Duration>,
     notify: &Arc<Notify>,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
@@ -205,7 +239,13 @@ where
     let c = ctx.clone();
     let n = notify.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
+        let outcome = invoke_handler(
+            async move { h.handle(message, metadata, c.as_ref()).await },
+            timeout,
+            &topic,
+            group.as_deref(),
+        )
+        .await;
         let _ = tx.send(outcome);
         n.notify_one();
     });
@@ -237,6 +277,8 @@ where
     H: MessageHandler<T>,
 {
     let notify = Arc::new(Notify::new());
+    let topic: Arc<str> = Arc::from(topology.queue());
+    let group: Option<Arc<str>> = options.consumer_group.as_deref().map(Arc::from);
 
     // Max number of handlers running concurrently (1 = serial / non-concurrent mode).
     let max_in_flight = options.prefetch_count as usize;
@@ -427,9 +469,12 @@ where
 
             let body = extract_payload(msg.body().unwrap_or_default());
 
+            metrics::record_message_size(&topic, group.as_deref(), body.len());
+
             // Reject oversized messages before deserialization
             if let Err(e) = options.validate_payload_message_size(body.len()) {
                 warn!(error = %e, queue_url, "rejecting oversized message");
+                metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
             }
@@ -438,6 +483,11 @@ where
                 Ok(m) => m,
                 Err(err) => {
                     error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting");
+                    metrics::record_failed(
+                        &topic,
+                        group.as_deref(),
+                        metrics::FailReason::Deserialize,
+                    );
                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     continue;
                 }
@@ -457,6 +507,8 @@ where
                 metadata,
                 options.handler_timeout,
                 &notify,
+                Arc::clone(&topic),
+                group.clone(),
             );
             in_flight.push_back(PendingMessage {
                 receipt_handle,
@@ -509,6 +561,10 @@ where
                 .send()
                 .await
                 .map_err(|e| {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::SnsSqs,
+                        metrics::BackendErrorKind::Consume,
+                    );
                     map_sqs_error(&format!("SQS ReceiveMessage failed on {queue_url}"), e)
                 })?;
 
@@ -616,6 +672,7 @@ fn extract_sequence_key(msg: &Message) -> Option<String> {
 
 /// Spawns a handler task for a sequenced message, signalling completion via an
 /// mpsc channel with the sequence key.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler_keyed<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -624,6 +681,8 @@ fn spawn_handler_keyed<T, H>(
     timeout: Option<Duration>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key: String,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
@@ -634,7 +693,13 @@ where
     let c = ctx.clone();
     let completed = completed_tx.clone();
     tokio::spawn(async move {
-        let outcome = invoke_handler::<T, H>(&h, c.as_ref(), message, metadata, timeout).await;
+        let outcome = invoke_handler(
+            async move { h.handle(message, metadata, c.as_ref()).await },
+            timeout,
+            &topic,
+            group.as_deref(),
+        )
+        .await;
         let _ = tx.send(outcome);
         let _ = completed.send(key);
     });
@@ -728,6 +793,8 @@ where
 {
     let prefetch = options.prefetch_count as usize;
     let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<String>();
+    let topic: Arc<str> = Arc::from(topology.queue());
+    let group: Option<Arc<str>> = options.consumer_group.as_deref().map(Arc::from);
 
     let mut key_states: HashMap<String, KeyState> = HashMap::new();
     let mut in_flight_count: usize = 0;
@@ -793,6 +860,8 @@ where
                         &mut key_states,
                         &mut in_flight_count,
                         pending_deliveries,
+                        &topic,
+                        &group,
                     )
                     .await;
                 }
@@ -821,6 +890,8 @@ where
                         &mut key_states,
                         &mut in_flight_count,
                         pending_deliveries,
+                        &topic,
+                        &group,
                     )
                     .await;
                 }
@@ -943,6 +1014,10 @@ where
             }, if can_accept => {
                 let messages = result
                     .map_err(|e| {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::SnsSqs,
+                            metrics::BackendErrorKind::Consume,
+                        );
                         map_sqs_error(
                             &format!("SQS ReceiveMessage failed on {queue_url}"),
                             e,
@@ -1023,6 +1098,11 @@ where
                                         limit,
                                         "per-key pending buffer full, rejecting"
                                     );
+                                    metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        metrics::FailReason::PendingFull,
+                                    );
                                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                     continue;
                                 }
@@ -1062,6 +1142,11 @@ where
                                             limit,
                                             "per-key pending buffer full, rejecting"
                                         );
+                                        metrics::record_failed(
+                                            &topic,
+                                            group.as_deref(),
+                                            metrics::FailReason::PendingFull,
+                                        );
                                         router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                         continue;
                                     }
@@ -1084,6 +1169,8 @@ where
                     // ── Spawn handler for this key ──
                     let body = extract_payload(msg.body().unwrap_or_default());
 
+                    metrics::record_message_size(&topic, group.as_deref(), body.len());
+
                     // Reject oversized messages before deserialization
                     if let Err(e) = options.validate_payload_message_size(body.len()) {
                         warn!(
@@ -1091,6 +1178,11 @@ where
                             queue_url,
                             sequence_key = %seq_key,
                             "rejecting oversized message"
+                        );
+                        metrics::record_failed(
+                            &topic,
+                            group.as_deref(),
+                            metrics::FailReason::Oversize,
                         );
                         if on_failure == SequenceFailure::FailAll {
                             poisoned_keys.insert(seq_key.clone());
@@ -1107,6 +1199,11 @@ where
                                 queue_url,
                                 sequence_key = %seq_key,
                                 "failed to deserialize SQS message, rejecting"
+                            );
+                            metrics::record_failed(
+                                &topic,
+                                group.as_deref(),
+                                metrics::FailReason::Deserialize,
                             );
                             if on_failure == SequenceFailure::FailAll {
                                 poisoned_keys.insert(seq_key.clone());
@@ -1132,6 +1229,8 @@ where
                         options.handler_timeout,
                         &completed_tx,
                         seq_key.clone(),
+                        Arc::clone(&topic),
+                        group.clone(),
                     );
 
                     key_states.insert(
@@ -1172,6 +1271,8 @@ async fn drain_pending_for_key<T, H>(
     key_states: &mut HashMap<String, KeyState>,
     in_flight_count: &mut usize,
     pending_deliveries: &mut HashMap<String, VecDeque<Message>>,
+    topic: &Arc<str>,
+    group: &Option<Arc<str>>,
 ) where
     T: Topic,
     H: MessageHandler<T>,
@@ -1221,6 +1322,8 @@ async fn drain_pending_for_key<T, H>(
 
         let body = extract_payload(msg.body().unwrap_or_default());
 
+        metrics::record_message_size(topic, group.as_deref(), body.len());
+
         // Reject oversized messages before deserialization
         if let Err(e) = options.validate_payload_message_size(body.len()) {
             warn!(
@@ -1229,6 +1332,7 @@ async fn drain_pending_for_key<T, H>(
                 sequence_key = %key,
                 "rejecting oversized buffered message"
             );
+            metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Oversize);
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
                 while let Some(pd) = pending.pop_front() {
@@ -1251,6 +1355,7 @@ async fn drain_pending_for_key<T, H>(
                     sequence_key = %key,
                     "failed to deserialize buffered SQS message, rejecting"
                 );
+                metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Deserialize);
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
                     while let Some(pd) = pending.pop_front() {
@@ -1275,6 +1380,8 @@ async fn drain_pending_for_key<T, H>(
             options.handler_timeout,
             completed_tx,
             key.to_string(),
+            Arc::clone(topic),
+            group.clone(),
         );
 
         key_states.insert(
@@ -1334,6 +1441,10 @@ where
                 .message_attribute_names("All")
                 .send() => {
                 let output = result.map_err(|e| {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::SnsSqs,
+                        metrics::BackendErrorKind::Consume,
+                    );
                     map_sqs_error(&format!("SQS ReceiveMessage failed on DLQ {queue_url}"), e)
                 })?;
 

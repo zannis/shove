@@ -340,6 +340,7 @@ impl ConsumerGroup {
         options.handler_timeout = self.config.handler_timeout;
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
+        options.consumer_group = Some(Arc::from(self.name.as_str()));
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.name, consumer_index = self.consumers.len() - 1, "spawned consumer");

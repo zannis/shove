@@ -19,11 +19,13 @@ use crate::consumer::validate_message_size;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
+use std::future::Future;
 
 use super::client::NatsClient;
 use super::constants::{
@@ -293,23 +295,52 @@ async fn route_outcome(
 // Handler invocation
 // ---------------------------------------------------------------------------
 
-/// Wraps handler.handle() with optional timeout, returns Outcome::Retry on timeout.
-async fn invoke_handler<T: Topic, H: MessageHandler<T> + ?Sized>(
-    handler: &H,
-    ctx: &H::Context,
-    message: T::Message,
-    metadata: MessageMetadata,
+/// Wraps a handler future with optional timeout, emitting inflight/consumed/duration metrics.
+/// Returns `Outcome::Retry` on timeout or panic.
+///
+/// The future is run inside a child `tokio::spawn` so a panic inside the
+/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
+/// `Outcome::Retry` with metrics recorded — without this, the spawned task
+/// aborts before the metric calls and panicked handlers disappear from the
+/// consumed/latency series even though the caller still requeues them.
+async fn invoke_handler<F>(
+    fut: F,
     timeout: Option<Duration>,
-) -> Outcome {
-    match timeout {
-        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
-            .await
-            .unwrap_or_else(|_| {
-                tracing::warn!("handler timed out after {duration:?}, retrying");
+    topic: &str,
+    group: Option<&str>,
+) -> Outcome
+where
+    F: Future<Output = Outcome> + Send + 'static,
+{
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
+    let start = std::time::Instant::now();
+    let mut join = tokio::spawn(fut);
+    let outcome = match timeout {
+        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "handler task panicked, retrying message");
                 Outcome::Retry
-            }),
-        None => handler.handle(message, metadata, ctx).await,
-    }
+            }
+            Err(_) => {
+                join.abort();
+                tracing::warn!("handler timed out after {duration:?}, retrying");
+                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
+                Outcome::Retry
+            }
+        },
+        None => match join.await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, "handler task panicked, retrying message");
+                Outcome::Retry
+            }
+        },
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +469,8 @@ impl NatsConsumer {
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
+        let topic: Arc<str> = Arc::from(queue);
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         tracing::info!(
             queue,
@@ -458,6 +491,8 @@ impl NatsConsumer {
             let shutdown = shutdown.clone();
             let consumer_name = consumer_name.clone();
             let semaphore = semaphore.clone();
+            let topic = topic.clone();
+            let group = group.clone();
             async move {
                 let stream = client
                     .jetstream()
@@ -501,17 +536,31 @@ impl NatsConsumer {
                                 Some(Ok(msg)) => msg,
                                 Some(Err(e)) => {
                                     tracing::error!(error = %e, queue, "consumer stream error");
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("consumer stream error on {queue}: {e}"),
                                     ));
                                 }
                                 None => {
                                     tracing::warn!(queue, "consumer stream closed");
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("consumer stream closed for {queue}"),
                                     ));
                                 }
                             };
+
+                            metrics::record_message_size(
+                                &topic,
+                                group.as_deref(),
+                                msg.payload.len(),
+                            );
 
                             // Reject oversized messages before deserialization
                             if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
@@ -519,6 +568,11 @@ impl NatsConsumer {
                                     error = %e,
                                     queue,
                                     "rejecting oversized message to DLQ"
+                                );
+                                metrics::record_failed(
+                                    &topic,
+                                    group.as_deref(),
+                                    metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
@@ -545,6 +599,11 @@ impl NatsConsumer {
                                         error = %e,
                                         queue,
                                         "failed to deserialize message, sending to DLQ"
+                                    );
+                                    metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        metrics::FailReason::Deserialize,
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
@@ -577,15 +636,18 @@ impl NatsConsumer {
                             let task_processing = processing.clone();
                             let task_semaphore = semaphore.clone();
                             let task_prefetch = prefetch_count;
+                            let task_topic = topic.clone();
+                            let task_group = group.clone();
 
                             let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
                             tokio::spawn(async move {
                                 let outcome = invoke_handler(
-                                    task_handler.as_ref(),
-                                    task_ctx.as_ref(),
-                                    payload,
-                                    metadata,
+                                    async move {
+                                        task_handler.handle(payload, metadata, task_ctx.as_ref()).await
+                                    },
                                     handler_timeout,
+                                    &task_topic,
+                                    task_group.as_deref(),
                                 )
                                 .await;
                                 let _ = outcome_tx.send(outcome);
@@ -661,6 +723,8 @@ impl NatsConsumer {
         let handler_timeout = options.handler_timeout;
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
+        let topic: Arc<str> = Arc::from(queue);
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         let stream = self
             .client
@@ -709,6 +773,8 @@ impl NatsConsumer {
             let shard_client = client.clone();
             let shard_shutdown = shutdown.clone();
             let shard_processing = processing.clone();
+            let shard_topic = topic.clone();
+            let shard_group = group.clone();
 
             let task = tokio::spawn(async move {
                 let mut messages = match pull_consumer.messages().await {
@@ -742,12 +808,23 @@ impl NatsConsumer {
                                 }
                             };
 
+                            metrics::record_message_size(
+                                &shard_topic,
+                                shard_group.as_deref(),
+                                msg.payload.len(),
+                            );
+
                             // Reject oversized messages before deserialization
                             if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     shard,
                                     "rejecting oversized message to DLQ"
+                                );
+                                metrics::record_failed(
+                                    &shard_topic,
+                                    shard_group.as_deref(),
+                                    metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &shard_client,
@@ -774,6 +851,11 @@ impl NatsConsumer {
                                         error = %e,
                                         shard,
                                         "failed to deserialize message, sending to DLQ"
+                                    );
+                                    metrics::record_failed(
+                                        &shard_topic,
+                                        shard_group.as_deref(),
+                                        metrics::FailReason::Deserialize,
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &shard_client,
@@ -802,8 +884,15 @@ impl NatsConsumer {
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let h = shard_handler.clone();
                                 let c = shard_ctx.clone();
+                                let spawn_topic = shard_topic.clone();
+                                let spawn_group = shard_group.clone();
                                 tokio::spawn(async move {
-                                    let o = invoke_handler(h.as_ref(), c.as_ref(), payload, metadata, handler_timeout).await;
+                                    let o = invoke_handler(
+                                        async move { h.handle(payload, metadata, c.as_ref()).await },
+                                        handler_timeout,
+                                        &spawn_topic,
+                                        spawn_group.as_deref(),
+                                    ).await;
                                     let _ = tx.send(o);
                                 });
                                 rx.await.unwrap_or_else(|_| {
@@ -905,12 +994,20 @@ impl NatsConsumer {
                                 Some(Ok(msg)) => msg,
                                 Some(Err(e)) => {
                                     tracing::error!(error = %e, dlq, "DLQ consumer stream error");
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("DLQ consumer stream error on {dlq}: {e}"),
                                     ));
                                 }
                                 None => {
                                     tracing::warn!(dlq, "DLQ consumer stream closed");
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("DLQ consumer stream closed for {dlq}"),
                                     ));

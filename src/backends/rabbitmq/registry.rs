@@ -8,6 +8,7 @@ use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
+use crate::metrics;
 use crate::topic::Topic;
 
 /// Registry of all [`ConsumerGroup`]s managed by the autoscaler.
@@ -49,6 +50,10 @@ impl ConsumerGroupRegistry {
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Topology,
+            );
             return Err(ShoveError::Topology(format!(
                 "consumer group '{name}' is already registered"
             )));

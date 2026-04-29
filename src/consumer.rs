@@ -127,6 +127,7 @@ pub struct ConsumerOptions<B: Backend> {
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,
     pub(crate) processing: Arc<AtomicBool>,
+    pub(crate) consumer_group: Option<Arc<str>>,
 
     _backend: PhantomData<fn() -> B>,
 }
@@ -149,6 +150,7 @@ impl<B: Backend> ConsumerOptions<B> {
             max_ack_pending: None,
             shutdown: None,
             processing: Arc::new(AtomicBool::new(false)),
+            consumer_group: None,
             _backend: PhantomData,
         }
     }
@@ -227,6 +229,14 @@ impl<B: Backend> ConsumerOptions<B> {
         self
     }
 
+    /// Tag this consumer with a group name for metrics labelling. Group
+    /// registries set this automatically; `ConsumerSupervisor` leaves it
+    /// unset (which surfaces as `consumer_group="default"` in metrics).
+    pub fn with_consumer_group(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.consumer_group = Some(name.into());
+        self
+    }
+
     /// Clone of the internal "is currently processing" flag. Primarily useful
     /// for tests that want to block until a consumer starts handling a
     /// message; production code observes this through the autoscaler.
@@ -253,6 +263,7 @@ impl<B: Backend> ConsumerOptions<B> {
             max_message_size: self.max_message_size,
             shutdown: self.shutdown.unwrap_or_default(),
             processing: self.processing,
+            consumer_group: self.consumer_group,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]
@@ -286,6 +297,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             max_ack_pending: self.max_ack_pending,
             shutdown: self.shutdown.clone(),
             processing: self.processing.clone(),
+            consumer_group: self.consumer_group.clone(),
             _backend: PhantomData,
         }
     }
@@ -328,6 +340,7 @@ impl ConsumerOptions<RabbitMq> {
 }
 
 #[cfg(test)]
+#[allow(clippy::absolute_paths)]
 mod tests {
     use super::*;
 

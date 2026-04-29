@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
 use crate::error::Result;
+use crate::metrics;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
@@ -40,6 +41,10 @@ pub(super) async fn publish_with_retry(
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     if attempt == max_attempts {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Nats,
+                            metrics::BackendErrorKind::Publish,
+                        );
                         return Err(ShoveError::Connection(format!(
                             "{label} ack failed after {max_attempts} attempts: {e}"
                         )));
@@ -51,6 +56,10 @@ pub(super) async fn publish_with_retry(
             },
             Err(e) => {
                 if attempt == max_attempts {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Nats,
+                        metrics::BackendErrorKind::Publish,
+                    );
                     return Err(ShoveError::Connection(format!(
                         "{label} failed after {max_attempts} attempts: {e}"
                     )));
@@ -136,9 +145,9 @@ impl NatsPublisher {
             .await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         let topology = T::topology();
-        let prepared: Vec<(String, HeaderMap, Bytes)> = messages
+        let prepared: Result<Vec<(String, HeaderMap, Bytes)>> = messages
             .iter()
             .map(|msg| {
                 let payload = serde_json::to_vec(msg)?;
@@ -146,26 +155,59 @@ impl NatsPublisher {
                 let headers = Self::build_headers(None);
                 Ok((subject, headers, Bytes::from(payload)))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
+        let prepared = match prepared {
+            Ok(v) => v,
+            Err(e) => return (0, Err(e)),
+        };
 
-        // Fire all publishes, then await all acks — O(1 RTT) instead of O(N RTT)
+        // Fire all publishes, then await all acks — O(1 RTT) instead of O(N RTT).
+        // Submission and ack are tracked separately so the wrapper can
+        // attribute partial-failure counters to what NATS actually accepted
+        // before we surface the first error.
         let mut ack_futures = Vec::with_capacity(prepared.len());
+        let mut first_err: Option<ShoveError> = None;
         for (subject, headers, payload) in prepared {
-            let ack = self
+            match self
                 .client
                 .jetstream()
                 .publish_with_headers(subject, headers, payload)
                 .await
-                .map_err(|e| ShoveError::Connection(format!("batch publish failed: {e}")))?;
-            ack_futures.push(ack);
+            {
+                Ok(ack) => ack_futures.push(ack),
+                Err(e) => {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Nats,
+                        metrics::BackendErrorKind::Publish,
+                    );
+                    first_err = Some(ShoveError::Connection(format!("batch publish failed: {e}")));
+                    break;
+                }
+            }
         }
 
-        for ack in ack_futures {
-            ack.await
-                .map_err(|e| ShoveError::Connection(format!("batch publish ack failed: {e}")))?;
+        let mut succeeded: u64 = 0;
+        if first_err.is_none() {
+            for ack in ack_futures {
+                match ack.await {
+                    Ok(_) => succeeded += 1,
+                    Err(e) => {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Nats,
+                            metrics::BackendErrorKind::Publish,
+                        );
+                        first_err = Some(ShoveError::Connection(format!(
+                            "batch publish ack failed: {e}"
+                        )));
+                        break;
+                    }
+                }
+            }
         }
-
-        Ok(())
+        match first_err {
+            Some(e) => (succeeded, Err(e)),
+            None => (succeeded, Ok(())),
+        }
     }
 }
 
@@ -185,7 +227,7 @@ impl PublisherImpl for NatsPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         NatsPublisher::publish_batch::<T>(self, msgs)
     }
 }

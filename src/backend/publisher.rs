@@ -23,8 +23,15 @@ pub(crate) trait PublisherImpl: Send + Sync {
         headers: HashMap<String, String>,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Publish a batch, returning the number of messages the backend
+    /// confirmed as accepted alongside the overall result. On `Ok(())` the
+    /// caller can assume `succeeded == msgs.len()`; on `Err(_)` the count
+    /// reflects how many were accepted before the failure surfaced (e.g.
+    /// SNS chunks, Kafka per-partition acks, RabbitMQ confirms), so the
+    /// `messages_published_total` counter doesn't have to choose between
+    /// overcounting failures or undercounting successes.
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = (u64, Result<()>)> + Send;
 }

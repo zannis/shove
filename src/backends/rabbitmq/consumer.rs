@@ -24,6 +24,7 @@ use crate::backends::rabbitmq::router;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
@@ -80,13 +81,25 @@ fn unwrap_delivery(
 ) -> Result<Delivery> {
     match item {
         Some(Ok(d)) => Ok(d),
-        Some(Err(e)) => Err(map_lapin_error(
-            &format!("consumer stream error on {queue}"),
-            e,
-        )),
-        None => Err(ShoveError::Connection(format!(
-            "consumer stream closed for {queue}"
-        ))),
+        Some(Err(e)) => {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Consume,
+            );
+            Err(map_lapin_error(
+                &format!("consumer stream error on {queue}"),
+                e,
+            ))
+        }
+        None => {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Consume,
+            );
+            Err(ShoveError::Connection(format!(
+                "consumer stream closed for {queue}"
+            )))
+        }
     }
 }
 
@@ -251,6 +264,8 @@ impl RabbitMqConsumer {
         let publisher = ChannelPublisher::new(channel);
         // Channel for handlers to signal completion by sending their sequence key.
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel::<String>();
+        let topic: Arc<str> = Arc::from(T::topology().queue());
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         let mut key_states: HashMap<String, KeyState> = HashMap::new();
         let mut in_flight_count: usize = 0;
@@ -329,6 +344,8 @@ impl RabbitMqConsumer {
                             queue,
                             topology,
                             &publisher,
+                            &topic,
+                            &group,
                         )
                         .await;
                     }
@@ -548,6 +565,11 @@ impl RabbitMqConsumer {
                                         limit,
                                         "per-key pending buffer full, rejecting to DLQ"
                                     );
+                                    metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        metrics::FailReason::PendingFull,
+                                    );
                                     router::route_reject(&delivery, topology, &publisher).await;
                                     continue;
                                 }
@@ -589,6 +611,11 @@ impl RabbitMqConsumer {
                                             limit,
                                             "per-key pending buffer full, rejecting to DLQ"
                                         );
+                                        metrics::record_failed(
+                                            &topic,
+                                            group.as_deref(),
+                                            metrics::FailReason::PendingFull,
+                                        );
                                         router::route_reject(&delivery, topology, &publisher).await;
                                         continue;
                                     }
@@ -610,7 +637,18 @@ impl RabbitMqConsumer {
 
                     // ── Spawn handler for this key ──
                     let metadata = extract_message_metadata(&delivery);
-                    match try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, options).await {
+                    match try_deserialize_or_reject::<T>(
+                        &delivery,
+                        &metadata,
+                        queue,
+                        topology,
+                        &publisher,
+                        options,
+                        &topic,
+                        group.as_deref(),
+                    )
+                    .await
+                    {
                         None => {
                             // Reject undeserializable messages immediately.
                             if on_failure == SequenceFailure::FailAll {
@@ -626,6 +664,8 @@ impl RabbitMqConsumer {
                                 options.handler_timeout,
                                 &completed_tx,
                                 seq_key.clone(),
+                                topic.clone(),
+                                group.clone(),
                             );
 
                             key_states.insert(
@@ -662,6 +702,8 @@ impl RabbitMqConsumer {
         queue: &str,
         topology: &'static QueueTopology,
         publisher: &ChannelPublisher,
+        topic: &Arc<str>,
+        group: &Option<Arc<str>>,
     ) where
         T: Topic,
         T::Message: for<'de> serde::Deserialize<'de>,
@@ -709,7 +751,14 @@ impl RabbitMqConsumer {
 
             let metadata = extract_message_metadata(&delivery);
             match try_deserialize_or_reject::<T>(
-                &delivery, &metadata, queue, topology, publisher, options,
+                &delivery,
+                &metadata,
+                queue,
+                topology,
+                publisher,
+                options,
+                topic,
+                group.as_deref(),
             )
             .await
             {
@@ -734,6 +783,8 @@ impl RabbitMqConsumer {
                         options.handler_timeout,
                         completed_tx,
                         key.to_string(),
+                        topic.clone(),
+                        group.clone(),
                     );
 
                     key_states.insert(
@@ -813,6 +864,8 @@ impl RabbitMqConsumer {
         let publisher = ChannelPublisher::new(channel);
         let notify = Arc::new(Notify::new());
         let max_in_flight = options.prefetch_count as usize;
+        let topic: Arc<str> = Arc::from(T::topology().queue());
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         struct PendingMessage {
             delivery: Delivery,
@@ -901,7 +954,18 @@ impl RabbitMqConsumer {
 
                     let metadata = extract_message_metadata(&delivery);
 
-                    if let Some(message) = try_deserialize_or_reject::<T>(&delivery, &metadata, queue, topology, &publisher, options).await {
+                    if let Some(message) = try_deserialize_or_reject::<T>(
+                        &delivery,
+                        &metadata,
+                        queue,
+                        topology,
+                        &publisher,
+                        options,
+                        &topic,
+                        group.as_deref(),
+                    )
+                    .await
+                    {
                         let rx = spawn_handler::<T, H>(
                             &handler,
                             &ctx,
@@ -909,6 +973,8 @@ impl RabbitMqConsumer {
                             metadata,
                             options.handler_timeout,
                             &notify,
+                            topic.clone(),
+                            group.clone(),
                         );
 
                         in_flight.push_back(PendingMessage {
@@ -1085,22 +1151,57 @@ async fn nack_requeue_all_pending(
     }
 }
 
-/// Run the handler future with an optional timeout.
-/// Returns `Outcome::Retry` if the timeout is exceeded.
-async fn invoke_handler(fut: impl Future<Output = Outcome>, timeout: Option<Duration>) -> Outcome {
-    match timeout {
-        Some(duration) => tokio::time::timeout(duration, fut)
-            .await
-            .unwrap_or_else(|_elapsed| {
-                warn!("handler exceeded timeout ({duration:?}), retrying message");
+/// Run the handler future with an optional timeout, emitting inflight/consumed/duration metrics.
+/// Returns `Outcome::Retry` if the timeout is exceeded or the handler panics.
+///
+/// The future is run inside a child `tokio::spawn` so a panic inside the
+/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
+/// `Outcome::Retry` with metrics recorded — without this, the spawned task
+/// aborts before the metric calls and panicked handlers disappear from the
+/// consumed/latency series even though the caller still requeues them.
+async fn invoke_handler<F>(
+    fut: F,
+    timeout: Option<Duration>,
+    topic: &str,
+    group: Option<&str>,
+) -> Outcome
+where
+    F: Future<Output = Outcome> + Send + 'static,
+{
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
+    let start = std::time::Instant::now();
+    let mut join = tokio::spawn(fut);
+    let outcome = match timeout {
+        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                warn!(error = %e, "handler task panicked, retrying message");
                 Outcome::Retry
-            }),
-        None => fut.await,
-    }
+            }
+            Err(_) => {
+                join.abort();
+                warn!("handler exceeded timeout ({duration:?}), retrying message");
+                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
+                Outcome::Retry
+            }
+        },
+        None => match join.await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(error = %e, "handler task panicked, retrying message");
+                Outcome::Retry
+            }
+        },
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    outcome
 }
 
 /// Spawns a handler task for a deserialized message.
 /// Returns the oneshot receiver that will resolve with the handler's outcome.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -1108,6 +1209,8 @@ fn spawn_handler<T, H>(
     metadata: MessageMetadata,
     timeout: Option<Duration>,
     notify: &Arc<Notify>,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
@@ -1121,6 +1224,8 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            &topic,
+            group.as_deref(),
         )
         .await;
         let _ = tx.send(outcome);
@@ -1132,6 +1237,7 @@ where
 /// Spawns a handler task for a sequenced message, signalling completion via an
 /// mpsc channel with the sequence key. This avoids O(N) polling of all in-flight
 /// keys to find which one completed.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler_keyed<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -1140,6 +1246,8 @@ fn spawn_handler_keyed<T, H>(
     timeout: Option<Duration>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key: String,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
 ) -> oneshot::Receiver<Outcome>
 where
     T: Topic,
@@ -1153,6 +1261,8 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            &topic,
+            group.as_deref(),
         )
         .await;
         let _ = tx.send(outcome);
@@ -1164,6 +1274,7 @@ where
 /// Attempts to deserialize a delivery's payload. On failure, logs the error
 /// and rejects the delivery (nack without requeue).
 /// Returns `Some(message)` on success, `None` if rejected.
+#[allow(clippy::too_many_arguments)]
 async fn try_deserialize_or_reject<T: Topic>(
     delivery: &Delivery,
     metadata: &MessageMetadata,
@@ -1171,10 +1282,14 @@ async fn try_deserialize_or_reject<T: Topic>(
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     options: &ConsumerOptions,
+    topic: &str,
+    group: Option<&str>,
 ) -> Option<T::Message>
 where
     T::Message: for<'de> serde::Deserialize<'de>,
 {
+    metrics::record_message_size(topic, group, delivery.data.len());
+
     if let Err(e) = options.validate_payload_message_size(delivery.data.len()) {
         warn!(
             error = %e,
@@ -1182,6 +1297,7 @@ where
             queue,
             "rejecting oversized message"
         );
+        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
         router::route_reject(delivery, topology, publisher).await;
         return None;
     }
@@ -1194,6 +1310,7 @@ where
                 queue = %queue,
                 "failed to deserialize message"
             );
+            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
             router::route_reject(delivery, topology, publisher).await;
             None
         }
@@ -1335,14 +1452,14 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_handler_returns_outcome_without_timeout() {
-        let outcome = invoke_handler(async { Outcome::Ack }, None).await;
+        let outcome = invoke_handler(async { Outcome::Ack }, None, "test-topic", None).await;
         assert!(matches!(outcome, Outcome::Ack));
     }
 
     #[tokio::test]
     async fn invoke_handler_returns_outcome_within_timeout() {
         let timeout = Some(Duration::from_secs(1));
-        let outcome = invoke_handler(async { Outcome::Reject }, timeout).await;
+        let outcome = invoke_handler(async { Outcome::Reject }, timeout, "test-topic", None).await;
         assert!(matches!(outcome, Outcome::Reject));
     }
 
@@ -1355,6 +1472,24 @@ mod tests {
                 Outcome::Ack
             },
             timeout,
+            "test-topic",
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    #[tokio::test]
+    async fn invoke_handler_returns_retry_on_panic() {
+        // The handler panics inside the spawned task. Without panic catching,
+        // the task aborts before `record_consumed`/`record_processing_duration`
+        // run and the caller sees a dropped channel; we surface `Retry` so
+        // metrics are recorded for the requeued message.
+        let outcome = invoke_handler::<std::pin::Pin<Box<dyn Future<Output = Outcome> + Send>>>(
+            Box::pin(async { panic!("boom") }),
+            None,
+            "test-topic",
+            None,
         )
         .await;
         assert!(matches!(outcome, Outcome::Retry));

@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::metrics;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -266,7 +267,15 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
                 }
             };
 
-            let decision = self.strategy.evaluate(&group.to_string(), &metrics);
+            let group_str = group.to_string();
+            let decision = self.strategy.evaluate(&group_str, &metrics);
+
+            let direction: &'static str = match &decision {
+                ScalingDecision::ScaleUp(_) => "up",
+                ScalingDecision::ScaleDown(_) => "down",
+                ScalingDecision::Hold => "hold",
+            };
+            metrics::record_autoscaler_decision(&group_str, direction);
 
             if decision == ScalingDecision::Hold {
                 continue;

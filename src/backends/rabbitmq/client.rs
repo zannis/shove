@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::SHUTDOWN_GRACE;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
+use crate::metrics;
 use crate::retry::Backoff;
 
 /// RabbitMQ connection configuration.
@@ -129,6 +130,10 @@ impl RabbitMqClient {
     /// or if the channel cannot be created.
     pub async fn create_channel(&self) -> Result<Channel> {
         if self.shutdown_token.is_cancelled() {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Connection,
+            );
             return Err(ShoveError::Connection(
                 "cannot create channel: client is shutting down".into(),
             ));
@@ -146,6 +151,10 @@ impl RabbitMqClient {
     /// if the channel cannot be created, or if confirms cannot be enabled.
     pub async fn create_confirm_channel(&self) -> Result<Channel> {
         if self.shutdown_token.is_cancelled() {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Connection,
+            );
             return Err(ShoveError::Connection(
                 "cannot create confirm channel: client is shutting down".into(),
             ));
@@ -178,6 +187,10 @@ impl RabbitMqClient {
     #[cfg(feature = "rabbitmq-transactional")]
     pub async fn create_tx_channel(&self) -> Result<Channel> {
         if self.shutdown_token.is_cancelled() {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Connection,
+            );
             return Err(ShoveError::Connection(
                 "cannot create tx channel: client is shutting down".into(),
             ));

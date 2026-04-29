@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
 use crate::error::Result;
+use crate::metrics;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
@@ -43,6 +44,10 @@ pub(super) async fn publish_with_retry(
             Ok(_) => return Ok(()),
             Err((e, _)) => {
                 if attempt == max_attempts {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Kafka,
+                        metrics::BackendErrorKind::Publish,
+                    );
                     return Err(ShoveError::Connection(format!(
                         "{label} failed after {max_attempts} attempts: {e}"
                     )));
@@ -139,12 +144,12 @@ impl KafkaPublisher {
         .await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
-        use futures_util::future::try_join_all;
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+        use futures_util::future::join_all;
 
         let topology = T::topology();
         #[allow(clippy::type_complexity)]
-        let prepared: Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)> = messages
+        let prepared: Result<Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> = messages
             .iter()
             .map(|msg| {
                 let payload = serde_json::to_vec(msg)?;
@@ -152,35 +157,60 @@ impl KafkaPublisher {
                 let headers = Self::build_headers(None);
                 Ok((topic, key, headers, payload))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
+        let prepared = match prepared {
+            Ok(v) => v,
+            Err(e) => return (0, Err(e)),
+        };
 
         // Submit every record concurrently so librdkafka's internal batching
         // (`batch.size` / `linger.ms`) can coalesce them into broker-side
         // batches. Awaiting each `send` serially forced one round-trip per
         // message and pinned publish throughput at ~200 msg/s on localhost.
+        // We use `join_all` (not `try_join_all`) so an error on one message
+        // doesn't cancel the others — that lets the wrapper attribute
+        // accurate per-message success/failure counters even on partial
+        // failure, and we still surface the first error to the caller.
         let producer = self.client.producer();
-        try_join_all(
-            prepared
-                .into_iter()
-                .map(|(topic, key, headers, payload)| async move {
-                    let mut record = FutureRecord::to(&topic)
-                        .payload(payload.as_slice())
-                        .headers(headers);
-                    if let Some(k) = key.as_deref() {
-                        record = record.key(k);
-                    }
-                    producer
-                        .send(record, PRODUCE_TIMEOUT)
-                        .await
-                        .map_err(|(e, _)| {
-                            ShoveError::Connection(format!("batch publish failed: {e}"))
-                        })?;
-                    Ok::<(), ShoveError>(())
-                }),
-        )
-        .await?;
+        let results: Vec<Result<()>> = join_all(prepared.into_iter().map(
+            |(topic, key, headers, payload)| async move {
+                let mut record = FutureRecord::to(&topic)
+                    .payload(payload.as_slice())
+                    .headers(headers);
+                if let Some(k) = key.as_deref() {
+                    record = record.key(k);
+                }
+                producer
+                    .send(record, PRODUCE_TIMEOUT)
+                    .await
+                    .map_err(|(e, _)| {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Kafka,
+                            metrics::BackendErrorKind::Publish,
+                        );
+                        ShoveError::Connection(format!("batch publish failed: {e}"))
+                    })?;
+                Ok::<(), ShoveError>(())
+            },
+        ))
+        .await;
 
-        Ok(())
+        let mut succeeded: u64 = 0;
+        let mut first_err: Option<ShoveError> = None;
+        for r in results {
+            match r {
+                Ok(()) => succeeded += 1,
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => (succeeded, Err(e)),
+            None => (succeeded, Ok(())),
+        }
     }
 }
 
@@ -200,7 +230,7 @@ impl PublisherImpl for KafkaPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         KafkaPublisher::publish_batch::<T>(self, msgs)
     }
 }

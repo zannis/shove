@@ -15,6 +15,7 @@ use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
+use crate::metrics;
 use crate::topic::Topic;
 use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
@@ -292,6 +293,7 @@ impl NatsConsumerGroup {
         options.handler_timeout = self.config.handler_timeout;
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
+        options.consumer_group = Some(Arc::from(self.queue.as_str()));
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
@@ -350,6 +352,10 @@ impl NatsConsumerGroupRegistry {
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
+            metrics::record_backend_error(
+                metrics::BackendLabel::Nats,
+                metrics::BackendErrorKind::Topology,
+            );
             return Err(ShoveError::Topology(format!(
                 "consumer group '{name}' is already registered"
             )));

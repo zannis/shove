@@ -15,6 +15,7 @@ use crate::consumer::{
 use crate::error::Result;
 
 #[derive(Clone)]
+#[allow(dead_code)] // Fields are read by backend consumers behind feature gates.
 pub(crate) struct ConsumerOptionsInner {
     pub max_retries: u32,
     pub prefetch_count: u16,
@@ -23,6 +24,8 @@ pub(crate) struct ConsumerOptionsInner {
     pub max_message_size: Option<usize>,
     pub shutdown: CancellationToken,
     pub processing: Arc<AtomicBool>,
+    /// Consumer-group name for metrics labels. `None` is treated as `"default"`.
+    pub consumer_group: Option<Arc<str>>,
 
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
@@ -36,6 +39,7 @@ impl ConsumerOptionsInner {
     /// Crate-internal constructor used by per-backend fallback paths
     /// (e.g. DLQ consumer loops) that need a plain `ConsumerOptionsInner`
     /// with library defaults bound to a supplied shutdown token.
+    #[allow(dead_code)] // Used only by feature-gated backend consumers.
     pub(crate) fn defaults_with_shutdown(shutdown: CancellationToken) -> Self {
         Self {
             max_retries: 10,
@@ -45,6 +49,7 @@ impl ConsumerOptionsInner {
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
+            consumer_group: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

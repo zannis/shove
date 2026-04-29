@@ -77,8 +77,14 @@ mod bounds_smoke {
 
     use super::*;
     use crate::backend::capability::HasCoordinatedGroups;
+    // Imports below feed the per-backend `_anchor_*` functions, which are
+    // each gated behind their backend's feature flag — so without any
+    // backend feature enabled these imports go unused.
+    #[allow(unused_imports)]
     use crate::markers::*;
+    #[allow(unused_imports)]
     use crate::{MessageMetadata, QueueTopology, SupervisorOutcome};
+    #[allow(unused_imports)]
     use tokio_util::sync::CancellationToken;
 
     fn _require_backend<B: Backend>() {
@@ -190,6 +196,7 @@ mod bounds_smoke {
             max_message_size: None,
             shutdown: CancellationToken::new(),
             processing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            consumer_group: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

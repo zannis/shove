@@ -16,6 +16,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
+use crate::metrics;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
@@ -160,6 +161,10 @@ impl RabbitMqPublisher {
             .map_err(|e| map_lapin_error("publish confirm failed", e))?;
 
         if confirm.is_nack() {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Publish,
+            );
             return Err(ShoveError::Connection(
                 "broker NACKed the published message".to_string(),
             ));
@@ -168,50 +173,68 @@ impl RabbitMqPublisher {
         Ok(())
     }
 
-    async fn publish_batch_raw(&self, exchange: &str, items: &[(&str, Vec<u8>)]) -> Result<()> {
+    /// Returns `(succeeded, result)` for the batch. On success `succeeded ==
+    /// items.len()`; on failure it reflects the count from the final attempt
+    /// (retries replay the full batch on a fresh channel, so the previous
+    /// attempts' confirmations are no longer attributable to a single
+    /// publish call).
+    async fn publish_batch_raw(
+        &self,
+        exchange: &str,
+        items: &[(&str, Vec<u8>)],
+    ) -> (u64, Result<()>) {
         let slot = self.pool.get();
         let mut channel_guard = slot.lock().await;
 
         debug!(exchange, count = items.len(), "publishing batch");
 
         let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
-        let mut last_err = None;
+        let mut last: (u64, Result<()>) = (0, Ok(()));
 
         for attempt in 0..3u32 {
-            match Self::do_publish_batch(&channel_guard, exchange, items).await {
+            let (succeeded, result) = Self::do_publish_batch(&channel_guard, exchange, items).await;
+            match result {
                 Ok(()) => {
                     debug!(
                         exchange,
                         count = items.len(),
                         "batch published and confirmed"
                     );
-                    return Ok(());
+                    return (succeeded, Ok(()));
                 }
                 Err(e) => {
                     warn!(exchange, attempt, error = %e, "batch publish failed, recovering channel");
-                    last_err = Some(e);
+                    last = (succeeded, Err(e));
                     if attempt < 2 {
                         let delay = backoff.next().expect("backoff is infinite");
                         tokio::time::sleep(delay).await;
-                        let fresh = self.client.create_confirm_channel().await?;
-                        *channel_guard = fresh;
+                        match self.client.create_confirm_channel().await {
+                            Ok(fresh) => *channel_guard = fresh,
+                            Err(e) => return (last.0, Err(e)),
+                        }
                     }
                 }
             }
         }
 
-        Err(last_err.expect("loop ran at least once"))
+        last
     }
 
+    /// Submit every message and await each publisher confirm, returning the
+    /// number of confirmed-acked messages alongside the first error
+    /// encountered. The success count reflects only confirmations actually
+    /// observed: messages submitted to the channel but unconfirmed when an
+    /// earlier basic_publish fails are not counted, since we don't know if
+    /// the broker ever received them.
     async fn do_publish_batch(
         channel: &Channel,
         exchange: &str,
         items: &[(&str, Vec<u8>)],
-    ) -> Result<()> {
+    ) -> (u64, Result<()>) {
         let mut confirms = Vec::with_capacity(items.len());
         let props = base_properties();
         for (routing_key, payload) in items {
-            let confirm = channel
+            match channel
                 .basic_publish(
                     exchange.into(),
                     (*routing_key).into(),
@@ -220,24 +243,35 @@ impl RabbitMqPublisher {
                     props.clone(),
                 )
                 .await
-                .map_err(|e| map_lapin_error("batch publish failed", e))?;
-
-            confirms.push(confirm);
-        }
-
-        for confirm in confirms {
-            let result = confirm
-                .await
-                .map_err(|e| map_lapin_error("batch confirm failed", e))?;
-
-            if result.is_nack() {
-                return Err(ShoveError::Connection(
-                    "broker NACKed a batch message".to_string(),
-                ));
+            {
+                Ok(confirm) => confirms.push(confirm),
+                Err(e) => return (0, Err(map_lapin_error("batch publish failed", e))),
             }
         }
 
-        Ok(())
+        let mut succeeded: u64 = 0;
+        for confirm in confirms {
+            match confirm.await {
+                Ok(result) => {
+                    if result.is_nack() {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::RabbitMq,
+                            metrics::BackendErrorKind::Publish,
+                        );
+                        return (
+                            succeeded,
+                            Err(ShoveError::Connection(
+                                "broker NACKed a batch message".to_string(),
+                            )),
+                        );
+                    }
+                    succeeded += 1;
+                }
+                Err(e) => return (succeeded, Err(map_lapin_error("batch confirm failed", e))),
+            }
+        }
+
+        (succeeded, Ok(()))
     }
 }
 
@@ -285,8 +319,9 @@ impl RabbitMqPublisher {
         }
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         let topology = T::topology();
+        let queue = topology.queue();
         let sequencing = topology.sequencing();
         let key_fn = T::SEQUENCE_KEY_FN;
 
@@ -298,7 +333,10 @@ impl RabbitMqPublisher {
                 Ok(buf)
             })
             .collect();
-        let payloads = payloads?;
+        let payloads = match payloads {
+            Ok(v) => v,
+            Err(e) => return (0, Err(e)),
+        };
 
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
 
@@ -311,11 +349,13 @@ impl RabbitMqPublisher {
                     .collect();
                 self.publish_batch_raw(seq.exchange(), &items).await
             }
-            (Some(_), None) => Err(ShoveError::Topology(
-                "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
-            )),
+            (Some(_), None) => (
+                0,
+                Err(ShoveError::Topology(
+                    "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
+                )),
+            ),
             (None, _) => {
-                let queue = topology.queue();
                 let items: Vec<(&str, Vec<u8>)> =
                     payloads.into_iter().map(|p| (queue, p)).collect();
                 self.publish_batch_raw("", &items).await
@@ -340,7 +380,7 @@ impl PublisherImpl for RabbitMqPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         RabbitMqPublisher::publish_batch::<T>(self, msgs)
     }
 }
@@ -436,6 +476,10 @@ impl ChannelPublisher {
             .map_err(|e| map_lapin_error("publish to queue confirm failed", e))?;
 
         if !self.tx_mode && confirm.is_nack() {
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Publish,
+            );
             return Err(ShoveError::Connection(
                 "broker NACKed the published message".to_string(),
             ));

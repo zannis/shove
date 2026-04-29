@@ -72,11 +72,15 @@ impl InMemoryPublisher {
         self.publish_one::<T>(message, headers).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+        let mut succeeded: u64 = 0;
         for message in messages {
-            self.publish_one::<T>(message, HashMap::new()).await?;
+            match self.publish_one::<T>(message, HashMap::new()).await {
+                Ok(()) => succeeded += 1,
+                Err(e) => return (succeeded, Err(e)),
+            }
         }
-        Ok(())
+        (succeeded, Ok(()))
     }
 }
 
@@ -96,7 +100,7 @@ impl PublisherImpl for InMemoryPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         InMemoryPublisher::publish_batch::<T>(self, msgs)
     }
 }
@@ -267,10 +271,9 @@ mod tests {
         let publisher = InMemoryPublisher::new(broker.clone());
 
         let messages: Vec<Msg> = (0..5).map(|i| Msg { id: i }).collect();
-        publisher
-            .publish_batch::<SimpleTopic>(&messages)
-            .await
-            .unwrap();
+        let (succeeded, res) = publisher.publish_batch::<SimpleTopic>(&messages).await;
+        res.unwrap();
+        assert_eq!(succeeded, messages.len() as u64);
 
         let queue = broker.lookup("simple-pub").unwrap();
         assert_eq!(queue.buffer.lock().await.len(), 5);

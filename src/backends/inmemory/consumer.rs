@@ -17,6 +17,7 @@ use crate::consumer::validate_message_size;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
@@ -154,6 +155,7 @@ where
             let max_size = options.max_message_size;
             let timeout_opt = options.handler_timeout;
             let env_for_task = env.clone();
+            let group = options.consumer_group.clone();
 
             let abort = inflight.spawn(async move {
                 let outcome = invoke_handler::<T, H>(
@@ -162,6 +164,8 @@ where
                     &env_for_task,
                     max_size,
                     timeout_opt,
+                    T::topology().queue(),
+                    group.as_deref(),
                 )
                 .await;
                 (ticket, outcome)
@@ -407,6 +411,8 @@ async fn run_fifo_shard<T, H>(
                     options.handler_timeout,
                     &shutdown,
                     &broker_shutdown,
+                    T::topology().queue(),
+                    options.consumer_group.as_deref(),
                 )
                 .await;
                 match raw {
@@ -723,9 +729,14 @@ async fn route_reject(
 fn prepare_message<T: Topic>(
     env: &Envelope,
     max_size: Option<usize>,
+    topic: &str,
+    group: Option<&str>,
 ) -> std::result::Result<(T::Message, MessageMetadata), Outcome> {
+    metrics::record_message_size(topic, group, env.payload.len());
+
     if let Err(e) = validate_message_size(env.payload.len(), max_size) {
         tracing::warn!(error = %e, "rejecting oversized message");
+        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
         return Err(Outcome::Reject);
     }
 
@@ -733,6 +744,7 @@ fn prepare_message<T: Topic>(
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, "failed to deserialize message — rejecting");
+            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
             return Err(Outcome::Reject);
         }
     };
@@ -747,6 +759,8 @@ async fn run_handler<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout_opt: Option<Duration>,
+    topic: &str,
+    group: Option<&str>,
 ) -> Outcome
 where
     T: Topic,
@@ -758,6 +772,7 @@ where
                 Ok(o) => o,
                 Err(_) => {
                     tracing::warn!(timeout = ?timeout_dur, "handler timed out — retrying");
+                    metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                     Outcome::Retry
                 }
             }
@@ -774,22 +789,32 @@ async fn invoke_handler<T, H>(
     env: &Envelope,
     max_size: Option<usize>,
     timeout_opt: Option<Duration>,
+    topic: &str,
+    group: Option<&str>,
 ) -> Outcome
 where
     T: Topic,
     H: MessageHandler<T>,
 {
-    match prepare_message::<T>(env, max_size) {
-        Ok((message, metadata)) => {
-            run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt).await
-        }
-        Err(o) => o,
-    }
+    let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
+        Ok(pair) => pair,
+        Err(o) => return o,
+    };
+
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
+    let start = std::time::Instant::now();
+    let outcome =
+        run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt, topic, group).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    outcome
 }
 
 /// Runs the handler with panic-catching and shutdown-awareness for paths
 /// without an outer `JoinSet` (the FIFO shard loop). Returns `None` when
 /// shutdown aborts the in-flight handler — the caller must drop the message.
+#[allow(clippy::too_many_arguments)]
 async fn invoke_handler_caught<T, H>(
     handler: Arc<H>,
     ctx: Arc<H::Context>,
@@ -798,6 +823,8 @@ async fn invoke_handler_caught<T, H>(
     timeout_opt: Option<Duration>,
     shutdown: &CancellationToken,
     broker_shutdown: &CancellationToken,
+    topic: &str,
+    group: Option<&str>,
 ) -> Option<Outcome>
 where
     T: Topic,
@@ -806,16 +833,34 @@ where
     // Deserialize on the caller task so the spawned task only owns the
     // already-decoded message + metadata — avoids cloning the full Envelope
     // on every FIFO message.
-    let (message, metadata) = match prepare_message::<T>(env, max_size) {
+    let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
         Ok(pair) => pair,
         Err(o) => return Some(o),
     };
 
-    let mut join = tokio::spawn(async move {
-        run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt).await
+    let topic_owned: std::sync::Arc<str> = std::sync::Arc::from(topic);
+    let group_owned: Option<std::sync::Arc<str>> = group.map(std::sync::Arc::from);
+    let _inflight = metrics::InflightGuard::new(topic_owned.clone(), group_owned.clone());
+    let start = std::time::Instant::now();
+
+    let mut join = tokio::spawn({
+        let topic_owned = topic_owned.clone();
+        let group_owned = group_owned.clone();
+        async move {
+            run_handler::<T, H>(
+                handler,
+                ctx,
+                message,
+                metadata,
+                timeout_opt,
+                &topic_owned,
+                group_owned.as_deref(),
+            )
+            .await
+        }
     });
 
-    tokio::select! {
+    let outcome_opt = tokio::select! {
         biased;
         _ = shutdown.cancelled() => { join.abort(); None }
         _ = broker_shutdown.cancelled() => { join.abort(); None }
@@ -823,7 +868,14 @@ where
             tracing::warn!(error = %e, "handler task panicked — retrying message");
             Outcome::Retry
         })),
+    };
+
+    let elapsed = start.elapsed().as_secs_f64();
+    if let Some(ref o) = outcome_opt {
+        metrics::record_consumed(&topic_owned, group_owned.as_deref(), o);
+        metrics::record_processing_duration(&topic_owned, group_owned.as_deref(), o, elapsed);
     }
+    outcome_opt
 }
 
 // ---------------------------------------------------------------------------
