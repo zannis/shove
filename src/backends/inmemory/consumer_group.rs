@@ -462,13 +462,14 @@ impl InMemoryConsumerGroupRegistry {
         H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
-        let queue = topology.queue().to_string();
+        let name = topology.queue().to_string();
 
-        if self.groups.contains_key(&queue) {
+        if self.groups.contains_key(&name) {
             return Err(ShoveError::Topology(format!(
-                "topic '{queue}' is already registered on this consumer group"
+                "consumer group '{name}' is already registered"
             )));
         }
+        let queue = name.clone();
 
         let broker = self.broker.as_ref().ok_or_else(|| {
             ShoveError::Topology("registry not initialized".into())
