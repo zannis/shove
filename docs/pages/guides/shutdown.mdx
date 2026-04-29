@@ -167,6 +167,54 @@ Critically: `Clean` means NO message was left partially-processed mid-flight. If
 
 For handlers with irreversible side effects, consider increasing the drain timeout or reducing handler latency before a rolling deploy. Abandoned in-flight messages under `DrainTimeout` are the most common source of production incidents involving `shove` consumers.
 
+## Sequenced topics: `run_fifo_until_timeout`
+
+Sequenced topics don't go through the `ConsumerSupervisor` / `ConsumerGroup` harness — `register` rejects them so per-key ordering can't be silently dropped (see [Sequenced consumers](/guides/sequenced)). Each backend's consumer instead exposes `run_fifo`, which spawns one task per routing shard and runs until the consumer's shutdown token is cancelled.
+
+For graceful shutdown with the same `SupervisorOutcome` semantics as the harness, use `run_fifo_until_timeout`:
+
+```rust,no_run
+use std::time::Duration;
+use shove::SupervisorOutcome;
+use shove::rabbitmq::consumer::RabbitMqConsumer;
+
+let consumer = RabbitMqConsumer::new(client.clone());
+let opts = ConsumerOptions::<RabbitMq>::new()
+    .with_prefetch_count(1)
+    .with_max_retries(5)
+    .with_shutdown(shutdown.clone());
+
+let outcome: SupervisorOutcome = consumer
+    .run_fifo_until_timeout::<MyTopic, _, _>(
+        handler,
+        ctx,
+        opts,
+        shutdown.cancelled_owned(),
+        Duration::from_secs(30),
+    )
+    .await;
+
+std::process::exit(outcome.exit_code());
+```
+
+`run_fifo_until_timeout` races `signal` against shards finishing on their own:
+
+- If shards finish before `signal`: tally errors and panics, return immediately (no drain timeout consumed).
+- If `signal` fires first: cancel `options.shutdown`, wait up to `drain_timeout` for shards to finish, then abort surviving shards. The timeout itself sets `timed_out = true`, which `exit_code()` maps to `3`.
+
+This is the FIFO peer of `ConsumerGroup::run_until_timeout` and shares the same `SupervisorOutcome` type, so a process-level `.max(...)` rollup across groups + FIFO drains is just:
+
+```rust,no_run
+let exit_code = group_outcome
+    .exit_code()
+    .max(fifo_outcome.exit_code());
+std::process::exit(exit_code);
+```
+
+Available on `RabbitMqConsumer`, `KafkaConsumer`, `NatsConsumer`, `InMemoryConsumer`, and `SqsConsumer`.
+
+**Handler-panic counting note.** Most backends (RabbitMQ, Kafka, NATS, InMemory) wrap each handler invocation in a `tokio::spawn` + `oneshot` boundary that catches panics and maps them to `Outcome::Retry`. As a result `outcome.panics` does not increment for panics inside `MessageHandler::handle` — those land in your retry/DLQ path instead. `outcome.panics > 0` is reserved for panics in shard-infrastructure code or aborted-during-drain shards. SQS is the exception: its FIFO shard awaits the handler directly, so handler panics propagate to the shard task and increment `outcome.panics`.
+
 ## What's next
 
 - [Consumer Groups & Autoscaling](/guides/groups)
