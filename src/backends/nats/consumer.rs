@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::consumer::validate_message_size;
+use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -700,12 +702,145 @@ impl NatsConsumer {
             .await
     }
 
+    pub async fn run_fifo_until_timeout<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Nats>,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        self.run_fifo_until_timeout_with_inner::<T, H, S>(
+            handler,
+            ctx,
+            options.into_inner(),
+            signal,
+            drain_timeout,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_fifo_until_timeout_with_inner<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        let shutdown = options.shutdown.clone();
+        let handles = match self.spawn_fifo_shards::<T, H>(handler, ctx, options).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
+                return SupervisorOutcome { errors: 1, panics: 0, timed_out: false };
+            }
+        };
+
+        let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+        for handle in handles {
+            joinset.spawn(async move {
+                match handle.await {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => Ok(()),
+                    Err(e) => std::panic::resume_unwind(e.into_panic()),
+                }
+            });
+        }
+
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+
+        let shards_done = {
+            let errors = &mut errors;
+            let panics = &mut panics;
+            let joinset = &mut joinset;
+            async move {
+                while let Some(res) = joinset.join_next().await {
+                    crate::consumer_supervisor::tally_join_result(res, errors, panics);
+                }
+            }
+        };
+
+        let signal_won = tokio::select! {
+            biased;
+            _ = signal => true,
+            _ = shards_done => false,
+        };
+
+        if !signal_won {
+            return SupervisorOutcome { errors, panics, timed_out: false };
+        }
+
+        shutdown.cancel();
+        let drain = async {
+            while let Some(res) = joinset.join_next().await {
+                crate::consumer_supervisor::tally_join_result(res, &mut errors, &mut panics);
+            }
+        };
+        match tokio::time::timeout(drain_timeout, drain).await {
+            Ok(()) => SupervisorOutcome { errors, panics, timed_out: false },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "run_fifo_until_timeout: drain timed out; aborting surviving shards"
+                );
+                joinset.abort_all();
+                while let Some(res) = joinset.join_next().await {
+                    crate::consumer_supervisor::tally_join_result(
+                        res, &mut errors, &mut panics,
+                    );
+                }
+                SupervisorOutcome { errors, panics, timed_out: true }
+            }
+        }
+    }
+
     pub(crate) async fn run_fifo_with_inner<T, H>(
         &self,
         handler: H,
         ctx: H::Context,
         options: ConsumerOptions,
     ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options).await?;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("NATS sequenced shard task failed: {e}"),
+                Err(e) => tracing::error!("NATS sequenced shard task panicked: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn one task per routing shard and return the join handles.
+    ///
+    /// Each shard task internally returns `()` (errors are logged within the
+    /// task), so each handle is wrapped to produce `Result<()>` for a uniform
+    /// handle type across backends.
+    ///
+    /// The `pub(crate)` visibility is required for Phase 2 (Task 16), which
+    /// calls this from the consumer-group module.
+    pub(crate) async fn spawn_fifo_shards<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
         H: MessageHandler<T>,
@@ -744,7 +879,8 @@ impl NatsConsumer {
             "NATS FIFO consumer started"
         );
 
-        let mut shard_tasks = Vec::with_capacity(routing_shards as usize);
+        let mut shard_tasks: Vec<tokio::task::JoinHandle<Result<()>>> =
+            Vec::with_capacity(routing_shards as usize);
 
         for shard in 0..routing_shards {
             let consumer_name = format!("{queue}-shard-{shard}");
@@ -776,7 +912,8 @@ impl NatsConsumer {
             let shard_topic = topic.clone();
             let shard_group = group.clone();
 
-            let task = tokio::spawn(async move {
+            #[allow(unreachable_code)]
+            let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
                 let mut messages = match pull_consumer.messages().await {
                     Ok(m) => m,
                     Err(e) => {
@@ -785,7 +922,7 @@ impl NatsConsumer {
                             shard,
                             "failed to get message stream for shard"
                         );
-                        return;
+                        return Ok(());
                     }
                 };
 
@@ -793,18 +930,18 @@ impl NatsConsumer {
                     tokio::select! {
                         _ = shard_shutdown.cancelled() => {
                             tracing::info!(shard, "shutdown signal received, stopping shard consumer");
-                            return;
+                            return Ok(());
                         }
                         item = messages.next() => {
                             let msg = match item {
                                 Some(Ok(msg)) => msg,
                                 Some(Err(e)) => {
                                     tracing::error!(error = %e, shard, "shard consumer stream error");
-                                    return;
+                                    return Ok(());
                                 }
                                 None => {
                                     tracing::warn!(shard, "shard consumer stream closed");
-                                    return;
+                                    return Ok(());
                                 }
                             };
 
@@ -915,17 +1052,14 @@ impl NatsConsumer {
                         }
                     }
                 }
+
+                Ok(())
             });
 
             shard_tasks.push(task);
         }
 
-        // Wait for all shard tasks to complete
-        for task in shard_tasks {
-            let _ = task.await;
-        }
-
-        Ok(())
+        Ok(shard_tasks)
     }
 
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
