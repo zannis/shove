@@ -2,6 +2,7 @@ use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_sqs::types::{Message, MessageAttributeValue, MessageSystemAttributeName};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::router;
 use crate::backends::sns::topology::QueueRegistry;
+use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -1553,63 +1555,177 @@ impl SqsConsumer {
         self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
     }
 
-    pub(crate) fn run_fifo_with_inner<T, H>(
+    pub async fn run_fifo_until_timeout<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Sqs>,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        self.run_fifo_until_timeout_with_inner::<T, H, S>(
+            handler,
+            ctx,
+            options.into_inner(),
+            signal,
+            drain_timeout,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_fifo_until_timeout_with_inner<T, H, S>(
         &self,
         handler: H,
         ctx: H::Context,
         options: ConsumerOptions,
-    ) -> impl Future<Output = Result<()>> + Send
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        let shutdown = options.shutdown.clone();
+        let handles = match self.spawn_fifo_shards::<T, H>(handler, ctx, options).await {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
+                return SupervisorOutcome { errors: 1, panics: 0, timed_out: false };
+            }
+        };
+
+        let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+        for handle in handles {
+            joinset.spawn(async move {
+                match handle.await {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => Ok(()),
+                    Err(e) => std::panic::resume_unwind(e.into_panic()),
+                }
+            });
+        }
+
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+
+        let shards_done = {
+            let errors = &mut errors;
+            let panics = &mut panics;
+            let joinset = &mut joinset;
+            async move {
+                while let Some(res) = joinset.join_next().await {
+                    crate::consumer_supervisor::tally_join_result(res, errors, panics);
+                }
+            }
+        };
+
+        let signal_won = tokio::select! {
+            biased;
+            _ = signal => true,
+            _ = shards_done => false,
+        };
+
+        if !signal_won {
+            return SupervisorOutcome { errors, panics, timed_out: false };
+        }
+
+        shutdown.cancel();
+        let drain = async {
+            while let Some(res) = joinset.join_next().await {
+                crate::consumer_supervisor::tally_join_result(res, &mut errors, &mut panics);
+            }
+        };
+        match tokio::time::timeout(drain_timeout, drain).await {
+            Ok(()) => SupervisorOutcome { errors, panics, timed_out: false },
+            Err(_) => {
+                warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "run_fifo_until_timeout: drain timed out; aborting surviving shards"
+                );
+                joinset.abort_all();
+                while let Some(res) = joinset.join_next().await {
+                    crate::consumer_supervisor::tally_join_result(
+                        res, &mut errors, &mut panics,
+                    );
+                }
+                SupervisorOutcome { errors, panics, timed_out: true }
+            }
+        }
+    }
+
+    pub(crate) async fn run_fifo_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<()>
     where
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        let client = self.client.clone();
-        let queue_registry = self.queue_registry.clone();
-        async move {
-            let topology = T::topology();
-            let seq = topology.sequencing().ok_or_else(|| {
-                ShoveError::Topology("run_fifo requires a sequenced topic".into())
-            })?;
-
-            let handler = Arc::new(handler);
-            let ctx = Arc::new(ctx);
-            let consumer = SqsConsumer::new(client, queue_registry);
-            let on_failure = seq.on_failure();
-            let mut handles = Vec::new();
-
-            for i in 0..seq.routing_shards() {
-                let shard_queue_name = format!("{}-seq-{i}", topology.queue());
-                let shard_queue_url = consumer.resolve_queue_url(&shard_queue_name).await?;
-
-                let sqs = consumer.client.sqs().clone();
-                let h = handler.clone();
-                let c = ctx.clone();
-                let opts = options.clone();
-
-                handles.push(tokio::spawn(async move {
-                    run_sequenced_shard::<T, H>(
-                        &sqs,
-                        &shard_queue_url,
-                        &shard_queue_name,
-                        topology,
-                        &h,
-                        &c,
-                        &opts,
-                        on_failure,
-                    )
-                    .await
-                }));
+        let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options).await?;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("SQS sequenced shard task failed: {e}"),
+                Err(e) => error!("SQS sequenced shard task panicked: {e}"),
             }
-
-            // Wait for all shards
-            for handle in handles {
-                if let Err(e) = handle.await {
-                    error!("shard consumer task panicked: {e}");
-                }
-            }
-
-            Ok(())
         }
+        Ok(())
+    }
+
+    pub(crate) async fn spawn_fifo_shards<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        let topology = T::topology();
+        let seq = topology.sequencing().ok_or_else(|| {
+            ShoveError::Topology("run_fifo requires a sequenced topic".into())
+        })?;
+
+        let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
+        let consumer = SqsConsumer::new(self.client.clone(), self.queue_registry.clone());
+        let on_failure = seq.on_failure();
+        let mut handles = Vec::new();
+
+        for i in 0..seq.routing_shards() {
+            let shard_queue_name = format!("{}-seq-{i}", topology.queue());
+            let shard_queue_url = consumer.resolve_queue_url(&shard_queue_name).await?;
+
+            let sqs = consumer.client.sqs().clone();
+            let h = handler.clone();
+            let c = ctx.clone();
+            let opts = options.clone();
+
+            handles.push(tokio::spawn(async move {
+                run_sequenced_shard::<T, H>(
+                    &sqs,
+                    &shard_queue_url,
+                    &shard_queue_name,
+                    topology,
+                    &h,
+                    &c,
+                    &opts,
+                    on_failure,
+                )
+                .await
+            }));
+        }
+
+        Ok(handles)
     }
 
     pub fn run_dlq<T, H>(
