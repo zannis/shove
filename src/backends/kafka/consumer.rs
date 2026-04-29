@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::consumer::validate_message_size;
+use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -875,8 +876,38 @@ impl KafkaConsumer {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
+        let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options)?;
+        // Kafka has exactly one FIFO task per call (single consumer, partition ordering).
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("Kafka FIFO consumer task failed: {e}"),
+                Err(e) => tracing::error!("Kafka FIFO consumer task panicked: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn the Kafka FIFO consumer task and return its join handle.
+    ///
+    /// Kafka relies on partition-level ordering, so a single consumer task is
+    /// sufficient — `routing_shards` is a no-op for Kafka FIFO. The returned
+    /// `Vec` always contains exactly one element.
+    ///
+    /// `pub(crate)` visibility is required for Phase 2 (Task 16), which calls
+    /// this from the consumer-group module.
+    pub(crate) fn spawn_fifo_shards<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
-        let queue = topology.queue();
+        let queue = topology.queue().to_string();
         let _seq_config = topology
             .sequencing()
             .expect("run_fifo requires a sequenced topology");
@@ -896,94 +927,65 @@ impl KafkaConsumer {
         // processing one message at a time guarantees FIFO per key (all
         // messages for the same key land in the same partition).
         let group_id = format!("{queue}-fifo");
-        let topic: Arc<str> = Arc::from(queue);
+        let topic: Arc<str> = Arc::from(queue.as_str());
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
         tracing::info!(queue, group_id, max_retries, "Kafka FIFO consumer started");
 
-        run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
-            let handler = handler.clone();
-            let ctx = ctx.clone();
-            let client = client.clone();
-            let shutdown = shutdown.clone();
-            let processing = processing.clone();
-            let group_id = group_id.clone();
-            let topic = topic.clone();
-            let group = group.clone();
-            async move {
-                let consumer = create_stream_consumer(client.base_config(), &group_id)?;
-                consumer
-                    .subscribe(&[queue])
-                    .map_err(|e| {
-                        map_kafka_error("failed to subscribe", e)
-                    })?;
+        let shard_task = tokio::spawn(async move {
+            run_with_reconnect(&shutdown, &queue, CONNECTION_RETRIES, || {
+                let handler = handler.clone();
+                let ctx = ctx.clone();
+                let client = client.clone();
+                let shutdown = shutdown.clone();
+                let processing = processing.clone();
+                let group_id = group_id.clone();
+                let queue = queue.clone();
+                let topic = topic.clone();
+                let group = group.clone();
+                async move {
+                    let consumer = create_stream_consumer(client.base_config(), &group_id)?;
+                    consumer
+                        .subscribe(&[queue.as_str()])
+                        .map_err(|e| {
+                            map_kafka_error("failed to subscribe", e)
+                        })?;
 
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {
-                            tracing::info!(queue, "shutdown signal received, stopping FIFO consumer");
-                            return Ok(());
-                        }
-                        msg_result = consumer.recv() => {
-                            let msg = match msg_result {
-                                Ok(msg) => msg,
-                                Err(e) => {
-                                    tracing::error!(error = %e, queue, "FIFO consumer recv error");
-                                    return Err(map_kafka_error(
-                                        &format!("FIFO consumer recv error on {queue}"),
-                                        e,
-                                    ));
-                                }
-                            };
-
-                            let payload_bytes = msg.payload().unwrap_or_default().to_vec();
-                            let headers = extract_string_headers(&msg);
-                            let key = msg.key().map(|k| k.to_vec());
-
-                            metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
-
-                            // Reject oversized messages before deserialization
-                            if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
-                                tracing::warn!(
-                                    error = %e,
-                                    queue,
-                                    "rejecting oversized FIFO message to DLQ"
-                                );
-                                metrics::record_failed(
-                                    &topic,
-                                    group.as_deref(),
-                                    metrics::FailReason::Oversize,
-                                );
-                                if let Err(dlq_err) = publish_to_dlq(
-                                    &client,
-                                    topology,
-                                    &payload_bytes,
-                                    key.as_deref(),
-                                    &headers,
-                                    &e.to_string(),
-                                ).await {
-                                    tracing::error!(
-                                        error = %dlq_err,
-                                        "failed to publish oversized message to DLQ"
-                                    );
-                                }
-                                consumer.commit_message(&msg, CommitMode::Async).ok();
-                                continue;
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {
+                                tracing::info!(queue, "shutdown signal received, stopping FIFO consumer");
+                                return Ok(());
                             }
+                            msg_result = consumer.recv() => {
+                                let msg = match msg_result {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        tracing::error!(error = %e, queue, "FIFO consumer recv error");
+                                        return Err(map_kafka_error(
+                                            &format!("FIFO consumer recv error on {queue}"),
+                                            e,
+                                        ));
+                                    }
+                                };
 
-                            // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match serde_json::from_slice(&payload_bytes) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::error!(
+                                let payload_bytes = msg.payload().unwrap_or_default().to_vec();
+                                let headers = extract_string_headers(&msg);
+                                let key = msg.key().map(|k| k.to_vec());
+
+                                metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+
+                                // Reject oversized messages before deserialization
+                                if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
+                                    tracing::warn!(
                                         error = %e,
                                         queue,
-                                        "failed to deserialize FIFO message, sending to DLQ"
+                                        "rejecting oversized FIFO message to DLQ"
                                     );
                                     metrics::record_failed(
                                         &topic,
                                         group.as_deref(),
-                                        metrics::FailReason::Deserialize,
+                                        metrics::FailReason::Oversize,
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
@@ -991,61 +993,207 @@ impl KafkaConsumer {
                                         &payload_bytes,
                                         key.as_deref(),
                                         &headers,
-                                        &format!("deserialization_error: {e}"),
+                                        &e.to_string(),
                                     ).await {
                                         tracing::error!(
                                             error = %dlq_err,
-                                            "failed to publish bad message to DLQ"
+                                            "failed to publish oversized message to DLQ"
                                         );
                                     }
                                     consumer.commit_message(&msg, CommitMode::Async).ok();
                                     continue;
                                 }
-                            };
 
-                            let metadata = build_message_metadata(&headers, false);
-                            let retry_count = metadata.retry_count;
+                                // Deserialize payload; reject to DLQ on failure
+                                let payload: T::Message = match serde_json::from_slice(&payload_bytes) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            queue,
+                                            "failed to deserialize FIFO message, sending to DLQ"
+                                        );
+                                        metrics::record_failed(
+                                            &topic,
+                                            group.as_deref(),
+                                            metrics::FailReason::Deserialize,
+                                        );
+                                        if let Err(dlq_err) = publish_to_dlq(
+                                            &client,
+                                            topology,
+                                            &payload_bytes,
+                                            key.as_deref(),
+                                            &headers,
+                                            &format!("deserialization_error: {e}"),
+                                        ).await {
+                                            tracing::error!(
+                                                error = %dlq_err,
+                                                "failed to publish bad message to DLQ"
+                                            );
+                                        }
+                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        continue;
+                                    }
+                                };
 
-                            processing.store(true, Ordering::Release);
+                                let metadata = build_message_metadata(&headers, false);
+                                let retry_count = metadata.retry_count;
 
-                            let outcome = spawn_handler::<T, H>(
-                                handler.clone(),
-                                ctx.clone(),
-                                payload,
-                                metadata,
-                                handler_timeout,
-                                topic.clone(),
-                                group.clone(),
-                            )
-                            .await
-                            .unwrap_or_else(|_| {
-                                tracing::warn!(queue, "handler task panicked, retrying message");
-                                Outcome::Retry
-                            });
-                            let outcome = adjust_outcome_for_fifo(outcome);
+                                processing.store(true, Ordering::Release);
 
-                            route_outcome(
-                                &client,
-                                queue,
-                                &payload_bytes,
-                                key.as_deref(),
-                                &headers,
-                                outcome,
-                                topology,
-                                retry_count,
-                                max_retries,
-                                hold_queues,
-                            )
-                            .await;
+                                let outcome = spawn_handler::<T, H>(
+                                    handler.clone(),
+                                    ctx.clone(),
+                                    payload,
+                                    metadata,
+                                    handler_timeout,
+                                    topic.clone(),
+                                    group.clone(),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    tracing::warn!(queue, "handler task panicked, retrying message");
+                                    Outcome::Retry
+                                });
+                                let outcome = adjust_outcome_for_fifo(outcome);
 
-                            consumer.commit_message(&msg, CommitMode::Async).ok();
-                            processing.store(false, Ordering::Release);
+                                route_outcome(
+                                    &client,
+                                    &queue,
+                                    &payload_bytes,
+                                    key.as_deref(),
+                                    &headers,
+                                    outcome,
+                                    topology,
+                                    retry_count,
+                                    max_retries,
+                                    hold_queues,
+                                )
+                                .await;
+
+                                consumer.commit_message(&msg, CommitMode::Async).ok();
+                                processing.store(false, Ordering::Release);
+                            }
                         }
                     }
                 }
-            }
-        })
+            })
+            .await
+        });
+
+        Ok(vec![shard_task])
+    }
+
+    /// Drain a Kafka FIFO consumer with a timeout, mirroring
+    /// [`ConsumerSupervisor::run_until_timeout`] for sequenced topics.
+    ///
+    /// Spawns a single FIFO task (Kafka uses partition ordering rather than
+    /// routing shards). Races `signal` against the task exiting on its own.
+    /// When `signal` resolves, cancels `options.shutdown` and waits up to
+    /// `drain_timeout` for the task to finish; a surviving task is aborted
+    /// and reflected in `timed_out`.
+    pub async fn run_fifo_until_timeout<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Kafka>,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        self.run_fifo_until_timeout_with_inner::<T, H, S>(
+            handler,
+            ctx,
+            options.into_inner(),
+            signal,
+            drain_timeout,
+        )
         .await
+    }
+
+    pub(crate) async fn run_fifo_until_timeout_with_inner<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        let shutdown = options.shutdown.clone();
+        let handles = match self.spawn_fifo_shards::<T, H>(handler, ctx, options) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
+                return SupervisorOutcome { errors: 1, panics: 0, timed_out: false };
+            }
+        };
+
+        let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+        for handle in handles {
+            joinset.spawn(async move {
+                match handle.await {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => Ok(()),
+                    Err(e) => std::panic::resume_unwind(e.into_panic()),
+                }
+            });
+        }
+
+        let mut errors = 0usize;
+        let mut panics = 0usize;
+
+        let shards_done = {
+            let errors = &mut errors;
+            let panics = &mut panics;
+            let joinset = &mut joinset;
+            async move {
+                while let Some(res) = joinset.join_next().await {
+                    crate::consumer_supervisor::tally_join_result(res, errors, panics);
+                }
+            }
+        };
+
+        let signal_won = tokio::select! {
+            biased;
+            _ = signal => true,
+            _ = shards_done => false,
+        };
+
+        if !signal_won {
+            return SupervisorOutcome { errors, panics, timed_out: false };
+        }
+
+        shutdown.cancel();
+        let drain = async {
+            while let Some(res) = joinset.join_next().await {
+                crate::consumer_supervisor::tally_join_result(res, &mut errors, &mut panics);
+            }
+        };
+        match tokio::time::timeout(drain_timeout, drain).await {
+            Ok(()) => SupervisorOutcome { errors, panics, timed_out: false },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "run_fifo_until_timeout: drain timed out; aborting surviving shards"
+                );
+                joinset.abort_all();
+                while let Some(res) = joinset.join_next().await {
+                    crate::consumer_supervisor::tally_join_result(
+                        res, &mut errors, &mut panics,
+                    );
+                }
+                SupervisorOutcome { errors, panics, timed_out: true }
+            }
+        }
     }
 
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
