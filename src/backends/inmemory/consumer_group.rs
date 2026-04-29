@@ -475,14 +475,13 @@ impl InMemoryConsumerGroupRegistry {
         })?.clone();
 
         let group_token = broker.shutdown_token().child_token();
-        let mut group = InMemoryConsumerGroup::new_fifo::<T, H>(
+        let group = InMemoryConsumerGroup::new_fifo::<T, H>(
             queue.clone(),
             broker,
             group_token,
             handler_factory,
             ctx,
         );
-        group.start();
         self.groups.insert(queue, group);
         Ok(())
     }

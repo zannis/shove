@@ -1303,6 +1303,42 @@ async fn run_fifo_until_timeout_drain_does_not_hang_on_slow_handler() {
 }
 
 #[tokio::test]
+async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for seq in 0..3u64 {
+        publisher
+            .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq })
+            .await
+            .unwrap();
+    }
+
+    struct H;
+    impl MessageHandler<LedgerSkipTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<LedgerSkipTopic, _>(|| H)
+        .await
+        .unwrap();
+
+    // Give shards a moment to ack the messages, then drain.
+    let signal = tokio::time::sleep(Duration::from_millis(200));
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean(), "outcome was {outcome:?}");
+}
+
+#[tokio::test]
 async fn run_fifo_until_timeout_returns_clean_when_shards_finish_first() {
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
