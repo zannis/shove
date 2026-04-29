@@ -1,0 +1,27 @@
+src/metrics.rs
+  8e14c028f601a158 279-318
+src/backends/rabbitmq/consumer.rs
+  8e14c028f601a158 1149
+src/backends/inmemory/consumer.rs
+  8e14c028f601a158 807,847-848
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1d71d7382626807af115225e6afab2927d9e501e",
+  "prompts": {
+    "8e14c028f601a158": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "157627df-f3e2-49e0-97d5-234336bc2834",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 44,
+      "total_deletions": 8,
+      "accepted_lines": 44,
+      "overriden_lines": 0
+    }
+  }
+}
