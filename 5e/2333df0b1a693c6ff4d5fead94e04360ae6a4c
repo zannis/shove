@@ -1,0 +1,11 @@
+tests/sns_sqs_integration.rs
+  cee101a3fc7af78f 2948-2961,2963-2998,3000-3019,3021-3046,3054-3069,3071-3109,3111-3117
+docs/pages/guides/shutdown.mdx
+  cee101a3fc7af78f 170-215,217-219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "5e2333df0b1a693c6ff4d5fead94e04360ae6a4c",
+  "prompts": {}
+}
