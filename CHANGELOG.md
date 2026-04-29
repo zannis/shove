@@ -13,7 +13,7 @@
   std::process::exit(outcome.exit_code());
   ```
 
-  Handler panics are absorbed at the `tokio::spawn` + `oneshot` boundary on RabbitMQ, Kafka, NATS, and InMemory — they map to `Outcome::Retry` and don't increment `outcome.panics`. SQS awaits the handler directly, so handler panics propagate to the shard task. `outcome.panics > 0` consistently reflects shard-infrastructure panics or aborted-during-drain shards across all backends.
+  Handler panics are absorbed at the `tokio::spawn` + `oneshot` boundary on every backend — they map to `Outcome::Retry` and don't increment `outcome.panics`, landing in the configured retry/DLQ flow instead. `outcome.panics > 0` reflects panics in shard-infrastructure code that escape the in-shard handler-spawn boundary; aborted-during-drain shards do **not** count as panics (cancellation is ignored by the harness's tally), so a clean drain timeout returns `timed_out=true, panics=0, errors=0`.
 
 - `ConsumerSupervisor::register_fifo<T: SequencedTopic, H>` and `ConsumerGroup::register_fifo<T: SequencedTopic, H>`. Sequenced topics now register on the same harness as regular topics and drain through the same `run_until_timeout`, returning one `SupervisorOutcome` for the entire harness:
 

@@ -3044,9 +3044,13 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
         )
         .await;
 
-    // The harness must complete — no hang or deadlock — regardless of whether
-    // the panic is caught at the shard boundary or propagated to the JoinSet.
+    // SQS catches handler panics at the `spawn_handler_keyed` oneshot
+    // boundary and maps them to `Outcome::Retry` — the panic never escapes
+    // the consume loop. So the harness sees a clean shutdown when the
+    // signal fires: no panics, no errors, no timeout.
     assert!(!outcome.timed_out, "harness must not hang on handler panics; got {outcome:?}");
+    assert_eq!(outcome.panics, 0, "handler panics are absorbed at the shard boundary; got {outcome:?}");
+    assert_eq!(outcome.errors, 0, "handler panics are absorbed at the shard boundary; got {outcome:?}");
 }
 
 #[tokio::test]
