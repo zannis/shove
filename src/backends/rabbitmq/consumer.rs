@@ -80,13 +80,25 @@ fn unwrap_delivery(
 ) -> Result<Delivery> {
     match item {
         Some(Ok(d)) => Ok(d),
-        Some(Err(e)) => Err(map_lapin_error(
-            &format!("consumer stream error on {queue}"),
-            e,
-        )),
-        None => Err(ShoveError::Connection(format!(
-            "consumer stream closed for {queue}"
-        ))),
+        Some(Err(e)) => {
+            crate::metrics::record_backend_error(
+                crate::metrics::BackendLabel::RabbitMq,
+                crate::metrics::BackendErrorKind::Consume,
+            );
+            Err(map_lapin_error(
+                &format!("consumer stream error on {queue}"),
+                e,
+            ))
+        }
+        None => {
+            crate::metrics::record_backend_error(
+                crate::metrics::BackendLabel::RabbitMq,
+                crate::metrics::BackendErrorKind::Consume,
+            );
+            Err(ShoveError::Connection(format!(
+                "consumer stream closed for {queue}"
+            )))
+        }
     }
 }
 

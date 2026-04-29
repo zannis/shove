@@ -43,6 +43,10 @@ pub(super) async fn publish_with_retry(
             Ok(_) => return Ok(()),
             Err((e, _)) => {
                 if attempt == max_attempts {
+                    crate::metrics::record_backend_error(
+                        crate::metrics::BackendLabel::Kafka,
+                        crate::metrics::BackendErrorKind::Publish,
+                    );
                     return Err(ShoveError::Connection(format!(
                         "{label} failed after {max_attempts} attempts: {e}"
                     )));

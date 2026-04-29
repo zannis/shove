@@ -49,6 +49,10 @@ impl ConsumerGroupRegistry {
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
+            crate::metrics::record_backend_error(
+                crate::metrics::BackendLabel::RabbitMq,
+                crate::metrics::BackendErrorKind::Topology,
+            );
             return Err(ShoveError::Topology(format!(
                 "consumer group '{name}' is already registered"
             )));

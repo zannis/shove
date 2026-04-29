@@ -157,6 +157,10 @@ impl InMemoryBroker {
             tokio::select! {
                 _ = &mut notified => continue,
                 _ = self.inner.shutdown.cancelled() => {
+                    crate::metrics::record_backend_error(
+                        crate::metrics::BackendLabel::InMemory,
+                        crate::metrics::BackendErrorKind::Connection,
+                    );
                     return Err(ShoveError::Connection("broker shutdown".into()));
                 }
             }

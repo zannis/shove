@@ -160,6 +160,10 @@ impl RabbitMqPublisher {
             .map_err(|e| map_lapin_error("publish confirm failed", e))?;
 
         if confirm.is_nack() {
+            crate::metrics::record_backend_error(
+                crate::metrics::BackendLabel::RabbitMq,
+                crate::metrics::BackendErrorKind::Publish,
+            );
             return Err(ShoveError::Connection(
                 "broker NACKed the published message".to_string(),
             ));
@@ -231,6 +235,10 @@ impl RabbitMqPublisher {
                 .map_err(|e| map_lapin_error("batch confirm failed", e))?;
 
             if result.is_nack() {
+                crate::metrics::record_backend_error(
+                    crate::metrics::BackendLabel::RabbitMq,
+                    crate::metrics::BackendErrorKind::Publish,
+                );
                 return Err(ShoveError::Connection(
                     "broker NACKed a batch message".to_string(),
                 ));
@@ -436,6 +444,10 @@ impl ChannelPublisher {
             .map_err(|e| map_lapin_error("publish to queue confirm failed", e))?;
 
         if !self.tx_mode && confirm.is_nack() {
+            crate::metrics::record_backend_error(
+                crate::metrics::BackendLabel::RabbitMq,
+                crate::metrics::BackendErrorKind::Publish,
+            );
             return Err(ShoveError::Connection(
                 "broker NACKed the published message".to_string(),
             ));

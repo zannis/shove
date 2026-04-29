@@ -52,6 +52,10 @@ impl SqsConsumerGroupRegistry {
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
+            crate::metrics::record_backend_error(
+                crate::metrics::BackendLabel::SnsSqs,
+                crate::metrics::BackendErrorKind::Topology,
+            );
             return Err(ShoveError::Topology(format!(
                 "consumer group '{name}' already registered"
             )));

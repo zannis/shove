@@ -513,12 +513,20 @@ impl NatsConsumer {
                                 Some(Ok(msg)) => msg,
                                 Some(Err(e)) => {
                                     tracing::error!(error = %e, queue, "consumer stream error");
+                                    crate::metrics::record_backend_error(
+                                        crate::metrics::BackendLabel::Nats,
+                                        crate::metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("consumer stream error on {queue}: {e}"),
                                     ));
                                 }
                                 None => {
                                     tracing::warn!(queue, "consumer stream closed");
+                                    crate::metrics::record_backend_error(
+                                        crate::metrics::BackendLabel::Nats,
+                                        crate::metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("consumer stream closed for {queue}"),
                                     ));
@@ -963,12 +971,20 @@ impl NatsConsumer {
                                 Some(Ok(msg)) => msg,
                                 Some(Err(e)) => {
                                     tracing::error!(error = %e, dlq, "DLQ consumer stream error");
+                                    crate::metrics::record_backend_error(
+                                        crate::metrics::BackendLabel::Nats,
+                                        crate::metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("DLQ consumer stream error on {dlq}: {e}"),
                                     ));
                                 }
                                 None => {
                                     tracing::warn!(dlq, "DLQ consumer stream closed");
+                                    crate::metrics::record_backend_error(
+                                        crate::metrics::BackendLabel::Nats,
+                                        crate::metrics::BackendErrorKind::Consume,
+                                    );
                                     return Err(ShoveError::Connection(
                                         format!("DLQ consumer stream closed for {dlq}"),
                                     ));

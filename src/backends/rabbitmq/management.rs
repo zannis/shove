@@ -103,6 +103,10 @@ impl QueueStatsProvider for ManagementClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            crate::metrics::record_backend_error(
+                crate::metrics::BackendLabel::RabbitMq,
+                crate::metrics::BackendErrorKind::Topology,
+            );
             return Err(ShoveError::Connection(format!(
                 "management API returned non-success status {status} for queue {queue}"
             )));
