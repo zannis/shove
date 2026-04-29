@@ -16,7 +16,7 @@ use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
-use crate::topic::Topic;
+use crate::topic::{SequencedTopic, Topic};
 
 use super::client::InMemoryBroker;
 use super::consumer::InMemoryConsumer;
@@ -149,6 +149,10 @@ pub struct InMemoryConsumerGroup {
     /// `run_with_inner` returns `Err`. Drained by
     /// [`InMemoryConsumerGroup::shutdown_with_tally`].
     pub(crate) error_count: Arc<AtomicUsize>,
+    /// Panic count incremented by the FIFO spawner wrapper when a shard
+    /// task exits with a `JoinError` that is not a cancellation. Drained by
+    /// [`InMemoryConsumerGroup::shutdown_with_tally`].
+    pub(crate) panic_count: Arc<AtomicUsize>,
 }
 
 impl InMemoryConsumerGroup {
@@ -186,6 +190,73 @@ impl InMemoryConsumerGroup {
             spawner,
             group_token,
             error_count,
+            panic_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Construct a FIFO consumer group for a `SequencedTopic`.
+    ///
+    /// FIFO replica count is fixed at 1 — concurrency comes from shards,
+    /// not from multiple replicas of the shard set.
+    pub fn new_fifo<T, H>(
+        queue: impl Into<String>,
+        broker: InMemoryBroker,
+        group_token: CancellationToken,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Self
+    where
+        T: SequencedTopic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let panic_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
+        let pc_for_spawner = panic_count.clone();
+
+        // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
+        let fifo_config = InMemoryConsumerGroupConfig::new(1..=1);
+
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptionsInner| {
+            let handler = handler_factory();
+            let consumer = InMemoryConsumer::new(broker.clone());
+            let ec = ec_for_spawner.clone();
+            let pc = pc_for_spawner.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let handles = match consumer.spawn_fifo_shards_inner::<T, H>(handler, ctx, options) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        ec.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!("FIFO registration failed: {e}");
+                        return;
+                    }
+                };
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            ec.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard exited with error: {e}");
+                        }
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => {
+                            pc.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard panicked: {e}");
+                        }
+                    }
+                }
+            })
+        });
+
+        Self {
+            queue: queue.into(),
+            consumers: Vec::with_capacity(1),
+            config: fifo_config,
+            spawner,
+            group_token,
+            error_count,
+            panic_count,
         }
     }
 
@@ -289,6 +360,7 @@ impl InMemoryConsumerGroup {
             }
         }
         let errors = self.error_count.swap(0, Ordering::Relaxed);
+        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
         debug!(group = %self.queue, errors, panics, "in-memory consumer group shutdown complete");
         ShutdownTally { errors, panics }
     }
@@ -380,6 +452,41 @@ impl InMemoryConsumerGroupRegistry {
         Ok(())
     }
 
+    pub async fn register_fifo<T, H>(
+        &mut self,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Result<()>
+    where
+        T: SequencedTopic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        let topology = T::topology();
+        let queue = topology.queue().to_string();
+
+        if self.groups.contains_key(&queue) {
+            return Err(ShoveError::Topology(format!(
+                "topic '{queue}' is already registered on this consumer group"
+            )));
+        }
+
+        let broker = self.broker.as_ref().ok_or_else(|| {
+            ShoveError::Topology("registry not initialized".into())
+        })?.clone();
+
+        let group_token = broker.shutdown_token().child_token();
+        let mut group = InMemoryConsumerGroup::new_fifo::<T, H>(
+            queue.clone(),
+            broker,
+            group_token,
+            handler_factory,
+            ctx,
+        );
+        group.start();
+        self.groups.insert(queue, group);
+        Ok(())
+    }
+
     pub fn start_all(&mut self) {
         info!(
             count = self.groups.len(),
@@ -457,6 +564,7 @@ mod tests {
             spawner,
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
+            panic_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -527,6 +635,7 @@ mod tests {
             spawner,
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
+            panic_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
