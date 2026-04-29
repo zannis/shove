@@ -95,6 +95,85 @@ pub(crate) fn tally_join_result(
     }
 }
 
+/// Drive an already-spawned set of FIFO shard task handles to completion or
+/// timeout, mirroring [`ConsumerSupervisor::run_until_timeout`] for
+/// sequenced topics.
+///
+/// Each handle is wrapped in a [`tokio::task::JoinSet`] entry that maps
+/// abort-cancellation to `Ok(())` and re-panics on real panics, so the
+/// outer drain can use [`tally_join_result`] uniformly.
+///
+/// - Races `signal` against shards finishing on their own.
+/// - On signal, cancels `shutdown` and waits up to `drain_timeout` for
+///   shards to finish.
+/// - On timeout, calls `JoinSet::abort_all` and sets
+///   [`SupervisorOutcome::timed_out`] = `true`.
+pub(crate) async fn drive_fifo_until_timeout<S>(
+    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+    shutdown: tokio_util::sync::CancellationToken,
+    signal: S,
+    drain_timeout: std::time::Duration,
+) -> SupervisorOutcome
+where
+    S: Future<Output = ()> + Send + 'static,
+{
+    let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+    for handle in handles {
+        joinset.spawn(async move {
+            match handle.await {
+                Ok(r) => r,
+                Err(e) if e.is_cancelled() => Ok(()),
+                Err(e) => std::panic::resume_unwind(e.into_panic()),
+            }
+        });
+    }
+
+    let mut errors = 0usize;
+    let mut panics = 0usize;
+
+    let shards_done = {
+        let errors = &mut errors;
+        let panics = &mut panics;
+        let joinset = &mut joinset;
+        async move {
+            while let Some(res) = joinset.join_next().await {
+                tally_join_result(res, errors, panics);
+            }
+        }
+    };
+
+    let signal_won = tokio::select! {
+        biased;
+        _ = signal => true,
+        _ = shards_done => false,
+    };
+
+    if !signal_won {
+        return SupervisorOutcome { errors, panics, timed_out: false };
+    }
+
+    shutdown.cancel();
+    let drain = async {
+        while let Some(res) = joinset.join_next().await {
+            tally_join_result(res, &mut errors, &mut panics);
+        }
+    };
+    match tokio::time::timeout(drain_timeout, drain).await {
+        Ok(()) => SupervisorOutcome { errors, panics, timed_out: false },
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = drain_timeout.as_millis() as u64,
+                "run_fifo_until_timeout: drain timed out; aborting surviving shards"
+            );
+            joinset.abort_all();
+            while let Some(res) = joinset.join_next().await {
+                tally_join_result(res, &mut errors, &mut panics);
+            }
+            SupervisorOutcome { errors, panics, timed_out: true }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ConsumerSupervisor<B, Ctx>
 // ---------------------------------------------------------------------------
