@@ -68,6 +68,18 @@ impl ShutdownTally {
 // Shared drain helper
 // ---------------------------------------------------------------------------
 
+/// RAII guard that calls `AbortHandle::abort` on drop. Used to ensure that
+/// when a wrapper task around a FIFO shard `JoinHandle` is itself aborted
+/// (e.g. by `JoinSet::abort_all`), the inner shard task is aborted too —
+/// not merely detached, which is what dropping a bare `JoinHandle` does.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Map a `JoinSet::join_next` result onto running `errors` / `panics`
 /// counters. Shared by `ConsumerSupervisor::run_until_timeout` and each
 /// backend's `run_fifo_until_timeout`.
@@ -103,11 +115,19 @@ pub(crate) fn tally_join_result(
 /// abort-cancellation to `Ok(())` and re-panics on real panics, so the
 /// outer drain can use [`tally_join_result`] uniformly.
 ///
-/// - Races `signal` against shards finishing on their own.
+/// - Races `signal` against shards finishing on their own. `biased` puts
+///   `signal` first so a shutdown trigger that's already ready wins ties
+///   with a shard that has just completed — `shards_done` then runs as the
+///   post-cancel drain instead.
 /// - On signal, cancels `shutdown` and waits up to `drain_timeout` for
 ///   shards to finish.
 /// - On timeout, calls `JoinSet::abort_all` and sets
-///   [`SupervisorOutcome::timed_out`] = `true`.
+///   [`SupervisorOutcome::timed_out`] = `true`. The wrapper holds an
+///   [`AbortOnDrop`] guard around the inner shard `JoinHandle`, so aborting
+///   the wrapper task aborts the inner shard task too — without it,
+///   `JoinHandle::drop` would just *detach* the inner task, leaking it.
+/// - `drain_timeout = Duration::ZERO` means "abort immediately after
+///   `signal` fires" (no grace period); this is honored verbatim.
 pub(crate) async fn drive_fifo_until_timeout<S>(
     handles: Vec<tokio::task::JoinHandle<Result<()>>>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -119,7 +139,13 @@ where
 {
     let mut joinset: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
     for handle in handles {
+        let abort_guard = AbortOnDrop(handle.abort_handle());
         joinset.spawn(async move {
+            // Bind the guard to the wrapper task's stack so it drops with
+            // the wrapper future — including when the wrapper is itself
+            // aborted by `JoinSet::abort_all`. Calling `abort()` on an
+            // already-finished inner task is a no-op.
+            let _abort_guard = abort_guard;
             match handle.await {
                 Ok(r) => r,
                 Err(e) if e.is_cancelled() => Ok(()),
@@ -255,7 +281,13 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
             .spawn_fifo_shards::<T, H>(handler, ctx, inner)
             .await?;
         for handle in handles {
+            // Hold an AbortOnDrop guard on the inner shard handle so that
+            // when the supervisor's JoinSet aborts this wrapper (e.g. on
+            // drain timeout escalation in `run_until_timeout`), the inner
+            // shard task is aborted instead of detached.
+            let abort_guard = AbortOnDrop(handle.abort_handle());
             self.tasks.spawn(async move {
+                let _abort_guard = abort_guard;
                 match handle.await {
                     Ok(r) => r,
                     Err(e) if e.is_cancelled() => Ok(()),

@@ -1376,3 +1376,72 @@ async fn run_fifo_until_timeout_returns_clean_when_shards_finish_first() {
 
     assert_eq!(outcome, SupervisorOutcome::default());
 }
+
+/// Regression test for the abort-leak: when `run_fifo_until_timeout`
+/// returns, the underlying shard task must not keep invoking handlers.
+///
+/// Without the `AbortOnDrop` guard on the inner shard `JoinHandle`,
+/// dropping the wrapper task on drain-timeout would merely *detach* the
+/// shard, leaving it free to pull more messages and invoke more handlers
+/// after the function returns. With the guard, aborting the wrapper
+/// aborts the shard, so the invocation count freezes at the point of
+/// return.
+///
+/// On InMemory, the shard cooperatively exits on shutdown so the drain
+/// timeout escalation rarely fires; this test still validates the
+/// invariant by checking the invocation count is stable across a
+/// post-return wait. On backends where in-flight handlers don't abort on
+/// shutdown (RabbitMQ, Kafka, NATS), the same invariant catches actual
+/// detached-shard leaks.
+#[tokio::test]
+async fn run_fifo_until_timeout_does_not_invoke_handlers_after_return() {
+    use std::sync::atomic::AtomicU32;
+
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<LedgerSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for seq in 0..5u64 {
+        publisher
+            .publish::<LedgerSkipTopic>(&Event { account: "A".into(), seq })
+            .await
+            .unwrap();
+    }
+
+    #[derive(Clone)]
+    struct CountingSlowHandler(Arc<AtomicU32>);
+    impl MessageHandler<LedgerSkipTopic> for CountingSlowHandler {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            // Long enough that drain budget MUST elapse first on backends
+            // where in-flight handlers ignore shutdown.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Outcome::Ack
+        }
+    }
+
+    let invoked = Arc::new(AtomicU32::new(0));
+    let handler = CountingSlowHandler(invoked.clone());
+
+    let consumer = InMemoryConsumer::new(client.clone());
+    let signal = tokio::time::sleep(Duration::from_millis(150));
+    let opts = ConsumerOptions::<InMemory>::new().with_prefetch_count(1);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<LedgerSkipTopic, _, _>(
+            handler, (), opts, signal, Duration::from_millis(100),
+        )
+        .await;
+
+    let invocations_at_return = invoked.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let invocations_after_wait = invoked.load(Ordering::Relaxed);
+
+    assert_eq!(
+        invocations_at_return, invocations_after_wait,
+        "shard task kept invoking handlers after return ({} → {}, outcome: {outcome:?})",
+        invocations_at_return, invocations_after_wait
+    );
+}
