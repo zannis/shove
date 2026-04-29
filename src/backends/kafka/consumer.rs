@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -403,22 +404,58 @@ async fn route_outcome(
 // Handler invocation
 // ---------------------------------------------------------------------------
 
-async fn invoke_handler<T: Topic, H: MessageHandler<T> + ?Sized>(
-    handler: &H,
-    ctx: &H::Context,
-    message: T::Message,
-    metadata: MessageMetadata,
+/// Invoke the handler future with an optional timeout, emitting inflight /
+/// consumed / duration metrics. Returns `Outcome::Retry` on timeout.
+async fn invoke_handler(
+    fut: impl std::future::Future<Output = Outcome>,
     timeout: Option<Duration>,
+    topic: &str,
+    group: Option<&str>,
 ) -> Outcome {
-    match timeout {
-        Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
+    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
+    let start = std::time::Instant::now();
+    let outcome = match timeout {
+        Some(duration) => tokio::time::timeout(duration, fut)
             .await
             .unwrap_or_else(|_| {
                 tracing::warn!("handler timed out after {duration:?}, retrying");
+                crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Timeout);
                 Outcome::Retry
             }),
-        None => handler.handle(message, metadata, ctx).await,
-    }
+        None => fut.await,
+    };
+    let elapsed = start.elapsed().as_secs_f64();
+    crate::metrics::record_consumed(topic, group, &outcome);
+    crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    outcome
+}
+
+/// Spawns a handler task and returns a oneshot receiver for the outcome.
+fn spawn_handler<T, H>(
+    handler: Arc<H>,
+    ctx: Arc<H::Context>,
+    message: T::Message,
+    metadata: MessageMetadata,
+    timeout: Option<Duration>,
+    topic: Arc<str>,
+    group: Option<Arc<str>>,
+) -> tokio::sync::oneshot::Receiver<Outcome>
+where
+    T: Topic,
+    H: MessageHandler<T>,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let outcome = invoke_handler(
+            async move { handler.handle(message, metadata, ctx.as_ref()).await },
+            timeout,
+            &topic,
+            group.as_deref(),
+        )
+        .await;
+        let _ = tx.send(outcome);
+    });
+    rx
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +626,8 @@ impl KafkaConsumer {
         );
 
         let semaphore = Arc::new(Semaphore::new(prefetch_count as usize));
+        let topic: Arc<str> = Arc::from(queue);
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
             let handler = handler.clone();
@@ -598,6 +637,8 @@ impl KafkaConsumer {
             let shutdown = shutdown.clone();
             let group_id = group_id.clone();
             let semaphore = semaphore.clone();
+            let topic = topic.clone();
+            let group = group.clone();
             async move {
                 let consumer = create_stream_consumer(client.base_config(), &group_id)?;
                 consumer
@@ -663,12 +704,19 @@ impl KafkaConsumer {
                                 tracker.lock().await.track_received(partition, offset);
                             }
 
+                            crate::metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+
                             // Reject oversized messages before deserialization
                             if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
                                     "rejecting oversized message to DLQ"
+                                );
+                                crate::metrics::record_failed(
+                                    &topic,
+                                    group.as_deref(),
+                                    crate::metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
@@ -696,6 +744,11 @@ impl KafkaConsumer {
                                         queue,
                                         "failed to deserialize message, sending to DLQ"
                                     );
+                                    crate::metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        crate::metrics::FailReason::Deserialize,
+                                    );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
@@ -721,33 +774,28 @@ impl KafkaConsumer {
                                 ShoveError::Connection("semaphore closed".to_string())
                             })?;
 
-                            let task_handler = handler.clone();
-                            let task_ctx = ctx.clone();
                             let task_client = client.clone();
                             let task_processing = processing.clone();
                             let task_semaphore = semaphore.clone();
                             let task_prefetch = prefetch_count;
                             let task_tx = completion_tx.clone();
-                            let task_topic = queue_owned.clone();
+                            let task_topic = topic.clone();
 
-                            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
-                            tokio::spawn(async move {
-                                let outcome = invoke_handler(
-                                    task_handler.as_ref(),
-                                    task_ctx.as_ref(),
-                                    payload,
-                                    metadata,
-                                    handler_timeout,
-                                )
-                                .await;
-                                let _ = outcome_tx.send(outcome);
-                            });
+                            let outcome_rx = spawn_handler::<T, H>(
+                                handler.clone(),
+                                ctx.clone(),
+                                payload,
+                                metadata,
+                                handler_timeout,
+                                topic.clone(),
+                                group.clone(),
+                            );
 
                             tokio::spawn(async move {
                                 task_processing.store(true, Ordering::Release);
 
                                 let outcome = outcome_rx.await.unwrap_or_else(|_| {
-                                    tracing::warn!(queue = task_topic.as_str(), "handler task panicked, retrying message");
+                                    tracing::warn!(queue = task_topic.as_ref(), "handler task panicked, retrying message");
                                     Outcome::Retry
                                 });
 
@@ -825,6 +873,8 @@ impl KafkaConsumer {
         // processing one message at a time guarantees FIFO per key (all
         // messages for the same key land in the same partition).
         let group_id = format!("{queue}-fifo");
+        let topic: Arc<str> = Arc::from(queue);
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         tracing::info!(queue, group_id, max_retries, "Kafka FIFO consumer started");
 
@@ -835,6 +885,8 @@ impl KafkaConsumer {
             let shutdown = shutdown.clone();
             let processing = processing.clone();
             let group_id = group_id.clone();
+            let topic = topic.clone();
+            let group = group.clone();
             async move {
                 let consumer = create_stream_consumer(client.base_config(), &group_id)?;
                 consumer
@@ -865,12 +917,19 @@ impl KafkaConsumer {
                             let headers = extract_string_headers(&msg);
                             let key = msg.key().map(|k| k.to_vec());
 
+                            crate::metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+
                             // Reject oversized messages before deserialization
                             if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
                                     "rejecting oversized FIFO message to DLQ"
+                                );
+                                crate::metrics::record_failed(
+                                    &topic,
+                                    group.as_deref(),
+                                    crate::metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
@@ -898,6 +957,11 @@ impl KafkaConsumer {
                                         queue,
                                         "failed to deserialize FIFO message, sending to DLQ"
                                     );
+                                    crate::metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        crate::metrics::FailReason::Deserialize,
+                                    );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
@@ -921,19 +985,20 @@ impl KafkaConsumer {
 
                             processing.store(true, Ordering::Release);
 
-                            let outcome = {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                let h = handler.clone();
-                                let c = ctx.clone();
-                                tokio::spawn(async move {
-                                    let o = invoke_handler(h.as_ref(), c.as_ref(), payload, metadata, handler_timeout).await;
-                                    let _ = tx.send(o);
-                                });
-                                rx.await.unwrap_or_else(|_| {
-                                    tracing::warn!(queue, "handler task panicked, retrying message");
-                                    Outcome::Retry
-                                })
-                            };
+                            let outcome = spawn_handler::<T, H>(
+                                handler.clone(),
+                                ctx.clone(),
+                                payload,
+                                metadata,
+                                handler_timeout,
+                                topic.clone(),
+                                group.clone(),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                tracing::warn!(queue, "handler task panicked, retrying message");
+                                Outcome::Retry
+                            });
                             let outcome = adjust_outcome_for_fifo(outcome);
 
                             route_outcome(
