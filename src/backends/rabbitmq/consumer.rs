@@ -24,12 +24,12 @@ use crate::backends::rabbitmq::router;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
 use crate::{QueueTopology, RabbitMq};
-use crate::metrics;
 
 use super::map_lapin_error;
 
@@ -1437,8 +1437,7 @@ mod tests {
     #[tokio::test]
     async fn invoke_handler_returns_outcome_within_timeout() {
         let timeout = Some(Duration::from_secs(1));
-        let outcome =
-            invoke_handler(async { Outcome::Reject }, timeout, "test-topic", None).await;
+        let outcome = invoke_handler(async { Outcome::Reject }, timeout, "test-topic", None).await;
         assert!(matches!(outcome, Outcome::Reject));
     }
 

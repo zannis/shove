@@ -16,10 +16,10 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
+use crate::metrics;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
-use crate::metrics;
 
 const DELIVERY_MODE_PERSISTENT: u8 = 2;
 const DEFAULT_CHANNEL_POOL_SIZE: usize = 4;

@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::SHUTDOWN_GRACE;
 use crate::backends::rabbitmq::map_lapin_error;
 use crate::error::{Result, ShoveError};
-use crate::retry::Backoff;
 use crate::metrics;
+use crate::retry::Backoff;
 
 /// RabbitMQ connection configuration.
 #[derive(Clone)]

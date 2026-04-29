@@ -15,8 +15,8 @@ use crate::consumer::{
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
-use crate::topic::Topic;
 use crate::metrics;
+use crate::topic::Topic;
 
 use super::client::InMemoryBroker;
 use super::consumer::InMemoryConsumer;

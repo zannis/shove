@@ -9,8 +9,8 @@ use crate::backends::sns::consumer_group::{SqsConsumerGroup, SqsConsumerGroupCon
 use crate::backends::sns::topology::SnsTopologyDeclarer;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
-use crate::topic::Topic;
 use crate::metrics;
+use crate::topic::Topic;
 
 /// Registry of all [`SqsConsumerGroup`]s.
 ///

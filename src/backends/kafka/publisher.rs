@@ -7,11 +7,11 @@ use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
 use crate::error::Result;
+use crate::metrics;
 use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
-use crate::metrics;
 
 use super::client::KafkaClient;
 use super::constants::{MESSAGE_ID_HEADER, RETRY_COUNT_HEADER};

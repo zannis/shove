@@ -40,9 +40,9 @@ pub fn set_prefix(prefix: impl Into<String>) {
          the name cache; call set_prefix at startup before any broker/publisher work",
     );
     let leaked: &'static str = Box::leak(prefix.into().into_boxed_str());
-    PREFIX.set(leaked).expect(
-        "shove::metrics::set_prefix called twice; the prefix is set-once at startup",
-    );
+    PREFIX
+        .set(leaked)
+        .expect("shove::metrics::set_prefix called twice; the prefix is set-once at startup");
 }
 
 fn prefix() -> &'static str {
@@ -73,9 +73,7 @@ pub(crate) fn names() -> &'static MetricNames {
             message_processing_duration_seconds: leak(format!(
                 "{p}_message_processing_duration_seconds"
             )),
-            message_publish_duration_seconds: leak(format!(
-                "{p}_message_publish_duration_seconds"
-            )),
+            message_publish_duration_seconds: leak(format!("{p}_message_publish_duration_seconds")),
             message_size_bytes: leak(format!("{p}_message_size_bytes")),
             messages_inflight: leak(format!("{p}_messages_inflight")),
             autoscaler_decisions_total: leak(format!("{p}_autoscaler_decisions_total")),
@@ -323,10 +321,7 @@ impl InflightGuard {
 
     /// Convenience constructor for borrowed inputs.
     pub(crate) fn from_refs(topic: &str, group: Option<&str>) -> Self {
-        Self::new(
-            std::sync::Arc::from(topic),
-            group.map(std::sync::Arc::from),
-        )
+        Self::new(std::sync::Arc::from(topic), group.map(std::sync::Arc::from))
     }
 
     pub(crate) fn topic(&self) -> &str {

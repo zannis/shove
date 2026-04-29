@@ -20,7 +20,11 @@ struct Ping {
     value: u32,
 }
 
-define_topic!(PingTopic, Ping, TopologyBuilder::new("ping_metrics").build());
+define_topic!(
+    PingTopic,
+    Ping,
+    TopologyBuilder::new("ping_metrics").build()
+);
 
 #[derive(Clone)]
 struct AckHandler;
@@ -98,8 +102,14 @@ async fn inmemory_roundtrip_emits_full_metric_set() {
         .map(|l| (l.key().to_string(), l.value().to_string()))
         .collect();
     assert!(labels.iter().any(|(k, v)| k == "outcome" && v == "ack"));
-    assert!(labels.iter().any(|(k, v)| k == "topic" && v == "ping_metrics"));
-    assert!(labels
-        .iter()
-        .any(|(k, v)| k == "consumer_group" && v == "default"));
+    assert!(
+        labels
+            .iter()
+            .any(|(k, v)| k == "topic" && v == "ping_metrics")
+    );
+    assert!(
+        labels
+            .iter()
+            .any(|(k, v)| k == "consumer_group" && v == "default")
+    );
 }

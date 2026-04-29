@@ -17,12 +17,12 @@ use crate::backends::sns::topology::QueueRegistry;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
-use crate::metrics;
 
 /// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
 ///
@@ -456,11 +456,7 @@ where
             // Reject oversized messages before deserialization
             if let Err(e) = options.validate_payload_message_size(body.len()) {
                 warn!(error = %e, queue_url, "rejecting oversized message");
-                metrics::record_failed(
-                    &topic,
-                    group.as_deref(),
-                    metrics::FailReason::Oversize,
-                );
+                metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
             }
@@ -1313,11 +1309,7 @@ async fn drain_pending_for_key<T, H>(
                 sequence_key = %key,
                 "rejecting oversized buffered message"
             );
-            metrics::record_failed(
-                topic,
-                group.as_deref(),
-                metrics::FailReason::Oversize,
-            );
+            metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Oversize);
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
                 while let Some(pd) = pending.pop_front() {
@@ -1340,11 +1332,7 @@ async fn drain_pending_for_key<T, H>(
                     sequence_key = %key,
                     "failed to deserialize buffered SQS message, rejecting"
                 );
-                metrics::record_failed(
-                    topic,
-                    group.as_deref(),
-                    metrics::FailReason::Deserialize,
-                );
+                metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Deserialize);
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
                     while let Some(pd) = pending.pop_front() {

@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
 use crate::error::Result;
-use crate::retry::Backoff;
 use crate::metrics;
+use crate::retry::Backoff;
 
 /// TLS material for Kafka connections. Client cert/key are only needed for mTLS.
 ///

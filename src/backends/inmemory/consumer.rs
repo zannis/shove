@@ -17,11 +17,11 @@ use crate::consumer::validate_message_size;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
-use crate::metrics;
 
 /// Consumes messages from an [`InMemoryBroker`] queue.
 #[derive(Clone)]
@@ -772,11 +772,7 @@ where
                 Ok(o) => o,
                 Err(_) => {
                     tracing::warn!(timeout = ?timeout_dur, "handler timed out — retrying");
-                    metrics::record_failed(
-                        topic,
-                        group,
-                        metrics::FailReason::Timeout,
-                    );
+                    metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                     Outcome::Retry
                 }
             }
@@ -807,10 +803,8 @@ where
 
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let outcome = run_handler::<T, H>(
-        handler, ctx, message, metadata, timeout_opt, topic, group,
-    )
-    .await;
+    let outcome =
+        run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt, topic, group).await;
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
     metrics::record_processing_duration(topic, group, &outcome, elapsed);
@@ -879,12 +873,7 @@ where
     let elapsed = start.elapsed().as_secs_f64();
     if let Some(ref o) = outcome_opt {
         metrics::record_consumed(&topic_owned, group_owned.as_deref(), o);
-        metrics::record_processing_duration(
-            &topic_owned,
-            group_owned.as_deref(),
-            o,
-            elapsed,
-        );
+        metrics::record_processing_duration(&topic_owned, group_owned.as_deref(), o, elapsed);
     }
     outcome_opt
 }
