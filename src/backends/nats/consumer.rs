@@ -24,6 +24,7 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
+use crate::metrics;
 use std::future::Future;
 
 use super::client::NatsClient;
@@ -302,21 +303,21 @@ async fn invoke_handler(
     topic: &str,
     group: Option<&str>,
 ) -> Outcome {
-    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = match timeout {
         Some(duration) => tokio::time::timeout(duration, fut)
             .await
             .unwrap_or_else(|_| {
                 tracing::warn!("handler timed out after {duration:?}, retrying");
-                crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Timeout);
+                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
             }),
         None => fut.await,
     };
     let elapsed = start.elapsed().as_secs_f64();
-    crate::metrics::record_consumed(topic, group, &outcome);
-    crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
     outcome
 }
 
@@ -513,9 +514,9 @@ impl NatsConsumer {
                                 Some(Ok(msg)) => msg,
                                 Some(Err(e)) => {
                                     tracing::error!(error = %e, queue, "consumer stream error");
-                                    crate::metrics::record_backend_error(
-                                        crate::metrics::BackendLabel::Nats,
-                                        crate::metrics::BackendErrorKind::Consume,
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
                                     );
                                     return Err(ShoveError::Connection(
                                         format!("consumer stream error on {queue}: {e}"),
@@ -523,9 +524,9 @@ impl NatsConsumer {
                                 }
                                 None => {
                                     tracing::warn!(queue, "consumer stream closed");
-                                    crate::metrics::record_backend_error(
-                                        crate::metrics::BackendLabel::Nats,
-                                        crate::metrics::BackendErrorKind::Consume,
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
                                     );
                                     return Err(ShoveError::Connection(
                                         format!("consumer stream closed for {queue}"),
@@ -533,7 +534,7 @@ impl NatsConsumer {
                                 }
                             };
 
-                            crate::metrics::record_message_size(
+                            metrics::record_message_size(
                                 &topic,
                                 group.as_deref(),
                                 msg.payload.len(),
@@ -546,10 +547,10 @@ impl NatsConsumer {
                                     queue,
                                     "rejecting oversized message to DLQ"
                                 );
-                                crate::metrics::record_failed(
+                                metrics::record_failed(
                                     &topic,
                                     group.as_deref(),
-                                    crate::metrics::FailReason::Oversize,
+                                    metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
@@ -577,10 +578,10 @@ impl NatsConsumer {
                                         queue,
                                         "failed to deserialize message, sending to DLQ"
                                     );
-                                    crate::metrics::record_failed(
+                                    metrics::record_failed(
                                         &topic,
                                         group.as_deref(),
-                                        crate::metrics::FailReason::Deserialize,
+                                        metrics::FailReason::Deserialize,
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
@@ -785,7 +786,7 @@ impl NatsConsumer {
                                 }
                             };
 
-                            crate::metrics::record_message_size(
+                            metrics::record_message_size(
                                 &shard_topic,
                                 shard_group.as_deref(),
                                 msg.payload.len(),
@@ -798,10 +799,10 @@ impl NatsConsumer {
                                     shard,
                                     "rejecting oversized message to DLQ"
                                 );
-                                crate::metrics::record_failed(
+                                metrics::record_failed(
                                     &shard_topic,
                                     shard_group.as_deref(),
-                                    crate::metrics::FailReason::Oversize,
+                                    metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &shard_client,
@@ -829,10 +830,10 @@ impl NatsConsumer {
                                         shard,
                                         "failed to deserialize message, sending to DLQ"
                                     );
-                                    crate::metrics::record_failed(
+                                    metrics::record_failed(
                                         &shard_topic,
                                         shard_group.as_deref(),
-                                        crate::metrics::FailReason::Deserialize,
+                                        metrics::FailReason::Deserialize,
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &shard_client,
@@ -971,9 +972,9 @@ impl NatsConsumer {
                                 Some(Ok(msg)) => msg,
                                 Some(Err(e)) => {
                                     tracing::error!(error = %e, dlq, "DLQ consumer stream error");
-                                    crate::metrics::record_backend_error(
-                                        crate::metrics::BackendLabel::Nats,
-                                        crate::metrics::BackendErrorKind::Consume,
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
                                     );
                                     return Err(ShoveError::Connection(
                                         format!("DLQ consumer stream error on {dlq}: {e}"),
@@ -981,9 +982,9 @@ impl NatsConsumer {
                                 }
                                 None => {
                                     tracing::warn!(dlq, "DLQ consumer stream closed");
-                                    crate::metrics::record_backend_error(
-                                        crate::metrics::BackendLabel::Nats,
-                                        crate::metrics::BackendErrorKind::Consume,
+                                    metrics::record_backend_error(
+                                        metrics::BackendLabel::Nats,
+                                        metrics::BackendErrorKind::Consume,
                                     );
                                     return Err(ShoveError::Connection(
                                         format!("DLQ consumer stream closed for {dlq}"),

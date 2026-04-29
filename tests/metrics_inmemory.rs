@@ -4,6 +4,7 @@
 //! binary so it does not race with any other test that emits metrics.
 
 #![cfg(all(feature = "inmemory", feature = "metrics"))]
+#![allow(clippy::mutable_key_type)] // metrics-util's CompositeKey has interior mutability
 
 use std::time::Duration;
 

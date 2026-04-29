@@ -22,6 +22,7 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
+use crate::metrics;
 
 /// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
 ///
@@ -177,26 +178,27 @@ async fn invoke_handler<T: Topic, H: MessageHandler<T>>(
     topic: &str,
     group: Option<&str>,
 ) -> Outcome {
-    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = match timeout {
         Some(duration) => tokio::time::timeout(duration, handler.handle(message, metadata, ctx))
             .await
             .unwrap_or_else(|_| {
                 warn!("handler exceeded timeout ({duration:?}), retrying message");
-                crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Timeout);
+                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
             }),
         None => handler.handle(message, metadata, ctx).await,
     };
     let elapsed = start.elapsed().as_secs_f64();
-    crate::metrics::record_consumed(topic, group, &outcome);
-    crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
     outcome
 }
 
 /// Spawns a handler task for a deserialized message.
 /// Returns the oneshot receiver that will resolve with the handler's outcome.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -449,15 +451,15 @@ where
 
             let body = extract_payload(msg.body().unwrap_or_default());
 
-            crate::metrics::record_message_size(&topic, group.as_deref(), body.len());
+            metrics::record_message_size(&topic, group.as_deref(), body.len());
 
             // Reject oversized messages before deserialization
             if let Err(e) = options.validate_payload_message_size(body.len()) {
                 warn!(error = %e, queue_url, "rejecting oversized message");
-                crate::metrics::record_failed(
+                metrics::record_failed(
                     &topic,
                     group.as_deref(),
-                    crate::metrics::FailReason::Oversize,
+                    metrics::FailReason::Oversize,
                 );
                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
@@ -467,10 +469,10 @@ where
                 Ok(m) => m,
                 Err(err) => {
                     error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting");
-                    crate::metrics::record_failed(
+                    metrics::record_failed(
                         &topic,
                         group.as_deref(),
-                        crate::metrics::FailReason::Deserialize,
+                        metrics::FailReason::Deserialize,
                     );
                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     continue;
@@ -652,6 +654,7 @@ fn extract_sequence_key(msg: &Message) -> Option<String> {
 
 /// Spawns a handler task for a sequenced message, signalling completion via an
 /// mpsc channel with the sequence key.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler_keyed<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -1076,10 +1079,10 @@ where
                                         limit,
                                         "per-key pending buffer full, rejecting"
                                     );
-                                    crate::metrics::record_failed(
+                                    metrics::record_failed(
                                         &topic,
                                         group.as_deref(),
-                                        crate::metrics::FailReason::PendingFull,
+                                        metrics::FailReason::PendingFull,
                                     );
                                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                     continue;
@@ -1120,10 +1123,10 @@ where
                                             limit,
                                             "per-key pending buffer full, rejecting"
                                         );
-                                        crate::metrics::record_failed(
+                                        metrics::record_failed(
                                             &topic,
                                             group.as_deref(),
-                                            crate::metrics::FailReason::PendingFull,
+                                            metrics::FailReason::PendingFull,
                                         );
                                         router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                                         continue;
@@ -1147,7 +1150,7 @@ where
                     // ── Spawn handler for this key ──
                     let body = extract_payload(msg.body().unwrap_or_default());
 
-                    crate::metrics::record_message_size(&topic, group.as_deref(), body.len());
+                    metrics::record_message_size(&topic, group.as_deref(), body.len());
 
                     // Reject oversized messages before deserialization
                     if let Err(e) = options.validate_payload_message_size(body.len()) {
@@ -1157,10 +1160,10 @@ where
                             sequence_key = %seq_key,
                             "rejecting oversized message"
                         );
-                        crate::metrics::record_failed(
+                        metrics::record_failed(
                             &topic,
                             group.as_deref(),
-                            crate::metrics::FailReason::Oversize,
+                            metrics::FailReason::Oversize,
                         );
                         if on_failure == SequenceFailure::FailAll {
                             poisoned_keys.insert(seq_key.clone());
@@ -1178,10 +1181,10 @@ where
                                 sequence_key = %seq_key,
                                 "failed to deserialize SQS message, rejecting"
                             );
-                            crate::metrics::record_failed(
+                            metrics::record_failed(
                                 &topic,
                                 group.as_deref(),
-                                crate::metrics::FailReason::Deserialize,
+                                metrics::FailReason::Deserialize,
                             );
                             if on_failure == SequenceFailure::FailAll {
                                 poisoned_keys.insert(seq_key.clone());
@@ -1300,7 +1303,7 @@ async fn drain_pending_for_key<T, H>(
 
         let body = extract_payload(msg.body().unwrap_or_default());
 
-        crate::metrics::record_message_size(topic, group.as_deref(), body.len());
+        metrics::record_message_size(topic, group.as_deref(), body.len());
 
         // Reject oversized messages before deserialization
         if let Err(e) = options.validate_payload_message_size(body.len()) {
@@ -1310,10 +1313,10 @@ async fn drain_pending_for_key<T, H>(
                 sequence_key = %key,
                 "rejecting oversized buffered message"
             );
-            crate::metrics::record_failed(
+            metrics::record_failed(
                 topic,
                 group.as_deref(),
-                crate::metrics::FailReason::Oversize,
+                metrics::FailReason::Oversize,
             );
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
@@ -1337,10 +1340,10 @@ async fn drain_pending_for_key<T, H>(
                     sequence_key = %key,
                     "failed to deserialize buffered SQS message, rejecting"
                 );
-                crate::metrics::record_failed(
+                metrics::record_failed(
                     topic,
                     group.as_deref(),
-                    crate::metrics::FailReason::Deserialize,
+                    metrics::FailReason::Deserialize,
                 );
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());

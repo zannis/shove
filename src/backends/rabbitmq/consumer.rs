@@ -29,6 +29,7 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
 use crate::{QueueTopology, RabbitMq};
+use crate::metrics;
 
 use super::map_lapin_error;
 
@@ -81,9 +82,9 @@ fn unwrap_delivery(
     match item {
         Some(Ok(d)) => Ok(d),
         Some(Err(e)) => {
-            crate::metrics::record_backend_error(
-                crate::metrics::BackendLabel::RabbitMq,
-                crate::metrics::BackendErrorKind::Consume,
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Consume,
             );
             Err(map_lapin_error(
                 &format!("consumer stream error on {queue}"),
@@ -91,9 +92,9 @@ fn unwrap_delivery(
             ))
         }
         None => {
-            crate::metrics::record_backend_error(
-                crate::metrics::BackendLabel::RabbitMq,
-                crate::metrics::BackendErrorKind::Consume,
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Consume,
             );
             Err(ShoveError::Connection(format!(
                 "consumer stream closed for {queue}"
@@ -564,10 +565,10 @@ impl RabbitMqConsumer {
                                         limit,
                                         "per-key pending buffer full, rejecting to DLQ"
                                     );
-                                    crate::metrics::record_failed(
+                                    metrics::record_failed(
                                         &topic,
                                         group.as_deref(),
-                                        crate::metrics::FailReason::PendingFull,
+                                        metrics::FailReason::PendingFull,
                                     );
                                     router::route_reject(&delivery, topology, &publisher).await;
                                     continue;
@@ -610,10 +611,10 @@ impl RabbitMqConsumer {
                                             limit,
                                             "per-key pending buffer full, rejecting to DLQ"
                                         );
-                                        crate::metrics::record_failed(
+                                        metrics::record_failed(
                                             &topic,
                                             group.as_deref(),
-                                            crate::metrics::FailReason::PendingFull,
+                                            metrics::FailReason::PendingFull,
                                         );
                                         router::route_reject(&delivery, topology, &publisher).await;
                                         continue;
@@ -1158,26 +1159,27 @@ async fn invoke_handler(
     topic: &str,
     group: Option<&str>,
 ) -> Outcome {
-    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = match timeout {
         Some(duration) => tokio::time::timeout(duration, fut)
             .await
             .unwrap_or_else(|_elapsed| {
                 warn!("handler exceeded timeout ({duration:?}), retrying message");
-                crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Timeout);
+                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
             }),
         None => fut.await,
     };
     let elapsed = start.elapsed().as_secs_f64();
-    crate::metrics::record_consumed(topic, group, &outcome);
-    crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
     outcome
 }
 
 /// Spawns a handler task for a deserialized message.
 /// Returns the oneshot receiver that will resolve with the handler's outcome.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -1213,6 +1215,7 @@ where
 /// Spawns a handler task for a sequenced message, signalling completion via an
 /// mpsc channel with the sequence key. This avoids O(N) polling of all in-flight
 /// keys to find which one completed.
+#[allow(clippy::too_many_arguments)]
 fn spawn_handler_keyed<T, H>(
     handler: &Arc<H>,
     ctx: &Arc<H::Context>,
@@ -1249,6 +1252,7 @@ where
 /// Attempts to deserialize a delivery's payload. On failure, logs the error
 /// and rejects the delivery (nack without requeue).
 /// Returns `Some(message)` on success, `None` if rejected.
+#[allow(clippy::too_many_arguments)]
 async fn try_deserialize_or_reject<T: Topic>(
     delivery: &Delivery,
     metadata: &MessageMetadata,
@@ -1262,7 +1266,7 @@ async fn try_deserialize_or_reject<T: Topic>(
 where
     T::Message: for<'de> serde::Deserialize<'de>,
 {
-    crate::metrics::record_message_size(topic, group, delivery.data.len());
+    metrics::record_message_size(topic, group, delivery.data.len());
 
     if let Err(e) = options.validate_payload_message_size(delivery.data.len()) {
         warn!(
@@ -1271,7 +1275,7 @@ where
             queue,
             "rejecting oversized message"
         );
-        crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Oversize);
+        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
         router::route_reject(delivery, topology, publisher).await;
         return None;
     }
@@ -1284,7 +1288,7 @@ where
                 queue = %queue,
                 "failed to deserialize message"
             );
-            crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Deserialize);
+            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
             router::route_reject(delivery, topology, publisher).await;
             None
         }

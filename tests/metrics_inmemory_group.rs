@@ -6,6 +6,7 @@
 //! conflicting with the other test's global recorder slot.
 
 #![cfg(all(feature = "inmemory", feature = "metrics"))]
+#![allow(clippy::mutable_key_type)] // metrics-util's CompositeKey has interior mutability
 
 use std::time::Duration;
 

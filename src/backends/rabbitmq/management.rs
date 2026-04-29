@@ -4,6 +4,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::error::{Result, ShoveError};
+use crate::metrics;
 
 #[derive(Clone)]
 pub struct ManagementConfig {
@@ -103,9 +104,9 @@ impl QueueStatsProvider for ManagementClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            crate::metrics::record_backend_error(
-                crate::metrics::BackendLabel::RabbitMq,
-                crate::metrics::BackendErrorKind::Topology,
+            metrics::record_backend_error(
+                metrics::BackendLabel::RabbitMq,
+                metrics::BackendErrorKind::Topology,
             );
             return Err(ShoveError::Connection(format!(
                 "management API returned non-success status {status} for queue {queue}"

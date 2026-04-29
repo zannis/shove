@@ -340,6 +340,7 @@ impl ConsumerOptions<RabbitMq> {
 }
 
 #[cfg(test)]
+#[allow(clippy::absolute_paths)]
 mod tests {
     use super::*;
 

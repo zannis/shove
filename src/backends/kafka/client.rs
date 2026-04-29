@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ShoveError;
 use crate::error::Result;
 use crate::retry::Backoff;
+use crate::metrics;
 
 /// TLS material for Kafka connections. Client cert/key are only needed for mTLS.
 ///
@@ -340,9 +341,9 @@ impl KafkaClient {
                         tracing::debug!(topic, "topic already exists, checking partition count");
                         self.ensure_partitions(&admin, name, num_partitions).await?;
                     } else {
-                        crate::metrics::record_backend_error(
-                            crate::metrics::BackendLabel::Kafka,
-                            crate::metrics::BackendErrorKind::Topology,
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Kafka,
+                            metrics::BackendErrorKind::Topology,
                         );
                         return Err(ShoveError::Topology(format!(
                             "failed to create topic {topic}: {code:?}"
@@ -412,9 +413,9 @@ impl KafkaClient {
 
         for result in results {
             if let Err((topic, code)) = result {
-                crate::metrics::record_backend_error(
-                    crate::metrics::BackendLabel::Kafka,
-                    crate::metrics::BackendErrorKind::Topology,
+                metrics::record_backend_error(
+                    metrics::BackendLabel::Kafka,
+                    metrics::BackendErrorKind::Topology,
                 );
                 return Err(ShoveError::Topology(format!(
                     "failed to expand partitions for {topic}: {code:?}"

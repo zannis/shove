@@ -16,6 +16,7 @@ use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::metrics;
 
 use super::client::InMemoryBroker;
 use super::consumer::InMemoryConsumer;
@@ -349,9 +350,9 @@ impl InMemoryConsumerGroupRegistry {
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
-            crate::metrics::record_backend_error(
-                crate::metrics::BackendLabel::InMemory,
-                crate::metrics::BackendErrorKind::Topology,
+            metrics::record_backend_error(
+                metrics::BackendLabel::InMemory,
+                metrics::BackendErrorKind::Topology,
             );
             return Err(ShoveError::Topology(format!(
                 "consumer group '{name}' is already registered"

@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Result, ShoveError};
+use crate::metrics;
 
 use super::constants::DEFAULT_QUEUE_CAPACITY;
 
@@ -157,9 +158,9 @@ impl InMemoryBroker {
             tokio::select! {
                 _ = &mut notified => continue,
                 _ = self.inner.shutdown.cancelled() => {
-                    crate::metrics::record_backend_error(
-                        crate::metrics::BackendLabel::InMemory,
-                        crate::metrics::BackendErrorKind::Connection,
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::InMemory,
+                        metrics::BackendErrorKind::Connection,
                     );
                     return Err(ShoveError::Connection("broker shutdown".into()));
                 }

@@ -17,6 +17,7 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
 use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
+use crate::metrics;
 
 /// Type-erased factory that spawns a single consumer task.
 pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
@@ -351,9 +352,9 @@ impl KafkaConsumerGroupRegistry {
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
-            crate::metrics::record_backend_error(
-                crate::metrics::BackendLabel::Kafka,
-                crate::metrics::BackendErrorKind::Topology,
+            metrics::record_backend_error(
+                metrics::BackendLabel::Kafka,
+                metrics::BackendErrorKind::Topology,
             );
             return Err(ShoveError::Topology(format!(
                 "consumer group '{name}' is already registered"

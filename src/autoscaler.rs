@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::metrics;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -274,7 +275,7 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
                 ScalingDecision::ScaleDown(n) => ("down", Some(*n)),
                 ScalingDecision::Hold => ("hold", None),
             };
-            crate::metrics::record_autoscaler_decision(&group_str, direction);
+            metrics::record_autoscaler_decision(&group_str, direction);
 
             if decision == ScalingDecision::Hold {
                 continue;
@@ -283,7 +284,7 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
             match self.backend.scale(&group, decision).await {
                 Ok(()) => {
                     if let Some(target) = target_workers {
-                        crate::metrics::set_consumer_workers(&group_str, target as i64);
+                        metrics::set_consumer_workers(&group_str, target as i64);
                     }
                 }
                 Err(e) => tracing::error!("failed to scale {group}: {e}"),

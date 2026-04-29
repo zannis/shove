@@ -22,6 +22,7 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
+use crate::metrics;
 
 use super::client::KafkaClient;
 use super::constants::{
@@ -412,21 +413,21 @@ async fn invoke_handler(
     topic: &str,
     group: Option<&str>,
 ) -> Outcome {
-    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = match timeout {
         Some(duration) => tokio::time::timeout(duration, fut)
             .await
             .unwrap_or_else(|_| {
                 tracing::warn!("handler timed out after {duration:?}, retrying");
-                crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Timeout);
+                metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
             }),
         None => fut.await,
     };
     let elapsed = start.elapsed().as_secs_f64();
-    crate::metrics::record_consumed(topic, group, &outcome);
-    crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
     outcome
 }
 
@@ -704,7 +705,7 @@ impl KafkaConsumer {
                                 tracker.lock().await.track_received(partition, offset);
                             }
 
-                            crate::metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+                            metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
 
                             // Reject oversized messages before deserialization
                             if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
@@ -713,10 +714,10 @@ impl KafkaConsumer {
                                     queue,
                                     "rejecting oversized message to DLQ"
                                 );
-                                crate::metrics::record_failed(
+                                metrics::record_failed(
                                     &topic,
                                     group.as_deref(),
-                                    crate::metrics::FailReason::Oversize,
+                                    metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
@@ -744,10 +745,10 @@ impl KafkaConsumer {
                                         queue,
                                         "failed to deserialize message, sending to DLQ"
                                     );
-                                    crate::metrics::record_failed(
+                                    metrics::record_failed(
                                         &topic,
                                         group.as_deref(),
-                                        crate::metrics::FailReason::Deserialize,
+                                        metrics::FailReason::Deserialize,
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
@@ -917,7 +918,7 @@ impl KafkaConsumer {
                             let headers = extract_string_headers(&msg);
                             let key = msg.key().map(|k| k.to_vec());
 
-                            crate::metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+                            metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
 
                             // Reject oversized messages before deserialization
                             if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
@@ -926,10 +927,10 @@ impl KafkaConsumer {
                                     queue,
                                     "rejecting oversized FIFO message to DLQ"
                                 );
-                                crate::metrics::record_failed(
+                                metrics::record_failed(
                                     &topic,
                                     group.as_deref(),
-                                    crate::metrics::FailReason::Oversize,
+                                    metrics::FailReason::Oversize,
                                 );
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
@@ -957,10 +958,10 @@ impl KafkaConsumer {
                                         queue,
                                         "failed to deserialize FIFO message, sending to DLQ"
                                     );
-                                    crate::metrics::record_failed(
+                                    metrics::record_failed(
                                         &topic,
                                         group.as_deref(),
-                                        crate::metrics::FailReason::Deserialize,
+                                        metrics::FailReason::Deserialize,
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,

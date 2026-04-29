@@ -13,6 +13,7 @@ use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
+use crate::metrics;
 
 use super::client::NatsClient;
 use super::constants::RETRY_COUNT_HEADER;
@@ -40,9 +41,9 @@ pub(super) async fn publish_with_retry(
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     if attempt == max_attempts {
-                        crate::metrics::record_backend_error(
-                            crate::metrics::BackendLabel::Nats,
-                            crate::metrics::BackendErrorKind::Publish,
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Nats,
+                            metrics::BackendErrorKind::Publish,
                         );
                         return Err(ShoveError::Connection(format!(
                             "{label} ack failed after {max_attempts} attempts: {e}"
@@ -55,9 +56,9 @@ pub(super) async fn publish_with_retry(
             },
             Err(e) => {
                 if attempt == max_attempts {
-                    crate::metrics::record_backend_error(
-                        crate::metrics::BackendLabel::Nats,
-                        crate::metrics::BackendErrorKind::Publish,
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Nats,
+                        metrics::BackendErrorKind::Publish,
                     );
                     return Err(ShoveError::Connection(format!(
                         "{label} failed after {max_attempts} attempts: {e}"

@@ -21,6 +21,7 @@ use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
+use crate::metrics;
 
 /// Consumes messages from an [`InMemoryBroker`] queue.
 #[derive(Clone)]
@@ -731,11 +732,11 @@ fn prepare_message<T: Topic>(
     topic: &str,
     group: Option<&str>,
 ) -> std::result::Result<(T::Message, MessageMetadata), Outcome> {
-    crate::metrics::record_message_size(topic, group, env.payload.len());
+    metrics::record_message_size(topic, group, env.payload.len());
 
     if let Err(e) = validate_message_size(env.payload.len(), max_size) {
         tracing::warn!(error = %e, "rejecting oversized message");
-        crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Oversize);
+        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
         return Err(Outcome::Reject);
     }
 
@@ -743,7 +744,7 @@ fn prepare_message<T: Topic>(
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, "failed to deserialize message — rejecting");
-            crate::metrics::record_failed(topic, group, crate::metrics::FailReason::Deserialize);
+            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
             return Err(Outcome::Reject);
         }
     };
@@ -771,10 +772,10 @@ where
                 Ok(o) => o,
                 Err(_) => {
                     tracing::warn!(timeout = ?timeout_dur, "handler timed out — retrying");
-                    crate::metrics::record_failed(
+                    metrics::record_failed(
                         topic,
                         group,
-                        crate::metrics::FailReason::Timeout,
+                        metrics::FailReason::Timeout,
                     );
                     Outcome::Retry
                 }
@@ -804,21 +805,22 @@ where
         Err(o) => return o,
     };
 
-    let _inflight = crate::metrics::InflightGuard::from_refs(topic, group);
+    let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
     let outcome = run_handler::<T, H>(
         handler, ctx, message, metadata, timeout_opt, topic, group,
     )
     .await;
     let elapsed = start.elapsed().as_secs_f64();
-    crate::metrics::record_consumed(topic, group, &outcome);
-    crate::metrics::record_processing_duration(topic, group, &outcome, elapsed);
+    metrics::record_consumed(topic, group, &outcome);
+    metrics::record_processing_duration(topic, group, &outcome, elapsed);
     outcome
 }
 
 /// Runs the handler with panic-catching and shutdown-awareness for paths
 /// without an outer `JoinSet` (the FIFO shard loop). Returns `None` when
 /// shutdown aborts the in-flight handler — the caller must drop the message.
+#[allow(clippy::too_many_arguments)]
 async fn invoke_handler_caught<T, H>(
     handler: Arc<H>,
     ctx: Arc<H::Context>,
@@ -844,7 +846,7 @@ where
 
     let topic_owned: std::sync::Arc<str> = std::sync::Arc::from(topic);
     let group_owned: Option<std::sync::Arc<str>> = group.map(std::sync::Arc::from);
-    let _inflight = crate::metrics::InflightGuard::new(topic_owned.clone(), group_owned.clone());
+    let _inflight = metrics::InflightGuard::new(topic_owned.clone(), group_owned.clone());
     let start = std::time::Instant::now();
 
     let mut join = tokio::spawn({
@@ -876,8 +878,8 @@ where
 
     let elapsed = start.elapsed().as_secs_f64();
     if let Some(ref o) = outcome_opt {
-        crate::metrics::record_consumed(&topic_owned, group_owned.as_deref(), o);
-        crate::metrics::record_processing_duration(
+        metrics::record_consumed(&topic_owned, group_owned.as_deref(), o);
+        metrics::record_processing_duration(
             &topic_owned,
             group_owned.as_deref(),
             o,

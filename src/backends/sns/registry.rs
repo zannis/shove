@@ -10,6 +10,7 @@ use crate::backends::sns::topology::SnsTopologyDeclarer;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
+use crate::metrics;
 
 /// Registry of all [`SqsConsumerGroup`]s.
 ///
@@ -52,9 +53,9 @@ impl SqsConsumerGroupRegistry {
         let name = topology.queue().to_string();
 
         if self.groups.contains_key(&name) {
-            crate::metrics::record_backend_error(
-                crate::metrics::BackendLabel::SnsSqs,
-                crate::metrics::BackendErrorKind::Topology,
+            metrics::record_backend_error(
+                metrics::BackendLabel::SnsSqs,
+                metrics::BackendErrorKind::Topology,
             );
             return Err(ShoveError::Topology(format!(
                 "consumer group '{name}' already registered"
