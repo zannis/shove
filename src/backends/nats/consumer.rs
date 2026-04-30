@@ -27,7 +27,6 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
-use std::future::Future;
 
 use super::client::NatsClient;
 use super::constants::{

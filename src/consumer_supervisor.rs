@@ -128,6 +128,7 @@ pub(crate) fn tally_join_result(
 ///   `JoinHandle::drop` would just *detach* the inner task, leaking it.
 /// - `drain_timeout = Duration::ZERO` means "abort immediately after
 ///   `signal` fires" (no grace period); this is honored verbatim.
+#[allow(dead_code)] // every caller is feature-gated; unused under --no-default-features
 pub(crate) async fn drive_fifo_until_timeout<S>(
     handles: Vec<tokio::task::JoinHandle<Result<()>>>,
     shutdown: CancellationToken,
