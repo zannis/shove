@@ -7,7 +7,9 @@ mod consumer_group;
 mod publisher;
 mod topology;
 
-pub use autoscaler::KafkaAutoscalerBackend;
+pub use autoscaler::{
+    KafkaAutoscalerBackend, KafkaLagStatsProvider, KafkaQueueStats, KafkaQueueStatsProvider,
+};
 pub use client::{KafkaClient, KafkaConfig};
 #[cfg(feature = "kafka-ssl")]
 pub use client::{KafkaSasl, KafkaTls};

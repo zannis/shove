@@ -215,14 +215,16 @@ pub use audit::{AuditLog, ShoveAuditHandler};
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
-// Backend re-exports — marker + config + management types only.
-// Old per-backend publisher/consumer/consumer-group/autoscaler/topology
-// types are now pub(crate) — users go through `Broker<B>` / `Publisher<B>` /
-// `ConsumerSupervisor<B>` / `ConsumerGroup<B>` / `TopologyDeclarer<B>` /
-// `Autoscaler<B>` (see DESIGN_V2 §11.4).
+// Backend re-exports.
 //
-// Exception: types named by existing integration tests remain `pub` until
-// tests migrate to the generic API. See Phase 11.4 caveat in the plan.
+// The recommended user-facing path is the generic `Broker<B>` /
+// `Publisher<B>` / `ConsumerSupervisor<B>` / `ConsumerGroup<B>` /
+// `TopologyDeclarer<B>` / `Autoscaler<B>` API. The per-backend modules
+// below also expose their concrete client, publisher, consumer, topology,
+// autoscaler, registry, and stats-provider types as a permanent escape
+// hatch for code that needs to drive a backend directly — backend-specific
+// configuration, custom stats providers, and integration tests that
+// exercise the underlying machinery.
 #[cfg(feature = "pub-aws-sns")]
 #[cfg_attr(docsrs, doc(cfg(feature = "pub-aws-sns")))]
 pub mod sns {
@@ -231,8 +233,6 @@ pub mod sns {
     #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
     pub use crate::markers::Sqs;
 
-    // Kept pub because `tests/sns_integration.rs` and `tests/sns_sqs_integration.rs`
-    // use the inherent `SnsTopologyDeclarer` and associated registry types.
     pub use crate::backends::sns::{
         client::SnsClient,
         publisher::SnsPublisher,
@@ -257,13 +257,10 @@ pub mod nats {
     pub use crate::backends::nats::NatsConfig;
     pub use crate::markers::Nats;
 
-    // Kept pub because `tests/nats_integration.rs` uses these types directly.
-    pub use crate::backends::nats::autoscaler::{
-        JetStreamStatsProvider, NatsQueueStats, NatsQueueStatsProvider,
-    };
     pub use crate::backends::nats::{
-        NatsAutoscalerBackend, NatsClient, NatsConsumer, NatsConsumerGroup,
-        NatsConsumerGroupConfig, NatsConsumerGroupRegistry, NatsPublisher, NatsTopologyDeclarer,
+        JetStreamStatsProvider, NatsAutoscalerBackend, NatsClient, NatsConsumer, NatsConsumerGroup,
+        NatsConsumerGroupConfig, NatsConsumerGroupRegistry, NatsPublisher, NatsQueueStats,
+        NatsQueueStatsProvider, NatsTopologyDeclarer,
     };
 }
 
@@ -273,14 +270,10 @@ pub mod kafka {
     pub use crate::backends::kafka::KafkaConfig;
     pub use crate::markers::Kafka;
 
-    // Kept pub because `tests/kafka_integration.rs` uses these types directly.
-    pub use crate::backends::kafka::autoscaler::{
-        KafkaLagStatsProvider, KafkaQueueStats, KafkaQueueStatsProvider,
-    };
     pub use crate::backends::kafka::{
         KafkaAutoscalerBackend, KafkaClient, KafkaConsumer, KafkaConsumerGroup,
-        KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry, KafkaPublisher,
-        KafkaTopologyDeclarer,
+        KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry, KafkaLagStatsProvider,
+        KafkaPublisher, KafkaQueueStats, KafkaQueueStatsProvider, KafkaTopologyDeclarer,
     };
     #[cfg(feature = "kafka-ssl")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]
@@ -298,7 +291,6 @@ pub mod kafka {
 pub mod inmemory {
     pub use crate::markers::InMemory;
 
-    // Kept pub because `tests/inmemory_integration.rs` uses these types directly.
     pub use crate::backends::inmemory::{
         BrokerStatsProvider, DEFAULT_QUEUE_CAPACITY, InMemoryAutoscalerBackend, InMemoryBroker,
         InMemoryConfig, InMemoryConsumer, InMemoryConsumerGroup, InMemoryConsumerGroupConfig,
@@ -314,7 +306,6 @@ pub mod rabbitmq {
     pub use crate::backends::rabbitmq::management::ManagementConfig;
     pub use crate::markers::RabbitMq;
 
-    // Kept pub because `tests/rabbitmq_integration.rs` uses these types directly.
     pub use crate::backends::rabbitmq::{
         autoscaler::RabbitMqAutoscalerBackend,
         client::RabbitMqClient,
