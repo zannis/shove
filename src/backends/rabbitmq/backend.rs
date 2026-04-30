@@ -152,6 +152,19 @@ impl ConsumerImpl for RabbitMqConsumer {
     {
         RabbitMqConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
+
+    async fn spawn_fifo_shards<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        RabbitMqConsumer::spawn_fifo_shards::<T, H>(self, handler, ctx, options)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +230,18 @@ impl RegistryImpl for ConsumerGroupRegistry {
         H: MessageHandler<T>,
     {
         ConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
+    }
+
+    async fn register_fifo<T, H>(
+        &mut self,
+        factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        ConsumerGroupRegistry::register_fifo::<T, H>(self, factory, ctx).await
     }
 
     fn cancellation_token(&self) -> CancellationToken {

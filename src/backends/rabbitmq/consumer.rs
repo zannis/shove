@@ -21,6 +21,7 @@ use crate::backends::rabbitmq::headers::{
 };
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::backends::rabbitmq::router;
+use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
@@ -1375,6 +1376,31 @@ impl RabbitMqConsumer {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
+        let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options)?;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("sequenced consumer sub-task failed: {e}"),
+                Err(e) => error!("sequenced consumer task panicked: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn one task per routing shard and return the join handles.
+    ///
+    /// The `pub(crate)` visibility is required for Phase 2 of this work
+    /// (Task 15) which calls it from the consumer-group module.
+    pub(crate) fn spawn_fifo_shards<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
         let topology = T::topology();
         let seq = topology.sequencing().ok_or_else(|| {
             ShoveError::Topology("run_fifo called on topic without sequencing config".into())
@@ -1416,15 +1442,65 @@ impl RabbitMqConsumer {
             }));
         }
 
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => error!("sequenced consumer sub-task failed: {e}"),
-                Err(e) => error!("sequenced consumer task panicked: {e}"),
-            }
-        }
+        Ok(handles)
+    }
 
-        Ok(())
+    /// Drain a FIFO consumer with a timeout, mirroring
+    /// [`ConsumerSupervisor::run_until_timeout`] for sequenced topics.
+    ///
+    /// Spawns one task per `routing_shards` (same as [`Self::run_fifo`]). Races
+    /// `signal` against shards exiting on their own. When `signal` resolves,
+    /// cancels `options.shutdown` and waits up to `drain_timeout` for shards
+    /// to finish; surviving shards are aborted and counted as panics.
+    pub async fn run_fifo_until_timeout<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<RabbitMq>,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        self.run_fifo_until_timeout_with_inner::<T, H, S>(
+            handler,
+            ctx,
+            options.into_inner(),
+            signal,
+            drain_timeout,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_fifo_until_timeout_with_inner<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        let shutdown = options.shutdown.clone();
+        let handles = match self.spawn_fifo_shards::<T, H>(handler, ctx, options) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
+                return SupervisorOutcome {
+                    errors: 1,
+                    panics: 0,
+                    timed_out: false,
+                };
+            }
+        };
+        drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>

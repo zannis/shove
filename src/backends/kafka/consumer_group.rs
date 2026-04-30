@@ -16,7 +16,7 @@ use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
-use crate::topic::Topic;
+use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
@@ -132,6 +132,10 @@ pub struct KafkaConsumerGroup {
     pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
     pub(crate) group_token: CancellationToken,
     pub(crate) error_count: Arc<AtomicUsize>,
+    /// Panic count incremented by the FIFO spawner wrapper when a shard task
+    /// exits with a `JoinError` that is not a cancellation. Drained by
+    /// [`KafkaConsumerGroup::shutdown_with_tally`].
+    pub(crate) panic_count: Arc<AtomicUsize>,
 }
 
 impl KafkaConsumerGroup {
@@ -180,6 +184,75 @@ impl KafkaConsumerGroup {
             spawner,
             group_token,
             error_count,
+            panic_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Construct a FIFO consumer group for a [`SequencedTopic`].
+    ///
+    /// FIFO replica count is fixed at 1 — Kafka uses partition-level ordering,
+    /// so a single consumer task is sufficient.
+    pub fn new_fifo<T, H>(
+        queue: impl Into<String>,
+        client: KafkaClient,
+        group_token: CancellationToken,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Self
+    where
+        T: SequencedTopic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let panic_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
+        let pc_for_spawner = panic_count.clone();
+
+        // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
+        let fifo_config = KafkaConsumerGroupConfig::new(1..=1);
+
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let handler = handler_factory();
+            let consumer = KafkaConsumer::new(client.clone());
+            let ec = ec_for_spawner.clone();
+            let pc = pc_for_spawner.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                // `spawn_fifo_shards` is sync for Kafka — no `.await` needed.
+                let handles = match consumer.spawn_fifo_shards::<T, H>(handler, ctx, options) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        ec.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!("FIFO registration failed: {e}");
+                        return;
+                    }
+                };
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            ec.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard exited with error: {e}");
+                        }
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => {
+                            pc.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard panicked: {e}");
+                        }
+                    }
+                }
+            })
+        });
+
+        let queue_str: String = queue.into();
+        Self {
+            queue: queue_str.clone(),
+            consumers: Vec::with_capacity(1),
+            config: fifo_config,
+            spawner,
+            group_token,
+            error_count,
+            panic_count,
         }
     }
 
@@ -276,6 +349,7 @@ impl KafkaConsumerGroup {
             }
         }
         let errors = self.error_count.swap(0, Ordering::Relaxed);
+        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
         debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
         ShutdownTally { errors, panics }
     }
@@ -383,6 +457,50 @@ impl KafkaConsumerGroupRegistry {
         Ok(())
     }
 
+    /// Register a new FIFO consumer group for a [`SequencedTopic`].
+    ///
+    /// Declares the topology for `T` before creating the group. The group is
+    /// **not** started — call [`start_all`] separately.
+    ///
+    /// [`start_all`]: Self::start_all
+    pub async fn register_fifo<T, H>(
+        &mut self,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Result<()>
+    where
+        T: SequencedTopic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        let topology = T::topology();
+        let name = topology.queue().to_string();
+
+        if self.groups.contains_key(&name) {
+            return Err(ShoveError::Topology(format!(
+                "consumer group '{name}' is already registered"
+            )));
+        }
+
+        let client = self.client.as_ref().ok_or_else(|| {
+            ShoveError::Topology("registry has no client (test-only registry)".into())
+        })?;
+
+        let declarer = KafkaTopologyDeclarer::new(client.clone()).with_min_partitions(1);
+        declarer.declare(topology).await?;
+
+        info!(group = %name, "registering FIFO consumer group");
+        let group_token = client.shutdown_token().child_token();
+        let group = KafkaConsumerGroup::new_fifo::<T, H>(
+            name.clone(),
+            client.clone(),
+            group_token,
+            handler_factory,
+            ctx,
+        );
+        self.groups.insert(name, group);
+        Ok(())
+    }
+
     pub fn start_all(&mut self) {
         info!(count = self.groups.len(), "starting all consumer groups");
         for group in self.groups.values_mut() {
@@ -443,6 +561,7 @@ mod tests {
             spawner,
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
+            panic_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 

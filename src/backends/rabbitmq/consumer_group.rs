@@ -15,7 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
 use crate::consumer_supervisor::ShutdownTally;
 use crate::handler::MessageHandler;
-use crate::topic::Topic;
+use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
@@ -158,6 +158,10 @@ pub struct ConsumerGroup {
     /// inner `run_with_inner` returns `Err`. Drained by
     /// [`ConsumerGroup::shutdown_with_tally`].
     error_count: Arc<AtomicUsize>,
+    /// Panic count incremented by the FIFO spawner wrapper when a shard task
+    /// exits with a `JoinError` that is not a cancellation. Drained by
+    /// [`ConsumerGroup::shutdown_with_tally`].
+    panic_count: Arc<AtomicUsize>,
 }
 
 impl ConsumerGroup {
@@ -218,6 +222,75 @@ impl ConsumerGroup {
             spawner,
             group_token,
             error_count,
+            panic_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Construct a FIFO consumer group for a [`SequencedTopic`].
+    ///
+    /// FIFO replica count is fixed at 1 — concurrency comes from shards,
+    /// not from multiple replicas of the shard set.
+    pub fn new_fifo<T, H>(
+        queue: impl Into<String>,
+        client: RabbitMqClient,
+        group_token: CancellationToken,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Self
+    where
+        T: SequencedTopic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let panic_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
+        let pc_for_spawner = panic_count.clone();
+
+        // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
+        let fifo_config = ConsumerGroupConfig::new(1..=1);
+
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let handler = handler_factory();
+            let consumer = RabbitMqConsumer::new(client.clone());
+            let ec = ec_for_spawner.clone();
+            let pc = pc_for_spawner.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let handles = match consumer.spawn_fifo_shards::<T, H>(handler, ctx, options) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        ec.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!("FIFO registration failed: {e}");
+                        return;
+                    }
+                };
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            ec.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard exited with error: {e}");
+                        }
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => {
+                            pc.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard panicked: {e}");
+                        }
+                    }
+                }
+            })
+        });
+
+        let queue_str: String = queue.into();
+        Self {
+            name: queue_str.clone(),
+            queue: queue_str,
+            consumers: Vec::with_capacity(1),
+            config: fifo_config,
+            spawner,
+            group_token,
+            error_count,
+            panic_count,
         }
     }
 
@@ -324,6 +397,7 @@ impl ConsumerGroup {
             }
         }
         let errors = self.error_count.swap(0, Ordering::Relaxed);
+        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
         debug!(group = %self.name, errors, panics, "consumer group shutdown complete");
         ShutdownTally { errors, panics }
     }
@@ -369,6 +443,7 @@ mod tests {
             spawner,
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
+            panic_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 

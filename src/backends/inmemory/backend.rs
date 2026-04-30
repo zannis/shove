@@ -143,6 +143,19 @@ impl ConsumerImpl for InMemoryConsumer {
     {
         InMemoryConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
+
+    async fn spawn_fifo_shards<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        InMemoryConsumer::spawn_fifo_shards_inner::<T, H>(self, handler, ctx, options)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +213,18 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
         // method here — `<Self as _>::` disambiguation would be infinite
         // recursion.
         InMemoryConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
+    }
+
+    async fn register_fifo<T, H>(
+        &mut self,
+        factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        InMemoryConsumerGroupRegistry::register_fifo::<T, H>(self, factory, ctx).await
     }
 
     fn cancellation_token(&self) -> CancellationToken {

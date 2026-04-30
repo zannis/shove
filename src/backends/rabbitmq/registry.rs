@@ -9,7 +9,7 @@ use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
-use crate::topic::Topic;
+use crate::topic::{SequencedTopic, Topic};
 
 /// Registry of all [`ConsumerGroup`]s managed by the autoscaler.
 ///
@@ -69,6 +69,47 @@ impl ConsumerGroupRegistry {
             name.clone(),
             name.clone(),
             config,
+            self.client.clone(),
+            group_token,
+            handler_factory,
+            ctx,
+        );
+        self.groups.insert(name, group);
+        Ok(())
+    }
+
+    /// Register a new FIFO consumer group for a [`SequencedTopic`].
+    ///
+    /// Declares the topology for `T` before creating the group.  The group is
+    /// **not** started — call [`start_all`] separately.
+    ///
+    /// [`start_all`]: Self::start_all
+    pub async fn register_fifo<T, H>(
+        &mut self,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Result<()>
+    where
+        T: SequencedTopic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        let topology = T::topology();
+        let name = topology.queue().to_string();
+
+        if self.groups.contains_key(&name) {
+            return Err(ShoveError::Topology(format!(
+                "consumer group '{name}' is already registered"
+            )));
+        }
+
+        let channel = self.client.create_channel().await?;
+        let declarer = RabbitMqTopologyDeclarer::new(channel);
+        declarer.declare(topology).await?;
+
+        info!(group = %name, "registering FIFO consumer group");
+        let group_token = self.client.shutdown_token().child_token();
+        let group = ConsumerGroup::new_fifo::<T, H>(
+            name.clone(),
             self.client.clone(),
             group_token,
             handler_factory,

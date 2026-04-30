@@ -313,6 +313,7 @@ mod tests {
             spawner,
             group_token,
             error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            panic_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         if started {
             group.start();

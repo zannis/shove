@@ -159,15 +159,15 @@ A routing shard count of 0 panics at `build()` time. The builder enforces this g
 
 ## Consuming sequenced topics
 
-Sequenced topics require a backend-specific `run_fifo` consumer call. The `ConsumerSupervisor::register` method explicitly rejects sequenced topics at runtime — it returns an error explaining that FIFO ordering cannot be preserved through the generic `register` API:
+Sequenced topics participate in the same harness as regular topics via `register_fifo` — but the plain `register` method still rejects them at runtime so per-key ordering can't be silently dropped:
 
 ```rust,no_run
 // This will return Err for sequenced topics:
 supervisor.register::<AccountLedger, _>(handler, options)?;
-// ^ error: use run_fifo instead
+// ^ error: use register_fifo instead
 ```
 
-For the in-memory backend, use `InMemoryConsumer::run_fifo`:
+For the in-memory backend, use `InMemoryConsumer::run_fifo` for the consumer-direct path:
 
 ```rust,no_run
 consumer.run_fifo::<LedgerTopic, _>(handler, ctx, opts).await
@@ -177,7 +177,49 @@ The type signature enforces the `SequencedTopic` bound — the call will not com
 
 Other backends have equivalent per-backend sequenced consumer entry points: `RabbitMqConsumer::run_fifo`, `NatsConsumer::run_fifo`, `KafkaConsumer::run_fifo`, and `SqsConsumer::run_fifo`.
 
-**The generic `broker.consumer_group()` harness does not currently route to the FIFO path** — spawned workers call the unsequenced `run`. To prevent per-key ordering being silently dropped, both `ConsumerGroup::register` and `ConsumerSupervisor::register` reject any topic whose topology has `.sequenced(...)` configured: registration returns `ShoveError::Topology(...)` at runtime. To preserve ordering on a coordinated backend, drive the consumer through `run_fifo` directly until FIFO registration is surfaced on the harness.
+### Harness path: `register_fifo`
+
+When you're already running other consumers through `ConsumerSupervisor` or `ConsumerGroup`, register sequenced topics on the same harness via `register_fifo`. They drain through the same `run_until_timeout` as regular registrations, returning a single `SupervisorOutcome` for the entire harness:
+
+```rust,no_run
+let mut sup = broker.consumer_supervisor().with_context(ctx);
+sup.register::<RegularTopic, _>(handler_a, options_a)?;
+sup.register_fifo::<SequencedTopic, _>(handler_b, options_b).await?;
+
+let outcome = sup
+    .run_until_timeout(shutdown.cancelled_owned(), Duration::from_secs(30))
+    .await;
+```
+
+For consumer groups, `register_fifo` takes only the handler factory — there is no `ConsumerGroupConfig` parameter because FIFO concurrency is determined by the topology's `routing_shards`, not by user-supplied min/max. Autoscaling is not applied to FIFO registrations (more replicas would break per-key ordering):
+
+```rust,no_run
+let mut group = broker.consumer_group().with_context(ctx);
+group.register_fifo::<SequencedTopic, _>(|| MyHandler).await?;
+let outcome = group.run_until_timeout(signal, Duration::from_secs(30)).await;
+```
+
+Pick the harness path when you have a mix of sequenced and unsequenced topics in one binary; pick `run_fifo_until_timeout` (below) when you only have one FIFO consumer and don't want a harness layer.
+
+### Graceful shutdown
+
+`run_fifo` blocks until every shard exits — usually because the shutdown token in `ConsumerOptions` was cancelled. To bound the drain and surface error/panic counts to the process, use `run_fifo_until_timeout` instead:
+
+```rust,no_run
+let outcome = consumer
+    .run_fifo_until_timeout::<LedgerTopic, _, _>(
+        handler,
+        ctx,
+        opts,
+        shutdown.cancelled_owned(),
+        Duration::from_secs(30),
+    )
+    .await;
+```
+
+Returns the same `SupervisorOutcome` as `ConsumerGroup::run_until_timeout`, so process-level exit-code rollups across coordinated groups and sequenced topics use one type. See [Shutdown semantics → Sequenced topics](/guides/shutdown#sequenced-topics-run_fifo_until_timeout) for the full contract.
+
+To preserve per-key ordering, both `ConsumerGroup::register` and `ConsumerSupervisor::register` reject any topic whose topology has `.sequenced(...)` configured: registration returns `ShoveError::Topology(...)` pointing at `register_fifo`. The plain `register` path spawns workers via the unsequenced `run`, which would silently drop ordering — the runtime check is there as a safety net, not a long-term limitation.
 
 `ConsumerOptions::max_pending_per_key` (default: 1,000) limits how many messages can be locally buffered per key in concurrent-sequenced consumers. When exceeded, new deliveries for that key are rejected to the DLQ. Adjust with `.with_max_pending_per_key(N)` or disable with `.without_max_pending_per_key()`.
 
