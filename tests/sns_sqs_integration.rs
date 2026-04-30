@@ -2945,3 +2945,198 @@ async fn autoscaler_scale_magnitude_with_sqs() {
     let _ = auto_handle.await;
     registry_arc.lock().await.shutdown_all().await;
 }
+
+// ---------------------------------------------------------------------------
+// run_fifo_until_timeout — drain semantics for sequenced topics
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_fifo_until_timeout_clean_drain() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    for i in 0..5u64 {
+        setup
+            .publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "A".into(),
+                amount: i,
+            })
+            .await
+            .expect("publish should succeed");
+    }
+
+    let counter = WaitableCounter::new();
+    let counter_clone = counter.clone();
+
+    #[derive(Clone)]
+    struct CountSeqHandler(WaitableCounter);
+    impl MessageHandler<SeqSkipTopic> for CountSeqHandler {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.0.increment();
+            Outcome::Ack
+        }
+    }
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+
+    // Signal fires once all 5 messages have been acked, plus a brief grace
+    // period to let the shard finish its ack round trip.
+    let signal = async move {
+        let _ = counter_clone.wait_for(5, Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
+            CountSeqHandler(counter.clone()),
+            (),
+            ConsumerOptions::<Sqs>::new().with_max_retries(3),
+            signal,
+            Duration::from_secs(10),
+        )
+        .await;
+
+    assert!(
+        outcome.is_clean(),
+        "expected clean outcome, got {outcome:?}"
+    );
+    assert_eq!(counter.get(), 5);
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_observes_handler_panic() {
+    // SQS FIFO shards run each handler synchronously inside `run_sequenced_shard`.
+    // Handler panics propagate up through the spawn boundary — they are NOT
+    // absorbed at the consume-loop level the way NATS absorbs them. The shard
+    // task panics, the JoinSet re-raises it via `resume_unwind`, and the
+    // JoinSet wrapper catches it as a panic, incrementing `panics`. The
+    // harness still completes without hanging or deadlocking.
+    //
+    // This test documents that contract: the harness does not crash or deadlock
+    // when a handler panics, and the outcome reports the panic correctly.
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    setup
+        .publisher
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .expect("publish should succeed");
+
+    #[derive(Clone)]
+    struct PanicHandler;
+    impl MessageHandler<SeqSkipTopic> for PanicHandler {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            panic!("intentional test panic");
+        }
+    }
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    // Generous signal — give the message time to arrive and trigger the panic.
+    let signal = tokio::time::sleep(Duration::from_secs(30));
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
+            PanicHandler,
+            (),
+            ConsumerOptions::<Sqs>::new().with_max_retries(0),
+            signal,
+            Duration::from_secs(10),
+        )
+        .await;
+
+    // SQS catches handler panics at the `spawn_handler_keyed` oneshot
+    // boundary and maps them to `Outcome::Retry` — the panic never escapes
+    // the consume loop. So the harness sees a clean shutdown when the
+    // signal fires: no panics, no errors, no timeout.
+    assert!(
+        !outcome.timed_out,
+        "harness must not hang on handler panics; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.panics, 0,
+        "handler panics are absorbed at the shard boundary; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "handler panics are absorbed at the shard boundary; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
+    // The SQS FIFO consume loop processes messages sequentially: it awaits the
+    // handler future for each message before moving to the next. A handler
+    // currently in-flight when shutdown fires keeps running until it completes.
+    // With a slow handler (60 s sleep) and a short drain budget (500 ms), the
+    // timeout fires before the shard finishes, the JoinSet aborts surviving
+    // shards, and `timed_out` is set to true.
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    setup
+        .publisher
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .expect("publish should succeed");
+
+    // Use a counter so the signal only fires once the handler is in-flight,
+    // avoiding a race where the signal fires before the message is delivered.
+    let started = WaitableCounter::new();
+    let started_clone = started.clone();
+
+    #[derive(Clone)]
+    struct SlowSeqHandler(WaitableCounter);
+    impl MessageHandler<SeqSkipTopic> for SlowSeqHandler {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.0.increment();
+            // Block well beyond drain timeout.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Outcome::Ack
+        }
+    }
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    // Disable handler timeout so the 60 s sleep is not interrupted before the
+    // drain budget expires.
+    let opts = ConsumerOptions::<Sqs>::new()
+        .with_max_retries(1)
+        .without_handler_timeout();
+
+    // Signal fires only once the handler is confirmed in-flight; drain budget
+    // is much shorter than the handler sleep.
+    let signal = async move {
+        started_clone.wait_for(1, Duration::from_secs(60)).await;
+        // Small gap to ensure the handler is past its counter increment and
+        // blocked in the sleep before shutdown fires.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let drain = Duration::from_millis(500);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
+            SlowSeqHandler(started),
+            (),
+            opts,
+            signal,
+            drain,
+        )
+        .await;
+
+    // STRICT — handler ignores shutdown, drain budget runs out, shard aborted.
+    assert!(outcome.timed_out, "expected timed_out, got {outcome:?}");
+    assert_eq!(outcome.exit_code(), 3);
+}

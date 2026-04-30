@@ -7,6 +7,8 @@
 //! a non-unit [`MessageHandler::Context`](MessageHandler::Context)
 //! work through the generic harness.
 
+use std::future::Future;
+
 use crate::backend::ConsumerOptionsInner;
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -42,5 +44,15 @@ pub(crate) trait ConsumerImpl: Send + Sync {
     fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        H: MessageHandler<T>;
+
+    fn spawn_fifo_shards<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> impl Future<Output = Result<Vec<tokio::task::JoinHandle<Result<()>>>>> + Send
+    where
+        T: SequencedTopic,
         H: MessageHandler<T>;
 }

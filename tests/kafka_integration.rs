@@ -213,6 +213,14 @@ impl MessageHandler<DeferNoHoldTopic> for CountingHandler {
     }
 }
 
+impl MessageHandler<SeqSkipTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
 struct FixedOutcomeHandler(Outcome);
 
 impl MessageHandler<WorkTopic> for FixedOutcomeHandler {
@@ -1980,6 +1988,255 @@ async fn sequenced_defer_falls_back_to_retry() {
         counts[1], 1,
         "second call should have retry_count 1 (Defer became Retry)"
     );
+
+    broker.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// run_fifo_until_timeout — drain semantics for sequenced topics
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_fifo_until_timeout_clean_drain() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    // Publish a small batch.
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..5u64 {
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "A".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let counter = WaitableCounter::new();
+    let counter_clone = counter.clone();
+
+    #[derive(Clone)]
+    struct CountSeqHandler(WaitableCounter);
+    impl MessageHandler<SeqSkipTopic> for CountSeqHandler {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.0.increment();
+            Outcome::Ack
+        }
+    }
+
+    let consumer = KafkaConsumer::new(client.clone());
+
+    // Wait until the handler has acked all 5, then send the signal.
+    let signal = async move {
+        let _ = counter_clone.wait_for(5, Duration::from_secs(30)).await;
+        // Brief grace period to let the shard finish its commit round trip.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
+            CountSeqHandler(counter.clone()),
+            (),
+            ConsumerOptions::<Kafka>::new().with_max_retries(3),
+            signal,
+            Duration::from_secs(10),
+        )
+        .await;
+
+    assert!(
+        outcome.is_clean(),
+        "expected clean outcome, got {outcome:?}"
+    );
+    assert_eq!(counter.get(), 5);
+
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_observes_handler_panic() {
+    // Shard-level panic boundary: the Kafka FIFO consume loop spawns each
+    // handler via `tokio::spawn` and awaits it through a oneshot channel.
+    // When the handler panics, the task panics before sending, the receiver
+    // closes, and the consume loop treats the closed channel as `Outcome::Retry`.
+    // The panic never escapes `run_with_reconnect` — it always returns `Ok(())`.
+    // As a result, `outcome.panics` and `outcome.errors` will both be zero.
+    // This test documents and verifies that contract: the harness does not
+    // crash or deadlock when handlers panic, and the outcome is clean.
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .unwrap();
+
+    #[derive(Clone)]
+    struct PanicHandler;
+    impl MessageHandler<SeqSkipTopic> for PanicHandler {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            panic!("intentional test panic");
+        }
+    }
+
+    let consumer = KafkaConsumer::new(client.clone());
+    // max_retries=1 so the message is dispatched once (retry_count 0 < 1),
+    // panics (Retry), then redelivered with retry_count=1 >= max_retries -> DLQ.
+    let opts = ConsumerOptions::<Kafka>::new().with_max_retries(1);
+
+    // Generous signal — give the shard time to pull the message, panic, and DLQ it.
+    let signal = tokio::time::sleep(Duration::from_secs(10));
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(
+            PanicHandler,
+            (),
+            opts,
+            signal,
+            Duration::from_secs(10),
+        )
+        .await;
+
+    // The shard absorbs handler panics at the oneshot channel level (see above),
+    // so neither panics nor errors are incremented. The harness returns cleanly.
+    assert!(
+        !outcome.timed_out,
+        "harness must not hang on handler panics; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.panics, 0,
+        "Kafka shards absorb handler panics internally; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "Kafka shards absorb handler panics as Retry; got {outcome:?}"
+    );
+
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
+    // Kafka's consume loop processes messages sequentially: it awaits the
+    // oneshot receiver for each handler before moving to the next message.
+    // A handler currently in-flight when shutdown fires keeps running until it
+    // completes. With a slow handler (60 s sleep) and a short drain budget
+    // (500 ms), the timeout fires before the shard finishes, the JoinSet
+    // abort_all's the handle, and timed_out is set to true.
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<SeqSkipTopic>(&OrderMessage {
+            order_id: "A".into(),
+            amount: 0,
+        })
+        .await
+        .unwrap();
+
+    // Use a counter so the signal only fires once the handler is in-flight,
+    // avoiding a race where the signal fires before the message is delivered.
+    let started = WaitableCounter::new();
+    let started_clone = started.clone();
+
+    #[derive(Clone)]
+    struct SlowHandler(WaitableCounter);
+    impl MessageHandler<SeqSkipTopic> for SlowHandler {
+        type Context = ();
+        async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.0.increment();
+            // Block well beyond drain timeout.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Outcome::Ack
+        }
+    }
+
+    let consumer = KafkaConsumer::new(client.clone());
+    // max_retries=1 so the initial delivery (retry_count=0) passes the
+    // max-retries check and the handler is actually dispatched.
+    // Disable the handler timeout so the 60 s sleep is not interrupted before
+    // the drain budget expires.
+    let opts = ConsumerOptions::<Kafka>::new()
+        .with_max_retries(1)
+        .without_handler_timeout();
+
+    // Signal fires only once the handler is confirmed in-flight; drain budget
+    // is much shorter than the handler sleep.
+    let signal = async move {
+        started_clone.wait_for(1, Duration::from_secs(30)).await;
+        // Small gap to make sure the handler is past its counter increment and
+        // is blocked in the sleep before we fire shutdown.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let drain = Duration::from_millis(500);
+
+    let outcome = consumer
+        .run_fifo_until_timeout::<SeqSkipTopic, _, _>(SlowHandler(started), (), opts, signal, drain)
+        .await;
+
+    // STRICT — handler ignores shutdown, drain budget runs out, shard aborted.
+    assert!(outcome.timed_out, "expected timed_out, got {outcome:?}");
+    assert_eq!(outcome.exit_code(), 3);
+
+    broker.close().await;
+}
+
+// ===========================================================================
+// ConsumerGroup::register_fifo
+// ===========================================================================
+
+/// Consumer group `register_fifo` drains all messages via `run_until_timeout`.
+#[tokio::test]
+async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..5u64 {
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "A".into(),
+                amount: i,
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<SeqSkipTopic, _>({
+            let h = handler.clone();
+            move || h.clone()
+        })
+        .await
+        .unwrap();
+
+    let counter = handler.counter.clone();
+    let signal = async move {
+        counter.wait_for(5, Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome was {outcome:?}");
+    assert_eq!(handler.counter.get(), 5);
 
     broker.close().await;
 }

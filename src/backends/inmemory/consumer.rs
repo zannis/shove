@@ -14,6 +14,7 @@ use super::constants::{
 use super::topology::InMemoryTopologyDeclarer;
 use crate::backend::ConsumerOptionsInner;
 use crate::consumer::validate_message_size;
+use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
@@ -62,6 +63,30 @@ impl InMemoryConsumer {
         run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options.into_inner())
     }
 
+    pub async fn run_fifo_until_timeout<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions<InMemory>,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        run_fifo_until_timeout_impl::<T, H, S>(
+            self.broker.clone(),
+            handler,
+            ctx,
+            options.into_inner(),
+            signal,
+            drain_timeout,
+        )
+        .await
+    }
+
     pub(crate) fn run_with_inner<T, H>(
         &self,
         handler: H,
@@ -86,6 +111,19 @@ impl InMemoryConsumer {
         H: MessageHandler<T>,
     {
         run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options)
+    }
+
+    pub(crate) fn spawn_fifo_shards_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        spawn_fifo_shards::<T, H>(self.broker.clone(), handler, ctx, options)
     }
 
     pub fn run_dlq<T, H>(
@@ -280,12 +318,20 @@ async fn drain_pending(
 // Sequenced (FIFO) loop
 // ---------------------------------------------------------------------------
 
-async fn run_fifo_impl<T, H>(
+/// Spawn one task per shard and return the join handles.
+///
+/// The `pub(crate)` visibility is required because the consumer group
+/// (Phase 2, Task 14) will call this from `consumer_group.rs`.
+///
+/// InMemory shard tasks return `()` internally (errors are handled inside
+/// `run_fifo_shard`), so each task is wrapped to produce `Result<()>` so
+/// the handle type is uniform with other backends.
+pub(crate) fn spawn_fifo_shards<T, H>(
     broker: InMemoryBroker,
     handler: H,
     ctx: H::Context,
     options: ConsumerOptionsInner,
-) -> Result<()>
+) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
 where
     T: SequencedTopic,
     H: MessageHandler<T>,
@@ -315,27 +361,73 @@ where
     // shrink a pool while a sibling shard is in the middle of a message.
     let busy = Arc::new(AtomicUsize::new(0));
 
-    let mut workers: JoinSet<()> = JoinSet::new();
+    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+        Vec::with_capacity(n_shards as usize);
     for (shard_name, shard) in shards {
         let broker = broker.clone();
         let handler = Arc::clone(&handler);
         let ctx = Arc::clone(&ctx);
         let options = options.clone();
         let busy = Arc::clone(&busy);
-        workers.spawn(async move {
+        handles.push(tokio::spawn(async move {
             run_fifo_shard::<T, H>(
                 broker, shard_name, shard, topology, on_failure, handler, ctx, options, busy,
             )
             .await;
-        });
+            Result::<()>::Ok(())
+        }));
     }
 
-    while let Some(res) = workers.join_next().await {
-        if let Err(e) = res {
-            tracing::error!("sequenced consumer task panicked: {e}");
+    Ok(handles)
+}
+
+async fn run_fifo_impl<T, H>(
+    broker: InMemoryBroker,
+    handler: H,
+    ctx: H::Context,
+    options: ConsumerOptionsInner,
+) -> Result<()>
+where
+    T: SequencedTopic,
+    H: MessageHandler<T>,
+{
+    let handles = spawn_fifo_shards::<T, H>(broker, handler, ctx, options)?;
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!("sequenced shard task failed: {e}"),
+            Err(e) => tracing::error!("sequenced shard task panicked: {e}"),
         }
     }
     Ok(())
+}
+
+async fn run_fifo_until_timeout_impl<T, H, S>(
+    broker: InMemoryBroker,
+    handler: H,
+    ctx: H::Context,
+    options: ConsumerOptionsInner,
+    signal: S,
+    drain_timeout: Duration,
+) -> SupervisorOutcome
+where
+    T: SequencedTopic,
+    H: MessageHandler<T>,
+    S: Future<Output = ()> + Send + 'static,
+{
+    let shutdown = options.shutdown.clone();
+    let handles = match spawn_fifo_shards::<T, H>(broker, handler, ctx, options) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
+            return SupervisorOutcome {
+                errors: 1,
+                panics: 0,
+                timed_out: false,
+            };
+        }
+    };
+    drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
 }
 
 #[allow(clippy::too_many_arguments)]

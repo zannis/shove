@@ -11,9 +11,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::consumer_supervisor::SupervisorOutcome;
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
-use crate::topic::Topic;
+use crate::topic::{SequencedTopic, Topic};
 
 // Methods are anchored by the InMemory port's `_anchor_*` helpers in
 // `backend::mod` under the `inmemory` feature. Under
@@ -33,6 +33,24 @@ pub(crate) trait RegistryImpl: Send {
     where
         T: Topic,
         H: MessageHandler<T>;
+
+    fn register_fifo<T, H>(
+        &mut self,
+        _factory: impl Fn() -> H + Send + Sync + 'static,
+        _ctx: H::Context,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        async {
+            Err(ShoveError::Topology(
+                "register_fifo is not yet implemented for this backend; \
+                 use the backend-specific consumer's run_fifo_until_timeout instead"
+                    .into(),
+            ))
+        }
+    }
 
     fn cancellation_token(&self) -> CancellationToken;
 
