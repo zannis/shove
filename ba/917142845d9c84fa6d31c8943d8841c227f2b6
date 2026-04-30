@@ -1,0 +1,27 @@
+tests/sns_sqs_integration.rs
+  e1e2441a5bc0f201 3011-3015
+tests/inmemory_integration.rs
+  e1e2441a5bc0f201 1356-1357,1361,1367,1369,1373-1384,1389
+tests/nats_integration.rs
+  e1e2441a5bc0f201 2040-2047
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "ba917142845d9c84fa6d31c8943d8841c227f2b6",
+  "prompts": {
+    "e1e2441a5bc0f201": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f498b5d8-c0ae-4ef6-adf7-a76f60b31767",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 31,
+      "total_deletions": 13,
+      "accepted_lines": 31,
+      "overriden_lines": 0
+    }
+  }
+}
