@@ -1353,26 +1353,40 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
             .unwrap();
     }
 
-    struct H;
+    let consumed = Arc::new(AtomicUsize::new(0));
+    struct H(Arc<AtomicUsize>);
     impl MessageHandler<LedgerSkipTopic> for H {
         type Context = ();
         async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
             Outcome::Ack
         }
     }
 
     let mut group = broker.consumer_group();
+    let counter = consumed.clone();
     group
-        .register_fifo::<LedgerSkipTopic, _>(|| H)
+        .register_fifo::<LedgerSkipTopic, _>(move || H(counter.clone()))
         .await
         .unwrap();
 
-    // Give shards a moment to ack the messages, then drain.
-    let signal = tokio::time::sleep(Duration::from_millis(200));
+    // Wait until all 3 messages were actually consumed before signalling drain,
+    // so a regression where shards never start would fail the test.
+    let signal_counter = consumed.clone();
+    let signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while signal_counter.load(Ordering::Relaxed) < 3 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
     let outcome = group
         .run_until_timeout(signal, Duration::from_secs(5))
         .await;
     assert!(outcome.is_clean(), "outcome was {outcome:?}");
+    assert_eq!(consumed.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]

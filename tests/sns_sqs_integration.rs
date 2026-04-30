@@ -3008,15 +3008,11 @@ async fn run_fifo_until_timeout_clean_drain() {
 
 #[tokio::test]
 async fn run_fifo_until_timeout_observes_handler_panic() {
-    // SQS FIFO shards run each handler synchronously inside `run_sequenced_shard`.
-    // Handler panics propagate up through the spawn boundary — they are NOT
-    // absorbed at the consume-loop level the way NATS absorbs them. The shard
-    // task panics, the JoinSet re-raises it via `resume_unwind`, and the
-    // JoinSet wrapper catches it as a panic, incrementing `panics`. The
-    // harness still completes without hanging or deadlocking.
-    //
-    // This test documents that contract: the harness does not crash or deadlock
-    // when a handler panics, and the outcome reports the panic correctly.
+    // SQS catches handler panics at the `spawn_handler_keyed` oneshot
+    // boundary and maps them to `Outcome::Retry`, matching every other
+    // backend. The panic never escapes the consume loop, so the harness
+    // sees a clean shutdown when the signal fires: no panics, no errors,
+    // no timeout.
     let broker = TestBroker::start().await;
     let setup = TestSetup::new(&broker).await;
     setup.declare::<SeqSkipTopic>().await;

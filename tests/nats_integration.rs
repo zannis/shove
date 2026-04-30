@@ -2037,6 +2037,14 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
         !outcome.timed_out,
         "harness must not hang on handler panics; got {outcome:?}"
     );
+    assert_eq!(
+        outcome.panics, 0,
+        "handler panics are absorbed at the shard boundary; got {outcome:?}"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "handler panics are absorbed at the shard boundary; got {outcome:?}"
+    );
 
     broker.close().await;
 }
