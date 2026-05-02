@@ -17,4 +17,4 @@ pub(super) const DEFAULT_GROUP: &str = "shove";
 /// the shutdown token regularly; long enough to avoid busy-polling.
 pub(super) const BLOCK_MS: u64 = 2_000;
 /// Number of pending entries reclaimed per XAUTOCLAIM call.
-pub(super) const AUTOCLAIM_COUNT: u64 = 100;
+pub(super) const AUTOCLAIM_COUNT: usize = 100;
