@@ -17,3 +17,7 @@ pub mod kafka;
 #[cfg(feature = "inmemory")]
 #[cfg_attr(docsrs, doc(cfg(feature = "inmemory")))]
 pub mod inmemory;
+
+#[cfg(feature = "redis-streams")]
+#[cfg_attr(docsrs, doc(cfg(feature = "redis-streams")))]
+pub mod redis;
