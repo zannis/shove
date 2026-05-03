@@ -10,22 +10,6 @@ use crate::topology::QueueTopology;
 use super::client::RedisClient;
 
 // ---------------------------------------------------------------------------
-// Stream naming helpers
-// ---------------------------------------------------------------------------
-
-/// Shard stream name for a sequenced topic at the given shard index.
-/// Format: `{main_queue}-seq-{shard_index}`
-pub fn shard_stream_name(main_queue: &str, shard: u16) -> String {
-    format!("{main_queue}-seq-{shard}")
-}
-
-/// Hold queue sorted set key for a hold queue.
-/// Format: `{hold_queue_name}:pending`
-pub fn hold_set_name(hold_queue_name: &str) -> String {
-    format!("{hold_queue_name}:pending")
-}
-
-// ---------------------------------------------------------------------------
 // RedisTopologyDeclarer
 // ---------------------------------------------------------------------------
 
@@ -46,13 +30,13 @@ impl RedisTopologyDeclarer {
     /// Shard stream name for a sequenced topic at the given shard index.
     /// Format: `{main_queue}-seq-{shard_index}`
     pub fn shard_stream_name(main_queue: &str, shard: u16) -> String {
-        shard_stream_name(main_queue, shard)
+        format!("{main_queue}-seq-{shard}")
     }
 
     /// Hold queue sorted set key for a hold queue.
     /// Format: `{hold_queue_name}:pending`
     pub fn hold_set_name(hold_queue_name: &str) -> String {
-        hold_set_name(hold_queue_name)
+        format!("{hold_queue_name}:pending")
     }
 
     /// Declare all Redis structures for the given topology.
@@ -70,28 +54,27 @@ impl RedisTopologyDeclarer {
     /// Returns `ShoveError::Topology` if stream or group creation fails
     /// (other than BUSYGROUP, which is idempotent).
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        let mut conn = self.client.multiplexed_conn().await?;
+
         // Create main or shard streams with consumer groups.
         if let Some(seq) = topology.sequencing() {
             // Sequenced: create shard streams.
             for shard_idx in 0..seq.routing_shards() {
                 let stream_name = Self::shard_stream_name(topology.queue(), shard_idx);
-                self.ensure_stream_and_group(&stream_name).await?;
+                Self::ensure_stream_and_group(&mut conn, &stream_name, self.client.group()).await?;
             }
         } else {
             // Non-sequenced: create main stream.
-            self.ensure_stream_and_group(topology.queue()).await?;
+            Self::ensure_stream_and_group(&mut conn, topology.queue(), self.client.group()).await?;
         }
 
         // Create DLQ stream if present.
         if let Some(dlq) = topology.dlq() {
-            self.ensure_stream_and_group(dlq).await?;
+            Self::ensure_stream_and_group(&mut conn, dlq, self.client.group()).await?;
         }
 
-        // Hold queues: no-op (created on first ZADD by requeuer).
-        // Just verify the naming helpers work if called.
-        for _ in topology.hold_queues() {
-            // Names are constructed by requeuer; no Redis operations here.
-        }
+        // Hold queues are implemented as Redis Sorted Sets (ZSET), not streams.
+        // No XGROUP CREATE needed — the requeuer creates ZSET keys on first ZADD.
 
         Ok(())
     }
@@ -99,11 +82,15 @@ impl RedisTopologyDeclarer {
     /// Idempotently create a stream and consumer group.
     ///
     /// Runs `XGROUP CREATE {stream} {group} $ MKSTREAM`.
+    /// The `$` start-ID means the group only receives messages published *after*
+    /// creation, not replay of history. This is intentional for idempotent
+    /// topology re-declaration — we don't want old messages re-delivered.
     /// If the group already exists (BUSYGROUP), treats it as success.
-    async fn ensure_stream_and_group(&self, stream: &str) -> Result<()> {
-        let mut conn = self.client.multiplexed_conn().await?;
-        let group = self.client.group();
-
+    async fn ensure_stream_and_group(
+        conn: &mut crate::backends::redis::client::RedisConnection,
+        stream: &str,
+        group: &str,
+    ) -> Result<()> {
         // Build: XGROUP CREATE {stream} {group} $ MKSTREAM
         let mut cmd = redis::cmd("XGROUP");
         cmd.arg("CREATE")
@@ -116,7 +103,8 @@ impl RedisTopologyDeclarer {
         match conn.query::<()>(&mut cmd).await {
             Ok(_) => Ok(()),
             Err(ShoveError::Connection(e)) => {
-                // Check if it's a BUSYGROUP error (idempotent case).
+                // The client converts redis::RedisError to ShoveError::Connection(String),
+                // losing the typed error kind. A substring check is the only option here.
                 if e.contains("BUSYGROUP") {
                     Ok(())
                 } else {
