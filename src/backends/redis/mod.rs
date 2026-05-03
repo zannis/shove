@@ -6,14 +6,15 @@
 pub(super) mod constants;
 pub(super) mod client;
 mod topology;
+mod publisher;
 
 pub use client::{RedisClient, RedisConfig, RedisMode};
 pub use topology::RedisTopologyDeclarer;
+pub use publisher::{RedisPublisher, shard_for_key};
 
 // Sub-modules added in subsequent tasks:
 // mod autoscaler;
 // mod backend;
 // mod consumer;
 // mod consumer_group;
-// mod publisher;
 // mod requeue;
