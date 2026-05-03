@@ -8,7 +8,7 @@ use crate::error::{Result, ShoveError};
 use crate::topic::Topic;
 
 use super::client::RedisClient;
-use super::constants::{PAYLOAD_FIELD, X_SEQUENCE_KEY};
+use super::constants::{PAYLOAD_FIELD, X_SEQUENCE_KEY, DEFAULT_ROUTING_SHARDS};
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
@@ -17,6 +17,7 @@ use super::topology::RedisTopologyDeclarer;
 
 /// Map a sequence key to a shard index using FNV-1a 32-bit hash mod `routing_shards`.
 pub fn shard_for_key(key: &str, routing_shards: u16) -> u16 {
+    assert!(routing_shards > 0, "routing_shards must be > 0");
     let mut hash: u32 = 2_166_136_261;
     for byte in key.bytes() {
         hash ^= u32::from(byte);
@@ -51,18 +52,18 @@ impl RedisPublisher {
     ) -> Result<()> {
         let topology = T::topology();
         let payload =
-            serde_json::to_string(msg).map_err(|e| ShoveError::Serialization(e))?;
+            serde_json::to_string(msg).map_err(ShoveError::Serialization)?;
 
         // Determine stream name and optional sequence key.
         let (stream, sequence_key) = if let Some(key_fn) = T::SEQUENCE_KEY_FN {
             let seq_key = key_fn(msg);
-            let shard_idx = shard_for_key(
-                &seq_key,
-                topology
-                    .sequencing()
-                    .map(|s| s.routing_shards())
-                    .unwrap_or(8),
-            );
+            let routing_shards = topology
+                .sequencing()
+                .ok_or_else(|| ShoveError::Validation(
+                    "topic has SEQUENCE_KEY_FN but topology.sequencing() is None; declare with sequenced()".into()
+                ))?
+                .routing_shards();
+            let shard_idx = shard_for_key(&seq_key, routing_shards);
             let stream = RedisTopologyDeclarer::shard_stream_name(topology.queue(), shard_idx);
             (stream, Some(seq_key))
         } else {
@@ -99,13 +100,18 @@ impl RedisPublisher {
             .map_err(|e| ShoveError::Connection(format!("XADD to {stream} failed: {e}")))
     }
 
-    /// Publish pre-built fields to a named stream (used by consumer group
-    /// registry for requeue operations).
+    /// Publishes pre-built fields to a named stream. Each call targets a single key,
+    /// which is safe for Redis Cluster (single-slot XADD). Callers must NOT attempt
+    /// to XADD to multiple shard streams in a single MULTI/EXEC without hash tags.
     pub(super) async fn publish_to_stream(
         &self,
         stream: &str,
         fields: &[(&str, &str)],
     ) -> Result<()> {
+        if fields.is_empty() {
+            return Err(ShoveError::Topology("publish_to_stream: fields must not be empty".into()));
+        }
+
         let mut conn = self.client.multiplexed_conn().await?;
 
         let mut cmd = redis::cmd("XADD");

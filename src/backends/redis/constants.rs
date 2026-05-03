@@ -11,6 +11,8 @@ pub(super) const X_DEATH_REASON: &str = "x-death-reason";
 pub(super) const X_DEATH_COUNT: &str = "x-death-count";
 pub(super) const X_ORIGINAL_QUEUE: &str = "x-original-queue";
 
+/// Default number of FIFO routing shards when routing_shards() is not overridden.
+pub(super) const DEFAULT_ROUTING_SHARDS: u16 = 8;
 /// Default Redis consumer group name used when none is provided in ConsumerOptions.
 pub(super) const DEFAULT_GROUP: &str = "shove";
 /// BLOCK timeout for XREADGROUP calls (milliseconds). Short enough to check
