@@ -45,7 +45,7 @@ impl RedisConfig {
 // ---------------------------------------------------------------------------
 
 /// A single Redis connection, abstracting over standalone vs cluster transports.
-pub(super) enum RedisConnection {
+pub(crate) enum RedisConnection {
     /// Multiplexed standalone connection – safe for BLOCK commands with finite timeouts (BLOCK 2000).
     Standalone(redis::aio::MultiplexedConnection),
     /// Cluster connection – safe to share; BLOCK commands work the same way.
@@ -54,7 +54,7 @@ pub(super) enum RedisConnection {
 
 impl RedisConnection {
     /// Execute `cmd` and deserialize the response into `T`.
-    pub(super) async fn query<T: redis::FromRedisValue + Send>(
+    pub(crate) async fn query<T: redis::FromRedisValue + Send>(
         &mut self,
         cmd: &mut redis::Cmd,
     ) -> Result<T> {

@@ -1,14 +1,27 @@
 //! Hold queue requeuer for delayed message redelivery.
 //!
-//! This module implements a background task that polls Redis sorted sets
-//! (hold queues) for entries with due redelivery timestamps, deserializes them,
-//! re-adds them to their origin streams, and removes them from the hold queue.
+//! Hold queues are modelled as Redis Sorted Sets where:
+//!   key   = `{hold_queue_name}:pending`  (see `RedisTopologyDeclarer::hold_set_name`)
+//!   score = Unix timestamp in milliseconds at which the entry should be redelivered
+//!   value = JSON-serialized `HoldEntry`
+//!
+//! This task polls each hold set every `POLL_INTERVAL`, moves all entries
+//! whose score ≤ now_ms back to the appropriate stream via XADD, and removes
+//! them from the set only after successful XADD (at-least-once delivery).
+//!
+//! ## Concurrent requeuer instances
+//!
+//! This module provides **at-least-once** redelivery semantics. If two requeuer
+//! instances run concurrently (e.g., during a rolling restart), both may XADD
+//! the same entry before either ZREM completes, resulting in duplicate delivery.
+//! This is expected behaviour: consumers must be idempotent, which is already
+//! required by the broader shove at-least-once contract.
 
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{Result, ShoveError};
+use crate::error::Result;
 use super::client::{RedisClient, RedisConnection};
 use super::topology::RedisTopologyDeclarer;
 use super::constants::{REQUEUE_POLL_MS, REQUEUE_BATCH_SIZE};
@@ -17,7 +30,7 @@ use super::constants::{REQUEUE_POLL_MS, REQUEUE_BATCH_SIZE};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Interval between requeue polling ticks (milliseconds).
+/// Interval between requeue polling ticks.
 const POLL_INTERVAL: Duration = Duration::from_millis(REQUEUE_POLL_MS);
 
 // ---------------------------------------------------------------------------
@@ -30,7 +43,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(REQUEUE_POLL_MS);
 /// equal to the Unix timestamp (in milliseconds) when the message should
 /// be redelivered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HoldEntry {
+pub(crate) struct HoldEntry {
     /// Target stream to XADD back into (the main stream or shard stream).
     pub stream: String,
     /// All fields (payload + metadata) to restore on redeliver, as key-value pairs.
@@ -46,28 +59,20 @@ pub struct HoldEntry {
 /// Stores the entry as JSON in the sorted set keyed by `hold_queue_name`,
 /// with a score equal to the current time plus `delay`.
 ///
-/// # Arguments
-///
-/// * `conn` - Active Redis connection
-/// * `hold_queue_name` - Name of the hold queue (e.g., "orders-hold-5s")
-/// * `entry` - The message entry containing stream and fields
-/// * `delay` - How long to wait before redelivery
-///
 /// # Errors
 ///
-/// Returns `ShoveError::Serialization` if JSON encoding fails,
-/// or `ShoveError::Connection` if Redis operations fail.
-pub async fn enqueue_hold(
+/// Returns an error if JSON encoding fails or the Redis ZADD fails.
+pub(crate) async fn enqueue_hold(
     conn: &mut RedisConnection,
     hold_queue_name: &str,
     entry: HoldEntry,
     delay: Duration,
 ) -> Result<()> {
     let set_key = RedisTopologyDeclarer::hold_set_name(hold_queue_name);
-    let redeliver_at_ms = now_ms() + delay.as_millis() as u64;
+    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    let redeliver_at_ms = now_ms().saturating_add(delay_ms);
     let value = serde_json::to_string(&entry)?;
 
-    // ZADD key redeliver_at_ms value
     let mut cmd = redis::cmd("ZADD");
     cmd.arg(&set_key)
         .arg(redeliver_at_ms as f64)
@@ -80,41 +85,42 @@ pub async fn enqueue_hold(
 /// Spawn a background requeuer task that periodically drains due entries
 /// from all hold sets back to their target streams.
 ///
-/// The task polls all hold queues on a 500ms interval, looking for entries
-/// with scores (timestamps) <= current time. For each due entry, it:
-/// 1. Deserializes the JSON
-/// 2. XADDs the message back to the origin stream
-/// 3. Removes the entry from the hold set (only on successful XADD)
+/// The task acquires one connection and reuses it across poll ticks. On
+/// connection error it attempts to reconnect before the next tick. The task
+/// runs until `shutdown` is cancelled.
 ///
-/// The task runs until `shutdown` is cancelled. Deserialization and XADD
-/// failures are logged as warnings but do not stop the requeuer.
-///
-/// # Arguments
-///
-/// * `client` - Redis client (cloned for background task)
-/// * `hold_queue_names` - List of hold queue names to monitor
-/// * `shutdown` - Token to signal task cancellation
-///
-/// # Returns
-///
-/// A `tokio::task::JoinHandle` that completes when the task exits.
-/// Abort the handle to stop the requeuer.
-pub fn spawn_requeuer(
+/// **At-least-once semantics:** see module-level documentation for the
+/// concurrent-instance duplicate-delivery note.
+pub(crate) fn spawn_requeuer(
     client: RedisClient,
     hold_queue_names: Vec<String>,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Acquire one connection for the lifetime of this task.
+        let mut conn = match client.multiplexed_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("requeuer: failed to acquire initial connection: {}", e);
+                return;
+            }
+        };
+
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => {
-                    break;
-                }
+                _ = shutdown.cancelled() => break,
                 _ = tokio::time::sleep(POLL_INTERVAL) => {
-                    // Poll all hold sets on this tick
+                    let mut needs_reconnect = false;
                     for hold_queue_name in &hold_queue_names {
-                        if let Err(e) = poll_hold_set(&client, hold_queue_name).await {
-                            tracing::warn!("failed to poll hold set {}: {}", hold_queue_name, e);
+                        if let Err(e) = poll_hold_set(&mut conn, hold_queue_name).await {
+                            tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
+                            needs_reconnect = true;
+                        }
+                    }
+                    if needs_reconnect {
+                        match client.multiplexed_conn().await {
+                            Ok(new_conn) => conn = new_conn,
+                            Err(e) => tracing::warn!("requeuer: reconnect failed: {}", e),
                         }
                     }
                 }
@@ -127,51 +133,58 @@ pub fn spawn_requeuer(
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Current Unix timestamp in milliseconds.
+/// Current Unix timestamp in milliseconds, saturating at `u64::MAX`.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Poll a single hold set for due entries and requeue them.
 ///
-/// Fetches up to 200 entries with score <= now_ms, deserializes each,
-/// XADDs to the origin stream, and removes from the hold set.
-/// Logs warnings for deserialization and XADD failures but continues.
-async fn poll_hold_set(client: &RedisClient, hold_queue_name: &str) -> Result<()> {
-    let mut conn = client.multiplexed_conn().await?;
+/// Fetches up to `REQUEUE_BATCH_SIZE` entries with score ≤ now_ms,
+/// XADDs each to its origin stream, and removes it from the hold set only on
+/// success. Corrupt entries (JSON parse failures) are removed from the set to
+/// avoid perpetual re-fetch and logged as warnings.
+async fn poll_hold_set(conn: &mut RedisConnection, hold_queue_name: &str) -> Result<()> {
     let set_key = RedisTopologyDeclarer::hold_set_name(hold_queue_name);
     let now = now_ms();
 
-    // ZRANGEBYSCORE key 0 {now} LIMIT 0 200
     let entries: Vec<String> = conn
-        .query(&mut redis::cmd("ZRANGEBYSCORE")
-            .arg(&set_key)
-            .arg(0f64)
-            .arg(now as f64)
-            .arg("LIMIT")
-            .arg(0i64)
-            .arg(REQUEUE_BATCH_SIZE))
+        .query(
+            redis::cmd("ZRANGEBYSCORE")
+                .arg(&set_key)
+                .arg(0f64)
+                .arg(now as f64)
+                .arg("LIMIT")
+                .arg(0i64)
+                .arg(REQUEUE_BATCH_SIZE),
+        )
         .await
         .unwrap_or_default();
 
     for raw_json in entries {
-        // Deserialize the HoldEntry
         let entry: HoldEntry = match serde_json::from_str(&raw_json) {
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!(
-                    "failed to deserialize hold entry in {}: {}",
+                    "requeuer: corrupt hold entry in {} (removing): {}",
                     hold_queue_name,
                     e
                 );
+                // Remove corrupt entry so it doesn't spam warnings on every tick.
+                let _: i64 = conn
+                    .query(redis::cmd("ZREM").arg(&set_key).arg(&raw_json))
+                    .await
+                    .unwrap_or(0);
                 continue;
             }
         };
 
-        // XADD {entry.stream} * field1 val1 field2 val2 ...
         let mut cmd = redis::cmd("XADD");
         cmd.arg(&entry.stream).arg("*");
         for (k, v) in &entry.fields {
@@ -180,12 +193,13 @@ async fn poll_hold_set(client: &RedisClient, hold_queue_name: &str) -> Result<()
 
         match conn.query::<String>(&mut cmd).await {
             Ok(_) => {
-                // Only remove from hold set on successful XADD
-                let mut del_cmd = redis::cmd("ZREM");
-                del_cmd.arg(&set_key).arg(&raw_json);
-                if let Err(e) = conn.query::<i64>(&mut del_cmd).await {
+                // Remove from the sorted set only after successful XADD.
+                if let Err(e) = conn
+                    .query::<i64>(redis::cmd("ZREM").arg(&set_key).arg(&raw_json))
+                    .await
+                {
                     tracing::warn!(
-                        "failed to remove hold entry from {}: {}",
+                        "requeuer: ZREM failed for entry in {}: {}",
                         hold_queue_name,
                         e
                     );
@@ -193,7 +207,7 @@ async fn poll_hold_set(client: &RedisClient, hold_queue_name: &str) -> Result<()
             }
             Err(e) => {
                 tracing::warn!(
-                    "failed to XADD to {} during requeue: {}",
+                    "requeuer: XADD failed for stream {}: {}",
                     entry.stream,
                     e
                 );
@@ -224,7 +238,8 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.stream, "orders");
-        assert_eq!(decoded.fields.len(), 2);
+        assert_eq!(decoded.fields[0], ("payload".into(), "{}".into()));
+        assert_eq!(decoded.fields[1], ("x-retry-count".into(), "1".into()));
     }
 
     #[test]
