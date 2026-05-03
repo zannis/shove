@@ -86,7 +86,7 @@ bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
 rdkafka = { version = "0.39", features = ["tokio"], optional = true }
 dashmap = { version = "6", optional = true }
-redis = { version = "0.27", features = ["tokio-comp", "streams", "connection-manager", "tokio-rustls-comp", "cluster-async"], optional = true }
+redis = { version = "1", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"], optional = true }
 metrics = { version = "0.24", optional = true }
 
 [target.'cfg(windows)'.dependencies]

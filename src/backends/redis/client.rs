@@ -1,8 +1,5 @@
 //! Redis client abstraction supporting standalone, TLS (`rediss://`), and cluster modes.
 
-// redis::aio::Connection is deprecated in 0.27 but remains the only way to get a
-// non-multiplexed (dedicated) async connection required for BLOCK commands on standalone.
-#![allow(deprecated)]
 // Items are used by subsequent tasks (publisher, consumer, topology…).
 #![allow(dead_code)]
 
@@ -36,17 +33,21 @@ pub struct RedisConfig {
     pub group: Option<String>,
 }
 
+impl RedisConfig {
+    /// Return the resolved consumer group name, defaulting to `"shove"` if not set.
+    pub fn resolved_group(&self) -> &str {
+        self.group.as_deref().unwrap_or(DEFAULT_GROUP)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal connection enum
 // ---------------------------------------------------------------------------
 
 /// A single Redis connection, abstracting over standalone vs cluster transports.
 pub(super) enum RedisConnection {
-    /// Multiplexed standalone connection – for non-blocking ops.
+    /// Multiplexed standalone connection – safe for BLOCK commands with finite timeouts (BLOCK 2000).
     Standalone(redis::aio::MultiplexedConnection),
-    /// Dedicated (non-multiplexed) standalone connection – required for BLOCK commands
-    /// so they don't serialize the shared multiplexed connection.
-    StandaloneDedicated(redis::aio::Connection),
     /// Cluster connection – safe to share; BLOCK commands work the same way.
     Cluster(redis::cluster_async::ClusterConnection),
 }
@@ -59,10 +60,6 @@ impl RedisConnection {
     ) -> Result<T> {
         match self {
             RedisConnection::Standalone(conn) => cmd
-                .query_async(conn)
-                .await
-                .map_err(|e| ShoveError::Connection(e.to_string())),
-            RedisConnection::StandaloneDedicated(conn) => cmd
                 .query_async(conn)
                 .await
                 .map_err(|e| ShoveError::Connection(e.to_string())),
@@ -101,9 +98,7 @@ impl RedisClient {
     /// Build a [`RedisClient`] and eagerly verify connectivity by opening a
     /// test connection.
     pub(super) async fn connect(config: RedisConfig) -> Result<Self> {
-        let group = config
-            .group
-            .unwrap_or_else(|| DEFAULT_GROUP.to_string());
+        let group = config.resolved_group().to_owned();
 
         let inner = match config.mode {
             RedisMode::Standalone { url } => {
@@ -116,7 +111,10 @@ impl RedisClient {
                     .map_err(|e| ShoveError::Connection(format!("standalone ping failed: {e}")))?;
                 ClientInner::Standalone(client)
             }
-            RedisMode::Cluster { urls } => {
+            RedisMode::Cluster { ref urls } => {
+                if urls.is_empty() {
+                    return Err(ShoveError::Connection("cluster URLs must not be empty".into()));
+                }
                 let nodes: Vec<&str> = urls.iter().map(String::as_str).collect();
                 let client = redis::cluster::ClusterClient::new(nodes)
                     .map_err(|e| ShoveError::Connection(e.to_string()))?;
@@ -139,47 +137,26 @@ impl RedisClient {
     /// such as XADD, XACK, ZADD, and XLEN.
     pub(super) async fn multiplexed_conn(&self) -> Result<RedisConnection> {
         match self.inner.as_ref() {
-            ClientInner::Standalone(client) => {
-                let conn = client
-                    .get_multiplexed_async_connection()
-                    .await
-                    .map_err(|e| ShoveError::Connection(e.to_string()))?;
-                Ok(RedisConnection::Standalone(conn))
-            }
-            ClientInner::Cluster(client) => {
-                let conn = client
-                    .get_async_connection()
-                    .await
-                    .map_err(|e| ShoveError::Connection(e.to_string()))?;
-                Ok(RedisConnection::Cluster(conn))
-            }
+            ClientInner::Standalone(client) => client
+                .get_multiplexed_async_connection()
+                .await
+                .map(RedisConnection::Standalone)
+                .map_err(|e| ShoveError::Connection(e.to_string())),
+            ClientInner::Cluster(client) => client
+                .get_async_connection()
+                .await
+                .map(RedisConnection::Cluster)
+                .map_err(|e| ShoveError::Connection(e.to_string())),
         }
     }
 
-    /// Return a dedicated (non-shared) connection suitable for consumer loops
-    /// that use BLOCK commands (e.g. XREADGROUP with `BLOCK`).
+    /// Return a dedicated connection suitable for consumer loops that use BLOCK commands
+    /// (e.g. XREADGROUP with `BLOCK`).
     ///
-    /// For standalone Redis this is a separate, non-multiplexed connection so
-    /// that long-blocking calls don't block other in-flight commands.
-    /// For cluster mode, `get_async_connection()` already returns an independent
-    /// connection handle, so the same approach is used.
+    /// For standalone, `MultiplexedConnection` is safe for BLOCK commands with finite timeouts
+    /// (BLOCK 2000). For cluster, each consumer task gets its own `ClusterConnection` handle.
     pub(super) async fn dedicated_conn(&self) -> Result<RedisConnection> {
-        match self.inner.as_ref() {
-            ClientInner::Standalone(client) => {
-                let conn = client
-                    .get_async_connection()
-                    .await
-                    .map_err(|e| ShoveError::Connection(e.to_string()))?;
-                Ok(RedisConnection::StandaloneDedicated(conn))
-            }
-            ClientInner::Cluster(client) => {
-                let conn = client
-                    .get_async_connection()
-                    .await
-                    .map_err(|e| ShoveError::Connection(e.to_string()))?;
-                Ok(RedisConnection::Cluster(conn))
-            }
-        }
+        self.multiplexed_conn().await
     }
 
     /// The consumer group name shared by all consumers on this client.
@@ -198,26 +175,24 @@ mod tests {
 
     #[test]
     fn config_default_group() {
-        let config = RedisConfig {
+        let cfg = RedisConfig {
             mode: RedisMode::Standalone {
                 url: "redis://127.0.0.1:6379/".to_string(),
             },
             group: None,
         };
-        let group = config.group.unwrap_or_else(|| DEFAULT_GROUP.to_string());
-        assert_eq!(group, "shove");
+        assert_eq!(cfg.resolved_group(), "shove");
     }
 
     #[test]
     fn config_custom_group() {
-        let config = RedisConfig {
+        let cfg = RedisConfig {
             mode: RedisMode::Standalone {
                 url: "redis://127.0.0.1:6379/".to_string(),
             },
             group: Some("myapp".to_string()),
         };
-        let group = config.group.unwrap_or_else(|| DEFAULT_GROUP.to_string());
-        assert_eq!(group, "myapp");
+        assert_eq!(cfg.resolved_group(), "myapp");
     }
 
     #[test]
