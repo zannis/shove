@@ -20,3 +20,7 @@ pub(super) const DEFAULT_GROUP: &str = "shove";
 pub(super) const BLOCK_MS: u64 = 2_000;
 /// Number of pending entries reclaimed per XAUTOCLAIM call.
 pub(super) const AUTOCLAIM_COUNT: usize = 100;
+/// Poll interval for the hold queue requeuer (milliseconds).
+pub(super) const REQUEUE_POLL_MS: u64 = 500;
+/// Maximum number of entries to fetch per ZRANGEBYSCORE call in the requeuer.
+pub(super) const REQUEUE_BATCH_SIZE: i64 = 200;
