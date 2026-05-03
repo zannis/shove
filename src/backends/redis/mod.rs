@@ -8,14 +8,15 @@ pub(super) mod client;
 mod topology;
 mod publisher;
 mod requeue;
+mod consumer;
 
 pub use client::{RedisClient, RedisConfig, RedisMode};
 pub use topology::RedisTopologyDeclarer;
 pub use publisher::{RedisPublisher, shard_for_key};
 pub(crate) use requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
+pub use consumer::RedisConsumer;
 
 // Sub-modules added in subsequent tasks:
 // mod autoscaler;
 // mod backend;
-// mod consumer;
 // mod consumer_group;
