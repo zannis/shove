@@ -1,0 +1,4 @@
+# Retry docker-backed integration tests once to handle occasional
+# container startup races under load.
+[profile.default]
+retries = 1

@@ -52,12 +52,24 @@ async fn redis_url() -> &'static str {
 
 async fn make_broker(group: &str) -> Broker<Redis> {
     let url = redis_url().await;
-    Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.to_owned() },
-        group: Some(group.into()),
-    })
-    .await
-    .expect("connect to Redis")
+    // Retry a few times — testcontainers occasionally returns before Redis
+    // is fully accepting connections, especially when multiple containers
+    // start in parallel under nextest.
+    for attempt in 0u32..5 {
+        match Broker::<Redis>::new(RedisConfig {
+            mode: RedisMode::Standalone { url: url.to_owned() },
+            group: Some(group.into()),
+        })
+        .await
+        {
+            Ok(b) => return b,
+            Err(_) if attempt < 4 => {
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+            }
+            Err(e) => panic!("connect to Redis after retries: {e}"),
+        }
+    }
+    unreachable!()
 }
 
 async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
