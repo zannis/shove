@@ -7,7 +7,7 @@ use crate::backend::publisher::PublisherImpl;
 use crate::error::{Result, ShoveError};
 use crate::topic::Topic;
 
-use super::client::RedisClient;
+use super::client::{RedisClient, RedisConnection};
 use super::constants::{PAYLOAD_FIELD, X_SEQUENCE_KEY, DEFAULT_ROUTING_SHARDS};
 use super::topology::RedisTopologyDeclarer;
 
@@ -46,16 +46,16 @@ impl RedisPublisher {
     }
 
     /// Core XADD helper — resolves the stream name, serializes, and publishes.
+    /// Accepts an optional pre-acquired connection so `publish_batch` can reuse one.
     async fn publish_inner<T: Topic>(
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
+        conn: Option<&mut RedisConnection>,
     ) -> Result<()> {
         let topology = T::topology();
-        let payload =
-            serde_json::to_string(msg).map_err(ShoveError::Serialization)?;
+        let payload = serde_json::to_string(msg).map_err(ShoveError::Serialization)?;
 
-        // Determine stream name and optional sequence key.
         let (stream, sequence_key) = if let Some(key_fn) = T::SEQUENCE_KEY_FN {
             let seq_key = key_fn(msg);
             let routing_shards = topology
@@ -71,34 +71,15 @@ impl RedisPublisher {
             (topology.queue().to_owned(), None)
         };
 
-        self.xadd_fields(&stream, &payload, &headers, sequence_key.as_deref())
-            .await
-    }
+        let mut owned;
+        let c: &mut RedisConnection = if let Some(c) = conn {
+            c
+        } else {
+            owned = self.client.multiplexed_conn().await?;
+            &mut owned
+        };
 
-    /// Low-level XADD: build and execute the command.
-    async fn xadd_fields(
-        &self,
-        stream: &str,
-        payload: &str,
-        headers: &HashMap<String, String>,
-        sequence_key: Option<&str>,
-    ) -> Result<()> {
-        let mut conn = self.client.multiplexed_conn().await?;
-
-        let mut cmd = redis::cmd("XADD");
-        cmd.arg(stream).arg("*");
-        cmd.arg(PAYLOAD_FIELD).arg(payload);
-        for (k, v) in headers {
-            cmd.arg(k).arg(v);
-        }
-        if let Some(seq_key) = sequence_key {
-            cmd.arg(X_SEQUENCE_KEY).arg(seq_key);
-        }
-
-        conn.query::<redis::Value>(&mut cmd)
-            .await
-            .map(|_| ())
-            .map_err(|e| ShoveError::Connection(format!("XADD to {stream} failed: {e}")))
+        xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await
     }
 
 }
@@ -112,7 +93,7 @@ impl PublisherImpl for RedisPublisher {
         &self,
         msg: &T::Message,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        self.publish_inner::<T>(msg, HashMap::new())
+        self.publish_inner::<T>(msg, HashMap::new(), None)
     }
 
     fn publish_with_headers<T: Topic>(
@@ -120,7 +101,7 @@ impl PublisherImpl for RedisPublisher {
         msg: &T::Message,
         headers: HashMap<String, String>,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        self.publish_inner::<T>(msg, headers)
+        self.publish_inner::<T>(msg, headers, None)
     }
 
     fn publish_batch<T: Topic>(
@@ -128,9 +109,13 @@ impl PublisherImpl for RedisPublisher {
         msgs: &[T::Message],
     ) -> impl std::future::Future<Output = (u64, Result<()>)> + Send {
         async move {
+            let mut conn = match self.client.multiplexed_conn().await {
+                Ok(c) => c,
+                Err(e) => return (0, Err(e)),
+            };
             let mut succeeded: u64 = 0;
             for msg in msgs {
-                match self.publish_inner::<T>(msg, HashMap::new()).await {
+                match self.publish_inner::<T>(msg, HashMap::new(), Some(&mut conn)).await {
                     Ok(()) => succeeded += 1,
                     Err(e) => return (succeeded, Err(e)),
                 }
@@ -138,6 +123,33 @@ impl PublisherImpl for RedisPublisher {
             (succeeded, Ok(()))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Execute a single XADD on an already-open connection.
+async fn xadd_on_conn(
+    conn: &mut RedisConnection,
+    stream: &str,
+    payload: &str,
+    headers: &HashMap<String, String>,
+    sequence_key: Option<&str>,
+) -> Result<()> {
+    let mut cmd = redis::cmd("XADD");
+    cmd.arg(stream).arg("*");
+    cmd.arg(PAYLOAD_FIELD).arg(payload);
+    for (k, v) in headers {
+        cmd.arg(k).arg(v);
+    }
+    if let Some(seq_key) = sequence_key {
+        cmd.arg(X_SEQUENCE_KEY).arg(seq_key);
+    }
+    conn.query::<redis::Value>(&mut cmd)
+        .await
+        .map(|_| ())
+        .map_err(|e| ShoveError::Connection(format!("XADD to {stream} failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------

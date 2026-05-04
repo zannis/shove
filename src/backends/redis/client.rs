@@ -1,6 +1,5 @@
 //! Redis client abstraction supporting standalone, TLS (`rediss://`), and cluster modes.
 
-// Items are used by subsequent tasks (publisher, consumer, topology…).
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -104,7 +103,6 @@ impl RedisClient {
             RedisMode::Standalone { url } => {
                 let client = redis::Client::open(url.as_str())
                     .map_err(|e| ShoveError::Connection(e.to_string()))?;
-                // Eagerly verify connectivity.
                 client
                     .get_multiplexed_async_connection()
                     .await

@@ -96,20 +96,7 @@ impl TopologyImpl for RedisTopologyDeclarer {
 }
 
 // ---------------------------------------------------------------------------
-// AutoscalerBackendImpl — trait has no methods in Phase 4; already impl'd
-// in autoscaler.rs; do NOT duplicate.
-// ---------------------------------------------------------------------------
-
-// (AutoscalerBackendImpl for RedisAutoscalerBackend is in autoscaler.rs)
-
-// ---------------------------------------------------------------------------
-// QueueStatsProviderImpl — already impl'd in autoscaler.rs; do NOT duplicate.
-// ---------------------------------------------------------------------------
-
-// (QueueStatsProviderImpl for RedisQueueStatsProvider is in autoscaler.rs)
-
-// ---------------------------------------------------------------------------
-// RegistryImpl — thin forward over the existing inherent methods
+// RegistryImpl
 // ---------------------------------------------------------------------------
 
 impl RegistryImpl for RedisConsumerGroupRegistry {

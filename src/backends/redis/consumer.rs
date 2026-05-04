@@ -268,28 +268,27 @@ where
     let topic_name = topology.queue();
     let consumer_group = options.consumer_group.as_deref();
 
-    // Idle threshold for XAUTOCLAIM — use handler_timeout as the basis so that
-    // messages claimed by a crashed consumer are reclaimed after roughly the
-    // same interval as a handler timeout.
+    // Pre-compute metric label arcs once — reused cheaply for every message.
+    let topic_arc: Arc<str> = Arc::from(topic_name);
+    let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);
+
     let idle_ms = options
         .handler_timeout
         .unwrap_or(Duration::from_secs(30))
         .as_millis() as u64;
 
-    // Reclaim stale pending entries from prior crashed consumers on startup.
-    if let Ok(mut conn) = client.dedicated_conn().await {
-        let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
-    }
-
     let mut conn = client.dedicated_conn().await?;
+    // Reclaim stale pending entries from prior crashed consumers on startup.
+    let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
     let prefetch = options.prefetch_count.max(1) as usize;
+    let autoclaim_interval = Duration::from_millis(idle_ms.max(30_000));
+    let mut last_autoclaim = std::time::Instant::now();
 
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        // XREADGROUP GROUP {group} {consumer} COUNT {prefetch} BLOCK {BLOCK_MS} STREAMS {stream} >
         let raw_reply: redis::Value = match conn
             .query(
                 redis::cmd("XREADGROUP")
@@ -396,8 +395,6 @@ where
 
             let handler_clone = Arc::clone(&handler);
             let ctx_clone = Arc::clone(&ctx);
-            let topic_arc: Arc<str> = Arc::from(topic_name);
-            let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);
 
             let _inflight = metrics::InflightGuard::new(topic_arc.clone(), group_arc.clone());
             let start = std::time::Instant::now();
@@ -460,8 +457,10 @@ where
             .await;
         }
 
-        // Periodically reclaim stale PEL entries.
-        let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
+        if last_autoclaim.elapsed() >= autoclaim_interval {
+            let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
+            last_autoclaim = std::time::Instant::now();
+        }
     }
 
     Ok(())

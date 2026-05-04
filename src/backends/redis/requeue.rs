@@ -74,7 +74,7 @@ pub(crate) async fn enqueue_hold(
     let value = serde_json::to_string(&entry)?;
 
     let mut cmd = redis::cmd("ZADD");
-    cmd.arg(&set_key)
+    cmd.arg(set_key)
         .arg(redeliver_at_ms as f64)
         .arg(&value);
 
@@ -96,8 +96,13 @@ pub(crate) fn spawn_requeuer(
     hold_queue_names: Vec<String>,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    // Pre-compute the sorted-set key for each hold queue once.
+    let hold_set_keys: Vec<String> = hold_queue_names
+        .iter()
+        .map(|n| RedisTopologyDeclarer::hold_set_name(n))
+        .collect();
+
     tokio::spawn(async move {
-        // Acquire one connection for the lifetime of this task.
         let mut conn = match client.multiplexed_conn().await {
             Ok(c) => c,
             Err(e) => {
@@ -111,8 +116,8 @@ pub(crate) fn spawn_requeuer(
                 _ = shutdown.cancelled() => break,
                 _ = tokio::time::sleep(POLL_INTERVAL) => {
                     let mut needs_reconnect = false;
-                    for hold_queue_name in &hold_queue_names {
-                        if let Err(e) = poll_hold_set(&mut conn, hold_queue_name).await {
+                    for (hold_queue_name, set_key) in hold_queue_names.iter().zip(hold_set_keys.iter()) {
+                        if let Err(e) = poll_hold_set(&mut conn, hold_queue_name, set_key).await {
                             tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
                             needs_reconnect = true;
                         }
@@ -150,14 +155,13 @@ fn now_ms() -> u64 {
 /// XADDs each to its origin stream, and removes it from the hold set only on
 /// success. Corrupt entries (JSON parse failures) are removed from the set to
 /// avoid perpetual re-fetch and logged as warnings.
-async fn poll_hold_set(conn: &mut RedisConnection, hold_queue_name: &str) -> Result<()> {
-    let set_key = RedisTopologyDeclarer::hold_set_name(hold_queue_name);
+async fn poll_hold_set(conn: &mut RedisConnection, hold_queue_name: &str, set_key: &str) -> Result<()> {
     let now = now_ms();
 
     let entries: Vec<String> = conn
         .query(
             redis::cmd("ZRANGEBYSCORE")
-                .arg(&set_key)
+                .arg(set_key)
                 .arg(0f64)
                 .arg(now as f64)
                 .arg("LIMIT")
@@ -176,9 +180,8 @@ async fn poll_hold_set(conn: &mut RedisConnection, hold_queue_name: &str) -> Res
                     hold_queue_name,
                     e
                 );
-                // Remove corrupt entry so it doesn't spam warnings on every tick.
                 let _: i64 = conn
-                    .query(redis::cmd("ZREM").arg(&set_key).arg(&raw_json))
+                    .query(redis::cmd("ZREM").arg(set_key).arg(&raw_json))
                     .await
                     .unwrap_or(0);
                 continue;
@@ -193,9 +196,8 @@ async fn poll_hold_set(conn: &mut RedisConnection, hold_queue_name: &str) -> Res
 
         match conn.query::<String>(&mut cmd).await {
             Ok(_) => {
-                // Remove from the sorted set only after successful XADD.
                 if let Err(e) = conn
-                    .query::<i64>(redis::cmd("ZREM").arg(&set_key).arg(&raw_json))
+                    .query::<i64>(redis::cmd("ZREM").arg(set_key).arg(&raw_json))
                     .await
                 {
                     tracing::warn!(
@@ -228,18 +230,19 @@ mod tests {
 
     #[test]
     fn hold_entry_roundtrips() {
+        use super::super::constants::{PAYLOAD_FIELD, X_RETRY_COUNT};
         let entry = HoldEntry {
             stream: "orders".into(),
             fields: vec![
-                ("payload".into(), "{}".into()),
-                ("x-retry-count".into(), "1".into()),
+                (PAYLOAD_FIELD.into(), "{}".into()),
+                (X_RETRY_COUNT.into(), "1".into()),
             ],
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.stream, "orders");
-        assert_eq!(decoded.fields[0], ("payload".into(), "{}".into()));
-        assert_eq!(decoded.fields[1], ("x-retry-count".into(), "1".into()));
+        assert_eq!(decoded.fields[0], (PAYLOAD_FIELD.into(), "{}".into()));
+        assert_eq!(decoded.fields[1], (X_RETRY_COUNT.into(), "1".into()));
     }
 
     #[test]

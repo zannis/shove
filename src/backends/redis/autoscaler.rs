@@ -38,25 +38,27 @@ impl RedisQueueStatsProvider {
     /// Fetch current stats for `queue` using XLEN (total entries) and
     /// XPENDING (PEL / in-flight count).
     pub async fn get_queue_stats(&self, queue: &str) -> Result<RedisQueueStats> {
-        let mut conn = self.client.multiplexed_conn().await?;
         let group = self.client.group().to_owned();
+        let client = self.client.clone();
+        let client2 = self.client.clone();
+        let group2 = group.clone();
+        let queue2 = queue.to_owned();
 
-        // XLEN {queue} — total entries in the stream.
-        let stream_len: u64 = conn
-            .query(redis::cmd("XLEN").arg(queue))
-            .await
-            .map_err(|e| ShoveError::Connection(format!("XLEN failed: {e}")))?;
-
-        // XPENDING {queue} {group} - + 1 — returns summary: [count, min-id, max-id, consumers].
-        // We use the summary form (no IDLE / consumer filter) to get the total PEL size.
-        let pending_reply: redis::Value = conn
-            .query(
-                redis::cmd("XPENDING")
-                    .arg(queue)
-                    .arg(&group),
-            )
-            .await
-            .unwrap_or(redis::Value::Nil);
+        // Run XLEN and XPENDING concurrently — two independent reads, no causal dependency.
+        let (stream_len, pending_reply) = tokio::try_join!(
+            async move {
+                let mut conn = client.multiplexed_conn().await?;
+                conn.query::<u64>(redis::cmd("XLEN").arg(queue))
+                    .await
+                    .map_err(|e| ShoveError::Connection(format!("XLEN failed: {e}")))
+            },
+            async move {
+                let mut conn = client2.multiplexed_conn().await?;
+                conn.query::<redis::Value>(redis::cmd("XPENDING").arg(&queue2).arg(&group2))
+                    .await
+                    .map_err(|e| ShoveError::Connection(format!("XPENDING failed: {e}")))
+            }
+        )?;
 
         let in_flight: u64 = match &pending_reply {
             redis::Value::Array(parts) => {

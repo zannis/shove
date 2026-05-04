@@ -56,15 +56,12 @@ impl RedisTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
         let mut conn = self.client.multiplexed_conn().await?;
 
-        // Create main or shard streams with consumer groups.
         if let Some(seq) = topology.sequencing() {
-            // Sequenced: create shard streams.
             for shard_idx in 0..seq.routing_shards() {
                 let stream_name = Self::shard_stream_name(topology.queue(), shard_idx);
                 Self::ensure_stream_and_group(&mut conn, &stream_name, self.client.group()).await?;
             }
         } else {
-            // Non-sequenced: create main stream.
             Self::ensure_stream_and_group(&mut conn, topology.queue(), self.client.group()).await?;
         }
 
@@ -73,8 +70,7 @@ impl RedisTopologyDeclarer {
             Self::ensure_stream_and_group(&mut conn, dlq, self.client.group()).await?;
         }
 
-        // Hold queues are implemented as Redis Sorted Sets (ZSET), not streams.
-        // No XGROUP CREATE needed — the requeuer creates ZSET keys on first ZADD.
+        // Hold queues are ZSET keys — no XGROUP CREATE needed; requeuer creates them on first ZADD.
 
         Ok(())
     }
