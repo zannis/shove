@@ -12,7 +12,7 @@ use crate::backend::consumer::ConsumerImpl;
 use crate::backend::ConsumerOptionsInner;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
-use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
