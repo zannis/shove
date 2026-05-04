@@ -149,4 +149,56 @@ mod tests {
         let ready = stream_len.saturating_sub(in_flight);
         assert_eq!(ready, 0);
     }
+
+    /// Helper that mirrors the XPENDING-reply parsing inside `get_queue_stats`.
+    fn parse_xpending_in_flight(reply: &redis::Value) -> u64 {
+        match reply {
+            redis::Value::Array(parts) => {
+                if let Some(redis::Value::Int(n)) = parts.first() {
+                    *n as u64
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn xpending_reply_extracts_in_flight_count() {
+        // XPENDING summary reply: [<count>, <min-id>, <max-id>, [...consumers]]
+        let reply = redis::Value::Array(vec![
+            redis::Value::Int(7),
+            redis::Value::BulkString(b"1-0".to_vec()),
+            redis::Value::BulkString(b"99-0".to_vec()),
+        ]);
+        assert_eq!(parse_xpending_in_flight(&reply), 7);
+    }
+
+    #[test]
+    fn xpending_empty_array_returns_zero() {
+        let reply = redis::Value::Array(vec![]);
+        assert_eq!(parse_xpending_in_flight(&reply), 0);
+    }
+
+    #[test]
+    fn xpending_non_int_first_element_returns_zero() {
+        let reply = redis::Value::Array(vec![
+            redis::Value::BulkString(b"unexpected".to_vec()),
+        ]);
+        assert_eq!(parse_xpending_in_flight(&reply), 0);
+    }
+
+    #[test]
+    fn xpending_nil_reply_returns_zero() {
+        assert_eq!(parse_xpending_in_flight(&redis::Value::Nil), 0);
+    }
+
+    #[test]
+    fn messages_ready_is_stream_len_minus_in_flight() {
+        let stream_len: u64 = 20;
+        let in_flight: u64 = 5;
+        let ready = stream_len.saturating_sub(in_flight);
+        assert_eq!(ready, 15);
+    }
 }

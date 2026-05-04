@@ -824,12 +824,6 @@ mod tests {
 
     #[test]
     fn parse_xreadgroup_valid_entry() {
-        // Simulate:
-        // [
-        //   [ "mystream", [
-        //     [ "1234-0", ["payload", "{}", "x-retry-count", "0"] ]
-        //   ]]
-        // ]
         let entry = redis::Value::Array(vec![
             redis::Value::BulkString(b"1234-0".to_vec()),
             redis::Value::Array(vec![
@@ -854,5 +848,99 @@ mod tests {
             result[0].1[1],
             ("x-retry-count".to_string(), "0".to_string())
         );
+    }
+
+    #[test]
+    fn parse_xreadgroup_simple_string_id() {
+        // Some Redis versions return SimpleString for the entry ID.
+        let entry = redis::Value::Array(vec![
+            redis::Value::SimpleString("9999-1".to_string()),
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"payload".to_vec()),
+                redis::Value::BulkString(b"hello".to_vec()),
+            ]),
+        ]);
+        let stream = redis::Value::Array(vec![
+            redis::Value::BulkString(b"s".to_vec()),
+            redis::Value::Array(vec![entry]),
+        ]);
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "9999-1");
+    }
+
+    #[test]
+    fn parse_xreadgroup_nil_field_value_becomes_empty_string() {
+        // Redis may return Nil for a field value in some edge cases.
+        let entry = redis::Value::Array(vec![
+            redis::Value::BulkString(b"1-0".to_vec()),
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"payload".to_vec()),
+                redis::Value::Nil,
+            ]),
+        ]);
+        let stream = redis::Value::Array(vec![
+            redis::Value::BulkString(b"s".to_vec()),
+            redis::Value::Array(vec![entry]),
+        ]);
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1[0], ("payload".to_string(), String::new()));
+    }
+
+    #[test]
+    fn parse_xreadgroup_odd_field_count_stops_at_last_key() {
+        // Odd number of field values — the trailing key is dropped (no value follows).
+        let entry = redis::Value::Array(vec![
+            redis::Value::BulkString(b"2-0".to_vec()),
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"payload".to_vec()),
+                redis::Value::BulkString(b"{}".to_vec()),
+                redis::Value::BulkString(b"dangling-key".to_vec()),
+                // no value — loop breaks on None
+            ]),
+        ]);
+        let stream = redis::Value::Array(vec![
+            redis::Value::BulkString(b"s".to_vec()),
+            redis::Value::Array(vec![entry]),
+        ]);
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        assert_eq!(result.len(), 1);
+        // Only the complete pair should be present.
+        assert_eq!(result[0].1.len(), 1);
+        assert_eq!(result[0].1[0].0, "payload");
+    }
+
+    #[test]
+    fn parse_xreadgroup_wrong_root_type_returns_empty() {
+        let result = parse_xreadgroup_reply(redis::Value::Int(0));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn build_headers_excludes_internal_fields() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(PAYLOAD_FIELD.to_string(), "data".to_string());
+        fields.insert(X_RETRY_COUNT.to_string(), "2".to_string());
+        fields.insert(X_SEQUENCE_KEY.to_string(), "acct-1".to_string());
+        fields.insert("x-custom".to_string(), "val".to_string());
+
+        let headers = build_headers(&fields);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.get("x-custom").map(String::as_str), Some("val"));
+    }
+
+    #[test]
+    fn build_headers_empty_input_returns_empty() {
+        let fields = std::collections::HashMap::new();
+        let headers = build_headers(&fields);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn consumer_name_is_unique() {
+        let a = RedisConsumer::consumer_name();
+        let b = RedisConsumer::consumer_name();
+        assert_ne!(a, b, "consumer names must be unique per call");
     }
 }
