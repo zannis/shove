@@ -24,37 +24,40 @@ use shove::{
 };
 
 // ---------------------------------------------------------------------------
-// Test harness
+// Shared Redis container (started once for the entire test binary)
 // ---------------------------------------------------------------------------
 
-struct RedisFixture {
-    _container: testcontainers::ContainerAsync<RedisContainer>,
-    url: String,
-}
+static REDIS_URL: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+// Keep the container alive for the duration of the test binary.
+static REDIS_CONTAINER: OnceLock<testcontainers::ContainerAsync<RedisContainer>> = OnceLock::new();
 
-impl RedisFixture {
-    async fn start() -> Self {
-        let container = RedisContainer::default()
-            .start()
-            .await
-            .expect("failed to start Redis container");
-        let host = container.get_host().await.expect("failed to get host");
-        let port = container
-            .get_host_port_ipv4(REDIS_PORT)
-            .await
-            .expect("failed to get Redis port");
-        let url = format!("redis://{host}:{port}/");
-        Self { _container: container, url }
-    }
-
-    async fn make_broker(&self, group: &str) -> Broker<Redis> {
-        Broker::<Redis>::new(RedisConfig {
-            mode: RedisMode::Standalone { url: self.url.clone() },
-            group: Some(group.into()),
+async fn redis_url() -> &'static str {
+    REDIS_URL
+        .get_or_init(|| async {
+            let container = RedisContainer::default()
+                .start()
+                .await
+                .expect("failed to start Redis container");
+            let host = container.get_host().await.expect("failed to get host");
+            let port = container
+                .get_host_port_ipv4(REDIS_PORT)
+                .await
+                .expect("failed to get Redis port");
+            let url = format!("redis://{host}:{port}/");
+            REDIS_CONTAINER.set(container).ok();
+            url
         })
         .await
-        .expect("connect to Redis")
-    }
+}
+
+async fn make_broker(group: &str) -> Broker<Redis> {
+    let url = redis_url().await;
+    Broker::<Redis>::new(RedisConfig {
+        mode: RedisMode::Standalone { url: url.to_owned() },
+        group: Some(group.into()),
+    })
+    .await
+    .expect("connect to Redis")
 }
 
 async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
@@ -134,6 +137,7 @@ impl Topic for LedgerTopic {
             TopologyBuilder::new("redis-int-ledger")
                 .sequenced(SequenceFailure::Skip)
                 .routing_shards(4)
+                .allow_message_loss()
                 .build()
         })
     }
@@ -151,8 +155,7 @@ impl SequencedTopic for LedgerTopic {
 
 #[tokio::test]
 async fn basic_pubsub_ack() {
-    let fixture = RedisFixture::start().await;
-    let broker = fixture.make_broker("redis-int-basic-ack").await;
+    let broker = make_broker("redis-int-basic-ack").await;
     broker
         .topology()
         .declare::<OrdersTopic>()
@@ -203,8 +206,7 @@ async fn basic_pubsub_ack() {
 
 #[tokio::test]
 async fn retry_then_ack_on_redeliver() {
-    let fixture = RedisFixture::start().await;
-    let broker = fixture.make_broker("redis-int-retry").await;
+    let broker = make_broker("redis-int-retry").await;
     broker
         .topology()
         .declare::<RetryTopic>()
@@ -243,7 +245,7 @@ async fn retry_then_ack_on_redeliver() {
 
     let probe = call_count.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 2, Duration::from_secs(15)).await;
+        poll_until(move || probe.load(Ordering::Relaxed) >= 2, Duration::from_secs(10)).await;
     };
 
     let outcome = supervisor
@@ -263,8 +265,7 @@ async fn retry_then_ack_on_redeliver() {
 
 #[tokio::test]
 async fn reject_no_panic() {
-    let fixture = RedisFixture::start().await;
-    let broker = fixture.make_broker("redis-int-reject").await;
+    let broker = make_broker("redis-int-reject").await;
     broker
         .topology()
         .declare::<RejectTopic>()
@@ -320,8 +321,7 @@ async fn reject_no_panic() {
 
 #[tokio::test]
 async fn fifo_same_key_in_order() {
-    let fixture = RedisFixture::start().await;
-    let broker = fixture.make_broker("redis-int-fifo").await;
+    let broker = make_broker("redis-int-fifo").await;
     broker
         .topology()
         .declare::<LedgerTopic>()

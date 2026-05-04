@@ -149,12 +149,26 @@ impl RedisClient {
     }
 
     /// Return a dedicated connection suitable for consumer loops that use BLOCK commands
-    /// (e.g. XREADGROUP with `BLOCK`).
+    /// (e.g. XREADGROUP with `BLOCK 2000`).
     ///
-    /// For standalone, `MultiplexedConnection` is safe for BLOCK commands with finite timeouts
-    /// (BLOCK 2000). For cluster, each consumer task gets its own `ClusterConnection` handle.
+    /// The default response timeout (500 ms) is shorter than BLOCK_MS (2000 ms), causing
+    /// spurious "connection error: timed out" on every blocking read. We disable the response
+    /// timeout here so the connection waits however long Redis needs to reply.
     pub(super) async fn dedicated_conn(&self) -> Result<RedisConnection> {
-        self.multiplexed_conn().await
+        match self.inner.as_ref() {
+            ClientInner::Standalone(client) => client
+                .get_multiplexed_async_connection_with_config(
+                    &redis::AsyncConnectionConfig::new().set_response_timeout(None),
+                )
+                .await
+                .map(RedisConnection::Standalone)
+                .map_err(|e| ShoveError::Connection(e.to_string())),
+            ClientInner::Cluster(client) => client
+                .get_async_connection()
+                .await
+                .map(RedisConnection::Cluster)
+                .map_err(|e| ShoveError::Connection(e.to_string())),
+        }
     }
 
     /// The consumer group name shared by all consumers on this client.

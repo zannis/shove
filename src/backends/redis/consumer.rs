@@ -289,27 +289,30 @@ where
             break;
         }
 
-        let raw_reply: redis::Value = match conn
-            .query(
-                redis::cmd("XREADGROUP")
-                    .arg("GROUP")
-                    .arg(&group)
-                    .arg(&consumer)
-                    .arg("COUNT")
-                    .arg(prefetch)
-                    .arg("BLOCK")
-                    .arg(BLOCK_MS)
-                    .arg("STREAMS")
-                    .arg(stream)
-                    .arg(">"),
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, stream, "XREADGROUP failed, retrying after 500ms");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
+        let mut xreadgroup_cmd = redis::cmd("XREADGROUP");
+        xreadgroup_cmd
+            .arg("GROUP")
+            .arg(&group)
+            .arg(&consumer)
+            .arg("COUNT")
+            .arg(prefetch)
+            .arg("BLOCK")
+            .arg(BLOCK_MS)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">");
+        let xreadgroup_fut = conn.query(&mut xreadgroup_cmd);
+
+        let raw_reply: redis::Value = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            result = xreadgroup_fut => match result {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, stream, "XREADGROUP failed, retrying after 500ms");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
             }
         };
 
