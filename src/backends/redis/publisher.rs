@@ -167,6 +167,26 @@ mod tests {
     }
 
     #[test]
+    fn shard_for_key_single_shard_always_zero() {
+        for key in ["a", "b", "hello-world", "acct-9999"] {
+            assert_eq!(shard_for_key(key, 1), 0, "single shard must always be 0");
+        }
+    }
+
+    #[test]
+    fn shard_for_key_different_keys_may_differ() {
+        // With enough shards, distinct keys should not all land on the same shard.
+        let shards = 16u16;
+        let shard_a = shard_for_key("user-1", shards);
+        let shard_b = shard_for_key("user-2", shards);
+        let shard_c = shard_for_key("account-xyz", shards);
+        // Can't assert they're all different (hash collisions are possible),
+        // but with 16 shards and 3 distinct keys the probability they all collide is tiny.
+        let all_same = shard_a == shard_b && shard_b == shard_c;
+        assert!(!all_same, "expected at least two keys on different shards");
+    }
+
+    #[test]
     fn shard_distribution_reasonably_uniform() {
         let shards = 8u16;
         let mut buckets = vec![0u32; shards as usize];
@@ -175,5 +195,12 @@ mod tests {
         }
         let occupied = buckets.iter().filter(|&&c| c > 0).count();
         assert!(occupied >= 6, "poor distribution: {buckets:?}");
+    }
+
+    #[test]
+    fn shard_for_key_empty_string() {
+        // Empty string is a valid key; must not panic and must return < shards.
+        let result = shard_for_key("", 4);
+        assert!(result < 4);
     }
 }
