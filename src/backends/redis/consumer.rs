@@ -118,6 +118,9 @@ impl ConsumerImpl for RedisConsumer {
                     topology.queue()
                 ))
             })?;
+            // DLQ consumers intentionally run until their JoinHandle is
+            // aborted by the caller — the `ConsumerImpl::run_dlq` trait
+            // contract does not accept an external shutdown token.
             let shutdown = CancellationToken::new();
             let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
             run_stream_loop::<T, H>(client, handler, ctx, options, topology, dlq_name).await
@@ -507,8 +510,7 @@ async fn route_outcome(
                 );
                 requeue_to_stream(conn, stream, fields, new_retry).await;
                 let _ = xack(conn, stream, group, entry_id).await;
-            } else {
-                let level = (new_retry as usize).min(hold_queues.len() - 1);
+            } else if let Some(level) = hold_level(new_retry, hold_queues) {
                 let hq = &hold_queues[level];
                 route_to_hold(conn, stream, group, entry_id, fields, hq.name(), hq.delay(), new_retry)
                     .await;

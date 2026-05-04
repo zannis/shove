@@ -4,6 +4,7 @@
 
 pub(super) const PAYLOAD_FIELD: &str = "payload";
 pub(super) const X_RETRY_COUNT: &str = "x-retry-count";
+/// Reserved for future distributed-tracing support; not yet written or read.
 pub(super) const X_TRACE_ID: &str = "x-trace-id";
 pub(super) const X_MESSAGE_ID: &str = "x-message-id";
 pub(super) const X_SEQUENCE_KEY: &str = "x-sequence-key";

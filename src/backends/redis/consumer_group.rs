@@ -6,7 +6,6 @@
 //! drives the set to completion or a configurable drain deadline.
 
 use std::future::Future;
-use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -38,32 +37,29 @@ type TaskFactory = Box<dyn FnOnce() -> BoxFuture + Send>;
 
 /// Configuration for a [`RedisConsumerGroupRegistry`] registration.
 ///
-/// The `consumer_range` controls how many concurrent consumer tasks are
-/// spawned for a single non-FIFO topic. FIFO topics always spawn one task
-/// per shard regardless of this setting.
+/// `consumer_count` controls how many concurrent consumer tasks are spawned
+/// for a single non-FIFO topic (minimum 1). FIFO topics always spawn one
+/// task per shard regardless of this setting.
 #[derive(Debug, Clone)]
 pub struct RedisConsumerGroupConfig {
-    consumer_range: RangeInclusive<u16>,
+    consumer_count: u16,
 }
 
 impl RedisConsumerGroupConfig {
-    /// Create a new config with the given consumer-count range.
-    ///
-    /// Only the **start** bound is used when spawning tasks — the range is
-    /// stored in full so callers can inspect it via [`consumer_range`].
-    pub fn new(consumer_range: RangeInclusive<u16>) -> Self {
-        Self { consumer_range }
+    /// Create a new config with the given concurrent consumer count.
+    pub fn new(consumer_count: u16) -> Self {
+        Self { consumer_count: consumer_count.max(1) }
     }
 
-    /// The configured consumer count range.
-    pub fn consumer_range(&self) -> &RangeInclusive<u16> {
-        &self.consumer_range
+    /// The configured consumer count.
+    pub fn consumer_count(&self) -> u16 {
+        self.consumer_count
     }
 }
 
 impl Default for RedisConsumerGroupConfig {
     fn default() -> Self {
-        Self::new(1..=1)
+        Self::new(1)
     }
 }
 
@@ -125,7 +121,7 @@ impl RedisConsumerGroupRegistry {
         let declarer = RedisTopologyDeclarer::new(self.client.clone());
         declarer.declare(topology).await?;
 
-        let n = (*config.consumer_range().start()).max(1) as usize;
+        let n = config.consumer_count() as usize;
 
         for _ in 0..n {
             let client = self.client.clone();
@@ -256,16 +252,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_consumer_range() {
-        let cfg = RedisConsumerGroupConfig::new(1..=4);
-        assert_eq!(*cfg.consumer_range().start(), 1);
-        assert_eq!(*cfg.consumer_range().end(), 4);
+    fn config_consumer_count() {
+        let cfg = RedisConsumerGroupConfig::new(4);
+        assert_eq!(cfg.consumer_count(), 4);
     }
 
     #[test]
-    fn config_default_range_is_one() {
+    fn config_default_count_is_one() {
         let cfg = RedisConsumerGroupConfig::default();
-        assert_eq!(*cfg.consumer_range().start(), 1);
-        assert_eq!(*cfg.consumer_range().end(), 1);
+        assert_eq!(cfg.consumer_count(), 1);
+    }
+
+    #[test]
+    fn config_zero_clamped_to_one() {
+        let cfg = RedisConsumerGroupConfig::new(0);
+        assert_eq!(cfg.consumer_count(), 1);
     }
 }

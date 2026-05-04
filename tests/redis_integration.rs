@@ -1,12 +1,10 @@
 //! Integration tests for the Redis Streams backend.
 //!
-//! These tests require a running Redis/Valkey instance. By default they
-//! connect to `redis://127.0.0.1:6379/`. Set the `REDIS_URL` environment
-//! variable to point at a different instance.
+//! These tests spin up a Redis container automatically via testcontainers.
+//! Docker (or compatible runtime) must be available.
 //!
 //! Run with:
-//!   docker run --rm -p 6379:6379 redis:7-alpine
-//!   cargo test --test redis_integration --features redis-streams
+//!   cargo test -q --test redis_integration --features redis-streams
 
 #![cfg(feature = "redis-streams")]
 
@@ -16,6 +14,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::redis::{Redis as RedisContainer, REDIS_PORT};
 
 use shove::redis::{RedisConfig, RedisMode};
 use shove::{
@@ -24,22 +24,37 @@ use shove::{
 };
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Test harness
 // ---------------------------------------------------------------------------
 
-fn redis_url() -> String {
-    std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into())
+struct RedisFixture {
+    _container: testcontainers::ContainerAsync<RedisContainer>,
+    url: String,
 }
 
-async fn make_broker(group: &str) -> Broker<Redis> {
-    Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone {
-            url: redis_url(),
-        },
-        group: Some(group.into()),
-    })
-    .await
-    .expect("connect to Redis")
+impl RedisFixture {
+    async fn start() -> Self {
+        let container = RedisContainer::default()
+            .start()
+            .await
+            .expect("failed to start Redis container");
+        let host = container.get_host().await.expect("failed to get host");
+        let port = container
+            .get_host_port_ipv4(REDIS_PORT)
+            .await
+            .expect("failed to get Redis port");
+        let url = format!("redis://{host}:{port}/");
+        Self { _container: container, url }
+    }
+
+    async fn make_broker(&self, group: &str) -> Broker<Redis> {
+        Broker::<Redis>::new(RedisConfig {
+            mode: RedisMode::Standalone { url: self.url.clone() },
+            group: Some(group.into()),
+        })
+        .await
+        .expect("connect to Redis")
+    }
 }
 
 async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
@@ -62,7 +77,6 @@ struct Order {
     id: u64,
 }
 
-/// Basic pub/sub topic — unique name per test to avoid cross-test stream pollution.
 struct OrdersTopic;
 impl Topic for OrdersTopic {
     type Message = Order;
@@ -77,7 +91,6 @@ impl Topic for OrdersTopic {
     }
 }
 
-/// Topic used for the retry test — separate stream to avoid interference.
 struct RetryTopic;
 impl Topic for RetryTopic {
     type Message = Order;
@@ -92,7 +105,6 @@ impl Topic for RetryTopic {
     }
 }
 
-/// Topic used for the reject test — separate stream to avoid interference.
 struct RejectTopic;
 impl Topic for RejectTopic {
     type Message = Order;
@@ -113,7 +125,6 @@ struct Event {
     seq: u64,
 }
 
-/// Sequenced topic for the FIFO ordering test.
 struct LedgerTopic;
 impl Topic for LedgerTopic {
     type Message = Event;
@@ -138,10 +149,10 @@ impl SequencedTopic for LedgerTopic {
 // Test 1: basic_pubsub_ack
 // ---------------------------------------------------------------------------
 
-/// Publish one message, consume with Ack, assert handler called exactly once.
 #[tokio::test]
 async fn basic_pubsub_ack() {
-    let broker = make_broker("redis-int-basic-ack").await;
+    let fixture = RedisFixture::start().await;
+    let broker = fixture.make_broker("redis-int-basic-ack").await;
     broker
         .topology()
         .declare::<OrdersTopic>()
@@ -176,7 +187,7 @@ async fn basic_pubsub_ack() {
 
     let probe = counter.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(5)).await;
+        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(15)).await;
     };
 
     let outcome = supervisor
@@ -190,11 +201,10 @@ async fn basic_pubsub_ack() {
 // Test 2: retry_then_ack_on_redeliver
 // ---------------------------------------------------------------------------
 
-/// Publish one message. Handler returns Retry on first delivery (retry_count==0)
-/// and Ack on redeliver. Assert the handler was invoked exactly twice.
 #[tokio::test]
 async fn retry_then_ack_on_redeliver() {
-    let broker = make_broker("redis-int-retry").await;
+    let fixture = RedisFixture::start().await;
+    let broker = fixture.make_broker("redis-int-retry").await;
     broker
         .topology()
         .declare::<RetryTopic>()
@@ -233,8 +243,7 @@ async fn retry_then_ack_on_redeliver() {
 
     let probe = call_count.clone();
     let signal = async move {
-        // Wait until the handler has been called at least twice (retry + ack).
-        poll_until(move || probe.load(Ordering::Relaxed) >= 2, Duration::from_secs(10)).await;
+        poll_until(move || probe.load(Ordering::Relaxed) >= 2, Duration::from_secs(15)).await;
     };
 
     let outcome = supervisor
@@ -252,11 +261,10 @@ async fn retry_then_ack_on_redeliver() {
 // Test 3: reject_no_panic
 // ---------------------------------------------------------------------------
 
-/// Publish one message. Handler returns Reject. Assert handler was called
-/// exactly once and the supervisor shuts down cleanly (no panic).
 #[tokio::test]
 async fn reject_no_panic() {
-    let broker = make_broker("redis-int-reject").await;
+    let fixture = RedisFixture::start().await;
+    let broker = fixture.make_broker("redis-int-reject").await;
     broker
         .topology()
         .declare::<RejectTopic>()
@@ -289,11 +297,9 @@ async fn reject_no_panic() {
         )
         .expect("register");
 
-    // Wait for at least one invocation, then shut down.
     let probe = call_count.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(5)).await;
-        // Give the consumer a moment to route to DLQ before shutdown.
+        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(15)).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
@@ -312,11 +318,10 @@ async fn reject_no_panic() {
 // Test 4: fifo_same_key_in_order
 // ---------------------------------------------------------------------------
 
-/// Publish 10 events for "acct-1" via LedgerTopic (sequenced). Consume with
-/// register_fifo and assert all 10 are received in sequence order.
 #[tokio::test]
 async fn fifo_same_key_in_order() {
-    let broker = make_broker("redis-int-fifo").await;
+    let fixture = RedisFixture::start().await;
+    let broker = fixture.make_broker("redis-int-fifo").await;
     broker
         .topology()
         .declare::<LedgerTopic>()
@@ -362,7 +367,7 @@ async fn fifo_same_key_in_order() {
                     .map(|v| v.len() >= 10)
                     .unwrap_or(false)
             },
-            Duration::from_secs(10),
+            Duration::from_secs(15),
         )
         .await;
     };

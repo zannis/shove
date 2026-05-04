@@ -42,6 +42,7 @@
 //! | `rabbitmq-transactional`   | RabbitMQ exactly-once routing via AMQP transactions (implies `rabbitmq`)                    |
 //! | `pub-aws-sns`              | SNS publisher and topology declaration only                                                 |
 //! | `aws-sns-sqs`              | Full SNS + SQS stack — publisher, SQS consumer, supervisor, autoscaling (implies `pub-aws-sns`) |
+//! | `redis-streams`            | Redis/Valkey Streams publisher, consumer, topology, consumer groups, FIFO sharding          |
 //! | `audit`                    | [`ShoveAuditHandler`] + [`AuditLog`] topic for persisting audit records through any backend |
 //!
 //! # Quickstart

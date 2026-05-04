@@ -101,31 +101,6 @@ impl RedisPublisher {
             .map_err(|e| ShoveError::Connection(format!("XADD to {stream} failed: {e}")))
     }
 
-    /// Publishes pre-built fields to a named stream. Each call targets a single key,
-    /// which is safe for Redis Cluster (single-slot XADD). Callers must NOT attempt
-    /// to XADD to multiple shard streams in a single MULTI/EXEC without hash tags.
-    pub(super) async fn publish_to_stream(
-        &self,
-        stream: &str,
-        fields: &[(&str, &str)],
-    ) -> Result<()> {
-        if fields.is_empty() {
-            return Err(ShoveError::Topology("publish_to_stream: fields must not be empty".into()));
-        }
-
-        let mut conn = self.client.multiplexed_conn().await?;
-
-        let mut cmd = redis::cmd("XADD");
-        cmd.arg(stream).arg("*");
-        for (k, v) in fields {
-            cmd.arg(k).arg(v);
-        }
-
-        conn.query::<redis::Value>(&mut cmd)
-            .await
-            .map(|_| ())
-            .map_err(|e| ShoveError::Connection(format!("XADD to {stream} failed: {e}")))
-    }
 }
 
 // ---------------------------------------------------------------------------
