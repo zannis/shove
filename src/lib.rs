@@ -206,6 +206,9 @@ pub use markers::RabbitMq;
 #[cfg(feature = "aws-sns-sqs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
 pub use markers::Sqs;
+#[cfg(feature = "redis-streams")]
+#[cfg_attr(docsrs, doc(cfg(feature = "redis-streams")))]
+pub use markers::Redis;
 
 #[cfg(feature = "audit")]
 #[cfg_attr(docsrs, doc(cfg(feature = "audit")))]
@@ -278,6 +281,23 @@ pub mod kafka {
     #[cfg(feature = "kafka-ssl")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]
     pub use crate::backends::kafka::{KafkaSasl, KafkaTls};
+}
+
+/// Redis Streams backend.
+///
+/// Uses Redis Streams (XADD / XREADGROUP) as the transport. Supports
+/// consumer groups, hold queues (via sorted sets), DLQ routing, FIFO
+/// sharding, and crash recovery via XAUTOCLAIM.
+#[cfg(feature = "redis-streams")]
+#[cfg_attr(docsrs, doc(cfg(feature = "redis-streams")))]
+pub mod redis {
+    pub use crate::markers::Redis;
+
+    pub use crate::backends::redis::{
+        RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer,
+        RedisConsumerGroupConfig, RedisConsumerGroupRegistry, RedisPublisher, RedisQueueStats,
+        RedisQueueStatsProvider, RedisTopologyDeclarer,
+    };
 }
 
 /// In-process, non-durable broker backend.

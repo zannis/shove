@@ -34,6 +34,7 @@ pub fn shard_for_key(key: &str, routing_shards: u16) -> u16 {
 ///
 /// Implements [`PublisherImpl`]. Obtains a multiplexed connection per call
 /// (cheap — the underlying connection is shared by the client).
+#[derive(Clone)]
 pub struct RedisPublisher {
     client: RedisClient,
 }
