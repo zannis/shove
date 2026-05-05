@@ -64,6 +64,19 @@ impl Default for RabbitMqConfig {
     }
 }
 
+/// Returns true for lapin errors that indicate the underlying AMQP connection
+/// is permanently dead and the only recovery is to dial a new one. Channel-
+/// level errors (closed channel, channels limit) are excluded — those don't
+/// mean the connection itself is gone.
+fn is_connection_dead(e: &lapin::Error) -> bool {
+    matches!(
+        e.kind(),
+        lapin::ErrorKind::InvalidConnectionState(_)
+            | lapin::ErrorKind::IOError(_)
+            | lapin::ErrorKind::MissingHeartbeatError
+    )
+}
+
 /// RabbitMQ client with connection management and graceful shutdown.
 #[derive(Clone)]
 pub struct RabbitMqClient {
@@ -267,5 +280,34 @@ mod tests {
     fn default_config_is_localhost() {
         let cfg = RabbitMqConfig::default();
         assert!(cfg.uri().contains("localhost:5672"));
+    }
+
+    #[test]
+    fn invalid_connection_state_is_dead() {
+        let err = lapin::Error::from(lapin::ErrorKind::InvalidConnectionState(
+            lapin::ConnectionState::Closed,
+        ));
+        assert!(is_connection_dead(&err));
+    }
+
+    #[test]
+    fn missing_heartbeat_is_dead() {
+        let err = lapin::Error::from(lapin::ErrorKind::MissingHeartbeatError);
+        assert!(is_connection_dead(&err));
+    }
+
+    #[test]
+    fn invalid_channel_state_is_not_connection_dead() {
+        let err = lapin::Error::from(lapin::ErrorKind::InvalidChannelState(
+            lapin::ChannelState::Closed,
+            "test",
+        ));
+        assert!(!is_connection_dead(&err));
+    }
+
+    #[test]
+    fn channels_limit_is_not_connection_dead() {
+        let err = lapin::Error::from(lapin::ErrorKind::ChannelsLimitReached);
+        assert!(!is_connection_dead(&err));
     }
 }
