@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use lapin::options::ConfirmSelectOptions;
 use lapin::{Channel, Connection, ConnectionProperties};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::SHUTDOWN_GRACE;
