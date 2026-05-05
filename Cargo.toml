@@ -210,6 +210,10 @@ name = "rabbitmq_integration"
 required-features = ["rabbitmq"]
 
 [[test]]
+name = "rabbitmq_reconnect"
+required-features = ["rabbitmq"]
+
+[[test]]
 name = "sns_integration"
 required-features = ["pub-aws-sns"]
 
