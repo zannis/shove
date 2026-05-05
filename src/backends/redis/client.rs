@@ -236,4 +236,38 @@ mod tests {
             _ => panic!("expected Cluster"),
         }
     }
+
+    #[test]
+    fn resolved_group_empty_string_preserved() {
+        // Some("") is not None so it must be returned as-is, not replaced by the default.
+        let cfg = RedisConfig {
+            mode: RedisMode::Standalone {
+                url: "redis://127.0.0.1:6379/".to_string(),
+            },
+            group: Some(String::new()),
+        };
+        assert_eq!(cfg.resolved_group(), "");
+    }
+
+    #[test]
+    fn redis_mode_standalone_variant_matches() {
+        let cfg = RedisConfig {
+            mode: RedisMode::Standalone {
+                url: "redis://localhost/".to_string(),
+            },
+            group: None,
+        };
+        assert!(matches!(cfg.mode, RedisMode::Standalone { .. }));
+    }
+
+    #[test]
+    fn redis_mode_cluster_variant_matches() {
+        let cfg = RedisConfig {
+            mode: RedisMode::Cluster {
+                urls: vec!["redis://node1/".to_string()],
+            },
+            group: None,
+        };
+        assert!(matches!(cfg.mode, RedisMode::Cluster { .. }));
+    }
 }

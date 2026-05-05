@@ -249,4 +249,45 @@ mod tests {
     fn now_ms_is_nonzero() {
         assert!(now_ms() > 0);
     }
+
+    #[test]
+    fn hold_entry_with_empty_fields_roundtrips() {
+        let entry = HoldEntry {
+            stream: "my-stream".into(),
+            fields: vec![],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.stream, "my-stream");
+        assert!(decoded.fields.is_empty());
+    }
+
+    #[test]
+    fn hold_entry_fields_order_preserved() {
+        // JSON round-trip must preserve insertion order of fields.
+        let entry = HoldEntry {
+            stream: "order-stream".into(),
+            fields: vec![
+                ("alpha".into(), "1".into()),
+                ("beta".into(), "2".into()),
+                ("gamma".into(), "3".into()),
+            ],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.fields[0], ("alpha".into(), "1".into()));
+        assert_eq!(decoded.fields[1], ("beta".into(), "2".into()));
+        assert_eq!(decoded.fields[2], ("gamma".into(), "3".into()));
+    }
+
+    #[test]
+    fn now_ms_is_positive_and_recent() {
+        let before = now_ms();
+        let after = now_ms();
+        // Monotonically non-decreasing between two consecutive calls.
+        assert!(after >= before);
+        // Should be in the range of a plausible Unix timestamp (year 2020+).
+        // 2020-01-01 00:00:00 UTC in ms = 1_577_836_800_000
+        assert!(before > 1_577_836_800_000u64, "timestamp too small: {before}");
+    }
 }

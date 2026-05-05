@@ -38,6 +38,12 @@ impl<B: Backend> Broker<B> {
     pub async fn close(&self) {
         B::close(&self.client).await
     }
+
+    /// Return a [`QueueStatsImpl`](crate::backend::Backend::QueueStatsImpl) for
+    /// reading queue depth from the underlying broker.
+    pub fn queue_stats_provider(&self) -> B::QueueStatsImpl {
+        B::make_stats_provider(&self.client)
+    }
 }
 
 impl<B: HasCoordinatedGroups> Broker<B> {

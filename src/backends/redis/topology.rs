@@ -146,4 +146,30 @@ mod tests {
             "ledger-seq-0"
         );
     }
+
+    #[test]
+    fn shard_stream_name_large_index() {
+        // High shard indices must format correctly (no panic, correct string).
+        assert_eq!(
+            RedisTopologyDeclarer::shard_stream_name("payments", u16::MAX),
+            format!("payments-seq-{}", u16::MAX)
+        );
+        assert_eq!(
+            RedisTopologyDeclarer::shard_stream_name("orders", 1000),
+            "orders-seq-1000"
+        );
+    }
+
+    #[test]
+    fn hold_set_name_with_special_chars() {
+        // Colons and hyphens in the queue name must pass through verbatim.
+        assert_eq!(
+            RedisTopologyDeclarer::hold_set_name("my:queue-hold"),
+            "my:queue-hold:pending"
+        );
+        assert_eq!(
+            RedisTopologyDeclarer::hold_set_name(""),
+            ":pending"
+        );
+    }
 }

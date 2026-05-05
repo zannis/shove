@@ -203,4 +203,23 @@ mod tests {
         let result = shard_for_key("", 4);
         assert!(result < 4);
     }
+
+    #[test]
+    fn shard_for_key_with_max_shards() {
+        // u16::MAX shards — result must be < u16::MAX.
+        let result = shard_for_key("key", u16::MAX);
+        assert!(result < u16::MAX);
+    }
+
+    #[test]
+    fn shard_for_key_two_shards_splits_keys() {
+        // With 100 keys and 2 shards both shards must be used at least once.
+        let mut seen = [false; 2];
+        for i in 0..100u32 {
+            let shard = shard_for_key(&format!("key-{i}"), 2);
+            seen[shard as usize] = true;
+        }
+        assert!(seen[0], "shard 0 was never hit");
+        assert!(seen[1], "shard 1 was never hit");
+    }
 }

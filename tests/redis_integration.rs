@@ -394,3 +394,263 @@ async fn fifo_same_key_in_order() {
     let expected: Vec<u64> = (0..10).collect();
     assert_eq!(*seqs, expected, "messages must arrive in sequence order");
 }
+
+// ---------------------------------------------------------------------------
+// Additional test topics (unique names to avoid cross-test pollution)
+// ---------------------------------------------------------------------------
+
+struct HeadersTopic;
+impl Topic for HeadersTopic {
+    type Message = Order;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-headers").dlq().build())
+    }
+}
+
+struct BatchTopic;
+impl Topic for BatchTopic {
+    type Message = Order;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-batch").build())
+    }
+}
+
+struct DeferTopic;
+impl Topic for DeferTopic {
+    type Message = Order;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-defer")
+                .hold_queue(Duration::from_millis(100))
+                .build()
+        })
+    }
+}
+
+struct StatsTopic;
+impl Topic for StatsTopic {
+    type Message = Order;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-stats").build())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: publish_with_headers_visible_in_metadata
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_with_headers_visible_in_metadata() {
+    let broker = make_broker("redis-int-headers-grp").await;
+    broker
+        .topology()
+        .declare::<HeadersTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-trace-id".to_string(), "trace-abc".to_string());
+    headers.insert("x-tenant".to_string(), "acme".to_string());
+    publisher
+        .publish_with_headers::<HeadersTopic>(&Order { id: 10 }, headers)
+        .await
+        .expect("publish_with_headers");
+
+    let received_headers: Arc<tokio::sync::Mutex<Option<std::collections::HashMap<String, String>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    let rh = received_headers.clone();
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let cc = call_count.clone();
+
+    #[derive(Clone)]
+    struct H(
+        Arc<tokio::sync::Mutex<Option<std::collections::HashMap<String, String>>>>,
+        Arc<AtomicUsize>,
+    );
+    impl MessageHandler<HeadersTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+            *self.0.lock().await = Some(meta.headers.clone());
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<HeadersTopic, _>(
+            H(rh, cc),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    let probe = call_count.clone();
+    let signal = async move {
+        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(15)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(call_count.load(Ordering::Relaxed), 1);
+
+    let hdrs = received_headers.lock().await;
+    let hdrs = hdrs.as_ref().expect("headers must be set");
+    assert_eq!(
+        hdrs.get("x-trace-id").map(String::as_str),
+        Some("trace-abc"),
+        "x-trace-id header must be preserved"
+    );
+    assert_eq!(
+        hdrs.get("x-tenant").map(String::as_str),
+        Some("acme"),
+        "x-tenant header must be preserved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: publish_batch_returns_correct_count
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_batch_returns_correct_count() {
+    let broker = make_broker("redis-int-batch-grp").await;
+    broker
+        .topology()
+        .declare::<BatchTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let msgs: Vec<Order> = (0..5).map(|i| Order { id: i }).collect();
+    // Publisher<B>::publish_batch returns Result<()>; verify it succeeds for a full batch.
+    let res = publisher.publish_batch::<BatchTopic>(&msgs).await;
+    assert!(res.is_ok(), "publish_batch must succeed: {res:?}");
+
+    // Verify all 5 messages arrived using the stats provider.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stats = broker
+        .queue_stats_provider()
+        .get_queue_stats(BatchTopic::topology().queue())
+        .await
+        .expect("get_queue_stats");
+    assert_eq!(
+        stats.messages_ready + stats.messages_in_flight,
+        5,
+        "expected 5 total messages in stream after publish_batch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: defer_does_not_increment_retry_count
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn defer_does_not_increment_retry_count() {
+    let broker = make_broker("redis-int-defer-grp").await;
+    broker
+        .topology()
+        .declare::<DeferTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<DeferTopic>(&Order { id: 77 })
+        .await
+        .expect("publish");
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    // Store retry_count on second delivery to verify it stayed 0.
+    let retry_on_second: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>, Arc<AtomicU32>);
+    impl MessageHandler<DeferTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+            let n = self.0.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                Outcome::Defer
+            } else {
+                self.1.store(meta.retry_count, Ordering::Relaxed);
+                Outcome::Ack
+            }
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<DeferTopic, _>(
+            H(call_count.clone(), retry_on_second.clone()),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    let probe = call_count.clone();
+    let signal = async move {
+        poll_until(move || probe.load(Ordering::Relaxed) >= 2, Duration::from_secs(15)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        call_count.load(Ordering::Relaxed),
+        2,
+        "handler must be called exactly twice"
+    );
+    assert_eq!(
+        retry_on_second.load(Ordering::Relaxed),
+        0,
+        "Defer must not increment retry_count"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: autoscaler_stats_reflect_published_messages
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn autoscaler_stats_reflect_published_messages() {
+    let broker = make_broker("redis-int-stats-grp").await;
+    broker
+        .topology()
+        .declare::<StatsTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..5u64 {
+        publisher
+            .publish::<StatsTopic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+
+    // Give Redis a moment to persist all messages before reading stats.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Use the new queue_stats_provider() method on Broker to access stats
+    // without needing internal visibility into the Redis client.
+    let stats_provider = broker.queue_stats_provider();
+    let stats = stats_provider
+        .get_queue_stats(StatsTopic::topology().queue())
+        .await
+        .expect("get_queue_stats");
+
+    assert!(
+        stats.messages_ready >= 5,
+        "expected at least 5 ready messages, got {}",
+        stats.messages_ready
+    );
+}

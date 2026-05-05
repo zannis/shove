@@ -268,4 +268,20 @@ mod tests {
         let cfg = RedisConsumerGroupConfig::new(0);
         assert_eq!(cfg.consumer_count(), 1);
     }
+
+    #[test]
+    fn config_large_consumer_count() {
+        let cfg = RedisConsumerGroupConfig::new(u16::MAX);
+        assert_eq!(cfg.consumer_count(), u16::MAX);
+    }
+
+    #[test]
+    fn config_builder_chain_consumer_count_accessible() {
+        let cfg = RedisConsumerGroupConfig::new(8);
+        // Verify `consumer_count()` returns the configured value.
+        assert_eq!(cfg.consumer_count(), 8);
+        // Clone should preserve the value.
+        let cloned = cfg.clone();
+        assert_eq!(cloned.consumer_count(), 8);
+    }
 }

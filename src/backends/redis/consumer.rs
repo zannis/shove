@@ -943,4 +943,200 @@ mod tests {
         let b = RedisConsumer::consumer_name();
         assert_ne!(a, b, "consumer names must be unique per call");
     }
+
+    // --- Additional branch coverage for parse_xreadgroup_reply ---
+
+    #[test]
+    fn parse_xreadgroup_non_array_stream_item_skipped() {
+        // A non-array element at the stream level is skipped via `_ => continue`.
+        let reply = redis::Value::Array(vec![
+            redis::Value::Int(42), // not an array — should be skipped
+        ]);
+        let result = parse_xreadgroup_reply(reply);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_xreadgroup_stream_pair_too_short_skipped() {
+        // An array with len < 2 at the stream level is skipped.
+        let reply = redis::Value::Array(vec![
+            redis::Value::Array(vec![redis::Value::BulkString(b"only-one".to_vec())]),
+        ]);
+        let result = parse_xreadgroup_reply(reply);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_xreadgroup_non_array_entry_list_skipped() {
+        // stream_pair[1] is not an array — the whole stream is skipped.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Int(99), // entries list is not an array
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_xreadgroup_entry_pair_too_short_skipped() {
+        // An entry array with len < 2 is skipped.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![
+                // entry with only one element
+                redis::Value::Array(vec![redis::Value::BulkString(b"1-0".to_vec())]),
+            ]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_xreadgroup_int_entry_id_skipped() {
+        // Entry ID is an Int — entry is skipped via `_ => continue`.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::Int(12345), // not a valid ID type
+                redis::Value::Array(vec![]),
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_xreadgroup_non_array_field_list_skipped() {
+        // entry_pair[1] is not an array — entry is skipped via `_ => continue`.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"1-0".to_vec()),
+                redis::Value::Int(0), // field list is not an array
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_xreadgroup_simple_string_field_key() {
+        // Field key is a SimpleString — should be accepted.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"1-0".to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::SimpleString("myfieldkey".to_string()),
+                    redis::Value::BulkString(b"myvalue".to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1.len(), 1);
+        assert_eq!(result[0].1[0].0, "myfieldkey");
+        assert_eq!(result[0].1[0].1, "myvalue");
+    }
+
+    #[test]
+    fn parse_xreadgroup_int_field_key_breaks_loop() {
+        // An Int field key triggers the `Some(_) => break` branch.
+        // Fields collected before the int key are kept; the int terminates the loop.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"1-0".to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"good-key".to_vec()),
+                    redis::Value::BulkString(b"good-val".to_vec()),
+                    redis::Value::Int(42), // triggers break
+                    redis::Value::BulkString(b"after-break".to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        // The entry IS emitted (the break only ends field collection, not the entry).
+        assert_eq!(result.len(), 1);
+        // Only the pair before the Int key should be present.
+        assert_eq!(result[0].1.len(), 1);
+        assert_eq!(result[0].1[0].0, "good-key");
+    }
+
+    #[test]
+    fn parse_xreadgroup_simple_string_field_value() {
+        // Field value is a SimpleString — should be accepted.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"1-0".to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"key".to_vec()),
+                    redis::Value::SimpleString("simplevalue".to_string()),
+                ]),
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1[0].1, "simplevalue");
+    }
+
+    #[test]
+    fn parse_xreadgroup_int_field_value_breaks_loop() {
+        // An Int field value triggers the `Some(_) => break` branch.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"1-0".to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"k1".to_vec()),
+                    redis::Value::BulkString(b"v1".to_vec()),
+                    redis::Value::BulkString(b"k2".to_vec()),
+                    redis::Value::Int(99), // Int value triggers break
+                ]),
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 1);
+        // Only the pair before the Int value should be present.
+        assert_eq!(result[0].1.len(), 1);
+        assert_eq!(result[0].1[0].0, "k1");
+    }
+
+    #[test]
+    fn parse_xreadgroup_multiple_streams_merged_flat() {
+        // Multiple streams in one reply produce a flat list of entries.
+        fn make_stream(name: &str, id: &str, val: &str) -> redis::Value {
+            redis::Value::Array(vec![
+                redis::Value::BulkString(name.as_bytes().to_vec()),
+                redis::Value::Array(vec![redis::Value::Array(vec![
+                    redis::Value::BulkString(id.as_bytes().to_vec()),
+                    redis::Value::Array(vec![
+                        redis::Value::BulkString(b"payload".to_vec()),
+                        redis::Value::BulkString(val.as_bytes().to_vec()),
+                    ]),
+                ])]),
+            ])
+        }
+        let reply = redis::Value::Array(vec![
+            make_stream("stream-a", "1-0", "msg-a"),
+            make_stream("stream-b", "2-0", "msg-b"),
+            make_stream("stream-c", "3-0", "msg-c"),
+        ]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, "1-0");
+        assert_eq!(result[1].0, "2-0");
+        assert_eq!(result[2].0, "3-0");
+    }
+
+    #[test]
+    fn hold_level_single_element_always_returns_zero() {
+        let single = vec!["only-queue"];
+        // Any retry count on a single-element slice must return Some(0).
+        assert_eq!(hold_level(0, &single), Some(0));
+        assert_eq!(hold_level(1, &single), Some(0));
+        assert_eq!(hold_level(100, &single), Some(0));
+        assert_eq!(hold_level(u32::MAX, &single), Some(0));
+    }
 }
