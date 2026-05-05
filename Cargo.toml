@@ -115,6 +115,11 @@ name = "consumer_overhead"
 harness = false
 required-features = ["rabbitmq"]
 
+[[bench]]
+name = "publish_throughput"
+harness = false
+required-features = ["rabbitmq"]
+
 [[example]]
 name = "rabbitmq_basic_pubsub"
 path = "examples/rabbitmq/basic_pubsub.rs"
