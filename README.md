@@ -6,9 +6,9 @@
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
 
-Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS JetStream, Apache Kafka, or an in-process broker.
+Type-safe async pub/sub for Rust on top of RabbitMQ, AWS SNS/SQS, NATS JetStream, Apache Kafka, Redis/Valkey Streams, or an in-process broker.
 
-`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it. Pick the transport that fits your stack — RabbitMQ, SNS/SQS, NATS JetStream, Kafka, or the zero-dependency in-process backend for tests and single-process apps — and get the same high-level API everywhere.
+`shove` is for workloads where "just use the broker client" stops being enough: retries with backoff, DLQs, ordered delivery, consumer groups, autoscaling, and auditability. You define a topic once as a Rust type and the crate derives the messaging topology and runtime behavior from it. Pick the transport that fits your stack — RabbitMQ, SNS/SQS, NATS JetStream, Kafka, Redis/Valkey Streams, or the zero-dependency in-process backend for tests and single-process apps — and get the same high-level API everywhere.
 
 ## Why shove
 
@@ -29,12 +29,12 @@ Broker<B>
    ├─ .topology()             → TopologyDeclarer<B>
    ├─ .publisher().await      → Publisher<B>
    ├─ .consumer_supervisor()  → ConsumerSupervisor<B>        (all backends)
-   └─ .consumer_group()       → ConsumerGroup<B>             (RabbitMQ, NATS, Kafka, InMemory)
+   └─ .consumer_group()       → ConsumerGroup<B>             (RabbitMQ, NATS, Kafka, Redis, InMemory)
 ```
 
-`B` is a zero-sized marker (`RabbitMq`, `Sqs`, `Nats`, `Kafka`, `InMemory`) that binds a backend's client/publisher/consumer/topology types together. Swap `B` — the topic definitions, handlers, and call sites stay identical.
+`B` is a zero-sized marker (`RabbitMq`, `Sqs`, `Nats`, `Kafka`, `Redis`, `InMemory`) that binds a backend's client/publisher/consumer/topology types together. Swap `B` — the topic definitions, handlers, and call sites stay identical.
 
-SQS has no broker-level coordinated-group primitive; `Broker<Sqs>` exposes `consumer_supervisor()` only. The other four backends expose both: `consumer_supervisor()` for manual per-topic fan-out, `consumer_group()` for min/max-bounded coordinated groups with autoscaling.
+SQS has no broker-level coordinated-group primitive; `Broker<Sqs>` exposes `consumer_supervisor()` only. The other five backends expose both: `consumer_supervisor()` for manual per-topic fan-out, `consumer_group()` for min/max-bounded coordinated groups with autoscaling.
 
 ## 30-second tour
 
@@ -92,17 +92,18 @@ async fn main() -> Result<(), shove::ShoveError> {
 }
 ```
 
-Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, or `Kafka` — the topic definition and handler stay identical.
+Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` — the topic definition and handler stay identical.
 
 ## Pick your backend
 
-| Backend        | Feature flag    | Marker      | Durability         | Ordering primitive                    | Autoscale signal       | Ops burden            |
-|----------------|-----------------|-------------|--------------------|---------------------------------------|------------------------|-----------------------|
-| RabbitMQ       | `rabbitmq`      | `RabbitMq`  | Disk               | Consistent-hash exchange + SAC shards | Queue depth (mgmt API) | Broker + mgmt plugin  |
-| AWS SNS/SQS    | `aws-sns-sqs`   | `Sqs`       | Managed (AWS)      | FIFO topic + `MessageGroupId`         | Queue depth            | Managed — no infra    |
-| NATS JetStream | `nats`          | `Nats`      | Disk (JetStream)   | Subject shard + `max_ack_pending=1`   | Pending messages       | NATS server           |
-| Apache Kafka   | `kafka`         | `Kafka`     | Disk (log)         | Partition key                         | Consumer lag           | Kafka cluster         |
-| In-process     | `inmemory`      | `InMemory`  | None (process RAM) | Per-key FIFO shards                   | Queue depth (in-proc)  | None                  |
+| Backend              | Feature flag      | Marker      | Durability         | Ordering primitive                    | Autoscale signal       | Ops burden            |
+|----------------------|-------------------|-------------|--------------------|---------------------------------------|------------------------|-----------------------|
+| RabbitMQ             | `rabbitmq`        | `RabbitMq`  | Disk               | Consistent-hash exchange + SAC shards | Queue depth (mgmt API) | Broker + mgmt plugin  |
+| AWS SNS/SQS          | `aws-sns-sqs`     | `Sqs`       | Managed (AWS)      | FIFO topic + `MessageGroupId`         | Queue depth            | Managed — no infra    |
+| NATS JetStream       | `nats`            | `Nats`      | Disk (JetStream)   | Subject shard + `max_ack_pending=1`   | Pending messages       | NATS server           |
+| Apache Kafka         | `kafka`           | `Kafka`     | Disk (log)         | Partition key                         | Consumer lag           | Kafka cluster         |
+| Redis/Valkey Streams | `redis-streams`   | `Redis`     | Disk (AOF/RDB)     | FNV-1a shard streams                  | XLEN + XPENDING        | Redis/Valkey server   |
+| In-process           | `inmemory`        | `InMemory`  | None (process RAM) | Per-key FIFO shards                   | Queue depth (in-proc)  | None                  |
 
 Rules of thumb:
 
@@ -111,6 +112,7 @@ Rules of thumb:
 - **Low-latency streaming, high throughput, replay** → `kafka`
 - **Complex routing + retry topologies, existing RabbitMQ** → `rabbitmq`
 - **Lightweight edge deployments, JetStream already in-stack** → `nats`
+- **Redis/Valkey already in the stack, simple durable queuing** → `redis-streams`
 
 ## Features
 
@@ -138,6 +140,9 @@ cargo add shove --features kafka
 # Apache Kafka with TLS + SASL (PLAIN, SCRAM-SHA-256/512)
 cargo add shove --features kafka-ssl
 
+# Redis/Valkey Streams
+cargo add shove --features redis-streams
+
 # In-memory broker
 cargo add shove --features inmemory
 
@@ -157,6 +162,7 @@ cargo add shove --features rabbitmq,metrics
 | `nats` | NATS JetStream publisher, consumer, topology declaration, consumer groups, autoscaling |
 | `kafka` | Kafka publisher, consumer, topology declaration, consumer groups, autoscaling          |
 | `kafka-ssl` | `kafka` + TLS (SSL) and SASL (PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512) via `KafkaTls` / `KafkaSasl` |
+| `redis-streams` | Redis/Valkey Streams publisher, consumer, topology declaration, consumer groups, FIFO sharding, autoscaling |
 | `inmemory` | In-memory broker — publisher, consumer, topology, consumer groups, autoscaling         |
 | `audit` | Built-in `ShoveAuditHandler` and `AuditLog` topic                                      |
 | `metrics` | Operational metrics (counters, histograms, gauges) via the [`metrics`](https://docs.rs/metrics) facade — wire your own exporter |
@@ -332,6 +338,40 @@ let outcome = group
 </details>
 
 <details>
+<summary><strong>Redis/Valkey Streams</strong></summary>
+
+```rust,ignore
+use futures::FutureExt as _;
+use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
+use shove::{Broker, ConsumerGroupConfig, Redis};
+use std::time::Duration;
+
+let broker = Broker::<Redis>::new(RedisConfig {
+    mode: RedisMode::Standalone { url: "redis://localhost:6379/".into() },
+    group: Some("myapp".into()),
+}).await?;
+
+broker.topology().declare::<OrderSettlement>().await?;
+
+let publisher = broker.publisher().await?;
+publisher.publish::<OrderSettlement>(&event).await?;
+
+let mut group = broker.consumer_group();
+group
+    .register::<OrderSettlement, _>(
+        ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1..=4)),
+        || SettlementHandler,
+    )
+    .await?;
+
+let outcome = group
+    .run_until_timeout(tokio::signal::ctrl_c().map(drop), Duration::from_secs(30))
+    .await;
+```
+
+</details>
+
+<details>
 <summary><strong>In-process (no broker, no Docker)</strong></summary>
 
 ```rust,ignore
@@ -477,11 +517,11 @@ Use `Skip` when messages are independently valid (e.g. audit entries). Use `Fail
 
 Messages for other sequence keys are unaffected by either policy.
 
-RabbitMQ uses consistent-hash routing for this. SNS/SQS uses FIFO topics and queues. NATS uses subject-based shard routing with `max_ack_pending: 1` per shard to enforce strict ordering. Kafka uses partition-key routing — messages with the same sequence key land in the same partition, and the consumer processes one message at a time to guarantee order.
+RabbitMQ uses consistent-hash routing for this. SNS/SQS uses FIFO topics and queues. NATS uses subject-based shard routing with `max_ack_pending: 1` per shard to enforce strict ordering. Kafka uses partition-key routing — messages with the same sequence key land in the same partition, and the consumer processes one message at a time to guarantee order. Redis/Valkey uses FNV-1a hashing to map sequence keys to dedicated shard streams, with one consumer per shard to enforce strict per-key ordering.
 
 ## Consumer groups and autoscaling
 
-All backends with a coordinated-group primitive (RabbitMQ, NATS, Kafka, InMemory) expose `broker.consumer_group()`. SQS uses `broker.consumer_supervisor()` with N parallel pollers instead. Both share the same `run_until_timeout` / `SupervisorOutcome` shutdown contract.
+All backends with a coordinated-group primitive (RabbitMQ, NATS, Kafka, Redis, InMemory) expose `broker.consumer_group()`. SQS uses `broker.consumer_supervisor()` with N parallel pollers instead. Both share the same `run_until_timeout` / `SupervisorOutcome` shutdown contract.
 
 ```rust,ignore
 use shove::rabbitmq::{ConsumerGroupConfig as RabbitMqGroupConfig, RabbitMqConfig};
@@ -589,6 +629,7 @@ cargo run --example rabbitmq_exactly_once --features rabbitmq-transactional
 | AWS SNS/SQS     | `aws-sns-sqs`             | `sqs_basic_pubsub`, `sqs_concurrent_pubsub`, `sqs_sequenced_pubsub`, `sqs_consumer_groups`, `sqs_audited_consumer`, `sqs_autoscaler`, `sqs_stress` |
 | NATS JetStream  | `nats`                    | `nats_basic`, `nats_sequenced`, `nats_audited_consumer`, `nats_stress` |
 | Apache Kafka    | `kafka`                   | `kafka_basic`, `kafka_sequenced`, `kafka_audited_consumer`, `kafka_stress` |
+| Redis/Valkey    | `redis-streams`           | `redis_basic`, `redis_sequenced` |
 | In-process      | `inmemory`                | `inmemory_basic`, `inmemory_sequenced`, `inmemory_consumer_groups`, `inmemory_audited_consumer`, `inmemory_stress` |
 
 The `audit` feature is required on top of the backend flag for any `*_audited_consumer` example.
@@ -602,9 +643,9 @@ Full rustdoc is on [docs.rs/shove](https://docs.rs/shove):
 - [`Outcome`](https://docs.rs/shove/latest/shove/enum.Outcome.html) — what a handler returns (`Ack`, `Retry`, `Reject`, `Defer`)
 - [`TopologyBuilder`](https://docs.rs/shove/latest/shove/struct.TopologyBuilder.html) — `.hold_queue`, `.sequenced`, `.routing_shards`, `.dlq`
 - [`ConsumerOptions`](https://docs.rs/shove/latest/shove/struct.ConsumerOptions.html), [`MessageHandler`](https://docs.rs/shove/latest/shove/trait.MessageHandler.html), [`MessageHandlerExt`](https://docs.rs/shove/latest/shove/trait.MessageHandlerExt.html)
-- Per-backend modules: [`rabbitmq`](https://docs.rs/shove/latest/shove/rabbitmq/), [`sns`](https://docs.rs/shove/latest/shove/sns/), [`nats`](https://docs.rs/shove/latest/shove/nats/), [`kafka`](https://docs.rs/shove/latest/shove/kafka/), [`inmemory`](https://docs.rs/shove/latest/shove/inmemory/)
+- Per-backend modules: [`rabbitmq`](https://docs.rs/shove/latest/shove/rabbitmq/), [`sns`](https://docs.rs/shove/latest/shove/sns/), [`nats`](https://docs.rs/shove/latest/shove/nats/), [`kafka`](https://docs.rs/shove/latest/shove/kafka/), [`redis`](https://docs.rs/shove/latest/shove/redis/), [`inmemory`](https://docs.rs/shove/latest/shove/inmemory/)
 
-Backend-specific sequenced-delivery mapping: RabbitMQ uses a consistent-hash exchange with SAC shards. SNS/SQS uses FIFO topics + `MessageGroupId`. NATS uses subject-based shard routing with `max_ack_pending: 1`. Kafka uses partition-key routing. In-process uses per-key FIFO shards (ordering enforced in-memory, no persistence, no cross-process delivery).
+Backend-specific sequenced-delivery mapping: RabbitMQ uses a consistent-hash exchange with SAC shards. SNS/SQS uses FIFO topics + `MessageGroupId`. NATS uses subject-based shard routing with `max_ack_pending: 1`. Kafka uses partition-key routing. Redis/Valkey uses FNV-1a shard streams with one consumer per shard. In-process uses per-key FIFO shards (ordering enforced in-memory, no persistence, no cross-process delivery).
 
 ## Requirements
 
