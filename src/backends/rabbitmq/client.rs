@@ -66,16 +66,20 @@ impl Default for RabbitMqConfig {
 }
 
 /// Returns true for lapin errors that indicate the underlying AMQP connection
-/// is permanently dead and the only recovery is to dial a new one. Channel-
-/// level errors (closed channel, channels limit) are excluded — those don't
-/// mean the connection itself is gone.
+/// is permanently dead and the only recovery is to dial a new one. Matches
+/// hard AMQP errors (codes 3xx/5xx that close the connection, such as
+/// `CONNECTION-FORCED`, `FRAME-ERROR`, `COMMAND-INVALID`) as well as TCP/IO
+/// failures and heartbeat timeouts. Channel-level soft errors (closed channel,
+/// channels limit) are excluded — those don't mean the connection itself is
+/// gone.
 fn is_connection_dead(e: &lapin::Error) -> bool {
-    matches!(
-        e.kind(),
-        lapin::ErrorKind::InvalidConnectionState(_)
-            | lapin::ErrorKind::IOError(_)
-            | lapin::ErrorKind::MissingHeartbeatError
-    )
+    e.is_amqp_hard_error()
+        || matches!(
+            e.kind(),
+            lapin::ErrorKind::InvalidConnectionState(_)
+                | lapin::ErrorKind::IOError(_)
+                | lapin::ErrorKind::MissingHeartbeatError
+        )
 }
 
 /// RabbitMQ client with connection management and graceful shutdown.
@@ -365,6 +369,35 @@ mod tests {
     #[test]
     fn channels_limit_is_not_connection_dead() {
         let err = lapin::Error::from(lapin::ErrorKind::ChannelsLimitReached);
+        assert!(!is_connection_dead(&err));
+    }
+
+    #[test]
+    fn io_error_is_dead() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "broken pipe");
+        let err = lapin::Error::from(lapin::ErrorKind::IOError(std::sync::Arc::new(io_err)));
+        assert!(is_connection_dead(&err));
+    }
+
+    #[test]
+    fn amqp_hard_error_is_dead() {
+        // CONNECTION_FORCED (320) is a hard error — broker initiated the close.
+        let amqp_err = lapin::protocol::AMQPError::new(
+            lapin::protocol::AMQPErrorKind::Hard(lapin::protocol::AMQPHardError::CONNECTIONFORCED),
+            "broker closed".into(),
+        );
+        let err = lapin::Error::from(lapin::ErrorKind::ProtocolError(amqp_err));
+        assert!(is_connection_dead(&err));
+    }
+
+    #[test]
+    fn amqp_soft_error_is_not_connection_dead() {
+        // ACCESS_REFUSED (403) is a soft (channel-class) error — connection lives.
+        let amqp_err = lapin::protocol::AMQPError::new(
+            lapin::protocol::AMQPErrorKind::Soft(lapin::protocol::AMQPSoftError::ACCESSREFUSED),
+            "denied".into(),
+        );
+        let err = lapin::Error::from(lapin::ErrorKind::ProtocolError(amqp_err));
         assert!(!is_connection_dead(&err));
     }
 }
