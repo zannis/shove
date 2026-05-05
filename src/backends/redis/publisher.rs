@@ -103,6 +103,7 @@ impl PublisherImpl for RedisPublisher {
         self.publish_inner::<T>(msg, headers, None)
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],

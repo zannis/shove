@@ -4,6 +4,10 @@
 
 use std::sync::Arc;
 
+use redis::aio::MultiplexedConnection;
+use redis::cluster::ClusterClient;
+use redis::cluster_async::ClusterConnection;
+
 use crate::error::{Result, ShoveError};
 
 use super::constants::DEFAULT_GROUP;
@@ -46,9 +50,9 @@ impl RedisConfig {
 /// A single Redis connection, abstracting over standalone vs cluster transports.
 pub(crate) enum RedisConnection {
     /// Multiplexed standalone connection – safe for BLOCK commands with finite timeouts (BLOCK 2000).
-    Standalone(redis::aio::MultiplexedConnection),
+    Standalone(MultiplexedConnection),
     /// Cluster connection – safe to share; BLOCK commands work the same way.
-    Cluster(redis::cluster_async::ClusterConnection),
+    Cluster(ClusterConnection),
 }
 
 impl RedisConnection {
@@ -76,7 +80,7 @@ impl RedisConnection {
 
 enum ClientInner {
     Standalone(redis::Client),
-    Cluster(redis::cluster::ClusterClient),
+    Cluster(ClusterClient),
 }
 
 // ---------------------------------------------------------------------------
@@ -116,8 +120,8 @@ impl RedisClient {
                     ));
                 }
                 let nodes: Vec<&str> = urls.iter().map(String::as_str).collect();
-                let client = redis::cluster::ClusterClient::new(nodes)
-                    .map_err(|e| ShoveError::Connection(e.to_string()))?;
+                let client =
+                    ClusterClient::new(nodes).map_err(|e| ShoveError::Connection(e.to_string()))?;
                 // Eagerly verify connectivity.
                 client
                     .get_async_connection()

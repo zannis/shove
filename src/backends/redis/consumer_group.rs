@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner;
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{SupervisorOutcome, tally_join_result};
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
@@ -219,7 +219,7 @@ impl RedisConsumerGroupRegistry {
 
         let drain = async {
             while let Some(res) = set.join_next().await {
-                crate::consumer_supervisor::tally_join_result(res, &mut errors, &mut panics);
+                tally_join_result(res, &mut errors, &mut panics);
             }
         };
 
@@ -237,7 +237,7 @@ impl RedisConsumerGroupRegistry {
                 set.abort_all();
                 // Drain aborted tasks so the JoinSet is fully emptied.
                 while let Some(res) = set.join_next().await {
-                    crate::consumer_supervisor::tally_join_result(res, &mut errors, &mut panics);
+                    tally_join_result(res, &mut errors, &mut panics);
                 }
                 SupervisorOutcome {
                     errors,

@@ -7,7 +7,7 @@
 use crate::error::{Result, ShoveError};
 use crate::topology::QueueTopology;
 
-use super::client::RedisClient;
+use super::client::{RedisClient, RedisConnection};
 
 // ---------------------------------------------------------------------------
 // RedisTopologyDeclarer
@@ -83,7 +83,7 @@ impl RedisTopologyDeclarer {
     /// topology re-declaration — we don't want old messages re-delivered.
     /// If the group already exists (BUSYGROUP), treats it as success.
     async fn ensure_stream_and_group(
-        conn: &mut crate::backends::redis::client::RedisConnection,
+        conn: &mut RedisConnection,
         stream: &str,
         group: &str,
     ) -> Result<()> {

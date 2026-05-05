@@ -16,7 +16,7 @@ use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::topic::{SequencedTopic, Topic};
-use crate::topology::QueueTopology;
+use crate::topology::{HoldQueue, QueueTopology};
 
 use super::client::{RedisClient, RedisConnection};
 use super::constants::{
@@ -254,7 +254,7 @@ async fn run_stream_loop_arc<T, H>(
     options: ConsumerOptionsInner,
     topology: &'static QueueTopology,
     stream: &str,
-    hold_queues: &[crate::topology::HoldQueue],
+    hold_queues: &[HoldQueue],
 ) -> Result<()>
 where
     T: Topic,
@@ -335,32 +335,28 @@ where
                 .unwrap_or(0);
 
             // Size check.
-            if let Some(max) = options.max_message_size {
-                if payload_raw.len() > max {
-                    tracing::warn!(
-                        entry_id,
-                        size = payload_raw.len(),
-                        limit = max,
-                        "message exceeds size limit — sending to DLQ"
-                    );
-                    metrics::record_failed(
-                        topic_name,
-                        consumer_group,
-                        metrics::FailReason::Oversize,
-                    );
-                    route_to_dlq(
-                        &mut conn,
-                        topology,
-                        stream,
-                        &group,
-                        &entry_id,
-                        &fields,
-                        "oversize",
-                        retry_count,
-                    )
-                    .await;
-                    continue;
-                }
+            if let Some(max) = options.max_message_size
+                && payload_raw.len() > max
+            {
+                tracing::warn!(
+                    entry_id,
+                    size = payload_raw.len(),
+                    limit = max,
+                    "message exceeds size limit — sending to DLQ"
+                );
+                metrics::record_failed(topic_name, consumer_group, metrics::FailReason::Oversize);
+                route_to_dlq(
+                    &mut conn,
+                    topology,
+                    stream,
+                    &group,
+                    &entry_id,
+                    &fields,
+                    "oversize",
+                    retry_count,
+                )
+                .await;
+                continue;
             }
 
             // Deserialize.
@@ -497,7 +493,7 @@ async fn route_outcome(
     outcome: Outcome,
     retry_count: u32,
     max_retries: u32,
-    hold_queues: &[crate::topology::HoldQueue],
+    hold_queues: &[HoldQueue],
 ) {
     match outcome {
         Outcome::Ack => {
@@ -581,6 +577,7 @@ async fn route_outcome(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route_to_hold(
     conn: &mut RedisConnection,
     stream: &str,
@@ -610,6 +607,7 @@ async fn route_to_hold(
     let _ = xack(conn, stream, group, entry_id).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route_to_dlq(
     conn: &mut RedisConnection,
     topology: &'static QueueTopology,
