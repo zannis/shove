@@ -57,6 +57,9 @@ kafka-ssl = ["kafka", "rdkafka?/ssl", "rdkafka?/sasl"]
 # In-process backend
 inmemory = ["dep:dashmap"]
 
+# Redis Streams pubsub
+redis-streams = ["dep:redis"]
+
 # Emit operational metrics via the `metrics` facade. Consumer services
 # install their own recorder (e.g. `metrics-exporter-prometheus`) and
 # expose the endpoint themselves; this crate never opens a port.
@@ -83,6 +86,7 @@ bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
 rdkafka = { version = "0.39", features = ["tokio"], optional = true }
 dashmap = { version = "6", optional = true }
+redis = { version = "1", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"], optional = true }
 metrics = { version = "0.24", optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -91,7 +95,7 @@ rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = tr
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats", "kafka"] }
+testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats", "kafka", "redis"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -276,3 +280,17 @@ required-features = ["inmemory", "audit"]
 name = "inmemory_stress"
 path = "examples/inmemory/stress.rs"
 required-features = ["inmemory"]
+
+[[test]]
+name = "redis_integration"
+required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_basic"
+path = "examples/redis/basic.rs"
+required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_sequenced"
+path = "examples/redis/sequenced.rs"
+required-features = ["redis-streams"]

@@ -44,3 +44,7 @@ pub struct Sqs;
 #[cfg(feature = "inmemory")]
 #[cfg_attr(docsrs, doc(cfg(feature = "inmemory")))]
 pub struct InMemory;
+
+#[cfg(feature = "redis-streams")]
+#[cfg_attr(docsrs, doc(cfg(feature = "redis-streams")))]
+pub struct Redis;

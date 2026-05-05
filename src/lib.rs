@@ -42,6 +42,7 @@
 //! | `rabbitmq-transactional`   | RabbitMQ exactly-once routing via AMQP transactions (implies `rabbitmq`)                    |
 //! | `pub-aws-sns`              | SNS publisher and topology declaration only                                                 |
 //! | `aws-sns-sqs`              | Full SNS + SQS stack — publisher, SQS consumer, supervisor, autoscaling (implies `pub-aws-sns`) |
+//! | `redis-streams`            | Redis/Valkey Streams publisher, consumer, topology, consumer groups, FIFO sharding          |
 //! | `audit`                    | [`ShoveAuditHandler`] + [`AuditLog`] topic for persisting audit records through any backend |
 //!
 //! # Quickstart
@@ -203,6 +204,9 @@ pub use markers::Nats;
 #[cfg(feature = "rabbitmq")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
 pub use markers::RabbitMq;
+#[cfg(feature = "redis-streams")]
+#[cfg_attr(docsrs, doc(cfg(feature = "redis-streams")))]
+pub use markers::Redis;
 #[cfg(feature = "aws-sns-sqs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
 pub use markers::Sqs;
@@ -278,6 +282,23 @@ pub mod kafka {
     #[cfg(feature = "kafka-ssl")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]
     pub use crate::backends::kafka::{KafkaSasl, KafkaTls};
+}
+
+/// Redis Streams backend.
+///
+/// Uses Redis Streams (XADD / XREADGROUP) as the transport. Supports
+/// consumer groups, hold queues (via sorted sets), DLQ routing, FIFO
+/// sharding, and crash recovery via XAUTOCLAIM.
+#[cfg(feature = "redis-streams")]
+#[cfg_attr(docsrs, doc(cfg(feature = "redis-streams")))]
+pub mod redis {
+    pub use crate::markers::Redis;
+
+    pub use crate::backends::redis::{
+        RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer, RedisConsumerGroupConfig,
+        RedisConsumerGroupRegistry, RedisMode, RedisPublisher, RedisQueueStats,
+        RedisQueueStatsProvider, RedisTopologyDeclarer,
+    };
 }
 
 /// In-process, non-durable broker backend.
