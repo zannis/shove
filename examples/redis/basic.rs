@@ -100,7 +100,9 @@ async fn main() -> Result<(), shove::ShoveError> {
     println!("consuming — press Ctrl-C to stop");
     let outcome = group
         .run_until_timeout(
-            async { tokio::signal::ctrl_c().await.ok(); },
+            async {
+                tokio::signal::ctrl_c().await.ok();
+            },
             Duration::from_secs(5),
         )
         .await;

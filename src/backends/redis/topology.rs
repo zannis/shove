@@ -167,9 +167,6 @@ mod tests {
             RedisTopologyDeclarer::hold_set_name("my:queue-hold"),
             "my:queue-hold:pending"
         );
-        assert_eq!(
-            RedisTopologyDeclarer::hold_set_name(""),
-            ":pending"
-        );
+        assert_eq!(RedisTopologyDeclarer::hold_set_name(""), ":pending");
     }
 }

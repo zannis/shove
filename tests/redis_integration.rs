@@ -15,12 +15,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::redis::{Redis as RedisContainer, REDIS_PORT};
+use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
 use shove::redis::{RedisConfig, RedisMode};
 use shove::{
-    Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Redis,
-    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
+    Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Redis, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,7 +57,9 @@ async fn make_broker(group: &str) -> Broker<Redis> {
     // start in parallel under nextest.
     for attempt in 0u32..5 {
         match Broker::<Redis>::new(RedisConfig {
-            mode: RedisMode::Standalone { url: url.to_owned() },
+            mode: RedisMode::Standalone {
+                url: url.to_owned(),
+            },
             group: Some(group.into()),
         })
         .await
@@ -194,22 +196,27 @@ async fn basic_pubsub_ack() {
 
     let mut supervisor = broker.consumer_supervisor();
     supervisor
-        .register::<OrdersTopic, _>(
-            H(counter.clone()),
-            ConsumerOptions::<Redis>::new(),
-        )
+        .register::<OrdersTopic, _>(H(counter.clone()), ConsumerOptions::<Redis>::new())
         .expect("register");
 
     let probe = counter.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(15)).await;
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
     };
 
     let outcome = supervisor
         .run_until_timeout(signal, Duration::from_secs(2))
         .await;
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
-    assert_eq!(counter.load(Ordering::Relaxed), 1, "handler must be called exactly once");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "handler must be called exactly once"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +264,11 @@ async fn retry_then_ack_on_redeliver() {
 
     let probe = call_count.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 2, Duration::from_secs(10)).await;
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 2,
+            Duration::from_secs(10),
+        )
+        .await;
     };
 
     let outcome = supervisor
@@ -304,15 +315,16 @@ async fn reject_no_panic() {
 
     let mut supervisor = broker.consumer_supervisor();
     supervisor
-        .register::<RejectTopic, _>(
-            H(call_count.clone()),
-            ConsumerOptions::<Redis>::new(),
-        )
+        .register::<RejectTopic, _>(H(call_count.clone()), ConsumerOptions::<Redis>::new())
         .expect("register");
 
     let probe = call_count.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(15)).await;
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
@@ -373,12 +385,7 @@ async fn fifo_same_key_in_order() {
     let probe = received.clone();
     let signal = async move {
         poll_until(
-            move || {
-                probe
-                    .try_lock()
-                    .map(|v| v.len() >= 10)
-                    .unwrap_or(false)
-            },
+            move || probe.try_lock().map(|v| v.len() >= 10).unwrap_or(false),
             Duration::from_secs(15),
         )
         .await;
@@ -461,8 +468,9 @@ async fn publish_with_headers_visible_in_metadata() {
         .await
         .expect("publish_with_headers");
 
-    let received_headers: Arc<tokio::sync::Mutex<Option<std::collections::HashMap<String, String>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let received_headers: Arc<
+        tokio::sync::Mutex<Option<std::collections::HashMap<String, String>>>,
+    > = Arc::new(tokio::sync::Mutex::new(None));
 
     let rh = received_headers.clone();
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -484,15 +492,16 @@ async fn publish_with_headers_visible_in_metadata() {
 
     let mut supervisor = broker.consumer_supervisor();
     supervisor
-        .register::<HeadersTopic, _>(
-            H(rh, cc),
-            ConsumerOptions::<Redis>::new(),
-        )
+        .register::<HeadersTopic, _>(H(rh, cc), ConsumerOptions::<Redis>::new())
         .expect("register");
 
     let probe = call_count.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 1, Duration::from_secs(15)).await;
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
     };
 
     let outcome = supervisor
@@ -597,7 +606,11 @@ async fn defer_does_not_increment_retry_count() {
 
     let probe = call_count.clone();
     let signal = async move {
-        poll_until(move || probe.load(Ordering::Relaxed) >= 2, Duration::from_secs(15)).await;
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 2,
+            Duration::from_secs(15),
+        )
+        .await;
     };
 
     let outcome = supervisor

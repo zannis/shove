@@ -111,7 +111,9 @@ impl RedisClient {
             }
             RedisMode::Cluster { ref urls } => {
                 if urls.is_empty() {
-                    return Err(ShoveError::Connection("cluster URLs must not be empty".into()));
+                    return Err(ShoveError::Connection(
+                        "cluster URLs must not be empty".into(),
+                    ));
                 }
                 let nodes: Vec<&str> = urls.iter().map(String::as_str).collect();
                 let client = redis::cluster::ClusterClient::new(nodes)

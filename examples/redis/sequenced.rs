@@ -100,9 +100,9 @@ async fn main() -> Result<(), shove::ShoveError> {
         ("acct-001", 1000, 0),
         ("acct-002", 2000, 0),
         ("acct-001", -500, 1),
-        ("acct-003", 750,  0),
+        ("acct-003", 750, 0),
         ("acct-002", -200, 1),
-        ("acct-001", 300,  2),
+        ("acct-001", 300, 2),
         ("acct-003", -100, 1),
     ];
 
@@ -120,14 +120,14 @@ async fn main() -> Result<(), shove::ShoveError> {
     // Consume with FIFO (one task per shard — entries for the same account
     // are always processed in the order they were published).
     let mut group = broker.consumer_group();
-    group
-        .register_fifo::<Ledger, _>(|| Handler)
-        .await?;
+    group.register_fifo::<Ledger, _>(|| Handler).await?;
 
     println!("consuming — press Ctrl-C to stop");
     let outcome = group
         .run_until_timeout(
-            async { tokio::signal::ctrl_c().await.ok(); },
+            async {
+                tokio::signal::ctrl_c().await.ok();
+            },
             Duration::from_secs(5),
         )
         .await;

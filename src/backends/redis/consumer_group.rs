@@ -48,7 +48,9 @@ pub struct RedisConsumerGroupConfig {
 impl RedisConsumerGroupConfig {
     /// Create a new config with the given concurrent consumer count.
     pub fn new(consumer_count: u16) -> Self {
-        Self { consumer_count: consumer_count.max(1) }
+        Self {
+            consumer_count: consumer_count.max(1),
+        }
     }
 
     /// The configured consumer count.
@@ -194,7 +196,11 @@ impl RedisConsumerGroupRegistry {
     ///
     /// Returns a [`SupervisorOutcome`] summarising errors, panics, and
     /// whether the drain timed out.
-    pub async fn run_until_timeout<S>(mut self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
+    pub async fn run_until_timeout<S>(
+        mut self,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {

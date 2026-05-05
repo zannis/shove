@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::consumer::ConsumerImpl;
 use crate::backend::ConsumerOptionsInner;
+use crate::backend::consumer::ConsumerImpl;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
@@ -100,11 +100,7 @@ impl ConsumerImpl for RedisConsumer {
         }
     }
 
-    fn run_dlq<T, H>(
-        &self,
-        handler: H,
-        ctx: H::Context,
-    ) -> impl Future<Output = Result<()>> + Send
+    fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
         H: MessageHandler<T>,
@@ -171,8 +167,10 @@ impl ConsumerImpl for RedisConsumer {
                 let options = options.clone();
 
                 handles.push(tokio::spawn(async move {
-                    let hold_names: Vec<String> =
-                        shard_hold_queues.iter().map(|hq| hq.name().to_owned()).collect();
+                    let hold_names: Vec<String> = shard_hold_queues
+                        .iter()
+                        .map(|hq| hq.name().to_owned())
+                        .collect();
 
                     let shutdown = options.shutdown.clone();
                     let requeue_handle = if !hold_names.is_empty() {
@@ -345,7 +343,11 @@ where
                         limit = max,
                         "message exceeds size limit — sending to DLQ"
                     );
-                    metrics::record_failed(topic_name, consumer_group, metrics::FailReason::Oversize);
+                    metrics::record_failed(
+                        topic_name,
+                        consumer_group,
+                        metrics::FailReason::Oversize,
+                    );
                     route_to_dlq(
                         &mut conn,
                         topology,
@@ -366,7 +368,11 @@ where
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(error = %e, entry_id, "deserialization failed — sending to DLQ");
-                    metrics::record_failed(topic_name, consumer_group, metrics::FailReason::Deserialize);
+                    metrics::record_failed(
+                        topic_name,
+                        consumer_group,
+                        metrics::FailReason::Deserialize,
+                    );
                     route_to_dlq(
                         &mut conn,
                         topology,
@@ -394,7 +400,9 @@ where
                 headers: build_headers(&fields),
             };
 
-            options.processing.store(true, std::sync::atomic::Ordering::Release);
+            options
+                .processing
+                .store(true, std::sync::atomic::Ordering::Release);
 
             let handler_clone = Arc::clone(&handler);
             let ctx_clone = Arc::clone(&ctx);
@@ -440,7 +448,12 @@ where
             };
 
             metrics::record_consumed(&topic_arc, group_arc.as_deref(), &outcome);
-            metrics::record_processing_duration(&topic_arc, group_arc.as_deref(), &outcome, elapsed);
+            metrics::record_processing_duration(
+                &topic_arc,
+                group_arc.as_deref(),
+                &outcome,
+                elapsed,
+            );
             options
                 .processing
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -514,13 +527,31 @@ async fn route_outcome(
                 let _ = xack(conn, stream, group, entry_id).await;
             } else if let Some(level) = hold_level(new_retry, hold_queues) {
                 let hq = &hold_queues[level];
-                route_to_hold(conn, stream, group, entry_id, fields, hq.name(), hq.delay(), new_retry)
-                    .await;
+                route_to_hold(
+                    conn,
+                    stream,
+                    group,
+                    entry_id,
+                    fields,
+                    hq.name(),
+                    hq.delay(),
+                    new_retry,
+                )
+                .await;
             }
         }
         Outcome::Reject => {
-            route_to_dlq(conn, topology, stream, group, entry_id, fields, "rejected", retry_count)
-                .await;
+            route_to_dlq(
+                conn,
+                topology,
+                stream,
+                group,
+                entry_id,
+                fields,
+                "rejected",
+                retry_count,
+            )
+            .await;
         }
         Outcome::Defer => {
             if hold_queues.is_empty() {
@@ -534,8 +565,17 @@ async fn route_outcome(
             } else {
                 let hq = &hold_queues[0];
                 // Defer does NOT increment retry count.
-                route_to_hold(conn, stream, group, entry_id, fields, hq.name(), hq.delay(), retry_count)
-                    .await;
+                route_to_hold(
+                    conn,
+                    stream,
+                    group,
+                    entry_id,
+                    fields,
+                    hq.name(),
+                    hq.delay(),
+                    retry_count,
+                )
+                .await;
             }
         }
     }
@@ -621,21 +661,11 @@ async fn requeue_to_stream(
     let _ = conn.query::<redis::Value>(&mut cmd).await;
 }
 
-async fn xack(
-    conn: &mut RedisConnection,
-    stream: &str,
-    group: &str,
-    entry_id: &str,
-) -> Result<()> {
-    conn.query::<i64>(
-        redis::cmd("XACK")
-            .arg(stream)
-            .arg(group)
-            .arg(entry_id),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| ShoveError::Connection(format!("XACK failed: {e}")))
+async fn xack(conn: &mut RedisConnection, stream: &str, group: &str, entry_id: &str) -> Result<()> {
+    conn.query::<i64>(redis::cmd("XACK").arg(stream).arg(group).arg(entry_id))
+        .await
+        .map(|_| ())
+        .map_err(|e| ShoveError::Connection(format!("XACK failed: {e}")))
 }
 
 async fn autoclaim_all(
@@ -682,9 +712,7 @@ async fn autoclaim_all(
 ///   ]
 /// ]
 /// ```
-pub(super) fn parse_xreadgroup_reply(
-    value: redis::Value,
-) -> Vec<(String, Vec<(String, String)>)> {
+pub(super) fn parse_xreadgroup_reply(value: redis::Value) -> Vec<(String, Vec<(String, String)>)> {
     let streams = match value {
         redis::Value::Nil => return vec![],
         redis::Value::Array(arr) => arr,
@@ -738,9 +766,7 @@ pub(super) fn parse_xreadgroup_reply(
                     None => break,
                 };
                 let val = match iter.next() {
-                    Some(redis::Value::BulkString(b)) => {
-                        String::from_utf8_lossy(b).into_owned()
-                    }
+                    Some(redis::Value::BulkString(b)) => String::from_utf8_lossy(b).into_owned(),
                     Some(redis::Value::SimpleString(s)) => s.clone(),
                     Some(redis::Value::Nil) => String::new(),
                     Some(_) => break,
@@ -959,9 +985,9 @@ mod tests {
     #[test]
     fn parse_xreadgroup_stream_pair_too_short_skipped() {
         // An array with len < 2 at the stream level is skipped.
-        let reply = redis::Value::Array(vec![
-            redis::Value::Array(vec![redis::Value::BulkString(b"only-one".to_vec())]),
-        ]);
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![redis::Value::BulkString(
+            b"only-one".to_vec(),
+        )])]);
         let result = parse_xreadgroup_reply(reply);
         assert!(result.is_empty());
     }

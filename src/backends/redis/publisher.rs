@@ -8,7 +8,7 @@ use crate::error::{Result, ShoveError};
 use crate::topic::Topic;
 
 use super::client::{RedisClient, RedisConnection};
-use super::constants::{PAYLOAD_FIELD, X_SEQUENCE_KEY, DEFAULT_ROUTING_SHARDS};
+use super::constants::{DEFAULT_ROUTING_SHARDS, PAYLOAD_FIELD, X_SEQUENCE_KEY};
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
@@ -81,7 +81,6 @@ impl RedisPublisher {
 
         xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +114,10 @@ impl PublisherImpl for RedisPublisher {
             };
             let mut succeeded: u64 = 0;
             for msg in msgs {
-                match self.publish_inner::<T>(msg, HashMap::new(), Some(&mut conn)).await {
+                match self
+                    .publish_inner::<T>(msg, HashMap::new(), Some(&mut conn))
+                    .await
+                {
                     Ok(()) => succeeded += 1,
                     Err(e) => return (succeeded, Err(e)),
                 }

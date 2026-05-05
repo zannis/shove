@@ -204,12 +204,12 @@ pub use markers::Nats;
 #[cfg(feature = "rabbitmq")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
 pub use markers::RabbitMq;
-#[cfg(feature = "aws-sns-sqs")]
-#[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
-pub use markers::Sqs;
 #[cfg(feature = "redis-streams")]
 #[cfg_attr(docsrs, doc(cfg(feature = "redis-streams")))]
 pub use markers::Redis;
+#[cfg(feature = "aws-sns-sqs")]
+#[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
+pub use markers::Sqs;
 
 #[cfg(feature = "audit")]
 #[cfg_attr(docsrs, doc(cfg(feature = "audit")))]
@@ -295,9 +295,9 @@ pub mod redis {
     pub use crate::markers::Redis;
 
     pub use crate::backends::redis::{
-        RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer,
-        RedisConsumerGroupConfig, RedisConsumerGroupRegistry, RedisMode, RedisPublisher,
-        RedisQueueStats, RedisQueueStatsProvider, RedisTopologyDeclarer,
+        RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer, RedisConsumerGroupConfig,
+        RedisConsumerGroupRegistry, RedisMode, RedisPublisher, RedisQueueStats,
+        RedisQueueStatsProvider, RedisTopologyDeclarer,
     };
 }
 

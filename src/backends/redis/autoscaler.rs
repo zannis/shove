@@ -183,9 +183,7 @@ mod tests {
 
     #[test]
     fn xpending_non_int_first_element_returns_zero() {
-        let reply = redis::Value::Array(vec![
-            redis::Value::BulkString(b"unexpected".to_vec()),
-        ]);
+        let reply = redis::Value::Array(vec![redis::Value::BulkString(b"unexpected".to_vec())]);
         assert_eq!(parse_xpending_in_flight(&reply), 0);
     }
 

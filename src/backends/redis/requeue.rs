@@ -17,14 +17,14 @@
 //! This is expected behaviour: consumers must be idempotent, which is already
 //! required by the broader shove at-least-once contract.
 
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Result;
 use super::client::{RedisClient, RedisConnection};
+use super::constants::{REQUEUE_BATCH_SIZE, REQUEUE_POLL_MS};
 use super::topology::RedisTopologyDeclarer;
-use super::constants::{REQUEUE_POLL_MS, REQUEUE_BATCH_SIZE};
+use crate::error::Result;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -74,9 +74,7 @@ pub(crate) async fn enqueue_hold(
     let value = serde_json::to_string(&entry)?;
 
     let mut cmd = redis::cmd("ZADD");
-    cmd.arg(set_key)
-        .arg(redeliver_at_ms as f64)
-        .arg(&value);
+    cmd.arg(set_key).arg(redeliver_at_ms as f64).arg(&value);
 
     let _: i64 = conn.query(&mut cmd).await?;
     Ok(())
@@ -155,7 +153,11 @@ fn now_ms() -> u64 {
 /// XADDs each to its origin stream, and removes it from the hold set only on
 /// success. Corrupt entries (JSON parse failures) are removed from the set to
 /// avoid perpetual re-fetch and logged as warnings.
-async fn poll_hold_set(conn: &mut RedisConnection, hold_queue_name: &str, set_key: &str) -> Result<()> {
+async fn poll_hold_set(
+    conn: &mut RedisConnection,
+    hold_queue_name: &str,
+    set_key: &str,
+) -> Result<()> {
     let now = now_ms();
 
     let entries: Vec<String> = conn
@@ -208,11 +210,7 @@ async fn poll_hold_set(conn: &mut RedisConnection, hold_queue_name: &str, set_ke
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    "requeuer: XADD failed for stream {}: {}",
-                    entry.stream,
-                    e
-                );
+                tracing::warn!("requeuer: XADD failed for stream {}: {}", entry.stream, e);
             }
         }
     }
@@ -288,6 +286,9 @@ mod tests {
         assert!(after >= before);
         // Should be in the range of a plausible Unix timestamp (year 2020+).
         // 2020-01-01 00:00:00 UTC in ms = 1_577_836_800_000
-        assert!(before > 1_577_836_800_000u64, "timestamp too small: {before}");
+        assert!(
+            before > 1_577_836_800_000u64,
+            "timestamp too small: {before}"
+        );
     }
 }
