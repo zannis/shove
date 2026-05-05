@@ -78,9 +78,24 @@ fn is_connection_dead(e: &lapin::Error) -> bool {
 }
 
 /// RabbitMQ client with connection management and graceful shutdown.
+///
+/// Internally wraps an `ArcSwap<Connection>` so the underlying AMQP connection
+/// can be replaced after a broker disconnect without invalidating outstanding
+/// `RabbitMqClient` clones, publishers, or consumers.
 #[derive(Clone)]
 pub struct RabbitMqClient {
-    connection: Arc<Connection>,
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
+    /// Current connection. Read via `load_full()` to snapshot, replaced via
+    /// `store()` after a successful reconnect.
+    connection: arc_swap::ArcSwap<Connection>,
+    /// Stored so `reconnect()` can dial a fresh `Connection` with the same URI.
+    config: RabbitMqConfig,
+    /// Single-flight guard so concurrent failures don't dial-storm the broker.
+    /// Held across the async dial.
+    reconnect_lock: tokio::sync::Mutex<()>,
     shutdown_token: CancellationToken,
 }
 
@@ -90,19 +105,14 @@ impl RabbitMqClient {
     /// The connection is named `shove-rs-{pid}` and a fresh [`CancellationToken`]
     /// is created to coordinate shutdown across clones of this client.
     pub async fn connect(config: &RabbitMqConfig) -> Result<Self> {
-        let pid = std::process::id();
-        let connection_name = format!("shove-rs-{pid}");
-
-        let properties =
-            ConnectionProperties::default().with_connection_name(connection_name.into());
-
-        let connection = Connection::connect(&config.uri, properties)
-            .await
-            .map_err(|e| map_lapin_error("failed to connect to RabbitMQ", e))?;
-
+        let connection = Self::dial(config).await?;
         Ok(Self {
-            connection: Arc::new(connection),
-            shutdown_token: CancellationToken::new(),
+            inner: Arc::new(ClientInner {
+                connection: arc_swap::ArcSwap::from_pointee(connection),
+                config: config.clone(),
+                reconnect_lock: tokio::sync::Mutex::new(()),
+                shutdown_token: CancellationToken::new(),
+            }),
         })
     }
 
@@ -137,12 +147,34 @@ impl RabbitMqClient {
         Err(last_err.expect("loop ran at least once"))
     }
 
+    /// Dial a fresh `Connection` using the stored config. Used by `connect`
+    /// and by `reconnect` after a broker disconnect.
+    async fn dial(config: &RabbitMqConfig) -> Result<Connection> {
+        let pid = std::process::id();
+        let connection_name = format!("shove-rs-{pid}");
+
+        let properties =
+            ConnectionProperties::default().with_connection_name(connection_name.into());
+
+        Connection::connect(&config.uri, properties)
+            .await
+            .map_err(|e| map_lapin_error("failed to connect to RabbitMQ", e))
+    }
+
+    /// Snapshot the current connection. The returned `Arc<Connection>` may
+    /// be replaced under us at any point; this is fine — operations on the
+    /// snapshot will simply fail with a connection-class error and the
+    /// caller can trigger a retry via `with_reconnect`.
+    fn snapshot(&self) -> Arc<Connection> {
+        self.inner.connection.load_full()
+    }
+
     /// Open a basic channel on the underlying connection.
     ///
     /// Returns [`ShoveError::Connection`] if shutdown has already been requested
     /// or if the channel cannot be created.
     pub async fn create_channel(&self) -> Result<Channel> {
-        if self.shutdown_token.is_cancelled() {
+        if self.inner.shutdown_token.is_cancelled() {
             metrics::record_backend_error(
                 metrics::BackendLabel::RabbitMq,
                 metrics::BackendErrorKind::Connection,
@@ -152,7 +184,7 @@ impl RabbitMqClient {
             ));
         }
 
-        self.connection
+        self.snapshot()
             .create_channel()
             .await
             .map_err(|e| map_lapin_error("failed to create channel", e))
@@ -163,7 +195,7 @@ impl RabbitMqClient {
     /// Returns [`ShoveError::Connection`] if shutdown has already been requested,
     /// if the channel cannot be created, or if confirms cannot be enabled.
     pub async fn create_confirm_channel(&self) -> Result<Channel> {
-        if self.shutdown_token.is_cancelled() {
+        if self.inner.shutdown_token.is_cancelled() {
             metrics::record_backend_error(
                 metrics::BackendLabel::RabbitMq,
                 metrics::BackendErrorKind::Connection,
@@ -174,7 +206,7 @@ impl RabbitMqClient {
         }
 
         let channel = self
-            .connection
+            .snapshot()
             .create_channel()
             .await
             .map_err(|e| map_lapin_error("failed to create confirm channel", e))?;
@@ -199,7 +231,7 @@ impl RabbitMqClient {
     /// if the channel cannot be created, or if `tx_select` cannot be enabled.
     #[cfg(feature = "rabbitmq-transactional")]
     pub async fn create_tx_channel(&self) -> Result<Channel> {
-        if self.shutdown_token.is_cancelled() {
+        if self.inner.shutdown_token.is_cancelled() {
             metrics::record_backend_error(
                 metrics::BackendLabel::RabbitMq,
                 metrics::BackendErrorKind::Connection,
@@ -210,7 +242,7 @@ impl RabbitMqClient {
         }
 
         let channel = self
-            .connection
+            .snapshot()
             .create_channel()
             .await
             .map_err(|e| map_lapin_error("failed to create tx channel", e))?;
@@ -228,12 +260,12 @@ impl RabbitMqClient {
     /// Callers can use this token to coordinate their own teardown with the
     /// client's shutdown sequence.
     pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown_token.clone()
+        self.inner.shutdown_token.clone()
     }
 
     /// Return `true` if the underlying AMQP connection is still open.
     pub fn is_connected(&self) -> bool {
-        self.connection.status().connected()
+        self.snapshot().status().connected()
     }
 
     /// Initiate a graceful shutdown.
@@ -242,10 +274,10 @@ impl RabbitMqClient {
     /// down, waits for [`SHUTDOWN_GRACE`] to allow in-flight operations to
     /// complete, and then closes the underlying AMQP connection.
     pub async fn shutdown(&self) {
-        self.shutdown_token.cancel();
+        self.inner.shutdown_token.cancel();
         sleep(SHUTDOWN_GRACE).await;
 
-        if let Err(e) = self.connection.close(0, "shutdown".into()).await {
+        if let Err(e) = self.snapshot().close(0, "shutdown".into()).await {
             tracing::warn!("error while closing RabbitMQ connection: {e}");
         }
     }
