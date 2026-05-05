@@ -27,7 +27,7 @@ absolute-paths = "deny"
 default = []
 
 # RabbitMQ Pubsub
-rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest"]
+rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest", "dep:arc-swap"]
 
 # Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.
 # Makes publish-to-hold-queue + ack atomic (tx_select/tx_commit), eliminating
@@ -81,6 +81,7 @@ aws-config = { version = "1", features = ["behavior-version-latest", "default-ht
 aws-sdk-sns = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
 aws-sdk-sqs = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
 rand = "0.10"
+arc-swap = { version = "1", optional = true }
 async-nats = { version = "0.47", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
@@ -111,6 +112,11 @@ required-features = ["rabbitmq"]
 
 [[bench]]
 name = "consumer_overhead"
+harness = false
+required-features = ["rabbitmq"]
+
+[[bench]]
+name = "publish_throughput"
 harness = false
 required-features = ["rabbitmq"]
 
@@ -206,6 +212,10 @@ required-features = ["nats", "audit"]
 
 [[test]]
 name = "rabbitmq_integration"
+required-features = ["rabbitmq"]
+
+[[test]]
+name = "rabbitmq_reconnect"
 required-features = ["rabbitmq"]
 
 [[test]]
