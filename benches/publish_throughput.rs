@@ -78,6 +78,10 @@ fn bench_publish(c: &mut Criterion) {
         });
     });
     group.finish();
+
+    // testcontainers' ContainerAsync runs an async destructor; drop it inside
+    // the still-live runtime so it doesn't panic when criterion tears down.
+    rt.block_on(async move { drop(_container) });
 }
 
 criterion_group!(benches, bench_publish);
