@@ -1,7 +1,5 @@
 //! Redis client abstraction supporting standalone, TLS (`rediss://`), and cluster modes.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use redis::aio::MultiplexedConnection;
