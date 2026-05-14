@@ -15,6 +15,7 @@ use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, QueueTopology};
 
@@ -203,6 +204,49 @@ impl ConsumerImpl for RedisConsumer {
 }
 
 // ---------------------------------------------------------------------------
+// Reconnect wrapper
+// ---------------------------------------------------------------------------
+
+/// Run `f` in a reconnect loop, retrying on transient errors until shutdown.
+///
+/// Acquires a fresh connection on each attempt and applies exponential backoff
+/// with jitter (1 s → 30 s). Non-retryable errors are propagated immediately.
+async fn run_with_reconnect<F, Fut>(
+    shutdown: &CancellationToken,
+    stream: &str,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut backoff = Backoff::default();
+    loop {
+        match f().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !e.is_retryable() {
+                    return Err(e);
+                }
+                if shutdown.is_cancelled() {
+                    return Ok(());
+                }
+                let delay = backoff.next().expect("backoff is infinite");
+                tracing::warn!(
+                    stream,
+                    error = %e,
+                    "consumer error, reconnecting in {delay:?}"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core loop
 // ---------------------------------------------------------------------------
 
@@ -261,7 +305,6 @@ where
     H: MessageHandler<T>,
 {
     let group = client.group().to_owned();
-    let consumer = RedisConsumer::consumer_name();
     let shutdown = options.shutdown.clone();
     let topic_name = topology.queue();
     let consumer_group = options.consumer_group.as_deref();
@@ -274,208 +317,228 @@ where
         .handler_timeout
         .unwrap_or(Duration::from_secs(30))
         .as_millis() as u64;
-
-    let mut conn = client.dedicated_conn().await?;
-    // Reclaim stale pending entries from prior crashed consumers on startup.
-    let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
     let prefetch = options.prefetch_count.max(1) as usize;
     let autoclaim_interval = Duration::from_millis(idle_ms.max(30_000));
-    let mut last_autoclaim = std::time::Instant::now();
 
-    loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
+    run_with_reconnect(&shutdown, stream, || {
+        let client = client.clone();
+        let handler = Arc::clone(&handler);
+        let ctx = Arc::clone(&ctx);
+        let options = options.clone();
+        let group = group.clone();
+        let consumer = RedisConsumer::consumer_name();
+        let topic_arc = Arc::clone(&topic_arc);
+        let group_arc = group_arc.clone();
+        let shutdown = shutdown.clone();
 
-        let mut xreadgroup_cmd = redis::cmd("XREADGROUP");
-        xreadgroup_cmd
-            .arg("GROUP")
-            .arg(&group)
-            .arg(&consumer)
-            .arg("COUNT")
-            .arg(prefetch)
-            .arg("BLOCK")
-            .arg(BLOCK_MS)
-            .arg("STREAMS")
-            .arg(stream)
-            .arg(">");
-        let xreadgroup_fut = conn.query(&mut xreadgroup_cmd);
+        async move {
+            let mut conn = client.dedicated_conn().await?;
+            let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
+            let mut last_autoclaim = std::time::Instant::now();
 
-        let raw_reply: redis::Value = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            result = xreadgroup_fut => match result {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, stream, "XREADGROUP failed, retrying after 500ms");
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
+            loop {
+                if shutdown.is_cancelled() {
+                    return Ok(());
                 }
-            }
-        };
 
-        let entries = parse_xreadgroup_reply(raw_reply);
+                let mut xreadgroup_cmd = redis::cmd("XREADGROUP");
+                xreadgroup_cmd
+                    .arg("GROUP")
+                    .arg(&group)
+                    .arg(&consumer)
+                    .arg("COUNT")
+                    .arg(prefetch)
+                    .arg("BLOCK")
+                    .arg(BLOCK_MS)
+                    .arg("STREAMS")
+                    .arg(stream)
+                    .arg(">");
+                let xreadgroup_fut = conn.query(&mut xreadgroup_cmd);
 
-        for (entry_id, fields_vec) in entries {
-            let fields: HashMap<String, String> = fields_vec.into_iter().collect();
+                let raw_reply: redis::Value = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Ok(()),
+                    result = xreadgroup_fut => match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(error = %e, stream, "XREADGROUP failed");
+                            return Err(e);
+                        }
+                    }
+                };
 
-            // Extract payload.
-            let payload_raw = match fields.get(PAYLOAD_FIELD) {
-                Some(s) => s.clone(),
-                None => {
-                    tracing::warn!(entry_id, "missing payload field — acking and skipping");
-                    let _ = xack(&mut conn, stream, &group, &entry_id).await;
-                    continue;
-                }
-            };
+                let entries = parse_xreadgroup_reply(raw_reply);
 
-            let retry_count = fields
-                .get(X_RETRY_COUNT)
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0);
+                for (entry_id, fields_vec) in entries {
+                    let fields: HashMap<String, String> = fields_vec.into_iter().collect();
 
-            // Size check.
-            if let Some(max) = options.max_message_size
-                && payload_raw.len() > max
-            {
-                tracing::warn!(
-                    entry_id,
-                    size = payload_raw.len(),
-                    limit = max,
-                    "message exceeds size limit — sending to DLQ"
-                );
-                metrics::record_failed(topic_name, consumer_group, metrics::FailReason::Oversize);
-                route_to_dlq(
-                    &mut conn,
-                    topology,
-                    stream,
-                    &group,
-                    &entry_id,
-                    &fields,
-                    "oversize",
-                    retry_count,
-                )
-                .await;
-                continue;
-            }
+                    // Extract payload.
+                    let payload_raw = match fields.get(PAYLOAD_FIELD) {
+                        Some(s) => s.clone(),
+                        None => {
+                            tracing::warn!(entry_id, "missing payload field — acking and skipping");
+                            let _ = xack(&mut conn, stream, &group, &entry_id).await;
+                            continue;
+                        }
+                    };
 
-            // Deserialize.
-            let msg: T::Message = match serde_json::from_str(&payload_raw) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!(error = %e, entry_id, "deserialization failed — sending to DLQ");
-                    metrics::record_failed(
-                        topic_name,
-                        consumer_group,
-                        metrics::FailReason::Deserialize,
+                    let retry_count = fields
+                        .get(X_RETRY_COUNT)
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+
+                    // Size check.
+                    if let Some(max) = options.max_message_size
+                        && payload_raw.len() > max
+                    {
+                        tracing::warn!(
+                            entry_id,
+                            size = payload_raw.len(),
+                            limit = max,
+                            "message exceeds size limit — sending to DLQ"
+                        );
+                        metrics::record_failed(
+                            topic_name,
+                            consumer_group,
+                            metrics::FailReason::Oversize,
+                        );
+                        route_to_dlq(
+                            &mut conn,
+                            topology,
+                            stream,
+                            &group,
+                            &entry_id,
+                            &fields,
+                            "oversize",
+                            retry_count,
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    // Deserialize.
+                    let msg: T::Message = match serde_json::from_str(&payload_raw) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                entry_id,
+                                "deserialization failed — sending to DLQ"
+                            );
+                            metrics::record_failed(
+                                topic_name,
+                                consumer_group,
+                                metrics::FailReason::Deserialize,
+                            );
+                            route_to_dlq(
+                                &mut conn,
+                                topology,
+                                stream,
+                                &group,
+                                &entry_id,
+                                &fields,
+                                "deserialize",
+                                retry_count,
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
+                    let delivery_id = fields
+                        .get(X_MESSAGE_ID)
+                        .cloned()
+                        .unwrap_or_else(|| entry_id.clone());
+
+                    let meta = MessageMetadata {
+                        retry_count,
+                        delivery_id,
+                        redelivered: retry_count > 0,
+                        headers: build_headers(&fields),
+                    };
+
+                    options
+                        .processing
+                        .store(true, std::sync::atomic::Ordering::Release);
+
+                    let handler_clone = Arc::clone(&handler);
+                    let ctx_clone = Arc::clone(&ctx);
+
+                    let _inflight =
+                        metrics::InflightGuard::new(topic_arc.clone(), group_arc.clone());
+                    let start = std::time::Instant::now();
+
+                    let outcome_opt = match options.handler_timeout {
+                        Some(timeout_dur) => {
+                            match tokio::time::timeout(
+                                timeout_dur,
+                                handler_clone.handle(msg, meta, &ctx_clone),
+                            )
+                            .await
+                            {
+                                Ok(o) => Some(o),
+                                Err(_) => {
+                                    tracing::warn!(
+                                        entry_id,
+                                        timeout = ?timeout_dur,
+                                        "handler timed out — leaving in PEL for XAUTOCLAIM"
+                                    );
+                                    metrics::record_failed(
+                                        &topic_arc,
+                                        group_arc.as_deref(),
+                                        metrics::FailReason::Timeout,
+                                    );
+                                    // Do NOT ack — XAUTOCLAIM will reclaim it after idle_ms.
+                                    None
+                                }
+                            }
+                        }
+                        None => Some(handler_clone.handle(msg, meta, &ctx_clone).await),
+                    };
+
+                    let elapsed = start.elapsed().as_secs_f64();
+
+                    let Some(outcome) = outcome_opt else {
+                        options
+                            .processing
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        continue;
+                    };
+
+                    metrics::record_consumed(&topic_arc, group_arc.as_deref(), &outcome);
+                    metrics::record_processing_duration(
+                        &topic_arc,
+                        group_arc.as_deref(),
+                        &outcome,
+                        elapsed,
                     );
-                    route_to_dlq(
+                    options
+                        .processing
+                        .store(false, std::sync::atomic::Ordering::Release);
+
+                    route_outcome(
                         &mut conn,
                         topology,
                         stream,
                         &group,
                         &entry_id,
                         &fields,
-                        "deserialize",
+                        outcome,
                         retry_count,
+                        options.max_retries,
+                        hold_queues,
                     )
                     .await;
-                    continue;
                 }
-            };
 
-            let delivery_id = fields
-                .get(X_MESSAGE_ID)
-                .cloned()
-                .unwrap_or_else(|| entry_id.clone());
-
-            let meta = MessageMetadata {
-                retry_count,
-                delivery_id,
-                redelivered: retry_count > 0,
-                headers: build_headers(&fields),
-            };
-
-            options
-                .processing
-                .store(true, std::sync::atomic::Ordering::Release);
-
-            let handler_clone = Arc::clone(&handler);
-            let ctx_clone = Arc::clone(&ctx);
-
-            let _inflight = metrics::InflightGuard::new(topic_arc.clone(), group_arc.clone());
-            let start = std::time::Instant::now();
-
-            let outcome_opt = match options.handler_timeout {
-                Some(timeout_dur) => {
-                    match tokio::time::timeout(
-                        timeout_dur,
-                        handler_clone.handle(msg, meta, &ctx_clone),
-                    )
-                    .await
-                    {
-                        Ok(o) => Some(o),
-                        Err(_) => {
-                            tracing::warn!(
-                                entry_id,
-                                timeout = ?timeout_dur,
-                                "handler timed out — leaving in PEL for XAUTOCLAIM"
-                            );
-                            metrics::record_failed(
-                                &topic_arc,
-                                group_arc.as_deref(),
-                                metrics::FailReason::Timeout,
-                            );
-                            // Do NOT ack — XAUTOCLAIM will reclaim it after idle_ms.
-                            None
-                        }
-                    }
+                if last_autoclaim.elapsed() >= autoclaim_interval {
+                    let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
+                    last_autoclaim = std::time::Instant::now();
                 }
-                None => Some(handler_clone.handle(msg, meta, &ctx_clone).await),
-            };
-
-            let elapsed = start.elapsed().as_secs_f64();
-
-            let Some(outcome) = outcome_opt else {
-                options
-                    .processing
-                    .store(false, std::sync::atomic::Ordering::Release);
-                continue;
-            };
-
-            metrics::record_consumed(&topic_arc, group_arc.as_deref(), &outcome);
-            metrics::record_processing_duration(
-                &topic_arc,
-                group_arc.as_deref(),
-                &outcome,
-                elapsed,
-            );
-            options
-                .processing
-                .store(false, std::sync::atomic::Ordering::Release);
-
-            route_outcome(
-                &mut conn,
-                topology,
-                stream,
-                &group,
-                &entry_id,
-                &fields,
-                outcome,
-                retry_count,
-                options.max_retries,
-                hold_queues,
-            )
-            .await;
+            }
         }
-
-        if last_autoclaim.elapsed() >= autoclaim_interval {
-            let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
-            last_autoclaim = std::time::Instant::now();
-        }
-    }
-
-    Ok(())
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -788,7 +851,15 @@ pub(super) fn parse_xreadgroup_reply(value: redis::Value) -> Vec<(String, Vec<(S
 /// excluding internal shove fields that are exposed via dedicated metadata
 /// fields.
 fn build_headers(fields: &HashMap<String, String>) -> HashMap<String, String> {
-    const SKIP: &[&str] = &[PAYLOAD_FIELD, X_RETRY_COUNT, X_SEQUENCE_KEY];
+    const SKIP: &[&str] = &[
+        PAYLOAD_FIELD,
+        X_RETRY_COUNT,
+        X_SEQUENCE_KEY,
+        X_MESSAGE_ID,
+        X_DEATH_REASON,
+        X_DEATH_COUNT,
+        X_ORIGINAL_QUEUE,
+    ];
     fields
         .iter()
         .filter(|(k, _)| !SKIP.contains(&k.as_str()))
@@ -952,6 +1023,28 @@ mod tests {
         let headers = build_headers(&fields);
         assert_eq!(headers.len(), 1);
         assert_eq!(headers.get("x-custom").map(String::as_str), Some("val"));
+    }
+
+    #[test]
+    fn build_headers_excludes_all_internal_fields() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(PAYLOAD_FIELD.to_string(), "data".to_string());
+        fields.insert(X_RETRY_COUNT.to_string(), "2".to_string());
+        fields.insert(X_SEQUENCE_KEY.to_string(), "acct-1".to_string());
+        fields.insert(X_MESSAGE_ID.to_string(), "msg-abc".to_string());
+        fields.insert(X_DEATH_REASON.to_string(), "max-retries".to_string());
+        fields.insert(X_DEATH_COUNT.to_string(), "5".to_string());
+        fields.insert(X_ORIGINAL_QUEUE.to_string(), "orders".to_string());
+        fields.insert("x-custom".to_string(), "val".to_string());
+
+        let headers = build_headers(&fields);
+        // Only x-custom must survive; all internal fields must be stripped.
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.get("x-custom").map(String::as_str), Some("val"));
+        assert!(!headers.contains_key(X_MESSAGE_ID));
+        assert!(!headers.contains_key(X_DEATH_REASON));
+        assert!(!headers.contains_key(X_DEATH_COUNT));
+        assert!(!headers.contains_key(X_ORIGINAL_QUEUE));
     }
 
     #[test]
