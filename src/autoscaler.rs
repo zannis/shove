@@ -202,8 +202,7 @@ impl<S: ScalingStrategy> ScalingStrategy for Stabilized<S> {
     }
 
     fn gc(&mut self, active: &[impl AsRef<str>]) {
-        let active: std::collections::HashSet<&str> =
-            active.iter().map(|g| g.as_ref()).collect();
+        let active: std::collections::HashSet<&str> = active.iter().map(|g| g.as_ref()).collect();
         self.state.retain(|k, _| active.contains(k.as_str()));
     }
 }
