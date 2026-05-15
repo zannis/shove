@@ -153,6 +153,7 @@ impl RedisConsumerGroupRegistry {
     /// Topology structures are declared before returning.
     pub async fn register_fifo<T, H>(
         &mut self,
+        config: RedisConsumerGroupConfig,
         factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -164,20 +165,22 @@ impl RedisConsumerGroupRegistry {
         let declarer = RedisTopologyDeclarer::new(self.client.clone());
         declarer.declare(topology).await?;
 
-        let client = self.client.clone();
-        let shutdown = self.shutdown.clone();
-        let handler = factory();
-        let ctx = ctx.clone();
+        let n = config.consumer_count() as usize;
+        for _ in 0..n {
+            let client = self.client.clone();
+            let shutdown = self.shutdown.clone();
+            let handler = factory();
+            let ctx = ctx.clone();
 
-        let task: TaskFactory = Box::new(move || {
-            Box::pin(async move {
-                let consumer = RedisConsumer::new(client);
-                let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
-                consumer.run_fifo::<T, H>(handler, ctx, options).await
-            })
-        });
-        self.tasks.push(task);
-
+            let task: TaskFactory = Box::new(move || {
+                Box::pin(async move {
+                    let consumer = RedisConsumer::new(client);
+                    let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
+                    consumer.run_fifo::<T, H>(handler, ctx, options).await
+                })
+            });
+            self.tasks.push(task);
+        }
         Ok(())
     }
 

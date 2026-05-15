@@ -117,6 +117,7 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
 
     async fn register_fifo<T, H>(
         &mut self,
+        config: Self::GroupConfig,
         factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -124,7 +125,7 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        RedisConsumerGroupRegistry::register_fifo::<T, H>(self, factory, ctx).await
+        RedisConsumerGroupRegistry::register_fifo::<T, H>(self, config, factory, ctx).await
     }
 
     fn cancellation_token(&self) -> CancellationToken {

@@ -201,6 +201,7 @@ impl InMemoryConsumerGroup {
     pub fn new_fifo<T, H>(
         queue: impl Into<String>,
         broker: InMemoryBroker,
+        mut config: InMemoryConsumerGroupConfig,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
@@ -215,7 +216,9 @@ impl InMemoryConsumerGroup {
         let pc_for_spawner = panic_count.clone();
 
         // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
-        let fifo_config = InMemoryConsumerGroupConfig::new(1..=1);
+        // Override min/max consumers from the user-provided config since FIFO is always single-replica.
+        config.min_consumers = 1;
+        config.max_consumers = 1;
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptionsInner| {
             let handler = handler_factory();
@@ -253,7 +256,7 @@ impl InMemoryConsumerGroup {
         Self {
             queue: queue.into(),
             consumers: Vec::with_capacity(1),
-            config: fifo_config,
+            config,
             spawner,
             group_token,
             error_count,
@@ -455,6 +458,7 @@ impl InMemoryConsumerGroupRegistry {
 
     pub async fn register_fifo<T, H>(
         &mut self,
+        config: InMemoryConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -482,6 +486,7 @@ impl InMemoryConsumerGroupRegistry {
         let group = InMemoryConsumerGroup::new_fifo::<T, H>(
             queue.clone(),
             broker,
+            config,
             group_token,
             handler_factory,
             ctx,

@@ -217,6 +217,7 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
 
     async fn register_fifo<T, H>(
         &mut self,
+        config: Self::GroupConfig,
         factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -224,7 +225,7 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        InMemoryConsumerGroupRegistry::register_fifo::<T, H>(self, factory, ctx).await
+        InMemoryConsumerGroupRegistry::register_fifo::<T, H>(self, config, factory, ctx).await
     }
 
     fn cancellation_token(&self) -> CancellationToken {

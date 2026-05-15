@@ -233,6 +233,7 @@ impl ConsumerGroup {
     pub fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: RabbitMqClient,
+        mut config: ConsumerGroupConfig,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
@@ -247,7 +248,8 @@ impl ConsumerGroup {
         let pc_for_spawner = panic_count.clone();
 
         // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
-        let fifo_config = ConsumerGroupConfig::new(1..=1);
+        config.min_consumers = 1;
+        config.max_consumers = 1;
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
@@ -286,7 +288,7 @@ impl ConsumerGroup {
             name: queue_str.clone(),
             queue: queue_str,
             consumers: Vec::with_capacity(1),
-            config: fifo_config,
+            config,
             spawner,
             group_token,
             error_count,

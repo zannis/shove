@@ -67,6 +67,7 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
 
     pub async fn register_fifo<T, H>(
         &mut self,
+        config: ConsumerGroupConfig<B>,
         factory: impl Fn() -> H + Send + Sync + 'static,
     ) -> Result<()>
     where
@@ -83,7 +84,7 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
             )));
         }
         self.inner
-            .register_fifo::<T, H>(factory, self.ctx.clone())
+            .register_fifo::<T, H>(config.inner, factory, self.ctx.clone())
             .await
     }
 
@@ -186,7 +187,10 @@ mod tests {
 
         let mut group = broker.consumer_group();
         group
-            .register_fifo::<Ledger, _>(|| NoopHandler)
+            .register_fifo::<Ledger, _>(
+                ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
+                || NoopHandler,
+            )
             .await
             .expect("register_fifo");
 

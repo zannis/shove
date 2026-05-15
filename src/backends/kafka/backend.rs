@@ -199,6 +199,7 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
 
     async fn register_fifo<T, H>(
         &mut self,
+        config: Self::GroupConfig,
         factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -206,7 +207,7 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        KafkaConsumerGroupRegistry::register_fifo::<T, H>(self, factory, ctx).await
+        KafkaConsumerGroupRegistry::register_fifo::<T, H>(self, config, factory, ctx).await
     }
 
     fn cancellation_token(&self) -> CancellationToken {
