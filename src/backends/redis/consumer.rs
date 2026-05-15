@@ -740,19 +740,28 @@ async fn autoclaim_all(
     consumer: &str,
     min_idle_ms: u64,
 ) -> Result<()> {
-    conn.query::<redis::Value>(
-        redis::cmd("XAUTOCLAIM")
-            .arg(stream)
-            .arg(group)
-            .arg(consumer)
-            .arg(min_idle_ms)
-            .arg("0-0")
-            .arg("COUNT")
-            .arg(AUTOCLAIM_COUNT),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| ShoveError::Connection(format!("XAUTOCLAIM failed: {e}")))
+    let mut cursor = "0-0".to_owned();
+    loop {
+        let reply: redis::streams::StreamAutoClaimReply = conn
+            .query(
+                redis::cmd("XAUTOCLAIM")
+                    .arg(stream)
+                    .arg(group)
+                    .arg(consumer)
+                    .arg(min_idle_ms)
+                    .arg(&cursor)
+                    .arg("COUNT")
+                    .arg(AUTOCLAIM_COUNT),
+            )
+            .await
+            .map_err(|e| ShoveError::Connection(format!("XAUTOCLAIM failed: {e}")))?;
+
+        if reply.next_stream_id == "0-0" || reply.next_stream_id.is_empty() {
+            break;
+        }
+        cursor = reply.next_stream_id;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
