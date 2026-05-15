@@ -374,10 +374,7 @@ async fn reject_sends_to_dlq() {
 
     let mut supervisor = broker.consumer_supervisor();
     supervisor
-        .register::<DlqDeliveryTopic, _>(
-            RejectH(handled.clone()),
-            ConsumerOptions::<Redis>::new(),
-        )
+        .register::<DlqDeliveryTopic, _>(RejectH(handled.clone()), ConsumerOptions::<Redis>::new())
         .expect("register");
 
     let probe = handled.clone();
@@ -422,12 +419,10 @@ async fn reject_sends_to_dlq() {
     // Parse: [[stream_name, [[entry_id, [field, value, ...]], ...]]]
     let has_entries = match &raw {
         redis::Value::Array(outer) if !outer.is_empty() => match &outer[0] {
-            redis::Value::Array(stream_pair) if stream_pair.len() >= 2 => {
-                match &stream_pair[1] {
-                    redis::Value::Array(entries) => !entries.is_empty(),
-                    _ => false,
-                }
-            }
+            redis::Value::Array(stream_pair) if stream_pair.len() >= 2 => match &stream_pair[1] {
+                redis::Value::Array(entries) => !entries.is_empty(),
+                _ => false,
+            },
             _ => false,
         },
         _ => false,
@@ -511,11 +506,7 @@ impl Topic for DlqDeliveryTopic {
     type Message = Order;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
-        T.get_or_init(|| {
-            TopologyBuilder::new("redis-int-dlq-delivery")
-                .dlq()
-                .build()
-        })
+        T.get_or_init(|| TopologyBuilder::new("redis-int-dlq-delivery").dlq().build())
     }
 }
 
