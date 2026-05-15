@@ -162,10 +162,12 @@ async fn poll_hold_set(
 
     let entries: Vec<String> = conn
         .query(
-            redis::cmd("ZRANGEBYSCORE")
+            // ZRANGE with BYSCORE replaces the deprecated ZRANGEBYSCORE (Redis 6.2+).
+            redis::cmd("ZRANGE")
                 .arg(set_key)
                 .arg(0f64)
                 .arg(now as f64)
+                .arg("BYSCORE")
                 .arg("LIMIT")
                 .arg(0i64)
                 .arg(REQUEUE_BATCH_SIZE),
