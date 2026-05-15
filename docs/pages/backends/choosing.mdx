@@ -8,6 +8,7 @@
 - **[AWS SNS + SQS →](/backends/sqs)** — fully managed; SNS fanout, SQS polling. Uses `consumer_supervisor()` since SQS has no coordinated-group primitive.
 - **[NATS JetStream →](/backends/nats)** — subject-based shard routing for per-key ordering, JetStream-backed durability.
 - **[Apache Kafka →](/backends/kafka)** — partition-key routing, native consumer groups with consumer-lag autoscaling, log retention for replay.
+- **[Redis / Valkey Streams →](/backends/redis)** — stream-based delivery with FNV-1a shard routing; requires Redis 6.2+ or any Valkey release.
 - **[In-process →](/backends/inmemory)** — zero-dependency, in-RAM. For tests and single-process apps; same API as the durable backends.
 
 ## Same code, every broker

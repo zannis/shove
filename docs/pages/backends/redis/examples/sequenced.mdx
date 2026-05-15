@@ -1,0 +1,41 @@
+# Redis — Sequenced
+
+Demonstrates per-key ordering with `SequencedTopic` and `register_fifo`. Interleaved ledger entries for three accounts are published; entries for the same account are always consumed in strict publish order, regardless of how many shard consumer tasks run.
+
+## Prerequisites
+
+- Redis 6.2+ or Valkey running locally (see command below)
+- Cargo feature: `redis-streams`
+
+## Run
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+cargo run --example redis_sequenced --features redis-streams
+```
+
+## Expected output
+
+```text
+published account=acct-001 seq=000
+published account=acct-002 seq=000
+published account=acct-001 seq=001
+published account=acct-003 seq=000
+published account=acct-002 seq=001
+published account=acct-001 seq=002
+published account=acct-003 seq=001
+consuming — press Ctrl-C to stop
+account=acct-001 seq=000 amount=+1000
+account=acct-002 seq=000 amount=+2000
+account=acct-001 seq=001 amount=-500
+account=acct-003 seq=000 amount=+750
+account=acct-002 seq=001 amount=-200
+account=acct-001 seq=002 amount=+300
+account=acct-003 seq=001 amount=-100
+```
+
+## Source
+
+```rust
+// [!include ~/examples/redis/sequenced.rs]
+```

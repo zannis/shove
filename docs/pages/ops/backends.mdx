@@ -84,6 +84,16 @@ On macOS, the dependency is typically satisfied via Homebrew. `librdkafka` is a 
 
 **Consumer offsets are committed asynchronously.** `librdkafka` commits offsets in the background. On clean shutdown, shove flushes pending commits before exiting. On a crash or SIGKILL, expect at-least-once redelivery from the last committed offset when the consumer restarts. Design handlers to be idempotent or use the dedup layer to handle this.
 
+## Redis / Valkey Streams
+
+**Redis 6.2 or newer is required.** shove uses `ZRANGE … BYSCORE` for hold-queue polling, a command introduced in Redis 6.2. The version is checked at connection time — if the server is older, `Broker::new` returns an error with a clear message rather than failing later with a cryptic protocol error. Any Valkey release is compatible (Valkey reports a 7.x-equivalent `redis_version` for backwards compatibility).
+
+**Standalone, TLS, and cluster modes are all supported.** Use `RedisMode::Standalone` with a `redis://` or `rediss://` URL for single-node and Sentinel setups. Use `RedisMode::Cluster` with a list of seed node URLs for Redis Cluster. shove opens one multiplexed connection for non-blocking operations (XADD, XACK, ZADD) and a separate dedicated connection per consumer loop for blocking reads (XREADGROUP with `BLOCK`).
+
+**Hold queues use Sorted Sets, not Streams.** Messages waiting for delayed retry are stored in a Redis Sorted Set with the redeliver-at timestamp as the score. A background requeuer task polls the set on each node and XADDs due entries back to the appropriate shard stream. If two requeuer instances run concurrently (e.g. during a rolling restart), the same entry may be XADDed twice — this is expected at-least-once behaviour; handlers must be idempotent.
+
+**Consumer groups are created automatically.** At topology declaration, shove creates an XGROUP on each shard stream if one does not already exist. The group name defaults to `"shove"` and can be overridden via `RedisConfig::group`. Do not reuse the same group name across unrelated applications that share a Redis instance.
+
 ## In-process
 
 **No durability.** Messages live entirely in process memory. Process exit — whether clean or via a crash — means message loss. State this explicitly on every internal review of "should we use the in-process backend in production?" — the answer is almost always no for distributed or stateful workloads.
