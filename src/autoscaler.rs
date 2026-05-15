@@ -103,6 +103,10 @@ pub enum ScalingDecision {
 /// across groups while tracking per-group state.
 pub trait ScalingStrategy: Send + Sync {
     fn evaluate(&mut self, group: &str, metrics: &ScalingMetrics) -> ScalingDecision;
+
+    /// Drop any per-group state for groups that are no longer active.
+    /// Default is a no-op.
+    fn gc(&mut self, _active: &[impl AsRef<str>]) {}
 }
 
 /// A simple threshold-based scaling strategy.
@@ -196,6 +200,12 @@ impl<S: ScalingStrategy> ScalingStrategy for Stabilized<S> {
             }
         }
     }
+
+    fn gc(&mut self, active: &[impl AsRef<str>]) {
+        let active: std::collections::HashSet<&str> =
+            active.iter().map(|g| g.as_ref()).collect();
+        self.state.retain(|k, _| active.contains(k.as_str()));
+    }
 }
 
 /// A backend that provides group discovery, metric fetching, and scaling
@@ -258,8 +268,8 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
             }
         };
 
-        for group in groups {
-            let metrics = match self.backend.fetch_metrics(&group).await {
+        for group in &groups {
+            let metrics = match self.backend.fetch_metrics(group).await {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!("failed to fetch metrics for {group}: {e}");
@@ -281,10 +291,13 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
                 continue;
             }
 
-            if let Err(e) = self.backend.scale(&group, decision).await {
+            if let Err(e) = self.backend.scale(group, decision).await {
                 tracing::error!("failed to scale {group}: {e}");
             }
         }
+
+        let group_refs: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
+        self.strategy.gc(&group_refs);
     }
 }
 
