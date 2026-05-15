@@ -209,15 +209,11 @@ fn check_version_info(info: &str) -> Result<()> {
     let major: u32 = parts
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            ShoveError::Connection(format!("unparseable Redis version: {version}"))
-        })?;
+        .ok_or_else(|| ShoveError::Connection(format!("unparseable Redis version: {version}")))?;
     let minor: u32 = parts
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| {
-            ShoveError::Connection(format!("unparseable Redis version: {version}"))
-        })?;
+        .ok_or_else(|| ShoveError::Connection(format!("unparseable Redis version: {version}")))?;
 
     if (major, minor) < (6, 2) {
         return Err(ShoveError::Connection(format!(
@@ -336,9 +332,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_info(version: &str) -> String {
-        format!(
-            "# Server\r\nredis_version:{version}\r\nredis_git_sha1:00000000\r\nos:Linux\r\n"
-        )
+        format!("# Server\r\nredis_version:{version}\r\nredis_git_sha1:00000000\r\nos:Linux\r\n")
     }
 
     #[test]
@@ -384,7 +378,10 @@ mod tests {
     fn missing_version_line_is_an_error() {
         let info = "# Server\r\nredis_git_sha1:00000000\r\nos:Linux\r\n";
         let err = check_version_info(info).unwrap_err();
-        assert!(err.to_string().contains("could not determine Redis version"));
+        assert!(
+            err.to_string()
+                .contains("could not determine Redis version")
+        );
     }
 
     #[test]
