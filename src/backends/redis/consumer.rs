@@ -412,7 +412,7 @@ where
                             "oversize",
                             retry_count,
                         )
-                        .await;
+                        .await?;
                         continue;
                     }
 
@@ -440,7 +440,7 @@ where
                                 "deserialize",
                                 retry_count,
                             )
-                            .await;
+                            .await?;
                             continue;
                         }
                     };
@@ -528,7 +528,7 @@ where
                         options.max_retries,
                         hold_queues,
                     )
-                    .await;
+                    .await?;
                 }
 
                 if last_autoclaim.elapsed() >= autoclaim_interval {
@@ -557,7 +557,7 @@ async fn route_outcome(
     retry_count: u32,
     max_retries: u32,
     hold_queues: &[HoldQueue],
-) {
+) -> Result<()> {
     match outcome {
         Outcome::Ack => {
             let _ = xack(conn, stream, group, entry_id).await;
@@ -575,7 +575,7 @@ async fn route_outcome(
                     "max-retries",
                     new_retry,
                 )
-                .await;
+                .await?;
             } else if hold_queues.is_empty() {
                 tracing::warn!(
                     stream,
@@ -610,7 +610,7 @@ async fn route_outcome(
                 "rejected",
                 retry_count,
             )
-            .await;
+            .await?;
         }
         Outcome::Defer => {
             if hold_queues.is_empty() {
@@ -638,6 +638,7 @@ async fn route_outcome(
             }
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -680,13 +681,13 @@ async fn route_to_dlq(
     fields: &HashMap<String, String>,
     reason: &str,
     death_count: u32,
-) {
+) -> Result<()> {
     let dlq = match topology.dlq() {
         Some(d) => d,
         None => {
             tracing::warn!(stream, entry_id, reason, "no DLQ configured — discarding");
             let _ = xack(conn, stream, group, entry_id).await;
-            return;
+            return Ok(());
         }
     };
 
@@ -699,10 +700,13 @@ async fn route_to_dlq(
     cmd.arg(X_DEATH_COUNT).arg(death_count.to_string());
     cmd.arg(X_ORIGINAL_QUEUE).arg(stream);
 
-    if let Err(e) = conn.query::<redis::Value>(&mut cmd).await {
-        tracing::warn!(error = %e, dlq, "XADD to DLQ failed");
-    }
+    conn.query::<redis::Value>(&mut cmd).await.map_err(|e| {
+        tracing::warn!(error = %e, dlq, "XADD to DLQ failed — message stays in PEL");
+        ShoveError::Connection(format!("XADD to DLQ failed: {e}"))
+    })?;
+
     let _ = xack(conn, stream, group, entry_id).await;
+    Ok(())
 }
 
 async fn requeue_to_stream(
