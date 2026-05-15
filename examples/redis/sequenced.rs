@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use shove::redis::{RedisConfig, RedisMode};
+use shove::consumer_group::ConsumerGroupConfig;
+use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
 use shove::{
     Broker, MessageHandler, MessageMetadata, Outcome, Redis, SequenceFailure, SequencedTopic,
     Topic, TopologyBuilder,
@@ -120,7 +121,12 @@ async fn main() -> Result<(), shove::ShoveError> {
     // Consume with FIFO (one task per shard — entries for the same account
     // are always processed in the order they were published).
     let mut group = broker.consumer_group();
-    group.register_fifo::<Ledger, _>(|| Handler).await?;
+    group
+        .register_fifo::<Ledger, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::default()),
+            || Handler,
+        )
+        .await?;
 
     println!("consuming — press Ctrl-C to stop");
     let outcome = group
