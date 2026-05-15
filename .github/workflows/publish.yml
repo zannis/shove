@@ -48,6 +48,23 @@ jobs:
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - uses: pnpm/action-setup@v4
+        if: inputs.bump != 'none'
+
+      - uses: actions/setup-node@v4
+        if: inputs.bump != 'none'
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Sync package.json version
+        if: inputs.bump != 'none'
+        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version
+
+      - name: Update pnpm lockfile
+        if: inputs.bump != 'none'
+        run: pnpm install
+
       - name: Import GPG signing key
         if: inputs.bump != 'none'
         uses: crazy-max/ghaction-import-gpg@v7
@@ -61,7 +78,7 @@ jobs:
       - name: Commit and tag
         if: inputs.bump != 'none'
         run: |
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock package.json pnpm-lock.yaml
           git commit -m "release: v${{ steps.version.outputs.version }}"
           git tag -m "v${{ steps.version.outputs.version }}" "v${{ steps.version.outputs.version }}"
           git push origin main --follow-tags
