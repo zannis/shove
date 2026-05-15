@@ -19,6 +19,8 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, QueueTopology};
 
+use redis::streams::StreamAutoClaimReply;
+
 use super::client::{RedisClient, RedisConnection};
 use super::constants::{
     AUTOCLAIM_COUNT, BLOCK_MS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID,
@@ -742,7 +744,7 @@ async fn autoclaim_all(
 ) -> Result<()> {
     let mut cursor = "0-0".to_owned();
     loop {
-        let reply: redis::streams::StreamAutoClaimReply = conn
+        let reply: StreamAutoClaimReply = conn
             .query(
                 redis::cmd("XAUTOCLAIM")
                     .arg(stream)
