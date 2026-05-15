@@ -1,0 +1,94 @@
+# Redis / Valkey Streams
+
+If Redis or Valkey is already in your stack, this backend gives you stream-based messaging with FNV-1a shard routing for per-key ordering, consumer groups, hold-queue retries, and queue-depth autoscaling — without adding another broker to your infrastructure.
+
+## What you need
+
+Redis 6.2+ or any Valkey release. shove uses `ZRANGE … BYSCORE` (introduced in Redis 6.2) for hold-queue polling. The version is validated at connection time: `Broker::new` returns an error immediately if the server is older rather than failing later with a cryptic protocol error.
+
+For local dev:
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+```
+
+## Install
+
+```sh
+cargo add shove --features redis-streams
+```
+
+## Connect
+
+```rust
+use shove::redis::{RedisConfig, RedisMode};
+use shove::{Broker, Redis};
+
+let broker = Broker::<Redis>::new(RedisConfig {
+    mode: RedisMode::Standalone {
+        url: "redis://127.0.0.1:6379/".into(),
+    },
+    group: None,
+})
+.await?;
+```
+
+`RedisMode::Standalone` accepts `redis://` and `rediss://` (TLS) URLs. For Redis Cluster, use `RedisMode::Cluster { urls: vec![...] }` with one or more seed node URLs.
+
+`group` sets the consumer group name shared by all consumers. Defaults to `"shove"` if `None`.
+
+## Declare topology
+
+```rust
+broker.topology().declare::<Orders>().await?;
+```
+
+`declare` creates the Redis Streams and Sorted Sets required by the topic topology: the main shard streams, hold-queue sorted sets, and DLQ stream when `.dlq()` is configured. The call is idempotent and safe to run on every startup.
+
+## Publish
+
+```rust
+let publisher = broker.publisher().await?;
+publisher.publish::<Orders>(&OrderPaid { order_id: "ORD-1".into() }).await?;
+```
+
+`publish` routes to a shard stream via FNV-1a hash of the message key and appends the entry with `XADD`.
+
+## Consume
+
+```rust
+use shove::redis::RedisConsumerGroupConfig;
+use shove::{ConsumerGroupConfig};
+
+let mut group = broker.consumer_group();
+group
+    .register::<Orders, _>(
+        ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1)),
+        || Handler,
+    )
+    .await?;
+```
+
+`RedisConsumerGroupConfig::new(n)` sets the number of concurrent consumer tasks. Each task polls its assigned shard stream with `XREADGROUP BLOCK`.
+
+## Sequenced delivery
+
+Messages for the same key stay in order. The publisher hashes the sequence key to a shard stream; each shard has exactly one active consumer task, so messages for the same key are never processed concurrently. Different keys on different shards are fully independent.
+
+```rust
+group.register_fifo::<Ledger, _>(|| Handler).await?;
+```
+
+`register_fifo` wires one consumer task per shard. See [Sequenced Topics](/guides/sequenced) for the full ordering model.
+
+## Gotchas
+
+- **Redis 6.2+ is required.** Connecting to an older server returns an error at startup. Any Valkey release is compatible.
+- **Standalone vs cluster.** Cluster mode routes XADD and XREADGROUP commands through the cluster client. All shard keys for a given topic should hash to the same slot if you rely on Lua-based atomicity; shove does not use Lua, so cross-slot operations are safe.
+- **Consumer group names must be unique per application.** The group name (default `"shove"`) is shared by all consumers on the client. If multiple unrelated applications share a Redis instance, set a distinct group name per application via `RedisConfig { group: Some("myapp".into()), .. }`.
+- **Hold queues are Sorted Sets, not streams.** Retried messages are stored in a Redis Sorted Set with a redeliver-at timestamp as the score. A background requeuer task polls the set and XADDs due entries back. If two instances run concurrently during a rolling restart, the same message may be requeued twice — this is expected at-least-once behaviour; handlers must be idempotent.
+
+## Examples
+
+- [Basic](/backends/redis/examples/basic) — publish/consume round trip with hold queues and DLQ
+- [Sequenced](/backends/redis/examples/sequenced) — FNV-1a shard routing for per-key ordering

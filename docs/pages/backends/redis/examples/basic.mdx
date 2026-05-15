@@ -1,0 +1,33 @@
+# Redis — Basic
+
+A minimal Redis Streams publish/consume round-trip. Three `OrderPaid` messages are published to a topic with a hold queue and DLQ, then consumed by a single-worker consumer group until Ctrl-C.
+
+## Prerequisites
+
+- Redis 6.2+ or Valkey running locally (see command below)
+- Cargo feature: `redis-streams`
+
+## Run
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+cargo run --example redis_basic --features redis-streams
+```
+
+## Expected output
+
+```text
+published ORD-0001
+published ORD-0002
+published ORD-0003
+consuming — press Ctrl-C to stop
+received order: ORD-0001 (retry=0)
+received order: ORD-0002 (retry=0)
+received order: ORD-0003 (retry=0)
+```
+
+## Source
+
+```rust
+// [!include ~/examples/redis/basic.rs]
+```

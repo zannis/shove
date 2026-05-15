@@ -89,6 +89,8 @@ Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` — the topic
 | Redis/Valkey Streams | `redis-streams` | `Redis`    | FNV-1a shard streams                  | XLEN + XPENDING        |
 | In-process           | `inmemory`      | `InMemory` | Per-key FIFO shards                   | Queue depth (in-proc)  |
 
+> **Redis/Valkey requirement:** Redis 6.2+ (or an equivalent Valkey release) is required. shove uses `ZRANGE … BYSCORE` for hold-queue polling, which was introduced in Redis 6.2. The version is validated at connection time and an error is returned if the server is older.
+
 `cargo add shove --features <flag>`. No features are enabled by default. Decision guide: [Choosing a backend](https://shove.rs/backends/choosing).
 
 Optional add-ons: `audit` (built-in `ShoveAuditHandler` + `AuditLog` topic), `metrics` (Prometheus/StatsD/OTel via the [`metrics`](https://docs.rs/metrics) facade), `kafka-ssl` (TLS + SASL), `rabbitmq-transactional` (exactly-once routing).
@@ -126,7 +128,8 @@ MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91. Reproducible via
 
 ## Requirements
 
-Rust 1.85 or newer (edition 2024).
+- Rust 1.85 or newer (edition 2024).
+- Redis 6.2+ or Valkey (any release) when using the `redis-streams` backend.
 
 ## License
 

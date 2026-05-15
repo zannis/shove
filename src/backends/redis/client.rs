@@ -129,10 +129,15 @@ impl RedisClient {
             }
         };
 
-        Ok(Self {
+        let client = Self {
             inner: Arc::new(inner),
             group,
-        })
+        };
+
+        let mut conn = client.multiplexed_conn().await?;
+        check_min_version(&mut conn).await?;
+
+        Ok(client)
     }
 
     /// Return a multiplexed (shared) connection suitable for non-blocking operations
@@ -179,6 +184,53 @@ impl RedisClient {
     pub(super) fn group(&self) -> &str {
         &self.group
     }
+}
+
+// ---------------------------------------------------------------------------
+// Version check
+// ---------------------------------------------------------------------------
+
+/// Verify that the connected server is Redis/Valkey 6.2 or newer.
+///
+/// shove uses `ZRANGE … BYSCORE` (introduced in Redis 6.2) for hold-queue
+/// polling, so older servers will fail at runtime with cryptic errors.
+/// Catching the version mismatch at connection time gives a clear message.
+/// Parse and validate the `redis_version` field from an `INFO server` response.
+///
+/// Extracted as a sync function so it can be unit-tested without a real connection.
+fn check_version_info(info: &str) -> Result<()> {
+    let version = info
+        .lines()
+        .find_map(|line| line.strip_prefix("redis_version:"))
+        .ok_or_else(|| ShoveError::Connection("could not determine Redis version".into()))?
+        .trim();
+
+    let mut parts = version.splitn(3, '.');
+    let major: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ShoveError::Connection(format!("unparseable Redis version: {version}")))?;
+    let minor: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ShoveError::Connection(format!("unparseable Redis version: {version}")))?;
+
+    if (major, minor) < (6, 2) {
+        return Err(ShoveError::Connection(format!(
+            "Redis {version} is not supported; shove requires Redis 6.2 or newer"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn check_min_version(conn: &mut RedisConnection) -> Result<()> {
+    let info: String = conn
+        .query(redis::cmd("INFO").arg("server"))
+        .await
+        .map_err(|e| ShoveError::Connection(format!("INFO server failed: {e}")))?;
+
+    check_version_info(&info)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,5 +325,88 @@ mod tests {
             group: None,
         };
         assert!(matches!(cfg.mode, RedisMode::Cluster { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_version_info
+    // -----------------------------------------------------------------------
+
+    fn make_info(version: &str) -> String {
+        format!("# Server\r\nredis_version:{version}\r\nredis_git_sha1:00000000\r\nos:Linux\r\n")
+    }
+
+    #[test]
+    fn version_6_2_0_is_accepted() {
+        assert!(check_version_info(&make_info("6.2.0")).is_ok());
+    }
+
+    #[test]
+    fn version_6_2_14_is_accepted() {
+        assert!(check_version_info(&make_info("6.2.14")).is_ok());
+    }
+
+    #[test]
+    fn version_7_0_0_is_accepted() {
+        assert!(check_version_info(&make_info("7.0.0")).is_ok());
+    }
+
+    #[test]
+    fn version_8_0_0_is_accepted() {
+        assert!(check_version_info(&make_info("8.0.0")).is_ok());
+    }
+
+    #[test]
+    fn version_5_0_0_is_rejected() {
+        let err = check_version_info(&make_info("5.0.0")).unwrap_err();
+        assert!(err.to_string().contains("5.0.0"));
+        assert!(err.to_string().contains("6.2"));
+    }
+
+    #[test]
+    fn version_6_0_0_is_rejected() {
+        let err = check_version_info(&make_info("6.0.0")).unwrap_err();
+        assert!(err.to_string().contains("6.0.0"));
+    }
+
+    #[test]
+    fn version_6_1_9_is_rejected() {
+        let err = check_version_info(&make_info("6.1.9")).unwrap_err();
+        assert!(err.to_string().contains("6.1.9"));
+    }
+
+    #[test]
+    fn missing_version_line_is_an_error() {
+        let info = "# Server\r\nredis_git_sha1:00000000\r\nos:Linux\r\n";
+        let err = check_version_info(info).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not determine Redis version")
+        );
+    }
+
+    #[test]
+    fn malformed_version_no_dots_is_an_error() {
+        let err = check_version_info(&make_info("garbage")).unwrap_err();
+        assert!(err.to_string().contains("unparseable Redis version"));
+    }
+
+    #[test]
+    fn malformed_version_major_only_is_an_error() {
+        let err = check_version_info(&make_info("7")).unwrap_err();
+        assert!(err.to_string().contains("unparseable Redis version"));
+    }
+
+    #[test]
+    fn version_line_with_surrounding_noise_is_parsed_correctly() {
+        // Realistic INFO output has many lines before and after redis_version.
+        let info = "# Server\r\nredis_version:7.2.5\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:abc\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\n";
+        assert!(check_version_info(info).is_ok());
+    }
+
+    #[test]
+    fn valkey_reports_compatible_redis_version() {
+        // Valkey sets redis_version to a 7.x compat value for backwards compatibility.
+        let info = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:8.0.0\r\n";
+        assert!(check_version_info(info).is_ok());
     }
 }
