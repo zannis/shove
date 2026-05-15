@@ -11,8 +11,6 @@ const RANDOMIZATION_FACTOR: f64 = 0.5;
 pub(crate) struct Backoff {
     /// The base interval that grows exponentially.
     current: Duration,
-    /// The initial interval (used by `reset`).
-    initial: Duration,
     /// The upper bound on the base interval.
     max: Duration,
     /// Randomization factor in `[0, 1)`. `0` means no jitter.
@@ -31,16 +29,9 @@ impl Backoff {
     pub(crate) fn new(initial: Duration, max: Duration) -> Self {
         Self {
             current: initial,
-            initial,
             max,
             randomization_factor: RANDOMIZATION_FACTOR,
         }
-    }
-
-    /// Reset the iterator to the initial delay (call after a successful operation).
-    #[allow(dead_code)]
-    pub(crate) fn reset(&mut self) {
-        self.current = self.initial;
     }
 
     /// Compute a jittered delay from the current base interval.
@@ -102,20 +93,6 @@ mod tests {
     }
 
     #[test]
-    fn backoff_reset() {
-        let mut b = Backoff::default();
-        b.next(); // advances to 2s base
-        b.next(); // advances to 4s base
-        b.reset();
-        // After reset the base is back to 1s, so jittered value must be in [0.5s, 1.5s].
-        let delay = b.next().unwrap();
-        assert!(
-            delay >= Duration::from_millis(500) && delay <= Duration::from_millis(1500),
-            "after reset, delay {delay:?} should be in [500ms, 1500ms]"
-        );
-    }
-
-    #[test]
     fn backoff_custom_initial_and_max() {
         // initial=100ms, max=500ms → bases: 100, 200, 400, 500, 500
         let bases_ms = [100u64, 200, 400, 500, 500];
@@ -138,7 +115,6 @@ mod tests {
     fn backoff_no_jitter() {
         let mut b = Backoff {
             current: Duration::from_secs(1),
-            initial: Duration::from_secs(1),
             max: Duration::from_secs(30),
             randomization_factor: 0.0,
         };

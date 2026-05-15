@@ -163,6 +163,14 @@ pub mod topology;
 pub mod topology_declarer;
 
 mod backends;
+#[cfg(any(
+    feature = "rabbitmq",
+    feature = "nats",
+    feature = "kafka",
+    feature = "pub-aws-sns",
+    feature = "aws-sns-sqs",
+    feature = "redis-streams"
+))]
 pub(crate) mod retry;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
