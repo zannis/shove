@@ -342,6 +342,104 @@ async fn reject_no_panic() {
 }
 
 // ---------------------------------------------------------------------------
+// DLQ delivery test: rejected messages must arrive in the DLQ stream
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reject_sends_to_dlq() {
+    let broker = make_broker("redis-int-dlq-delivery-grp").await;
+    broker
+        .topology()
+        .declare::<DlqDeliveryTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<DlqDeliveryTopic>(&Order { id: 77 })
+        .await
+        .expect("publish");
+
+    let handled = Arc::new(AtomicU32::new(0));
+
+    #[derive(Clone)]
+    struct RejectH(Arc<AtomicU32>);
+    impl MessageHandler<DlqDeliveryTopic> for RejectH {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Reject
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<DlqDeliveryTopic, _>(
+            RejectH(handled.clone()),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    let probe = handled.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
+        // Give the DLQ XADD time to complete before we read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    // Read from the DLQ stream directly and verify the message arrived.
+    let url = redis_url().await;
+    let client = redis::Client::open(url).expect("redis client for DLQ check");
+    let mut raw_conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw redis conn");
+
+    // DLQ stream name — topology appends "-dlq" to the queue name.
+    let base_stream = DlqDeliveryTopic::topology().queue();
+    let dlq_stream = format!("{base_stream}-dlq");
+
+    // Use raw XREAD to avoid AsyncCommands API uncertainty.
+    let raw: redis::Value = redis::cmd("XREAD")
+        .arg("COUNT")
+        .arg(10i64)
+        .arg("STREAMS")
+        .arg(&dlq_stream)
+        .arg("0-0")
+        .query_async(&mut raw_conn)
+        .await
+        .unwrap_or(redis::Value::Nil);
+
+    // Parse: [[stream_name, [[entry_id, [field, value, ...]], ...]]]
+    let has_entries = match &raw {
+        redis::Value::Array(outer) if !outer.is_empty() => match &outer[0] {
+            redis::Value::Array(stream_pair) if stream_pair.len() >= 2 => {
+                match &stream_pair[1] {
+                    redis::Value::Array(entries) => !entries.is_empty(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+
+    assert!(
+        has_entries,
+        "DLQ stream '{dlq_stream}' must contain at least one entry after Reject; got: {raw:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 4: fifo_same_key_in_order
 // ---------------------------------------------------------------------------
 
@@ -407,6 +505,19 @@ async fn fifo_same_key_in_order() {
 // ---------------------------------------------------------------------------
 // Additional test topics (unique names to avoid cross-test pollution)
 // ---------------------------------------------------------------------------
+
+struct DlqDeliveryTopic;
+impl Topic for DlqDeliveryTopic {
+    type Message = Order;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-dlq-delivery")
+                .dlq()
+                .build()
+        })
+    }
+}
 
 struct HeadersTopic;
 impl Topic for HeadersTopic {
