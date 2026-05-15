@@ -11,6 +11,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
   pull_request:
     paths:
       - 'src/**'
@@ -20,6 +22,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
 
 permissions:
   contents: read
@@ -42,21 +46,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -- --check
       - run: cargo clippy -q --all-features -- -D warnings
+      - run: cargo clippy -q --no-default-features -- -D warnings
+      - run: cargo test --no-default-features
       - run: cargo publish --dry-run --all-features
 
   coverage:
     runs-on: ubuntu-latest
     env:
       LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: inmemory
+            features: inmemory,metrics
+          - name: rabbitmq
+            features: rabbitmq,audit,rabbitmq-transactional
+          - name: aws-sns-sqs
+            features: pub-aws-sns,aws-sns-sqs,audit
+          - name: nats
+            features: nats,audit
+          - name: kafka
+            features: kafka,kafka-ssl,audit
+          - name: redis-streams
+            features: redis-streams
     steps:
       - uses: actions/checkout@v6
-      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
+      - if: matrix.name == 'kafka'
+        run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
-      - run: cargo llvm-cov nextest --all-features --lcov --output-path lcov.info
+      - run: cargo llvm-cov nextest --features ${{ matrix.features }} --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
+          flags: ${{ matrix.name }}
           fail_ci_if_error: true
