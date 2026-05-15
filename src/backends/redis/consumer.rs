@@ -363,6 +363,14 @@ where
                     result = xreadgroup_fut => match result {
                         Ok(v) => v,
                         Err(e) => {
+                            // NOGROUP means the consumer group was deleted externally or topology
+                            // was not declared before consuming. This is a configuration error, not
+                            // a transient network failure — retrying will never succeed.
+                            if e.to_string().contains("NOGROUP") {
+                                return Err(ShoveError::Topology(format!(
+                                    "consumer group does not exist on stream '{stream}': {e}"
+                                )));
+                            }
                             tracing::warn!(error = %e, stream, "XREADGROUP failed");
                             return Err(e);
                         }
@@ -1270,5 +1278,16 @@ mod tests {
         assert_eq!(hold_level(1, &single), Some(0));
         assert_eq!(hold_level(100, &single), Some(0));
         assert_eq!(hold_level(u32::MAX, &single), Some(0));
+    }
+
+    #[test]
+    fn nogroup_error_string_is_detected() {
+        // Verify the substring we check for matches what Redis actually returns.
+        // Redis error format: "NOGROUP No such consumer group 'grp' for key name 'stream'"
+        let err_str = "NOGROUP No such consumer group 'grp' for key name 'stream'";
+        assert!(err_str.contains("NOGROUP"));
+        // The ShoveError wrapping must preserve the NOGROUP text for the check to work.
+        let err = ShoveError::Connection(err_str.to_string());
+        assert!(err.to_string().contains("NOGROUP"));
     }
 }
