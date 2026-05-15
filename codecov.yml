@@ -1,8 +1,12 @@
-coverage:
-  status:
-    project:
-      default:
-        after_n_builds: 6
+codecov:
+  notify:
+    after_n_builds: 6
+    wait_for_ci: true
+
+ignore:
+  - "tests/**"
+  - "benches/**"
+  - "examples/**"
 
 flag_management:
   default_rules:
