@@ -76,10 +76,18 @@ group
 Messages for the same key stay in order. The publisher hashes the sequence key to a shard stream; each shard has exactly one active consumer task, so messages for the same key are never processed concurrently. Different keys on different shards are fully independent.
 
 ```rust
-group.register_fifo::<Ledger, _>(|| Handler).await?;
+use shove::consumer_group::ConsumerGroupConfig;
+use shove::redis::RedisConsumerGroupConfig;
+
+group
+    .register_fifo::<Ledger, _>(
+        ConsumerGroupConfig::new(RedisConsumerGroupConfig::default()),
+        || Handler,
+    )
+    .await?;
 ```
 
-`register_fifo` wires one consumer task per shard. See [Sequenced Topics](/guides/sequenced) for the full ordering model.
+`register_fifo` wires consumer tasks for sequenced delivery. `RedisConsumerGroupConfig::default()` spawns one consumer task; use `RedisConsumerGroupConfig::new(n)` to run more. See [Sequenced Topics](/guides/sequenced) for the full ordering model.
 
 ## Gotchas
 

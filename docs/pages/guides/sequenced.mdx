@@ -191,11 +191,18 @@ let outcome = sup
     .await;
 ```
 
-For consumer groups, `register_fifo` takes only the handler factory — there is no `ConsumerGroupConfig` parameter because FIFO concurrency is determined by the topology's `routing_shards`, not by user-supplied min/max. Autoscaling is not applied to FIFO registrations (more replicas would break per-key ordering):
+For consumer groups, `register_fifo` accepts a `ConsumerGroupConfig` — the same type as `register`. On most backends the consumer count is pinned to 1 internally (ordering requires a single consumer per shard); on Redis, `consumer_count()` controls how many consumer tasks are spawned. Autoscaling is not applied to FIFO registrations:
 
 ```rust,no_run
+use shove::consumer_group::ConsumerGroupConfig;
+
 let mut group = broker.consumer_group().with_context(ctx);
-group.register_fifo::<SequencedTopic, _>(|| MyHandler).await?;
+group
+    .register_fifo::<SequencedTopic, _>(
+        ConsumerGroupConfig::new(BackendConsumerGroupConfig::default()),
+        || MyHandler,
+    )
+    .await?;
 let outcome = group.run_until_timeout(signal, Duration::from_secs(30)).await;
 ```
 
