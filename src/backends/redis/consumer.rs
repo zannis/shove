@@ -329,6 +329,11 @@ where
         let options = options.clone();
         let group = group.clone();
         let consumer = RedisConsumer::consumer_name();
+        tracing::debug!(
+            consumer,
+            stream,
+            "new consumer name registered; previous name left as stale entry in group until XGROUP DELCONSUMER is called"
+        );
         let topic_arc = Arc::clone(&topic_arc);
         let group_arc = group_arc.clone();
         let shutdown = shutdown.clone();
