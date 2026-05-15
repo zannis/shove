@@ -766,12 +766,28 @@ fn schedule_redelivery(
                 return;
             }
         }
+        // Re-check shutdown after sleep — the broker may have shut down while
+        // awaiting capacity.
+        if broker_shutdown.is_cancelled() {
+            return;
+        }
         let Ok(q) = broker_clone.lookup(&main_queue) else {
             tracing::warn!(queue = %main_queue, "redelivery target queue no longer exists");
             return;
         };
-        if let Err(e) = broker_clone.enqueue(&q, env).await {
-            tracing::warn!(queue = %main_queue, error = %e, "redelivery enqueue failed");
+        let redelivery_timeout = Duration::from_secs(30);
+        match tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(queue = %main_queue, error = %e, "redelivery enqueue failed");
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    queue = %main_queue,
+                    "redelivery enqueue timed out after {}s — message dropped",
+                    redelivery_timeout.as_secs()
+                );
+            }
         }
     });
 }
