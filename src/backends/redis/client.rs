@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use redis::aio::MultiplexedConnection;
-use redis::cluster::ClusterClient;
+use redis::cluster::{ClusterClient, ClusterConfig};
 use redis::cluster_async::ClusterConnection;
 
 use crate::error::{Result, ShoveError};
@@ -168,7 +168,7 @@ impl RedisClient {
                 .map(RedisConnection::Standalone)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
             ClientInner::Cluster(client) => client
-                .get_async_connection()
+                .get_async_connection_with_config(ClusterConfig::new())
                 .await
                 .map(RedisConnection::Cluster)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
