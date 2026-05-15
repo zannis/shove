@@ -1,0 +1,23 @@
+coverage:
+  status:
+    project:
+      default:
+        after_n_builds: 6
+
+flag_management:
+  default_rules:
+    carryforward: true
+
+flags:
+  inmemory:
+    carryforward: true
+  rabbitmq:
+    carryforward: true
+  aws-sns-sqs:
+    carryforward: true
+  nats:
+    carryforward: true
+  kafka:
+    carryforward: true
+  redis-streams:
+    carryforward: true
