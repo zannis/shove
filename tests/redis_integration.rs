@@ -19,7 +19,8 @@ use testcontainers::core::ContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
-use shove::redis::{RedisConfig, RedisMode};
+use shove::consumer_group::ConsumerGroupConfig;
+use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
 use shove::{
     Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Redis, SequenceFailure,
     SequencedTopic, Topic, TopologyBuilder,
@@ -474,7 +475,10 @@ async fn fifo_same_key_in_order() {
     let received_c = received.clone();
     let mut group = broker.consumer_group();
     group
-        .register_fifo::<LedgerTopic, _>(move || H(Arc::clone(&received_c)))
+        .register_fifo::<LedgerTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::default()),
+            move || H(Arc::clone(&received_c)),
+        )
         .await
         .expect("register_fifo");
 

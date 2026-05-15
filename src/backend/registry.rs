@@ -36,6 +36,7 @@ pub(crate) trait RegistryImpl: Send {
 
     fn register_fifo<T, H>(
         &mut self,
+        _config: Self::GroupConfig,
         _factory: impl Fn() -> H + Send + Sync + 'static,
         _ctx: H::Context,
     ) -> impl Future<Output = Result<()>> + Send

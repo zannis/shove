@@ -1366,7 +1366,10 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     let mut group = broker.consumer_group();
     let counter = consumed.clone();
     group
-        .register_fifo::<LedgerSkipTopic, _>(move || H(counter.clone()))
+        .register_fifo::<LedgerSkipTopic, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
+            move || H(counter.clone()),
+        )
         .await
         .unwrap();
 

@@ -2143,10 +2143,13 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     let handler = CountingHandler::new();
     let mut group = broker.consumer_group();
     group
-        .register_fifo::<SeqSkipTopic, _>({
-            let h = handler.clone();
-            move || h.clone()
-        })
+        .register_fifo::<SeqSkipTopic, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
         .await
         .unwrap();
 

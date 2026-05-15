@@ -5226,10 +5226,13 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     let handler = CountingHandler::new();
     let mut group = b.consumer_group();
     group
-        .register_fifo::<OrderTopic, _>({
-            let h = handler.clone();
-            move || h.clone()
-        })
+        .register_fifo::<OrderTopic, _>(
+            shove::consumer_group::ConsumerGroupConfig::new(ConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
         .await
         .unwrap();
 

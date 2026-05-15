@@ -195,6 +195,7 @@ impl KafkaConsumerGroup {
     pub fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: KafkaClient,
+        mut config: KafkaConsumerGroupConfig,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
@@ -209,7 +210,8 @@ impl KafkaConsumerGroup {
         let pc_for_spawner = panic_count.clone();
 
         // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
-        let fifo_config = KafkaConsumerGroupConfig::new(1..=1);
+        config.min_consumers = 1;
+        config.max_consumers = 1;
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
@@ -248,7 +250,7 @@ impl KafkaConsumerGroup {
         Self {
             queue: queue_str.clone(),
             consumers: Vec::with_capacity(1),
-            config: fifo_config,
+            config,
             spawner,
             group_token,
             error_count,
@@ -465,6 +467,7 @@ impl KafkaConsumerGroupRegistry {
     /// [`start_all`]: Self::start_all
     pub async fn register_fifo<T, H>(
         &mut self,
+        config: KafkaConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -493,6 +496,7 @@ impl KafkaConsumerGroupRegistry {
         let group = KafkaConsumerGroup::new_fifo::<T, H>(
             name.clone(),
             client.clone(),
+            config,
             group_token,
             handler_factory,
             ctx,

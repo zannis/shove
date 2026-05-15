@@ -86,6 +86,7 @@ impl ConsumerGroupRegistry {
     /// [`start_all`]: Self::start_all
     pub async fn register_fifo<T, H>(
         &mut self,
+        config: ConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -111,6 +112,7 @@ impl ConsumerGroupRegistry {
         let group = ConsumerGroup::new_fifo::<T, H>(
             name.clone(),
             self.client.clone(),
+            config,
             group_token,
             handler_factory,
             ctx,
