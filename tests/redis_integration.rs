@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use testcontainers::ImageExt;
+use testcontainers::core::ContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
@@ -666,4 +668,188 @@ async fn autoscaler_stats_reflect_published_messages() {
         "expected at least 5 ready messages, got {}",
         stats.messages_ready
     );
+}
+
+// ---------------------------------------------------------------------------
+// Helper for finding a free port
+// ---------------------------------------------------------------------------
+
+fn find_free_port() -> u16 {
+    // Bind to port 0 to let the OS allocate a free ephemeral port, then
+    // immediately drop the listener so the port is available for Docker.
+    // There is a small TOCTOU window, but it is negligible for test use.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind for free port");
+    listener.local_addr().expect("local addr").port()
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect test topic
+// ---------------------------------------------------------------------------
+
+struct ReconnectTopic;
+impl Topic for ReconnectTopic {
+    type Message = Order;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-reconnect")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect test: consumer recovers after Redis container restart
+// ---------------------------------------------------------------------------
+
+/// Verify that the consumer survives a full Redis restart:
+/// 1. Consume one message to prove it is working.
+/// 2. Stop the Redis container (simulating a network partition or crash).
+/// 3. Start the Redis container again.
+/// 4. Redeclare topology and publish a second message.
+/// 5. The running consumer reconnects and processes the new message.
+#[tokio::test]
+async fn consumer_recovers_after_redis_restart() {
+    // Each reconnect test uses its own container so we can stop/start it.
+    // The shared `redis_url()` container is not used here.
+    // Use a dynamically allocated host port to avoid CI collisions.
+    let host_port: u16 = find_free_port();
+    let container = RedisContainer::default()
+        .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
+        .start()
+        .await
+        .expect("start Redis container");
+    let host = container.get_host().await.expect("get host");
+    let url = format!("redis://{host}:{host_port}/");
+
+    let broker = Broker::<Redis>::new(RedisConfig {
+        mode: RedisMode::Standalone { url: url.clone() },
+        group: Some("reconnect".into()),
+    })
+    .await
+    .expect("connect");
+
+    broker
+        .topology()
+        .declare::<ReconnectTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<ReconnectTopic>(&Order { id: 1 })
+        .await
+        .expect("publish 1");
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct CountingHandler(Arc<AtomicUsize>);
+    impl MessageHandler<ReconnectTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    let token = supervisor.cancellation_token();
+    supervisor
+        .register::<ReconnectTopic, _>(
+            CountingHandler(counter.clone()),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    // Wait for the first message to be consumed.
+    let probe1 = counter.clone();
+    assert!(
+        poll_until(
+            move || probe1.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(10),
+        )
+        .await,
+        "first message was not consumed"
+    );
+
+    // --- Simulate Redis outage ---
+    // Kill and restart the container. The fixed port binding ensures
+    // the consumer's cached URL remains valid across the restart.
+    let container_id = container.id().to_string();
+    let status = std::process::Command::new("docker")
+        .args(["kill", &container_id])
+        .status()
+        .expect("docker kill");
+    assert!(status.success(), "docker kill failed");
+
+    // Let the consumer notice the disconnect and enter the backoff loop.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let status = std::process::Command::new("docker")
+        .args(["start", &container_id])
+        .status()
+        .expect("docker start");
+    assert!(status.success(), "docker start failed");
+
+    // Give Redis time to initialise and accept connections.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verify Redis is reachable before proceeding.
+    let ping = std::process::Command::new("docker")
+        .args(["exec", &container_id, "redis-cli", "ping"])
+        .output()
+        .expect("docker exec redis-cli");
+    assert!(
+        ping.status.success(),
+        "redis-cli ping failed: {:?}",
+        String::from_utf8_lossy(&ping.stderr)
+    );
+
+    // Reconnect and redeclare topology (data was lost in the restart).
+    // Redis is confirmed running at this point.
+    let broker2 = Broker::<Redis>::new(RedisConfig {
+        mode: RedisMode::Standalone { url: url.clone() },
+        group: Some("reconnect".into()),
+    })
+    .await
+    .expect("reconnect after restart");
+
+    broker2
+        .topology()
+        .declare::<ReconnectTopic>()
+        .await
+        .expect("redeclare");
+
+    let publisher2 = broker2.publisher().await.expect("publisher2");
+    publisher2
+        .publish::<ReconnectTopic>(&Order { id: 2 })
+        .await
+        .expect("publish 2");
+
+    // Wait for the consumer to reconnect and process the second message.
+    let probe2 = counter.clone();
+    assert!(
+        poll_until(
+            move || probe2.load(Ordering::Relaxed) >= 2,
+            Duration::from_secs(30),
+        )
+        .await,
+        "consumer did not recover after Redis restart (counter = {})",
+        counter.load(Ordering::Relaxed)
+    );
+
+    // Clean shutdown.
+    token.cancel();
+    let outcome = supervisor
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(5))
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "supervisor outcome not clean: {outcome:?}"
+    );
+
+    container.rm().await.ok();
 }
