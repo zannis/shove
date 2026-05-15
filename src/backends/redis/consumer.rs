@@ -733,7 +733,9 @@ async fn requeue_to_stream(
         }
     }
     cmd.arg(X_RETRY_COUNT).arg(retry_count.to_string());
-    let _ = conn.query::<redis::Value>(&mut cmd).await;
+    if let Err(e) = conn.query::<redis::Value>(&mut cmd).await {
+        tracing::warn!(error = %e, stream, "XADD on immediate requeue failed — message may be lost");
+    }
 }
 
 async fn xack(conn: &mut RedisConnection, stream: &str, group: &str, entry_id: &str) -> Result<()> {
