@@ -368,11 +368,17 @@ where
                     result = xreadgroup_fut => match result {
                         Ok(v) => v,
                         Err(e) => {
-                            // NOGROUP means the consumer group was deleted externally or topology
-                            // was not declared before consuming. This is a configuration error, not
-                            // a transient network failure — retrying will never succeed.
+                            // NOGROUP means the consumer group does not exist on the stream.
+                            // This is transient after a Redis restart with data loss while the
+                            // application re-declares topology. Return a retryable Connection
+                            // error so run_with_reconnect backs off and retries.
                             if e.to_string().contains("NOGROUP") {
-                                return Err(ShoveError::Topology(format!(
+                                tracing::warn!(
+                                    stream,
+                                    error = %e,
+                                    "consumer group does not exist — topology may not be declared yet; will retry"
+                                );
+                                return Err(ShoveError::Connection(format!(
                                     "consumer group does not exist on stream '{stream}': {e}"
                                 )));
                             }
@@ -1296,5 +1302,34 @@ mod tests {
         // The ShoveError wrapping must preserve the NOGROUP text for the check to work.
         let err = ShoveError::Connection(err_str.to_string());
         assert!(err.to_string().contains("NOGROUP"));
+    }
+
+    #[test]
+    fn nogroup_error_is_retryable() {
+        // NOGROUP is wrapped as Connection so run_with_reconnect retries after Redis
+        // restart with data loss, giving the application time to re-declare topology.
+        let err = ShoveError::Connection(
+            "consumer group does not exist on stream 'foo': NOGROUP ...".into(),
+        );
+        assert!(
+            err.is_retryable(),
+            "NOGROUP error must be retryable so consumers survive Redis restart"
+        );
+    }
+
+    #[test]
+    fn nogroup_error_is_connection_not_topology() {
+        // Verifies the variant: NOGROUP must NOT be ShoveError::Topology (non-retryable).
+        let err = ShoveError::Connection(
+            "consumer group does not exist on stream 'foo': NOGROUP ...".into(),
+        );
+        assert!(
+            matches!(err, ShoveError::Connection(_)),
+            "NOGROUP must be ShoveError::Connection, not Topology"
+        );
+        assert!(
+            !matches!(err, ShoveError::Topology(_)),
+            "NOGROUP must not be ShoveError::Topology"
+        );
     }
 }

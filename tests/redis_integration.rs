@@ -37,6 +37,7 @@ async fn redis_url() -> &'static str {
     REDIS_URL
         .get_or_init(|| async {
             let container = RedisContainer::default()
+                .with_tag("7.0")
                 .start()
                 .await
                 .expect("failed to start Redis container");
@@ -819,6 +820,7 @@ async fn consumer_recovers_after_redis_restart() {
     // Use a dynamically allocated host port to avoid CI collisions.
     let host_port: u16 = find_free_port();
     let container = RedisContainer::default()
+        .with_tag("7.0")
         .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
         .start()
         .await
