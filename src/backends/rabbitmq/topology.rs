@@ -75,9 +75,9 @@ impl RabbitMqTopologyDeclarer {
     }
 
     async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<()> {
-        let seq = topology
-            .sequencing()
-            .expect("declare_sequenced called without sequencing config");
+        let seq = topology.sequencing().ok_or(
+            ShoveError::Topology("declare_sequenced called without sequencing config".into())
+        )?;
 
         if let Some(dlq) = topology.dlq() {
             self.declare_queue(dlq, FieldTable::default()).await?;
