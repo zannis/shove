@@ -108,6 +108,7 @@ fn unwrap_delivery(
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     queue: &str,
+    max_reconnect_attempts: Option<u32>,
     mut f: F,
 ) -> Result<()>
 where
@@ -115,6 +116,7 @@ where
     Fut: Future<Output = Result<()>>,
 {
     let mut backoff = Backoff::default();
+    let mut attempts = 0u32;
     loop {
         match f().await {
             Ok(()) => return Ok(()),
@@ -125,8 +127,27 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
+                attempts += 1;
+                if let Some(max) = max_reconnect_attempts
+                    && attempts >= max
+                {
+                    tracing::error!(
+                        queue,
+                        attempts,
+                        error = %e,
+                        "max reconnect attempts reached, giving up"
+                    );
+                    return Err(ShoveError::Connection(format!(
+                        "consumer on '{queue}' exhausted {max} reconnect attempt(s): {e}"
+                    )));
+                }
                 let delay = backoff.next().expect("backoff is infinite");
-                warn!("consumer error on {queue}: {e}. Reconnecting in {delay:?}");
+                warn!(
+                    queue,
+                    attempt = attempts,
+                    ?max_reconnect_attempts,
+                    "consumer error, reconnecting in {delay:?}: {e}"
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = shutdown.cancelled() => return Ok(()),
@@ -189,6 +210,7 @@ impl RabbitMqConsumer {
         let mut poisoned_keys = HashSet::new();
         let mut pending_deliveries: HashMap<String, VecDeque<Delivery>> = HashMap::new();
         let mut backoff = Backoff::default();
+        let mut attempts = 0u32;
         loop {
             match self
                 .consume_loop_concurrent_sequenced::<T, H>(
@@ -219,8 +241,27 @@ impl RabbitMqConsumer {
                     // On reconnect, the channel is dead — we cannot ack/nack.
                     // Clear pending; the broker will redeliver after reconnect.
                     pending_deliveries.clear();
+                    attempts += 1;
+                    if let Some(max) = options.max_reconnect_attempts
+                        && attempts >= max
+                    {
+                        tracing::error!(
+                            queue,
+                            attempts,
+                            error = %e,
+                            "max reconnect attempts reached, giving up"
+                        );
+                        return Err(ShoveError::Connection(format!(
+                            "consumer on '{queue}' exhausted {max} reconnect attempt(s): {e}"
+                        )));
+                    }
                     let delay = backoff.next().expect("backoff is infinite");
-                    warn!("consumer error on {queue}: {e}. Reconnecting in {delay:?}");
+                    warn!(
+                        queue,
+                        attempt = attempts,
+                        max_reconnect_attempts = ?options.max_reconnect_attempts,
+                        "consumer error, reconnecting in {delay:?}: {e}"
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = options.shutdown.cancelled() => return Ok(()),
@@ -824,7 +865,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let shutdown = options.shutdown.clone();
-        run_with_reconnect(&shutdown, queue, || {
+        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
             self.consume_loop_concurrent::<T, H>(
                 handler.clone(),
                 ctx.clone(),
@@ -1515,9 +1556,12 @@ impl RabbitMqConsumer {
         let shutdown = self.client.shutdown_token();
         let options = ConsumerOptions::defaults_with_shutdown(shutdown);
 
-        run_with_reconnect(&options.shutdown, dlq, || {
-            consume_dlq_loop::<T, H>(&self.client, &handler, &ctx, dlq, &options)
-        })
+        run_with_reconnect(
+            &options.shutdown,
+            dlq,
+            options.max_reconnect_attempts,
+            || consume_dlq_loop::<T, H>(&self.client, &handler, &ctx, dlq, &options),
+        )
         .await
     }
 }

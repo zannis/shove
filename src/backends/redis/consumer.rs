@@ -216,6 +216,7 @@ impl ConsumerImpl for RedisConsumer {
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     stream: &str,
+    max_reconnect_attempts: Option<u32>,
     mut f: F,
 ) -> Result<()>
 where
@@ -223,6 +224,7 @@ where
     Fut: Future<Output = Result<()>>,
 {
     let mut backoff = Backoff::default();
+    let mut attempts = 0u32;
     loop {
         match f().await {
             Ok(()) => return Ok(()),
@@ -233,9 +235,25 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
+                attempts += 1;
+                if let Some(max) = max_reconnect_attempts
+                    && attempts >= max
+                {
+                    tracing::error!(
+                        stream,
+                        attempts,
+                        error = %e,
+                        "max reconnect attempts reached, giving up"
+                    );
+                    return Err(ShoveError::Connection(format!(
+                        "consumer on '{stream}' exhausted {max} reconnect attempt(s): {e}"
+                    )));
+                }
                 let delay = backoff.next().expect("backoff is infinite");
                 tracing::warn!(
                     stream,
+                    attempt = attempts,
+                    ?max_reconnect_attempts,
                     error = %e,
                     "consumer error, reconnecting in {delay:?}"
                 );
@@ -322,7 +340,7 @@ where
     let prefetch = options.prefetch_count.max(1) as usize;
     let autoclaim_interval = Duration::from_millis(idle_ms.max(30_000));
 
-    run_with_reconnect(&shutdown, stream, || {
+    run_with_reconnect(&shutdown, stream, options.max_reconnect_attempts, || {
         let client = client.clone();
         let handler = Arc::clone(&handler);
         let ctx = Arc::clone(&ctx);

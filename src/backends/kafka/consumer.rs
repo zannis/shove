@@ -27,8 +27,8 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
 
 use super::client::KafkaClient;
 use super::constants::{
-    CONNECTION_RETRIES, DEATH_COUNT_HEADER, DEATH_REASON_HEADER, MESSAGE_ID_HEADER,
-    ORIGINAL_QUEUE_HEADER, RETRY_COUNT_HEADER,
+    DEATH_COUNT_HEADER, DEATH_REASON_HEADER, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
+    RETRY_COUNT_HEADER,
 };
 use super::publisher::publish_with_retry;
 
@@ -544,7 +544,7 @@ fn create_stream_consumer(mut base: ClientConfig, group_id: &str) -> Result<Stre
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
-    max_retries: u32,
+    max_reconnect_attempts: Option<u32>,
     mut f: F,
 ) -> Result<()>
 where
@@ -564,15 +564,25 @@ where
                     return Ok(());
                 }
                 attempts += 1;
-                if attempts >= max_retries {
-                    return Err(e);
+                if let Some(max) = max_reconnect_attempts
+                    && attempts >= max
+                {
+                    tracing::error!(
+                        label,
+                        attempts,
+                        error = %e,
+                        "max reconnect attempts reached, giving up"
+                    );
+                    return Err(ShoveError::Connection(format!(
+                        "consumer on '{label}' exhausted {max} reconnect attempt(s): {e}"
+                    )));
                 }
                 let delay = backoff.next().expect("backoff is infinite");
                 tracing::warn!(
-                    error = %e,
                     label,
                     attempt = attempts,
-                    max_retries,
+                    ?max_reconnect_attempts,
+                    error = %e,
                     delay_ms = delay.as_millis() as u64,
                     "consumer error, reconnecting"
                 );
@@ -653,7 +663,7 @@ impl KafkaConsumer {
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
-        run_with_reconnect(&shutdown, queue, CONNECTION_RETRIES, || {
+        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client = client.clone();
@@ -933,7 +943,7 @@ impl KafkaConsumer {
         tracing::info!(queue, group_id, max_retries, "Kafka FIFO consumer started");
 
         let shard_task = tokio::spawn(async move {
-            run_with_reconnect(&shutdown, &queue, CONNECTION_RETRIES, || {
+            run_with_reconnect(&shutdown, &queue, options.max_reconnect_attempts, || {
                 let handler = handler.clone();
                 let ctx = ctx.clone();
                 let client = client.clone();
@@ -1161,7 +1171,7 @@ impl KafkaConsumer {
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
-        run_with_reconnect(&shutdown, dlq, CONNECTION_RETRIES, || {
+        run_with_reconnect(&shutdown, dlq, None, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
             let client_clone = client.clone();

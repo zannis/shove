@@ -143,6 +143,7 @@ fn extract_dead_metadata(msg: &Message, queue_name: &str) -> DeadMessageMetadata
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     queue: &str,
+    max_reconnect_attempts: Option<u32>,
     mut f: F,
 ) -> Result<()>
 where
@@ -150,6 +151,7 @@ where
     Fut: Future<Output = Result<()>>,
 {
     let mut backoff = Backoff::default();
+    let mut attempts = 0u32;
     loop {
         match f().await {
             Ok(()) => return Ok(()),
@@ -160,8 +162,27 @@ where
                 if shutdown.is_cancelled() {
                     return Ok(());
                 }
+                attempts += 1;
+                if let Some(max) = max_reconnect_attempts
+                    && attempts >= max
+                {
+                    tracing::error!(
+                        queue,
+                        attempts,
+                        error = %e,
+                        "max reconnect attempts reached, giving up"
+                    );
+                    return Err(ShoveError::Connection(format!(
+                        "consumer on '{queue}' exhausted {max} reconnect attempt(s): {e}"
+                    )));
+                }
                 let delay = backoff.next().expect("backoff is infinite");
-                warn!("consumer error on {queue}: {e}. Reconnecting in {delay:?}");
+                warn!(
+                    queue,
+                    attempt = attempts,
+                    ?max_reconnect_attempts,
+                    "consumer error, reconnecting in {delay:?}: {e}"
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = shutdown.cancelled() => return Ok(()),
@@ -732,6 +753,7 @@ where
     let mut poisoned_keys = HashSet::new();
     let mut pending_deliveries: HashMap<String, VecDeque<Message>> = HashMap::new();
     let mut backoff = Backoff::default();
+    let mut attempts = 0u32;
 
     loop {
         match consume_loop_sequenced::<T, H>(
@@ -766,8 +788,27 @@ where
                 // On reconnect, clear pending — visibility will expire and SQS
                 // will redeliver them.
                 pending_deliveries.clear();
+                attempts += 1;
+                if let Some(max) = options.max_reconnect_attempts
+                    && attempts >= max
+                {
+                    tracing::error!(
+                        queue = queue_name,
+                        attempts,
+                        error = %e,
+                        "max reconnect attempts reached, giving up"
+                    );
+                    return Err(ShoveError::Connection(format!(
+                        "consumer on '{queue_name}' exhausted {max} reconnect attempt(s): {e}"
+                    )));
+                }
                 let delay = backoff.next().expect("backoff is infinite");
-                warn!("consumer error on {queue_name}: {e}. Reconnecting in {delay:?}");
+                warn!(
+                    queue = queue_name,
+                    attempt = attempts,
+                    max_reconnect_attempts = ?options.max_reconnect_attempts,
+                    "consumer error, reconnecting in {delay:?}: {e}"
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = options.shutdown.cancelled() => return Ok(()),
@@ -1533,11 +1574,16 @@ impl SqsConsumer {
             let ctx = Arc::new(ctx);
             let sqs = consumer.client.sqs().clone();
 
-            run_with_reconnect(&options.shutdown, topology.queue(), || {
-                consume_loop_concurrent::<T, H>(
-                    &sqs, &queue_url, topology, &handler, &ctx, &options,
-                )
-            })
+            run_with_reconnect(
+                &options.shutdown,
+                topology.queue(),
+                options.max_reconnect_attempts,
+                || {
+                    consume_loop_concurrent::<T, H>(
+                        &sqs, &queue_url, topology, &handler, &ctx, &options,
+                    )
+                },
+            )
             .await
         }
     }
@@ -1703,7 +1749,7 @@ impl SqsConsumer {
             let sqs = consumer.client.sqs().clone();
             let shutdown = consumer.client.shutdown_token();
 
-            run_with_reconnect(&shutdown, dlq, || {
+            run_with_reconnect(&shutdown, dlq, None, || {
                 consume_dlq_loop::<T, H>(
                     &sqs,
                     &queue_url,
