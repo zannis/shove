@@ -23,6 +23,10 @@ pub(crate) struct ConsumerOptionsInner {
     pub max_pending_per_key: Option<usize>,
     pub max_message_size: Option<usize>,
     pub max_reconnect_attempts: Option<u32>,
+    /// Maximum time a sequence key may remain in the AwaitingRetry state
+    /// before its pending messages are dead-lettered (RabbitMQ only).
+    #[cfg(feature = "rabbitmq")]
+    pub hold_queue_timeout: Option<Duration>,
     pub shutdown: CancellationToken,
     pub processing: Arc<AtomicBool>,
     /// Consumer-group name for metrics labels. `None` is treated as `"default"`.
@@ -49,6 +53,8 @@ impl ConsumerOptionsInner {
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             max_reconnect_attempts: None,
+            #[cfg(feature = "rabbitmq")]
+            hold_queue_timeout: None,
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
