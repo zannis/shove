@@ -1,6 +1,7 @@
 use async_nats::connection::State;
 use async_nats::jetstream;
 use std::fmt;
+use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -11,11 +12,37 @@ use crate::retry::Backoff;
 
 pub struct NatsConfig {
     pub url: String,
+    /// Path to a PEM-encoded CA certificate for verifying the server's TLS certificate.
+    pub tls_ca_cert: Option<PathBuf>,
+    /// Path to a PEM-encoded client certificate for mutual TLS.
+    pub tls_client_cert: Option<PathBuf>,
+    /// Path to a PEM-encoded private key matching `tls_client_cert`.
+    pub tls_client_key: Option<PathBuf>,
+    /// Plain-text username for NATS user/password authentication.
+    pub username: Option<String>,
+    /// Plain-text password for NATS user/password authentication.
+    pub password: Option<String>,
+    /// Static token for NATS token authentication.
+    pub token: Option<String>,
+    /// NKey seed string for NKey-based authentication.
+    pub nkey_seed: Option<String>,
+    /// Path to a NATS `.creds` file (JWT + NKey) for credentials-based authentication.
+    pub creds_file: Option<PathBuf>,
 }
 
 impl NatsConfig {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+        Self {
+            url: url.into(),
+            tls_ca_cert: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            username: None,
+            password: None,
+            token: None,
+            nkey_seed: None,
+            creds_file: None,
+        }
     }
 
     /// URL of the NATS server this config connects to.
@@ -49,6 +76,12 @@ impl fmt::Debug for NatsConfig {
         };
         f.debug_struct("NatsConfig")
             .field("url", &redacted)
+            .field("tls_ca_cert", &self.tls_ca_cert)
+            .field("tls_client_cert", &self.tls_client_cert)
+            .field("username", &self.username)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("nkey_seed", &self.nkey_seed.as_ref().map(|_| "<redacted>"))
+            .field("creds_file", &self.creds_file)
             .finish()
     }
 }
@@ -65,8 +98,28 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 impl NatsClient {
     pub async fn connect(config: &NatsConfig) -> Result<Self> {
         let client_name = format!("shove-rs-{}", process::id());
-        let client = async_nats::ConnectOptions::new()
-            .name(client_name)
+        let mut opts = async_nats::ConnectOptions::new().name(client_name);
+
+        if let Some(ca) = &config.tls_ca_cert {
+            opts = opts.add_root_certificates(ca.clone());
+        }
+        if let (Some(cert), Some(key)) = (&config.tls_client_cert, &config.tls_client_key) {
+            opts = opts.add_client_certificate(cert.clone(), key.clone());
+        }
+        if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+            opts = opts.user_and_password(user.clone(), pass.clone());
+        } else if let Some(token) = &config.token {
+            opts = opts.token(token.clone());
+        } else if let Some(seed) = &config.nkey_seed {
+            opts = opts.nkey(seed.clone());
+        } else if let Some(creds) = &config.creds_file {
+            opts = opts
+                .credentials_file(creds)
+                .await
+                .map_err(|e| ShoveError::Connection(format!("failed to load NATS credentials: {e}")))?;
+        }
+
+        let client = opts
             .connect(&config.url)
             .await
             .map_err(|e| ShoveError::Connection(e.to_string()))?;
@@ -92,7 +145,7 @@ impl NatsClient {
                     if attempts >= max_attempts {
                         return Err(e);
                     }
-                    let delay = backoff.next().unwrap_or(Duration::from_secs(5));
+                    let delay = backoff.next().expect("backoff iterator is infinite; this is a bug");
                     tracing::warn!(
                         attempt = attempts,
                         max_attempts,
