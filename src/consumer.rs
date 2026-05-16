@@ -95,6 +95,26 @@ pub struct ConsumerOptions<B: Backend> {
     /// Default: [`DEFAULT_MAX_MESSAGE_SIZE`] (10 MiB). Set to `None` to
     /// disable the check.
     pub max_message_size: Option<usize>,
+    /// Maximum number of reconnect attempts before the consumer gives up and
+    /// returns an error.
+    ///
+    /// Each connection-level failure (broker unreachable, channel error, etc.)
+    /// increments the attempt counter. Once the counter reaches this limit the
+    /// consumer emits a `tracing::error!` and propagates
+    /// `ShoveError::Connection` to the caller (typically the supervisor, which
+    /// may then restart the consumer or surface the error).
+    ///
+    /// `None` (the default) means unlimited retries — the consumer will keep
+    /// backing off and retrying until it succeeds or is shut down. Use a
+    /// finite value in environments where a permanently-unreachable broker
+    /// should be surfaced rather than silently spinning.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// ConsumerOptions::<MyBackend>::new().with_max_reconnect_attempts(50)
+    /// ```
+    pub max_reconnect_attempts: Option<u32>,
 
     /// Enable exactly-once delivery via AMQP transactions (RabbitMQ only).
     ///
@@ -142,6 +162,7 @@ impl<B: Backend> ConsumerOptions<B> {
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
+            max_reconnect_attempts: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
@@ -220,6 +241,14 @@ impl<B: Backend> ConsumerOptions<B> {
         self
     }
 
+    /// Set the maximum number of reconnect attempts before the consumer gives
+    /// up and surfaces an error. See [`max_reconnect_attempts`](Self::max_reconnect_attempts)
+    /// for full semantics.
+    pub fn with_max_reconnect_attempts(mut self, n: u32) -> Self {
+        self.max_reconnect_attempts = Some(n);
+        self
+    }
+
     /// Attach a shutdown token. Supervisors/groups call this at `.register()`
     /// time so application code does not have to thread tokens manually.
     /// Direct `consumer.run()` call sites (primarily tests that bypass the
@@ -261,6 +290,7 @@ impl<B: Backend> ConsumerOptions<B> {
             handler_timeout: self.handler_timeout,
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
+            max_reconnect_attempts: self.max_reconnect_attempts,
             shutdown: self.shutdown.unwrap_or_default(),
             processing: self.processing,
             consumer_group: self.consumer_group,
@@ -289,6 +319,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             handler_timeout: self.handler_timeout,
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
+            max_reconnect_attempts: self.max_reconnect_attempts,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]
@@ -360,6 +391,7 @@ mod tests {
         not(feature = "inmemory"),
         not(feature = "kafka"),
         not(feature = "nats"),
+        not(feature = "redis-streams"),
         feature = "rabbitmq"
     ))]
     type TestBackend = RabbitMq;
@@ -379,6 +411,7 @@ mod tests {
         assert_eq!(opts.handler_timeout, Some(DEFAULT_HANDLER_TIMEOUT));
         assert_eq!(opts.max_pending_per_key, Some(DEFAULT_MAX_PENDING_PER_KEY));
         assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
+        assert_eq!(opts.max_reconnect_attempts, None);
         assert!(!opts.processing.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -476,12 +509,14 @@ mod tests {
             .with_prefetch_count(20)
             .with_handler_timeout(Duration::from_secs(5))
             .with_max_pending_per_key(100)
-            .with_max_message_size(5 * 1024 * 1024);
+            .with_max_message_size(5 * 1024 * 1024)
+            .with_max_reconnect_attempts(50);
         assert_eq!(opts.max_retries, 3);
         assert_eq!(opts.prefetch_count, 20);
         assert_eq!(opts.handler_timeout, Some(Duration::from_secs(5)));
         assert_eq!(opts.max_pending_per_key, Some(100));
         assert_eq!(opts.max_message_size, Some(5 * 1024 * 1024));
+        assert_eq!(opts.max_reconnect_attempts, Some(50));
     }
 
     #[cfg(any(
@@ -518,6 +553,18 @@ mod tests {
     fn with_max_message_size_overrides_default() {
         let opts = ConsumerOptions::<TestBackend>::new().with_max_message_size(1024 * 1024);
         assert_eq!(opts.max_message_size, Some(1024 * 1024));
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn with_max_reconnect_attempts_sets_value() {
+        let opts = ConsumerOptions::<TestBackend>::new().with_max_reconnect_attempts(25);
+        assert_eq!(opts.max_reconnect_attempts, Some(25));
     }
 
     #[cfg(any(
@@ -641,7 +688,8 @@ mod tests {
             .with_concurrent_processing(false)
             .with_handler_timeout(Duration::from_secs(11))
             .with_max_pending_per_key(99)
-            .with_max_message_size(4096);
+            .with_max_message_size(4096)
+            .with_max_reconnect_attempts(42);
         let copy = opts.clone();
         assert_eq!(copy.max_retries, 7);
         assert_eq!(copy.prefetch_count, 13);
@@ -649,6 +697,7 @@ mod tests {
         assert_eq!(copy.handler_timeout, Some(Duration::from_secs(11)));
         assert_eq!(copy.max_pending_per_key, Some(99));
         assert_eq!(copy.max_message_size, Some(4096));
+        assert_eq!(copy.max_reconnect_attempts, Some(42));
     }
 
     #[cfg(feature = "aws-sns-sqs")]

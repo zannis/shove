@@ -71,6 +71,21 @@ When `retry_count >= max_retries`, the consumer routes to the DLQ regardless of 
 
 If the topic has no DLQ and `max_retries` is exhausted, the message is discarded (nack without requeue) and a warning is logged. `shove` does not silently drop messages — you will see the warning.
 
+## max\_reconnect\_attempts
+
+`ConsumerOptions::with_max_reconnect_attempts(N)` caps how many times the consumer will attempt to re-establish a broker connection after a connection-level failure. The default is **unlimited** (`None`) — the consumer backs off and retries forever until it succeeds or is shut down.
+
+```rust,no_run
+let opts = ConsumerOptions::<Redis>::new()
+    .with_max_reconnect_attempts(50); // give up after 50 failed reconnects
+```
+
+Each failed connection attempt increments the counter. Once the limit is reached the consumer emits a `tracing::error!` and propagates the error to the caller — typically the supervisor, which may then restart the consumer or surface the failure to your alerting pipeline.
+
+Use this when a permanently-unreachable broker should fail fast and visibly rather than silently spinning in a backoff loop. For transient outages (broker restarts, network blips) the default unlimited behaviour is usually correct.
+
+> **Note:** `max_reconnect_attempts` counts connection failures, not message-handling failures. It does not interact with `max_retries`, which counts handler-level retries for individual messages.
+
 ## The retry counter is best-effort
 
 The retry counter is stored in a broker-level header (`x-shove-retry-count` or the backend equivalent). The publish-to-hold-queue and ack-of-original-delivery are two separate broker operations. There is a small window between them where a crash can produce a duplicate:

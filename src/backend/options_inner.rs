@@ -22,6 +22,7 @@ pub(crate) struct ConsumerOptionsInner {
     pub handler_timeout: Option<Duration>,
     pub max_pending_per_key: Option<usize>,
     pub max_message_size: Option<usize>,
+    pub max_reconnect_attempts: Option<u32>,
     pub shutdown: CancellationToken,
     pub processing: Arc<AtomicBool>,
     /// Consumer-group name for metrics labels. `None` is treated as `"default"`.
@@ -47,6 +48,7 @@ impl ConsumerOptionsInner {
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
+            max_reconnect_attempts: None,
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
