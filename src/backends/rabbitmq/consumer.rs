@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_lite::StreamExt;
 use lapin::message::Delivery;
@@ -171,7 +171,9 @@ enum KeyState {
     },
     /// The handler returned Retry/Defer and the message has been routed to a
     /// hold queue. The key is blocked until the retry comes back.
-    AwaitingRetry,
+    /// The `Instant` records when the key entered this state, used to enforce
+    /// `hold_queue_timeout` eviction.
+    AwaitingRetry(Instant),
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +314,17 @@ impl RabbitMqConsumer {
         let mut key_states: HashMap<String, KeyState> = HashMap::new();
         let mut in_flight_count: usize = 0;
 
+        // Interval for evicting keys that have been stuck in AwaitingRetry too long.
+        // When no timeout is configured we use a very long period so the arm never
+        // fires meaningfully (the `if options.hold_queue_timeout.is_some()` guard
+        // in the select! makes it inactive, but Interval still needs a valid duration).
+        let eviction_period = options
+            .hold_queue_timeout
+            .unwrap_or(Duration::from_secs(86400));
+        let mut eviction_ticker = tokio::time::interval(eviction_period);
+        eviction_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        eviction_ticker.tick().await; // consume the immediate first tick
+
         info!("concurrent-sequenced consumer started on sub-queue {queue} (prefetch={prefetch})");
 
         loop {
@@ -327,7 +340,7 @@ impl RabbitMqConsumer {
                 } = state
                 else {
                     // AwaitingRetry — shouldn't happen, but put it back.
-                    key_states.insert(key, state);
+                    key_states.insert(key, KeyState::AwaitingRetry(Instant::now()));
                     continue;
                 };
 
@@ -357,7 +370,7 @@ impl RabbitMqConsumer {
                     Outcome::Ack | Outcome::Reject => {
                         // Terminal outcomes — process, then drain pending.
                         if matches!(outcome, Outcome::Ack) {
-                            router::route_ack(&delivery, &publisher).await;
+                            router::route_ack(&delivery, &publisher).await?;
                         } else {
                             if on_failure == SequenceFailure::FailAll {
                                 info!(
@@ -367,7 +380,7 @@ impl RabbitMqConsumer {
                                 );
                                 poisoned_keys.insert(key.clone());
                             }
-                            router::route_reject(&delivery, topology, &publisher).await;
+                            router::route_reject(&delivery, topology, &publisher).await?;
                         }
                         in_flight_count -= 1;
 
@@ -425,7 +438,7 @@ impl RabbitMqConsumer {
                                                 "failed to ack delivery after deferring to shard hold queue: {e}"
                                             );
                                             publisher.rollback_if_tx().await;
-                                            router::nack_requeue(&delivery, &publisher).await;
+                                            router::nack_requeue(&delivery, &publisher).await.ok();
                                         } else {
                                             if let Err(e) = publisher.commit_if_tx().await {
                                                 error!("tx_commit failed for shard defer: {e}");
@@ -442,15 +455,15 @@ impl RabbitMqConsumer {
                                             "failed to publish to shard hold queue {} for defer, requeuing: {e}",
                                             hold_queue.name()
                                         );
-                                        router::nack_requeue(&delivery, &publisher).await;
+                                        router::nack_requeue(&delivery, &publisher).await.ok();
                                     }
                                 }
                             } else {
-                                router::nack_requeue(&delivery, &publisher).await;
+                                router::nack_requeue(&delivery, &publisher).await.ok();
                             }
                         }
                         in_flight_count -= 1;
-                        key_states.insert(key, KeyState::AwaitingRetry);
+                        key_states.insert(key, KeyState::AwaitingRetry(Instant::now()));
                     }
                 }
             }
@@ -470,9 +483,16 @@ impl RabbitMqConsumer {
                         in_flight_count
                     );
                     // Wait for all in-flight handlers to complete.
+                    let drain_timeout = options.handler_timeout.unwrap_or(crate::consumer::DEFAULT_HANDLER_TIMEOUT);
                     for (key, state) in key_states.drain() {
                         if let KeyState::InFlight { delivery, outcome_rx } = state {
-                            let outcome = outcome_rx.await.unwrap_or(Outcome::Retry);
+                            let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
+                                .await
+                                .unwrap_or_else(|_| {
+                                    warn!(queue, sequence_key = %key, "handler timed out during shutdown drain, retrying");
+                                    Ok(Outcome::Retry)
+                                })
+                                .unwrap_or(Outcome::Retry);
                             let retry_count = get_retry_count(&delivery);
                             debug!(
                                 queue,
@@ -481,7 +501,9 @@ impl RabbitMqConsumer {
                                 "draining in-flight message on shutdown"
                             );
                             match outcome {
-                                Outcome::Ack => router::route_ack(&delivery, &publisher).await,
+                                Outcome::Ack => {
+                                    router::route_ack(&delivery, &publisher).await.ok();
+                                }
                                 Outcome::Retry => {
                                     route_shard_retry(
                                         &delivery,
@@ -493,7 +515,7 @@ impl RabbitMqConsumer {
                                     .await;
                                 }
                                 Outcome::Reject => {
-                                    router::route_reject(&delivery, topology, &publisher).await;
+                                    router::route_reject(&delivery, topology, &publisher).await.ok();
                                 }
                                 Outcome::Defer => {
                                     if shard_hold_queues.is_empty() {
@@ -519,18 +541,18 @@ impl RabbitMqConsumer {
                                                 {
                                                     error!("failed to ack delivery after defer on shutdown: {e}");
                                                     publisher.rollback_if_tx().await;
-                                                    router::nack_requeue(&delivery, &publisher).await;
+                                                    router::nack_requeue(&delivery, &publisher).await.ok();
                                                 } else if let Err(e) = publisher.commit_if_tx().await {
                                                     error!("tx_commit failed for defer on shutdown: {e}");
                                                 }
                                             }
                                             Err(e) => {
                                                 warn!("failed to defer on shutdown: {e}");
-                                                router::nack_requeue(&delivery, &publisher).await;
+                                                router::nack_requeue(&delivery, &publisher).await.ok();
                                             }
                                         }
                                     } else {
-                                        router::nack_requeue(&delivery, &publisher).await;
+                                        router::nack_requeue(&delivery, &publisher).await.ok();
                                     }
                                 }
                             }
@@ -548,6 +570,39 @@ impl RabbitMqConsumer {
                     let _ = completed_tx.send(key);
                 }
 
+                _ = eviction_ticker.tick(), if options.hold_queue_timeout.is_some() => {
+                    let timeout = options.hold_queue_timeout.expect("guard checked is_some");
+                    let now = Instant::now();
+                    let timed_out: Vec<String> = key_states
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            if let KeyState::AwaitingRetry(entered_at) = v {
+                                if now.duration_since(*entered_at) >= timeout {
+                                    Some(k.clone())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for key in timed_out {
+                        warn!(
+                            queue,
+                            sequence_key = %key,
+                            ?timeout,
+                            "sequence key stuck in AwaitingRetry, dead-lettering pending messages"
+                        );
+                        key_states.remove(&key);
+                        if let Some(pending) = pending_deliveries.remove(&key) {
+                            for pd in pending {
+                                router::route_reject(&pd, topology, &publisher).await?;
+                            }
+                        }
+                    }
+                }
+
                 item = stream.next(), if can_accept => {
                     let delivery = unwrap_delivery(item, queue)?;
                     let seq_key = delivery.routing_key.to_string();
@@ -562,7 +617,7 @@ impl RabbitMqConsumer {
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
-                        router::route_reject(&delivery, topology, &publisher).await;
+                        router::route_reject(&delivery, topology, &publisher).await?;
                         continue;
                     }
 
@@ -584,11 +639,11 @@ impl RabbitMqConsumer {
                             // Also reject all pending deliveries for this key.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
-                                    router::route_reject(&pd, topology, &publisher).await;
+                                    router::route_reject(&pd, topology, &publisher).await?;
                                 }
                             }
                         }
-                        router::route_reject(&delivery, topology, &publisher).await;
+                        router::route_reject(&delivery, topology, &publisher).await?;
                         continue;
                     }
 
@@ -612,7 +667,7 @@ impl RabbitMqConsumer {
                                         group.as_deref(),
                                         metrics::FailReason::PendingFull,
                                     );
-                                    router::route_reject(&delivery, topology, &publisher).await;
+                                    router::route_reject(&delivery, topology, &publisher).await?;
                                     continue;
                                 }
                             }
@@ -627,7 +682,7 @@ impl RabbitMqConsumer {
                                 .push_back(delivery);
                             continue;
                         }
-                        Some(KeyState::AwaitingRetry) => {
+                        Some(KeyState::AwaitingRetry(_)) => {
                             if retry_count > 0 || delivery.redelivered {
                                 // This is the returning retry (or a nack+requeue
                                 // redelivery when no hold queue is configured) —
@@ -658,7 +713,7 @@ impl RabbitMqConsumer {
                                             group.as_deref(),
                                             metrics::FailReason::PendingFull,
                                         );
-                                        router::route_reject(&delivery, topology, &publisher).await;
+                                        router::route_reject(&delivery, topology, &publisher).await?;
                                         continue;
                                     }
                                 }
@@ -755,7 +810,7 @@ impl RabbitMqConsumer {
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
-                    router::route_reject(&pd, topology, publisher).await;
+                    router::route_reject(&pd, topology, publisher).await.ok();
                 }
             }
             return;
@@ -780,14 +835,14 @@ impl RabbitMqConsumer {
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
                     // Reject remaining pending for this key too.
-                    router::route_reject(&delivery, topology, publisher).await;
+                    router::route_reject(&delivery, topology, publisher).await.ok();
                     while let Some(pd) = pending.pop_front() {
-                        router::route_reject(&pd, topology, publisher).await;
+                        router::route_reject(&pd, topology, publisher).await.ok();
                     }
                     pending_deliveries.remove(key);
                     return;
                 }
-                router::route_reject(&delivery, topology, publisher).await;
+                router::route_reject(&delivery, topology, publisher).await.ok();
                 continue;
             }
 
@@ -809,7 +864,7 @@ impl RabbitMqConsumer {
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {
-                            router::route_reject(&pd, topology, publisher).await;
+                            router::route_reject(&pd, topology, publisher).await.ok();
                         }
                         pending_deliveries.remove(key);
                         return;
@@ -927,7 +982,7 @@ impl RabbitMqConsumer {
                         let retry_count = get_retry_count(&msg.delivery);
                         debug!(queue, ?outcome, "message handled (concurrent)");
                         route_outcome(&msg.delivery, outcome, topology, &publisher, retry_count)
-                            .await;
+                            .await?;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Closed) => {
@@ -942,7 +997,7 @@ impl RabbitMqConsumer {
                             &publisher,
                             retry_count,
                         )
-                        .await;
+                        .await?;
                     }
                 }
             }
@@ -971,7 +1026,8 @@ impl RabbitMqConsumer {
                             &publisher,
                             retry_count,
                         )
-                        .await;
+                        .await
+                        .ok();
                     }
                     return Ok(());
                 }
@@ -990,7 +1046,7 @@ impl RabbitMqConsumer {
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
                         );
-                        router::route_reject(&delivery, topology, &publisher).await;
+                        router::route_reject(&delivery, topology, &publisher).await?;
                         continue;
                     }
 
@@ -1091,14 +1147,15 @@ where
     }
 }
 
-/// Route a delivery based on its outcome.
+/// Route a delivery based on its outcome. Returns Err if a tx_commit fails and
+/// the consumer loop should reconnect.
 async fn route_outcome(
     delivery: &Delivery,
     outcome: Outcome,
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     retry_count: u32,
-) {
+) -> crate::error::Result<()> {
     match outcome {
         Outcome::Ack => router::route_ack(delivery, publisher).await,
         Outcome::Retry => router::route_retry(delivery, topology, publisher, retry_count).await,
@@ -1129,7 +1186,7 @@ async fn route_shard_retry(
                 if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
                     error!("failed to ack delivery after publishing to shard hold queue: {e}");
                     publisher.rollback_if_tx().await;
-                    router::nack_requeue(delivery, publisher).await;
+                    router::nack_requeue(delivery, publisher).await.ok();
                     return;
                 }
                 if let Err(e) = publisher.commit_if_tx().await {
@@ -1147,7 +1204,7 @@ async fn route_shard_retry(
                     "failed to publish to shard hold queue {}, requeuing: {e}",
                     hold_queue.name()
                 );
-                router::nack_requeue(delivery, publisher).await;
+                router::nack_requeue(delivery, publisher).await.ok();
             }
         }
     } else {
@@ -1156,7 +1213,7 @@ async fn route_shard_retry(
             retry_count,
             "retrying sequenced message but no shard hold queues configured — requeuing with no delay"
         );
-        router::nack_requeue(delivery, publisher).await;
+        router::nack_requeue(delivery, publisher).await.ok();
     }
 }
 
@@ -1340,7 +1397,7 @@ where
             "rejecting oversized message"
         );
         metrics::record_failed(topic, group, metrics::FailReason::Oversize);
-        router::route_reject(delivery, topology, publisher).await;
+        router::route_reject(delivery, topology, publisher).await.ok();
         return None;
     }
     match serde_json::from_slice::<T::Message>(&delivery.data) {
@@ -1353,7 +1410,7 @@ where
                 "failed to deserialize message"
             );
             metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
-            router::route_reject(delivery, topology, publisher).await;
+            router::route_reject(delivery, topology, publisher).await.ok();
             None
         }
     }
@@ -1675,8 +1732,8 @@ mod tests {
 
     #[test]
     fn key_state_awaiting_retry_is_distinct() {
-        let state = KeyState::AwaitingRetry;
-        assert!(matches!(state, KeyState::AwaitingRetry));
+        let state = KeyState::AwaitingRetry(Instant::now());
+        assert!(matches!(state, KeyState::AwaitingRetry(_)));
         assert!(!matches!(state, KeyState::InFlight { .. }));
     }
 

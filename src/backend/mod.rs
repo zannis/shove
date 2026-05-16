@@ -191,6 +191,8 @@ mod bounds_smoke {
         let options = ConsumerOptionsInner {
             max_retries: 0,
             max_reconnect_attempts: None,
+            #[cfg(feature = "rabbitmq")]
+            hold_queue_timeout: None,
             prefetch_count: 1,
             handler_timeout: None,
             max_pending_per_key: None,
