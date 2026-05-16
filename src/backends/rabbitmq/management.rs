@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing::debug;
@@ -13,6 +14,10 @@ pub struct ManagementConfig {
     pub password: String,
     /// URL-encoded vhost, default `"%2F"` for `"/"`
     pub vhost: String,
+    /// Skip TLS certificate verification (insecure; only for testing/dev environments).
+    pub tls_skip_verify: bool,
+    /// Path to a PEM-encoded CA certificate to add as a trusted root.
+    pub tls_ca_cert: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ManagementConfig {
@@ -37,11 +42,23 @@ impl ManagementConfig {
             username: username.into(),
             password: password.into(),
             vhost: "%2F".into(),
+            tls_skip_verify: false,
+            tls_ca_cert: None,
         }
     }
 
     pub fn with_vhost(mut self, vhost: impl Into<String>) -> Self {
         self.vhost = vhost.into();
+        self
+    }
+
+    pub fn with_tls_skip_verify(mut self) -> Self {
+        self.tls_skip_verify = true;
+        self
+    }
+
+    pub fn with_tls_ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.tls_ca_cert = Some(path.into());
         self
     }
 }
@@ -72,11 +89,20 @@ pub struct ManagementClient {
 
 impl ManagementClient {
     pub fn new(config: ManagementConfig) -> Self {
-        let http = reqwest::ClientBuilder::new()
+        let mut builder = reqwest::ClientBuilder::new()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client");
+            .danger_accept_invalid_certs(config.tls_skip_verify);
+
+        if let Some(ca_path) = &config.tls_ca_cert {
+            let pem = std::fs::read(ca_path)
+                .expect("failed to read management API CA certificate");
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .expect("failed to parse management API CA certificate");
+            builder = builder.add_root_certificate(cert);
+        }
+
+        let http = builder.build().expect("failed to build HTTP client");
         Self { http, config }
     }
 }
