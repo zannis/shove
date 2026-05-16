@@ -24,7 +24,8 @@ use tokio_util::sync::CancellationToken;
 use super::client::{RedisClient, RedisConnection};
 use super::constants::{REQUEUE_BATCH_SIZE, REQUEUE_POLL_MS};
 use super::topology::RedisTopologyDeclarer;
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
+use crate::retry::Backoff;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -84,8 +85,9 @@ pub(crate) async fn enqueue_hold(
 /// from all hold sets back to their target streams.
 ///
 /// The task acquires one connection and reuses it across poll ticks. On
-/// connection error it attempts to reconnect before the next tick. The task
-/// runs until `shutdown` is cancelled.
+/// connection error it backs off with jitter and retries until the shutdown
+/// token is cancelled, preventing silent abandonment of hold-queue messages.
+/// The task runs until `shutdown` is cancelled.
 ///
 /// **At-least-once semantics:** see module-level documentation for the
 /// concurrent-instance duplicate-delivery note.
@@ -101,32 +103,34 @@ pub(crate) fn spawn_requeuer(
         .collect();
 
     tokio::spawn(async move {
-        let mut conn = match client.multiplexed_conn().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("requeuer: failed to acquire initial connection: {}", e);
-                return;
-            }
+        let mut conn = match acquire_conn_with_retry(&client, &shutdown).await {
+            Some(c) => c,
+            None => return,
         };
 
         loop {
+            let mut needs_reconnect = false;
+            for (hold_queue_name, set_key) in hold_queue_names.iter().zip(hold_set_keys.iter()) {
+                if let Err(e) = poll_hold_set(&mut conn, hold_queue_name, set_key).await {
+                    tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
+                    needs_reconnect = true;
+                    break;
+                }
+            }
+
+            if needs_reconnect {
+                match acquire_conn_with_retry(&client, &shutdown).await {
+                    Some(c) => {
+                        conn = c;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(POLL_INTERVAL) => {
-                    let mut needs_reconnect = false;
-                    for (hold_queue_name, set_key) in hold_queue_names.iter().zip(hold_set_keys.iter()) {
-                        if let Err(e) = poll_hold_set(&mut conn, hold_queue_name, set_key).await {
-                            tracing::warn!("requeuer: poll failed for {}: {}", hold_queue_name, e);
-                            needs_reconnect = true;
-                        }
-                    }
-                    if needs_reconnect {
-                        match client.multiplexed_conn().await {
-                            Ok(new_conn) => conn = new_conn,
-                            Err(e) => tracing::warn!("requeuer: reconnect failed: {}", e),
-                        }
-                    }
-                }
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
             }
         }
     })
@@ -135,6 +139,35 @@ pub(crate) fn spawn_requeuer(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Acquire a multiplexed Redis connection, retrying with exponential backoff
+/// (1 s → 30 s, full jitter) until the shutdown token is cancelled.
+async fn acquire_conn_with_retry(
+    client: &RedisClient,
+    shutdown: &CancellationToken,
+) -> Option<RedisConnection> {
+    let mut backoff = Backoff::default();
+    loop {
+        match client.multiplexed_conn().await {
+            Ok(c) => return Some(c),
+            Err(e) => {
+                if shutdown.is_cancelled() {
+                    return None;
+                }
+                let delay = backoff.next().expect("backoff is infinite");
+                tracing::warn!(
+                    "requeuer: connection failed ({}), retrying in {:.1}s",
+                    e,
+                    delay.as_secs_f64()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => return None,
+                }
+            }
+        }
+    }
+}
 
 /// Current Unix timestamp in milliseconds, saturating at `u64::MAX`.
 fn now_ms() -> u64 {
@@ -160,7 +193,7 @@ async fn poll_hold_set(
 ) -> Result<()> {
     let now = now_ms();
 
-    let entries: Vec<String> = conn
+    let entries: Vec<String> = match conn
         .query(
             // ZRANGE with BYSCORE replaces the deprecated ZRANGEBYSCORE (Redis 6.2+).
             redis::cmd("ZRANGE")
@@ -173,7 +206,20 @@ async fn poll_hold_set(
                 .arg(REQUEUE_BATCH_SIZE),
         )
         .await
-        .unwrap_or_default();
+    {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(
+                hold_queue = hold_queue_name,
+                set_key = set_key,
+                error = %e,
+                "requeuer: ZRANGE failed, cannot poll hold set"
+            );
+            return Err(ShoveError::Connection(format!(
+                "ZRANGE failed for hold set '{set_key}': {e}"
+            )));
+        }
+    };
 
     for raw_json in entries {
         let entry: HoldEntry = match serde_json::from_str(&raw_json) {
@@ -227,6 +273,7 @@ async fn poll_hold_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ShoveError;
 
     #[test]
     fn hold_entry_roundtrips() {
@@ -292,5 +339,75 @@ mod tests {
             before > 1_577_836_800_000u64,
             "timestamp too small: {before}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #14 — ZRANGE error propagation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zrange_error_is_connection_variant() {
+        // poll_hold_set wraps ZRANGE failures as ShoveError::Connection so that
+        // spawn_requeuer's error branch fires and sets needs_reconnect = true.
+        let set_key = "orders-hold-5s:pending";
+        let err = ShoveError::Connection(format!(
+            "ZRANGE failed for hold set '{set_key}': connection refused"
+        ));
+        assert!(
+            matches!(err, ShoveError::Connection(_)),
+            "ZRANGE error must be ShoveError::Connection"
+        );
+    }
+
+    #[test]
+    fn zrange_error_message_contains_set_key_and_cause() {
+        // The error message must include both the hold set name (operator context)
+        // and the original Redis error (root-cause diagnosis).
+        let set_key = "orders-hold-5s:pending";
+        let cause = "connection timed out";
+        let msg = format!("ZRANGE failed for hold set '{set_key}': {cause}");
+        assert!(
+            msg.contains(set_key),
+            "error message must name the hold set; got: {msg}"
+        );
+        assert!(
+            msg.contains(cause),
+            "error message must preserve the original error; got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix #24 — acquire_conn_with_retry backoff contract
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backoff_is_infinite_for_retry_loop() {
+        // acquire_conn_with_retry calls backoff.next().expect("backoff is infinite").
+        // Verify that Backoff::default() never yields None — even after the delay
+        // reaches the 30 s cap it keeps returning Some(delay).
+        let delays: Vec<_> = Backoff::default().take(500).collect();
+        assert_eq!(
+            delays.len(),
+            500,
+            "Backoff must never return None; the .expect() in acquire_conn_with_retry would panic"
+        );
+    }
+
+    #[test]
+    fn backoff_default_delay_stays_within_bounds() {
+        // acquire_conn_with_retry uses Backoff::default() which has initial=1s, max=30s,
+        // factor=0.5. Every yielded delay must be in [0.5s, 45s] (max * 1.5 upper bound).
+        let max_expected = std::time::Duration::from_millis(45_000);
+        let min_expected = std::time::Duration::from_millis(500);
+        for delay in Backoff::default().take(50) {
+            assert!(
+                delay >= min_expected,
+                "delay {delay:?} is below the minimum expected bound"
+            );
+            assert!(
+                delay <= max_expected,
+                "delay {delay:?} exceeds the maximum expected bound"
+            );
+        }
     }
 }

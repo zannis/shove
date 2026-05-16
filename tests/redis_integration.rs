@@ -807,6 +807,20 @@ impl Topic for ReconnectTopic {
     }
 }
 
+struct RequeuerRecoverTopic;
+impl Topic for RequeuerRecoverTopic {
+    type Message = Order;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-requeuer-recover")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reconnect test: consumer recovers after Redis container restart
 // ---------------------------------------------------------------------------
@@ -957,6 +971,125 @@ async fn consumer_recovers_after_redis_restart() {
     assert!(
         outcome.is_clean(),
         "supervisor outcome not clean: {outcome:?}"
+    );
+
+    container.rm().await.ok();
+}
+
+// ---------------------------------------------------------------------------
+// Requeuer reconnect test
+// ---------------------------------------------------------------------------
+
+/// Verify that the hold-queue requeuer reconnects after a Redis restart and
+/// continues delivering hold-set entries to the stream.
+///
+/// Fix #14: ZRANGE errors now propagate (instead of being swallowed as an
+///   empty entry list), causing spawn_requeuer to enter its reconnect branch.
+/// Fix #24: acquire_conn_with_retry retries with backoff on connection failure
+///   instead of silently exiting the requeuer task.
+///
+/// The test demonstrates both: after kill+restart, a message that enters the
+/// hold queue is redelivered by the requeuer — proving it reconnected and can
+/// successfully poll the hold set.
+#[tokio::test]
+async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
+    let host_port: u16 = find_free_port();
+    let container = RedisContainer::default()
+        .with_tag("7.0")
+        .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
+        .start()
+        .await
+        .expect("start Redis container");
+    let host = container.get_host().await.expect("get host");
+    let url = format!("redis://{host}:{host_port}/");
+
+    let broker = Broker::<Redis>::new(RedisConfig {
+        mode: RedisMode::Standalone { url: url.clone() },
+        group: Some("requeuer-recover".into()),
+    })
+    .await
+    .expect("connect");
+
+    broker
+        .topology()
+        .declare::<RequeuerRecoverTopic>()
+        .await
+        .expect("declare");
+
+    // Handler: first delivery → Retry (puts message in hold set);
+    // second delivery (from hold set) → Ack.
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<RequeuerRecoverTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            let n = self.0.fetch_add(1, Ordering::Relaxed);
+            if n == 0 { Outcome::Retry } else { Outcome::Ack }
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<RequeuerRecoverTopic, _>(
+            H(call_count.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(5),
+        )
+        .expect("register");
+
+    // Kill and restart Redis. The consumer and requeuer both lose their
+    // connections and must reconnect via their respective retry loops.
+    let container_id = container.id().to_string();
+    let status = std::process::Command::new("docker")
+        .args(["kill", &container_id])
+        .status()
+        .expect("docker kill");
+    assert!(status.success(), "docker kill failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let status = std::process::Command::new("docker")
+        .args(["start", &container_id])
+        .status()
+        .expect("docker start");
+    assert!(status.success(), "docker start failed");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Redeclare topology (data was wiped) and publish a message via a fresh broker.
+    let broker2 = Broker::<Redis>::new(RedisConfig {
+        mode: RedisMode::Standalone { url: url.clone() },
+        group: Some("requeuer-recover".into()),
+    })
+    .await
+    .expect("reconnect after restart");
+
+    broker2
+        .topology()
+        .declare::<RequeuerRecoverTopic>()
+        .await
+        .expect("redeclare");
+
+    let publisher2 = broker2.publisher().await.expect("publisher2");
+    publisher2
+        .publish::<RequeuerRecoverTopic>(&Order { id: 1 })
+        .await
+        .expect("publish");
+
+    // call_count >= 2 proves:
+    //   1. Consumer reconnected and received the message (call 0 → Retry).
+    //   2. Requeuer reconnected, polled the hold set (ZRANGE succeeded, fix #14),
+    //      and redelivered the message (call 1 → Ack).
+    let probe = call_count.clone();
+    assert!(
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 2,
+            Duration::from_secs(30),
+        )
+        .await,
+        "requeuer did not reconnect and redeliver hold entry (call_count = {})",
+        call_count.load(Ordering::Relaxed)
     );
 
     container.rm().await.ok();
