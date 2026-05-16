@@ -27,7 +27,7 @@ absolute-paths = "deny"
 default = []
 
 # RabbitMQ Pubsub
-rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest", "dep:arc-swap"]
+rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest", "dep:arc-swap", "dep:url"]
 
 # Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.
 # Makes publish-to-hold-queue + ack atomic (tx_select/tx_commit), eliminating
@@ -89,6 +89,7 @@ rdkafka = { version = "0.39", features = ["tokio"], optional = true }
 dashmap = { version = "6", optional = true }
 redis = { version = "1", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"], optional = true }
 metrics = { version = "0.24", optional = true }
+url = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = true }
