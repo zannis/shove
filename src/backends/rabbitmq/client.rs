@@ -22,23 +22,11 @@ pub struct RabbitMqConfig {
 
 impl Debug for RabbitMqConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let redacted_uri = if let Some(at_idx) = self.uri.find('@') {
-            if let Some(proto_idx) = self.uri.find("://") {
-                let prefix = &self.uri[..proto_idx + 3];
-                let creds = &self.uri[proto_idx + 3..at_idx];
-                let suffix = &self.uri[at_idx..];
-
-                if let Some(colon_idx) = creds.find(':') {
-                    let user = &creds[..colon_idx];
-                    format!("{prefix}{user}:<redacted>{suffix}")
-                } else {
-                    format!("{prefix}<redacted>{suffix}")
-                }
-            } else {
-                "<redacted>".to_string()
-            }
+        let redacted_uri = if let Ok(mut url) = url::Url::parse(&self.uri) {
+            url.set_password(None).ok();
+            url.to_string()
         } else {
-            self.uri.clone()
+            "<unparseable>".to_string()
         };
 
         f.debug_struct("RabbitMqConfig")
@@ -323,7 +311,7 @@ mod tests {
         let config = RabbitMqConfig::new("amqp://admin:s3cret!@localhost:5672/%2F");
         let debug_output = format!("{config:?}");
         assert!(!debug_output.contains("s3cret!"));
-        assert!(debug_output.contains("amqp://admin:<redacted>@localhost:5672/%2F"));
+        assert!(debug_output.contains("admin@localhost"));
     }
 
     #[test]
