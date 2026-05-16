@@ -7,15 +7,18 @@ use uuid::Uuid;
 
 use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY};
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
+use crate::error::{Result, ShoveError};
 use crate::topology::QueueTopology;
 
-pub(crate) async fn route_ack(delivery: &Delivery, publisher: &ChannelPublisher) {
+pub(crate) async fn route_ack(delivery: &Delivery, publisher: &ChannelPublisher) -> Result<()> {
     if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
         error!("failed to ack delivery: {e}");
     }
     if let Err(e) = publisher.commit_if_tx().await {
         error!("tx_commit failed after ack: {e}");
+        return Err(ShoveError::Connection(format!("tx_commit failed after ack: {e}")));
     }
+    Ok(())
 }
 
 pub(crate) async fn route_retry(
@@ -23,7 +26,7 @@ pub(crate) async fn route_retry(
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     retry_count: u32,
-) {
+) -> Result<()> {
     let new_retry_count = retry_count + 1;
     let hold_queues = topology.hold_queues();
 
@@ -42,14 +45,16 @@ pub(crate) async fn route_retry(
                     // Ack failed while publish is buffered in tx — roll back the
                     // buffered publish so no duplicate ends up in the hold queue.
                     publisher.rollback_if_tx().await;
-                    nack_requeue(delivery, publisher).await;
-                    return;
+                    nack_requeue(delivery, publisher).await.ok();
+                    return Ok(());
                 }
                 if let Err(e) = publisher.commit_if_tx().await {
                     error!("tx_commit failed for retry (attempt {new_retry_count}): {e}");
                     // tx_commit failure means neither publish nor ack happened;
                     // delivery remains unacked and will be redelivered by the broker.
-                    return;
+                    return Err(ShoveError::Connection(format!(
+                        "tx_commit failed for retry: {e}"
+                    )));
                 }
                 debug!(
                     "retrying message via hold queue {} (attempt {})",
@@ -62,7 +67,7 @@ pub(crate) async fn route_retry(
                     "failed to publish to hold queue {}, requeuing: {e}",
                     hold_queue.name()
                 );
-                nack_requeue(delivery, publisher).await;
+                nack_requeue(delivery, publisher).await.ok();
             }
         }
     } else {
@@ -70,15 +75,16 @@ pub(crate) async fn route_retry(
             queue = topology.queue(),
             retry_count, "retrying message but no hold queues configured — requeuing with no delay"
         );
-        nack_requeue(delivery, publisher).await;
+        nack_requeue(delivery, publisher).await.ok();
     }
+    Ok(())
 }
 
 pub(crate) async fn route_defer(
     delivery: &Delivery,
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
-) {
+) -> Result<()> {
     let hold_queues = topology.hold_queues();
 
     if !hold_queues.is_empty() {
@@ -93,12 +99,14 @@ pub(crate) async fn route_defer(
                 if let Err(e) = delivery.ack(BasicAckOptions::default()).await {
                     error!("failed to ack delivery after deferring to hold queue: {e}");
                     publisher.rollback_if_tx().await;
-                    nack_requeue(delivery, publisher).await;
-                    return;
+                    nack_requeue(delivery, publisher).await.ok();
+                    return Ok(());
                 }
                 if let Err(e) = publisher.commit_if_tx().await {
                     error!("tx_commit failed for defer: {e}");
-                    return;
+                    return Err(ShoveError::Connection(format!(
+                        "tx_commit failed for defer: {e}"
+                    )));
                 }
                 debug!("deferring message to hold queue {}", hold_queue.name());
             }
@@ -107,7 +115,7 @@ pub(crate) async fn route_defer(
                     "failed to publish to hold queue {} for defer, requeuing: {e}",
                     hold_queue.name()
                 );
-                nack_requeue(delivery, publisher).await;
+                nack_requeue(delivery, publisher).await.ok();
             }
         }
     } else {
@@ -115,15 +123,16 @@ pub(crate) async fn route_defer(
             queue = topology.queue(),
             "deferring message but no hold queues configured — requeuing with no delay"
         );
-        nack_requeue(delivery, publisher).await;
+        nack_requeue(delivery, publisher).await.ok();
     }
+    Ok(())
 }
 
 pub(crate) async fn route_reject(
     delivery: &Delivery,
     topology: &QueueTopology,
     publisher: &ChannelPublisher,
-) {
+) -> Result<()> {
     if topology.dlq().is_none() {
         warn!(
             queue = topology.queue(),
@@ -141,10 +150,12 @@ pub(crate) async fn route_reject(
     }
     if let Err(e) = publisher.commit_if_tx().await {
         error!("tx_commit failed after reject: {e}");
+        return Err(ShoveError::Connection(format!("tx_commit failed after reject: {e}")));
     }
+    Ok(())
 }
 
-pub(crate) async fn nack_requeue(delivery: &Delivery, publisher: &ChannelPublisher) {
+pub(crate) async fn nack_requeue(delivery: &Delivery, publisher: &ChannelPublisher) -> Result<()> {
     if let Err(e) = delivery
         .nack(BasicNackOptions {
             requeue: true,
@@ -156,7 +167,9 @@ pub(crate) async fn nack_requeue(delivery: &Delivery, publisher: &ChannelPublish
     }
     if let Err(e) = publisher.commit_if_tx().await {
         error!("tx_commit failed after nack-requeue: {e}");
+        return Err(ShoveError::Connection(format!("tx_commit failed after nack-requeue: {e}")));
     }
+    Ok(())
 }
 
 pub(crate) fn clone_headers_with_retry(delivery: &Delivery, retry_count: u32) -> FieldTable {
