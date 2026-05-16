@@ -45,7 +45,7 @@ fn content_dedup_id(payload: &str) -> String {
 /// Convert a `HashMap<String, String>` into SNS message attributes.
 fn hashmap_to_message_attributes(
     headers: HashMap<String, String>,
-) -> HashMap<String, MessageAttributeValue> {
+) -> Result<HashMap<String, MessageAttributeValue>> {
     headers
         .into_iter()
         .map(|(k, v)| {
@@ -53,8 +53,8 @@ fn hashmap_to_message_attributes(
                 .data_type("String")
                 .string_value(v)
                 .build()
-                .expect("building MessageAttributeValue should not fail");
-            (k, attr)
+                .map_err(|e| ShoveError::Validation(format!("invalid message attribute '{k}': {e}")))?;
+            Ok((k, attr))
         })
         .collect()
 }
@@ -106,7 +106,7 @@ impl SnsPublisher {
                     .data_type("String")
                     .string_value(shard.to_string())
                     .build()
-                    .expect("building shard MessageAttributeValue should not fail");
+                    .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))?;
                 req = req.message_attributes("shard", shard_attr);
             }
         }
@@ -153,7 +153,7 @@ impl SnsPublisher {
             _ => None,
         };
 
-        let attributes = headers.map(hashmap_to_message_attributes);
+        let attributes = headers.map(hashmap_to_message_attributes).transpose()?;
 
         debug!(queue_name, topic_arn, "publishing message to SNS");
 
@@ -245,7 +245,7 @@ impl SnsPublisher {
         );
 
         // Build batch entries
-        let entries: Vec<PublishBatchRequestEntry> = payloads
+        let entries = payloads
             .iter()
             .enumerate()
             .map(|(i, payload)| {
@@ -264,16 +264,20 @@ impl SnsPublisher {
                             .data_type("String")
                             .string_value(shard.to_string())
                             .build()
-                            .expect("building shard MessageAttributeValue should not fail");
+                            .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))?;
                         entry = entry.message_attributes("shard", shard_attr);
                     }
                 }
 
                 entry
                     .build()
-                    .expect("building PublishBatchRequestEntry should not fail")
+                    .map_err(|e| ShoveError::Validation(format!("invalid batch entry {i}: {e}")))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>();
+        let entries = match entries {
+            Ok(v) => v,
+            Err(e) => return (0, Err(e)),
+        };
 
         // Chunk into groups of 10 and send. Track the per-chunk outcome so
         // the wrapper can record accurate per-message counters even on partial
@@ -378,7 +382,7 @@ mod tests {
 
     #[test]
     fn hashmap_to_message_attributes_empty() {
-        let attrs = hashmap_to_message_attributes(HashMap::new());
+        let attrs = hashmap_to_message_attributes(HashMap::new()).unwrap();
         assert!(attrs.is_empty());
     }
 
@@ -386,7 +390,7 @@ mod tests {
     fn hashmap_to_message_attributes_single() {
         let mut map = HashMap::new();
         map.insert("x-trace-id".to_string(), "abc123".to_string());
-        let attrs = hashmap_to_message_attributes(map);
+        let attrs = hashmap_to_message_attributes(map).unwrap();
         assert_eq!(attrs.len(), 1);
         let attr = attrs.get("x-trace-id").expect("key should be present");
         assert_eq!(attr.data_type(), "String");
@@ -399,7 +403,7 @@ mod tests {
         map.insert("key-a".to_string(), "val-a".to_string());
         map.insert("key-b".to_string(), "val-b".to_string());
         map.insert("key-c".to_string(), "val-c".to_string());
-        let attrs = hashmap_to_message_attributes(map);
+        let attrs = hashmap_to_message_attributes(map).unwrap();
         assert_eq!(attrs.len(), 3);
         assert!(attrs.contains_key("key-a"));
         assert!(attrs.contains_key("key-b"));

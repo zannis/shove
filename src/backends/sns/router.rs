@@ -4,6 +4,7 @@ use aws_sdk_sqs::types::{
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
+use crate::metrics::{BackendErrorKind, BackendLabel, record_backend_error};
 use crate::topology::QueueTopology;
 
 /// Custom SQS message attribute used to track retry count across
@@ -262,6 +263,7 @@ async fn resend_to_queue(
                     error = %e,
                     "failed to delete original after re-send (possible duplicate)"
                 );
+                record_backend_error(BackendLabel::SnsSqs, BackendErrorKind::Ack);
             }
         }
         Err(e) => {
