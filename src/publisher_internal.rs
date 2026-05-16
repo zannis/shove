@@ -12,9 +12,9 @@ const RESERVED_HEADER_PREFIXES: &[&str] =
 #[allow(dead_code)] // Used by feature-gated backend publishers.
 pub(crate) fn validate_headers(headers: &HashMap<String, String>) -> Result<()> {
     for key in headers.keys() {
+        let key_lower = key.to_ascii_lowercase();
         if RESERVED_HEADER_PREFIXES.iter().any(|prefix| {
-            key.len() >= prefix.len()
-                && key.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            key_lower.starts_with(*prefix)
         }) {
             return Err(ShoveError::Validation(format!(
                 "header '{key}' uses a reserved prefix"
