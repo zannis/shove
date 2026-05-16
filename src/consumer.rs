@@ -115,6 +115,21 @@ pub struct ConsumerOptions<B: Backend> {
     /// ConsumerOptions::<MyBackend>::new().with_max_reconnect_attempts(50)
     /// ```
     pub max_reconnect_attempts: Option<u32>,
+    /// Maximum time a sequence key may remain in the `AwaitingRetry` state
+    /// before its pending deliveries are dead-lettered (RabbitMQ sequenced
+    /// consumers only).
+    ///
+    /// When a handler returns `Retry` or `Defer`, the key is blocked until
+    /// the hold-queue message comes back. If the hold queue has a longer TTL
+    /// than expected (or is misconfigured), the key stays blocked indefinitely.
+    /// Setting this timeout causes the consumer to dead-letter any buffered
+    /// deliveries for the key and unblock it, preventing consumer stalls.
+    ///
+    /// `None` (the default) disables the eviction — keys stay in
+    /// `AwaitingRetry` until the retry message arrives.
+    #[cfg(feature = "rabbitmq")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
+    pub hold_queue_timeout: Option<Duration>,
 
     /// Enable exactly-once delivery via AMQP transactions (RabbitMQ only).
     ///
@@ -163,6 +178,8 @@ impl<B: Backend> ConsumerOptions<B> {
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             max_reconnect_attempts: None,
+            #[cfg(feature = "rabbitmq")]
+            hold_queue_timeout: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
@@ -203,8 +220,9 @@ impl<B: Backend> ConsumerOptions<B> {
     }
 
     /// Set the handler timeout. If a handler exceeds this duration the message
-    /// is retried automatically.
+    /// is retried automatically. Panics if `timeout` is zero.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = Some(timeout);
         self
     }
@@ -291,6 +309,8 @@ impl<B: Backend> ConsumerOptions<B> {
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
             max_reconnect_attempts: self.max_reconnect_attempts,
+            #[cfg(feature = "rabbitmq")]
+            hold_queue_timeout: self.hold_queue_timeout,
             shutdown: self.shutdown.unwrap_or_default(),
             processing: self.processing,
             consumer_group: self.consumer_group,
@@ -320,6 +340,8 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
             max_reconnect_attempts: self.max_reconnect_attempts,
+            #[cfg(feature = "rabbitmq")]
+            hold_queue_timeout: self.hold_queue_timeout,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]
@@ -366,6 +388,21 @@ impl ConsumerOptions<RabbitMq> {
     /// See [`ConsumerOptions::exactly_once`] for the full trade-off description.
     pub fn with_exactly_once(mut self) -> Self {
         self.exactly_once = true;
+        self
+    }
+}
+
+#[cfg(feature = "rabbitmq")]
+#[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
+impl ConsumerOptions<crate::markers::RabbitMq> {
+    /// Set the maximum time a sequence key may remain in `AwaitingRetry`
+    /// before its pending deliveries are dead-lettered.
+    ///
+    /// See [`hold_queue_timeout`](Self::hold_queue_timeout) for semantics.
+    /// Panics if `timeout` is zero.
+    pub fn with_hold_queue_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "hold_queue_timeout must be positive");
+        self.hold_queue_timeout = Some(timeout);
         self
     }
 }
