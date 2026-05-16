@@ -206,6 +206,11 @@ impl KafkaClient {
                 (false, true) => Some("SASL_PLAINTEXT"),
                 (false, false) => None,
             };
+            if config.sasl.is_some() && config.tls.is_none() {
+                tracing::warn!(
+                    "Kafka SASL enabled without TLS; credentials will be sent in plaintext over the network"
+                );
+            }
             if let Some(p) = protocol {
                 base_config.set("security.protocol", p);
             }
@@ -272,7 +277,7 @@ impl KafkaClient {
                     if attempts >= max_attempts {
                         return Err(e);
                     }
-                    let delay = backoff.next().unwrap_or(Duration::from_secs(5));
+                    let delay = backoff.next().expect("backoff iterator is infinite; this is a bug");
                     tracing::warn!(
                         attempt = attempts,
                         max_attempts,
