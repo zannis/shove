@@ -25,6 +25,7 @@ use super::client::{RedisClient, RedisConnection};
 use super::constants::{REQUEUE_BATCH_SIZE, REQUEUE_POLL_MS};
 use super::topology::RedisTopologyDeclarer;
 use crate::error::{Result, ShoveError};
+use crate::metrics::{BackendErrorKind, BackendLabel, record_backend_error};
 use crate::retry::Backoff;
 
 // ---------------------------------------------------------------------------
@@ -255,6 +256,7 @@ async fn poll_hold_set(
                         hold_queue_name,
                         e
                     );
+                    record_backend_error(BackendLabel::Redis, BackendErrorKind::Ack);
                 }
             }
             Err(e) => {

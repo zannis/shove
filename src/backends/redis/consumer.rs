@@ -416,7 +416,10 @@ where
                         Some(s) => s.clone(),
                         None => {
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
-                            let _ = xack(&mut conn, stream, &group, &entry_id).await;
+                            if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
+                                tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
+                                metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                            }
                             continue;
                         }
                     };
@@ -599,7 +602,10 @@ async fn route_outcome(
 ) -> Result<()> {
     match outcome {
         Outcome::Ack => {
-            let _ = xack(conn, stream, group, entry_id).await;
+            if let Err(e) = xack(conn, stream, group, entry_id).await {
+                tracing::warn!(stream, entry_id, error = %e, "XACK failed on Ack");
+                metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+            }
         }
         Outcome::Retry => {
             let new_retry = retry_count + 1;
@@ -622,7 +628,10 @@ async fn route_outcome(
                     "Retry but no hold queues — re-queueing immediately"
                 );
                 requeue_to_stream(conn, stream, fields, new_retry).await;
-                let _ = xack(conn, stream, group, entry_id).await;
+                if let Err(e) = xack(conn, stream, group, entry_id).await {
+                    tracing::warn!(stream, entry_id, error = %e, "XACK failed after immediate requeue");
+                    metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                }
             } else if let Some(level) = hold_level(new_retry, hold_queues) {
                 let hq = &hold_queues[level];
                 route_to_hold(
@@ -659,7 +668,10 @@ async fn route_outcome(
                     "Defer but no hold queues — re-queueing immediately"
                 );
                 requeue_to_stream(conn, stream, fields, retry_count).await;
-                let _ = xack(conn, stream, group, entry_id).await;
+                if let Err(e) = xack(conn, stream, group, entry_id).await {
+                    tracing::warn!(stream, entry_id, error = %e, "XACK failed after defer requeue");
+                    metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                }
             } else {
                 let hq = &hold_queues[0];
                 // Defer does NOT increment retry count.
@@ -707,7 +719,10 @@ async fn route_to_hold(
         tracing::warn!(error = %e, hold_name, "enqueue_hold failed — message may be lost");
         return;
     }
-    let _ = xack(conn, stream, group, entry_id).await;
+    if let Err(e) = xack(conn, stream, group, entry_id).await {
+        tracing::warn!(stream, entry_id, error = %e, "XACK failed after enqueue_hold");
+        metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -725,7 +740,10 @@ async fn route_to_dlq(
         Some(d) => d,
         None => {
             tracing::warn!(stream, entry_id, reason, "no DLQ configured — discarding");
-            let _ = xack(conn, stream, group, entry_id).await;
+            if let Err(e) = xack(conn, stream, group, entry_id).await {
+                tracing::warn!(stream, entry_id, error = %e, "XACK failed while discarding (no DLQ)");
+                metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+            }
             return Ok(());
         }
     };
@@ -744,7 +762,10 @@ async fn route_to_dlq(
         ShoveError::Connection(format!("XADD to DLQ failed: {e}"))
     })?;
 
-    let _ = xack(conn, stream, group, entry_id).await;
+    if let Err(e) = xack(conn, stream, group, entry_id).await {
+        tracing::warn!(stream, entry_id, error = %e, "XACK failed after DLQ enqueue");
+        metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+    }
     Ok(())
 }
 
