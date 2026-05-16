@@ -16,6 +16,11 @@ pub enum ShoveError {
     /// Input validation failed (e.g. message too large, reserved header).
     #[error("validation error: {0}")]
     Validation(String),
+
+    /// An error from an external SDK or backend that doesn't map to a known category.
+    /// Treated as non-retryable so it surfaces immediately to the operator.
+    #[error("unknown backend error: {0}")]
+    Unknown(String),
 }
 
 impl ShoveError {

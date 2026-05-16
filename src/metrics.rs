@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 /// Default name prefix applied to every metric. Override with [`set_prefix`].
 const DEFAULT_PREFIX: &str = "shove";
 
-static PREFIX: OnceLock<&'static str> = OnceLock::new();
+static PREFIX: OnceLock<String> = OnceLock::new();
 static NAMES: OnceLock<MetricNames> = OnceLock::new();
 
 /// Override the prefix applied to every emitted metric name.
@@ -26,9 +26,6 @@ static NAMES: OnceLock<MetricNames> = OnceLock::new();
 /// hyphens or other special characters in the prefix produce invalid metric
 /// names that exporters will reject.
 ///
-/// The provided string is leaked so we can hand `&'static str` names to the
-/// `metrics` macros without per-emit allocation.
-///
 /// # Panics
 ///
 /// - If `set_prefix` has already been called.
@@ -39,53 +36,52 @@ pub fn set_prefix(prefix: impl Into<String>) {
         "shove::metrics::set_prefix called after metric emission already initialized \
          the name cache; call set_prefix at startup before any broker/publisher work",
     );
-    let leaked: &'static str = Box::leak(prefix.into().into_boxed_str());
     PREFIX
-        .set(leaked)
+        .set(prefix.into())
         .expect("shove::metrics::set_prefix called twice; the prefix is set-once at startup");
 }
 
 fn prefix() -> &'static str {
-    PREFIX.get().copied().unwrap_or(DEFAULT_PREFIX)
+    // PREFIX is a static OnceLock<String>, so the returned &str is 'static.
+    PREFIX.get().map(String::as_str).unwrap_or(DEFAULT_PREFIX)
 }
 
 #[allow(dead_code)] // Fields are read by emission helpers behind the `metrics` feature.
 pub(crate) struct MetricNames {
-    pub messages_consumed_total: &'static str,
-    pub messages_failed_total: &'static str,
-    pub messages_published_total: &'static str,
-    pub message_processing_duration_seconds: &'static str,
-    pub message_publish_duration_seconds: &'static str,
-    pub message_size_bytes: &'static str,
-    pub messages_inflight: &'static str,
-    pub autoscaler_decisions_total: &'static str,
-    pub backend_errors_total: &'static str,
+    pub messages_consumed_total: String,
+    pub messages_failed_total: String,
+    pub messages_published_total: String,
+    pub message_processing_duration_seconds: String,
+    pub message_publish_duration_seconds: String,
+    pub message_size_bytes: String,
+    pub messages_inflight: String,
+    pub autoscaler_decisions_total: String,
+    pub backend_errors_total: String,
 }
 
 #[allow(dead_code)] // used by emission helpers when the `metrics` feature is on
 pub(crate) fn names() -> &'static MetricNames {
     NAMES.get_or_init(|| {
         let p = prefix();
-        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
         MetricNames {
-            messages_consumed_total: leak(format!("{p}_messages_consumed_total")),
-            messages_failed_total: leak(format!("{p}_messages_failed_total")),
-            messages_published_total: leak(format!("{p}_messages_published_total")),
-            message_processing_duration_seconds: leak(format!(
+            messages_consumed_total: format!("{p}_messages_consumed_total"),
+            messages_failed_total: format!("{p}_messages_failed_total"),
+            messages_published_total: format!("{p}_messages_published_total"),
+            message_processing_duration_seconds: format!(
                 "{p}_message_processing_duration_seconds"
-            )),
-            message_publish_duration_seconds: leak(format!("{p}_message_publish_duration_seconds")),
-            message_size_bytes: leak(format!("{p}_message_size_bytes")),
-            messages_inflight: leak(format!("{p}_messages_inflight")),
-            autoscaler_decisions_total: leak(format!("{p}_autoscaler_decisions_total")),
-            backend_errors_total: leak(format!("{p}_backend_errors_total")),
+            ),
+            message_publish_duration_seconds: format!("{p}_message_publish_duration_seconds"),
+            message_size_bytes: format!("{p}_message_size_bytes"),
+            messages_inflight: format!("{p}_messages_inflight"),
+            autoscaler_decisions_total: format!("{p}_autoscaler_decisions_total"),
+            backend_errors_total: format!("{p}_backend_errors_total"),
         }
     })
 }
 
 use crate::outcome::Outcome;
 
-/// Stable string label for an [`Outcome`]. Stays low-cardinality (4 values).
+/// Stable string label for an [`Outcome`].
 #[allow(dead_code)]
 pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
     match o {
@@ -126,6 +122,7 @@ pub(crate) enum BackendLabel {
     RabbitMq,
     Kafka,
     Nats,
+    Redis,
     SnsSqs,
 }
 
@@ -137,6 +134,7 @@ impl BackendLabel {
             BackendLabel::RabbitMq => "rabbitmq",
             BackendLabel::Kafka => "kafka",
             BackendLabel::Nats => "nats",
+            BackendLabel::Redis => "redis",
             BackendLabel::SnsSqs => "sns_sqs",
         }
     }
@@ -181,7 +179,7 @@ pub(crate) fn group_label(group: Option<&str>) -> &str {
 #[cfg(feature = "metrics")]
 pub(crate) fn record_consumed(topic: &str, group: Option<&str>, outcome: &Outcome) {
     ::metrics::counter!(
-        names().messages_consumed_total,
+        names().messages_consumed_total.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
         "outcome" => outcome_label(outcome),
@@ -196,7 +194,7 @@ pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
 #[cfg(feature = "metrics")]
 pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason) {
     ::metrics::counter!(
-        names().messages_failed_total,
+        names().messages_failed_total.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
         "reason" => reason.as_label(),
@@ -223,7 +221,7 @@ pub(crate) fn record_published_n(topic: &str, ok: bool, count: u64) {
     }
     let outcome = if ok { "success" } else { "error" };
     ::metrics::counter!(
-        names().messages_published_total,
+        names().messages_published_total.as_str(),
         "topic" => topic.to_string(),
         "outcome" => outcome,
     )
@@ -242,7 +240,7 @@ pub(crate) fn record_processing_duration(
     elapsed_secs: f64,
 ) {
     ::metrics::histogram!(
-        names().message_processing_duration_seconds,
+        names().message_processing_duration_seconds.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
         "outcome" => outcome_label(outcome),
@@ -258,7 +256,7 @@ pub(crate) fn record_processing_duration(_: &str, _: Option<&str>, _: &Outcome, 
 pub(crate) fn record_publish_duration(topic: &str, ok: bool, elapsed_secs: f64) {
     let outcome = if ok { "success" } else { "error" };
     ::metrics::histogram!(
-        names().message_publish_duration_seconds,
+        names().message_publish_duration_seconds.as_str(),
         "topic" => topic.to_string(),
         "outcome" => outcome,
     )
@@ -271,7 +269,7 @@ pub(crate) fn record_publish_duration(_: &str, _: bool, _: f64) {}
 #[cfg(feature = "metrics")]
 pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize) {
     ::metrics::histogram!(
-        names().message_size_bytes,
+        names().message_size_bytes.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
     )
@@ -285,7 +283,7 @@ pub(crate) fn record_message_size(_: &str, _: Option<&str>, _: usize) {}
 #[cfg(feature = "metrics")]
 pub(crate) fn inc_inflight(topic: &str, group: Option<&str>) {
     ::metrics::gauge!(
-        names().messages_inflight,
+        names().messages_inflight.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
     )
@@ -298,7 +296,7 @@ pub(crate) fn inc_inflight(_: &str, _: Option<&str>) {}
 #[cfg(feature = "metrics")]
 pub(crate) fn dec_inflight(topic: &str, group: Option<&str>) {
     ::metrics::gauge!(
-        names().messages_inflight,
+        names().messages_inflight.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
     )
@@ -348,7 +346,7 @@ impl Drop for InflightGuard {
 #[cfg(feature = "metrics")]
 pub(crate) fn record_autoscaler_decision(group: &str, direction: &'static str) {
     ::metrics::counter!(
-        names().autoscaler_decisions_total,
+        names().autoscaler_decisions_total.as_str(),
         "consumer_group" => group.to_string(),
         "direction" => direction,
     )
@@ -361,7 +359,7 @@ pub(crate) fn record_autoscaler_decision(_: &str, _: &'static str) {}
 #[cfg(feature = "metrics")]
 pub(crate) fn record_backend_error(backend: BackendLabel, kind: BackendErrorKind) {
     ::metrics::counter!(
-        names().backend_errors_total,
+        names().backend_errors_total.as_str(),
         "backend" => backend.as_str(),
         "kind" => kind.as_label(),
     )
@@ -387,24 +385,24 @@ mod tests {
     #[test]
     fn names_use_default_prefix() {
         let n = names();
-        assert_eq!(n.messages_consumed_total, "shove_messages_consumed_total");
-        assert_eq!(n.messages_failed_total, "shove_messages_failed_total");
-        assert_eq!(n.messages_published_total, "shove_messages_published_total");
+        assert_eq!(n.messages_consumed_total.as_str(), "shove_messages_consumed_total");
+        assert_eq!(n.messages_failed_total.as_str(), "shove_messages_failed_total");
+        assert_eq!(n.messages_published_total.as_str(), "shove_messages_published_total");
         assert_eq!(
-            n.message_processing_duration_seconds,
+            n.message_processing_duration_seconds.as_str(),
             "shove_message_processing_duration_seconds"
         );
         assert_eq!(
-            n.message_publish_duration_seconds,
+            n.message_publish_duration_seconds.as_str(),
             "shove_message_publish_duration_seconds"
         );
-        assert_eq!(n.message_size_bytes, "shove_message_size_bytes");
-        assert_eq!(n.messages_inflight, "shove_messages_inflight");
+        assert_eq!(n.message_size_bytes.as_str(), "shove_message_size_bytes");
+        assert_eq!(n.messages_inflight.as_str(), "shove_messages_inflight");
         assert_eq!(
-            n.autoscaler_decisions_total,
+            n.autoscaler_decisions_total.as_str(),
             "shove_autoscaler_decisions_total"
         );
-        assert_eq!(n.backend_errors_total, "shove_backend_errors_total");
+        assert_eq!(n.backend_errors_total.as_str(), "shove_backend_errors_total");
     }
 
     #[test]
