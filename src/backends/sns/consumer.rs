@@ -58,7 +58,7 @@ where
         }
         // Required: SdkError is #[non_exhaustive]. All current variants are
         // handled above; this only fires if the AWS SDK adds new ones.
-        _ => ShoveError::Connection(format!("{context}: {e}")),
+        _ => ShoveError::Unknown(format!("unrecognized AWS SDK error in {context}: {e}")),
     }
 }
 
@@ -355,7 +355,7 @@ where
         while let Some(front) = in_flight.front_mut() {
             match front.outcome_rx.try_recv() {
                 Ok(Outcome::Ack) => {
-                    let msg = in_flight.pop_front().unwrap();
+                    let msg = in_flight.pop_front().expect("in_flight was just peeked");
                     debug!(queue_url, receipt_handle = %msg.receipt_handle, "message acked (pending flush)");
                     pending_acks.push(msg.receipt_handle);
                     // Flush immediately once we have a full batch.
@@ -379,7 +379,7 @@ where
                         router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
                             .await;
                     }
-                    let msg = in_flight.pop_front().unwrap();
+                    let msg = in_flight.pop_front().expect("in_flight was just peeked");
                     debug!(queue_url, ?outcome, "message handled");
                     route_outcome(
                         sqs,
@@ -405,7 +405,7 @@ where
                         router::route_ack_batch(sqs, queue_url, std::mem::take(&mut pending_acks))
                             .await;
                     }
-                    let msg = in_flight.pop_front().unwrap();
+                    let msg = in_flight.pop_front().expect("in_flight was just peeked");
                     warn!(queue_url, "handler task panicked, retrying message");
                     route_outcome(
                         sqs,
@@ -449,8 +449,15 @@ where
                     router::route_requeue(sqs, queue_url, rh).await;
                 }
             }
+            let drain_timeout = options.handler_timeout.unwrap_or(crate::consumer::DEFAULT_HANDLER_TIMEOUT);
             for pending in in_flight {
-                let outcome = pending.outcome_rx.await.unwrap_or(Outcome::Retry);
+                let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!(queue_url, "handler timed out during shutdown drain, retrying");
+                        Ok(Outcome::Retry)
+                    })
+                    .unwrap_or(Outcome::Retry);
                 route_outcome(
                     sqs,
                     queue_url,
