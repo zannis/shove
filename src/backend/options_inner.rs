@@ -67,6 +67,38 @@ impl ConsumerOptionsInner {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_shutdown() -> CancellationToken {
+        CancellationToken::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_with_shutdown_max_reconnect_attempts_is_none() {
+        let opts = ConsumerOptionsInner::defaults_with_shutdown(CancellationToken::new());
+        assert!(
+            opts.max_reconnect_attempts.is_none(),
+            "max_reconnect_attempts must default to None (unlimited)"
+        );
+    }
+
+    #[test]
+    fn defaults_with_shutdown_has_sensible_values() {
+        let opts = ConsumerOptionsInner::defaults_with_shutdown(CancellationToken::new());
+        assert_eq!(opts.max_retries, 10);
+        assert_eq!(opts.prefetch_count, 10);
+        assert!(opts.handler_timeout.is_some());
+        assert!(opts.max_pending_per_key.is_some());
+        assert!(opts.max_message_size.is_some());
+        assert!(opts.consumer_group.is_none());
+    }
+}
+
+impl ConsumerOptionsInner {
     /// Returns `Ok(())` if the payload is within the configured
     /// `max_message_size`, or an error if it exceeds the limit. Always
     /// succeeds when no limit is set.

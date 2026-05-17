@@ -1535,6 +1535,8 @@ impl RabbitMqConsumer {
             opts.handler_timeout = options.handler_timeout;
             opts.max_pending_per_key = options.max_pending_per_key;
             opts.max_message_size = options.max_message_size;
+            opts.max_reconnect_attempts = options.max_reconnect_attempts;
+            opts.hold_queue_timeout = options.hold_queue_timeout;
             handles.push(tokio::spawn(async move {
                 let consumer = RabbitMqConsumer::new(inner_client);
                 consumer
