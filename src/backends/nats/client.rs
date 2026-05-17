@@ -113,10 +113,9 @@ impl NatsClient {
         } else if let Some(seed) = &config.nkey_seed {
             opts = opts.nkey(seed.clone());
         } else if let Some(creds) = &config.creds_file {
-            opts = opts
-                .credentials_file(creds)
-                .await
-                .map_err(|e| ShoveError::Connection(format!("failed to load NATS credentials: {e}")))?;
+            opts = opts.credentials_file(creds).await.map_err(|e| {
+                ShoveError::Connection(format!("failed to load NATS credentials: {e}"))
+            })?;
         }
 
         let client = opts
@@ -145,7 +144,9 @@ impl NatsClient {
                     if attempts >= max_attempts {
                         return Err(e);
                     }
-                    let delay = backoff.next().expect("backoff iterator is infinite; this is a bug");
+                    let delay = backoff
+                        .next()
+                        .expect("backoff iterator is infinite; this is a bug");
                     tracing::warn!(
                         attempt = attempts,
                         max_attempts,

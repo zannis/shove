@@ -16,7 +16,9 @@ pub(crate) async fn route_ack(delivery: &Delivery, publisher: &ChannelPublisher)
     }
     if let Err(e) = publisher.commit_if_tx().await {
         error!("tx_commit failed after ack: {e}");
-        return Err(ShoveError::Connection(format!("tx_commit failed after ack: {e}")));
+        return Err(ShoveError::Connection(format!(
+            "tx_commit failed after ack: {e}"
+        )));
     }
     Ok(())
 }
@@ -150,7 +152,9 @@ pub(crate) async fn route_reject(
     }
     if let Err(e) = publisher.commit_if_tx().await {
         error!("tx_commit failed after reject: {e}");
-        return Err(ShoveError::Connection(format!("tx_commit failed after reject: {e}")));
+        return Err(ShoveError::Connection(format!(
+            "tx_commit failed after reject: {e}"
+        )));
     }
     Ok(())
 }
@@ -167,7 +171,9 @@ pub(crate) async fn nack_requeue(delivery: &Delivery, publisher: &ChannelPublish
     }
     if let Err(e) = publisher.commit_if_tx().await {
         error!("tx_commit failed after nack-requeue: {e}");
-        return Err(ShoveError::Connection(format!("tx_commit failed after nack-requeue: {e}")));
+        return Err(ShoveError::Connection(format!(
+            "tx_commit failed after nack-requeue: {e}"
+        )));
     }
     Ok(())
 }

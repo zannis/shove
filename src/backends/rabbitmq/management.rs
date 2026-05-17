@@ -95,8 +95,7 @@ impl ManagementClient {
             .danger_accept_invalid_certs(config.tls_skip_verify);
 
         if let Some(ca_path) = &config.tls_ca_cert {
-            let pem = std::fs::read(ca_path)
-                .expect("failed to read management API CA certificate");
+            let pem = std::fs::read(ca_path).expect("failed to read management API CA certificate");
             let cert = reqwest::Certificate::from_pem(&pem)
                 .expect("failed to parse management API CA certificate");
             builder = builder.add_root_certificate(cert);

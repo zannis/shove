@@ -53,7 +53,9 @@ fn hashmap_to_message_attributes(
                 .data_type("String")
                 .string_value(v)
                 .build()
-                .map_err(|e| ShoveError::Validation(format!("invalid message attribute '{k}': {e}")))?;
+                .map_err(|e| {
+                    ShoveError::Validation(format!("invalid message attribute '{k}': {e}"))
+                })?;
             Ok((k, attr))
         })
         .collect()
@@ -264,7 +266,9 @@ impl SnsPublisher {
                             .data_type("String")
                             .string_value(shard.to_string())
                             .build()
-                            .map_err(|e| ShoveError::Validation(format!("invalid shard attribute: {e}")))?;
+                            .map_err(|e| {
+                                ShoveError::Validation(format!("invalid shard attribute: {e}"))
+                            })?;
                         entry = entry.message_attributes("shard", shard_attr);
                     }
                 }

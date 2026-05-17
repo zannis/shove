@@ -67,9 +67,7 @@ pub(crate) fn names() -> &'static MetricNames {
             messages_consumed_total: format!("{p}_messages_consumed_total"),
             messages_failed_total: format!("{p}_messages_failed_total"),
             messages_published_total: format!("{p}_messages_published_total"),
-            message_processing_duration_seconds: format!(
-                "{p}_message_processing_duration_seconds"
-            ),
+            message_processing_duration_seconds: format!("{p}_message_processing_duration_seconds"),
             message_publish_duration_seconds: format!("{p}_message_publish_duration_seconds"),
             message_size_bytes: format!("{p}_message_size_bytes"),
             messages_inflight: format!("{p}_messages_inflight"),
@@ -385,9 +383,18 @@ mod tests {
     #[test]
     fn names_use_default_prefix() {
         let n = names();
-        assert_eq!(n.messages_consumed_total.as_str(), "shove_messages_consumed_total");
-        assert_eq!(n.messages_failed_total.as_str(), "shove_messages_failed_total");
-        assert_eq!(n.messages_published_total.as_str(), "shove_messages_published_total");
+        assert_eq!(
+            n.messages_consumed_total.as_str(),
+            "shove_messages_consumed_total"
+        );
+        assert_eq!(
+            n.messages_failed_total.as_str(),
+            "shove_messages_failed_total"
+        );
+        assert_eq!(
+            n.messages_published_total.as_str(),
+            "shove_messages_published_total"
+        );
         assert_eq!(
             n.message_processing_duration_seconds.as_str(),
             "shove_message_processing_duration_seconds"
@@ -402,7 +409,10 @@ mod tests {
             n.autoscaler_decisions_total.as_str(),
             "shove_autoscaler_decisions_total"
         );
-        assert_eq!(n.backend_errors_total.as_str(), "shove_backend_errors_total");
+        assert_eq!(
+            n.backend_errors_total.as_str(),
+            "shove_backend_errors_total"
+        );
     }
 
     #[test]

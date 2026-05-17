@@ -13,9 +13,10 @@ const RESERVED_HEADER_PREFIXES: &[&str] =
 pub(crate) fn validate_headers(headers: &HashMap<String, String>) -> Result<()> {
     for key in headers.keys() {
         let key_lower = key.to_ascii_lowercase();
-        if RESERVED_HEADER_PREFIXES.iter().any(|prefix| {
-            key_lower.starts_with(*prefix)
-        }) {
+        if RESERVED_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| key_lower.starts_with(*prefix))
+        {
             return Err(ShoveError::Validation(format!(
                 "header '{key}' uses a reserved prefix"
             )));

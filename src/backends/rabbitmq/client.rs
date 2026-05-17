@@ -302,9 +302,9 @@ impl RabbitMqClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use lapin::ErrorKind;
     use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPHardError, AMQPSoftError};
-    use super::*;
 
     #[test]
     fn config_debug_redacts_password_only() {

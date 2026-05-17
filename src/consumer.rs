@@ -394,7 +394,7 @@ impl ConsumerOptions<RabbitMq> {
 
 #[cfg(feature = "rabbitmq")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rabbitmq")))]
-impl ConsumerOptions<crate::markers::RabbitMq> {
+impl ConsumerOptions<RabbitMq> {
     /// Set the maximum time a sequence key may remain in `AwaitingRetry`
     /// before its pending deliveries are dead-lettered.
     ///
