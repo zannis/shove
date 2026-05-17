@@ -277,7 +277,9 @@ impl KafkaClient {
                     if attempts >= max_attempts {
                         return Err(e);
                     }
-                    let delay = backoff.next().expect("backoff iterator is infinite; this is a bug");
+                    let delay = backoff
+                        .next()
+                        .expect("backoff iterator is infinite; this is a bug");
                     tracing::warn!(
                         attempt = attempts,
                         max_attempts,

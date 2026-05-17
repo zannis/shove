@@ -19,11 +19,11 @@ use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
-use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
+use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
 
 /// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
@@ -449,12 +449,15 @@ where
                     router::route_requeue(sqs, queue_url, rh).await;
                 }
             }
-            let drain_timeout = options.handler_timeout.unwrap_or(crate::consumer::DEFAULT_HANDLER_TIMEOUT);
+            let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
             for pending in in_flight {
                 let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
                     .await
                     .unwrap_or_else(|_| {
-                        warn!(queue_url, "handler timed out during shutdown drain, retrying");
+                        warn!(
+                            queue_url,
+                            "handler timed out during shutdown drain, retrying"
+                        );
                         Ok(Outcome::Retry)
                     })
                     .unwrap_or(Outcome::Retry);

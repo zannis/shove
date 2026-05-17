@@ -25,11 +25,11 @@ use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
-use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
+use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
 use crate::{QueueTopology, RabbitMq};
 
 use super::map_lapin_error;
@@ -318,8 +318,11 @@ impl RabbitMqConsumer {
         // When no timeout is configured we use a very long period so the arm never
         // fires meaningfully (the `if options.hold_queue_timeout.is_some()` guard
         // in the select! makes it inactive, but Interval still needs a valid duration).
+        // Poll at half the timeout so a key evicted just after a tick is caught
+        // within 1.5× the configured maximum, not 2×.
         let eviction_period = options
             .hold_queue_timeout
+            .map(|t| t / 2)
             .unwrap_or(Duration::from_secs(86400));
         let mut eviction_ticker = tokio::time::interval(eviction_period);
         eviction_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -483,7 +486,7 @@ impl RabbitMqConsumer {
                         in_flight_count
                     );
                     // Wait for all in-flight handlers to complete.
-                    let drain_timeout = options.handler_timeout.unwrap_or(crate::consumer::DEFAULT_HANDLER_TIMEOUT);
+                    let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
                     for (key, state) in key_states.drain() {
                         if let KeyState::InFlight { delivery, outcome_rx } = state {
                             let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
@@ -835,14 +838,18 @@ impl RabbitMqConsumer {
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
                     // Reject remaining pending for this key too.
-                    router::route_reject(&delivery, topology, publisher).await.ok();
+                    router::route_reject(&delivery, topology, publisher)
+                        .await
+                        .ok();
                     while let Some(pd) = pending.pop_front() {
                         router::route_reject(&pd, topology, publisher).await.ok();
                     }
                     pending_deliveries.remove(key);
                     return;
                 }
-                router::route_reject(&delivery, topology, publisher).await.ok();
+                router::route_reject(&delivery, topology, publisher)
+                    .await
+                    .ok();
                 continue;
             }
 
@@ -1155,7 +1162,7 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     retry_count: u32,
-) -> crate::error::Result<()> {
+) -> Result<()> {
     match outcome {
         Outcome::Ack => router::route_ack(delivery, publisher).await,
         Outcome::Retry => router::route_retry(delivery, topology, publisher, retry_count).await,
@@ -1397,7 +1404,9 @@ where
             "rejecting oversized message"
         );
         metrics::record_failed(topic, group, metrics::FailReason::Oversize);
-        router::route_reject(delivery, topology, publisher).await.ok();
+        router::route_reject(delivery, topology, publisher)
+            .await
+            .ok();
         return None;
     }
     match serde_json::from_slice::<T::Message>(&delivery.data) {
@@ -1410,7 +1419,9 @@ where
                 "failed to deserialize message"
             );
             metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
-            router::route_reject(delivery, topology, publisher).await.ok();
+            router::route_reject(delivery, topology, publisher)
+                .await
+                .ok();
             None
         }
     }
