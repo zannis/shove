@@ -818,16 +818,10 @@ impl NatsConsumer {
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
-        let stream = self
-            .client
-            .jetstream()
-            .get_stream(queue)
-            .await
-            .map_err(|e| map_get_stream_error(queue, e))?;
-
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
+        let max_reconnect_attempts = options.max_reconnect_attempts;
 
         tracing::info!(
             queue,
@@ -843,24 +837,6 @@ impl NatsConsumer {
             let consumer_name = format!("{queue}-shard-{shard}");
             let filter_subject = format!("{queue}.shard.{shard}");
 
-            let pull_consumer = stream
-                .get_or_create_consumer(
-                    &consumer_name,
-                    PullConsumerConfig {
-                        durable_name: Some(consumer_name.clone()),
-                        filter_subject: filter_subject.clone(),
-                        ack_policy: AckPolicy::Explicit,
-                        max_ack_pending: 1,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    ShoveError::Connection(format!(
-                        "failed to create shard consumer {consumer_name}: {e}"
-                    ))
-                })?;
-
             let shard_handler = handler.clone();
             let shard_ctx = ctx.clone();
             let shard_client = client.clone();
@@ -869,148 +845,189 @@ impl NatsConsumer {
             let shard_topic = topic.clone();
             let shard_group = group.clone();
 
-            #[allow(unreachable_code)]
             let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
-                let mut messages = match pull_consumer.messages().await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            shard,
-                            "failed to get message stream for shard"
-                        );
-                        return Ok(());
-                    }
-                };
+                run_with_reconnect(&shard_shutdown, &consumer_name, max_reconnect_attempts, || {
+                    let shard_client = shard_client.clone();
+                    let shard_handler = shard_handler.clone();
+                    let shard_ctx = shard_ctx.clone();
+                    let shard_shutdown = shard_shutdown.clone();
+                    let shard_processing = shard_processing.clone();
+                    let shard_topic = shard_topic.clone();
+                    let shard_group = shard_group.clone();
+                    let consumer_name = consumer_name.clone();
+                    let filter_subject = filter_subject.clone();
+                    async move {
+                        let stream = shard_client
+                            .jetstream()
+                            .get_stream(queue)
+                            .await
+                            .map_err(|e| map_get_stream_error(queue, e))?;
 
-                loop {
-                    tokio::select! {
-                        _ = shard_shutdown.cancelled() => {
-                            tracing::info!(shard, "shutdown signal received, stopping shard consumer");
-                            return Ok(());
-                        }
-                        item = messages.next() => {
-                            let msg = match item {
-                                Some(Ok(msg)) => msg,
-                                Some(Err(e)) => {
-                                    tracing::error!(error = %e, shard, "shard consumer stream error");
+                        let pull_consumer = stream
+                            .get_or_create_consumer(
+                                &consumer_name,
+                                PullConsumerConfig {
+                                    durable_name: Some(consumer_name.clone()),
+                                    filter_subject: filter_subject.clone(),
+                                    ack_policy: AckPolicy::Explicit,
+                                    max_ack_pending: 1,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .map_err(|e| {
+                                ShoveError::Connection(format!(
+                                    "failed to create shard consumer {consumer_name}: {e}"
+                                ))
+                            })?;
+
+                        let mut messages = pull_consumer.messages().await.map_err(|e| {
+                            ShoveError::Connection(format!(
+                                "failed to get message stream for shard {shard}: {e}"
+                            ))
+                        })?;
+
+                        loop {
+                            tokio::select! {
+                                _ = shard_shutdown.cancelled() => {
+                                    tracing::info!(shard, "shutdown signal received, stopping shard consumer");
                                     return Ok(());
                                 }
-                                None => {
-                                    tracing::warn!(shard, "shard consumer stream closed");
-                                    return Ok(());
-                                }
-                            };
+                                item = messages.next() => {
+                                    let msg = match item {
+                                        Some(Ok(msg)) => msg,
+                                        Some(Err(e)) => {
+                                            tracing::error!(error = %e, shard, "shard consumer stream error");
+                                            metrics::record_backend_error(
+                                                metrics::BackendLabel::Nats,
+                                                metrics::BackendErrorKind::Consume,
+                                            );
+                                            return Err(ShoveError::Connection(
+                                                format!("shard {shard} stream error: {e}"),
+                                            ));
+                                        }
+                                        None => {
+                                            tracing::warn!(shard, "shard consumer stream closed");
+                                            metrics::record_backend_error(
+                                                metrics::BackendLabel::Nats,
+                                                metrics::BackendErrorKind::Consume,
+                                            );
+                                            return Err(ShoveError::Connection(
+                                                format!("shard {shard} stream closed"),
+                                            ));
+                                        }
+                                    };
 
-                            metrics::record_message_size(
-                                &shard_topic,
-                                shard_group.as_deref(),
-                                msg.payload.len(),
-                            );
-
-                            // Reject oversized messages before deserialization
-                            if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
-                                tracing::warn!(
-                                    error = %e,
-                                    shard,
-                                    "rejecting oversized message to DLQ"
-                                );
-                                metrics::record_failed(
-                                    &shard_topic,
-                                    shard_group.as_deref(),
-                                    metrics::FailReason::Oversize,
-                                );
-                                if let Err(dlq_err) = publish_to_dlq(
-                                    &shard_client,
-                                    topology,
-                                    &msg,
-                                    &e.to_string(),
-                                ).await {
-                                    tracing::error!(
-                                        error = %dlq_err,
-                                        "failed to publish oversized message to DLQ, nak-ing"
-                                    );
-                                    let _ = msg.ack_with(AckKind::Nak(None)).await;
-                                    continue;
-                                }
-                                let _ = msg.ack().await;
-                                continue;
-                            }
-
-                            // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match serde_json::from_slice(&msg.payload) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        shard,
-                                        "failed to deserialize message, sending to DLQ"
-                                    );
-                                    metrics::record_failed(
+                                    metrics::record_message_size(
                                         &shard_topic,
                                         shard_group.as_deref(),
-                                        metrics::FailReason::Deserialize,
+                                        msg.payload.len(),
                                     );
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &shard_client,
-                                        topology,
-                                        &msg,
-                                        &format!("deserialization_error: {e}"),
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish bad message to DLQ, nak-ing"
+
+                                    // Reject oversized messages before deserialization
+                                    if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            shard,
+                                            "rejecting oversized message to DLQ"
                                         );
-                                        let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                        metrics::record_failed(
+                                            &shard_topic,
+                                            shard_group.as_deref(),
+                                            metrics::FailReason::Oversize,
+                                        );
+                                        if let Err(dlq_err) = publish_to_dlq(
+                                            &shard_client,
+                                            topology,
+                                            &msg,
+                                            &e.to_string(),
+                                        ).await {
+                                            tracing::error!(
+                                                error = %dlq_err,
+                                                "failed to publish oversized message to DLQ, nak-ing"
+                                            );
+                                            let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                            continue;
+                                        }
+                                        let _ = msg.ack().await;
                                         continue;
                                     }
-                                    let _ = msg.ack().await;
-                                    continue;
+
+                                    // Deserialize payload; reject to DLQ on failure
+                                    let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                                        Ok(m) => m,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                error = %e,
+                                                shard,
+                                                "failed to deserialize message, sending to DLQ"
+                                            );
+                                            metrics::record_failed(
+                                                &shard_topic,
+                                                shard_group.as_deref(),
+                                                metrics::FailReason::Deserialize,
+                                            );
+                                            if let Err(dlq_err) = publish_to_dlq(
+                                                &shard_client,
+                                                topology,
+                                                &msg,
+                                                &format!("deserialization_error: {e}"),
+                                            ).await {
+                                                tracing::error!(
+                                                    error = %dlq_err,
+                                                    "failed to publish bad message to DLQ, nak-ing"
+                                                );
+                                                let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                                continue;
+                                            }
+                                            let _ = msg.ack().await;
+                                            continue;
+                                        }
+                                    };
+
+                                    let metadata = extract_message_metadata(&msg);
+                                    let retry_count = metadata.retry_count;
+
+                                    shard_processing.store(true, Ordering::Release);
+
+                                    let outcome = {
+                                        let (tx, rx) = tokio::sync::oneshot::channel();
+                                        let h = shard_handler.clone();
+                                        let c = shard_ctx.clone();
+                                        let spawn_topic = shard_topic.clone();
+                                        let spawn_group = shard_group.clone();
+                                        tokio::spawn(async move {
+                                            let o = invoke_handler(
+                                                async move { h.handle(payload, metadata, c.as_ref()).await },
+                                                handler_timeout,
+                                                &spawn_topic,
+                                                spawn_group.as_deref(),
+                                            ).await;
+                                            let _ = tx.send(o);
+                                        });
+                                        rx.await.unwrap_or_else(|_| {
+                                            tracing::warn!(shard, "handler task panicked, retrying message");
+                                            Outcome::Retry
+                                        })
+                                    };
+                                    let outcome = adjust_outcome_for_fifo(outcome);
+
+                                    route_outcome(
+                                        &shard_client,
+                                        &msg,
+                                        outcome,
+                                        topology,
+                                        retry_count,
+                                        max_retries,
+                                        hold_queues,
+                                    )
+                                    .await;
                                 }
-                            };
-
-                            let metadata = extract_message_metadata(&msg);
-                            let retry_count = metadata.retry_count;
-
-                            shard_processing.store(true, Ordering::Release);
-
-                            let outcome = {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                let h = shard_handler.clone();
-                                let c = shard_ctx.clone();
-                                let spawn_topic = shard_topic.clone();
-                                let spawn_group = shard_group.clone();
-                                tokio::spawn(async move {
-                                    let o = invoke_handler(
-                                        async move { h.handle(payload, metadata, c.as_ref()).await },
-                                        handler_timeout,
-                                        &spawn_topic,
-                                        spawn_group.as_deref(),
-                                    ).await;
-                                    let _ = tx.send(o);
-                                });
-                                rx.await.unwrap_or_else(|_| {
-                                    tracing::warn!(shard, "handler task panicked, retrying message");
-                                    Outcome::Retry
-                                })
-                            };
-                            let outcome = adjust_outcome_for_fifo(outcome);
-
-                            route_outcome(
-                                &shard_client,
-                                &msg,
-                                outcome,
-                                topology,
-                                retry_count,
-                                max_retries,
-                                hold_queues,
-                            )
-                            .await;
+                            }
                         }
                     }
-                }
-
-                Ok(())
+                })
+                .await
             });
 
             shard_tasks.push(task);

@@ -1383,4 +1383,78 @@ mod tests {
             "NOGROUP must not be ShoveError::Topology"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // run_with_reconnect — max_reconnect_attempts exhaustion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exhausted_reconnect_error_message_format() {
+        let stream = "orders";
+        let max: u32 = 3;
+        let cause = "connection refused";
+        let msg = format!("consumer on '{stream}' exhausted {max} reconnect attempt(s): {cause}");
+        assert!(msg.contains(stream), "stream name must appear in error");
+        assert!(
+            msg.contains(&max.to_string()),
+            "attempt count must appear in error"
+        );
+        assert!(msg.contains(cause), "root cause must appear in error");
+    }
+
+    #[tokio::test]
+    async fn run_with_reconnect_stops_when_limit_reached() {
+        use tokio_util::sync::CancellationToken;
+        let shutdown = CancellationToken::new();
+        let mut calls = 0u32;
+        let result = run_with_reconnect(&shutdown, "test-stream", Some(2), || {
+            calls += 1;
+            async { Err(ShoveError::Connection("transient".into())) }
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "must propagate error after exhausting attempts"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("test-stream"),
+            "error must name the stream; got: {msg}"
+        );
+        assert_eq!(calls, 2, "must attempt exactly max times before giving up");
+    }
+
+    #[tokio::test]
+    async fn run_with_reconnect_unlimited_can_succeed_after_retries() {
+        use tokio_util::sync::CancellationToken;
+        let shutdown = CancellationToken::new();
+        let mut calls = 0u32;
+        let result = run_with_reconnect(&shutdown, "test-stream", None, || {
+            calls += 1;
+            async move {
+                if calls < 3 {
+                    Err(ShoveError::Connection("transient".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "must succeed once the closure returns Ok");
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn run_with_reconnect_non_retryable_error_propagates_immediately() {
+        use tokio_util::sync::CancellationToken;
+        let shutdown = CancellationToken::new();
+        let mut calls = 0u32;
+        let result = run_with_reconnect(&shutdown, "test-stream", None, || {
+            calls += 1;
+            async { Err(ShoveError::Topology("bad topology".into())) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "non-retryable error must not trigger reconnect");
+    }
 }

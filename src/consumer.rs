@@ -9,7 +9,7 @@ use crate::backend::{Backend, ConsumerOptionsInner};
 use crate::error::{Result, ShoveError};
 #[cfg(feature = "nats")]
 use crate::markers::Nats;
-#[cfg(feature = "rabbitmq-transactional")]
+#[cfg(feature = "rabbitmq")]
 use crate::markers::RabbitMq;
 #[cfg(feature = "aws-sns-sqs")]
 use crate::markers::Sqs;

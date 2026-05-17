@@ -422,4 +422,23 @@ mod tests {
         // Same allocation reused on every call — verifies the OnceLock cache.
         assert!(std::ptr::eq(a, b));
     }
+
+    #[test]
+    fn backend_label_as_str_all_variants() {
+        assert_eq!(BackendLabel::InMemory.as_str(), "inmemory");
+        assert_eq!(BackendLabel::RabbitMq.as_str(), "rabbitmq");
+        assert_eq!(BackendLabel::Kafka.as_str(), "kafka");
+        assert_eq!(BackendLabel::Nats.as_str(), "nats");
+        assert_eq!(BackendLabel::Redis.as_str(), "redis");
+        assert_eq!(BackendLabel::SnsSqs.as_str(), "sns_sqs");
+    }
+
+    #[test]
+    fn backend_error_kind_as_str_all_variants() {
+        assert_eq!(BackendErrorKind::Connection.as_label(), "connection");
+        assert_eq!(BackendErrorKind::Publish.as_label(), "publish");
+        assert_eq!(BackendErrorKind::Consume.as_label(), "consume");
+        assert_eq!(BackendErrorKind::Topology.as_label(), "topology");
+        assert_eq!(BackendErrorKind::Ack.as_label(), "ack");
+    }
 }

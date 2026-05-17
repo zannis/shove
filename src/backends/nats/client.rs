@@ -188,4 +188,68 @@ mod tests {
         let cfg = NatsConfig::default();
         assert!(cfg.url().contains("localhost:4222"));
     }
+
+    #[test]
+    fn new_config_has_all_options_none() {
+        let cfg = NatsConfig::new("nats://localhost:4222");
+        assert!(cfg.tls_ca_cert.is_none());
+        assert!(cfg.tls_client_cert.is_none());
+        assert!(cfg.tls_client_key.is_none());
+        assert!(cfg.username.is_none());
+        assert!(cfg.password.is_none());
+        assert!(cfg.token.is_none());
+        assert!(cfg.nkey_seed.is_none());
+        assert!(cfg.creds_file.is_none());
+    }
+
+    #[test]
+    fn debug_redacts_url_credentials() {
+        let cfg = NatsConfig::new("nats://user:secret@broker.example.com:4222");
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("secret"),
+            "password must not appear in debug output"
+        );
+        assert!(
+            debug.contains("***@broker.example.com"),
+            "host must remain visible"
+        );
+    }
+
+    #[test]
+    fn debug_url_without_credentials_is_unchanged() {
+        let cfg = NatsConfig::new("nats://broker.example.com:4222");
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("broker.example.com"));
+    }
+
+    #[test]
+    fn debug_redacts_token_and_nkey() {
+        let mut cfg = NatsConfig::new("nats://localhost:4222");
+        cfg.token = Some("super-secret-token".into());
+        cfg.nkey_seed = Some("SUANKEY...".into());
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("super-secret-token"),
+            "token must be redacted"
+        );
+        assert!(!debug.contains("SUANKEY"), "nkey seed must be redacted");
+        assert!(
+            debug.contains("<redacted>"),
+            "redacted sentinel must appear"
+        );
+    }
+
+    #[test]
+    fn connect_with_retry_backoff_is_infinite() {
+        // connect_with_retry calls backoff.next().expect("backoff iterator is infinite; this is a bug").
+        // Verify that the Backoff used there (100ms initial, 5s max) never yields None.
+        let delays: Vec<_> = Backoff::new(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(5),
+        )
+        .take(200)
+        .collect();
+        assert_eq!(delays.len(), 200, "Backoff must never return None");
+    }
 }
