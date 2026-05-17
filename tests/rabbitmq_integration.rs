@@ -94,6 +94,18 @@ impl TestBroker {
         Broker::<RabbitMqMarker>::from_client(client)
     }
 
+    /// Stop only the AMQP broker application (not the container).
+    /// Existing TCP connections will drop; the container remains alive so
+    /// `broker.stop()` can still clean up.
+    async fn stop_broker_app(&self) {
+        let mut result = self
+            .container
+            .exec(ExecCommand::new(["rabbitmqctl", "stop_app"]))
+            .await
+            .expect("failed to exec rabbitmqctl stop_app");
+        let _ = result.stdout_to_vec().await;
+    }
+
     async fn stop(self) {
         self.container
             .stop_with_timeout(Some(0))
@@ -351,6 +363,21 @@ define_sequenced_topic!(
     TopologyBuilder::new("test-defer-seq-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .build()
+);
+
+// Topic for hold_queue_timeout eviction tests.
+// Long hold-queue TTL (60 s) so the retried message stays in the hold queue
+// for the duration of the test, letting the consumer-side eviction timer fire.
+define_sequenced_topic!(
+    EvictSeqOrders,
+    OrderMessage,
+    |msg: &OrderMessage| msg.account.clone(),
+    TopologyBuilder::new("test-evict-seq-orders")
+        .dlq()
+        .hold_queue(Duration::from_secs(60))
         .sequenced(SequenceFailure::Skip)
         .routing_shards(1)
         .build()
@@ -848,6 +875,17 @@ impl MessageHandler<SkipOrders> for OrderDlqHandler {
 }
 
 impl MessageHandler<FailAllOrders> for OrderDlqHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+}
+
+impl MessageHandler<EvictSeqOrders> for OrderDlqHandler {
     type Context = ();
     async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
@@ -5247,6 +5285,138 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
         .await;
     assert!(outcome.is_clean(), "outcome was {outcome:?}");
     assert_eq!(handler.count(), 5);
+
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- hold_queue_timeout eviction ---
+
+/// Verify that a sequence key stuck in `AwaitingRetry` is dead-lettered within
+/// 1.5× the configured `hold_queue_timeout`.
+///
+/// The eviction ticker fires at `timeout / 2`, so the worst-case scenario is a
+/// key entering `AwaitingRetry` just after a tick, which means it waits until
+/// the *next* tick (one full period) before the check at `1.5×` clears it.
+#[tokio::test]
+async fn sequenced_consumer_hold_queue_timeout_evicts_stuck_key_within_1_5x() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let b = broker.broker_from(client.clone());
+    b.topology().declare::<EvictSeqOrders>().await.unwrap();
+
+    let publisher = b.publisher().await.unwrap();
+
+    // msg1 → handler returns Retry → hold queue (60 s TTL, won't come back during test)
+    // key enters AwaitingRetry.
+    publisher
+        .publish::<EvictSeqOrders>(&OrderMessage {
+            account: "ACC-EVICT".into(),
+            seq: 1,
+        })
+        .await
+        .unwrap();
+
+    // msg2 → arrives while key is in AwaitingRetry → pending_deliveries.
+    // The eviction will dead-letter this message to the DLQ.
+    publisher
+        .publish::<EvictSeqOrders>(&OrderMessage {
+            account: "ACC-EVICT".into(),
+            seq: 2,
+        })
+        .await
+        .unwrap();
+
+    struct AlwaysRetry;
+    impl MessageHandler<EvictSeqOrders> for AlwaysRetry {
+        type Context = ();
+        async fn handle(&self, _: OrderMessage, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Retry
+        }
+    }
+
+    let hold_queue_timeout = Duration::from_secs(2);
+    // Worst-case eviction is 1.5× the timeout; add 500 ms scheduling slack.
+    let deadline = hold_queue_timeout.mul_f64(1.5) + Duration::from_millis(500);
+
+    // DLQ consumer watches for msg2 to be dead-lettered by the eviction.
+    let dlq_handler = OrderDlqHandler::new();
+    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let consumer2 = RabbitMqConsumer::new(client2.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle =
+        tokio::spawn(async move { consumer2.run_dlq::<EvictSeqOrders, _>(dh, ()).await });
+
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let s = shutdown.clone();
+    let started_at = Instant::now();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::<RabbitMqMarker>::new()
+            .with_shutdown(s)
+            // High limit so Retry is never treated as DLQ by the max-retries path.
+            .with_max_retries(100)
+            .with_hold_queue_timeout(hold_queue_timeout);
+        consumer
+            .run_fifo::<EvictSeqOrders, _>(AlwaysRetry, (), opts)
+            .await
+    });
+
+    assert!(
+        dlq_handler.wait_for_count(1, deadline).await,
+        "hold_queue_timeout eviction did not dead-letter msg2 within {deadline:?}"
+    );
+    assert!(
+        started_at.elapsed() <= deadline,
+        "eviction took {:?}, expected ≤ {deadline:?}",
+        started_at.elapsed()
+    );
+
+    shutdown.cancel();
+    consume_handle.await.unwrap().unwrap();
+    client2.shutdown().await;
+    dlq_handle.abort();
+    client.shutdown().await;
+    broker.stop().await;
+}
+
+// --- max_reconnect_attempts ---
+
+/// Verify that a consumer configured with `max_reconnect_attempts(N)` exits
+/// with a `ShoveError::Connection` after N failed reconnect attempts instead
+/// of spinning indefinitely.
+#[tokio::test]
+async fn consumer_exits_after_max_reconnect_attempts_exhausted() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let b = broker.broker_from(client.clone());
+    b.topology().declare::<SimpleWork>().await.unwrap();
+
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let opts = ConsumerOptions::<RabbitMqMarker>::new().with_max_reconnect_attempts(2);
+
+    let consume_handle = tokio::spawn(async move {
+        consumer
+            .run::<SimpleWork, _>(CountingHandler::new(), (), opts)
+            .await
+    });
+
+    // Kill the broker app so all reconnect attempts fail.
+    broker.stop_broker_app().await;
+
+    // Consumer should exit with an error after 2 reconnect attempts (not spin
+    // forever). Allow up to 45 s: connection-drop detection (~1–5 s) +
+    // backoff delays (1 s + jitter each) + two reconnect attempts.
+    let timeout = Duration::from_secs(45);
+    let result = tokio::time::timeout(timeout, consume_handle)
+        .await
+        .unwrap_or_else(|_| panic!("consumer did not exit within {timeout:?}"))
+        .expect("consumer task panicked");
+
+    assert!(
+        result.is_err(),
+        "expected consumer to return an error after exhausting reconnect attempts, got Ok"
+    );
 
     client.shutdown().await;
     broker.stop().await;
