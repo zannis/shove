@@ -110,12 +110,8 @@ impl KafkaPublisher {
 }
 
 impl KafkaPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
-        let payload = serde_json::to_vec(message)?;
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         let headers = Self::build_headers(None);
@@ -135,13 +131,9 @@ impl KafkaPublisher {
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
-    ) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         validate_headers(&extra_headers)?;
-        let payload = serde_json::to_vec(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         let headers = Self::build_headers(Some(&extra_headers));
@@ -157,11 +149,7 @@ impl KafkaPublisher {
             .await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         use futures_util::future::join_all;
 
         let topology = T::topology();
@@ -169,7 +157,7 @@ impl KafkaPublisher {
         let prepared: Result<Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> = messages
             .iter()
             .map(|msg| {
-                let payload = serde_json::to_vec(msg)?;
+                let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
                 let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
                 let headers = Self::build_headers(None);
                 Ok((topic, key, headers, payload))
