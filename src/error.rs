@@ -17,6 +17,17 @@ pub enum ShoveError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// A `Codec` failed to encode or decode a payload.
+    ///
+    /// `codec` is the codec's stable `NAME`. `source` is the codec-specific
+    /// error (e.g. `prost::EncodeError`, `prost::DecodeError`).
+    #[error("codec error in {codec}: {source}")]
+    Codec {
+        codec: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// An error from an external SDK or backend that doesn't map to a known category.
     /// Treated as non-retryable so it surfaces immediately to the operator.
     #[error("unknown backend error: {0}")]
@@ -64,5 +75,26 @@ mod tests {
         let json_err = serde_json::from_str::<String>("{}").unwrap_err();
         let err: ShoveError = json_err.into();
         assert!(matches!(err, ShoveError::Serialization(_)));
+    }
+
+    #[test]
+    fn display_codec_error() {
+        let inner: Box<dyn std::error::Error + Send + Sync> = "boom".into();
+        let err = ShoveError::Codec {
+            codec: "protobuf",
+            source: inner,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("codec error in protobuf"), "got: {msg}");
+    }
+
+    #[test]
+    fn codec_error_is_not_retryable() {
+        let inner: Box<dyn std::error::Error + Send + Sync> = "boom".into();
+        let err = ShoveError::Codec {
+            codec: "json",
+            source: inner,
+        };
+        assert!(!err.is_retryable());
     }
 }
