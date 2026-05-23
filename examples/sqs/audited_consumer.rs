@@ -11,7 +11,6 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-
 use shove::sns::SnsConfig;
 use shove::*;
 use testcontainers::ImageExt;

@@ -11,7 +11,6 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-
 use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
 use shove::*;
 use testcontainers::runners::AsyncRunner;

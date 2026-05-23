@@ -27,9 +27,8 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use mach2::traps::mach_task_self;
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::*;
-
 use shove::rabbitmq::ConsumerGroupConfig;
+use shove::rabbitmq::*;
 use shove::*;
 use testcontainers::ImageExt;
 use testcontainers::core::ExecCommand;
