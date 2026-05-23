@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -169,8 +168,6 @@ impl InMemoryConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        // Phase-3 placeholder: spawn path runs run_with_inner which still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let error_count = Arc::new(AtomicUsize::new(0));
@@ -213,8 +210,6 @@ impl InMemoryConsumerGroup {
     ) -> Self
     where
         T: SequencedTopic + 'static,
-        // Phase-3 placeholder: spawn path runs FIFO shards which still use serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let error_count = Arc::new(AtomicUsize::new(0));
@@ -442,8 +437,6 @@ impl InMemoryConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
-        // Phase-3 placeholder: spawn path runs run_with_inner which still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let mut config = config;
@@ -494,8 +487,6 @@ impl InMemoryConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: SequencedTopic + 'static,
-        // Phase-3 placeholder: spawn path runs FIFO shards which still use serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let mut config = config;

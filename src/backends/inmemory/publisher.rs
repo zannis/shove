@@ -27,14 +27,9 @@ impl InMemoryPublisher {
         &self,
         message: &T::Message,
         mut headers: HashMap<String, String>,
-    ) -> Result<()>
-    where
-        // Phase-3 placeholder: publish path still calls serde_json directly.
-        // Task 7 will route through <T::Codec as Codec<T::Message>>::encode.
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         let topology = T::topology();
-        let payload = serde_json::to_vec(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
 
         let queue_name = if let Some(seq) = topology.sequencing() {
             let key_fn = T::SEQUENCE_KEY_FN.ok_or_else(|| {
@@ -65,10 +60,7 @@ impl InMemoryPublisher {
 }
 
 impl InMemoryPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
-    where
-        T::Message: Serialize,
-    {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.publish_one::<T>(message, HashMap::new()).await
     }
 
@@ -76,18 +68,12 @@ impl InMemoryPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> Result<()>
-    where
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         validate_headers(&headers)?;
         self.publish_one::<T>(message, headers).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
-    where
-        T::Message: Serialize,
-    {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         let mut succeeded: u64 = 0;
         for message in messages {
             match self.publish_one::<T>(message, HashMap::new()).await {
