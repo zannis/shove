@@ -92,6 +92,18 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     /// through this `ConsumerGroup` whose per-group config did not call
     /// `with_handler_timeout` (or `without_handler_timeout`, on backends
     /// that expose it). Per-group explicit settings always win.
+    ///
+    /// Must be called **before** [`register`] / [`register_fifo`]. Each
+    /// backend resolves the effective handler timeout at registration
+    /// time, so a call after the first registration silently has no
+    /// effect on the already-registered group.
+    ///
+    /// `broker.consumer_group()` also constructs a fresh registry on
+    /// every call, so a default set on one returned handle does not
+    /// propagate to subsequent `broker.consumer_group()` results.
+    ///
+    /// [`register`]: Self::register
+    /// [`register_fifo`]: Self::register_fifo
     pub fn with_default_handler_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.inner.set_default_handler_timeout(timeout);
         self

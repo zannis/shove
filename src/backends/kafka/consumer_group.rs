@@ -109,6 +109,11 @@ impl KafkaConsumerGroupConfig {
         self.max_retries
     }
 
+    /// Returns the configured handler timeout. A freshly-constructed
+    /// config reports `Some(DEFAULT_HANDLER_TIMEOUT)`; a registry-level
+    /// default set via `ConsumerGroup::with_default_handler_timeout`
+    /// is not reflected here because the config does not know about
+    /// its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
         resolve_handler_timeout(self.handler_timeout, None)
     }
