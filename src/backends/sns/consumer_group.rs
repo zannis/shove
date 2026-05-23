@@ -14,9 +14,10 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::consumer::SqsConsumer;
 use crate::backends::sns::topology::QueueRegistry;
+use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::handler::MessageHandler;
 use crate::topic::Topic;
-use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 ///
@@ -32,7 +33,7 @@ pub struct SqsConsumerGroupConfig {
     pub(crate) max_retries: u32,
     /// Maximum time a handler may spend processing a single message.
     /// If exceeded the message is retried. `None` means no limit.
-    pub(crate) handler_timeout: Option<Duration>,
+    pub(crate) handler_timeout: HandlerTimeoutConfig,
     /// When `true`, each consumer in the group processes up to `prefetch_count`
     /// messages concurrently while preserving in-order acknowledgement.
     pub(crate) concurrent_processing: bool,
@@ -63,7 +64,7 @@ impl SqsConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: HandlerTimeoutConfig::Inherit,
             concurrent_processing: false,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
@@ -84,7 +85,7 @@ impl SqsConsumerGroupConfig {
 
     /// Set the maximum time a handler may spend processing a single message.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
-        self.handler_timeout = Some(timeout);
+        self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
 
@@ -119,7 +120,7 @@ impl SqsConsumerGroupConfig {
 
     /// Returns the handler timeout, if any.
     pub fn handler_timeout(&self) -> Option<Duration> {
-        self.handler_timeout
+        resolve_handler_timeout(self.handler_timeout, None)
     }
 
     /// Returns whether concurrent processing is enabled.
@@ -302,7 +303,7 @@ impl SqsConsumerGroup {
         options.max_retries = self.config.max_retries;
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
-        options.handler_timeout = self.config.handler_timeout;
+        options.handler_timeout = resolve_handler_timeout(self.config.handler_timeout, None);
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
         options.consumer_group = Some(Arc::from(self.name.as_str()));
@@ -315,6 +316,7 @@ impl SqsConsumerGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
     /// Build a `SqsConsumerGroup` with a test spawner that simply waits on the
     /// cancellation token (no AWS connection needed).
@@ -560,5 +562,34 @@ mod tests {
         assert_eq!(config.max_retries(), 3);
         assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
         assert!(config.concurrent_processing());
+    }
+
+    // -- HandlerTimeoutConfig resolution --
+
+    #[test]
+    fn inherit_config_uses_library_default_with_no_registry_default() {
+        let cfg = SqsConsumerGroupConfig::new(1..=4);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, None),
+            Some(DEFAULT_HANDLER_TIMEOUT),
+        );
+    }
+
+    #[test]
+    fn inherit_config_uses_registry_default_when_set() {
+        let cfg = SqsConsumerGroupConfig::new(1..=4);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(45)),
+        );
+    }
+
+    #[test]
+    fn with_handler_timeout_beats_registry_default() {
+        let cfg = SqsConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(5));
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(5)),
+        );
     }
 }

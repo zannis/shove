@@ -1,12 +1,14 @@
 #![cfg(feature = "aws-sns-sqs")]
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use tracing::{debug, info};
 
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::consumer_group::{SqsConsumerGroup, SqsConsumerGroupConfig};
 use crate::backends::sns::topology::SnsTopologyDeclarer;
+use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -22,6 +24,7 @@ use crate::topic::Topic;
 pub struct SqsConsumerGroupRegistry {
     groups: HashMap<String, SqsConsumerGroup>,
     client: SnsClient,
+    default_handler_timeout: Option<Duration>,
 }
 
 impl SqsConsumerGroupRegistry {
@@ -29,7 +32,16 @@ impl SqsConsumerGroupRegistry {
         Self {
             groups: HashMap::new(),
             client,
+            default_handler_timeout: None,
         }
+    }
+
+    /// Set the registry-level default handler timeout. Applies to every
+    /// group whose `SqsConsumerGroupConfig` did not explicitly call
+    /// `with_handler_timeout`. Per-group explicit settings always win.
+    pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        self.default_handler_timeout = Some(timeout);
+        self
     }
 
     /// Register a new consumer group.
@@ -49,6 +61,14 @@ impl SqsConsumerGroupRegistry {
         T: Topic + 'static,
         H: MessageHandler<T> + Clone + 'static,
     {
+        let mut config = config;
+        let resolved =
+            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
+        config.handler_timeout = match resolved {
+            Some(d) => HandlerTimeoutConfig::Set(d),
+            None => HandlerTimeoutConfig::Disabled,
+        };
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
