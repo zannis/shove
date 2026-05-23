@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rdkafka::client::ClientContext;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use uuid::Uuid;
@@ -21,15 +22,18 @@ const PRODUCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Publish a message to Kafka with retry on transient failures.
 /// Shared by both the publisher and consumer (for DLQ / retry publishes).
-pub(super) async fn publish_with_retry(
-    producer: &FutureProducer,
+pub(super) async fn publish_with_retry<C>(
+    producer: &FutureProducer<C>,
     topic: &str,
     key: Option<&[u8]>,
     headers: OwnedHeaders,
     payload: &[u8],
     max_attempts: u32,
     label: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: ClientContext + 'static,
+{
     let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
 
     for attempt in 1..=max_attempts {
