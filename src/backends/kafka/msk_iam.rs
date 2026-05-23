@@ -4,6 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_msk_iam_sasl_signer::generate_auth_token_from_credentials_provider;
 use rdkafka::client::{ClientContext, OAuthToken};
+use rdkafka::consumer::ConsumerContext;
 
 use crate::ShoveError;
 use crate::error::Result;
@@ -51,6 +52,8 @@ impl MskIamContext {
         Self { provider }
     }
 }
+
+impl ConsumerContext for MskIamContext {}
 
 impl ClientContext for MskIamContext {
     const ENABLE_REFRESH_OAUTH_TOKEN: bool = true;

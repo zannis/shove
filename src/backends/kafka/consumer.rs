@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer as RdkafkaConsumer, StreamConsumer};
-use rdkafka::error::KafkaError;
+use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::{Offset, TopicPartitionList};
 use tokio::sync::{Mutex, Semaphore, mpsc};
@@ -24,6 +24,9 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
+
+#[cfg(feature = "kafka-msk-iam")]
+use super::msk_iam::MskIamContext;
 
 use super::client::KafkaClient;
 use super::constants::{
@@ -497,17 +500,68 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// KafkaStreamConsumer — context-agnostic wrapper
+// ---------------------------------------------------------------------------
+
+pub(super) enum KafkaStreamConsumer {
+    Default(StreamConsumer),
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam(StreamConsumer<MskIamContext>),
+}
+
+impl KafkaStreamConsumer {
+    pub(super) fn subscribe(&self, topics: &[&str]) -> KafkaResult<()> {
+        match self {
+            Self::Default(c) => c.subscribe(topics),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.subscribe(topics),
+        }
+    }
+
+    pub(super) async fn recv(&self) -> KafkaResult<BorrowedMessage<'_>> {
+        match self {
+            Self::Default(c) => c.recv().await,
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.recv().await,
+        }
+    }
+
+    pub(super) fn commit(&self, tpl: &TopicPartitionList, mode: CommitMode) -> KafkaResult<()> {
+        match self {
+            Self::Default(c) => c.commit(tpl, mode),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.commit(tpl, mode),
+        }
+    }
+
+    pub(super) fn commit_message(
+        &self,
+        msg: &BorrowedMessage<'_>,
+        mode: CommitMode,
+    ) -> KafkaResult<()> {
+        match self {
+            Self::Default(c) => c.commit_message(msg, mode),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.commit_message(msg, mode),
+        }
+    }
+}
+
 // Consumer helper
 // ---------------------------------------------------------------------------
 
-fn create_stream_consumer(mut base: ClientConfig, group_id: &str) -> Result<StreamConsumer> {
+fn create_stream_consumer(
+    mut base: ClientConfig,
+    group_id: &str,
+    #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
+) -> Result<KafkaStreamConsumer> {
     // Each consumer task within a group gets a distinct `client.id` so
     // librdkafka treats them as separate members. Without this, group
     // rebalances across repeated join attempts can produce stale
     // "group generation id is not valid" commit errors.
     let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
-    let consumer: StreamConsumer = base
-        .set("group.id", group_id)
+    base.set("group.id", group_id)
         .set("client.id", client_id)
         // Cooperative-sticky assignment performs incremental rebalance so that
         // adding/removing a consumer only reassigns the delta — without this,
@@ -523,10 +577,20 @@ fn create_stream_consumer(mut base: ClientConfig, group_id: &str) -> Result<Stre
         // soon as any data is available; `fetch.wait.max.ms=50` caps the
         // blocking dwell so the broker doesn't hold the connection open.
         .set("fetch.min.bytes", "1")
-        .set("fetch.wait.max.ms", "50")
+        .set("fetch.wait.max.ms", "50");
+
+    #[cfg(feature = "kafka-msk-iam")]
+    if let Some(ctx) = msk_context {
+        let consumer: StreamConsumer<MskIamContext> = base
+            .create_with_context(ctx)
+            .map_err(|e| map_kafka_error("failed to create MSK consumer", e))?;
+        return Ok(KafkaStreamConsumer::MskIam(consumer));
+    }
+
+    let consumer: StreamConsumer = base
         .create()
         .map_err(|e| map_kafka_error("failed to create consumer", e))?;
-    Ok(consumer)
+    Ok(KafkaStreamConsumer::Default(consumer))
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +730,12 @@ impl KafkaConsumer {
             let topic = topic.clone();
             let group = group.clone();
             async move {
-                let consumer = create_stream_consumer(client.base_config(), &group_id)?;
+                let consumer = create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )?;
                 consumer
                     .subscribe(&[queue])
                     .map_err(|e| map_kafka_error("failed to subscribe", e))?;
@@ -946,12 +1015,15 @@ impl KafkaConsumer {
                 let topic = topic.clone();
                 let group = group.clone();
                 async move {
-                    let consumer = create_stream_consumer(client.base_config(), &group_id)?;
+                    let consumer = create_stream_consumer(
+                        client.base_config(),
+                        &group_id,
+                        #[cfg(feature = "kafka-msk-iam")]
+                        client.msk_context(),
+                    )?;
                     consumer
                         .subscribe(&[queue.as_str()])
-                        .map_err(|e| {
-                            map_kafka_error("failed to subscribe", e)
-                        })?;
+                        .map_err(|e| map_kafka_error("failed to subscribe", e))?;
 
                     loop {
                         tokio::select! {
@@ -1170,7 +1242,12 @@ impl KafkaConsumer {
             let shutdown = shutdown.clone();
             let dlq_group_id = dlq_group_id.clone();
             async move {
-                let consumer = create_stream_consumer(client_clone.base_config(), &dlq_group_id)?;
+                let consumer = create_stream_consumer(
+                    client_clone.base_config(),
+                    &dlq_group_id,
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client_clone.msk_context(),
+                )?;
                 consumer
                     .subscribe(&[dlq])
                     .map_err(|e| map_kafka_error("failed to subscribe to DLQ", e))?;

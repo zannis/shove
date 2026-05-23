@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
+use rdkafka::client::{ClientContext, DefaultClientContext};
 use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, Producer};
@@ -485,12 +485,27 @@ impl KafkaClient {
         self.shutdown_token.clone()
     }
 
-    pub(super) async fn create_admin(&self) -> Result<AdminClient<DefaultClientContext>> {
+    pub(super) async fn create_admin_default(&self) -> Result<AdminClient<DefaultClientContext>> {
         let admin: AdminClient<DefaultClientContext> = self
             .base_config
             .clone()
             .create()
             .map_err(|e| ShoveError::Topology(format!("failed to create admin client: {e}")))?;
+        Ok(admin)
+    }
+
+    #[cfg(feature = "kafka-msk-iam")]
+    pub(super) async fn create_admin_msk(
+        &self,
+        ctx: MskIamContext,
+    ) -> Result<AdminClient<MskIamContext>> {
+        let admin: AdminClient<MskIamContext> = self
+            .base_config
+            .clone()
+            .create_with_context(ctx)
+            .map_err(|e| {
+            ShoveError::Topology(format!("failed to create MSK admin client: {e}"))
+        })?;
         Ok(admin)
     }
 
@@ -502,7 +517,28 @@ impl KafkaClient {
         num_partitions: i32,
         replication_factor: i32,
     ) -> Result<()> {
-        let admin = self.create_admin().await?;
+        #[cfg(feature = "kafka-msk-iam")]
+        if let Some(ctx) = self.msk_context() {
+            let admin = self.create_admin_msk(ctx).await?;
+            return self
+                .create_topic_with_admin(&admin, name, num_partitions, replication_factor)
+                .await;
+        }
+        let admin = self.create_admin_default().await?;
+        self.create_topic_with_admin(&admin, name, num_partitions, replication_factor)
+            .await
+    }
+
+    async fn create_topic_with_admin<C>(
+        &self,
+        admin: &AdminClient<C>,
+        name: &str,
+        num_partitions: i32,
+        replication_factor: i32,
+    ) -> Result<()>
+    where
+        C: ClientContext + 'static,
+    {
         let new_topic = NewTopic::new(
             name,
             num_partitions,
@@ -519,7 +555,7 @@ impl KafkaClient {
                 Err((topic, code)) => {
                     if code == RDKafkaErrorCode::TopicAlreadyExists {
                         tracing::debug!(topic, "topic already exists, checking partition count");
-                        self.ensure_partitions(&admin, name, num_partitions).await?;
+                        self.ensure_partitions(admin, name, num_partitions).await?;
                     } else {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Kafka,
@@ -537,33 +573,67 @@ impl KafkaClient {
     }
 
     /// If the existing topic has fewer partitions than `desired`, expand it.
-    async fn ensure_partitions(
+    async fn ensure_partitions<C>(
         &self,
-        admin: &AdminClient<DefaultClientContext>,
+        admin: &AdminClient<C>,
         name: &str,
         desired: i32,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        C: ClientContext + 'static,
+    {
         use rdkafka::admin::NewPartitions;
 
         // Fetch current partition count from metadata.
         let base = self.base_config.clone();
         let topic_name = name.to_string();
+        #[cfg(feature = "kafka-msk-iam")]
+        let msk_ctx = self.msk_context();
         let current = tokio::task::spawn_blocking(move || -> Result<i32> {
             use rdkafka::consumer::{BaseConsumer, Consumer as _};
-            let consumer: BaseConsumer = base
-                .clone()
-                .set("group.id", "shove-partition-check")
-                .create()
-                .map_err(|e| {
-                    ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
-                })?;
-            let md = consumer
-                .fetch_metadata(Some(&topic_name), Duration::from_secs(10))
-                .map_err(|e| {
-                    ShoveError::Connection(format!(
-                        "failed to fetch metadata for {topic_name}: {e}"
-                    ))
-                })?;
+
+            let metadata = {
+                #[cfg(feature = "kafka-msk-iam")]
+                {
+                    if let Some(ctx) = msk_ctx {
+                        let consumer: BaseConsumer<MskIamContext> = base
+                            .clone()
+                            .set("group.id", "shove-partition-check")
+                            .create_with_context(ctx)
+                            .map_err(|e| {
+                                ShoveError::Topology(format!(
+                                    "failed to create MSK metadata consumer: {e}"
+                                ))
+                            })?;
+                        consumer.fetch_metadata(Some(&topic_name), Duration::from_secs(10))
+                    } else {
+                        let consumer: BaseConsumer = base
+                            .clone()
+                            .set("group.id", "shove-partition-check")
+                            .create()
+                            .map_err(|e| {
+                                ShoveError::Topology(format!(
+                                    "failed to create metadata consumer: {e}"
+                                ))
+                            })?;
+                        consumer.fetch_metadata(Some(&topic_name), Duration::from_secs(10))
+                    }
+                }
+                #[cfg(not(feature = "kafka-msk-iam"))]
+                {
+                    let consumer: BaseConsumer = base
+                        .clone()
+                        .set("group.id", "shove-partition-check")
+                        .create()
+                        .map_err(|e| {
+                            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
+                        })?;
+                    consumer.fetch_metadata(Some(&topic_name), Duration::from_secs(10))
+                }
+            };
+            let md = metadata.map_err(|e| {
+                ShoveError::Connection(format!("failed to fetch metadata for {topic_name}: {e}"))
+            })?;
             let topic = md.topics().first().ok_or_else(|| {
                 ShoveError::Topology(format!("no metadata for topic {topic_name}"))
             })?;
