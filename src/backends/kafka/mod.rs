@@ -4,6 +4,8 @@ mod client;
 mod constants;
 mod consumer;
 mod consumer_group;
+#[cfg(feature = "kafka-msk-iam")]
+mod msk_iam;
 mod publisher;
 mod topology;
 
