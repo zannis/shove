@@ -136,6 +136,7 @@ impl ConsumerGroupRegistry {
             group_token,
             handler_factory,
             ctx,
+            self.default_handler_timeout,
         );
         self.groups.insert(name, group);
         Ok(())

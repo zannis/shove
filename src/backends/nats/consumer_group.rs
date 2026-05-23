@@ -203,6 +203,7 @@ impl NatsConsumerGroup {
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
+        registry_default_handler_timeout: Option<Duration>,
     ) -> Self
     where
         T: SequencedTopic + 'static,
@@ -216,6 +217,12 @@ impl NatsConsumerGroup {
         // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
         config.min_consumers = 1;
         config.max_consumers = 1;
+        let resolved =
+            resolve_handler_timeout(config.handler_timeout, registry_default_handler_timeout);
+        config.handler_timeout = match resolved {
+            Some(d) => HandlerTimeoutConfig::Set(d),
+            None => HandlerTimeoutConfig::Disabled,
+        };
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
@@ -522,6 +529,7 @@ impl NatsConsumerGroupRegistry {
             group_token,
             handler_factory,
             ctx,
+            self.default_handler_timeout,
         );
         self.groups.insert(name, group);
         Ok(())

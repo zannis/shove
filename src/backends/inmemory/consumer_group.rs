@@ -206,6 +206,7 @@ impl InMemoryConsumerGroup {
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
+        registry_default_handler_timeout: Option<Duration>,
     ) -> Self
     where
         T: SequencedTopic + 'static,
@@ -220,6 +221,12 @@ impl InMemoryConsumerGroup {
         // Override min/max consumers from the user-provided config since FIFO is always single-replica.
         config.min_consumers = 1;
         config.max_consumers = 1;
+        let resolved =
+            resolve_handler_timeout(config.handler_timeout, registry_default_handler_timeout);
+        config.handler_timeout = match resolved {
+            Some(d) => HandlerTimeoutConfig::Set(d),
+            None => HandlerTimeoutConfig::Disabled,
+        };
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptionsInner| {
             let handler = handler_factory();
@@ -510,6 +517,7 @@ impl InMemoryConsumerGroupRegistry {
             group_token,
             handler_factory,
             ctx,
+            self.default_handler_timeout,
         );
         self.groups.insert(queue, group);
         Ok(())
