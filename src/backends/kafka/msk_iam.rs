@@ -16,6 +16,10 @@ use crate::error::Result;
 pub(super) struct MskIamTokenProvider {
     region: String,
     credentials: SharedCredentialsProvider,
+    /// Tokio runtime handle captured at construction time (inside an async
+    /// context). Used by `generate_oauth_token` to bridge from librdkafka's
+    /// non-Tokio poll thread to the async signer.
+    handle: tokio::runtime::Handle,
 }
 
 #[allow(dead_code)]
@@ -30,9 +34,15 @@ impl MskIamTokenProvider {
         let credentials = cfg.credentials_provider().ok_or_else(|| {
             ShoveError::Connection("no AWS credentials provider available for MSK IAM auth".into())
         })?;
+        // Capture the handle here, while we are inside an async context.
+        // `generate_oauth_token` is called from librdkafka's internal C
+        // thread, which has no Tokio runtime; using this pre-captured handle
+        // avoids the `Handle::current()` panic on that thread.
+        let handle = tokio::runtime::Handle::current();
         Ok(Self {
             region,
             credentials,
+            handle,
         })
     }
 }
@@ -62,10 +72,12 @@ impl ClientContext for MskIamContext {
         &self,
         _principal_name: Option<&str>,
     ) -> std::result::Result<OAuthToken, Box<dyn std::error::Error>> {
-        // librdkafka invokes this synchronously on its own poll thread.
-        // Bridge to the async signer via the current tokio runtime handle.
+        // librdkafka invokes this synchronously on its own poll thread, which
+        // is a plain C thread with no Tokio runtime. We use the handle captured
+        // during `MskIamTokenProvider::new` (constructed inside an async context)
+        // rather than `Handle::current()`, which would panic here.
         let provider = self.provider.clone();
-        let handle = tokio::runtime::Handle::current();
+        let handle = provider.handle.clone();
         let (token, expiry_ms) = handle.block_on(async move {
             generate_auth_token_from_credentials_provider(
                 aws_config::Region::new(provider.region.clone()),
