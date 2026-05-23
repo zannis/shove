@@ -4206,6 +4206,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "lapin",
+ "libc",
  "mach2",
  "metrics",
  "metrics-util",

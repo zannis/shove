@@ -9,6 +9,7 @@
 #![cfg(feature = "redis-streams")]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -31,8 +32,45 @@ use shove::{
 // ---------------------------------------------------------------------------
 
 static REDIS_URL: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-// Keep the container alive for the duration of the test binary.
-static REDIS_CONTAINER: OnceLock<testcontainers::ContainerAsync<RedisContainer>> = OnceLock::new();
+// Keep the container alive for the duration of the test binary. The
+// `Mutex<Option<…>>` lets the atexit cleanup hook below `.take()` ownership
+// and run the synchronous `rm()` logic, since Rust never drops `static`
+// values at process exit and `ContainerAsync::rm()` takes `self` by value.
+static REDIS_CONTAINER: OnceLock<Mutex<Option<testcontainers::ContainerAsync<RedisContainer>>>> =
+    OnceLock::new();
+
+// Register a `libc::atexit` hook on first access so the shared container is
+// removed when the test binary exits normally. Using `libc::atexit` (already
+// a transitive dep) avoids pulling in a new `ctor` dev-dep.
+static ATEXIT_REGISTERED: std::sync::Once = std::sync::Once::new();
+
+extern "C" fn cleanup_shared_redis_container() {
+    let Some(slot) = REDIS_CONTAINER.get() else {
+        return;
+    };
+    let Ok(mut guard) = slot.lock() else {
+        return;
+    };
+    let Some(container) = guard.take() else {
+        return;
+    };
+    // Mirror `ContainerOnDrop::drop`: run async `rm()` synchronously on a
+    // dedicated single-threaded runtime in a dedicated OS thread so we don't
+    // re-enter any runtime that might still be tearing down.
+    let handle = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+        rt.block_on(async move {
+            let _ = container.rm().await;
+        });
+    });
+    let _ = handle.join();
+}
 
 /// RAII wrapper for per-test Redis containers. `ContainerAsync::rm()` is
 /// async, and the bare testcontainers Drop spawns a background tokio task
@@ -90,7 +128,13 @@ async fn redis_url() -> &'static str {
                 .await
                 .expect("failed to get Redis port");
             let url = format!("redis://{host}:{port}/");
-            REDIS_CONTAINER.set(container).ok();
+            REDIS_CONTAINER.set(Mutex::new(Some(container))).ok();
+            ATEXIT_REGISTERED.call_once(|| {
+                // SAFETY: `atexit` only requires that the registered function
+                // be safe to call at process exit. Our cleanup is independent
+                // of static destructors and uses its own runtime/thread.
+                unsafe { libc::atexit(cleanup_shared_redis_container) };
+            });
             url
         })
         .await
