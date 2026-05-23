@@ -25,6 +25,7 @@ pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// left at default" and apply a registry-level default only in the
 /// latter case. Resolved into a plain `Option<Duration>` at
 /// registration time by [`resolve_handler_timeout`].
+#[allow(dead_code)] // every consumer is feature-gated; dead under --no-default-features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HandlerTimeoutConfig {
     /// Use the registry default if set; otherwise [`DEFAULT_HANDLER_TIMEOUT`].
@@ -39,6 +40,7 @@ pub(crate) enum HandlerTimeoutConfig {
 /// Resolve a per-config [`HandlerTimeoutConfig`] against an optional
 /// registry-level default, producing the effective `Option<Duration>`
 /// that is plumbed into `ConsumerOptionsInner.handler_timeout`.
+#[allow(dead_code)] // every consumer is feature-gated; dead under --no-default-features
 pub(crate) fn resolve_handler_timeout(
     config: HandlerTimeoutConfig,
     registry_default: Option<Duration>,
