@@ -8,7 +8,10 @@ use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::error::RDKafkaErrorCode;
+use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, Producer};
+
+use super::publisher::publish_with_retry as publisher_publish_with_retry;
 use tokio_util::sync::CancellationToken;
 
 use crate::ShoveError;
@@ -380,23 +383,15 @@ impl KafkaClient {
         &self,
         topic: &str,
         key: Option<&[u8]>,
-        headers: rdkafka::message::OwnedHeaders,
+        headers: OwnedHeaders,
         payload: &[u8],
         max_attempts: u32,
         label: &str,
-    ) -> crate::error::Result<()> {
+    ) -> Result<()> {
         match &self.producer {
             KafkaProducerInner::Default(p) => {
-                crate::backends::kafka::publisher::publish_with_retry(
-                    p,
-                    topic,
-                    key,
-                    headers,
-                    payload,
-                    max_attempts,
-                    label,
-                )
-                .await
+                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
+                    .await
             }
         }
     }
