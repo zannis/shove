@@ -99,8 +99,10 @@ pub enum KafkaSasl {
         password: String,
     },
 
-    /// AWS MSK IAM authentication. Token is refreshed automatically by
-    /// `MskIamTokenProvider` ahead of expiry (~15 min cadence).
+    /// AWS MSK IAM authentication. Tokens expire after ~15 minutes;
+    /// librdkafka invokes the refresh callback at ~80% of token lifetime
+    /// (so roughly every ~12 minutes), signing a fresh presigned URL via
+    /// `MskIamTokenProvider`.
     #[cfg(feature = "kafka-msk-iam")]
     MskIam {
         /// AWS region the MSK cluster lives in (e.g. `"eu-west-2"`).
@@ -594,60 +596,20 @@ impl KafkaClient {
     {
         use rdkafka::admin::NewPartitions;
 
-        // Fetch current partition count from metadata.
+        // Fetch current partition count from metadata. The blocking work is
+        // pushed onto a dedicated thread because librdkafka's metadata fetch
+        // is synchronous; the helper owns all the cfg-gated context selection.
         let base = self.base_config.clone();
         let topic_name = name.to_string();
         #[cfg(feature = "kafka-msk-iam")]
         let msk_ctx = self.msk_context();
-        let current = tokio::task::spawn_blocking(move || -> Result<i32> {
-            use rdkafka::consumer::{BaseConsumer, Consumer as _};
-
-            let metadata = {
+        let current = tokio::task::spawn_blocking(move || {
+            fetch_topic_partition_count_blocking(
+                base,
+                &topic_name,
                 #[cfg(feature = "kafka-msk-iam")]
-                {
-                    if let Some(ctx) = msk_ctx {
-                        let consumer: BaseConsumer<MskIamContext> = base
-                            .clone()
-                            .set("group.id", "shove-partition-check")
-                            .create_with_context(ctx)
-                            .map_err(|e| {
-                                ShoveError::Topology(format!(
-                                    "failed to create MSK metadata consumer: {e}"
-                                ))
-                            })?;
-                        consumer.fetch_metadata(Some(&topic_name), Duration::from_secs(10))
-                    } else {
-                        let consumer: BaseConsumer = base
-                            .clone()
-                            .set("group.id", "shove-partition-check")
-                            .create()
-                            .map_err(|e| {
-                                ShoveError::Topology(format!(
-                                    "failed to create metadata consumer: {e}"
-                                ))
-                            })?;
-                        consumer.fetch_metadata(Some(&topic_name), Duration::from_secs(10))
-                    }
-                }
-                #[cfg(not(feature = "kafka-msk-iam"))]
-                {
-                    let consumer: BaseConsumer = base
-                        .clone()
-                        .set("group.id", "shove-partition-check")
-                        .create()
-                        .map_err(|e| {
-                            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
-                        })?;
-                    consumer.fetch_metadata(Some(&topic_name), Duration::from_secs(10))
-                }
-            };
-            let md = metadata.map_err(|e| {
-                ShoveError::Connection(format!("failed to fetch metadata for {topic_name}: {e}"))
-            })?;
-            let topic = md.topics().first().ok_or_else(|| {
-                ShoveError::Topology(format!("no metadata for topic {topic_name}"))
-            })?;
-            Ok(topic.partitions().len() as i32)
+                msk_ctx,
+            )
         })
         .await
         .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??;
@@ -705,6 +667,52 @@ impl KafkaClient {
     pub(super) fn msk_context(&self) -> Option<MskIamContext> {
         self.msk_context.clone()
     }
+}
+
+/// Build a metadata `BaseConsumer` against `base`, fetch the topic's metadata
+/// synchronously, and return its partition count. Runs inside `spawn_blocking`
+/// because librdkafka's `fetch_metadata` is blocking.
+///
+/// The cfg branching lives here so `ensure_partitions` stays readable.
+fn fetch_topic_partition_count_blocking(
+    base: ClientConfig,
+    topic_name: &str,
+    #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
+) -> Result<i32> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let mut cfg = base;
+    cfg.set("group.id", "shove-partition-check");
+
+    #[cfg(feature = "kafka-msk-iam")]
+    let metadata = if let Some(ctx) = msk_ctx {
+        let consumer: BaseConsumer<MskIamContext> = cfg.create_with_context(ctx).map_err(|e| {
+            ShoveError::Topology(format!("failed to create MSK metadata consumer: {e}"))
+        })?;
+        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
+    } else {
+        let consumer: BaseConsumer = cfg.create().map_err(|e| {
+            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
+        })?;
+        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
+    };
+
+    #[cfg(not(feature = "kafka-msk-iam"))]
+    let metadata = {
+        let consumer: BaseConsumer = cfg.create().map_err(|e| {
+            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
+        })?;
+        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
+    };
+
+    let md = metadata.map_err(|e| {
+        ShoveError::Connection(format!("failed to fetch metadata for {topic_name}: {e}"))
+    })?;
+    let topic = md
+        .topics()
+        .first()
+        .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {topic_name}")))?;
+    Ok(topic.partitions().len() as i32)
 }
 
 #[cfg(test)]

@@ -179,3 +179,63 @@ async fn msk_iam_generate_oauth_token_does_not_panic() {
         }
     }
 }
+
+/// Verifies that the protocol overlay in `connect()` actually sets
+/// `security.protocol=SASL_SSL` and `sasl.mechanism=OAUTHBEARER` in the
+/// stored `base_config` when MSK IAM is selected.
+///
+/// Without this assertion, a future refactor could silently break the
+/// overlay (e.g. by re-ordering Phase B before Phase A) and the producer
+/// would attempt SCRAM or PLAIN instead of OAUTHBEARER — the failure
+/// would surface only in production logs as a SASL handshake error.
+#[tokio::test]
+async fn msk_iam_connect_overlays_sasl_ssl_and_oauthbearer_into_base_config() {
+    set_dummy_aws_env();
+
+    let cfg = KafkaConfig::new("192.0.2.1:9098")
+        .with_tls(KafkaTls {
+            skip_hostname_verification: true,
+            ..KafkaTls::default()
+        })
+        .with_sasl(KafkaSasl::msk_iam(AWS_REGION));
+
+    let client = KafkaClient::connect(&cfg).await.expect("connect");
+    let base = client.base_config();
+    let map = base.config_map();
+
+    assert_eq!(
+        map.get("security.protocol").copied(),
+        Some("SASL_SSL"),
+        "MSK IAM must overlay security.protocol=SASL_SSL"
+    );
+    assert_eq!(
+        map.get("sasl.mechanism").copied(),
+        Some("OAUTHBEARER"),
+        "MSK IAM must overlay sasl.mechanism=OAUTHBEARER"
+    );
+}
+
+/// Exercises `KafkaClient::connect_with_retry` on the MSK IAM happy path.
+///
+/// The retry loop simply re-invokes `connect()` on failure, so with valid
+/// credentials and TLS configured the very first attempt succeeds and the
+/// retry loop is a no-op. This test locks in that the MSK IAM `connect()`
+/// remains composable with the retry helper — a future refactor that breaks
+/// the type signature of the retry wrapper would fail here.
+#[tokio::test]
+async fn msk_iam_connect_with_retry_succeeds_on_first_attempt() {
+    set_dummy_aws_env();
+
+    let cfg = KafkaConfig::new("192.0.2.1:9098")
+        .with_tls(KafkaTls {
+            skip_hostname_verification: true,
+            ..KafkaTls::default()
+        })
+        .with_sasl(KafkaSasl::msk_iam(AWS_REGION));
+
+    let client = KafkaClient::connect_with_retry(&cfg, 1)
+        .await
+        .expect("connect_with_retry must succeed on first attempt with valid MSK IAM config");
+
+    assert!(!client.shutdown_token().is_cancelled());
+}
