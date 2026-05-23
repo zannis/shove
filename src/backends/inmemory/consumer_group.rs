@@ -85,11 +85,6 @@ impl InMemoryConsumerGroupConfig {
         self
     }
 
-    pub fn without_handler_timeout(mut self) -> Self {
-        self.handler_timeout = HandlerTimeoutConfig::Disabled;
-        self
-    }
-
     pub fn with_max_message_size(mut self, max: usize) -> Self {
         self.max_message_size = Some(max);
         self
@@ -132,7 +127,7 @@ impl InMemoryConsumerGroupConfig {
     /// is not reflected here because the config does not know about
     /// its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
-        resolve_handler_timeout(self.handler_timeout, None)
+        Some(resolve_handler_timeout(self.handler_timeout, None))
     }
 
     pub fn max_pending_per_key(&self) -> Option<usize> {
@@ -226,12 +221,10 @@ impl InMemoryConsumerGroup {
         // Override min/max consumers from the user-provided config since FIFO is always single-replica.
         config.min_consumers = 1;
         config.max_consumers = 1;
-        let resolved =
-            resolve_handler_timeout(config.handler_timeout, registry_default_handler_timeout);
-        config.handler_timeout = match resolved {
-            Some(d) => HandlerTimeoutConfig::Set(d),
-            None => HandlerTimeoutConfig::Disabled,
-        };
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            registry_default_handler_timeout,
+        ));
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptionsInner| {
             let handler = handler_factory();
@@ -388,7 +381,7 @@ impl InMemoryConsumerGroup {
         let mut options = ConsumerOptionsInner::defaults_with_shutdown(child_token.clone());
         options.max_retries = self.config.max_retries;
         options.prefetch_count = self.config.prefetch_count;
-        options.handler_timeout = resolve_handler_timeout(self.config.handler_timeout, None);
+        options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.max_message_size = self.config.max_message_size;
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.processing = processing.clone();
@@ -430,7 +423,7 @@ impl InMemoryConsumerGroupRegistry {
 
     /// Set the registry-level default handler timeout. Applies to every
     /// group whose `InMemoryConsumerGroupConfig` did not explicitly call
-    /// `with_handler_timeout` or `without_handler_timeout`.
+    /// `with_handler_timeout`.
     pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
         self.default_handler_timeout = Some(timeout);
         self
@@ -447,12 +440,10 @@ impl InMemoryConsumerGroupRegistry {
         H: MessageHandler<T> + 'static,
     {
         let mut config = config;
-        let resolved =
-            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
-        config.handler_timeout = match resolved {
-            Some(d) => HandlerTimeoutConfig::Set(d),
-            None => HandlerTimeoutConfig::Disabled,
-        };
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
 
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -596,7 +587,7 @@ mod tests {
         let cfg = InMemoryConsumerGroupConfig::new(1..=1);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, None),
-            Some(DEFAULT_HANDLER_TIMEOUT),
+            DEFAULT_HANDLER_TIMEOUT,
         );
     }
 
@@ -605,7 +596,7 @@ mod tests {
         let cfg = InMemoryConsumerGroupConfig::new(1..=1);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
-            Some(Duration::from_secs(45)),
+            Duration::from_secs(45),
         );
     }
 
@@ -615,16 +606,7 @@ mod tests {
             InMemoryConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(5));
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
-            Some(Duration::from_secs(5)),
-        );
-    }
-
-    #[test]
-    fn without_handler_timeout_beats_registry_default() {
-        let cfg = InMemoryConsumerGroupConfig::new(1..=1).without_handler_timeout();
-        assert_eq!(
-            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
-            None,
+            Duration::from_secs(5),
         );
     }
 

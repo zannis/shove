@@ -73,7 +73,7 @@ impl RedisConsumerGroupConfig {
     /// default is not reflected here because the config does not know
     /// about its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
-        resolve_handler_timeout(self.handler_timeout, None)
+        Some(resolve_handler_timeout(self.handler_timeout, None))
     }
 }
 
@@ -167,7 +167,7 @@ impl RedisConsumerGroupRegistry {
                 Box::pin(async move {
                     let consumer = RedisConsumer::new(client);
                     let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
-                    options.handler_timeout = handler_timeout;
+                    options.handler_timeout = Some(handler_timeout);
                     consumer.run::<T, H>(handler, ctx, options).await
                 })
             });
@@ -213,7 +213,7 @@ impl RedisConsumerGroupRegistry {
                 Box::pin(async move {
                     let consumer = RedisConsumer::new(client);
                     let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
-                    options.handler_timeout = handler_timeout;
+                    options.handler_timeout = Some(handler_timeout);
                     consumer.run_fifo::<T, H>(handler, ctx, options).await
                 })
             });
@@ -316,7 +316,7 @@ mod tests {
         let cfg = RedisConsumerGroupConfig::new(1);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
-            Some(Duration::from_secs(45)),
+            Duration::from_secs(45),
         );
     }
 
@@ -325,7 +325,7 @@ mod tests {
         let cfg = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::from_secs(5));
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
-            Some(Duration::from_secs(5)),
+            Duration::from_secs(5),
         );
     }
 

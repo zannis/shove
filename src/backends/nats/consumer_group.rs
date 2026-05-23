@@ -112,7 +112,7 @@ impl NatsConsumerGroupConfig {
     /// is not reflected here because the config does not know about
     /// its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
-        resolve_handler_timeout(self.handler_timeout, None)
+        Some(resolve_handler_timeout(self.handler_timeout, None))
     }
 
     pub fn concurrent_processing(&self) -> bool {
@@ -222,12 +222,10 @@ impl NatsConsumerGroup {
         // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
         config.min_consumers = 1;
         config.max_consumers = 1;
-        let resolved =
-            resolve_handler_timeout(config.handler_timeout, registry_default_handler_timeout);
-        config.handler_timeout = match resolved {
-            Some(d) => HandlerTimeoutConfig::Set(d),
-            None => HandlerTimeoutConfig::Disabled,
-        };
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            registry_default_handler_timeout,
+        ));
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
@@ -382,7 +380,7 @@ impl NatsConsumerGroup {
         options.max_retries = self.config.max_retries;
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
-        options.handler_timeout = resolve_handler_timeout(self.config.handler_timeout, None);
+        options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
@@ -452,12 +450,10 @@ impl NatsConsumerGroupRegistry {
         H: MessageHandler<T> + 'static,
     {
         let mut config = config;
-        let resolved =
-            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
-        config.handler_timeout = match resolved {
-            Some(d) => HandlerTimeoutConfig::Set(d),
-            None => HandlerTimeoutConfig::Disabled,
-        };
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
 
         let topology = T::topology();
         let name = topology.queue().to_string();
@@ -803,7 +799,7 @@ mod tests {
         let cfg = NatsConsumerGroupConfig::new(1..=4);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, None),
-            Some(DEFAULT_HANDLER_TIMEOUT),
+            DEFAULT_HANDLER_TIMEOUT,
         );
     }
 
@@ -812,7 +808,7 @@ mod tests {
         let cfg = NatsConsumerGroupConfig::new(1..=4);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
-            Some(Duration::from_secs(45)),
+            Duration::from_secs(45),
         );
     }
 
@@ -821,7 +817,7 @@ mod tests {
         let cfg = NatsConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(5));
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
-            Some(Duration::from_secs(5)),
+            Duration::from_secs(5),
         );
     }
 }

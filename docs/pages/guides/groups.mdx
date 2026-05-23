@@ -150,7 +150,7 @@ group
 
 Resolution order, from highest priority to lowest:
 
-1. **Per-group explicit** — the config called `.with_handler_timeout(d)` (or `.without_handler_timeout()` on backends that expose it). This always wins.
+1. **Per-group explicit** — the config called `.with_handler_timeout(d)`. This always wins.
 2. **Registry default** — `broker.consumer_group().with_default_handler_timeout(d)`.
 3. **Library default** — 30 seconds, the value of `DEFAULT_HANDLER_TIMEOUT`.
 

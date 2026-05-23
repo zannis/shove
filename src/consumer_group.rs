@@ -90,8 +90,7 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
 
     /// Set a default handler timeout applied to every group registered
     /// through this `ConsumerGroup` whose per-group config did not call
-    /// `with_handler_timeout` (or `without_handler_timeout`, on backends
-    /// that expose it). Per-group explicit settings always win.
+    /// `with_handler_timeout`. Per-group explicit settings always win.
     ///
     /// Must be called **before** [`register`] / [`register_fifo`]. Each
     /// backend resolves the effective handler timeout at registration

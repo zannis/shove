@@ -62,12 +62,10 @@ impl SqsConsumerGroupRegistry {
         H: MessageHandler<T> + Clone + 'static,
     {
         let mut config = config;
-        let resolved =
-            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
-        config.handler_timeout = match resolved {
-            Some(d) => HandlerTimeoutConfig::Set(d),
-            None => HandlerTimeoutConfig::Disabled,
-        };
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
 
         let topology = T::topology();
         let name = topology.queue().to_string();
