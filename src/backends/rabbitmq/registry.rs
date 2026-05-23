@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
+use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -19,6 +21,7 @@ use crate::topic::{SequencedTopic, Topic};
 pub struct ConsumerGroupRegistry {
     groups: HashMap<String, ConsumerGroup>,
     client: RabbitMqClient,
+    pub(super) default_handler_timeout: Option<Duration>,
 }
 
 impl ConsumerGroupRegistry {
@@ -26,7 +29,16 @@ impl ConsumerGroupRegistry {
         Self {
             groups: HashMap::new(),
             client,
+            default_handler_timeout: None,
         }
+    }
+
+    /// Set the registry-level default handler timeout. Applies to every
+    /// group whose `ConsumerGroupConfig` did not explicitly call
+    /// `with_handler_timeout`. Per-group explicit settings always win.
+    pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        self.default_handler_timeout = Some(timeout);
+        self
     }
 
     /// Register a new consumer group.
@@ -46,6 +58,14 @@ impl ConsumerGroupRegistry {
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        let resolved =
+            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
+        config.handler_timeout = match resolved {
+            Some(d) => HandlerTimeoutConfig::Set(d),
+            None => HandlerTimeoutConfig::Disabled,
+        };
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
