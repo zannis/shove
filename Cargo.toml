@@ -271,6 +271,11 @@ name = "kafka_audited_consumer"
 path = "examples/kafka/audited_consumer.rs"
 required-features = ["kafka", "audit"]
 
+[[example]]
+name = "kafka_msk_iam"
+path = "examples/kafka/msk_iam.rs"
+required-features = ["kafka-msk-iam"]
+
 [[test]]
 name = "inmemory_integration"
 required-features = ["inmemory"]
