@@ -1522,17 +1522,27 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
         .await
         .expect("publish");
 
+    // Drive shutdown on observed redelivery rather than a fixed sleep so
+    // the test isn't racy on a loaded CI host.
     let token = group.cancellation_token();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        token.cancel();
+    let redelivered_probe = ctx.redelivered.clone();
+    let canceller_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        let observed = poll_until(
+            move || redelivered_probe.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        canceller_token.cancel();
+        observed
     });
     let outcome = group
         .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
         .await;
+    let observed = canceller.await.expect("canceller");
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
     assert!(
-        ctx.redelivered.load(Ordering::SeqCst) >= 1,
+        observed && ctx.redelivered.load(Ordering::SeqCst) >= 1,
         "expected >=1 redelivery after handler timeout via registry default"
     );
 }
@@ -1699,17 +1709,27 @@ async fn registry_default_handler_timeout_applies_to_fifo_registrations() {
         .await
         .expect("publish");
 
+    // Drive shutdown on observed redelivery rather than a fixed sleep so
+    // the test isn't racy on a loaded CI host.
     let token = group.cancellation_token();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        token.cancel();
+    let redelivered_probe = ctx.redelivered.clone();
+    let canceller_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        let observed = poll_until(
+            move || redelivered_probe.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        canceller_token.cancel();
+        observed
     });
     let outcome = group
         .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
         .await;
+    let observed = canceller.await.expect("canceller");
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
     assert!(
-        ctx.redelivered.load(Ordering::SeqCst) >= 1,
+        observed && ctx.redelivered.load(Ordering::SeqCst) >= 1,
         "registry default handler timeout did not propagate to FIFO registrations",
     );
 }
