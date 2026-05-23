@@ -146,6 +146,7 @@ pub mod autoscaler;
 pub mod backend;
 pub mod broker;
 pub mod codec;
+pub mod codecs;
 pub mod consumer;
 pub mod consumer_group;
 pub mod consumer_supervisor;
@@ -178,6 +179,9 @@ pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;
 pub use backend::{Backend, capability::HasCoordinatedGroups};
 pub use codec::{Codec, JsonCodec, RawBytesCodec};
+#[cfg(feature = "protobuf")]
+#[cfg_attr(docsrs, doc(cfg(feature = "protobuf")))]
+pub use codecs::protobuf::ProtobufCodec;
 pub use consumer::{
     ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };
