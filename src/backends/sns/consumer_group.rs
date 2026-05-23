@@ -85,6 +85,7 @@ impl SqsConsumerGroupConfig {
 
     /// Set the maximum time a handler may spend processing a single message.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
@@ -595,5 +596,11 @@ mod tests {
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
             Duration::from_secs(5),
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "handler_timeout must be positive")]
+    fn with_handler_timeout_zero_panics() {
+        let _ = SqsConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::ZERO);
     }
 }

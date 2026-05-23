@@ -59,6 +59,7 @@ impl RedisConsumerGroupConfig {
     /// Set the maximum time a handler may spend processing a single
     /// message. If exceeded, the message is retried.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
@@ -116,6 +117,10 @@ impl RedisConsumerGroupRegistry {
     /// group whose `RedisConsumerGroupConfig` did not explicitly call
     /// `with_handler_timeout`. Per-group explicit settings always win.
     pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
         self.default_handler_timeout = Some(timeout);
         self
     }
@@ -327,6 +332,12 @@ mod tests {
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
             Duration::from_secs(5),
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "handler_timeout must be positive")]
+    fn with_handler_timeout_zero_panics() {
+        let _ = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::ZERO);
     }
 
     #[test]

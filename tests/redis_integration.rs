@@ -1270,3 +1270,111 @@ async fn redis_with_handler_timeout_aborts_slow_handler() {
         "handler completed its 400ms sleep despite a 100ms handler_timeout",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 10: registry_default_handler_timeout_aborts_slow_handler
+//
+// Same shape as Test 9, but the per-group config does NOT call
+// `with_handler_timeout` — the timeout is supplied by
+// `ConsumerGroup::with_default_handler_timeout` and must reach
+// the handler via the registry's pre-resolution.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn redis_registry_default_handler_timeout_aborts_slow_handler() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use shove::ConsumerGroupConfig;
+    use shove::redis::RedisConsumerGroupConfig;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct DefSlowOrder {
+        id: u64,
+    }
+
+    struct DefSlowOrdersTopic;
+    impl Topic for DefSlowOrdersTopic {
+        type Message = DefSlowOrder;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("redis-int-default-slow-orders")
+                    .hold_queue(Duration::from_millis(100))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Ctx {
+        started: Arc<AtomicU32>,
+        completed: Arc<AtomicU32>,
+    }
+
+    struct SlowHandler;
+    impl MessageHandler<DefSlowOrdersTopic> for SlowHandler {
+        type Context = Ctx;
+        async fn handle(&self, _msg: DefSlowOrder, _meta: MessageMetadata, ctx: &Ctx) -> Outcome {
+            ctx.started.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            ctx.completed.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+
+    let broker = make_broker("default-slow-orders-group").await;
+    broker
+        .topology()
+        .declare::<DefSlowOrdersTopic>()
+        .await
+        .expect("declare");
+    let ctx = Ctx {
+        started: Arc::new(AtomicU32::new(0)),
+        completed: Arc::new(AtomicU32::new(0)),
+    };
+
+    let mut group = broker
+        .consumer_group()
+        .with_context(ctx.clone())
+        .with_default_handler_timeout(Duration::from_millis(100));
+    group
+        .register::<DefSlowOrdersTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1)),
+            || SlowHandler,
+        )
+        .await
+        .expect("register");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<DefSlowOrdersTopic>(&DefSlowOrder { id: 1 })
+        .await
+        .expect("publish");
+
+    let token = group.cancellation_token();
+    let started_probe = ctx.started.clone();
+    let canceller_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        let entered = poll_until(
+            move || started_probe.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(2),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        canceller_token.cancel();
+        entered
+    });
+    let outcome = group
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
+        .await;
+    let entered = canceller.await.expect("canceller");
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(entered, "handler was never invoked");
+    assert_eq!(
+        ctx.completed.load(Ordering::SeqCst),
+        0,
+        "handler completed its 400ms sleep despite a 100ms registry default handler_timeout",
+    );
+}

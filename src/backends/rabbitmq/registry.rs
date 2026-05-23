@@ -37,6 +37,10 @@ impl ConsumerGroupRegistry {
     /// group whose `ConsumerGroupConfig` did not explicitly call
     /// `with_handler_timeout`. Per-group explicit settings always win.
     pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
         self.default_handler_timeout = Some(timeout);
         self
     }
@@ -112,6 +116,12 @@ impl ConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
@@ -134,7 +144,6 @@ impl ConsumerGroupRegistry {
             group_token,
             handler_factory,
             ctx,
-            self.default_handler_timeout,
         );
         self.groups.insert(name, group);
         Ok(())

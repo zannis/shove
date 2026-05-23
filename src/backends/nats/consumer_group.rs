@@ -81,6 +81,7 @@ impl NatsConsumerGroupConfig {
     }
 
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
@@ -208,7 +209,6 @@ impl NatsConsumerGroup {
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
-        registry_default_handler_timeout: Option<Duration>,
     ) -> Self
     where
         T: SequencedTopic + 'static,
@@ -222,10 +222,6 @@ impl NatsConsumerGroup {
         // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
         config.min_consumers = 1;
         config.max_consumers = 1;
-        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
-            config.handler_timeout,
-            registry_default_handler_timeout,
-        ));
 
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
             let handler = handler_factory();
@@ -424,6 +420,10 @@ impl NatsConsumerGroupRegistry {
     /// group whose `NatsConsumerGroupConfig` did not explicitly call
     /// `with_handler_timeout`. Per-group explicit settings always win.
     pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
         self.default_handler_timeout = Some(timeout);
         self
     }
@@ -505,6 +505,12 @@ impl NatsConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
@@ -530,7 +536,6 @@ impl NatsConsumerGroupRegistry {
             group_token,
             handler_factory,
             ctx,
-            self.default_handler_timeout,
         );
         self.groups.insert(name, group);
         Ok(())
@@ -819,5 +824,18 @@ mod tests {
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
             Duration::from_secs(5),
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "handler_timeout must be positive")]
+    fn with_handler_timeout_zero_panics() {
+        let _ = NatsConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "default_handler_timeout must be positive")]
+    fn with_default_handler_timeout_zero_panics() {
+        let registry = NatsConsumerGroupRegistry::from_groups(HashMap::new());
+        let _ = registry.with_default_handler_timeout(Duration::ZERO);
     }
 }

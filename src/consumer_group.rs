@@ -104,6 +104,10 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     /// [`register`]: Self::register
     /// [`register_fifo`]: Self::register_fifo
     pub fn with_default_handler_timeout(mut self, timeout: std::time::Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
         self.inner.set_default_handler_timeout(timeout);
         self
     }
@@ -246,5 +250,16 @@ mod tests {
             .run_until_timeout(std::future::ready(()), Duration::from_millis(500))
             .await;
         assert_eq!(outcome.exit_code(), 0);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "default_handler_timeout must be positive")]
+    async fn with_default_handler_timeout_zero_panics() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        let _ = broker
+            .consumer_group()
+            .with_default_handler_timeout(Duration::ZERO);
     }
 }

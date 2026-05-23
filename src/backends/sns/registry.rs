@@ -40,6 +40,10 @@ impl SqsConsumerGroupRegistry {
     /// group whose `SqsConsumerGroupConfig` did not explicitly call
     /// `with_handler_timeout`. Per-group explicit settings always win.
     pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
         self.default_handler_timeout = Some(timeout);
         self
     }
