@@ -20,6 +20,36 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 /// Default handler timeout: 30 seconds.
 pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Tri-state used by each backend's `ConsumerGroupConfig` so the
+/// registry can tell "user explicitly set a timeout" from "config
+/// left at default" and apply a registry-level default only in the
+/// latter case. Resolved into a plain `Option<Duration>` at
+/// registration time by [`resolve_handler_timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HandlerTimeoutConfig {
+    /// Use the registry default if set; otherwise [`DEFAULT_HANDLER_TIMEOUT`].
+    #[default]
+    Inherit,
+    /// Use this exact duration.
+    Set(Duration),
+    /// Disable the handler timeout entirely.
+    Disabled,
+}
+
+/// Resolve a per-config [`HandlerTimeoutConfig`] against an optional
+/// registry-level default, producing the effective `Option<Duration>`
+/// that is plumbed into `ConsumerOptionsInner.handler_timeout`.
+pub(crate) fn resolve_handler_timeout(
+    config: HandlerTimeoutConfig,
+    registry_default: Option<Duration>,
+) -> Option<Duration> {
+    match config {
+        HandlerTimeoutConfig::Set(d) => Some(d),
+        HandlerTimeoutConfig::Disabled => None,
+        HandlerTimeoutConfig::Inherit => registry_default.or(Some(DEFAULT_HANDLER_TIMEOUT)),
+    }
+}
+
 /// Default per-key pending buffer limit for sequenced consumers.
 pub const DEFAULT_MAX_PENDING_PER_KEY: usize = 1_000;
 
@@ -749,5 +779,47 @@ mod tests {
     fn nats_with_max_ack_pending_sets_value() {
         let opts = ConsumerOptions::<Nats>::new().with_max_ack_pending(128);
         assert_eq!(opts.max_ack_pending, Some(128));
+    }
+
+    #[test]
+    fn resolve_set_returns_explicit_duration() {
+        assert_eq!(
+            resolve_handler_timeout(
+                HandlerTimeoutConfig::Set(Duration::from_secs(5)),
+                Some(Duration::from_secs(60)),
+            ),
+            Some(Duration::from_secs(5)),
+        );
+    }
+
+    #[test]
+    fn resolve_disabled_returns_none() {
+        assert_eq!(
+            resolve_handler_timeout(
+                HandlerTimeoutConfig::Disabled,
+                Some(Duration::from_secs(60)),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn resolve_inherit_uses_registry_default_then_library_default() {
+        assert_eq!(
+            resolve_handler_timeout(HandlerTimeoutConfig::Inherit, Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(45)),
+        );
+        assert_eq!(
+            resolve_handler_timeout(HandlerTimeoutConfig::Inherit, None),
+            Some(DEFAULT_HANDLER_TIMEOUT),
+        );
+    }
+
+    #[test]
+    fn handler_timeout_config_default_is_inherit() {
+        assert_eq!(
+            HandlerTimeoutConfig::default(),
+            HandlerTimeoutConfig::Inherit
+        );
     }
 }
