@@ -6,6 +6,7 @@
 //! drives the set to completion or a configurable drain deadline.
 
 use std::future::Future;
+use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::ConsumerOptionsInner;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::{SupervisorOutcome, tally_join_result};
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
 
@@ -38,35 +39,96 @@ type TaskFactory = Box<dyn FnOnce() -> BoxFuture + Send>;
 
 /// Configuration for a [`RedisConsumerGroupRegistry`] registration.
 ///
-/// `consumer_count` controls how many concurrent consumer tasks are spawned
-/// for a single non-FIFO topic (minimum 1). FIFO topics always spawn one
-/// task per shard regardless of this setting.
+/// The consumer count range matches the other coordinated-group backends.
+/// Redis Streams has no native autoscaling integration here, so the registry
+/// spawns `max_consumers` consumer tasks up-front; `min_consumers` is
+/// informational. FIFO topics always spawn one task per shard regardless of
+/// this setting.
 #[derive(Debug, Clone)]
 pub struct RedisConsumerGroupConfig {
-    consumer_count: u16,
+    prefetch_count: u16,
+    min_consumers: u16,
+    max_consumers: u16,
+    concurrent_processing: bool,
     pub(crate) handler_timeout: HandlerTimeoutConfig,
 }
 
 impl RedisConsumerGroupConfig {
-    /// Create a new config with the given concurrent consumer count.
-    pub fn new(consumer_count: u16) -> Self {
+    /// Create a new config with the given consumer-count range.
+    ///
+    /// `range` sets `min_consumers..=max_consumers`. Both ends are clamped to
+    /// at least 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `*range.start() > *range.end()`.
+    pub fn new(range: RangeInclusive<u16>) -> Self {
+        let min = (*range.start()).max(1);
+        let max = (*range.end()).max(1);
+        assert!(
+            min <= max,
+            "min_consumers ({min}) must be <= max_consumers ({max})"
+        );
         Self {
-            consumer_count: consumer_count.max(1),
+            prefetch_count: 10,
+            min_consumers: min,
+            max_consumers: max,
+            concurrent_processing: false,
             handler_timeout: HandlerTimeoutConfig::Inherit,
         }
     }
 
+    /// Set the prefetch count (the `COUNT` argument to XREADGROUP). With
+    /// `concurrent_processing(true)` this is the upper bound on in-flight
+    /// handlers per consumer task; with `concurrent_processing(false)` the
+    /// effective prefetch is clamped to 1 so handlers serialize regardless.
+    pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
+        self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Enable concurrent message processing within each consumer.
+    ///
+    /// When enabled, each consumer processes up to `prefetch_count` messages
+    /// concurrently. Handlers are dispatched as independent tokio tasks and
+    /// each routes its own outcome (XACK / hold-queue / DLQ).
+    ///
+    /// Not available for sequenced topics — [`register_fifo`] rejects configs
+    /// with this flag set to preserve FIFO ordering within a shard.
+    ///
+    /// [`register_fifo`]: RedisConsumerGroupRegistry::register_fifo
+    pub fn with_concurrent_processing(mut self, concurrent: bool) -> Self {
+        self.concurrent_processing = concurrent;
+        self
+    }
+
     /// Set the maximum time a handler may spend processing a single
-    /// message. If exceeded, the message is retried.
+    /// message. If exceeded, the message is left in the PEL for XAUTOCLAIM.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
 
-    /// The configured consumer count.
-    pub fn consumer_count(&self) -> u16 {
-        self.consumer_count
+    /// Returns the configured prefetch count.
+    pub fn prefetch_count(&self) -> u16 {
+        self.prefetch_count
+    }
+
+    /// Returns the minimum number of consumers.
+    pub fn min_consumers(&self) -> u16 {
+        self.min_consumers
+    }
+
+    /// Returns the maximum number of consumers (also the number of consumer
+    /// tasks that get spawned today — Redis has no in-tree autoscaler hook).
+    pub fn max_consumers(&self) -> u16 {
+        self.max_consumers
+    }
+
+    /// Returns whether concurrent processing is enabled.
+    pub fn concurrent_processing(&self) -> bool {
+        self.concurrent_processing
     }
 
     /// Returns the configured handler timeout. A freshly-constructed
@@ -80,7 +142,7 @@ impl RedisConsumerGroupConfig {
 
 impl Default for RedisConsumerGroupConfig {
     fn default() -> Self {
-        Self::new(1)
+        Self::new(1..=4)
     }
 }
 
@@ -135,10 +197,9 @@ impl RedisConsumerGroupRegistry {
 
     /// Register a non-FIFO topic handler.
     ///
-    /// Spawns `*config.consumer_range().start()` (minimum 1) concurrent
-    /// consumer tasks when [`start_all`] is called. Each task gets its own
-    /// clone of `ctx` (via `H::Context: Clone`, already guaranteed by the
-    /// [`MessageHandler`] trait bound).
+    /// Spawns `config.max_consumers()` consumer tasks when [`start_all`] is
+    /// called. Each task gets its own clone of `ctx` (via `H::Context: Clone`,
+    /// already guaranteed by the [`MessageHandler`] trait bound).
     ///
     /// Topology structures (stream + consumer group) are declared before
     /// returning.
@@ -159,7 +220,18 @@ impl RedisConsumerGroupRegistry {
         let resolved_handler_timeout =
             resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
 
-        let n = config.consumer_count() as usize;
+        // Non-concurrent groups clamp prefetch to 1 so each XREADGROUP fetches
+        // at most one message, matching the other backends' "concurrent off"
+        // semantics. Concurrent groups use the configured value as the
+        // in-flight cap (semaphore size).
+        let effective_prefetch = if config.concurrent_processing {
+            config.prefetch_count.max(1)
+        } else {
+            1
+        };
+        let concurrent = config.concurrent_processing;
+
+        let n = config.max_consumers() as usize;
 
         for _ in 0..n {
             let client = self.client.clone();
@@ -173,7 +245,12 @@ impl RedisConsumerGroupRegistry {
                     let consumer = RedisConsumer::new(client);
                     let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
                     options.handler_timeout = Some(handler_timeout);
-                    consumer.run::<T, H>(handler, ctx, options).await
+                    options.prefetch_count = effective_prefetch;
+                    if concurrent {
+                        consumer.run_concurrent::<T, H>(handler, ctx, options).await
+                    } else {
+                        consumer.run::<T, H>(handler, ctx, options).await
+                    }
                 })
             });
             self.tasks.push(task);
@@ -188,6 +265,9 @@ impl RedisConsumerGroupRegistry {
     /// shard's stream via [`RedisConsumer::run_fifo`], which internally calls
     /// [`spawn_fifo_shards`] and awaits all shard handles.
     ///
+    /// Rejects configs with `concurrent_processing(true)` — concurrent
+    /// dispatch within a sequenced shard would break FIFO ordering.
+    ///
     /// Topology structures are declared before returning.
     pub async fn register_fifo<T, H>(
         &mut self,
@@ -199,6 +279,15 @@ impl RedisConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        if config.concurrent_processing {
+            return Err(ShoveError::Topology(format!(
+                "topic '{}' is sequenced; `concurrent_processing` on a FIFO consumer would \
+                 break per-key ordering. Drop `with_concurrent_processing(true)` or use \
+                 `register` for unsequenced topics.",
+                T::topology().queue(),
+            )));
+        }
+
         let topology = T::topology();
         let declarer = RedisTopologyDeclarer::new(self.client.clone());
         declarer.declare(topology).await?;
@@ -206,7 +295,8 @@ impl RedisConsumerGroupRegistry {
         let resolved_handler_timeout =
             resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
 
-        let n = config.consumer_count() as usize;
+        let prefetch = config.prefetch_count.max(1);
+        let n = config.max_consumers() as usize;
         for _ in 0..n {
             let client = self.client.clone();
             let shutdown = self.shutdown.clone();
@@ -219,6 +309,7 @@ impl RedisConsumerGroupRegistry {
                     let consumer = RedisConsumer::new(client);
                     let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
                     options.handler_timeout = Some(handler_timeout);
+                    options.prefetch_count = prefetch;
                     consumer.run_fifo::<T, H>(handler, ctx, options).await
                 })
             });
@@ -306,19 +397,19 @@ mod tests {
 
     #[test]
     fn config_default_handler_timeout_is_library_default() {
-        let cfg = RedisConsumerGroupConfig::new(1);
+        let cfg = RedisConsumerGroupConfig::new(1..=1);
         assert_eq!(cfg.handler_timeout(), Some(DEFAULT_HANDLER_TIMEOUT));
     }
 
     #[test]
     fn with_handler_timeout_round_trips() {
-        let cfg = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::from_secs(7));
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(7));
         assert_eq!(cfg.handler_timeout(), Some(Duration::from_secs(7)));
     }
 
     #[test]
     fn config_inherit_resolves_to_registry_default_when_set() {
-        let cfg = RedisConsumerGroupConfig::new(1);
+        let cfg = RedisConsumerGroupConfig::new(1..=1);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
             Duration::from_secs(45),
@@ -327,7 +418,7 @@ mod tests {
 
     #[test]
     fn with_handler_timeout_beats_registry_default() {
-        let cfg = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::from_secs(5));
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(5));
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
             Duration::from_secs(5),
@@ -337,40 +428,78 @@ mod tests {
     #[test]
     #[should_panic(expected = "handler_timeout must be positive")]
     fn with_handler_timeout_zero_panics() {
-        let _ = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::ZERO);
+        let _ = RedisConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::ZERO);
     }
 
     #[test]
-    fn config_consumer_count() {
-        let cfg = RedisConsumerGroupConfig::new(4);
-        assert_eq!(cfg.consumer_count(), 4);
+    fn config_consumer_range() {
+        let cfg = RedisConsumerGroupConfig::new(2..=4);
+        assert_eq!(cfg.min_consumers(), 2);
+        assert_eq!(cfg.max_consumers(), 4);
     }
 
     #[test]
-    fn config_default_count_is_one() {
+    fn config_default_range_is_one_to_four() {
         let cfg = RedisConsumerGroupConfig::default();
-        assert_eq!(cfg.consumer_count(), 1);
+        assert_eq!(cfg.min_consumers(), 1);
+        assert_eq!(cfg.max_consumers(), 4);
     }
 
     #[test]
     fn config_zero_clamped_to_one() {
-        let cfg = RedisConsumerGroupConfig::new(0);
-        assert_eq!(cfg.consumer_count(), 1);
+        let cfg = RedisConsumerGroupConfig::new(0..=0);
+        assert_eq!(cfg.min_consumers(), 1);
+        assert_eq!(cfg.max_consumers(), 1);
     }
 
     #[test]
     fn config_large_consumer_count() {
-        let cfg = RedisConsumerGroupConfig::new(u16::MAX);
-        assert_eq!(cfg.consumer_count(), u16::MAX);
+        let cfg = RedisConsumerGroupConfig::new(u16::MAX..=u16::MAX);
+        assert_eq!(cfg.max_consumers(), u16::MAX);
     }
 
     #[test]
-    fn config_builder_chain_consumer_count_accessible() {
-        let cfg = RedisConsumerGroupConfig::new(8);
-        // Verify `consumer_count()` returns the configured value.
-        assert_eq!(cfg.consumer_count(), 8);
-        // Clone should preserve the value.
-        let cloned = cfg.clone();
-        assert_eq!(cloned.consumer_count(), 8);
+    fn config_default_prefetch_count_is_ten() {
+        let cfg = RedisConsumerGroupConfig::default();
+        assert_eq!(cfg.prefetch_count(), 10);
+    }
+
+    #[test]
+    fn config_default_concurrent_processing_is_false() {
+        let cfg = RedisConsumerGroupConfig::default();
+        assert!(!cfg.concurrent_processing());
+    }
+
+    #[test]
+    fn with_prefetch_count_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_prefetch_count(64);
+        assert_eq!(cfg.prefetch_count(), 64);
+    }
+
+    #[test]
+    fn with_concurrent_processing_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_concurrent_processing(true);
+        assert!(cfg.concurrent_processing());
+    }
+
+    #[test]
+    fn builder_chain_preserves_all_fields() {
+        let cfg = RedisConsumerGroupConfig::new(2..=8)
+            .with_prefetch_count(32)
+            .with_concurrent_processing(true)
+            .with_handler_timeout(Duration::from_secs(3));
+        assert_eq!(cfg.min_consumers(), 2);
+        assert_eq!(cfg.max_consumers(), 8);
+        assert_eq!(cfg.prefetch_count(), 32);
+        assert!(cfg.concurrent_processing());
+        assert_eq!(cfg.handler_timeout(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    #[should_panic(expected = "min_consumers")]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn config_min_greater_than_max_panics() {
+        // Intentionally inverted: the constructor must assert that min <= max.
+        let _ = RedisConsumerGroupConfig::new(5..=2);
     }
 }

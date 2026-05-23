@@ -93,7 +93,7 @@ async fn main() -> Result<(), shove::ShoveError> {
     let mut group = broker.consumer_group();
     group
         .register::<Orders, _>(
-            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1)),
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1..=1)),
             || Handler,
         )
         .await?;
