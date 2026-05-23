@@ -130,9 +130,13 @@ async fn redis_url() -> &'static str {
             let url = format!("redis://{host}:{port}/");
             REDIS_CONTAINER.set(Mutex::new(Some(container))).ok();
             ATEXIT_REGISTERED.call_once(|| {
-                // SAFETY: `atexit` only requires that the registered function
-                // be safe to call at process exit. Our cleanup is independent
-                // of static destructors and uses its own runtime/thread.
+                // SAFETY: `atexit` requires the registered function be safe to
+                // call at process exit; our cleanup is independent of static
+                // destructors and uses its own runtime/thread. Note that
+                // `std::thread::spawn` inside an `atexit` handler is not
+                // strictly guaranteed by POSIX, but is reliable on the
+                // platforms this crate targets (macOS, Linux with glibc/musl).
+                // Worst-case failure mode is a leaked container, not UB.
                 unsafe { libc::atexit(cleanup_shared_redis_container) };
             });
             url
