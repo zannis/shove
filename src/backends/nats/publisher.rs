@@ -123,12 +123,8 @@ impl NatsPublisher {
 }
 
 impl NatsPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
-        let payload = serde_json::to_vec(message)?;
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
         let headers = Self::build_headers(None);
@@ -140,13 +136,9 @@ impl NatsPublisher {
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
-    ) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         validate_headers(&extra_headers)?;
-        let payload = serde_json::to_vec(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
         let headers = Self::build_headers(Some(&extra_headers));
@@ -154,16 +146,12 @@ impl NatsPublisher {
             .await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         let topology = T::topology();
         let prepared: Result<Vec<(String, HeaderMap, Bytes)>> = messages
             .iter()
             .map(|msg| {
-                let payload = serde_json::to_vec(msg)?;
+                let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
                 let subject = Self::resolve_subject::<T>(topology, msg);
                 let headers = Self::build_headers(None);
                 Ok((subject, headers, Bytes::from(payload)))
