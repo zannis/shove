@@ -77,9 +77,30 @@ impl fmt::Debug for KafkaTls {
 #[cfg(feature = "kafka-ssl")]
 #[derive(Clone)]
 pub enum KafkaSasl {
-    Plain { username: String, password: String },
-    ScramSha256 { username: String, password: String },
-    ScramSha512 { username: String, password: String },
+    Plain {
+        username: String,
+        password: String,
+    },
+    ScramSha256 {
+        username: String,
+        password: String,
+    },
+    ScramSha512 {
+        username: String,
+        password: String,
+    },
+
+    /// AWS MSK IAM authentication. Token is refreshed automatically by
+    /// `MskIamTokenProvider` ahead of expiry (~15 min cadence).
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam {
+        /// AWS region the MSK cluster lives in (e.g. `"eu-west-2"`).
+        region: String,
+        /// Optional named profile to load credentials from. If `None`,
+        /// the default credential provider chain is used (env → profile
+        /// → IMDS → IRSA → SSO).
+        profile: Option<String>,
+    },
 }
 
 #[cfg(feature = "kafka-ssl")]
@@ -105,18 +126,35 @@ impl KafkaSasl {
         }
     }
 
+    #[cfg(feature = "kafka-msk-iam")]
+    pub fn msk_iam(region: impl Into<String>) -> Self {
+        Self::MskIam {
+            region: region.into(),
+            profile: None,
+        }
+    }
+
+    #[cfg(feature = "kafka-msk-iam")]
+    pub fn msk_iam_with_profile(region: impl Into<String>, profile: impl Into<String>) -> Self {
+        Self::MskIam {
+            region: region.into(),
+            profile: Some(profile.into()),
+        }
+    }
+
     /// librdkafka mechanism string for this variant (e.g. `"PLAIN"`).
     pub(super) fn mechanism(&self) -> &'static str {
         match self {
             Self::Plain { .. } => "PLAIN",
             Self::ScramSha256 { .. } => "SCRAM-SHA-256",
             Self::ScramSha512 { .. } => "SCRAM-SHA-512",
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam { .. } => "OAUTHBEARER",
         }
     }
 
     /// Username/password pair to feed into `sasl.username` / `sasl.password`.
-    /// Returns `None` for variants that don't use a static password (none yet,
-    /// but `MskIam` lands in Task 5).
+    /// Returns `None` for variants that don't use a static password.
     pub(super) fn credentials(&self) -> Option<(&str, &str)> {
         match self {
             Self::Plain { username, password }
@@ -124,6 +162,8 @@ impl KafkaSasl {
             | Self::ScramSha512 { username, password } => {
                 Some((username.as_str(), password.as_str()))
             }
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam { .. } => None,
         }
     }
 }
@@ -146,6 +186,12 @@ impl fmt::Debug for KafkaSasl {
                 .debug_struct("KafkaSasl::ScramSha512")
                 .field("username", username)
                 .field("password", &"<redacted>")
+                .finish(),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam { region, profile } => f
+                .debug_struct("KafkaSasl::MskIam")
+                .field("region", region)
+                .field("profile", profile)
                 .finish(),
         }
     }

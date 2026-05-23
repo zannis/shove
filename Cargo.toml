@@ -242,6 +242,10 @@ required-features = ["nats"]
 name = "kafka_integration"
 required-features = ["kafka"]
 
+[[test]]
+name = "kafka_msk_iam_unit"
+required-features = ["kafka-msk-iam"]
+
 [[example]]
 name = "kafka_basic"
 path = "examples/kafka/basic.rs"
