@@ -72,7 +72,7 @@ duplicate_window: 600s  # example: 10-minute dedup window
 
 **`cmake` is required on Windows.** The `rdkafka` crate links `librdkafka`, which requires `cmake` during the build on Windows. Linux and macOS use the standard `librdkafka` build path without additional prerequisites.
 
-**SASL/TLS.** Enable the `kafka-ssl` feature for TLS transport. `KafkaSasl` configuration supports SCRAM-SHA-256 and SCRAM-SHA-512. GSSAPI/Kerberos requires activating the `rdkafka/gssapi` feature downstream in your own `Cargo.toml`.
+**SASL/TLS.** Enable the `kafka-ssl` feature for TLS transport. `KafkaSasl` configuration supports SCRAM-SHA-256 and SCRAM-SHA-512. GSSAPI/Kerberos requires activating the `rdkafka/gssapi` feature downstream in your own `Cargo.toml`. For Amazon MSK with IAM authentication, enable the `kafka-msk-iam` feature instead — see the [Kafka backend page](/backends/kafka) for setup details.
 
 **`librdkafka` system dependency.** On Debian/Ubuntu CI runners, install the SASL development headers before building:
 
