@@ -3009,6 +3009,70 @@ async fn handler_timeout_triggers_retry() {
     broker.stop().await;
 }
 
+/// Registry default handler timeout reaches a registered handler when the
+/// per-group config does NOT call `with_handler_timeout`. Mirrors the raw
+/// `handler_timeout_triggers_retry` test but exercises the registry
+/// pre-resolution path.
+#[tokio::test]
+async fn registry_default_handler_timeout_triggers_retry() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let b = broker.broker_from(client.clone());
+    b.topology().declare::<TimeoutWork>().await.unwrap();
+
+    let publisher = b.publisher().await.unwrap();
+    publisher
+        .publish::<TimeoutWork>(&SimpleMessage {
+            body: "default-timeout-test".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = TimeoutThenAckHandler::new(Duration::from_millis(500));
+    let factory_handler = handler.clone();
+
+    let mut group = b
+        .consumer_group()
+        .with_default_handler_timeout(Duration::from_millis(100));
+    group
+        .register::<TimeoutWork, _>(
+            #[allow(clippy::absolute_paths)]
+            shove::consumer_group::ConsumerGroupConfig::new(
+                ConsumerGroupConfig::new(1..=1)
+                    .with_prefetch_count(1)
+                    .with_max_retries(3),
+            ),
+            move || factory_handler.clone(),
+        )
+        .await
+        .unwrap();
+
+    let token = group.cancellation_token();
+    let cancel = token.clone();
+    let observer_handler = handler.clone();
+    let observer = tokio::spawn(async move {
+        if observer_handler
+            .wait_for_count(2, Duration::from_secs(15))
+            .await
+        {
+            cancel.cancel();
+        }
+    });
+
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    observer.await.unwrap();
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        handler.delivery_count() >= 2,
+        "expected >=2 deliveries (timeout+retry) via registry default, got {}",
+        handler.delivery_count()
+    );
+    client.shutdown().await;
+    broker.stop().await;
+}
+
 // --- Ungraceful shutdown recovery ---
 
 /// When a sequential consumer (prefetch=1) is aborted mid-flight, unacked
@@ -5265,6 +5329,7 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     let mut group = b.consumer_group();
     group
         .register_fifo::<OrderTopic, _>(
+            #[allow(clippy::absolute_paths)]
             shove::consumer_group::ConsumerGroupConfig::new(ConsumerGroupConfig::default()),
             {
                 let h = handler.clone();

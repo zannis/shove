@@ -38,7 +38,7 @@ ConsumerGroupConfig::new(
 )
 ```
 
-Methods available on all backend configs:
+Methods available on all backend configs (per-group; the registry-level default is documented below):
 
 - **`.new(min..=max)`** — sets the consumer count range. The group starts at `min` consumers and the autoscaler can add up to `max`. Panics if `min > max`.
 - **`.with_prefetch_count(N)`** — number of unacknowledged messages the broker delivers to each consumer. Default: 10.
@@ -123,11 +123,42 @@ Each backend's consumer group config has backend-specific knobs beyond the share
 
 **Kafka (`kafka::KafkaConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`. Kafka's consumer-group protocol handles partition assignment across instances automatically.
 
+**Redis (`redis::RedisConsumerGroupConfig`)** — adds `.with_handler_timeout(Duration)` mirroring every other backend. Redis Streams uses a fixed consumer count per registration (set via `RedisConsumerGroupConfig::new(consumer_count: u16)`); there is no concurrent-processing toggle.
+
 **InMemory (`inmemory::InMemoryConsumerGroupConfig`)** — adds knobs for `max_pending_per_key` (for sequenced topics) and `max_message_size`. Useful for test-environment configuration.
 
 **SQS** — has no broker-level coordinated-group primitive. `consumer_group()` is not available on `Broker\<Sqs\>`. Refer to the [SQS overview](/backends/sqs) for scaling on SQS.
 
 For exact method signatures and backend-specific options, refer to the sidebar links to each backend's overview page.
+
+## Registry-level default handler timeout
+
+`ConsumerGroup` (returned by `broker.consumer_group()`) exposes a registry-level default that applies to every group registered through that registry whose per-group config did not call `.with_handler_timeout(...)`:
+
+```rust,no_run
+let mut group = broker
+    .consumer_group()
+    .with_default_handler_timeout(Duration::from_secs(60));
+
+group
+    .register::<OrdersTopic, _>(
+        ConsumerGroupConfig::new(RabbitMqConsumerGroupConfig::new(1..=4)),
+        || OrdersHandler,
+    )
+    .await?;
+```
+
+Resolution order, from highest priority to lowest:
+
+1. **Per-group explicit** — the config called `.with_handler_timeout(d)`. This always wins.
+2. **Registry default** — `broker.consumer_group().with_default_handler_timeout(d)`.
+3. **Library default** — 30 seconds, the value of `DEFAULT_HANDLER_TIMEOUT`.
+
+Call `.with_default_handler_timeout(...)` **before** `register` / `register_fifo`. Each backend resolves the effective timeout at registration time, so a call after the first registration has no effect on the already-registered group. `broker.consumer_group()` also returns a fresh registry on every call — a default set on one handle does not propagate to subsequent `broker.consumer_group()` results.
+
+Both `.with_handler_timeout(d)` and `.with_default_handler_timeout(d)` panic if `d` is `Duration::ZERO` — a zero timeout would otherwise perpetuate an infinite retry loop.
+
+Available on every backend that implements coordinated consumer groups (RabbitMQ, NATS, Kafka, Redis, InMemory). SQS uses the supervisor model and has no `consumer_group()` entry point; SQS users set timeouts via `ConsumerOptions::<Sqs>::with_handler_timeout` instead.
 
 ## Full walkthrough
 

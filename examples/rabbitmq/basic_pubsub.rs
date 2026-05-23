@@ -40,7 +40,9 @@ struct OrderEvent {
 define_topic!(
     MinimalOrder,
     OrderEvent,
-    TopologyBuilder::new("ex-minimal-orders").build()
+    TopologyBuilder::new("ex-minimal-orders")
+        .hold_queue(Duration::from_secs(30))
+        .build()
 );
 
 // 2. With DLQ: rejected messages land in a dead-letter queue for inspection.
@@ -174,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // [!region connect]
     let broker = Broker::<RabbitMq>::new(RabbitMqConfig::new(&uri)).await?;
+
     // [!endregion connect]
 
     // ── Declare all topologies ──
@@ -242,7 +245,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     supervisor.register::<DlqOrder, _>(RejectHandler, ConsumerOptions::<RabbitMq>::new())?;
     supervisor.register::<RetryOrder, _>(
         RetryHandler,
-        ConsumerOptions::<RabbitMq>::new().with_max_retries(3),
+        ConsumerOptions::<RabbitMq>::new()
+            .with_max_retries(3)
+            .with_prefetch_count(20),
     )?;
     supervisor.register::<ScheduledOrder, _>(DeferHandler, ConsumerOptions::<RabbitMq>::new())?;
 

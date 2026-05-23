@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner;
 use crate::consumer::{
-    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
+    resolve_handler_timeout,
 };
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
@@ -31,7 +32,7 @@ pub struct InMemoryConsumerGroupConfig {
     min_consumers: u16,
     max_consumers: u16,
     max_retries: u32,
-    handler_timeout: Option<Duration>,
+    pub(crate) handler_timeout: HandlerTimeoutConfig,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
 }
@@ -63,7 +64,7 @@ impl InMemoryConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: HandlerTimeoutConfig::Inherit,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
         }
@@ -80,12 +81,8 @@ impl InMemoryConsumerGroupConfig {
     }
 
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
-        self.handler_timeout = Some(timeout);
-        self
-    }
-
-    pub fn without_handler_timeout(mut self) -> Self {
-        self.handler_timeout = None;
+        assert!(!timeout.is_zero(), "handler_timeout must be positive");
+        self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
 
@@ -125,8 +122,13 @@ impl InMemoryConsumerGroupConfig {
         self.max_retries
     }
 
+    /// Returns the configured handler timeout. A freshly-constructed
+    /// config reports `Some(DEFAULT_HANDLER_TIMEOUT)`; a registry-level
+    /// default set via `ConsumerGroup::with_default_handler_timeout`
+    /// is not reflected here because the config does not know about
+    /// its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
-        self.handler_timeout
+        Some(resolve_handler_timeout(self.handler_timeout, None))
     }
 
     pub fn max_pending_per_key(&self) -> Option<usize> {
@@ -375,7 +377,7 @@ impl InMemoryConsumerGroup {
         let mut options = ConsumerOptionsInner::defaults_with_shutdown(child_token.clone());
         options.max_retries = self.config.max_retries;
         options.prefetch_count = self.config.prefetch_count;
-        options.handler_timeout = self.config.handler_timeout;
+        options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.max_message_size = self.config.max_message_size;
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.processing = processing.clone();
@@ -394,6 +396,7 @@ impl InMemoryConsumerGroup {
 pub struct InMemoryConsumerGroupRegistry {
     pub(crate) groups: HashMap<String, InMemoryConsumerGroup>,
     broker: Option<InMemoryBroker>,
+    pub(super) default_handler_timeout: Option<Duration>,
 }
 
 impl InMemoryConsumerGroupRegistry {
@@ -401,6 +404,7 @@ impl InMemoryConsumerGroupRegistry {
         Self {
             groups: HashMap::new(),
             broker: Some(broker),
+            default_handler_timeout: None,
         }
     }
 
@@ -409,7 +413,20 @@ impl InMemoryConsumerGroupRegistry {
         Self {
             groups,
             broker: None,
+            default_handler_timeout: None,
         }
+    }
+
+    /// Set the registry-level default handler timeout. Applies to every
+    /// group whose `InMemoryConsumerGroupConfig` did not explicitly call
+    /// `with_handler_timeout`.
+    pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
+        self.default_handler_timeout = Some(timeout);
+        self
     }
 
     pub async fn register<T, H>(
@@ -422,6 +439,12 @@ impl InMemoryConsumerGroupRegistry {
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
@@ -466,6 +489,12 @@ impl InMemoryConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
@@ -556,6 +585,48 @@ impl InMemoryConsumerGroupRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
+
+    #[test]
+    fn inherit_config_uses_library_default_with_no_registry_default() {
+        let cfg = InMemoryConsumerGroupConfig::new(1..=1);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, None),
+            DEFAULT_HANDLER_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn inherit_config_uses_registry_default_when_set() {
+        let cfg = InMemoryConsumerGroupConfig::new(1..=1);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Duration::from_secs(45),
+        );
+    }
+
+    #[test]
+    fn with_handler_timeout_beats_registry_default() {
+        let cfg =
+            InMemoryConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(5));
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "handler_timeout must be positive")]
+    fn with_handler_timeout_zero_panics() {
+        let _ = InMemoryConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "default_handler_timeout must be positive")]
+    fn with_default_handler_timeout_zero_panics() {
+        let registry = InMemoryConsumerGroupRegistry::from_groups(HashMap::new());
+        let _ = registry.with_default_handler_timeout(Duration::ZERO);
+    }
 
     fn test_group(config: InMemoryConsumerGroupConfig) -> InMemoryConsumerGroup {
         let group_token = CancellationToken::new();

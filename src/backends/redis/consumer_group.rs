@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner;
+use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::{SupervisorOutcome, tally_join_result};
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -43,6 +44,7 @@ type TaskFactory = Box<dyn FnOnce() -> BoxFuture + Send>;
 #[derive(Debug, Clone)]
 pub struct RedisConsumerGroupConfig {
     consumer_count: u16,
+    pub(crate) handler_timeout: HandlerTimeoutConfig,
 }
 
 impl RedisConsumerGroupConfig {
@@ -50,12 +52,29 @@ impl RedisConsumerGroupConfig {
     pub fn new(consumer_count: u16) -> Self {
         Self {
             consumer_count: consumer_count.max(1),
+            handler_timeout: HandlerTimeoutConfig::Inherit,
         }
+    }
+
+    /// Set the maximum time a handler may spend processing a single
+    /// message. If exceeded, the message is retried.
+    pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "handler_timeout must be positive");
+        self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
+        self
     }
 
     /// The configured consumer count.
     pub fn consumer_count(&self) -> u16 {
         self.consumer_count
+    }
+
+    /// Returns the configured handler timeout. A freshly-constructed
+    /// config reports `Some(DEFAULT_HANDLER_TIMEOUT)`; a registry-level
+    /// default is not reflected here because the config does not know
+    /// about its registry.
+    pub fn handler_timeout(&self) -> Option<Duration> {
+        Some(resolve_handler_timeout(self.handler_timeout, None))
     }
 }
 
@@ -80,6 +99,7 @@ pub struct RedisConsumerGroupRegistry {
     client: RedisClient,
     tasks: Vec<TaskFactory>,
     shutdown: CancellationToken,
+    pub(super) default_handler_timeout: Option<Duration>,
 }
 
 impl RedisConsumerGroupRegistry {
@@ -89,7 +109,20 @@ impl RedisConsumerGroupRegistry {
             client,
             tasks: Vec::new(),
             shutdown: CancellationToken::new(),
+            default_handler_timeout: None,
         }
+    }
+
+    /// Set the registry-level default handler timeout. Applies to every
+    /// group whose `RedisConsumerGroupConfig` did not explicitly call
+    /// `with_handler_timeout`. Per-group explicit settings always win.
+    pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
+        self.default_handler_timeout = Some(timeout);
+        self
     }
 
     /// Return the broker-wide shutdown token.
@@ -123,6 +156,9 @@ impl RedisConsumerGroupRegistry {
         let declarer = RedisTopologyDeclarer::new(self.client.clone());
         declarer.declare(topology).await?;
 
+        let resolved_handler_timeout =
+            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
+
         let n = config.consumer_count() as usize;
 
         for _ in 0..n {
@@ -130,11 +166,13 @@ impl RedisConsumerGroupRegistry {
             let shutdown = self.shutdown.clone();
             let handler = factory();
             let ctx = ctx.clone();
+            let handler_timeout = resolved_handler_timeout;
 
             let task: TaskFactory = Box::new(move || {
                 Box::pin(async move {
                     let consumer = RedisConsumer::new(client);
-                    let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
+                    let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
+                    options.handler_timeout = Some(handler_timeout);
                     consumer.run::<T, H>(handler, ctx, options).await
                 })
             });
@@ -165,17 +203,22 @@ impl RedisConsumerGroupRegistry {
         let declarer = RedisTopologyDeclarer::new(self.client.clone());
         declarer.declare(topology).await?;
 
+        let resolved_handler_timeout =
+            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
+
         let n = config.consumer_count() as usize;
         for _ in 0..n {
             let client = self.client.clone();
             let shutdown = self.shutdown.clone();
             let handler = factory();
             let ctx = ctx.clone();
+            let handler_timeout = resolved_handler_timeout;
 
             let task: TaskFactory = Box::new(move || {
                 Box::pin(async move {
                     let consumer = RedisConsumer::new(client);
-                    let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
+                    let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
+                    options.handler_timeout = Some(handler_timeout);
                     consumer.run_fifo::<T, H>(handler, ctx, options).await
                 })
             });
@@ -259,6 +302,43 @@ impl RedisConsumerGroupRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
+
+    #[test]
+    fn config_default_handler_timeout_is_library_default() {
+        let cfg = RedisConsumerGroupConfig::new(1);
+        assert_eq!(cfg.handler_timeout(), Some(DEFAULT_HANDLER_TIMEOUT));
+    }
+
+    #[test]
+    fn with_handler_timeout_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::from_secs(7));
+        assert_eq!(cfg.handler_timeout(), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn config_inherit_resolves_to_registry_default_when_set() {
+        let cfg = RedisConsumerGroupConfig::new(1);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Duration::from_secs(45),
+        );
+    }
+
+    #[test]
+    fn with_handler_timeout_beats_registry_default() {
+        let cfg = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::from_secs(5));
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "handler_timeout must be positive")]
+    fn with_handler_timeout_zero_panics() {
+        let _ = RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::ZERO);
+    }
 
     #[test]
     fn config_consumer_count() {

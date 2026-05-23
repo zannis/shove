@@ -1435,6 +1435,118 @@ async fn run_fifo_until_timeout_returns_clean_when_shards_finish_first() {
     assert_eq!(outcome, SupervisorOutcome::default());
 }
 
+// ---------------------------------------------------------------------------
+// Registry-level default handler timeout (ConsumerGroup path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn registry_default_handler_timeout_times_out_slow_handler() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use serde::{Deserialize, Serialize};
+    use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
+    use shove::{
+        Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome, Topic,
+        TopologyBuilder,
+    };
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Slow {
+        n: u32,
+    }
+
+    struct SlowTopic;
+    impl Topic for SlowTopic {
+        type Message = Slow;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("registry-default-timeout-test")
+                    .hold_queue(Duration::from_millis(50))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Ctx {
+        redelivered: Arc<AtomicU32>,
+    }
+
+    struct SlowHandler;
+    impl MessageHandler<SlowTopic> for SlowHandler {
+        type Context = Ctx;
+        async fn handle(&self, _msg: Slow, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
+            if meta.retry_count == 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Outcome::Ack
+            } else {
+                ctx.redelivered.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("broker");
+    broker
+        .topology()
+        .declare::<SlowTopic>()
+        .await
+        .expect("declare");
+    let ctx = Ctx {
+        redelivered: Arc::new(AtomicU32::new(0)),
+    };
+
+    let mut group = broker
+        .consumer_group()
+        .with_context(ctx.clone())
+        .with_default_handler_timeout(Duration::from_millis(50));
+    group
+        .register::<SlowTopic, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1)),
+            || SlowHandler,
+        )
+        .await
+        .expect("register");
+
+    broker
+        .publisher()
+        .await
+        .expect("publisher")
+        .publish::<SlowTopic>(&Slow { n: 1 })
+        .await
+        .expect("publish");
+
+    // Drive shutdown on observed redelivery rather than a fixed sleep so
+    // the test isn't racy on a loaded CI host.
+    let token = group.cancellation_token();
+    let redelivered_probe = ctx.redelivered.clone();
+    let canceller_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        let observed = poll_until(
+            move || redelivered_probe.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        canceller_token.cancel();
+        observed
+    });
+    let outcome = group
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
+        .await;
+    let observed = canceller.await.expect("canceller");
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        observed && ctx.redelivered.load(Ordering::SeqCst) >= 1,
+        "expected >=1 redelivery after handler timeout via registry default"
+    );
+}
+
 /// Regression test for the abort-leak: when `run_fifo_until_timeout`
 /// returns, the underlying shard task must not keep invoking handlers.
 ///
@@ -1512,5 +1624,112 @@ async fn run_fifo_until_timeout_does_not_invoke_handlers_after_return() {
         invocations_at_return, invocations_after_wait,
         "shard task kept invoking handlers after return ({} → {}, outcome: {outcome:?})",
         invocations_at_return, invocations_after_wait
+    );
+}
+
+#[tokio::test]
+async fn registry_default_handler_timeout_applies_to_fifo_registrations() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use serde::{Deserialize, Serialize};
+    use shove::inmemory::InMemoryConfig;
+    use shove::{
+        Broker, InMemory, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
+        SequencedTopic, TopologyBuilder, define_sequenced_topic,
+    };
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct LedgerEntry {
+        account_id: String,
+    }
+
+    define_sequenced_topic!(
+        SlowLedger,
+        LedgerEntry,
+        |msg| msg.account_id.clone(),
+        TopologyBuilder::new("fifo-registry-default-timeout-test")
+            .sequenced(SequenceFailure::FailAll)
+            .hold_queue(Duration::from_millis(50))
+            .dlq()
+            .build()
+    );
+
+    #[derive(Clone)]
+    struct Ctx {
+        redelivered: Arc<AtomicU32>,
+    }
+
+    struct SlowHandler;
+    impl MessageHandler<SlowLedger> for SlowHandler {
+        type Context = Ctx;
+        async fn handle(&self, _msg: LedgerEntry, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
+            if meta.retry_count == 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Outcome::Ack
+            } else {
+                ctx.redelivered.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("broker");
+    broker
+        .topology()
+        .declare::<SlowLedger>()
+        .await
+        .expect("declare");
+    let ctx = Ctx {
+        redelivered: Arc::new(AtomicU32::new(0)),
+    };
+
+    let mut group = broker
+        .consumer_group()
+        .with_context(ctx.clone())
+        .with_default_handler_timeout(Duration::from_millis(50));
+    group
+        .register_fifo::<SlowLedger, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
+            || SlowHandler,
+        )
+        .await
+        .expect("register_fifo");
+
+    broker
+        .publisher()
+        .await
+        .expect("publisher")
+        .publish::<SlowLedger>(&LedgerEntry {
+            account_id: "acct-1".into(),
+        })
+        .await
+        .expect("publish");
+
+    // Drive shutdown on observed redelivery rather than a fixed sleep so
+    // the test isn't racy on a loaded CI host.
+    let token = group.cancellation_token();
+    let redelivered_probe = ctx.redelivered.clone();
+    let canceller_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        let observed = poll_until(
+            move || redelivered_probe.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(5),
+        )
+        .await;
+        canceller_token.cancel();
+        observed
+    });
+    let outcome = group
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
+        .await;
+    let observed = canceller.await.expect("canceller");
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        observed && ctx.redelivered.load(Ordering::SeqCst) >= 1,
+        "registry default handler timeout did not propagate to FIFO registrations",
     );
 }

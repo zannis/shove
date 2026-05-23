@@ -12,12 +12,13 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::nats::client::NatsClient;
 use crate::backends::nats::consumer::NatsConsumer;
 use crate::backends::nats::topology::NatsTopologyDeclarer;
+use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
 use crate::topic::{SequencedTopic, Topic};
-use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
@@ -32,7 +33,7 @@ pub struct NatsConsumerGroupConfig {
     min_consumers: u16,
     max_consumers: u16,
     max_retries: u32,
-    handler_timeout: Option<Duration>,
+    pub(crate) handler_timeout: HandlerTimeoutConfig,
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
@@ -62,7 +63,7 @@ impl NatsConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: HandlerTimeoutConfig::Inherit,
             concurrent_processing: false,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
@@ -80,7 +81,8 @@ impl NatsConsumerGroupConfig {
     }
 
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
-        self.handler_timeout = Some(timeout);
+        assert!(!timeout.is_zero(), "handler_timeout must be positive");
+        self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
 
@@ -105,8 +107,13 @@ impl NatsConsumerGroupConfig {
         self.max_retries
     }
 
+    /// Returns the configured handler timeout. A freshly-constructed
+    /// config reports `Some(DEFAULT_HANDLER_TIMEOUT)`; a registry-level
+    /// default set via `ConsumerGroup::with_default_handler_timeout`
+    /// is not reflected here because the config does not know about
+    /// its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
-        self.handler_timeout
+        Some(resolve_handler_timeout(self.handler_timeout, None))
     }
 
     pub fn concurrent_processing(&self) -> bool {
@@ -369,7 +376,7 @@ impl NatsConsumerGroup {
         options.max_retries = self.config.max_retries;
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
-        options.handler_timeout = self.config.handler_timeout;
+        options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
@@ -386,6 +393,7 @@ impl NatsConsumerGroup {
 pub struct NatsConsumerGroupRegistry {
     pub(crate) groups: HashMap<String, NatsConsumerGroup>,
     client: Option<NatsClient>,
+    pub(super) default_handler_timeout: Option<Duration>,
 }
 
 impl NatsConsumerGroupRegistry {
@@ -393,6 +401,7 @@ impl NatsConsumerGroupRegistry {
         Self {
             groups: HashMap::new(),
             client: Some(client),
+            default_handler_timeout: None,
         }
     }
 
@@ -403,7 +412,20 @@ impl NatsConsumerGroupRegistry {
         Self {
             groups,
             client: None,
+            default_handler_timeout: None,
         }
+    }
+
+    /// Set the registry-level default handler timeout. Applies to every
+    /// group whose `NatsConsumerGroupConfig` did not explicitly call
+    /// `with_handler_timeout`. Per-group explicit settings always win.
+    pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            !timeout.is_zero(),
+            "default_handler_timeout must be positive"
+        );
+        self.default_handler_timeout = Some(timeout);
+        self
     }
 
     /// Return the client's shutdown token.
@@ -427,6 +449,12 @@ impl NatsConsumerGroupRegistry {
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
@@ -477,6 +505,12 @@ impl NatsConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
@@ -551,6 +585,7 @@ impl NatsConsumerGroupRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
     fn test_group(config: NatsConsumerGroupConfig) -> NatsConsumerGroup {
         let group_token = CancellationToken::new();
@@ -760,5 +795,47 @@ mod tests {
     #[allow(clippy::reversed_empty_ranges)]
     fn new_panics_if_min_greater_than_max() {
         let _ = NatsConsumerGroupConfig::new(5..=2);
+    }
+
+    // -- handler timeout tri-state --
+
+    #[test]
+    fn inherit_config_uses_library_default_with_no_registry_default() {
+        let cfg = NatsConsumerGroupConfig::new(1..=4);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, None),
+            DEFAULT_HANDLER_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn inherit_config_uses_registry_default_when_set() {
+        let cfg = NatsConsumerGroupConfig::new(1..=4);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Duration::from_secs(45),
+        );
+    }
+
+    #[test]
+    fn with_handler_timeout_beats_registry_default() {
+        let cfg = NatsConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(5));
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "handler_timeout must be positive")]
+    fn with_handler_timeout_zero_panics() {
+        let _ = NatsConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "default_handler_timeout must be positive")]
+    fn with_default_handler_timeout_zero_panics() {
+        let registry = NatsConsumerGroupRegistry::from_groups(HashMap::new());
+        let _ = registry.with_default_handler_timeout(Duration::ZERO);
     }
 }

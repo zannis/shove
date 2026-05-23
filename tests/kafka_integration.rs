@@ -1341,6 +1341,82 @@ async fn consumer_group_processes_messages() {
     broker.close().await;
 }
 
+// Registry default handler timeout reaches a registered handler when the
+// per-group config does NOT call `with_handler_timeout`. Mirrors the
+// raw-consumer `handler_timeout_triggers_retry` test but exercises the
+// registry pre-resolution path.
+#[tokio::test]
+async fn registry_default_handler_timeout_triggers_retry() {
+    use shove::ConsumerGroupConfig;
+
+    #[derive(Clone)]
+    struct TimeoutThenAck(WaitableCounter);
+
+    impl MessageHandler<WorkTopic> for TimeoutThenAck {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            let attempt = self.0.get();
+            self.0.increment();
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Outcome::Ack
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "default-timeout-1".into(),
+            content: "default timeout".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = TimeoutThenAck(WaitableCounter::new());
+    let counter = handler.0.clone();
+    let factory_handler = handler.clone();
+
+    let mut group = broker
+        .consumer_group()
+        .with_default_handler_timeout(Duration::from_millis(500));
+    group
+        .register::<WorkTopic, _>(
+            ConsumerGroupConfig::new(
+                KafkaConsumerGroupConfig::new(1..=1)
+                    .with_prefetch_count(1)
+                    .with_max_retries(5),
+            ),
+            move || factory_handler.clone(),
+        )
+        .await
+        .unwrap();
+
+    let token = group.cancellation_token();
+    let cancel = token.clone();
+    let observer = tokio::spawn(async move {
+        if counter.wait_for(2, TIMEOUT).await {
+            cancel.cancel();
+        }
+    });
+
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    observer.await.unwrap();
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        handler.0.get() >= 2,
+        "expected >=2 invocations (timeout+retry) via registry default, got {}",
+        handler.0.get()
+    );
+    broker.close().await;
+}
+
 // ===========================================================================
 // Edge cases
 // ===========================================================================

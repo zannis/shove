@@ -68,8 +68,22 @@ impl ConsumerOptionsInner {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn test_shutdown() -> CancellationToken {
         CancellationToken::new()
+    }
+}
+
+impl ConsumerOptionsInner {
+    /// Returns `Ok(())` if the payload is within the configured
+    /// `max_message_size`, or an error if it exceeds the limit. Always
+    /// succeeds when no limit is set.
+    ///
+    /// Only some backend consumers route through this helper; a feature-limited
+    /// build (e.g. just `aws-sns-sqs`) may not call it at all.
+    #[allow(dead_code)]
+    pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
+        validate_message_size(len, self.max_message_size)
     }
 }
 
@@ -95,18 +109,5 @@ mod tests {
         assert!(opts.max_pending_per_key.is_some());
         assert!(opts.max_message_size.is_some());
         assert!(opts.consumer_group.is_none());
-    }
-}
-
-impl ConsumerOptionsInner {
-    /// Returns `Ok(())` if the payload is within the configured
-    /// `max_message_size`, or an error if it exceeds the limit. Always
-    /// succeeds when no limit is set.
-    ///
-    /// Only some backend consumers route through this helper; a feature-limited
-    /// build (e.g. just `aws-sns-sqs`) may not call it at all.
-    #[allow(dead_code)]
-    pub(crate) fn validate_payload_message_size(&self, len: usize) -> Result<()> {
-        validate_message_size(len, self.max_message_size)
     }
 }
