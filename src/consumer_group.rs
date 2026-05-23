@@ -88,6 +88,15 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
             .await
     }
 
+    /// Set a default handler timeout applied to every group registered
+    /// through this `ConsumerGroup` whose per-group config did not call
+    /// `with_handler_timeout` (or `without_handler_timeout`, on backends
+    /// that expose it). Per-group explicit settings always win.
+    pub fn with_default_handler_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.set_default_handler_timeout(timeout);
+        self
+    }
+
     pub fn cancellation_token(&self) -> CancellationToken {
         self.inner.cancellation_token()
     }
@@ -191,6 +200,31 @@ mod tests {
                 ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
                 || NoopHandler,
             )
+            .await
+            .expect("register_fifo");
+
+        let outcome = group
+            .run_until_timeout(std::future::ready(()), Duration::from_millis(500))
+            .await;
+        assert_eq!(outcome.exit_code(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_default_handler_timeout_chains_and_runs_clean() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker
+            .topology()
+            .declare::<Ledger>()
+            .await
+            .expect("declare");
+
+        let mut group = broker
+            .consumer_group()
+            .with_default_handler_timeout(Duration::from_secs(5));
+        group
+            .register_fifo::<Ledger, _>(|| NoopHandler)
             .await
             .expect("register_fifo");
 
