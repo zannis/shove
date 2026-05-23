@@ -55,6 +55,12 @@ pub(crate) trait RegistryImpl: Send {
 
     fn cancellation_token(&self) -> CancellationToken;
 
+    /// Set the registry-level default handler timeout. Applies to every
+    /// group whose `ConsumerGroupConfig` did not explicitly call
+    /// `with_handler_timeout` (or `without_handler_timeout`, where the
+    /// backend exposes it).
+    fn set_default_handler_timeout(&mut self, timeout: Duration);
+
     /// Run the registered consumer-group loops until `signal` resolves or
     /// the group's cancellation token fires, then drain in-flight work
     /// with a bounded grace window and return a `SupervisorOutcome`.
