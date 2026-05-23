@@ -224,6 +224,11 @@ name = "nats_audited_consumer"
 path = "examples/nats/audited_consumer.rs"
 required-features = ["nats", "audit"]
 
+[[example]]
+name = "nats_raw_bytes"
+path = "examples/nats/raw_bytes.rs"
+required-features = ["nats"]
+
 [[test]]
 name = "rabbitmq_integration"
 required-features = ["rabbitmq"]
