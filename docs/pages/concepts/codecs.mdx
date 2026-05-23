@@ -50,7 +50,7 @@ Enable the `protobuf` cargo feature, derive `prost::Message` on the payload, and
 // [!include ~/examples/kafka/protobuf_pubsub.rs:topic]
 ```
 
-`ProtobufCodec<M>` works for any `M: prost::Message + Default`. Encoding pre-sizes the buffer via `encoded_len`, so a single allocation covers the common case. Decoding failures surface as `ShoveError::Codec { codec: "protobuf", .. }` rather than `Serialization`, so handlers and middleware can distinguish protobuf-decode errors from JSON ones.
+`ProtobufCodec` is a single marker that implements `Codec<M>` for every `M: prost::Message + Default`. One topic can use `codec = ProtobufCodec` for `OrderEvent`, another for `UserCreated`, and so on — each call site picks the matching impl through `<ProtobufCodec as Codec<T::Message>>`. Encoding pre-sizes the buffer via `encoded_len`, so a single allocation covers the common case. Decoding failures surface as `ShoveError::Codec { codec: "protobuf", .. }` rather than `Serialization`, so handlers and middleware can distinguish protobuf-decode errors from JSON ones.
 
 Runnable example: [`examples/kafka/protobuf_pubsub.rs`](https://github.com/zannis/shove/blob/main/examples/kafka/protobuf_pubsub.rs).
 
@@ -107,7 +107,7 @@ define_topic!(
     Orders,
     myservice::OrderEvent,
     TopologyBuilder::new("orders").dlq().build(),
-    codec = ProtobufCodec<myservice::OrderEvent>
+    codec = ProtobufCodec
 );
 ```
 

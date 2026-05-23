@@ -31,7 +31,7 @@ shove::define_topic!(
     Orders,
     OrderEvent,
     TopologyBuilder::new("kafka-orders-proto").dlq().build(),
-    codec = ProtobufCodec<OrderEvent>
+    codec = ProtobufCodec
 );
 // [!endregion topic]
 
