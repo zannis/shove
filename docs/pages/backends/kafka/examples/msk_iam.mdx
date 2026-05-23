@@ -1,0 +1,98 @@
+# Kafka — MSK IAM
+
+Round-trips a single `Ping` message against an IAM-enabled Amazon MSK cluster, using `SASL_SSL` + `OAUTHBEARER` with auto-refreshed presigned tokens. Run this against a real MSK cluster you have access to — it's the canonical end-to-end check for the `kafka-msk-iam` feature.
+
+## Prerequisites
+
+- A running MSK cluster with IAM authentication enabled
+- AWS credentials available via the standard provider chain (env vars, shared credentials file, EC2 instance metadata, EKS pod identity / IRSA, or SSO)
+- The caller's principal must have `kafka-cluster:Connect` on the cluster (plus `kafka-cluster:WriteData` and `ReadData` on the topic for the publish/consume round-trip)
+- Cargo features: `kafka-msk-iam` (implies `kafka-ssl`)
+
+## Run
+
+```sh
+MSK_BROKERS=b-1.example.kafka.us-east-1.amazonaws.com:9098,b-2.example.kafka.us-east-1.amazonaws.com:9098 \
+AWS_REGION=us-east-1 \
+  cargo run --example kafka_msk_iam --features kafka-msk-iam
+```
+
+For a non-default named profile, set `AWS_PROFILE` alongside the rest — the AWS SDK picks it up via the standard provider chain. The example uses `KafkaSasl::msk_iam(region)`, which is the no-profile form. To pin a specific profile in code, swap in `KafkaSasl::msk_iam_with_profile(region, profile)`.
+
+## Expected output
+
+```text
+Using topic: shove-msk-iam-example-7a3f9c4e8b1d4e2a9c6f5b8d3e1a4f7b
+Connecting to MSK cluster at b-1.example.kafka.us-east-1.amazonaws.com:9098,... (region=us-east-1) …
+Connected.
+Published ping: id=4f2a8b3c-1d5e-4f6a-9b8c-2d7e3a5f8b1c
+Received ping: id=4f2a8b3c-1d5e-4f6a-9b8c-2d7e3a5f8b1c
+Done.
+```
+
+## Source
+
+```rust
+// [!include ~/examples/kafka/msk_iam.rs]
+```
+
+## Walkthrough
+
+### IAM auth on the `KafkaConfig`
+
+```rust
+let config = KafkaConfig::new(&brokers)
+    .with_tls(KafkaTls::default())
+    .with_sasl(KafkaSasl::msk_iam(&region));
+```
+
+`KafkaTls::default()` is the right TLS configuration for MSK — clusters use publicly-signed ACM certificates, so the OS trust store handles validation. There's nothing to download, no CA path to set.
+
+`KafkaSasl::msk_iam(region)` selects the OAUTHBEARER mechanism and binds the token signer to `region`. Behind the scenes shove sets `security.protocol=SASL_SSL`, `sasl.mechanism=OAUTHBEARER`, and installs a custom `ClientContext` whose token-refresh callback signs a fresh presigned URL via `aws-msk-iam-sasl-signer` whenever librdkafka asks for one (every ~12 minutes at default expiry).
+
+If you forget to call `with_tls(...)` for an MSK IAM config, `Broker::<Kafka>::new` returns `ShoveError::Topology` at connect time — presigned tokens over plaintext are a misconfiguration, not a runtime fallback.
+
+### Per-run topic name
+
+```rust
+let topic_name = format!("shove-msk-iam-example-{}", Uuid::new_v4().simple());
+PING_TOPOLOGY
+    .set(TopologyBuilder::new(&topic_name).build())
+    .expect("PING_TOPOLOGY already initialised");
+```
+
+The `Topic::topology()` method must return a `&'static QueueTopology`, but the topic name needs to differ across runs so reruns don't collide on the cluster. The example resolves this with a `OnceLock` initialised in `main` before the broker starts — the topology is set exactly once, then returned by reference forever after.
+
+### Topic provisioning
+
+```rust
+broker.topology().declare::<PingTopic>().await?;
+```
+
+`declare` creates the Kafka topics that back the topology (one main topic plus DLQ + hold queues if configured). The caller's IAM principal needs `kafka-cluster:CreateTopic` on the cluster ARN. In production where topology is pre-provisioned by infrastructure, this call is idempotent — it does nothing if the topics already exist with sufficient partitions.
+
+### Single consumer in a group
+
+```rust
+group
+    .register::<PingTopic, _>(
+        ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+        || PingHandler,
+    )
+    .await?;
+```
+
+`1..=1` pins exactly one consumer in the group, which keeps the example deterministic. For real workloads, see the [Basic example](/backends/kafka/examples/basic) for how the group scales partition assignment dynamically.
+
+## Token rotation
+
+Tokens are signed locally — no network call to AWS per refresh. librdkafka schedules a refresh at ~20% of the remaining lifetime (so ~3 minutes before expiry for a 15-minute token). The refresh callback runs on librdkafka's internal poll thread; shove bridges it to the async AWS signer via a Tokio runtime handle captured at `connect()` time.
+
+Do not set `sasl.oauthbearer.config` manually. The shove integration owns this property.
+
+## What to try next
+
+- Stop the running example mid-flight, revoke the caller's `kafka-cluster:Connect` permission for ~30 seconds, then restore it — librdkafka will report auth failures during the gap and recover on the next refresh.
+- Switch to `KafkaSasl::msk_iam_with_profile(region, "production")` and confirm shove reads credentials from the named profile instead of the default chain.
+- Wire this same code into a long-running consumer service and observe token-refresh log lines from librdkafka over a multi-hour run.
+- See the [Kafka backend overview](/backends/kafka) for the cargo feature matrix and other auth modes.
