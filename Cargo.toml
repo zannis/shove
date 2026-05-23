@@ -281,6 +281,11 @@ name = "kafka_msk_iam"
 path = "examples/kafka/msk_iam.rs"
 required-features = ["kafka-msk-iam"]
 
+[[example]]
+name = "kafka_protobuf_pubsub"
+path = "examples/kafka/protobuf_pubsub.rs"
+required-features = ["kafka", "protobuf"]
+
 [[test]]
 name = "inmemory_integration"
 required-features = ["inmemory"]
