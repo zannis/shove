@@ -28,3 +28,53 @@ pub trait Codec<M>: Send + Sync + 'static {
     /// Decode `bytes` into a value of type `M`.
     fn decode(bytes: &[u8]) -> Result<M>;
 }
+
+use serde::{Serialize, de::DeserializeOwned};
+
+/// JSON codec — the default. Routes through `serde_json` and surfaces
+/// failures via [`ShoveError::Serialization`] for back-compat with code that
+/// pattern-matches on that variant.
+pub struct JsonCodec;
+
+impl<M> Codec<M> for JsonCodec
+where
+    M: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    const NAME: &'static str = "json";
+
+    fn encode(value: &M) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(value)?)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<M> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Sample {
+        id: String,
+        n: u64,
+    }
+
+    #[test]
+    fn json_codec_round_trip() {
+        let sample = Sample {
+            id: "abc".into(),
+            n: 42,
+        };
+        let bytes = <JsonCodec as Codec<Sample>>::encode(&sample).unwrap();
+        let decoded = <JsonCodec as Codec<Sample>>::decode(&bytes).unwrap();
+        assert_eq!(decoded, sample);
+    }
+
+    #[test]
+    fn json_codec_name_is_json() {
+        assert_eq!(<JsonCodec as Codec<Sample>>::NAME, "json");
+    }
+}
