@@ -300,7 +300,17 @@ impl KafkaClient {
                 (false, true) => Some("SASL_PLAINTEXT"),
                 (false, false) => None,
             };
-            if config.sasl.is_some() && config.tls.is_none() {
+            // Only warn for mechanisms that actually transmit a static
+            // username/password. OAUTHBEARER (MSK IAM) sends a signed token
+            // instead, and MSK IAM is rejected outright below if TLS is off —
+            // suppressing the warning here keeps the eventual Topology error
+            // the only thing the operator sees.
+            if config
+                .sasl
+                .as_ref()
+                .is_some_and(|s| s.credentials().is_some())
+                && config.tls.is_none()
+            {
                 tracing::warn!(
                     "Kafka SASL enabled without TLS; credentials will be sent in plaintext over the network"
                 );
