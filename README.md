@@ -16,6 +16,7 @@ Type-safe async pub/sub for Rust. One API across RabbitMQ, AWS SNS+SQS, NATS Jet
 - **Retry topologies without glue code** — escalating backoff through hold queues, DLQ routing, retry budgets, handler timeouts.
 - **Strict per-key ordering** — `SequencedTopic` with pluggable failure policies (`Skip` or `FailAll`), enforced by the broker.
 - **Consumer groups + autoscaling** — min/max bounds driven by queue depth (or consumer lag on Kafka), with optional structured audit trails.
+- **Pluggable codecs** — JSON by default; opt into Protobuf (via the `protobuf` feature), raw bytes, or a custom `Codec<M>` per topic without touching backend code.
 - **One API across six backends** — swap the transport without changing topic definitions or handlers.
 
 If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, `async-nats`, or `rdkafka` directly. `shove` is the layer for multi-service event flows that need operational discipline.
@@ -93,7 +94,7 @@ Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` — the topic
 
 `cargo add shove --features <flag>`. No features are enabled by default. Decision guide: [Choosing a backend](https://shove.rs/backends/choosing).
 
-Optional add-ons: `audit` (built-in `ShoveAuditHandler` + `AuditLog` topic), `metrics` (Prometheus/StatsD/OTel via the [`metrics`](https://docs.rs/metrics) facade), `kafka-ssl` (TLS + SASL), `rabbitmq-transactional` (exactly-once routing).
+Optional add-ons: `audit` (built-in `ShoveAuditHandler` + `AuditLog` topic), `metrics` (Prometheus/StatsD/OTel via the [`metrics`](https://docs.rs/metrics) facade), `kafka-ssl` (TLS + SASL), `rabbitmq-transactional` (exactly-once routing), `protobuf` (`ProtobufCodec<M>` for `prost`-generated messages).
 
 ## Delivery
 
@@ -121,7 +122,7 @@ MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91. Reproducible via
 ## Learn more
 
 - [Getting Started](https://shove.rs/getting-started) — install, declare your first topic, publish and consume on every backend
-- [Core concepts](https://shove.rs/concepts/topics) — topics & topology, outcomes, handlers & context, the `Broker<B>` pattern
+- [Core concepts](https://shove.rs/concepts/topics) — topics & topology, codecs, outcomes, handlers & context, the `Broker<B>` pattern
 - [Guides](https://shove.rs/guides/retries) — retries, sequenced delivery, consumer groups, audit, observability, exactly-once, shutdown
 - [Backends](https://shove.rs/backends/choosing) — per-backend overviews and runnable examples
 - [docs.rs/shove](https://docs.rs/shove) — full rustdoc
