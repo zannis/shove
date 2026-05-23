@@ -205,6 +205,10 @@ mod shove_backend {
         }
     }
 
+    // The `T::Message: Serialize` bound below is required by the
+    // `serde_json::to_value(&record.payload)` call inside `audit`; the trait
+    // itself is codec-agnostic, so the bound lives on the impl block where
+    // JSON serialization actually happens.
     impl<T, B> AuditHandler<T> for ShoveAuditHandler<B>
     where
         T: Topic,

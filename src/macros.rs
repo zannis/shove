@@ -246,4 +246,12 @@ mod tests {
     fn define_sequenced_topic_has_dlq() {
         assert_eq!(MacroSeqTopic::topology().dlq(), Some("macro-seq-dlq"));
     }
+
+    #[test]
+    fn define_sequenced_topic_default_codec_is_json() {
+        assert_eq!(
+            <<MacroSeqTopic as Topic>::Codec as Codec<<MacroSeqTopic as Topic>::Message>>::NAME,
+            "json"
+        );
+    }
 }
