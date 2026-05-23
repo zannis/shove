@@ -1,5 +1,6 @@
 /// Errors that can occur during pub/sub operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ShoveError {
     /// Failed to serialize or deserialize a message.
     #[error("serialization error: {0}")]
