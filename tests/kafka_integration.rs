@@ -1599,13 +1599,17 @@ async fn deserialization_failure_rejects_to_dlq() {
     let client = tb.client();
     broker.topology().declare::<WorkTopic>().await.unwrap();
 
-    // Publish raw invalid JSON directly via rdkafka producer
-    use rdkafka::producer::FutureRecord;
-    let record: FutureRecord<str, [u8]> =
-        FutureRecord::to("kafka-work").payload(b"not valid json" as &[u8]);
+    // Publish raw invalid JSON directly via the client routing method
+    use rdkafka::message::OwnedHeaders;
     client
-        .producer()
-        .send(record, Duration::from_secs(5))
+        .publish_with_retry(
+            "kafka-work",
+            None,
+            OwnedHeaders::new(),
+            b"not valid json",
+            1,
+            "test raw publish",
+        )
         .await
         .expect("raw publish should succeed");
 
@@ -1879,12 +1883,16 @@ async fn dlq_consumer_handles_deserialization_failure() {
     broker.topology().declare::<WorkTopic>().await.unwrap();
 
     // Publish raw invalid JSON directly to the DLQ topic
-    use rdkafka::producer::FutureRecord;
-    let record: FutureRecord<str, [u8]> =
-        FutureRecord::to("kafka-work-dlq").payload(b"not valid json" as &[u8]);
+    use rdkafka::message::OwnedHeaders;
     client
-        .producer()
-        .send(record, Duration::from_secs(5))
+        .publish_with_retry(
+            "kafka-work-dlq",
+            None,
+            OwnedHeaders::new(),
+            b"not valid json",
+            1,
+            "test raw publish to DLQ",
+        )
         .await
         .expect("raw publish to DLQ should succeed");
 
@@ -1894,11 +1902,15 @@ async fn dlq_consumer_handles_deserialization_failure() {
         content: "valid".into(),
     })
     .unwrap();
-    let record2: FutureRecord<str, [u8]> =
-        FutureRecord::to("kafka-work-dlq").payload(&valid_payload);
     client
-        .producer()
-        .send(record2, Duration::from_secs(5))
+        .publish_with_retry(
+            "kafka-work-dlq",
+            None,
+            OwnedHeaders::new(),
+            &valid_payload,
+            1,
+            "test valid publish to DLQ",
+        )
         .await
         .expect("valid publish to DLQ should succeed");
 

@@ -6,10 +6,19 @@ use std::time::Duration;
 
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-use rdkafka::client::DefaultClientContext;
+use rdkafka::client::{ClientContext, DefaultClientContext};
 use rdkafka::error::RDKafkaErrorCode;
+use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, Producer};
+
+use super::publisher::publish_with_retry as publisher_publish_with_retry;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(feature = "kafka-msk-iam")]
+use std::sync::Arc;
+
+#[cfg(feature = "kafka-msk-iam")]
+use super::msk_iam::{MskIamContext, MskIamTokenProvider};
 
 use crate::ShoveError;
 use crate::error::Result;
@@ -76,36 +85,96 @@ impl fmt::Debug for KafkaTls {
 /// [`KafkaConfig`] to get `SASL_SSL`; without TLS this is `SASL_PLAINTEXT`.
 #[cfg(feature = "kafka-ssl")]
 #[derive(Clone)]
-pub struct KafkaSasl {
-    /// Mechanism name — e.g. `"PLAIN"`, `"SCRAM-SHA-256"`, `"SCRAM-SHA-512"`.
-    pub mechanism: String,
-    pub username: String,
-    pub password: String,
+pub enum KafkaSasl {
+    Plain {
+        username: String,
+        password: String,
+    },
+    ScramSha256 {
+        username: String,
+        password: String,
+    },
+    ScramSha512 {
+        username: String,
+        password: String,
+    },
+
+    /// AWS MSK IAM authentication. Tokens expire after ~15 minutes;
+    /// librdkafka invokes the refresh callback at ~80% of token lifetime
+    /// (so roughly every ~12 minutes), signing a fresh presigned URL via
+    /// `MskIamTokenProvider`.
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam {
+        /// AWS region the MSK cluster lives in (e.g. `"eu-west-2"`).
+        region: String,
+        /// Optional named profile to load credentials from. If `None`,
+        /// the default credential provider chain is used (env → profile
+        /// → IMDS → IRSA → SSO).
+        profile: Option<String>,
+    },
 }
 
 #[cfg(feature = "kafka-ssl")]
 impl KafkaSasl {
     pub fn plain(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            mechanism: "PLAIN".into(),
+        Self::Plain {
             username: username.into(),
             password: password.into(),
         }
     }
 
     pub fn scram_sha_256(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            mechanism: "SCRAM-SHA-256".into(),
+        Self::ScramSha256 {
             username: username.into(),
             password: password.into(),
         }
     }
 
     pub fn scram_sha_512(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            mechanism: "SCRAM-SHA-512".into(),
+        Self::ScramSha512 {
             username: username.into(),
             password: password.into(),
+        }
+    }
+
+    #[cfg(feature = "kafka-msk-iam")]
+    pub fn msk_iam(region: impl Into<String>) -> Self {
+        Self::MskIam {
+            region: region.into(),
+            profile: None,
+        }
+    }
+
+    #[cfg(feature = "kafka-msk-iam")]
+    pub fn msk_iam_with_profile(region: impl Into<String>, profile: impl Into<String>) -> Self {
+        Self::MskIam {
+            region: region.into(),
+            profile: Some(profile.into()),
+        }
+    }
+
+    /// librdkafka mechanism string for this variant (e.g. `"PLAIN"`).
+    pub(super) fn mechanism(&self) -> &'static str {
+        match self {
+            Self::Plain { .. } => "PLAIN",
+            Self::ScramSha256 { .. } => "SCRAM-SHA-256",
+            Self::ScramSha512 { .. } => "SCRAM-SHA-512",
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam { .. } => "OAUTHBEARER",
+        }
+    }
+
+    /// Username/password pair to feed into `sasl.username` / `sasl.password`.
+    /// Returns `None` for variants that don't use a static password.
+    pub(super) fn credentials(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Plain { username, password }
+            | Self::ScramSha256 { username, password }
+            | Self::ScramSha512 { username, password } => {
+                Some((username.as_str(), password.as_str()))
+            }
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam { .. } => None,
         }
     }
 }
@@ -113,11 +182,29 @@ impl KafkaSasl {
 #[cfg(feature = "kafka-ssl")]
 impl fmt::Debug for KafkaSasl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KafkaSasl")
-            .field("mechanism", &self.mechanism)
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
-            .finish()
+        match self {
+            Self::Plain { username, .. } => f
+                .debug_struct("KafkaSasl::Plain")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::ScramSha256 { username, .. } => f
+                .debug_struct("KafkaSasl::ScramSha256")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::ScramSha512 { username, .. } => f
+                .debug_struct("KafkaSasl::ScramSha512")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam { region, profile } => f
+                .debug_struct("KafkaSasl::MskIam")
+                .field("region", region)
+                .field("profile", profile)
+                .finish(),
+        }
     }
 }
 
@@ -187,8 +274,17 @@ pub struct KafkaClient {
     /// TLS/SASL settings. Every consumer/admin/metadata call clones this
     /// so security settings never have to be re-applied at call sites.
     base_config: ClientConfig,
-    producer: FutureProducer,
+    producer: KafkaProducerInner,
+    #[cfg(feature = "kafka-msk-iam")]
+    msk_context: Option<MskIamContext>,
     shutdown_token: CancellationToken,
+}
+
+#[derive(Clone)]
+enum KafkaProducerInner {
+    Default(FutureProducer<DefaultClientContext>),
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam(FutureProducer<MskIamContext>),
 }
 
 impl KafkaClient {
@@ -206,7 +302,17 @@ impl KafkaClient {
                 (false, true) => Some("SASL_PLAINTEXT"),
                 (false, false) => None,
             };
-            if config.sasl.is_some() && config.tls.is_none() {
+            // Only warn for mechanisms that actually transmit a static
+            // username/password. OAUTHBEARER (MSK IAM) sends a signed token
+            // instead, and MSK IAM is rejected outright below if TLS is off —
+            // suppressing the warning here keeps the eventual Topology error
+            // the only thing the operator sees.
+            if config
+                .sasl
+                .as_ref()
+                .is_some_and(|s| s.credentials().is_some())
+                && config.tls.is_none()
+            {
                 tracing::warn!(
                     "Kafka SASL enabled without TLS; credentials will be sent in plaintext over the network"
                 );
@@ -243,24 +349,85 @@ impl KafkaClient {
             }
 
             if let Some(sasl) = &config.sasl {
-                base_config.set("sasl.mechanism", &sasl.mechanism);
-                base_config.set("sasl.username", &sasl.username);
-                base_config.set("sasl.password", &sasl.password);
+                base_config.set("sasl.mechanism", sasl.mechanism());
+                if let Some((username, password)) = sasl.credentials() {
+                    base_config.set("sasl.username", username);
+                    base_config.set("sasl.password", password);
+                }
             }
         }
 
-        let producer: FutureProducer = base_config
-            .clone()
-            .set("client.id", &client_name)
-            .set("message.timeout.ms", "5000")
-            .set("acks", "all")
-            .create()
-            .map_err(|e| ShoveError::Topology(format!("failed to create Kafka producer: {e}")))?;
+        // Phase A — compute optional MskIamContext.
+        #[cfg(feature = "kafka-msk-iam")]
+        let msk_context: Option<MskIamContext> = match &config.sasl {
+            Some(KafkaSasl::MskIam { region, profile }) => {
+                if config.tls.is_none() {
+                    return Err(ShoveError::Topology(
+                        "MSK IAM auth requires TLS; set KafkaConfig::with_tls(...) before connect"
+                            .into(),
+                    ));
+                }
+                let provider =
+                    Arc::new(MskIamTokenProvider::new(region.clone(), profile.clone()).await?);
+                Some(MskIamContext::new(provider))
+            }
+            _ => None,
+        };
+
+        // Phase B — overlay SASL_SSL/OAUTHBEARER when MSK IAM is active (wins
+        // over the protocol-matrix block above).
+        #[cfg(feature = "kafka-msk-iam")]
+        if msk_context.is_some() {
+            base_config.set("security.protocol", "SASL_SSL");
+            base_config.set("sasl.mechanism", "OAUTHBEARER");
+        }
+
+        // Phase C — build the producer with whichever context applies.
+        #[cfg(feature = "kafka-msk-iam")]
+        let producer = if let Some(ctx) = msk_context.clone() {
+            let p: FutureProducer<MskIamContext> = base_config
+                .clone()
+                .set("client.id", &client_name)
+                .set("message.timeout.ms", "5000")
+                .set("acks", "all")
+                .create_with_context(ctx)
+                .map_err(|e| {
+                    ShoveError::Topology(format!("failed to create MSK IAM producer: {e}"))
+                })?;
+            KafkaProducerInner::MskIam(p)
+        } else {
+            let p: FutureProducer<DefaultClientContext> = base_config
+                .clone()
+                .set("client.id", &client_name)
+                .set("message.timeout.ms", "5000")
+                .set("acks", "all")
+                .create()
+                .map_err(|e| {
+                    ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
+                })?;
+            KafkaProducerInner::Default(p)
+        };
+
+        #[cfg(not(feature = "kafka-msk-iam"))]
+        let producer = {
+            let p: FutureProducer<DefaultClientContext> = base_config
+                .clone()
+                .set("client.id", &client_name)
+                .set("message.timeout.ms", "5000")
+                .set("acks", "all")
+                .create()
+                .map_err(|e| {
+                    ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
+                })?;
+            KafkaProducerInner::Default(p)
+        };
 
         Ok(Self {
             brokers: config.brokers.clone(),
             base_config,
             producer,
+            #[cfg(feature = "kafka-msk-iam")]
+            msk_context,
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -293,8 +460,26 @@ impl KafkaClient {
         }
     }
 
-    pub fn producer(&self) -> &FutureProducer {
-        &self.producer
+    pub async fn publish_with_retry(
+        &self,
+        topic: &str,
+        key: Option<&[u8]>,
+        headers: OwnedHeaders,
+        payload: &[u8],
+        max_attempts: u32,
+        label: &str,
+    ) -> Result<()> {
+        match &self.producer {
+            KafkaProducerInner::Default(p) => {
+                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
+                    .await
+            }
+            #[cfg(feature = "kafka-msk-iam")]
+            KafkaProducerInner::MskIam(p) => {
+                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
+                    .await
+            }
+        }
     }
 
     pub fn brokers(&self) -> &str {
@@ -312,12 +497,27 @@ impl KafkaClient {
         self.shutdown_token.clone()
     }
 
-    pub(super) async fn create_admin(&self) -> Result<AdminClient<DefaultClientContext>> {
+    pub(super) async fn create_admin_default(&self) -> Result<AdminClient<DefaultClientContext>> {
         let admin: AdminClient<DefaultClientContext> = self
             .base_config
             .clone()
             .create()
             .map_err(|e| ShoveError::Topology(format!("failed to create admin client: {e}")))?;
+        Ok(admin)
+    }
+
+    #[cfg(feature = "kafka-msk-iam")]
+    pub(super) async fn create_admin_msk(
+        &self,
+        ctx: MskIamContext,
+    ) -> Result<AdminClient<MskIamContext>> {
+        let admin: AdminClient<MskIamContext> = self
+            .base_config
+            .clone()
+            .create_with_context(ctx)
+            .map_err(|e| {
+            ShoveError::Topology(format!("failed to create MSK admin client: {e}"))
+        })?;
         Ok(admin)
     }
 
@@ -329,7 +529,28 @@ impl KafkaClient {
         num_partitions: i32,
         replication_factor: i32,
     ) -> Result<()> {
-        let admin = self.create_admin().await?;
+        #[cfg(feature = "kafka-msk-iam")]
+        if let Some(ctx) = self.msk_context() {
+            let admin = self.create_admin_msk(ctx).await?;
+            return self
+                .create_topic_with_admin(&admin, name, num_partitions, replication_factor)
+                .await;
+        }
+        let admin = self.create_admin_default().await?;
+        self.create_topic_with_admin(&admin, name, num_partitions, replication_factor)
+            .await
+    }
+
+    async fn create_topic_with_admin<C>(
+        &self,
+        admin: &AdminClient<C>,
+        name: &str,
+        num_partitions: i32,
+        replication_factor: i32,
+    ) -> Result<()>
+    where
+        C: ClientContext + 'static,
+    {
         let new_topic = NewTopic::new(
             name,
             num_partitions,
@@ -346,7 +567,7 @@ impl KafkaClient {
                 Err((topic, code)) => {
                     if code == RDKafkaErrorCode::TopicAlreadyExists {
                         tracing::debug!(topic, "topic already exists, checking partition count");
-                        self.ensure_partitions(&admin, name, num_partitions).await?;
+                        self.ensure_partitions(admin, name, num_partitions).await?;
                     } else {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Kafka,
@@ -364,37 +585,31 @@ impl KafkaClient {
     }
 
     /// If the existing topic has fewer partitions than `desired`, expand it.
-    async fn ensure_partitions(
+    async fn ensure_partitions<C>(
         &self,
-        admin: &AdminClient<DefaultClientContext>,
+        admin: &AdminClient<C>,
         name: &str,
         desired: i32,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        C: ClientContext + 'static,
+    {
         use rdkafka::admin::NewPartitions;
 
-        // Fetch current partition count from metadata.
+        // Fetch current partition count from metadata. The blocking work is
+        // pushed onto a dedicated thread because librdkafka's metadata fetch
+        // is synchronous; the helper owns all the cfg-gated context selection.
         let base = self.base_config.clone();
         let topic_name = name.to_string();
-        let current = tokio::task::spawn_blocking(move || -> Result<i32> {
-            use rdkafka::consumer::{BaseConsumer, Consumer as _};
-            let consumer: BaseConsumer = base
-                .clone()
-                .set("group.id", "shove-partition-check")
-                .create()
-                .map_err(|e| {
-                    ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
-                })?;
-            let md = consumer
-                .fetch_metadata(Some(&topic_name), Duration::from_secs(10))
-                .map_err(|e| {
-                    ShoveError::Connection(format!(
-                        "failed to fetch metadata for {topic_name}: {e}"
-                    ))
-                })?;
-            let topic = md.topics().first().ok_or_else(|| {
-                ShoveError::Topology(format!("no metadata for topic {topic_name}"))
-            })?;
-            Ok(topic.partitions().len() as i32)
+        #[cfg(feature = "kafka-msk-iam")]
+        let msk_ctx = self.msk_context();
+        let current = tokio::task::spawn_blocking(move || {
+            fetch_topic_partition_count_blocking(
+                base,
+                &topic_name,
+                #[cfg(feature = "kafka-msk-iam")]
+                msk_ctx,
+            )
         })
         .await
         .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??;
@@ -436,8 +651,68 @@ impl KafkaClient {
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
-        self.producer.flush(Duration::from_secs(5)).ok();
+        match &self.producer {
+            KafkaProducerInner::Default(p) => {
+                p.flush(Duration::from_secs(5)).ok();
+            }
+            #[cfg(feature = "kafka-msk-iam")]
+            KafkaProducerInner::MskIam(p) => {
+                p.flush(Duration::from_secs(5)).ok();
+            }
+        }
     }
+
+    #[cfg(feature = "kafka-msk-iam")]
+    #[allow(dead_code)]
+    pub(super) fn msk_context(&self) -> Option<MskIamContext> {
+        self.msk_context.clone()
+    }
+}
+
+/// Build a metadata `BaseConsumer` against `base`, fetch the topic's metadata
+/// synchronously, and return its partition count. Runs inside `spawn_blocking`
+/// because librdkafka's `fetch_metadata` is blocking.
+///
+/// The cfg branching lives here so `ensure_partitions` stays readable.
+fn fetch_topic_partition_count_blocking(
+    base: ClientConfig,
+    topic_name: &str,
+    #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
+) -> Result<i32> {
+    use rdkafka::consumer::{BaseConsumer, Consumer as _};
+
+    let mut cfg = base;
+    cfg.set("group.id", "shove-partition-check");
+
+    #[cfg(feature = "kafka-msk-iam")]
+    let metadata = if let Some(ctx) = msk_ctx {
+        let consumer: BaseConsumer<MskIamContext> = cfg.create_with_context(ctx).map_err(|e| {
+            ShoveError::Topology(format!("failed to create MSK metadata consumer: {e}"))
+        })?;
+        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
+    } else {
+        let consumer: BaseConsumer = cfg.create().map_err(|e| {
+            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
+        })?;
+        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
+    };
+
+    #[cfg(not(feature = "kafka-msk-iam"))]
+    let metadata = {
+        let consumer: BaseConsumer = cfg.create().map_err(|e| {
+            ShoveError::Topology(format!("failed to create metadata consumer: {e}"))
+        })?;
+        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
+    };
+
+    let md = metadata.map_err(|e| {
+        ShoveError::Connection(format!("failed to fetch metadata for {topic_name}: {e}"))
+    })?;
+    let topic = md
+        .topics()
+        .first()
+        .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {topic_name}")))?;
+    Ok(topic.partitions().len() as i32)
 }
 
 #[cfg(test)]
@@ -448,6 +723,19 @@ mod tests {
     fn default_config_is_localhost() {
         let cfg = KafkaConfig::default();
         assert!(cfg.brokers().contains("localhost:9092"));
+    }
+
+    #[cfg(feature = "kafka-ssl")]
+    #[test]
+    fn sasl_constructors_yield_expected_variants() {
+        let plain = KafkaSasl::plain("alice", "pw");
+        assert!(matches!(plain, KafkaSasl::Plain { .. }));
+
+        let s256 = KafkaSasl::scram_sha_256("alice", "pw");
+        assert!(matches!(s256, KafkaSasl::ScramSha256 { .. }));
+
+        let s512 = KafkaSasl::scram_sha_512("alice", "pw");
+        assert!(matches!(s512, KafkaSasl::ScramSha512 { .. }));
     }
 
     #[cfg(feature = "kafka-ssl")]

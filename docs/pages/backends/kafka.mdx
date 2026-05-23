@@ -24,6 +24,12 @@ For TLS + SASL (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512):
 cargo add shove --features kafka-ssl
 ```
 
+For AWS MSK with IAM authentication:
+
+```sh
+cargo add shove --features kafka-msk-iam
+```
+
 ## Connect
 
 ```rust
@@ -31,6 +37,42 @@ cargo add shove --features kafka-ssl
 ```
 
 `KafkaConfig::new` takes a bootstrap server address (e.g. `localhost:9092`). TLS and SASL are configured via `KafkaTls` and `KafkaSasl` on the config — available when the `kafka-ssl` feature is enabled.
+
+## Connecting to AWS MSK
+
+The `kafka-msk-iam` feature adds IAM-based authentication for Amazon MSK clusters. It pulls in `aws-config`, `aws-credential-types`, and `aws-msk-iam-sasl-signer`. Use it alongside `kafka-ssl`:
+
+```sh
+cargo add shove --features kafka-ssl,kafka-msk-iam
+```
+
+MSK IAM clusters listen on port `9098` (SASL/IAM). SCRAM/PLAIN clusters use port `9096`.
+
+### Minimal setup
+
+MSK brokers use publicly-signed ACM certificates. `KafkaTls::default()` is correct — the OS trust store handles validation. No custom CA path is needed.
+
+```rust
+use shove::kafka::{KafkaConfig, KafkaSasl, KafkaTls};
+
+let config = KafkaConfig::new("b-1.cluster.amazonaws.com:9098,b-2.cluster.amazonaws.com:9098")
+    .with_tls(KafkaTls::default())
+    .with_sasl(KafkaSasl::msk_iam("eu-west-2"));
+```
+
+`KafkaSasl::msk_iam(region)` resolves credentials from the standard AWS provider chain: environment variables, shared credentials file, EC2 instance metadata (IMDS), EKS pod identity / IRSA, and SSO. No explicit credential configuration is needed in most deployment environments.
+
+For a non-default named profile, use `KafkaSasl::msk_iam_with_profile`:
+
+```rust
+let config = KafkaConfig::new(brokers)
+    .with_tls(KafkaTls::default())
+    .with_sasl(KafkaSasl::msk_iam_with_profile("eu-west-2", "production"));
+```
+
+The OAUTHBEARER mechanism and `SASL_SSL` security protocol are set automatically. Do not set `sasl.mechanism` or `security.protocol` manually, and do not set `sasl.oauthbearer.config` — token rotation is handled automatically by the library.
+
+See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnable walkthrough.
 
 ## Declare topology
 
@@ -92,7 +134,7 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 - **Partition count is set at topic creation time** and is rarely changed after the fact. Choose carefully — partition count caps the maximum degree of parallelism a consumer group can achieve (one consumer per partition maximum).
 - **Consumer-group rebalances** during scale events cause brief delivery pauses. The larger the group and the more topics, the longer the rebalance. Tune `session.timeout.ms` and `max.poll.interval.ms` in `KafkaConfig` if handlers are slow.
 - **On Windows**, the `cmake-build` feature is required for `rdkafka` (the underlying C library). This is handled automatically via the `[target.'cfg(windows)'.dependencies]` entry in `Cargo.toml`.
-- **SASL and TLS** require the `kafka-ssl` feature. SCRAM-SHA-256 and SCRAM-SHA-512 are supported out of the box. GSSAPI/Kerberos requires downstream activation of `rdkafka/gssapi`.
+- **SASL and TLS** require the `kafka-ssl` feature. SCRAM-SHA-256 and SCRAM-SHA-512 are supported out of the box. GSSAPI/Kerberos requires downstream activation of `rdkafka/gssapi`. For AWS MSK IAM, use the `kafka-msk-iam` feature instead.
 - **`librdkafka` system dependencies** on Debian/Ubuntu CI runners: `libsasl2-dev` is required when using `kafka-ssl`. Add it to your CI runner setup (the shove `ci.yml` already does this).
 
 ## Examples
@@ -101,3 +143,4 @@ See the [Basic example](/backends/kafka/examples/basic) for a full runnable walk
 - [Sequenced](/backends/kafka/examples/sequenced) — partition-key ordering
 - [Audited Consumer](/backends/kafka/examples/audited) — `MessageHandlerExt::audited` wrapping
 - [Stress](/backends/kafka/examples/stress) — throughput benchmarking
+- [MSK IAM](/backends/kafka/examples/msk_iam) — IAM authentication against Amazon MSK

@@ -47,6 +47,7 @@ export default defineConfig({
         'backends/kafka/examples/sequenced.mdx': 'examples/kafka/sequenced.rs',
         'backends/kafka/examples/audited.mdx': 'examples/kafka/audited_consumer.rs',
         'backends/kafka/examples/stress.mdx': 'examples/kafka/stress.rs',
+        'backends/kafka/examples/msk_iam.mdx': 'examples/kafka/msk_iam.rs',
         'backends/redis/examples/basic.mdx': 'examples/redis/basic.rs',
         'backends/redis/examples/sequenced.mdx': 'examples/redis/sequenced.rs',
         'backends/inmemory/examples/basic.mdx': 'examples/inmemory/basic.rs',
@@ -126,6 +127,7 @@ export default defineConfig({
             { text: 'Sequenced', link: '/backends/kafka/examples/sequenced' },
             { text: 'Audited Consumer', link: '/backends/kafka/examples/audited' },
             { text: 'Stress', link: '/backends/kafka/examples/stress' },
+            { text: 'MSK IAM', link: '/backends/kafka/examples/msk_iam' },
           ],
         },
         {
