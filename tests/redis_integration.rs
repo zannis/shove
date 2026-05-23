@@ -1128,7 +1128,7 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
 
     #[derive(Clone)]
     struct Ctx {
-        timeouts: Arc<AtomicU32>,
+        redelivered: Arc<AtomicU32>,
     }
 
     struct SlowHandler;
@@ -1136,10 +1136,12 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
         type Context = Ctx;
         async fn handle(&self, _msg: SlowOrder, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
             if meta.retry_count == 0 {
-                ctx.timeouts.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(400)).await;
+                Outcome::Ack
+            } else {
+                ctx.redelivered.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ack
             }
-            Outcome::Ack
         }
     }
 
@@ -1150,7 +1152,7 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
         .await
         .expect("declare");
     let ctx = Ctx {
-        timeouts: Arc::new(AtomicU32::new(0)),
+        redelivered: Arc::new(AtomicU32::new(0)),
     };
 
     let mut group = broker.consumer_group().with_context(ctx.clone());
@@ -1181,10 +1183,10 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
     assert!(
         poll_until(
-            || ctx.timeouts.load(Ordering::SeqCst) >= 1,
+            || ctx.redelivered.load(Ordering::SeqCst) >= 1,
             Duration::from_secs(3),
         )
         .await,
-        "expected the slow handler to time out at least once",
+        "expected at least one redelivery after handler timeout",
     );
 }

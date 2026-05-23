@@ -1473,7 +1473,7 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
 
     #[derive(Clone)]
     struct Ctx {
-        timeouts: Arc<AtomicU32>,
+        redelivered: Arc<AtomicU32>,
     }
 
     struct SlowHandler;
@@ -1481,10 +1481,12 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
         type Context = Ctx;
         async fn handle(&self, _msg: Slow, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
             if meta.retry_count == 0 {
-                ctx.timeouts.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(500)).await;
+                Outcome::Ack
+            } else {
+                ctx.redelivered.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ack
             }
-            Outcome::Ack
         }
     }
 
@@ -1497,7 +1499,7 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
         .await
         .expect("declare");
     let ctx = Ctx {
-        timeouts: Arc::new(AtomicU32::new(0)),
+        redelivered: Arc::new(AtomicU32::new(0)),
     };
 
     let mut group = broker
@@ -1530,8 +1532,8 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
         .await;
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
     assert!(
-        ctx.timeouts.load(Ordering::SeqCst) >= 1,
-        "expected >=1 handler timeout via registry default"
+        ctx.redelivered.load(Ordering::SeqCst) >= 1,
+        "expected >=1 redelivery after handler timeout via registry default"
     );
 }
 
@@ -1612,5 +1614,99 @@ async fn run_fifo_until_timeout_does_not_invoke_handlers_after_return() {
         invocations_at_return, invocations_after_wait,
         "shard task kept invoking handlers after return ({} → {}, outcome: {outcome:?})",
         invocations_at_return, invocations_after_wait
+    );
+}
+
+#[tokio::test]
+async fn registry_default_handler_timeout_applies_to_fifo_registrations() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use serde::{Deserialize, Serialize};
+    use shove::inmemory::InMemoryConfig;
+    use shove::{
+        Broker, InMemory, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
+        SequencedTopic, TopologyBuilder, define_sequenced_topic,
+    };
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct LedgerEntry {
+        account_id: String,
+    }
+
+    define_sequenced_topic!(
+        SlowLedger,
+        LedgerEntry,
+        |msg| msg.account_id.clone(),
+        TopologyBuilder::new("fifo-registry-default-timeout-test")
+            .sequenced(SequenceFailure::FailAll)
+            .hold_queue(Duration::from_millis(50))
+            .dlq()
+            .build()
+    );
+
+    #[derive(Clone)]
+    struct Ctx {
+        redelivered: Arc<AtomicU32>,
+    }
+
+    struct SlowHandler;
+    impl MessageHandler<SlowLedger> for SlowHandler {
+        type Context = Ctx;
+        async fn handle(&self, _msg: LedgerEntry, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
+            if meta.retry_count == 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Outcome::Ack
+            } else {
+                ctx.redelivered.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ack
+            }
+        }
+    }
+
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("broker");
+    broker
+        .topology()
+        .declare::<SlowLedger>()
+        .await
+        .expect("declare");
+    let ctx = Ctx {
+        redelivered: Arc::new(AtomicU32::new(0)),
+    };
+
+    let mut group = broker
+        .consumer_group()
+        .with_context(ctx.clone())
+        .with_default_handler_timeout(Duration::from_millis(50));
+    group
+        .register_fifo::<SlowLedger, _>(|| SlowHandler)
+        .await
+        .expect("register_fifo");
+
+    broker
+        .publisher()
+        .await
+        .expect("publisher")
+        .publish::<SlowLedger>(&LedgerEntry {
+            account_id: "acct-1".into(),
+        })
+        .await
+        .expect("publish");
+
+    let token = group.cancellation_token();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        token.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        ctx.redelivered.load(Ordering::SeqCst) >= 1,
+        "registry default handler timeout did not propagate to FIFO registrations",
     );
 }
