@@ -6,7 +6,7 @@
 //! users opt into other encodings (Protobuf, raw bytes, custom) by setting
 //! `type Codec = ...` on their topic.
 
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -29,6 +29,24 @@ pub trait Codec<M>: Send + Sync + 'static {
 
     /// Decode `bytes` into a value of type `M`.
     fn decode(bytes: &[u8]) -> Result<M>;
+
+    /// Encode `value` to a UTF-8 `String` for string-API backends (SNS/SQS,
+    /// Redis Streams). The default implementation calls [`Self::encode`] and
+    /// then validates the bytes as UTF-8; non-UTF-8 codec output surfaces as
+    /// [`ShoveError::Codec`] with the codec's [`Self::NAME`].
+    ///
+    /// `String::from_utf8` is zero-copy (it takes ownership of the `Vec<u8>`
+    /// returned by `encode` and validates in place), so JSON output incurs no
+    /// extra allocation. Binary codecs (Protobuf, raw bytes containing
+    /// non-UTF-8) will fail here at publish time, which is the right failure
+    /// mode for those backends.
+    fn encode_to_string(value: &M) -> Result<String> {
+        let bytes = Self::encode(value)?;
+        String::from_utf8(bytes).map_err(|e| ShoveError::Codec {
+            codec: Self::NAME,
+            source: Box::new(e),
+        })
+    }
 }
 
 /// JSON codec — the default. Routes through `serde_json` and surfaces
@@ -107,5 +125,27 @@ mod tests {
     #[test]
     fn raw_bytes_codec_name_is_raw() {
         assert_eq!(<RawBytesCodec as Codec<Vec<u8>>>::NAME, "raw");
+    }
+
+    #[test]
+    fn json_codec_encode_to_string_round_trips() {
+        let sample = Sample {
+            id: "abc".into(),
+            n: 42,
+        };
+        let s = <JsonCodec as Codec<Sample>>::encode_to_string(&sample).unwrap();
+        assert!(s.contains("\"abc\""));
+        let decoded: Sample = <JsonCodec as Codec<Sample>>::decode(s.as_bytes()).unwrap();
+        assert_eq!(decoded, sample);
+    }
+
+    #[test]
+    fn raw_bytes_codec_encode_to_string_surfaces_non_utf8_as_codec_error() {
+        let payload: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+        let err = <RawBytesCodec as Codec<Vec<u8>>>::encode_to_string(&payload).unwrap_err();
+        match err {
+            crate::ShoveError::Codec { codec, .. } => assert_eq!(codec, "raw"),
+            other => panic!("expected Codec variant, got {other:?}"),
+        }
     }
 }

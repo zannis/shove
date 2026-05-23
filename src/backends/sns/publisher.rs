@@ -13,20 +13,6 @@ use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
-/// Encode a topic message to `String` for the SNS/SQS string-based wire.
-///
-/// JSON output is always valid UTF-8; binary codecs over SNS/SQS would
-/// fail here with a clear `ShoveError::Codec`. Users who want binary
-/// payloads on these backends should wrap them with `RawBytesCodec` and
-/// base64-encode inside the handler.
-fn encode_to_string<T: Topic>(message: &T::Message) -> Result<String> {
-    let bytes = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
-    String::from_utf8(bytes).map_err(|e| ShoveError::Codec {
-        codec: <T::Codec as crate::Codec<T::Message>>::NAME,
-        source: Box::new(e),
-    })
-}
-
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
@@ -149,7 +135,7 @@ impl SnsPublisher {
         message: &T::Message,
         headers: Option<HashMap<String, String>>,
     ) -> Result<()> {
-        let payload = encode_to_string::<T>(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_to_string(message)?;
         let topology = T::topology();
         let queue_name = topology.queue();
         let topic_arn = self.resolve_arn(queue_name).await?;
@@ -225,7 +211,10 @@ impl SnsPublisher {
         let key_fn = T::SEQUENCE_KEY_FN;
 
         // Serialize all messages up front for fail-fast behaviour.
-        let serialized: Result<Vec<String>> = messages.iter().map(encode_to_string::<T>).collect();
+        let serialized: Result<Vec<String>> = messages
+            .iter()
+            .map(<T::Codec as crate::Codec<T::Message>>::encode_to_string)
+            .collect();
 
         // Pre-compute routing keys while we still have access to messages.
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
