@@ -76,36 +76,54 @@ impl fmt::Debug for KafkaTls {
 /// [`KafkaConfig`] to get `SASL_SSL`; without TLS this is `SASL_PLAINTEXT`.
 #[cfg(feature = "kafka-ssl")]
 #[derive(Clone)]
-pub struct KafkaSasl {
-    /// Mechanism name — e.g. `"PLAIN"`, `"SCRAM-SHA-256"`, `"SCRAM-SHA-512"`.
-    pub mechanism: String,
-    pub username: String,
-    pub password: String,
+pub enum KafkaSasl {
+    Plain { username: String, password: String },
+    ScramSha256 { username: String, password: String },
+    ScramSha512 { username: String, password: String },
 }
 
 #[cfg(feature = "kafka-ssl")]
 impl KafkaSasl {
     pub fn plain(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            mechanism: "PLAIN".into(),
+        Self::Plain {
             username: username.into(),
             password: password.into(),
         }
     }
 
     pub fn scram_sha_256(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            mechanism: "SCRAM-SHA-256".into(),
+        Self::ScramSha256 {
             username: username.into(),
             password: password.into(),
         }
     }
 
     pub fn scram_sha_512(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            mechanism: "SCRAM-SHA-512".into(),
+        Self::ScramSha512 {
             username: username.into(),
             password: password.into(),
+        }
+    }
+
+    /// librdkafka mechanism string for this variant (e.g. `"PLAIN"`).
+    pub(super) fn mechanism(&self) -> &'static str {
+        match self {
+            Self::Plain { .. } => "PLAIN",
+            Self::ScramSha256 { .. } => "SCRAM-SHA-256",
+            Self::ScramSha512 { .. } => "SCRAM-SHA-512",
+        }
+    }
+
+    /// Username/password pair to feed into `sasl.username` / `sasl.password`.
+    /// Returns `None` for variants that don't use a static password (none yet,
+    /// but `MskIam` lands in Task 5).
+    pub(super) fn credentials(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Plain { username, password }
+            | Self::ScramSha256 { username, password }
+            | Self::ScramSha512 { username, password } => {
+                Some((username.as_str(), password.as_str()))
+            }
         }
     }
 }
@@ -113,11 +131,23 @@ impl KafkaSasl {
 #[cfg(feature = "kafka-ssl")]
 impl fmt::Debug for KafkaSasl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("KafkaSasl")
-            .field("mechanism", &self.mechanism)
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
-            .finish()
+        match self {
+            Self::Plain { username, .. } => f
+                .debug_struct("KafkaSasl::Plain")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::ScramSha256 { username, .. } => f
+                .debug_struct("KafkaSasl::ScramSha256")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::ScramSha512 { username, .. } => f
+                .debug_struct("KafkaSasl::ScramSha512")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
     }
 }
 
@@ -243,9 +273,11 @@ impl KafkaClient {
             }
 
             if let Some(sasl) = &config.sasl {
-                base_config.set("sasl.mechanism", &sasl.mechanism);
-                base_config.set("sasl.username", &sasl.username);
-                base_config.set("sasl.password", &sasl.password);
+                base_config.set("sasl.mechanism", sasl.mechanism());
+                if let Some((username, password)) = sasl.credentials() {
+                    base_config.set("sasl.username", username);
+                    base_config.set("sasl.password", password);
+                }
             }
         }
 
@@ -448,6 +480,19 @@ mod tests {
     fn default_config_is_localhost() {
         let cfg = KafkaConfig::default();
         assert!(cfg.brokers().contains("localhost:9092"));
+    }
+
+    #[cfg(feature = "kafka-ssl")]
+    #[test]
+    fn sasl_constructors_yield_expected_variants() {
+        let plain = KafkaSasl::plain("alice", "pw");
+        assert!(matches!(plain, KafkaSasl::Plain { .. }));
+
+        let s256 = KafkaSasl::scram_sha_256("alice", "pw");
+        assert!(matches!(s256, KafkaSasl::ScramSha256 { .. }));
+
+        let s512 = KafkaSasl::scram_sha_512("alice", "pw");
+        assert!(matches!(s512, KafkaSasl::ScramSha512 { .. }));
     }
 
     #[cfg(feature = "kafka-ssl")]
