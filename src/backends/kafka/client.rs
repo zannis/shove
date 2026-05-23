@@ -14,6 +14,12 @@ use rdkafka::producer::{FutureProducer, Producer};
 use super::publisher::publish_with_retry as publisher_publish_with_retry;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "kafka-msk-iam")]
+use std::sync::Arc;
+
+#[cfg(feature = "kafka-msk-iam")]
+use super::msk_iam::{MskIamContext, MskIamTokenProvider};
+
 use crate::ShoveError;
 use crate::error::Result;
 use crate::metrics;
@@ -267,12 +273,16 @@ pub struct KafkaClient {
     /// so security settings never have to be re-applied at call sites.
     base_config: ClientConfig,
     producer: KafkaProducerInner,
+    #[cfg(feature = "kafka-msk-iam")]
+    msk_context: Option<MskIamContext>,
     shutdown_token: CancellationToken,
 }
 
 #[derive(Clone)]
 enum KafkaProducerInner {
     Default(FutureProducer<DefaultClientContext>),
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam(FutureProducer<MskIamContext>),
 }
 
 impl KafkaClient {
@@ -335,18 +345,77 @@ impl KafkaClient {
             }
         }
 
-        let producer: FutureProducer<DefaultClientContext> = base_config
-            .clone()
-            .set("client.id", &client_name)
-            .set("message.timeout.ms", "5000")
-            .set("acks", "all")
-            .create()
-            .map_err(|e| ShoveError::Topology(format!("failed to create Kafka producer: {e}")))?;
+        // Phase A — compute optional MskIamContext.
+        #[cfg(feature = "kafka-msk-iam")]
+        let msk_context: Option<MskIamContext> = match &config.sasl {
+            Some(KafkaSasl::MskIam { region, profile }) => {
+                if config.tls.is_none() {
+                    return Err(ShoveError::Topology(
+                        "MSK IAM auth requires TLS; set KafkaConfig::with_tls(...) before connect"
+                            .into(),
+                    ));
+                }
+                let provider =
+                    Arc::new(MskIamTokenProvider::new(region.clone(), profile.clone()).await?);
+                Some(MskIamContext::new(provider))
+            }
+            _ => None,
+        };
+
+        // Phase B — overlay SASL_SSL/OAUTHBEARER when MSK IAM is active (wins
+        // over the protocol-matrix block above).
+        #[cfg(feature = "kafka-msk-iam")]
+        if msk_context.is_some() {
+            base_config.set("security.protocol", "SASL_SSL");
+            base_config.set("sasl.mechanism", "OAUTHBEARER");
+        }
+
+        // Phase C — build the producer with whichever context applies.
+        #[cfg(feature = "kafka-msk-iam")]
+        let producer = if let Some(ctx) = msk_context.clone() {
+            let p: FutureProducer<MskIamContext> = base_config
+                .clone()
+                .set("client.id", &client_name)
+                .set("message.timeout.ms", "5000")
+                .set("acks", "all")
+                .create_with_context(ctx)
+                .map_err(|e| {
+                    ShoveError::Topology(format!("failed to create MSK IAM producer: {e}"))
+                })?;
+            KafkaProducerInner::MskIam(p)
+        } else {
+            let p: FutureProducer<DefaultClientContext> = base_config
+                .clone()
+                .set("client.id", &client_name)
+                .set("message.timeout.ms", "5000")
+                .set("acks", "all")
+                .create()
+                .map_err(|e| {
+                    ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
+                })?;
+            KafkaProducerInner::Default(p)
+        };
+
+        #[cfg(not(feature = "kafka-msk-iam"))]
+        let producer = {
+            let p: FutureProducer<DefaultClientContext> = base_config
+                .clone()
+                .set("client.id", &client_name)
+                .set("message.timeout.ms", "5000")
+                .set("acks", "all")
+                .create()
+                .map_err(|e| {
+                    ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
+                })?;
+            KafkaProducerInner::Default(p)
+        };
 
         Ok(Self {
             brokers: config.brokers.clone(),
             base_config,
-            producer: KafkaProducerInner::Default(producer),
+            producer,
+            #[cfg(feature = "kafka-msk-iam")]
+            msk_context,
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -390,6 +459,11 @@ impl KafkaClient {
     ) -> Result<()> {
         match &self.producer {
             KafkaProducerInner::Default(p) => {
+                publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
+                    .await
+            }
+            #[cfg(feature = "kafka-msk-iam")]
+            KafkaProducerInner::MskIam(p) => {
                 publisher_publish_with_retry(p, topic, key, headers, payload, max_attempts, label)
                     .await
             }
@@ -539,7 +613,17 @@ impl KafkaClient {
             KafkaProducerInner::Default(p) => {
                 p.flush(Duration::from_secs(5)).ok();
             }
+            #[cfg(feature = "kafka-msk-iam")]
+            KafkaProducerInner::MskIam(p) => {
+                p.flush(Duration::from_secs(5)).ok();
+            }
         }
+    }
+
+    #[cfg(feature = "kafka-msk-iam")]
+    #[allow(dead_code)]
+    pub(super) fn msk_context(&self) -> Option<MskIamContext> {
+        self.msk_context.clone()
     }
 }
 
