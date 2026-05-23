@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig, KafkaSasl, KafkaTls};
 use shove::{
-    Broker, ConsumerGroupConfig, Kafka, MessageHandler, MessageMetadata, Outcome, Topic,
+    Broker, ConsumerGroupConfig, JsonCodec, Kafka, MessageHandler, MessageMetadata, Outcome, Topic,
     TopologyBuilder,
 };
 use uuid::Uuid;
@@ -48,6 +48,7 @@ struct PingTopic;
 
 impl Topic for PingTopic {
     type Message = Ping;
+    type Codec = JsonCodec;
 
     fn topology() -> &'static shove::QueueTopology {
         PING_TOPOLOGY
