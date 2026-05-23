@@ -217,8 +217,13 @@ pub struct KafkaClient {
     /// TLS/SASL settings. Every consumer/admin/metadata call clones this
     /// so security settings never have to be re-applied at call sites.
     base_config: ClientConfig,
-    producer: FutureProducer,
+    producer: KafkaProducerInner,
     shutdown_token: CancellationToken,
+}
+
+#[derive(Clone)]
+enum KafkaProducerInner {
+    Default(FutureProducer<DefaultClientContext>),
 }
 
 impl KafkaClient {
@@ -281,7 +286,7 @@ impl KafkaClient {
             }
         }
 
-        let producer: FutureProducer = base_config
+        let producer: FutureProducer<DefaultClientContext> = base_config
             .clone()
             .set("client.id", &client_name)
             .set("message.timeout.ms", "5000")
@@ -292,7 +297,7 @@ impl KafkaClient {
         Ok(Self {
             brokers: config.brokers.clone(),
             base_config,
-            producer,
+            producer: KafkaProducerInner::Default(producer),
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -325,8 +330,29 @@ impl KafkaClient {
         }
     }
 
-    pub fn producer(&self) -> &FutureProducer {
-        &self.producer
+    pub async fn publish_with_retry(
+        &self,
+        topic: &str,
+        key: Option<&[u8]>,
+        headers: rdkafka::message::OwnedHeaders,
+        payload: &[u8],
+        max_attempts: u32,
+        label: &str,
+    ) -> crate::error::Result<()> {
+        match &self.producer {
+            KafkaProducerInner::Default(p) => {
+                crate::backends::kafka::publisher::publish_with_retry(
+                    p,
+                    topic,
+                    key,
+                    headers,
+                    payload,
+                    max_attempts,
+                    label,
+                )
+                .await
+            }
+        }
     }
 
     pub fn brokers(&self) -> &str {
@@ -468,7 +494,11 @@ impl KafkaClient {
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
-        self.producer.flush(Duration::from_secs(5)).ok();
+        match &self.producer {
+            KafkaProducerInner::Default(p) => {
+                p.flush(Duration::from_secs(5)).ok();
+            }
+        }
     }
 }
 

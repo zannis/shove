@@ -114,16 +114,16 @@ impl KafkaPublisher {
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         let headers = Self::build_headers(None);
-        publish_with_retry(
-            self.client.producer(),
-            &topic,
-            key.as_deref(),
-            headers,
-            &payload,
-            MAX_PUBLISH_ATTEMPTS,
-            "publish",
-        )
-        .await
+        self.client
+            .publish_with_retry(
+                &topic,
+                key.as_deref(),
+                headers,
+                &payload,
+                MAX_PUBLISH_ATTEMPTS,
+                "publish",
+            )
+            .await
     }
 
     pub async fn publish_with_headers<T: Topic>(
@@ -136,16 +136,16 @@ impl KafkaPublisher {
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         let headers = Self::build_headers(Some(&extra_headers));
-        publish_with_retry(
-            self.client.producer(),
-            &topic,
-            key.as_deref(),
-            headers,
-            &payload,
-            MAX_PUBLISH_ATTEMPTS,
-            "publish_with_headers",
-        )
-        .await
+        self.client
+            .publish_with_retry(
+                &topic,
+                key.as_deref(),
+                headers,
+                &payload,
+                MAX_PUBLISH_ATTEMPTS,
+                "publish_with_headers",
+            )
+            .await
     }
 
     pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
@@ -175,29 +175,23 @@ impl KafkaPublisher {
         // doesn't cancel the others — that lets the wrapper attribute
         // accurate per-message success/failure counters even on partial
         // failure, and we still surface the first error to the caller.
-        let producer = self.client.producer();
-        let results: Vec<Result<()>> = join_all(prepared.into_iter().map(
-            |(topic, key, headers, payload)| async move {
-                let mut record = FutureRecord::to(&topic)
-                    .payload(payload.as_slice())
-                    .headers(headers);
-                if let Some(k) = key.as_deref() {
-                    record = record.key(k);
+        let results: Vec<Result<()>> =
+            join_all(prepared.into_iter().map(|(topic, key, headers, payload)| {
+                let client = &self.client;
+                async move {
+                    client
+                        .publish_with_retry(
+                            &topic,
+                            key.as_deref(),
+                            headers,
+                            &payload,
+                            1,
+                            "batch publish",
+                        )
+                        .await
                 }
-                producer
-                    .send(record, PRODUCE_TIMEOUT)
-                    .await
-                    .map_err(|(e, _)| {
-                        metrics::record_backend_error(
-                            metrics::BackendLabel::Kafka,
-                            metrics::BackendErrorKind::Publish,
-                        );
-                        ShoveError::Connection(format!("batch publish failed: {e}"))
-                    })?;
-                Ok::<(), ShoveError>(())
-            },
-        ))
-        .await;
+            }))
+            .await;
 
         let mut succeeded: u64 = 0;
         let mut first_err: Option<ShoveError> = None;

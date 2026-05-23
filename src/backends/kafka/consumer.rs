@@ -30,7 +30,6 @@ use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
     RETRY_COUNT_HEADER,
 };
-use super::publisher::publish_with_retry;
 
 // ---------------------------------------------------------------------------
 // Offset tracking for concurrent consumption
@@ -274,16 +273,9 @@ async fn publish_to_dlq(
     };
 
     let dlq_headers = headers_for_dlq(headers, reason, topology.queue());
-    publish_with_retry(
-        client.producer(),
-        &dlq_topic,
-        key,
-        dlq_headers,
-        payload,
-        3,
-        "DLQ publish",
-    )
-    .await
+    client
+        .publish_with_retry(&dlq_topic, key, dlq_headers, payload, 3, "DLQ publish")
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -338,16 +330,16 @@ async fn route_outcome(
 
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
-                if let Err(e) = publish_with_retry(
-                    client.producer(),
-                    &topic,
-                    key.as_deref(),
-                    retry_headers,
-                    &payload,
-                    3,
-                    "retry republish",
-                )
-                .await
+                if let Err(e) = client
+                    .publish_with_retry(
+                        &topic,
+                        key.as_deref(),
+                        retry_headers,
+                        &payload,
+                        3,
+                        "retry republish",
+                    )
+                    .await
                 {
                     tracing::error!(error = %e, "delayed retry republish failed");
                 }
@@ -383,16 +375,16 @@ async fn route_outcome(
 
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
-                if let Err(e) = publish_with_retry(
-                    client.producer(),
-                    &topic,
-                    key.as_deref(),
-                    defer_headers,
-                    &payload,
-                    3,
-                    "defer republish",
-                )
-                .await
+                if let Err(e) = client
+                    .publish_with_retry(
+                        &topic,
+                        key.as_deref(),
+                        defer_headers,
+                        &payload,
+                        3,
+                        "defer republish",
+                    )
+                    .await
                 {
                     tracing::error!(error = %e, "deferred republish failed");
                 }
