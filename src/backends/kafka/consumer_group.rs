@@ -12,12 +12,13 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
+use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
 use crate::topic::{SequencedTopic, Topic};
-use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
@@ -32,7 +33,7 @@ pub struct KafkaConsumerGroupConfig {
     min_consumers: u16,
     max_consumers: u16,
     max_retries: u32,
-    handler_timeout: Option<Duration>,
+    pub(crate) handler_timeout: HandlerTimeoutConfig,
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
@@ -65,7 +66,7 @@ impl KafkaConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
-            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout: HandlerTimeoutConfig::Inherit,
             concurrent_processing: false,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
@@ -83,7 +84,7 @@ impl KafkaConsumerGroupConfig {
     }
 
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
-        self.handler_timeout = Some(timeout);
+        self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
         self
     }
 
@@ -109,7 +110,7 @@ impl KafkaConsumerGroupConfig {
     }
 
     pub fn handler_timeout(&self) -> Option<Duration> {
-        self.handler_timeout
+        resolve_handler_timeout(self.handler_timeout, None)
     }
 
     pub fn concurrent_processing(&self) -> bool {
@@ -363,9 +364,7 @@ impl KafkaConsumerGroup {
         options.max_retries = self.config.max_retries;
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
-        if let Some(timeout) = self.config.handler_timeout {
-            options.handler_timeout = Some(timeout);
-        }
+        options.handler_timeout = resolve_handler_timeout(self.config.handler_timeout, None);
         if let Some(limit) = self.config.max_pending_per_key {
             options.max_pending_per_key = Some(limit);
         }
@@ -384,6 +383,7 @@ impl KafkaConsumerGroup {
 pub struct KafkaConsumerGroupRegistry {
     pub(crate) groups: HashMap<String, KafkaConsumerGroup>,
     client: Option<KafkaClient>,
+    pub(super) default_handler_timeout: Option<Duration>,
 }
 
 impl KafkaConsumerGroupRegistry {
@@ -391,6 +391,7 @@ impl KafkaConsumerGroupRegistry {
         Self {
             groups: HashMap::new(),
             client: Some(client),
+            default_handler_timeout: None,
         }
     }
 
@@ -400,7 +401,16 @@ impl KafkaConsumerGroupRegistry {
         Self {
             groups,
             client: None,
+            default_handler_timeout: None,
         }
+    }
+
+    /// Set the registry-level default handler timeout. Applies to every
+    /// group whose `KafkaConsumerGroupConfig` did not explicitly call
+    /// `with_handler_timeout`. Per-group explicit settings always win.
+    pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
+        self.default_handler_timeout = Some(timeout);
+        self
     }
 
     /// Return the client's shutdown token.
@@ -424,6 +434,14 @@ impl KafkaConsumerGroupRegistry {
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        let resolved =
+            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
+        config.handler_timeout = match resolved {
+            Some(d) => HandlerTimeoutConfig::Set(d),
+            None => HandlerTimeoutConfig::Disabled,
+        };
+
         let topology = T::topology();
         let name = topology.queue().to_string();
 
@@ -549,6 +567,7 @@ impl KafkaConsumerGroupRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
     fn test_group(config: KafkaConsumerGroupConfig) -> KafkaConsumerGroup {
         let group_token = CancellationToken::new();
@@ -758,5 +777,34 @@ mod tests {
     #[allow(clippy::reversed_empty_ranges)]
     fn new_panics_if_min_greater_than_max() {
         let _ = KafkaConsumerGroupConfig::new(5..=2);
+    }
+
+    // -- handler timeout tri-state --
+
+    #[test]
+    fn inherit_config_uses_library_default_with_no_registry_default() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=4);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, None),
+            Some(DEFAULT_HANDLER_TIMEOUT),
+        );
+    }
+
+    #[test]
+    fn inherit_config_uses_registry_default_when_set() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=4);
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(45)),
+        );
+    }
+
+    #[test]
+    fn with_handler_timeout_beats_registry_default() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(5));
+        assert_eq!(
+            resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(5)),
+        );
     }
 }
