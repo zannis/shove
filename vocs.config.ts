@@ -69,6 +69,7 @@ export default defineConfig({
       collapsed: false,
       items: [
         { text: 'Topics & Topology', link: '/concepts/topics' },
+        { text: 'Codecs', link: '/concepts/codecs' },
         { text: 'Outcomes & Delivery', link: '/concepts/outcomes' },
         { text: 'Handlers & Context', link: '/concepts/handlers' },
         { text: 'The Broker<B> Pattern', link: '/concepts/broker' },

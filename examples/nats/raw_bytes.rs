@@ -20,13 +20,16 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
+// [!region topic]
 shove::define_topic!(
     RawTopic,
     Vec<u8>,
     TopologyBuilder::new("raw-bytes").dlq().build(),
     codec = RawBytesCodec
 );
+// [!endregion topic]
 
+// [!region handler]
 struct RawHandler;
 
 impl MessageHandler<RawTopic> for RawHandler {
@@ -36,9 +39,11 @@ impl MessageHandler<RawTopic> for RawHandler {
         Outcome::Ack
     }
 }
+// [!endregion handler]
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // [!region main]
     tracing_subscriber::fmt::init();
 
     let cmd = NatsServerCmd::default().with_jetstream();
@@ -46,14 +51,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = container.get_host_port_ipv4(4222).await?;
     let url = format!("nats://localhost:{port}");
 
+    // [!region connect]
     let broker = Broker::<Nats>::new(NatsConfig::new(&url)).await?;
+    // [!endregion connect]
+    // [!region declare]
     broker.topology().declare::<RawTopic>().await?;
+    // [!endregion declare]
 
+    // [!region publish]
     let publisher = broker.publisher().await?;
     let payload: Vec<u8> = vec![0x01, 0x02, 0x03];
     publisher.publish::<RawTopic>(&payload).await?;
     println!("Published raw payload: {payload:?}");
+    // [!endregion publish]
 
+    // [!region consume]
     let mut group = broker.consumer_group();
     group
         .register::<RawTopic, _>(
@@ -73,7 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(10),
         )
         .await;
+    // [!endregion consume]
 
     println!("Done.");
     std::process::exit(outcome.exit_code());
+    // [!endregion main]
 }

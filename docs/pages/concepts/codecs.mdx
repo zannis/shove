@@ -46,43 +46,27 @@ This compiles down to a topic with `type Codec = JsonCodec;`. Payloads ride the 
 
 Enable the `protobuf` cargo feature, derive `prost::Message` on the payload, and pass the codec to the macro:
 
-```rust,no_run
-#[derive(Clone, PartialEq, ::prost::Message)]
-struct OrderEvent {
-    #[prost(string, tag = "1")]
-    order_id: String,
-    #[prost(double, tag = "2")]
-    amount: f64,
-}
-
-define_topic!(
-    Orders,
-    OrderEvent,
-    TopologyBuilder::new("orders").dlq().build(),
-    codec = ProtobufCodec<OrderEvent>
-);
+```rust
+// [!include ~/examples/kafka/protobuf_pubsub.rs:topic]
 ```
 
 `ProtobufCodec<M>` works for any `M: prost::Message + Default`. Encoding pre-sizes the buffer via `encoded_len`, so a single allocation covers the common case. Decoding failures surface as `ShoveError::Codec { codec: "protobuf", .. }` rather than `Serialization`, so handlers and middleware can distinguish protobuf-decode errors from JSON ones.
 
-For a runnable end-to-end example see `examples/kafka/protobuf_pubsub.rs`.
+Runnable example: [`examples/kafka/protobuf_pubsub.rs`](https://github.com/zannis/shove/blob/main/examples/kafka/protobuf_pubsub.rs).
 
 ## RawBytesCodec — the escape hatch
 
 `RawBytesCodec` is a passthrough for payloads that are already encoded. The topic carries `Vec<u8>` and the handler owns every wire-format decision:
 
-```rust,no_run
-define_topic!(
-    LegacyFeed,
-    Vec<u8>,
-    TopologyBuilder::new("legacy-feed").build(),
-    codec = RawBytesCodec
-);
+```rust
+// [!include ~/examples/nats/raw_bytes.rs:topic]
 ```
 
 The canonical use case is **Confluent Schema Registry**. Records on that wire arrive as `[magic_byte, schema_id (4 bytes), avro_payload...]`. The library doesn't ship a Schema Registry client, but `RawBytesCodec` lets the handler strip the 5-byte framing header, look up the schema, and decode the Avro payload itself. Re-publishing works the same way in reverse: prepend the framing header before publishing.
 
 Reach for `RawBytesCodec` only when the format genuinely isn't `serde`-friendly. Once the bytes leave the handler, the type system can no longer help you.
+
+Runnable example: [`examples/nats/raw_bytes.rs`](https://github.com/zannis/shove/blob/main/examples/nats/raw_bytes.rs).
 
 ## Migrating hand-rolled Topic impls
 

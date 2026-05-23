@@ -18,6 +18,7 @@ use shove::{
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
+// [!region topic]
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct OrderEvent {
     #[prost(string, tag = "1")]
@@ -32,7 +33,9 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-orders-proto").dlq().build(),
     codec = ProtobufCodec<OrderEvent>
 );
+// [!endregion topic]
 
+// [!region handler]
 struct OrderHandler;
 
 impl MessageHandler<Orders> for OrderHandler {
@@ -45,18 +48,25 @@ impl MessageHandler<Orders> for OrderHandler {
         Outcome::Ack
     }
 }
+// [!endregion handler]
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // [!region main]
     tracing_subscriber::fmt::init();
 
     let container = KafkaImage::default().start().await?;
     let port = container.get_host_port_ipv4(apache::KAFKA_PORT).await?;
     let bootstrap = format!("127.0.0.1:{port}");
 
+    // [!region connect]
     let broker = Broker::<Kafka>::new(KafkaConfig::new(&bootstrap)).await?;
+    // [!endregion connect]
+    // [!region declare]
     broker.topology().declare::<Orders>().await?;
+    // [!endregion declare]
 
+    // [!region publish]
     let publisher = broker.publisher().await?;
     publisher
         .publish::<Orders>(&OrderEvent {
@@ -65,7 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     println!("Published protobuf-encoded order ORD-1");
+    // [!endregion publish]
 
+    // [!region consume]
     let mut group = broker.consumer_group();
     group
         .register::<Orders, _>(
@@ -85,7 +97,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Duration::from_secs(10),
         )
         .await;
+    // [!endregion consume]
 
     println!("Done.");
     std::process::exit(outcome.exit_code());
+    // [!endregion main]
 }
