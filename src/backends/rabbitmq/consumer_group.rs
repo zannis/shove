@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -193,8 +192,6 @@ impl ConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
-        // Phase-3 placeholder: spawn path runs run_with_inner which still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
@@ -249,8 +246,6 @@ impl ConsumerGroup {
     ) -> Self
     where
         T: SequencedTopic + 'static,
-        // Phase-3 placeholder: spawn path runs FIFO shards which still use serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let error_count = Arc::new(AtomicUsize::new(0));

@@ -9,7 +9,6 @@ use lapin::message::Delivery;
 use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
 use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, Error as LapinError};
-use serde::Deserialize;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -207,7 +206,6 @@ impl RabbitMqConsumer {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let mut poisoned_keys = HashSet::new();
@@ -289,7 +287,6 @@ impl RabbitMqConsumer {
     ) -> Result<ChannelPublisher>
     where
         T: Topic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let prefetch = options.prefetch_count;
@@ -807,7 +804,6 @@ impl RabbitMqConsumer {
         group: &Option<Arc<str>>,
     ) where
         T: Topic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         // If the key is poisoned, reject all pending deliveries for it.
@@ -924,7 +920,6 @@ impl RabbitMqConsumer {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let shutdown = options.shutdown.clone();
@@ -950,7 +945,6 @@ impl RabbitMqConsumer {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         #[cfg(feature = "rabbitmq-transactional")]
@@ -1106,7 +1100,6 @@ async fn consume_dlq_loop<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    T::Message: for<'de> Deserialize<'de>,
     H: MessageHandler<T>,
 {
     // DLQ consumer never uses exactly-once mode (always acks, no hold-queue routing).
@@ -1132,7 +1125,7 @@ where
                         "oversized DLQ message — discarding"
                     );
                 } else {
-                    match serde_json::from_slice::<T::Message>(&delivery.data) {
+                    match <T::Codec as crate::Codec<T::Message>>::decode(&delivery.data) {
                         Err(err) => {
                             error!(
                                 error = %err,
@@ -1391,10 +1384,7 @@ async fn try_deserialize_or_reject<T: Topic>(
     options: &ConsumerOptions,
     topic: &str,
     group: Option<&str>,
-) -> Option<T::Message>
-where
-    T::Message: for<'de> Deserialize<'de>,
-{
+) -> Option<T::Message> {
     metrics::record_message_size(topic, group, delivery.data.len());
 
     if let Err(e) = options.validate_payload_message_size(delivery.data.len()) {
@@ -1410,7 +1400,7 @@ where
             .ok();
         return None;
     }
-    match serde_json::from_slice::<T::Message>(&delivery.data) {
+    match <T::Codec as crate::Codec<T::Message>>::decode(&delivery.data) {
         Ok(message) => Some(message),
         Err(err) => {
             error!(
@@ -1437,7 +1427,6 @@ impl RabbitMqConsumer {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -1452,8 +1441,6 @@ impl RabbitMqConsumer {
     ) -> Result<()>
     where
         T: Topic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -1473,7 +1460,6 @@ impl RabbitMqConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -1488,8 +1474,6 @@ impl RabbitMqConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options)?;
@@ -1515,8 +1499,6 @@ impl RabbitMqConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -1582,7 +1564,6 @@ impl RabbitMqConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1606,8 +1587,6 @@ impl RabbitMqConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1629,8 +1608,6 @@ impl RabbitMqConsumer {
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: for<'de> Deserialize<'de>,
         H: MessageHandler<T>,
     {
         let topology = T::topology();

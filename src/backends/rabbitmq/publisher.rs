@@ -277,12 +277,8 @@ impl RabbitMqPublisher {
 }
 
 impl RabbitMqPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
-        let payload = serde_json::to_vec(message)?;
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
 
         match (topology.sequencing(), T::SEQUENCE_KEY_FN) {
@@ -302,13 +298,9 @@ impl RabbitMqPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         validate_headers(&headers)?;
-        let payload = serde_json::to_vec(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let field_table = hashmap_to_field_table(headers);
         let topology = T::topology();
 
@@ -328,11 +320,7 @@ impl RabbitMqPublisher {
         }
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         let topology = T::topology();
         let queue = topology.queue();
         let sequencing = topology.sequencing();
@@ -340,11 +328,7 @@ impl RabbitMqPublisher {
 
         let payloads: Result<Vec<Vec<u8>>> = messages
             .iter()
-            .map(|m| {
-                let mut buf = Vec::with_capacity(128);
-                serde_json::to_writer(&mut buf, m).map_err(ShoveError::Serialization)?;
-                Ok(buf)
-            })
+            .map(<T::Codec as crate::Codec<T::Message>>::encode)
             .collect();
         let payloads = match payloads {
             Ok(v) => v,
