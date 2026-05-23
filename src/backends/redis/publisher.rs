@@ -3,8 +3,6 @@
 
 use std::collections::HashMap;
 
-use serde::Serialize;
-
 use crate::backend::publisher::PublisherImpl;
 use crate::error::{Result, ShoveError};
 use crate::topic::Topic;
@@ -106,10 +104,7 @@ impl PublisherImpl for RedisPublisher {
     fn publish<T: Topic>(
         &self,
         msg: &T::Message,
-    ) -> impl std::future::Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         self.publish_inner::<T>(msg, HashMap::new(), None)
     }
 
@@ -117,10 +112,7 @@ impl PublisherImpl for RedisPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl std::future::Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         self.publish_inner::<T>(msg, headers, None)
     }
 
@@ -128,10 +120,7 @@ impl PublisherImpl for RedisPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl std::future::Future<Output = (u64, Result<()>)> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl std::future::Future<Output = (u64, Result<()>)> + Send {
         async move {
             let mut conn = match self.client.multiplexed_conn().await {
                 Ok(c) => c,

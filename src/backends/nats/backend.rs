@@ -20,7 +20,6 @@ use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::markers::Nats;
 use crate::topic::{SequencedTopic, Topic};
-use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -102,7 +101,6 @@ impl ConsumerImpl for NatsConsumer {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         NatsConsumer::run_with_inner::<T, H>(self, handler, ctx, options).await
@@ -116,7 +114,6 @@ impl ConsumerImpl for NatsConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         NatsConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
@@ -125,7 +122,6 @@ impl ConsumerImpl for NatsConsumer {
     async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         NatsConsumer::run_dlq::<T, H>(self, handler, ctx).await
@@ -139,7 +135,6 @@ impl ConsumerImpl for NatsConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         NatsConsumer::spawn_fifo_shards::<T, H>(self, handler, ctx, options).await
@@ -194,7 +189,6 @@ impl RegistryImpl for NatsConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         NatsConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
@@ -208,7 +202,6 @@ impl RegistryImpl for NatsConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         NatsConsumerGroupRegistry::register_fifo::<T, H>(self, config, factory, ctx).await

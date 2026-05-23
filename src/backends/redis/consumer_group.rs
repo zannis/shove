@@ -9,7 +9,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -151,8 +150,6 @@ impl RedisConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
-        // Phase-3 placeholder: spawn path runs ConsumerImpl::run which still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();
@@ -200,8 +197,6 @@ impl RedisConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: SequencedTopic + 'static,
-        // Phase-3 placeholder: spawn path runs ConsumerImpl::run_fifo which still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let topology = T::topology();

@@ -6,7 +6,6 @@ use std::time::Duration;
 use lapin::options::BasicPublishOptions;
 use lapin::types::{AMQPValue, FieldTable};
 use lapin::{BasicProperties, Channel};
-use serde::Serialize;
 use tokio::sync::Mutex;
 
 use tracing::{debug, warn};
@@ -362,10 +361,7 @@ impl RabbitMqPublisher {
 }
 
 impl PublisherImpl for RabbitMqPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
         RabbitMqPublisher::publish::<T>(self, msg)
     }
 
@@ -373,20 +369,14 @@ impl PublisherImpl for RabbitMqPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl Future<Output = Result<()>> + Send {
         RabbitMqPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         RabbitMqPublisher::publish_batch::<T>(self, msgs)
     }
 }

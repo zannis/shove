@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
 use uuid::Uuid;
 
 use crate::Topic;
@@ -86,10 +85,7 @@ impl InMemoryPublisher {
 }
 
 impl PublisherImpl for InMemoryPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
         InMemoryPublisher::publish::<T>(self, msg)
     }
 
@@ -97,20 +93,14 @@ impl PublisherImpl for InMemoryPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl Future<Output = Result<()>> + Send {
         InMemoryPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         InMemoryPublisher::publish_batch::<T>(self, msgs)
     }
 }

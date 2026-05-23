@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::RegistryImpl;
@@ -52,8 +51,6 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     ) -> Result<()>
     where
         T: Topic,
-        // Phase-3 placeholder: RegistryImpl::register still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T, Context = Ctx>,
     {
         if T::topology().sequencing().is_some() {
@@ -75,8 +72,6 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
     ) -> Result<()>
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: RegistryImpl::register_fifo still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T, Context = Ctx>,
     {
         if T::topology().sequencing().is_none() {

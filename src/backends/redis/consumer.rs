@@ -6,7 +6,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner;
@@ -68,7 +67,6 @@ impl ConsumerImpl for RedisConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let client = self.client.clone();
@@ -87,7 +85,6 @@ impl ConsumerImpl for RedisConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let consumer = self.clone();
@@ -109,7 +106,6 @@ impl ConsumerImpl for RedisConsumer {
     fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let client = self.client.clone();
@@ -138,7 +134,6 @@ impl ConsumerImpl for RedisConsumer {
     ) -> impl Future<Output = Result<Vec<tokio::task::JoinHandle<Result<()>>>>> + Send
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let client = self.client.clone();

@@ -4,8 +4,6 @@
 
 use std::collections::HashMap;
 
-use serde::Serialize;
-
 use crate::error::Result;
 use crate::topic::Topic;
 
@@ -15,24 +13,15 @@ use crate::topic::Topic;
 // genuinely have no call site; `dead_code` is expected there and the
 // per-trait allow avoids polluting the default build with warnings
 // until Phase 5+ adds the generic wrappers.
-//
-// Phase-3 placeholder: the `T::Message: Serialize` bounds keep
-// compilation green until backends are migrated to route through
-// `<T::Codec as Codec<T::Message>>::encode`. Drop the bound once every
-// backend's `publish*` body has been switched over.
 #[allow(dead_code)]
 pub(crate) trait PublisherImpl: Send + Sync {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize;
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send;
 
     fn publish_with_headers<T: Topic>(
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize;
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Publish a batch, returning the number of messages the backend
     /// confirmed as accepted alongside the overall result. On `Ok(())` the
@@ -44,7 +33,5 @@ pub(crate) trait PublisherImpl: Send + Sync {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send
-    where
-        T::Message: Serialize;
+    ) -> impl Future<Output = (u64, Result<()>)> + Send;
 }

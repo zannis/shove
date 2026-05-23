@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 /// A single audit record capturing one delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditRecord<M: Serialize> {
+pub struct AuditRecord<M> {
     /// Trace identifier propagated across retries via the `x-trace-id` header.
     pub trace_id: String,
     /// The topic name (queue name from the topology).
@@ -38,11 +38,7 @@ pub struct AuditRecord<M: Serialize> {
 /// message will be reprocessed even if the business handler already succeeded.
 /// Handlers wrapped with [`Audited`] must therefore be **idempotent**.
 pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
-    fn audit(&self, record: &AuditRecord<T::Message>) -> impl Future<Output = Result<()>> + Send
-    where
-        // Phase-3 placeholder: AuditRecord<M> requires M: Serialize. Once
-        // audit serializes via T::Codec this bound can be dropped.
-        T::Message: Serialize;
+    fn audit(&self, record: &AuditRecord<T::Message>) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Wraps a `MessageHandler` with audit logging.
@@ -85,9 +81,7 @@ impl<H, A> Audited<H, A> {
 impl<T, H, A> MessageHandler<T> for Audited<H, A>
 where
     T: Topic,
-    // Phase-3 placeholder: AuditRecord<M> requires M: Serialize. Once audit
-    // serializes via T::Codec this bound can be dropped.
-    T::Message: Clone + Serialize,
+    T::Message: Clone,
     H: MessageHandler<T>,
     A: AuditHandler<T>,
 {

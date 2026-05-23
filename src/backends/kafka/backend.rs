@@ -20,7 +20,6 @@ use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::markers::Kafka;
 use crate::topic::{SequencedTopic, Topic};
-use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -105,7 +104,6 @@ impl ConsumerImpl for KafkaConsumer {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         KafkaConsumer::run_with_inner::<T, H>(self, handler, ctx, options).await
@@ -119,7 +117,6 @@ impl ConsumerImpl for KafkaConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         KafkaConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
@@ -128,7 +125,6 @@ impl ConsumerImpl for KafkaConsumer {
     async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         KafkaConsumer::run_dlq::<T, H>(self, handler, ctx).await
@@ -142,7 +138,6 @@ impl ConsumerImpl for KafkaConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         KafkaConsumer::spawn_fifo_shards::<T, H>(self, handler, ctx, options)
@@ -197,7 +192,6 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         KafkaConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
@@ -211,7 +205,6 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         KafkaConsumerGroupRegistry::register_fifo::<T, H>(self, config, factory, ctx).await

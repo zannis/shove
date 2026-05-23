@@ -3,8 +3,6 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use serde::Serialize;
-
 use crate::backend::{Backend, PublisherImpl};
 use crate::error::Result;
 use crate::metrics;
@@ -19,11 +17,7 @@ impl<B: Backend> Publisher<B> {
         Self { inner }
     }
 
-    pub async fn publish<T: Topic>(&self, msg: &T::Message) -> Result<()>
-    where
-        // Phase-3 placeholder: backends still encode via serde_json directly.
-        T::Message: Serialize,
-    {
+    pub async fn publish<T: Topic>(&self, msg: &T::Message) -> Result<()> {
         let topic = T::topology().queue();
         let start = Instant::now();
         let res = self.inner.publish::<T>(msg).await;
@@ -37,11 +31,7 @@ impl<B: Backend> Publisher<B> {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> Result<()>
-    where
-        // Phase-3 placeholder: backends still encode via serde_json directly.
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         let topic = T::topology().queue();
         let start = Instant::now();
         let res = self.inner.publish_with_headers::<T>(msg, headers).await;
@@ -51,11 +41,7 @@ impl<B: Backend> Publisher<B> {
         res
     }
 
-    pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> Result<()>
-    where
-        // Phase-3 placeholder: backends still encode via serde_json directly.
-        T::Message: Serialize,
-    {
+    pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> Result<()> {
         let topic = T::topology().queue();
         let start = Instant::now();
         let (succeeded, res) = self.inner.publish_batch::<T>(msgs).await;

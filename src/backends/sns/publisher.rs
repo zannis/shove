@@ -1,5 +1,4 @@
 use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -372,10 +371,7 @@ impl SnsPublisher {
 }
 
 impl PublisherImpl for SnsPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
         SnsPublisher::publish::<T>(self, msg)
     }
 
@@ -383,20 +379,14 @@ impl PublisherImpl for SnsPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl Future<Output = Result<()>> + Send {
         SnsPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send
-    where
-        T::Message: Serialize,
-    {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send {
         SnsPublisher::publish_batch::<T>(self, msgs)
     }
 }

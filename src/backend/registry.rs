@@ -8,7 +8,6 @@
 
 use std::time::Duration;
 
-use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::consumer_supervisor::SupervisorOutcome;
@@ -33,8 +32,6 @@ pub(crate) trait RegistryImpl: Send {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
-        // Phase-3 placeholder: ConsumerImpl::run still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>;
 
     fn register_fifo<T, H>(
@@ -45,8 +42,6 @@ pub(crate) trait RegistryImpl: Send {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: ConsumerImpl::spawn_fifo_shards still uses serde_json.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         async {
