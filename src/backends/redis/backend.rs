@@ -132,8 +132,8 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
         self.broker_shutdown_token()
     }
 
-    fn set_default_handler_timeout(&mut self, _timeout: std::time::Duration) {
-        todo!("set_default_handler_timeout: implemented in Task 3")
+    fn set_default_handler_timeout(&mut self, timeout: std::time::Duration) {
+        self.default_handler_timeout = Some(timeout);
     }
 
     async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
