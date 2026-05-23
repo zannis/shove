@@ -13,6 +13,19 @@ use super::client::{RedisClient, RedisConnection};
 use super::constants::{DEFAULT_ROUTING_SHARDS, PAYLOAD_FIELD, X_SEQUENCE_KEY};
 use super::topology::RedisTopologyDeclarer;
 
+/// Encode a topic message to `String` for the Redis Streams string-based
+/// field value. Mirrors the SNS publisher's helper — JSON output is always
+/// valid UTF-8; binary codecs over Redis would fail here with a clear
+/// `ShoveError::Codec`. Users who want binary payloads on Redis should
+/// wrap them with `RawBytesCodec` and base64-encode inside the handler.
+fn encode_to_string<T: Topic>(message: &T::Message) -> Result<String> {
+    let bytes = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+    String::from_utf8(bytes).map_err(|e| ShoveError::Codec {
+        codec: <T::Codec as crate::Codec<T::Message>>::NAME,
+        source: Box::new(e),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // FNV-1a shard routing
 // ---------------------------------------------------------------------------
@@ -54,13 +67,9 @@ impl RedisPublisher {
         msg: &T::Message,
         headers: HashMap<String, String>,
         conn: Option<&mut RedisConnection>,
-    ) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         let topology = T::topology();
-        let payload = serde_json::to_string(msg).map_err(ShoveError::Serialization)?;
+        let payload = encode_to_string::<T>(msg)?;
 
         let (stream, sequence_key) = if let Some(key_fn) = T::SEQUENCE_KEY_FN {
             let seq_key = key_fn(msg);

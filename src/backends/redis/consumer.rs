@@ -285,8 +285,6 @@ async fn run_stream_loop<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    // Phase-3 placeholder: decoder still uses serde_json directly.
-    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let hold_queues = topology.hold_queues();
@@ -329,8 +327,6 @@ async fn run_stream_loop_arc<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    // Phase-3 placeholder: decoder still uses serde_json directly.
-    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let group = client.group().to_owned();
@@ -468,7 +464,9 @@ where
                     }
 
                     // Deserialize.
-                    let msg: T::Message = match serde_json::from_str(&payload_raw) {
+                    let msg: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(
+                        payload_raw.as_bytes(),
+                    ) {
                         Ok(m) => m,
                         Err(e) => {
                             tracing::warn!(
