@@ -1096,11 +1096,20 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9: redis_with_handler_timeout_routes_slow_handler_through_retry
+// Test 9: redis_with_handler_timeout_aborts_slow_handler
+//
+// Redis Streams keeps a timed-out message in the consumer's PEL for
+// XAUTOCLAIM to reclaim after `idle_ms` (= the configured handler_timeout).
+// The consumer's periodic XAUTOCLAIM only runs every `idle_ms.max(30_000)`
+// ms — at least 30 s — so redelivery within a short test window is not
+// observable. Instead of asserting redelivery this test asserts the
+// timeout actually fired: `with_handler_timeout(100ms)` aborts the handler
+// before it can finish a 400 ms sleep, leaving `completed == 0` while
+// `started >= 1`.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
+async fn redis_with_handler_timeout_aborts_slow_handler() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1128,20 +1137,18 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
 
     #[derive(Clone)]
     struct Ctx {
-        redelivered: Arc<AtomicU32>,
+        started: Arc<AtomicU32>,
+        completed: Arc<AtomicU32>,
     }
 
     struct SlowHandler;
     impl MessageHandler<SlowOrdersTopic> for SlowHandler {
         type Context = Ctx;
-        async fn handle(&self, _msg: SlowOrder, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
-            if meta.retry_count == 0 {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                Outcome::Ack
-            } else {
-                ctx.redelivered.fetch_add(1, Ordering::SeqCst);
-                Outcome::Ack
-            }
+        async fn handle(&self, _msg: SlowOrder, _meta: MessageMetadata, ctx: &Ctx) -> Outcome {
+            ctx.started.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            ctx.completed.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
         }
     }
 
@@ -1152,7 +1159,8 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
         .await
         .expect("declare");
     let ctx = Ctx {
-        redelivered: Arc::new(AtomicU32::new(0)),
+        started: Arc::new(AtomicU32::new(0)),
+        completed: Arc::new(AtomicU32::new(0)),
     };
 
     let mut group = broker.consumer_group().with_context(ctx.clone());
@@ -1174,7 +1182,7 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
 
     let token = group.cancellation_token();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         token.cancel();
     });
     let outcome = group
@@ -1183,10 +1191,15 @@ async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
     assert!(
         poll_until(
-            || ctx.redelivered.load(Ordering::SeqCst) >= 1,
-            Duration::from_secs(3),
+            || ctx.started.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(1),
         )
         .await,
-        "expected at least one redelivery after handler timeout",
+        "handler was never invoked",
+    );
+    assert_eq!(
+        ctx.completed.load(Ordering::SeqCst),
+        0,
+        "handler completed its 400ms sleep despite a 100ms handler_timeout",
     );
 }
