@@ -182,7 +182,7 @@ pub use consumer::{
     ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
-pub use error::{Result, ShoveError};
+pub use error::ShoveError;
 pub use handler::{MessageHandler, MessageHandlerExt};
 pub use metadata::{DeadMessageMetadata, MessageMetadata};
 pub use outcome::Outcome;

@@ -1,8 +1,8 @@
 //! Verifies the public `Codec` trait shape. Compile-only — if this file
 //! builds, the trait is exposed in the documented form.
 
-use shove::Result;
 use shove::codec::Codec;
+use shove::error::Result;
 
 struct DummyCodec;
 impl Codec<Vec<u8>> for DummyCodec {
