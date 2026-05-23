@@ -5265,6 +5265,7 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     let mut group = b.consumer_group();
     group
         .register_fifo::<OrderTopic, _>(
+            #[allow(clippy::absolute_paths)]
             shove::consumer_group::ConsumerGroupConfig::new(ConsumerGroupConfig::default()),
             {
                 let h = handler.clone();

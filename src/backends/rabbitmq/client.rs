@@ -302,8 +302,6 @@ impl RabbitMqClient {
 
 #[cfg(test)]
 mod tests {
-    use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPHardError, AMQPSoftError};
-
     use super::*;
     use lapin::ErrorKind;
     use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPHardError, AMQPSoftError};

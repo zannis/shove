@@ -1682,7 +1682,10 @@ async fn registry_default_handler_timeout_applies_to_fifo_registrations() {
         .with_context(ctx.clone())
         .with_default_handler_timeout(Duration::from_millis(50));
     group
-        .register_fifo::<SlowLedger, _>(|| SlowHandler)
+        .register_fifo::<SlowLedger, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
+            || SlowHandler,
+        )
         .await
         .expect("register_fifo");
 

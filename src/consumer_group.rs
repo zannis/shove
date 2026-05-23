@@ -224,7 +224,10 @@ mod tests {
             .consumer_group()
             .with_default_handler_timeout(Duration::from_secs(5));
         group
-            .register_fifo::<Ledger, _>(|| NoopHandler)
+            .register_fifo::<Ledger, _>(
+                ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
+                || NoopHandler,
+            )
             .await
             .expect("register_fifo");
 
