@@ -145,6 +145,7 @@ pub mod autoscale_metrics;
 pub mod autoscaler;
 pub mod backend;
 pub mod broker;
+pub mod codec;
 pub mod consumer;
 pub mod consumer_group;
 pub mod consumer_supervisor;
@@ -176,11 +177,12 @@ pub(crate) mod retry;
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;
 pub use backend::{Backend, capability::HasCoordinatedGroups};
+pub use codec::Codec;
 pub use consumer::{
     ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
-pub use error::ShoveError;
+pub use error::{Result, ShoveError};
 pub use handler::{MessageHandler, MessageHandlerExt};
 pub use metadata::{DeadMessageMetadata, MessageMetadata};
 pub use outcome::Outcome;

@@ -11,6 +11,8 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use std::result::Result;
+
 use shove::rabbitmq::RabbitMqConfig;
 use shove::*;
 use testcontainers::runners::AsyncRunner;

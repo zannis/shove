@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
 // Disambiguate against the generic `shove::ConsumerGroupConfig<B>` wrapper
 // in favour of the rabbitmq-specific config this bench uses.
+use std::result::Result;
+
 use shove::rabbitmq::ConsumerGroupConfig;
 use shove::*;
 use testcontainers::ImageExt;
