@@ -54,6 +54,11 @@ kafka = ["dep:rdkafka", "dep:futures-util"]
 # additionally enable `rdkafka/gssapi` or `rdkafka/ssl-vendored` downstream.
 kafka-ssl = ["kafka", "rdkafka?/ssl", "rdkafka?/sasl"]
 
+# AWS MSK IAM authentication. Adds the `MskIam` variant to `KafkaSasl`,
+# which uses `SASL_SSL` + `OAUTHBEARER` with auto-refreshed presigned tokens
+# signed against `kafka-cluster:Connect`. Implies TLS.
+kafka-msk-iam = ["kafka-ssl", "dep:aws-config", "dep:aws-credential-types", "dep:aws-msk-iam-sasl-signer"]
+
 # In-process backend
 inmemory = ["dep:dashmap"]
 
@@ -78,6 +83,8 @@ lapin = { version = "4", features = ["rustls--ring"], optional = true }
 futures-lite = { version = "2", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"], optional = true }
+aws-msk-iam-sasl-signer = { version = "1", optional = true }
 aws-sdk-sns = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
 aws-sdk-sqs = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
 rand = "0.10"

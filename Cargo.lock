@@ -449,6 +449,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-msk-iam-sasl-signer"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e62f2c07adf3f0bd1ad40414dd30fcf34c595d5f613e36011d5b62eeff14f490"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-sts",
+ "aws-sigv4",
+ "aws-types",
+ "base64",
+ "chrono",
+ "futures",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "aws-runtime"
 version = "1.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4161,6 +4179,8 @@ dependencies = [
  "arc-swap",
  "async-nats",
  "aws-config",
+ "aws-credential-types",
+ "aws-msk-iam-sasl-signer",
  "aws-sdk-sns",
  "aws-sdk-sqs",
  "bytes",
