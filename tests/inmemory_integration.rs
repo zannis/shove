@@ -1435,6 +1435,106 @@ async fn run_fifo_until_timeout_returns_clean_when_shards_finish_first() {
     assert_eq!(outcome, SupervisorOutcome::default());
 }
 
+// ---------------------------------------------------------------------------
+// Registry-level default handler timeout (ConsumerGroup path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn registry_default_handler_timeout_times_out_slow_handler() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use serde::{Deserialize, Serialize};
+    use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
+    use shove::{
+        Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome, Topic,
+        TopologyBuilder,
+    };
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Slow {
+        n: u32,
+    }
+
+    struct SlowTopic;
+    impl Topic for SlowTopic {
+        type Message = Slow;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("registry-default-timeout-test")
+                    .hold_queue(Duration::from_millis(50))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Ctx {
+        timeouts: Arc<AtomicU32>,
+    }
+
+    struct SlowHandler;
+    impl MessageHandler<SlowTopic> for SlowHandler {
+        type Context = Ctx;
+        async fn handle(&self, _msg: Slow, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
+            if meta.retry_count == 0 {
+                ctx.timeouts.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Outcome::Ack
+        }
+    }
+
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("broker");
+    broker
+        .topology()
+        .declare::<SlowTopic>()
+        .await
+        .expect("declare");
+    let ctx = Ctx {
+        timeouts: Arc::new(AtomicU32::new(0)),
+    };
+
+    let mut group = broker
+        .consumer_group()
+        .with_context(ctx.clone())
+        .with_default_handler_timeout(Duration::from_millis(50));
+    group
+        .register::<SlowTopic, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=1)),
+            || SlowHandler,
+        )
+        .await
+        .expect("register");
+
+    broker
+        .publisher()
+        .await
+        .expect("publisher")
+        .publish::<SlowTopic>(&Slow { n: 1 })
+        .await
+        .expect("publish");
+
+    let token = group.cancellation_token();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        token.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        ctx.timeouts.load(Ordering::SeqCst) >= 1,
+        "expected >=1 handler timeout via registry default"
+    );
+}
+
 /// Regression test for the abort-leak: when `run_fifo_until_timeout`
 /// returns, the underlying shard task must not keep invoking handlers.
 ///

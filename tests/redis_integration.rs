@@ -1094,3 +1094,97 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
 
     container.rm().await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// Test 9: redis_with_handler_timeout_routes_slow_handler_through_retry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn redis_with_handler_timeout_routes_slow_handler_through_retry() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use shove::ConsumerGroupConfig;
+    use shove::redis::RedisConsumerGroupConfig;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct SlowOrder {
+        id: u64,
+    }
+
+    struct SlowOrdersTopic;
+    impl Topic for SlowOrdersTopic {
+        type Message = SlowOrder;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("redis-int-slow-orders")
+                    .hold_queue(Duration::from_millis(100))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct Ctx {
+        timeouts: Arc<AtomicU32>,
+    }
+
+    struct SlowHandler;
+    impl MessageHandler<SlowOrdersTopic> for SlowHandler {
+        type Context = Ctx;
+        async fn handle(&self, _msg: SlowOrder, meta: MessageMetadata, ctx: &Ctx) -> Outcome {
+            if meta.retry_count == 0 {
+                ctx.timeouts.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            Outcome::Ack
+        }
+    }
+
+    let broker = make_broker("slow-orders-group").await;
+    broker
+        .topology()
+        .declare::<SlowOrdersTopic>()
+        .await
+        .expect("declare");
+    let ctx = Ctx {
+        timeouts: Arc::new(AtomicU32::new(0)),
+    };
+
+    let mut group = broker.consumer_group().with_context(ctx.clone());
+    group
+        .register::<SlowOrdersTopic, _>(
+            ConsumerGroupConfig::new(
+                RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::from_millis(100)),
+            ),
+            || SlowHandler,
+        )
+        .await
+        .expect("register");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<SlowOrdersTopic>(&SlowOrder { id: 1 })
+        .await
+        .expect("publish");
+
+    let token = group.cancellation_token();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        token.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
+        poll_until(
+            || ctx.timeouts.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(3),
+        )
+        .await,
+        "expected the slow handler to time out at least once",
+    );
+}
