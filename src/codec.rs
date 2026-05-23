@@ -8,6 +8,8 @@
 
 use crate::error::Result;
 
+use serde::{Serialize, de::DeserializeOwned};
+
 /// Encodes and decodes the byte representation of a topic message.
 ///
 /// Implementations must be deterministic and round-trip-safe:
@@ -29,11 +31,9 @@ pub trait Codec<M>: Send + Sync + 'static {
     fn decode(bytes: &[u8]) -> Result<M>;
 }
 
-use serde::{Serialize, de::DeserializeOwned};
-
 /// JSON codec — the default. Routes through `serde_json` and surfaces
-/// failures via [`ShoveError::Serialization`] for back-compat with code that
-/// pattern-matches on that variant.
+/// failures via [`crate::error::ShoveError::Serialization`] for back-compat
+/// with code that pattern-matches on that variant.
 pub struct JsonCodec;
 
 impl<M> Codec<M> for JsonCodec
