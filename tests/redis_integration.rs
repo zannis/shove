@@ -34,6 +34,48 @@ static REDIS_URL: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_n
 // Keep the container alive for the duration of the test binary.
 static REDIS_CONTAINER: OnceLock<testcontainers::ContainerAsync<RedisContainer>> = OnceLock::new();
 
+/// RAII wrapper for per-test Redis containers. `ContainerAsync::rm()` is
+/// async, and the bare testcontainers Drop spawns a background tokio task
+/// that may be aborted when the test runtime tears down — leaking the
+/// container if the test panics or the binary is killed soon after. This
+/// wrapper runs `rm()` synchronously on a dedicated runtime in a dedicated
+/// thread, ensuring cleanup completes before scope exit (including unwind
+/// from a failed assertion).
+struct ContainerOnDrop(Option<testcontainers::ContainerAsync<RedisContainer>>);
+
+impl ContainerOnDrop {
+    fn new(container: testcontainers::ContainerAsync<RedisContainer>) -> Self {
+        Self(Some(container))
+    }
+}
+
+impl std::ops::Deref for ContainerOnDrop {
+    type Target = testcontainers::ContainerAsync<RedisContainer>;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("container removed before drop")
+    }
+}
+
+impl Drop for ContainerOnDrop {
+    fn drop(&mut self) {
+        if let Some(container) = self.0.take() {
+            // Spawn a fresh single-threaded runtime on a dedicated OS thread
+            // so we can `block_on` the async `rm()` without re-entering the
+            // test's own runtime (which would deadlock).
+            let handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("cleanup runtime");
+                rt.block_on(async move {
+                    let _ = container.rm().await;
+                });
+            });
+            let _ = handle.join();
+        }
+    }
+}
+
 async fn redis_url() -> &'static str {
     REDIS_URL
         .get_or_init(|| async {
@@ -837,12 +879,14 @@ async fn consumer_recovers_after_redis_restart() {
     // The shared `redis_url()` container is not used here.
     // Use a dynamically allocated host port to avoid CI collisions.
     let host_port: u16 = find_free_port();
-    let container = RedisContainer::default()
-        .with_tag("7.0")
-        .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
-        .start()
-        .await
-        .expect("start Redis container");
+    let container = ContainerOnDrop::new(
+        RedisContainer::default()
+            .with_tag("7.0")
+            .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
+            .start()
+            .await
+            .expect("start Redis container"),
+    );
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
@@ -973,7 +1017,7 @@ async fn consumer_recovers_after_redis_restart() {
         "supervisor outcome not clean: {outcome:?}"
     );
 
-    container.rm().await.ok();
+    // Container cleanup runs via `ContainerOnDrop::drop` even on panic.
 }
 
 // ---------------------------------------------------------------------------
@@ -994,12 +1038,14 @@ async fn consumer_recovers_after_redis_restart() {
 #[tokio::test]
 async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     let host_port: u16 = find_free_port();
-    let container = RedisContainer::default()
-        .with_tag("7.0")
-        .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
-        .start()
-        .await
-        .expect("start Redis container");
+    let container = ContainerOnDrop::new(
+        RedisContainer::default()
+            .with_tag("7.0")
+            .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
+            .start()
+            .await
+            .expect("start Redis container"),
+    );
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
@@ -1031,6 +1077,7 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     }
 
     let mut supervisor = broker.consumer_supervisor();
+    let token = supervisor.cancellation_token();
     supervisor
         .register::<RequeuerRecoverTopic, _>(
             H(call_count.clone()),
@@ -1092,7 +1139,19 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
         call_count.load(Ordering::Relaxed)
     );
 
-    container.rm().await.ok();
+    // Graceful supervisor drain so any error/panic tally from the reconnect
+    // path is surfaced rather than swallowed by JoinSet drop on supervisor
+    // drop. Matches the sibling reconnect test.
+    token.cancel();
+    let outcome = supervisor
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(5))
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "supervisor outcome not clean: {outcome:?}"
+    );
+
+    // Container cleanup runs via `ContainerOnDrop::drop` even on panic.
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,23 +1239,31 @@ async fn redis_with_handler_timeout_aborts_slow_handler() {
         .await
         .expect("publish");
 
+    // Cancel once the handler has been entered AND given enough wall time
+    // to confirm it didn't complete its 400ms sleep within the 100ms
+    // timeout. The wait is gated on `started >= 1` so a regression that
+    // never invokes the handler shows up as a poll_until failure rather
+    // than a silently-passing `completed == 0`.
     let token = group.cancellation_token();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        token.cancel();
+    let started_probe = ctx.started.clone();
+    let canceller_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        let entered = poll_until(
+            move || started_probe.load(Ordering::SeqCst) >= 1,
+            Duration::from_secs(2),
+        )
+        .await;
+        // Give the 100ms timeout time to fire after the handler started.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        canceller_token.cancel();
+        entered
     });
     let outcome = group
         .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(2))
         .await;
+    let entered = canceller.await.expect("canceller");
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
-    assert!(
-        poll_until(
-            || ctx.started.load(Ordering::SeqCst) >= 1,
-            Duration::from_secs(1),
-        )
-        .await,
-        "handler was never invoked",
-    );
+    assert!(entered, "handler was never invoked");
     assert_eq!(
         ctx.completed.load(Ordering::SeqCst),
         0,
