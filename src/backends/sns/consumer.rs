@@ -1,7 +1,6 @@
 use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_sqs::types::{Message, MessageAttributeValue, MessageSystemAttributeName};
-use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
@@ -298,8 +297,6 @@ async fn consume_loop_concurrent<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    // Phase-3 placeholder: decoder still uses serde_json directly.
-    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let notify = Arc::new(Notify::new());
@@ -515,7 +512,9 @@ where
                 continue;
             }
 
-            let message: T::Message = match serde_json::from_str(&body) {
+            let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(
+                body.as_bytes(),
+            ) {
                 Ok(m) => m,
                 Err(err) => {
                     error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting");
@@ -761,8 +760,6 @@ async fn run_sequenced_shard<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    // Phase-3 placeholder: decoder still uses serde_json directly.
-    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let mut poisoned_keys = HashSet::new();
@@ -847,8 +844,6 @@ async fn consume_loop_sequenced<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    // Phase-3 placeholder: decoder still uses serde_json directly.
-    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let prefetch = options.prefetch_count as usize;
@@ -1251,7 +1246,9 @@ where
                         continue;
                     }
 
-                    let message: T::Message = match serde_json::from_str(&body) {
+                    let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(
+                        body.as_bytes(),
+                    ) {
                         Ok(m) => m,
                         Err(err) => {
                             error!(
@@ -1335,8 +1332,6 @@ async fn drain_pending_for_key<T, H>(
     group: &Option<Arc<str>>,
 ) where
     T: Topic,
-    // Phase-3 placeholder: decoder still uses serde_json directly.
-    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     // If the key is poisoned, reject all pending deliveries for it.
@@ -1408,29 +1403,34 @@ async fn drain_pending_for_key<T, H>(
             continue;
         }
 
-        let message: T::Message = match serde_json::from_str(&body) {
-            Ok(m) => m,
-            Err(err) => {
-                error!(
-                    error = %err,
-                    queue_url,
-                    sequence_key = %key,
-                    "failed to deserialize buffered SQS message, rejecting"
-                );
-                metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Deserialize);
-                if on_failure == SequenceFailure::FailAll {
-                    poisoned_keys.insert(key.to_string());
-                    while let Some(pd) = pending.pop_front() {
-                        let rh = pd.receipt_handle().unwrap_or_default();
-                        router::route_reject(sqs, queue_url, rh, topology).await;
+        let message: T::Message =
+            match <T::Codec as crate::Codec<T::Message>>::decode(body.as_bytes()) {
+                Ok(m) => m,
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        queue_url,
+                        sequence_key = %key,
+                        "failed to deserialize buffered SQS message, rejecting"
+                    );
+                    metrics::record_failed(
+                        topic,
+                        group.as_deref(),
+                        metrics::FailReason::Deserialize,
+                    );
+                    if on_failure == SequenceFailure::FailAll {
+                        poisoned_keys.insert(key.to_string());
+                        while let Some(pd) = pending.pop_front() {
+                            let rh = pd.receipt_handle().unwrap_or_default();
+                            router::route_reject(sqs, queue_url, rh, topology).await;
+                        }
+                        pending_deliveries.remove(key);
+                        return;
                     }
-                    pending_deliveries.remove(key);
-                    return;
+                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                    continue;
                 }
-                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
-                continue;
-            }
-        };
+            };
 
         let metadata = extract_metadata(&msg);
 
@@ -1483,8 +1483,6 @@ async fn consume_dlq_loop<T, H>(
 ) -> Result<()>
 where
     T: Topic,
-    // Phase-3 placeholder: decoder still uses serde_json directly.
-    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     info!(queue_url, "DLQ consumer started");
@@ -1528,7 +1526,7 @@ where
                             "oversized DLQ message — discarding"
                         );
                     } else {
-                        match serde_json::from_str::<T::Message>(&body) {
+                        match <T::Codec as crate::Codec<T::Message>>::decode(body.as_bytes()) {
                             Err(err) => {
                                 error!(
                                     error = %err,
@@ -1570,7 +1568,6 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -1584,8 +1581,6 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let client = self.client.clone();
@@ -1620,7 +1615,6 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -1636,7 +1630,6 @@ impl SqsConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1660,8 +1653,6 @@ impl SqsConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1688,8 +1679,6 @@ impl SqsConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let handles = self
@@ -1713,8 +1702,6 @@ impl SqsConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -1762,8 +1749,6 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
-        // Phase-3 placeholder: decoder still uses serde_json directly.
-        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let client = self.client.clone();

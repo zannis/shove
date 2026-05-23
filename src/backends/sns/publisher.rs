@@ -14,6 +14,20 @@ use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
+/// Encode a topic message to `String` for the SNS/SQS string-based wire.
+///
+/// JSON output is always valid UTF-8; binary codecs over SNS/SQS would
+/// fail here with a clear `ShoveError::Codec`. Users who want binary
+/// payloads on these backends should wrap them with `RawBytesCodec` and
+/// base64-encode inside the handler.
+fn encode_to_string<T: Topic>(message: &T::Message) -> Result<String> {
+    let bytes = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+    String::from_utf8(bytes).map_err(|e| ShoveError::Codec {
+        codec: <T::Codec as crate::Codec<T::Message>>::NAME,
+        source: Box::new(e),
+    })
+}
+
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
 
@@ -135,12 +149,8 @@ impl SnsPublisher {
         &self,
         message: &T::Message,
         headers: Option<HashMap<String, String>>,
-    ) -> Result<()>
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
-        let payload = serde_json::to_string(message).map_err(ShoveError::Serialization)?;
+    ) -> Result<()> {
+        let payload = encode_to_string::<T>(message)?;
         let topology = T::topology();
         let queue_name = topology.queue();
         let topic_arn = self.resolve_arn(queue_name).await?;
@@ -198,10 +208,7 @@ impl SnsPublisher {
 }
 
 impl SnsPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
-    where
-        T::Message: Serialize,
-    {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         self.do_publish::<T>(message, None).await
     }
 
@@ -209,27 +216,17 @@ impl SnsPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> Result<()>
-    where
-        T::Message: Serialize,
-    {
+    ) -> Result<()> {
         validate_headers(&headers)?;
         self.do_publish::<T>(message, Some(headers)).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
-    where
-        // Phase-3 placeholder: encoder still uses serde_json directly.
-        T::Message: Serialize,
-    {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
         let topology = T::topology();
         let key_fn = T::SEQUENCE_KEY_FN;
 
         // Serialize all messages up front for fail-fast behaviour.
-        let serialized: Result<Vec<String>> = messages
-            .iter()
-            .map(|m| serde_json::to_string(m).map_err(ShoveError::Serialization))
-            .collect();
+        let serialized: Result<Vec<String>> = messages.iter().map(encode_to_string::<T>).collect();
 
         // Pre-compute routing keys while we still have access to messages.
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
