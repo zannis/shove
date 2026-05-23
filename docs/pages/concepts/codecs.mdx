@@ -1,0 +1,103 @@
+# Codecs
+
+A codec controls how a topic's messages cross the wire. Every topic carries a `Codec` associated type that decides how `T::Message` is encoded on `publish` and decoded on `consume`. The default is JSON, which means existing code keeps working without any changes; opting into a different encoding is a one-line edit on the topic definition.
+
+The codec slot is per-topic, not per-broker. Two topics on the same backend may speak entirely different wire formats. This is the right boundary: a topic models a single event flow, and the encoding is a property of that flow, not of the transport.
+
+## When to swap the default
+
+Three situations come up in practice:
+
+- **Protobuf**, when you need a compact, schema-evolution-aware wire format, or when you share message contracts with services written in other languages.
+- **Raw bytes**, when the payload is already encoded by an upstream component (Confluent Schema Registry's framed Avro, opaque blobs from a legacy system, a third-party format with its own framing).
+- **A custom codec**, when none of the above fit — for example, CBOR or a domain-specific framing.
+
+Outside those situations, stick with JSON; it is the default, requires no extra dependencies, and is the easiest format to debug.
+
+## The Codec trait
+
+The trait is short:
+
+```rust,no_run
+pub trait Codec<M>: Send + Sync + 'static {
+    const NAME: &'static str;
+    fn encode(value: &M) -> Result<Vec<u8>>;
+    fn decode(bytes: &[u8]) -> Result<M>;
+}
+```
+
+`encode` and `decode` are associated functions, not methods on a value. The codec carries no state; the macros plug the type in directly. `NAME` is a stable label used in logs.
+
+## JsonCodec — the default
+
+`JsonCodec` is what you get when `define_topic!` is invoked without a `codec = …` clause:
+
+```rust,no_run
+define_topic!(
+    OrderSettlement,
+    SettlementEvent,
+    TopologyBuilder::new("order-settlement").dlq().build()
+);
+```
+
+This compiles down to a topic with `type Codec = JsonCodec;`. Payloads ride the wire as `serde_json::to_vec` output, and `serde_json::from_slice` is called on the consumer side. `SettlementEvent` must implement `Serialize` and `DeserializeOwned`.
+
+## ProtobufCodec
+
+Enable the `protobuf` cargo feature, derive `prost::Message` on the payload, and pass the codec to the macro:
+
+```rust,no_run
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct OrderEvent {
+    #[prost(string, tag = "1")]
+    order_id: String,
+    #[prost(double, tag = "2")]
+    amount: f64,
+}
+
+define_topic!(
+    Orders,
+    OrderEvent,
+    TopologyBuilder::new("orders").dlq().build(),
+    codec = ProtobufCodec<OrderEvent>
+);
+```
+
+`ProtobufCodec<M>` works for any `M: prost::Message + Default`. Encoding pre-sizes the buffer via `encoded_len`, so a single allocation covers the common case. Decoding failures surface as `ShoveError::Codec { codec: "protobuf", .. }` rather than `Serialization`, so handlers and middleware can distinguish protobuf-decode errors from JSON ones.
+
+For a runnable end-to-end example see `examples/kafka/protobuf_pubsub.rs`.
+
+## RawBytesCodec — the escape hatch
+
+`RawBytesCodec` is a passthrough for payloads that are already encoded. The topic carries `Vec<u8>` and the handler owns every wire-format decision:
+
+```rust,no_run
+define_topic!(
+    LegacyFeed,
+    Vec<u8>,
+    TopologyBuilder::new("legacy-feed").build(),
+    codec = RawBytesCodec
+);
+```
+
+The canonical use case is **Confluent Schema Registry**. Records on that wire arrive as `[magic_byte, schema_id (4 bytes), avro_payload...]`. The library doesn't ship a Schema Registry client, but `RawBytesCodec` lets the handler strip the 5-byte framing header, look up the schema, and decode the Avro payload itself. Re-publishing works the same way in reverse: prepend the framing header before publishing.
+
+Reach for `RawBytesCodec` only when the format genuinely isn't `serde`-friendly. Once the bytes leave the handler, the type system can no longer help you.
+
+## Migrating hand-rolled Topic impls
+
+If you implement `Topic` by hand instead of via `define_topic!`, you now need an explicit `type Codec` line:
+
+```rust,no_run
+impl Topic for OrderSettlement {
+    type Message = SettlementEvent;
+    type Codec = JsonCodec;
+    fn topology() -> &'static QueueTopology { /* ... */ }
+}
+```
+
+`JsonCodec` preserves the old behaviour exactly. Macro-generated topics already do this for you.
+
+## Custom codecs
+
+Implement `Codec<M>` for your own type when neither JSON, Protobuf, nor raw bytes fits. The contract is round-trip safety: `decode(encode(m).unwrap()).unwrap() == m` for every `m` the codec supports. Encode and decode errors should surface as `ShoveError::Codec { codec: "<name>", source }` so consumers see a consistent error variant.
