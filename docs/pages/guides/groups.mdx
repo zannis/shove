@@ -154,6 +154,10 @@ Resolution order, from highest priority to lowest:
 2. **Registry default** — `broker.consumer_group().with_default_handler_timeout(d)`.
 3. **Library default** — 30 seconds, the value of `DEFAULT_HANDLER_TIMEOUT`.
 
+Call `.with_default_handler_timeout(...)` **before** `register` / `register_fifo`. Each backend resolves the effective timeout at registration time, so a call after the first registration has no effect on the already-registered group. `broker.consumer_group()` also returns a fresh registry on every call — a default set on one handle does not propagate to subsequent `broker.consumer_group()` results.
+
+Both `.with_handler_timeout(d)` and `.with_default_handler_timeout(d)` panic if `d` is `Duration::ZERO` — a zero timeout would otherwise perpetuate an infinite retry loop.
+
 Available on every backend that implements coordinated consumer groups (RabbitMQ, NATS, Kafka, Redis, InMemory). SQS uses the supervisor model and has no `consumer_group()` entry point; SQS users set timeouts via `ConsumerOptions::<Sqs>::with_handler_timeout` instead.
 
 ## Full walkthrough
