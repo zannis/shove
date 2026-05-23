@@ -110,6 +110,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 metrics-util = "0.20"
+aws-sdk-kafka = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 mach2 = "0.6"
 
@@ -244,6 +245,10 @@ required-features = ["kafka"]
 
 [[test]]
 name = "kafka_msk_iam_unit"
+required-features = ["kafka-msk-iam"]
+
+[[test]]
+name = "kafka_msk_iam_integration"
 required-features = ["kafka-msk-iam"]
 
 [[example]]
