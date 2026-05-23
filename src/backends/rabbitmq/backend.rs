@@ -20,6 +20,7 @@ use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::markers::RabbitMq;
 use crate::topic::{SequencedTopic, Topic};
+use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -127,6 +128,7 @@ impl ConsumerImpl for RabbitMqConsumer {
     ) -> Result<()>
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         RabbitMqConsumer::run_with_inner::<T, H>(self, handler, ctx, options).await
@@ -140,6 +142,7 @@ impl ConsumerImpl for RabbitMqConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         RabbitMqConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
@@ -148,6 +151,7 @@ impl ConsumerImpl for RabbitMqConsumer {
     async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         RabbitMqConsumer::run_dlq::<T, H>(self, handler, ctx).await
@@ -161,6 +165,7 @@ impl ConsumerImpl for RabbitMqConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         RabbitMqConsumer::spawn_fifo_shards::<T, H>(self, handler, ctx, options)
@@ -227,6 +232,7 @@ impl RegistryImpl for ConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         ConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
@@ -240,6 +246,7 @@ impl RegistryImpl for ConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         ConsumerGroupRegistry::register_fifo::<T, H>(self, config, factory, ctx).await

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
 use shove::{
-    Broker, ConsumerGroupConfig, MessageHandler, MessageMetadata, Outcome, Redis, Topic,
+    Broker, ConsumerGroupConfig, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis, Topic,
     TopologyBuilder,
 };
 
@@ -32,6 +32,7 @@ struct OrderPaid {
 struct Orders;
 impl Topic for Orders {
     type Message = OrderPaid;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
         T.get_or_init(|| {

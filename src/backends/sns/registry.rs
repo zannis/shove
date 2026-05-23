@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use tracing::{debug, info};
 
 use crate::backends::sns::client::SnsClient;
@@ -63,6 +64,8 @@ impl SqsConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
+        // Phase-3 placeholder: spawn path runs run_with_inner which still uses serde_json.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T> + Clone + 'static,
     {
         let mut config = config;

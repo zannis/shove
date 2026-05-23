@@ -25,8 +25,8 @@ use shove::inmemory::{
 };
 use shove::markers::InMemory;
 use shove::{
-    AutoscalerConfig, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
-    SequencedTopic, SupervisorOutcome, Topic, TopologyBuilder,
+    AutoscalerConfig, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+    SequenceFailure, SequencedTopic, SupervisorOutcome, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,7 @@ struct Order {
 struct OrdersTopic;
 impl Topic for OrdersTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -62,6 +63,7 @@ struct Event {
 struct LedgerFailAllTopic;
 impl Topic for LedgerFailAllTopic {
     type Message = Event;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -84,6 +86,7 @@ impl SequencedTopic for LedgerFailAllTopic {
 struct LedgerSkipTopic;
 impl Topic for LedgerSkipTopic {
     type Message = Event;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -109,6 +112,7 @@ struct Ping(u32);
 struct GroupTopic;
 impl Topic for GroupTopic {
     type Message = Ping;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("group-int").dlq().build())
@@ -658,6 +662,7 @@ struct BigPayload {
 struct BigTopic;
 impl Topic for BigTopic {
     type Message = BigPayload;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("big-int").dlq().build())
@@ -1448,8 +1453,8 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
     use serde::{Deserialize, Serialize};
     use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
     use shove::{
-        Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome, Topic,
-        TopologyBuilder,
+        Broker, ConsumerGroupConfig, InMemory, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+        Topic, TopologyBuilder,
     };
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1460,6 +1465,7 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
     struct SlowTopic;
     impl Topic for SlowTopic {
         type Message = Slow;
+        type Codec = JsonCodec;
         fn topology() -> &'static shove::QueueTopology {
             static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
             T.get_or_init(|| {

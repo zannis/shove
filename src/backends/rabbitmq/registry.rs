@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
+
+use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -60,6 +62,8 @@ impl ConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic + 'static,
+        // Phase-3 placeholder: spawn path runs run_with_inner which still uses serde_json.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let mut config = config;
@@ -114,6 +118,8 @@ impl ConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: SequencedTopic + 'static,
+        // Phase-3 placeholder: spawn path runs FIFO shards which still use serde_json.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T> + 'static,
     {
         let mut config = config;

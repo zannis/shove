@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +46,7 @@ impl InMemoryConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         run_concurrent::<T, H>(self.broker.clone(), handler, ctx, options.into_inner())
@@ -58,6 +60,7 @@ impl InMemoryConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options.into_inner())
@@ -73,6 +76,7 @@ impl InMemoryConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -95,6 +99,7 @@ impl InMemoryConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         run_concurrent::<T, H>(self.broker.clone(), handler, ctx, options)
@@ -108,6 +113,7 @@ impl InMemoryConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options)
@@ -121,6 +127,7 @@ impl InMemoryConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         spawn_fifo_shards::<T, H>(self.broker.clone(), handler, ctx, options)
@@ -133,6 +140,7 @@ impl InMemoryConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         run_dlq_impl::<T, H>(self.broker.clone(), handler, ctx)
@@ -151,6 +159,8 @@ async fn run_concurrent<T, H>(
 ) -> Result<()>
 where
     T: Topic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let topology = T::topology();
@@ -334,6 +344,8 @@ pub(crate) fn spawn_fifo_shards<T, H>(
 ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
 where
     T: SequencedTopic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let topology = T::topology();
@@ -389,6 +401,8 @@ async fn run_fifo_impl<T, H>(
 ) -> Result<()>
 where
     T: SequencedTopic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let handles = spawn_fifo_shards::<T, H>(broker, handler, ctx, options)?;
@@ -412,6 +426,8 @@ async fn run_fifo_until_timeout_impl<T, H, S>(
 ) -> SupervisorOutcome
 where
     T: SequencedTopic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
     S: Future<Output = ()> + Send + 'static,
 {
@@ -443,6 +459,8 @@ async fn run_fifo_shard<T, H>(
     busy: Arc<AtomicUsize>,
 ) where
     T: SequencedTopic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let mut poisoned: HashSet<String> = HashSet::new();
@@ -640,6 +658,8 @@ async fn route_reject_sequenced(
 async fn run_dlq_impl<T, H>(broker: InMemoryBroker, handler: H, ctx: H::Context) -> Result<()>
 where
     T: Topic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let topology = T::topology();
@@ -839,7 +859,11 @@ fn prepare_message<T: Topic>(
     max_size: Option<usize>,
     topic: &str,
     group: Option<&str>,
-) -> std::result::Result<(T::Message, MessageMetadata), Outcome> {
+) -> std::result::Result<(T::Message, MessageMetadata), Outcome>
+where
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
+{
     metrics::record_message_size(topic, group, env.payload.len());
 
     if let Err(e) = validate_message_size(env.payload.len(), max_size) {
@@ -902,6 +926,8 @@ async fn invoke_handler<T, H>(
 ) -> Outcome
 where
     T: Topic,
+    // Phase-3 placeholder: prepare_message uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
@@ -936,6 +962,8 @@ async fn invoke_handler_caught<T, H>(
 ) -> Option<Outcome>
 where
     T: Topic,
+    // Phase-3 placeholder: prepare_message uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     // Deserialize on the caller task so the spawned task only owns the

@@ -111,6 +111,7 @@ mod tests {
     struct TestTopic;
     impl Topic for TestTopic {
         type Message = TestMessage;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
             TOPOLOGY.get_or_init(|| TopologyBuilder::new("handler-test").build())

@@ -38,7 +38,11 @@ pub struct AuditRecord<M: Serialize> {
 /// message will be reprocessed even if the business handler already succeeded.
 /// Handlers wrapped with [`Audited`] must therefore be **idempotent**.
 pub trait AuditHandler<T: Topic>: Send + Sync + 'static {
-    fn audit(&self, record: &AuditRecord<T::Message>) -> impl Future<Output = Result<()>> + Send;
+    fn audit(&self, record: &AuditRecord<T::Message>) -> impl Future<Output = Result<()>> + Send
+    where
+        // Phase-3 placeholder: AuditRecord<M> requires M: Serialize. Once
+        // audit serializes via T::Codec this bound can be dropped.
+        T::Message: Serialize;
 }
 
 /// Wraps a `MessageHandler` with audit logging.
@@ -81,7 +85,9 @@ impl<H, A> Audited<H, A> {
 impl<T, H, A> MessageHandler<T> for Audited<H, A>
 where
     T: Topic,
-    T::Message: Clone,
+    // Phase-3 placeholder: AuditRecord<M> requires M: Serialize. Once audit
+    // serializes via T::Codec this bound can be dropped.
+    T::Message: Clone + Serialize,
     H: MessageHandler<T>,
     A: AuditHandler<T>,
 {
@@ -250,6 +256,7 @@ mod tests {
     struct TestTopic;
     impl Topic for TestTopic {
         type Message = TestMessage;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
             TOPOLOGY.get_or_init(|| TopologyBuilder::new("audit-test").dlq().build())

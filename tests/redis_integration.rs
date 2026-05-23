@@ -22,8 +22,8 @@ use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
 use shove::{
-    Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Redis, SequenceFailure,
-    SequencedTopic, Topic, TopologyBuilder,
+    Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
+    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -143,6 +143,7 @@ struct Order {
 struct OrdersTopic;
 impl Topic for OrdersTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -157,6 +158,7 @@ impl Topic for OrdersTopic {
 struct RetryTopic;
 impl Topic for RetryTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -171,6 +173,7 @@ impl Topic for RetryTopic {
 struct RejectTopic;
 impl Topic for RejectTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -191,6 +194,7 @@ struct Event {
 struct LedgerTopic;
 impl Topic for LedgerTopic {
     type Message = Event;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -551,6 +555,7 @@ async fn fifo_same_key_in_order() {
 struct DlqDeliveryTopic;
 impl Topic for DlqDeliveryTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-dlq-delivery").dlq().build())
@@ -560,6 +565,7 @@ impl Topic for DlqDeliveryTopic {
 struct HeadersTopic;
 impl Topic for HeadersTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-headers").dlq().build())
@@ -569,6 +575,7 @@ impl Topic for HeadersTopic {
 struct BatchTopic;
 impl Topic for BatchTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-batch").build())
@@ -578,6 +585,7 @@ impl Topic for BatchTopic {
 struct DeferTopic;
 impl Topic for DeferTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -591,6 +599,7 @@ impl Topic for DeferTopic {
 struct StatsTopic;
 impl Topic for StatsTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-stats").build())
@@ -838,6 +847,7 @@ fn find_free_port() -> u16 {
 struct ReconnectTopic;
 impl Topic for ReconnectTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -852,6 +862,7 @@ impl Topic for ReconnectTopic {
 struct RequeuerRecoverTopic;
 impl Topic for RequeuerRecoverTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -1183,6 +1194,7 @@ async fn redis_with_handler_timeout_aborts_slow_handler() {
     struct SlowOrdersTopic;
     impl Topic for SlowOrdersTopic {
         type Message = SlowOrder;
+        type Codec = JsonCodec;
         fn topology() -> &'static shove::QueueTopology {
             static T: OnceLock<shove::QueueTopology> = OnceLock::new();
             T.get_or_init(|| {
@@ -1296,6 +1308,7 @@ async fn redis_registry_default_handler_timeout_aborts_slow_handler() {
     struct DefSlowOrdersTopic;
     impl Topic for DefSlowOrdersTopic {
         type Message = DefSlowOrder;
+        type Codec = JsonCodec;
         fn topology() -> &'static shove::QueueTopology {
             static T: OnceLock<shove::QueueTopology> = OnceLock::new();
             T.get_or_init(|| {

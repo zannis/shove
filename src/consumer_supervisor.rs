@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -262,6 +263,8 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     pub fn register<T, H>(&mut self, handler: H, options: ConsumerOptions<B>) -> Result<()>
     where
         T: Topic,
+        // Phase-3 placeholder: ConsumerImpl::run still uses serde_json.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T, Context = Ctx>,
     {
         let queue = T::topology().queue();
@@ -291,6 +294,8 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
     ) -> Result<()>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: ConsumerImpl::spawn_fifo_shards still uses serde_json.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T, Context = Ctx>,
     {
         let queue = T::topology().queue();

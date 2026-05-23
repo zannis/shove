@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::Topic;
@@ -26,7 +27,12 @@ impl InMemoryPublisher {
         &self,
         message: &T::Message,
         mut headers: HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // Phase-3 placeholder: publish path still calls serde_json directly.
+        // Task 7 will route through <T::Codec as Codec<T::Message>>::encode.
+        T::Message: Serialize,
+    {
         let topology = T::topology();
         let payload = serde_json::to_vec(message)?;
 
@@ -59,7 +65,10 @@ impl InMemoryPublisher {
 }
 
 impl InMemoryPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
+    where
+        T::Message: Serialize,
+    {
         self.publish_one::<T>(message, HashMap::new()).await
     }
 
@@ -67,12 +76,18 @@ impl InMemoryPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T::Message: Serialize,
+    {
         validate_headers(&headers)?;
         self.publish_one::<T>(message, headers).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
+    where
+        T::Message: Serialize,
+    {
         let mut succeeded: u64 = 0;
         for message in messages {
             match self.publish_one::<T>(message, HashMap::new()).await {
@@ -85,7 +100,10 @@ impl InMemoryPublisher {
 }
 
 impl PublisherImpl for InMemoryPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         InMemoryPublisher::publish::<T>(self, msg)
     }
 
@@ -93,14 +111,20 @@ impl PublisherImpl for InMemoryPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         InMemoryPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send
+    where
+        T::Message: Serialize,
+    {
         InMemoryPublisher::publish_batch::<T>(self, msgs)
     }
 }
@@ -141,6 +165,7 @@ mod tests {
     struct SimpleTopic;
     impl TopicTrait for SimpleTopic {
         type Message = Msg;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: OnceLock<QueueTopology> = OnceLock::new();
             T.get_or_init(|| TopologyBuilder::new("simple-pub").dlq().build())
@@ -150,6 +175,7 @@ mod tests {
     struct SeqTopic;
     impl TopicTrait for SeqTopic {
         type Message = Msg;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: OnceLock<QueueTopology> = OnceLock::new();
             T.get_or_init(|| {
@@ -172,6 +198,7 @@ mod tests {
     struct SeqTopicNoKeyFn;
     impl TopicTrait for SeqTopicNoKeyFn {
         type Message = Msg;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: OnceLock<QueueTopology> = OnceLock::new();
             T.get_or_init(|| {

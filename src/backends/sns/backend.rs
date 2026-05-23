@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
@@ -104,6 +105,7 @@ impl ConsumerImpl for SqsConsumer {
     ) -> Result<()>
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         SqsConsumer::run_with_inner::<T, H>(self, handler, ctx, options).await
@@ -117,6 +119,7 @@ impl ConsumerImpl for SqsConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         SqsConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
@@ -125,6 +128,7 @@ impl ConsumerImpl for SqsConsumer {
     async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         SqsConsumer::run_dlq::<T, H>(self, handler, ctx).await
@@ -138,6 +142,7 @@ impl ConsumerImpl for SqsConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         SqsConsumer::spawn_fifo_shards::<T, H>(self, handler, ctx, options).await

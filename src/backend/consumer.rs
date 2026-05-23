@@ -9,6 +9,8 @@
 
 use std::future::Future;
 
+use serde::de::DeserializeOwned;
+
 use crate::backend::ConsumerOptionsInner;
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -19,6 +21,11 @@ use crate::topic::{SequencedTopic, Topic};
 // `--no-default-features` no backend is compiled, so the trait methods
 // genuinely have no call site; `dead_code` is expected there and the
 // per-trait allow avoids polluting the default build with warnings.
+//
+// Phase-3 placeholder: the `T::Message: DeserializeOwned`
+// bounds keep compilation green until backends are migrated to decode
+// through `<T::Codec as Codec<T::Message>>::decode`. Drop the bound
+// once every backend's consume path has been switched over.
 #[allow(dead_code)]
 pub(crate) trait ConsumerImpl: Send + Sync {
     fn run<T, H>(
@@ -29,6 +36,7 @@ pub(crate) trait ConsumerImpl: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>;
 
     fn run_fifo<T, H>(
@@ -39,11 +47,13 @@ pub(crate) trait ConsumerImpl: Send + Sync {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>;
 
     fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>;
 
     fn spawn_fifo_shards<T, H>(
@@ -54,5 +64,6 @@ pub(crate) trait ConsumerImpl: Send + Sync {
     ) -> impl Future<Output = Result<Vec<tokio::task::JoinHandle<Result<()>>>>> + Send
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>;
 }

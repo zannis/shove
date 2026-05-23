@@ -4,6 +4,7 @@ use std::time::Duration;
 use rdkafka::client::ClientContext;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
@@ -109,7 +110,11 @@ impl KafkaPublisher {
 }
 
 impl KafkaPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
@@ -130,7 +135,11 @@ impl KafkaPublisher {
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         validate_headers(&extra_headers)?;
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
@@ -148,7 +157,11 @@ impl KafkaPublisher {
             .await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         use futures_util::future::join_all;
 
         let topology = T::topology();
@@ -213,7 +226,10 @@ impl KafkaPublisher {
 }
 
 impl PublisherImpl for KafkaPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         KafkaPublisher::publish::<T>(self, msg)
     }
 
@@ -221,14 +237,20 @@ impl PublisherImpl for KafkaPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         KafkaPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send
+    where
+        T::Message: Serialize,
+    {
         KafkaPublisher::publish_batch::<T>(self, msgs)
     }
 }

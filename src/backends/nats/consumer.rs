@@ -12,6 +12,7 @@ use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
 use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
 use async_nats::jetstream::message::AckKind;
 use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -442,6 +443,7 @@ impl NatsConsumer {
     ) -> Result<()>
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -456,6 +458,8 @@ impl NatsConsumer {
     ) -> Result<()>
     where
         T: Topic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -704,6 +708,7 @@ impl NatsConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -720,6 +725,7 @@ impl NatsConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -743,6 +749,8 @@ impl NatsConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -769,6 +777,8 @@ impl NatsConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let handles = self
@@ -800,6 +810,8 @@ impl NatsConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -1039,6 +1051,8 @@ impl NatsConsumer {
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();

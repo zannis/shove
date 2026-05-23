@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -171,6 +172,8 @@ impl SqsConsumerGroup {
     ) -> Self
     where
         T: Topic + 'static,
+        // Phase-3 placeholder: spawn path runs run_with_inner which still uses serde_json.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T> + Clone + 'static,
     {
         let concurrent = config.concurrent_processing;

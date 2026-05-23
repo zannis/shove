@@ -1,6 +1,7 @@
 use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_sqs::types::{Message, MessageAttributeValue, MessageSystemAttributeName};
+use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
@@ -297,6 +298,8 @@ async fn consume_loop_concurrent<T, H>(
 ) -> Result<()>
 where
     T: Topic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let notify = Arc::new(Notify::new());
@@ -758,6 +761,8 @@ async fn run_sequenced_shard<T, H>(
 ) -> Result<()>
 where
     T: Topic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let mut poisoned_keys = HashSet::new();
@@ -842,6 +847,8 @@ async fn consume_loop_sequenced<T, H>(
 ) -> Result<()>
 where
     T: Topic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     let prefetch = options.prefetch_count as usize;
@@ -1328,6 +1335,8 @@ async fn drain_pending_for_key<T, H>(
     group: &Option<Arc<str>>,
 ) where
     T: Topic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     // If the key is poisoned, reject all pending deliveries for it.
@@ -1474,6 +1483,8 @@ async fn consume_dlq_loop<T, H>(
 ) -> Result<()>
 where
     T: Topic,
+    // Phase-3 placeholder: decoder still uses serde_json directly.
+    T::Message: DeserializeOwned,
     H: MessageHandler<T>,
 {
     info!(queue_url, "DLQ consumer started");
@@ -1559,6 +1570,7 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -1572,6 +1584,8 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let client = self.client.clone();
@@ -1606,6 +1620,7 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -1621,6 +1636,7 @@ impl SqsConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1644,6 +1660,8 @@ impl SqsConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1670,6 +1688,8 @@ impl SqsConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let handles = self
@@ -1693,6 +1713,8 @@ impl SqsConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -1740,6 +1762,8 @@ impl SqsConsumer {
     ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let client = self.client.clone();

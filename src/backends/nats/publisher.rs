@@ -5,6 +5,7 @@ use async_nats::HeaderMap;
 use async_nats::header::NATS_MESSAGE_ID;
 use async_nats::jetstream;
 use bytes::Bytes;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
@@ -122,7 +123,11 @@ impl NatsPublisher {
 }
 
 impl NatsPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
@@ -135,7 +140,11 @@ impl NatsPublisher {
         &self,
         message: &T::Message,
         extra_headers: HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         validate_headers(&extra_headers)?;
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
@@ -145,7 +154,11 @@ impl NatsPublisher {
             .await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         let topology = T::topology();
         let prepared: Result<Vec<(String, HeaderMap, Bytes)>> = messages
             .iter()
@@ -212,7 +225,10 @@ impl NatsPublisher {
 }
 
 impl PublisherImpl for NatsPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         NatsPublisher::publish::<T>(self, msg)
     }
 
@@ -220,14 +236,20 @@ impl PublisherImpl for NatsPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         NatsPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send
+    where
+        T::Message: Serialize,
+    {
         NatsPublisher::publish_batch::<T>(self, msgs)
     }
 }

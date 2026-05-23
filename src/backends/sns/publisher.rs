@@ -1,4 +1,5 @@
 use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,7 +135,11 @@ impl SnsPublisher {
         &self,
         message: &T::Message,
         headers: Option<HashMap<String, String>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         let payload = serde_json::to_string(message).map_err(ShoveError::Serialization)?;
         let topology = T::topology();
         let queue_name = topology.queue();
@@ -193,7 +198,10 @@ impl SnsPublisher {
 }
 
 impl SnsPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
+    where
+        T::Message: Serialize,
+    {
         self.do_publish::<T>(message, None).await
     }
 
@@ -201,12 +209,19 @@ impl SnsPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T::Message: Serialize,
+    {
         validate_headers(&headers)?;
         self.do_publish::<T>(message, Some(headers)).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         let topology = T::topology();
         let key_fn = T::SEQUENCE_KEY_FN;
 
@@ -360,7 +375,10 @@ impl SnsPublisher {
 }
 
 impl PublisherImpl for SnsPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         SnsPublisher::publish::<T>(self, msg)
     }
 
@@ -368,14 +386,20 @@ impl PublisherImpl for SnsPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         SnsPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send
+    where
+        T::Message: Serialize,
+    {
         SnsPublisher::publish_batch::<T>(self, msgs)
     }
 }

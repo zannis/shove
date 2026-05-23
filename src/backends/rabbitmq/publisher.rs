@@ -6,6 +6,7 @@ use std::time::Duration;
 use lapin::options::BasicPublishOptions;
 use lapin::types::{AMQPValue, FieldTable};
 use lapin::{BasicProperties, Channel};
+use serde::Serialize;
 use tokio::sync::Mutex;
 
 use tracing::{debug, warn};
@@ -276,7 +277,11 @@ impl RabbitMqPublisher {
 }
 
 impl RabbitMqPublisher {
-    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
+    pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()>
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         let payload = serde_json::to_vec(message)?;
         let topology = T::topology();
 
@@ -297,7 +302,11 @@ impl RabbitMqPublisher {
         &self,
         message: &T::Message,
         headers: HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         validate_headers(&headers)?;
         let payload = serde_json::to_vec(message)?;
         let field_table = hashmap_to_field_table(headers);
@@ -319,7 +328,11 @@ impl RabbitMqPublisher {
         }
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>)
+    where
+        // Phase-3 placeholder: encoder still uses serde_json directly.
+        T::Message: Serialize,
+    {
         let topology = T::topology();
         let queue = topology.queue();
         let sequencing = topology.sequencing();
@@ -365,7 +378,10 @@ impl RabbitMqPublisher {
 }
 
 impl PublisherImpl for RabbitMqPublisher {
-    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send {
+    fn publish<T: Topic>(&self, msg: &T::Message) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         RabbitMqPublisher::publish::<T>(self, msg)
     }
 
@@ -373,14 +389,20 @@ impl PublisherImpl for RabbitMqPublisher {
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
-    ) -> impl Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T::Message: Serialize,
+    {
         RabbitMqPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
+    ) -> impl Future<Output = (u64, Result<()>)> + Send
+    where
+        T::Message: Serialize,
+    {
         RabbitMqPublisher::publish_batch::<T>(self, msgs)
     }
 }

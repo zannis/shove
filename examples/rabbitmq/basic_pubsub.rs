@@ -19,8 +19,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::RabbitMqConfig;
 use shove::{
-    Broker, ConsumerOptions, DeadMessageMetadata, MessageHandler, MessageMetadata, Outcome,
-    QueueTopology, RabbitMq, Topic, TopologyBuilder, define_topic,
+    Broker, ConsumerOptions, DeadMessageMetadata, JsonCodec, MessageHandler, MessageMetadata,
+    Outcome, QueueTopology, RabbitMq, Topic, TopologyBuilder, define_topic,
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
@@ -71,6 +71,7 @@ struct ScheduledOrder;
 
 impl Topic for ScheduledOrder {
     type Message = OrderEvent;
+    type Codec = JsonCodec;
 
     fn topology() -> &'static QueueTopology {
         static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();

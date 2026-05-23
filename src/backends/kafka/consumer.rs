@@ -9,6 +9,7 @@ use rdkafka::consumer::{CommitMode, Consumer as RdkafkaConsumer, StreamConsumer}
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::{Offset, TopicPartitionList};
+use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -675,6 +676,8 @@ impl KafkaConsumer {
     ) -> Result<()>
     where
         T: Topic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -689,6 +692,8 @@ impl KafkaConsumer {
     ) -> Result<()>
     where
         T: Topic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -931,6 +936,8 @@ impl KafkaConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
@@ -945,6 +952,8 @@ impl KafkaConsumer {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let handles = self.spawn_fifo_shards::<T, H>(handler, ctx, options)?;
@@ -975,6 +984,8 @@ impl KafkaConsumer {
     ) -> Result<Vec<tokio::task::JoinHandle<Result<()>>>>
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();
@@ -1176,6 +1187,8 @@ impl KafkaConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1199,6 +1212,8 @@ impl KafkaConsumer {
     ) -> SupervisorOutcome
     where
         T: SequencedTopic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
         S: Future<Output = ()> + Send + 'static,
     {
@@ -1220,6 +1235,8 @@ impl KafkaConsumer {
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
+        // Phase-3 placeholder: decoder still uses serde_json directly.
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         let topology = T::topology();

@@ -193,6 +193,7 @@ mod tests {
         struct T;
         impl Topic for T {
             type Message = Msg;
+            type Codec = crate::JsonCodec;
             fn topology() -> &'static QueueTopology {
                 static TOPO: OnceLock<QueueTopology> = OnceLock::new();
                 TOPO.get_or_init(|| TopologyBuilder::new("test-queue").build())

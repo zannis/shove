@@ -10,6 +10,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
@@ -110,6 +111,7 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: Topic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         RedisConsumerGroupRegistry::register::<T, H>(self, config, factory, ctx).await
@@ -123,6 +125,7 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
     ) -> Result<()>
     where
         T: SequencedTopic,
+        T::Message: DeserializeOwned,
         H: MessageHandler<T>,
     {
         RedisConsumerGroupRegistry::register_fifo::<T, H>(self, config, factory, ctx).await
