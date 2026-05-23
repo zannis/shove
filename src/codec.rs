@@ -51,6 +51,23 @@ where
     }
 }
 
+/// Pass-through codec for topics whose payloads are already encoded
+/// (Schema Registry framings, opaque blobs, third-party formats).
+/// The handler owns the wire-format details.
+pub struct RawBytesCodec;
+
+impl Codec<Vec<u8>> for RawBytesCodec {
+    const NAME: &'static str = "raw";
+
+    fn encode(value: &Vec<u8>) -> Result<Vec<u8>> {
+        Ok(value.clone())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(bytes.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +93,19 @@ mod tests {
     #[test]
     fn json_codec_name_is_json() {
         assert_eq!(<JsonCodec as Codec<Sample>>::NAME, "json");
+    }
+
+    #[test]
+    fn raw_bytes_codec_passthrough() {
+        let payload: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let bytes = <RawBytesCodec as Codec<Vec<u8>>>::encode(&payload).unwrap();
+        assert_eq!(bytes, payload);
+        let decoded = <RawBytesCodec as Codec<Vec<u8>>>::decode(&bytes).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn raw_bytes_codec_name_is_raw() {
+        assert_eq!(<RawBytesCodec as Codec<Vec<u8>>>::NAME, "raw");
     }
 }
