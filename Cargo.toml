@@ -356,3 +356,8 @@ required-features = ["redis-streams"]
 name = "redis_autoscaler"
 path = "examples/redis/autoscaler.rs"
 required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_audited_consumer"
+path = "examples/redis/audited_consumer.rs"
+required-features = ["redis-streams", "audit"]
