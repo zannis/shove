@@ -60,6 +60,8 @@ async fn main() {
         .expect("failed to read LocalStack port");
     let endpoint = format!("http://localhost:{port}");
 
+    wait_until_ready(&endpoint).await;
+
     let purge_endpoint = endpoint.clone();
     let purge: harness::PurgeFn = Box::new(move || {
         let endpoint = purge_endpoint.clone();
@@ -111,4 +113,28 @@ async fn main() {
     .await;
 
     drop(container);
+}
+
+/// Issue a `ListQueues` against LocalStack until it succeeds. Testcontainers'
+/// wait-strategy only confirms port 4566 is open; LocalStack's per-service
+/// boot continues for a few seconds afterwards, and an SDK call against an
+/// unready SQS endpoint returns errors that look like real bugs.
+async fn wait_until_ready(endpoint: &str) {
+    let aws_cfg = aws_config::from_env()
+        .region(aws_config::Region::new("us-east-1"))
+        .endpoint_url(endpoint)
+        .load()
+        .await;
+    let sqs = aws_sdk_sqs::Client::new(&aws_cfg);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if sqs.list_queues().send().await.is_ok() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("LocalStack SQS did not become ready within 60s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
