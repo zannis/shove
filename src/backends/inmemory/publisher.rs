@@ -28,7 +28,7 @@ impl InMemoryPublisher {
         mut headers: HashMap<String, String>,
     ) -> Result<()> {
         let topology = T::topology();
-        let payload = serde_json::to_vec(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
 
         let queue_name = if let Some(seq) = topology.sequencing() {
             let key_fn = T::SEQUENCE_KEY_FN.ok_or_else(|| {
@@ -141,6 +141,7 @@ mod tests {
     struct SimpleTopic;
     impl TopicTrait for SimpleTopic {
         type Message = Msg;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: OnceLock<QueueTopology> = OnceLock::new();
             T.get_or_init(|| TopologyBuilder::new("simple-pub").dlq().build())
@@ -150,6 +151,7 @@ mod tests {
     struct SeqTopic;
     impl TopicTrait for SeqTopic {
         type Message = Msg;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: OnceLock<QueueTopology> = OnceLock::new();
             T.get_or_init(|| {
@@ -172,6 +174,7 @@ mod tests {
     struct SeqTopicNoKeyFn;
     impl TopicTrait for SeqTopicNoKeyFn {
         type Message = Msg;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: OnceLock<QueueTopology> = OnceLock::new();
             T.get_or_init(|| {

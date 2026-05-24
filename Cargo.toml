@@ -70,6 +70,10 @@ redis-streams = ["dep:redis"]
 # expose the endpoint themselves; this crate never opens a port.
 metrics = ["dep:metrics"]
 
+# Protobuf codec via `prost`. Enables `ProtobufCodec<M>` for any
+# `M: prost::Message + Default`.
+protobuf = ["dep:prost"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -97,6 +101,7 @@ dashmap = { version = "6", optional = true }
 redis = { version = "1", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"], optional = true }
 metrics = { version = "0.24", optional = true }
 url = { version = "2", optional = true }
+prost = { version = "0.13", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = true }
@@ -110,6 +115,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 metrics-util = "0.20"
+libc = "0.2"
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 mach2 = "0.6"
 
@@ -218,6 +224,11 @@ name = "nats_audited_consumer"
 path = "examples/nats/audited_consumer.rs"
 required-features = ["nats", "audit"]
 
+[[example]]
+name = "nats_raw_bytes"
+path = "examples/nats/raw_bytes.rs"
+required-features = ["nats"]
+
 [[test]]
 name = "rabbitmq_integration"
 required-features = ["rabbitmq"]
@@ -275,6 +286,11 @@ name = "kafka_msk_iam"
 path = "examples/kafka/msk_iam.rs"
 required-features = ["kafka-msk-iam"]
 
+[[example]]
+name = "kafka_protobuf_pubsub"
+path = "examples/kafka/protobuf_pubsub.rs"
+required-features = ["kafka", "protobuf"]
+
 [[test]]
 name = "inmemory_integration"
 required-features = ["inmemory"]
@@ -324,4 +340,9 @@ required-features = ["redis-streams"]
 [[example]]
 name = "redis_sequenced"
 path = "examples/redis/sequenced.rs"
+required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_stress"
+path = "examples/redis/stress.rs"
 required-features = ["redis-streams"]

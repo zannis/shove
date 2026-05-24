@@ -3,6 +3,16 @@ codecov:
     after_n_builds: 6
     wait_for_ci: true
 
+coverage:
+  status:
+    patch:
+      default:
+        # New / changed lines on a PR should be 80% covered. `informational`
+        # reports the result without failing the Codecov check — flip to
+        # `informational: false` once the gate has been calibrated.
+        target: 80%
+        informational: true
+
 ignore:
   - "tests/**"
   - "benches/**"

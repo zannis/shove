@@ -602,7 +602,7 @@ impl NatsConsumer {
                             }
 
                             // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&msg.payload) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(
@@ -954,7 +954,7 @@ impl NatsConsumer {
                                     }
 
                                     // Deserialize payload; reject to DLQ on failure
-                                    let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                                    let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&msg.payload) {
                                         Ok(m) => m,
                                         Err(e) => {
                                             tracing::error!(
@@ -1135,7 +1135,7 @@ impl NatsConsumer {
                             }
 
                             // Deserialize payload; on failure, log and ack anyway
-                            let payload: T::Message = match serde_json::from_slice(&msg.payload) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&msg.payload) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(

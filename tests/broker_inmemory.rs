@@ -33,6 +33,7 @@ async fn broker_topology_declares() {
     struct SmokeTopic;
     impl Topic for SmokeTopic {
         type Message = String;
+        type Codec = shove::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
             T.get_or_init(|| TopologyBuilder::new("smoke-test").build())
@@ -88,6 +89,7 @@ async fn supervisor_drain_timeout_surfaces_in_outcome() {
     struct SlowTopic;
     impl Topic for SlowTopic {
         type Message = String;
+        type Codec = shove::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
             T.get_or_init(|| TopologyBuilder::new("drain-timeout").build())
@@ -166,6 +168,7 @@ async fn non_unit_context_plumbs_through_supervisor_and_group() {
     struct SupTopic;
     impl Topic for SupTopic {
         type Message = Msg;
+        type Codec = shove::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
             T.get_or_init(|| TopologyBuilder::new("ctx-supervisor").build())
@@ -175,6 +178,7 @@ async fn non_unit_context_plumbs_through_supervisor_and_group() {
     struct GroupTopic;
     impl Topic for GroupTopic {
         type Message = Msg;
+        type Codec = shove::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
             T.get_or_init(|| TopologyBuilder::new("ctx-group").build())

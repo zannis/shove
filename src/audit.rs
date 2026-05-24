@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 /// A single audit record capturing one delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditRecord<M: Serialize> {
+pub struct AuditRecord<M> {
     /// Trace identifier propagated across retries via the `x-trace-id` header.
     pub trace_id: String,
     /// The topic name (queue name from the topology).
@@ -205,6 +205,10 @@ mod shove_backend {
         }
     }
 
+    // The `T::Message: Serialize` bound below is required by the
+    // `serde_json::to_value(&record.payload)` call inside `audit`; the trait
+    // itself is codec-agnostic, so the bound lives on the impl block where
+    // JSON serialization actually happens.
     impl<T, B> AuditHandler<T> for ShoveAuditHandler<B>
     where
         T: Topic,
@@ -250,6 +254,7 @@ mod tests {
     struct TestTopic;
     impl Topic for TestTopic {
         type Message = TestMessage;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
             TOPOLOGY.get_or_init(|| TopologyBuilder::new("audit-test").dlq().build())

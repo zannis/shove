@@ -16,8 +16,8 @@ use shove::inmemory::{
     InMemoryBroker, InMemoryConsumer, InMemoryPublisher, InMemoryTopologyDeclarer,
 };
 use shove::{
-    ConsumerOptions, InMemory, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
-    SequencedTopic, Topic, TopologyBuilder,
+    ConsumerOptions, InMemory, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +30,7 @@ struct LedgerEntry {
 struct LedgerTopic;
 impl Topic for LedgerTopic {
     type Message = LedgerEntry;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
         T.get_or_init(|| {

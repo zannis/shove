@@ -704,6 +704,43 @@ mod tests {
         feature = "rabbitmq"
     ))]
     #[test]
+    fn without_handler_timeout_clears_default() {
+        let opts = ConsumerOptions::<TestBackend>::new().without_handler_timeout();
+        assert_eq!(opts.handler_timeout, None);
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn without_max_pending_per_key_clears_default() {
+        let opts = ConsumerOptions::<TestBackend>::new().without_max_pending_per_key();
+        assert_eq!(opts.max_pending_per_key, None);
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn with_consumer_group_sets_label() {
+        let opts = ConsumerOptions::<TestBackend>::new().with_consumer_group("orders-worker");
+        let inner = opts.into_inner();
+        assert_eq!(inner.consumer_group.as_deref(), Some("orders-worker"));
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
     fn with_shutdown_stores_token() {
         let token = CancellationToken::new();
         let opts = ConsumerOptions::<TestBackend>::new().with_shutdown(token.clone());

@@ -110,7 +110,7 @@ impl KafkaPublisher {
 
 impl KafkaPublisher {
     pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
-        let payload = serde_json::to_vec(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         let headers = Self::build_headers(None);
@@ -132,7 +132,7 @@ impl KafkaPublisher {
         extra_headers: HashMap<String, String>,
     ) -> Result<()> {
         validate_headers(&extra_headers)?;
-        let payload = serde_json::to_vec(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         let headers = Self::build_headers(Some(&extra_headers));
@@ -156,7 +156,7 @@ impl KafkaPublisher {
         let prepared: Result<Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> = messages
             .iter()
             .map(|msg| {
-                let payload = serde_json::to_vec(msg)?;
+                let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
                 let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
                 let headers = Self::build_headers(None);
                 Ok((topic, key, headers, payload))

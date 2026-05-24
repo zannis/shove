@@ -148,6 +148,7 @@ mod bounds_smoke {
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
+            type Codec = crate::JsonCodec;
             fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }
@@ -171,6 +172,7 @@ mod bounds_smoke {
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
+            type Codec = crate::JsonCodec;
             fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }
@@ -221,6 +223,7 @@ mod bounds_smoke {
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
+            type Codec = crate::JsonCodec;
             fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }
@@ -247,6 +250,7 @@ mod bounds_smoke {
         struct Dummy;
         impl Topic for Dummy {
             type Message = ();
+            type Codec = crate::JsonCodec;
             fn topology() -> &'static QueueTopology {
                 unreachable!("anchor only")
             }

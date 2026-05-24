@@ -34,6 +34,8 @@ async fn main() {
         .expect("failed to read NATS port");
     let url = format!("nats://localhost:{port}");
 
+    wait_until_ready(&url).await;
+
     let purge_url = url.clone();
     let purge: harness::PurgeFn = Box::new(move || {
         let url = purge_url.clone();
@@ -70,4 +72,24 @@ async fn main() {
     .await;
 
     drop(container);
+}
+
+/// Block until JetStream is accepting requests. Testcontainers exits
+/// `.start()` once nats-server logs that it's listening, but JetStream
+/// initialization can lag a few hundred ms behind. Issuing an account-info
+/// call confirms the JS API is actually responding.
+async fn wait_until_ready(url: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(client) = async_nats::connect(url).await {
+            let js = jetstream::new(client);
+            if js.query_account().await.is_ok() {
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("NATS JetStream did not become ready within 30s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

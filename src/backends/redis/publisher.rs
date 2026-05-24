@@ -54,7 +54,7 @@ impl RedisPublisher {
         conn: Option<&mut RedisConnection>,
     ) -> Result<()> {
         let topology = T::topology();
-        let payload = serde_json::to_string(msg).map_err(ShoveError::Serialization)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_to_string(msg)?;
 
         let (stream, sequence_key) = if let Some(key_fn) = T::SEQUENCE_KEY_FN {
             let seq_key = key_fn(msg);

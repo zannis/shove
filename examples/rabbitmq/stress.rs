@@ -43,9 +43,10 @@ async fn main() {
         .await
         .expect("failed to enable consistent-hash plugin");
     let _ = exec.stdout_to_vec().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let uri = format!("amqp://guest:guest@localhost:{port}");
+
+    wait_until_ready(&uri).await;
 
     let purge_uri = uri.clone();
     let purge: harness::PurgeFn = Box::new(move || {
@@ -86,4 +87,23 @@ async fn main() {
     .await;
 
     drop(container);
+}
+
+/// Open and close one AMQP channel — confirms the broker is past startup and
+/// the just-enabled `consistent_hash_exchange` plugin is loaded. Replaces a
+/// blind `sleep(2s)` that was previously racing slow CI hosts.
+async fn wait_until_ready(uri: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(conn) = Connection::connect(uri, ConnectionProperties::default()).await
+            && conn.create_channel().await.is_ok()
+        {
+            let _ = conn.close(0, "ready probe".into()).await;
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("RabbitMQ did not become ready within 30s");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }

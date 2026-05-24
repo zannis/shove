@@ -9,9 +9,12 @@
 #[path = "../common/stress_test.rs"]
 mod harness;
 
+use std::time::Duration;
+
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions};
 use rdkafka::client::DefaultClientContext;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
 use shove::{Broker, Kafka};
 use testcontainers::runners::AsyncRunner;
@@ -33,6 +36,8 @@ async fn main() {
         .await
         .expect("failed to read Kafka port");
     let bootstrap = format!("127.0.0.1:{port}");
+
+    wait_until_ready(&bootstrap).await;
 
     let purge_bootstrap = bootstrap.clone();
     let purge: harness::PurgeFn = Box::new(move || {
@@ -74,4 +79,28 @@ async fn main() {
     .await;
 
     drop(container);
+}
+
+/// Poll the broker until a metadata fetch succeeds. Testcontainers' Kafka
+/// image returns from `.start()` as soon as the process logs "started", but
+/// the broker may still be coming up internally and reject the first
+/// connection attempts. Without this wait, the first scenario eats the
+/// startup latency inside its measurement window.
+async fn wait_until_ready(bootstrap: &str) {
+    let probe: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", "shove-stress-probe")
+        .create()
+        .expect("build Kafka probe consumer");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match probe.fetch_metadata(None, Duration::from_secs(2)) {
+            Ok(md) if !md.brokers().is_empty() => return,
+            _ if std::time::Instant::now() >= deadline => {
+                panic!("Kafka broker did not become ready within 60s")
+            }
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
 }

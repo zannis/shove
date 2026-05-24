@@ -474,6 +474,137 @@ mod tests {
         assert_eq!(errors, 0);
         assert_eq!(panics, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // drive_fifo_until_timeout — synthetic JoinHandle tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn drive_fifo_until_timeout_clean_completion_no_signal() {
+        // All shards finish on their own before the signal fires. The
+        // `shards_done` arm of the biased select wins, so the function
+        // returns a clean outcome without ever cancelling the shutdown token.
+        let handles: Vec<tokio::task::JoinHandle<Result<()>>> = vec![
+            tokio::spawn(async { Ok(()) }),
+            tokio::spawn(async { Ok(()) }),
+        ];
+        let shutdown = CancellationToken::new();
+        let outcome = drive_fifo_until_timeout(
+            handles,
+            shutdown.clone(),
+            std::future::pending::<()>(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(outcome.is_clean(), "unexpected outcome: {outcome:?}");
+        assert!(
+            !shutdown.is_cancelled(),
+            "shutdown must not be cancelled when shards complete on their own"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_fifo_until_timeout_signal_then_clean_drain() {
+        // Signal fires while shards are sleeping; they complete inside the
+        // drain window so timed_out stays false.
+        let handles: Vec<tokio::task::JoinHandle<Result<()>>> = vec![
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            }),
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            }),
+        ];
+        let shutdown = CancellationToken::new();
+        let outcome = drive_fifo_until_timeout(
+            handles,
+            shutdown.clone(),
+            async { /* signal ready immediately */ },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(outcome.is_clean(), "unexpected outcome: {outcome:?}");
+        assert!(
+            shutdown.is_cancelled(),
+            "shutdown must be cancelled once the signal fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_fifo_until_timeout_drain_timeout_aborts_surviving_shards() {
+        // Shards never finish on their own; after signal fires the drain
+        // window elapses and `abort_all` short-circuits them. Cancellation
+        // surfaces as `is_cancelled()` join errors that the wrapper maps to
+        // Ok(()), so the outcome is timed_out without false errors/panics.
+        let handles: Vec<tokio::task::JoinHandle<Result<()>>> = (0..3)
+            .map(|_| {
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(())
+                })
+            })
+            .collect();
+        let shutdown = CancellationToken::new();
+        let outcome = drive_fifo_until_timeout(
+            handles,
+            shutdown.clone(),
+            async {},
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(outcome.timed_out, "expected timed_out: {outcome:?}");
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.panics, 0);
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn drive_fifo_until_timeout_propagates_shard_panic() {
+        // A panicking shard surfaces through the wrapper's
+        // `resume_unwind(into_panic())` path. The outer JoinSet catches the
+        // resumed panic and tally_join_result counts it as a panic.
+        let handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+            vec![tokio::spawn(async { panic!("synthetic shard panic") })];
+        let shutdown = CancellationToken::new();
+        let outcome = drive_fifo_until_timeout(
+            handles,
+            shutdown,
+            std::future::pending::<()>(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            outcome.panics, 1,
+            "shard panic must be tallied: {outcome:?}"
+        );
+        assert_eq!(outcome.errors, 0);
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn drive_fifo_until_timeout_tallies_shard_error() {
+        // A shard that returns `Err(_)` increments the error counter and
+        // does not panic.
+        let handles: Vec<tokio::task::JoinHandle<Result<()>>> = vec![tokio::spawn(async {
+            Err(ShoveError::Topology("synthetic shard error".into()))
+        })];
+        let shutdown = CancellationToken::new();
+        let outcome = drive_fifo_until_timeout(
+            handles,
+            shutdown,
+            std::future::pending::<()>(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            outcome.errors, 1,
+            "shard error must be tallied: {outcome:?}"
+        );
+        assert_eq!(outcome.panics, 0);
+        assert!(!outcome.timed_out);
+    }
 }
 
 #[cfg(all(test, feature = "inmemory"))]
@@ -483,13 +614,14 @@ mod inmemory_tests {
     use serde::{Deserialize, Serialize};
 
     use crate::consumer::ConsumerOptions;
-    use crate::define_sequenced_topic;
     use crate::error::ShoveError;
     use crate::inmemory::InMemoryConfig;
     use crate::markers::InMemory;
     use crate::topic::SequencedTopic;
     use crate::topology::{SequenceFailure, TopologyBuilder};
-    use crate::{Broker, MessageHandler, MessageMetadata, Outcome};
+    use crate::{
+        Broker, MessageHandler, MessageMetadata, Outcome, define_sequenced_topic, define_topic,
+    };
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct LedgerEntry {
@@ -589,5 +721,153 @@ mod inmemory_tests {
             }
             other => panic!("expected Topology error, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // register / register_fifo additional rejection paths and drain timeout
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Note {
+        body: String,
+    }
+
+    define_topic!(
+        Notes,
+        Note,
+        TopologyBuilder::new("supervisor-notes-test").build()
+    );
+
+    struct NoteHandler;
+    impl MessageHandler<Notes> for NoteHandler {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    // A SequencedTopic intentionally paired with a non-sequenced topology so
+    // we can exercise the runtime check in `register_fifo` that the topology
+    // actually has `.sequenced(...)`.
+    define_sequenced_topic!(
+        UnsequencedBySchema,
+        LedgerEntry,
+        |msg| msg.account_id.clone(),
+        TopologyBuilder::new("supervisor-no-seq-test").build()
+    );
+
+    struct UnsequencedHandler;
+    impl MessageHandler<UnsequencedBySchema> for UnsequencedHandler {
+        type Context = ();
+        async fn handle(&self, _: LedgerEntry, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_duplicate_non_sequenced_topic() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker.topology().declare::<Notes>().await.expect("declare");
+
+        let mut sup = broker.consumer_supervisor();
+        sup.register::<Notes, _>(NoteHandler, ConsumerOptions::<InMemory>::new())
+            .expect("first register should succeed");
+
+        let result = sup.register::<Notes, _>(NoteHandler, ConsumerOptions::<InMemory>::new());
+        match result {
+            Err(ShoveError::Topology(msg)) => {
+                assert!(msg.contains("already registered"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Topology error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_fifo_rejects_topic_without_sequencing_config() {
+        // The macro-generated `UnsequencedBySchema` implements `SequencedTopic`
+        // but its topology has no `.sequenced(...)`. `register_fifo` must
+        // reject it rather than silently attaching to shard queues that were
+        // never declared.
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        // Skip declaring the topology — declaration would also fail (or be
+        // no-op) and isn't what we're testing.
+
+        let mut sup = broker.consumer_supervisor();
+        let result = sup
+            .register_fifo::<UnsequencedBySchema, _>(
+                UnsequencedHandler,
+                ConsumerOptions::<InMemory>::new(),
+            )
+            .await;
+        match result {
+            Err(ShoveError::Topology(msg)) => {
+                assert!(
+                    msg.contains("no \nsequencing config") || msg.contains("sequencing config"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            other => panic!("expected Topology error, got {other:?}"),
+        }
+    }
+
+    /// Handler that ignores cancellation and never returns within the test
+    /// window, forcing the supervisor's drain timeout to elapse.
+    struct StuckHandler;
+    impl MessageHandler<Notes> for StuckHandler {
+        type Context = ();
+        async fn handle(&self, _: Note, _: MessageMetadata, _: &()) -> Outcome {
+            std::future::pending::<()>().await;
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn run_until_timeout_drain_timeout_aborts_surviving_tasks() {
+        // Publish one message, register a handler that blocks forever, fire
+        // the signal immediately. The consumer task is still inside the
+        // handler when shutdown is cancelled, so the drain window elapses
+        // and `abort_all` triggers the timed_out branch.
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker.topology().declare::<Notes>().await.expect("declare");
+
+        // Disable the handler timeout so the handler stays inside `.handle()`
+        // long enough for the drain timeout to fire instead of the handler
+        // timeout returning Retry.
+        let opts = ConsumerOptions::<InMemory>::new().without_handler_timeout();
+
+        let mut sup = broker.consumer_supervisor();
+        sup.register::<Notes, _>(StuckHandler, opts)
+            .expect("register");
+
+        let publisher = broker.publisher().await.expect("publisher");
+        publisher
+            .publish::<Notes>(&Note {
+                body: "stuck".into(),
+            })
+            .await
+            .expect("publish");
+
+        // Give the consumer a moment to pick up the message and enter the
+        // handler before we signal shutdown.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let outcome = sup
+            .run_until_timeout(
+                async { /* signal immediately */ },
+                Duration::from_millis(50),
+            )
+            .await;
+
+        assert!(
+            outcome.timed_out,
+            "expected drain timeout, got: {outcome:?}"
+        );
+        assert_eq!(outcome.exit_code(), 3);
     }
 }

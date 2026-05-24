@@ -3,7 +3,10 @@
 /// Creates a unit struct and implements `Topic` with an internal `OnceLock`
 /// so the topology is computed once and returned as `&'static QueueTopology`.
 ///
-/// Accepts an optional visibility modifier (defaults to inherited):
+/// Accepts an optional visibility modifier (defaults to inherited). The codec
+/// defaults to `JsonCodec`; pass `codec = MyCodec` as the final argument to
+/// override.
+///
 /// ```ignore
 /// define_topic!(pub OrderSettlement, SettlementEvent,
 ///     TopologyBuilder::new("order-settlement").dlq().build()
@@ -12,13 +15,26 @@
 /// define_topic!(pub(crate) InternalTopic, InternalEvent,
 ///     TopologyBuilder::new("internal").build()
 /// );
+///
+/// define_topic!(RawTopic, Vec<u8>,
+///     TopologyBuilder::new("raw").build(),
+///     codec = shove::RawBytesCodec
+/// );
 /// ```
 #[macro_export]
 macro_rules! define_topic {
+    // Default form: codec inferred as JsonCodec.
     ($vis:vis $name:ident, $message:ty, $topology:expr) => {
+        $crate::define_topic!(
+            $vis $name, $message, $topology, codec = $crate::JsonCodec
+        );
+    };
+    // Explicit codec form.
+    ($vis:vis $name:ident, $message:ty, $topology:expr, codec = $codec:ty) => {
         $vis struct $name;
         impl $crate::Topic for $name {
             type Message = $message;
+            type Codec = $codec;
             fn topology() -> &'static $crate::QueueTopology {
                 static TOPOLOGY: std::sync::OnceLock<$crate::QueueTopology> =
                     std::sync::OnceLock::new();
@@ -37,6 +53,9 @@ macro_rules! define_topic {
 /// Capturing closures will produce a compile error because they cannot be
 /// coerced to `fn(&Message) -> String`.
 ///
+/// The codec defaults to `JsonCodec`; pass `codec = MyCodec` as the final
+/// argument to override.
+///
 /// ```ignore
 /// define_sequenced_topic!(pub AccountLedger, LedgerEntry, |msg| msg.account_id.clone(),
 ///     TopologyBuilder::new("account-ledger")
@@ -48,10 +67,18 @@ macro_rules! define_topic {
 /// ```
 #[macro_export]
 macro_rules! define_sequenced_topic {
+    // Default form: codec inferred as JsonCodec.
     ($vis:vis $name:ident, $message:ty, $key_fn:expr, $topology:expr) => {
+        $crate::define_sequenced_topic!(
+            $vis $name, $message, $key_fn, $topology, codec = $crate::JsonCodec
+        );
+    };
+    // Explicit codec form.
+    ($vis:vis $name:ident, $message:ty, $key_fn:expr, $topology:expr, codec = $codec:ty) => {
         $vis struct $name;
         impl $crate::Topic for $name {
             type Message = $message;
+            type Codec = $codec;
             fn topology() -> &'static $crate::QueueTopology {
                 static TOPOLOGY: std::sync::OnceLock<$crate::QueueTopology> =
                     std::sync::OnceLock::new();
@@ -73,7 +100,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::topology::{SequenceFailure, TopologyBuilder};
-    use crate::{SequencedTopic, Topic};
+    use crate::{Codec, RawBytesCodec, SequencedTopic, Topic};
 
     // -- message types --
 
@@ -121,6 +148,29 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: OrderEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn define_topic_default_codec_is_json() {
+        assert_eq!(
+            <<MacroBasicTopic as Topic>::Codec as Codec<<MacroBasicTopic as Topic>::Message>>::NAME,
+            "json"
+        );
+    }
+
+    define_topic!(
+        MacroRawTopic,
+        Vec<u8>,
+        TopologyBuilder::new("macro-raw").build(),
+        codec = RawBytesCodec
+    );
+
+    #[test]
+    fn define_topic_explicit_codec_overrides_default() {
+        assert_eq!(
+            <<MacroRawTopic as Topic>::Codec as Codec<<MacroRawTopic as Topic>::Message>>::NAME,
+            "raw"
+        );
     }
 
     // -- define_topic! with DLQ and hold queues --
@@ -195,5 +245,13 @@ mod tests {
     #[test]
     fn define_sequenced_topic_has_dlq() {
         assert_eq!(MacroSeqTopic::topology().dlq(), Some("macro-seq-dlq"));
+    }
+
+    #[test]
+    fn define_sequenced_topic_default_codec_is_json() {
+        assert_eq!(
+            <<MacroSeqTopic as Topic>::Codec as Codec<<MacroSeqTopic as Topic>::Message>>::NAME,
+            "json"
+        );
     }
 }

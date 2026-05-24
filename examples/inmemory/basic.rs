@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
 use shove::{
-    Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome, Topic,
-    TopologyBuilder,
+    Broker, ConsumerGroupConfig, InMemory, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+    Topic, TopologyBuilder,
 };
 
 // [!region topic]
@@ -23,6 +23,7 @@ struct Ping {
 struct PingTopic;
 impl Topic for PingTopic {
     type Message = Ping;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("ping").dlq().build())

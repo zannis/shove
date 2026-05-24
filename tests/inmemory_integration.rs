@@ -25,8 +25,8 @@ use shove::inmemory::{
 };
 use shove::markers::InMemory;
 use shove::{
-    AutoscalerConfig, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
-    SequencedTopic, SupervisorOutcome, Topic, TopologyBuilder,
+    AutoscalerConfig, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+    SequenceFailure, SequencedTopic, SupervisorOutcome, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,7 @@ struct Order {
 struct OrdersTopic;
 impl Topic for OrdersTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -62,6 +63,7 @@ struct Event {
 struct LedgerFailAllTopic;
 impl Topic for LedgerFailAllTopic {
     type Message = Event;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -84,6 +86,7 @@ impl SequencedTopic for LedgerFailAllTopic {
 struct LedgerSkipTopic;
 impl Topic for LedgerSkipTopic {
     type Message = Event;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -109,6 +112,7 @@ struct Ping(u32);
 struct GroupTopic;
 impl Topic for GroupTopic {
     type Message = Ping;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("group-int").dlq().build())
@@ -190,6 +194,87 @@ async fn end_to_end_publish_consume_ack() {
     let mut ids: Vec<u64> = seen.lock().await.iter().map(|o| o.id).collect();
     ids.sort();
     assert_eq!(ids, (0..5).collect::<Vec<_>>());
+}
+
+// ---------------------------------------------------------------------------
+// RawBytesCodec — sentinel: catches any backend that bypasses the codec hook
+// and silently round-trips through serde_json / UTF-8 string conversion.
+// ---------------------------------------------------------------------------
+
+shove::define_topic!(
+    RawBytesIntegrationTopic,
+    Vec<u8>,
+    TopologyBuilder::new("raw-bytes-integration").build(),
+    codec = shove::RawBytesCodec
+);
+
+#[tokio::test]
+async fn raw_bytes_codec_round_trips_non_utf8_payload() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
+    broker
+        .topology()
+        .declare::<RawBytesIntegrationTopic>()
+        .await
+        .unwrap();
+
+    // Includes 0xFF (invalid UTF-8 start byte) and 0x00 (NUL terminator).
+    // Either a UTF-8 conversion or a C-string truncation in the publish or
+    // consume path would corrupt this payload — that's the regression we're
+    // sentinelling against.
+    let payload: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF];
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<RawBytesIntegrationTopic>(&payload)
+        .await
+        .unwrap();
+
+    let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    #[derive(Clone)]
+    struct H(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl MessageHandler<RawBytesIntegrationTopic> for H {
+        type Context = ();
+        async fn handle(&self, msg: Vec<u8>, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.lock().await.push(msg);
+            Outcome::Ack
+        }
+    }
+
+    let handler = H(received.clone());
+    let mut supervisor = broker.consumer_supervisor();
+    let opts = ConsumerOptions::<InMemory>::new()
+        .with_shutdown(CancellationToken::new())
+        .with_prefetch_count(1);
+    supervisor
+        .register::<RawBytesIntegrationTopic, _>(handler, opts)
+        .unwrap();
+
+    let token = supervisor.cancellation_token();
+    let probe = received.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        poll_until(
+            move || probe.try_lock().map(|v| v.len() == 1).unwrap_or(false),
+            Duration::from_secs(2),
+        )
+        .await;
+        t.cancel();
+    });
+
+    let outcome = supervisor
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(5))
+        .await;
+    assert!(outcome.is_clean());
+
+    let captured = received.lock().await;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0], payload,
+        "RawBytesCodec must preserve non-UTF-8 bytes verbatim"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +743,7 @@ struct BigPayload {
 struct BigTopic;
 impl Topic for BigTopic {
     type Message = BigPayload;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("big-int").dlq().build())
@@ -1448,8 +1534,8 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
     use serde::{Deserialize, Serialize};
     use shove::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
     use shove::{
-        Broker, ConsumerGroupConfig, InMemory, MessageHandler, MessageMetadata, Outcome, Topic,
-        TopologyBuilder,
+        Broker, ConsumerGroupConfig, InMemory, JsonCodec, MessageHandler, MessageMetadata, Outcome,
+        Topic, TopologyBuilder,
     };
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1460,6 +1546,7 @@ async fn registry_default_handler_timeout_times_out_slow_handler() {
     struct SlowTopic;
     impl Topic for SlowTopic {
         type Message = Slow;
+        type Codec = JsonCodec;
         fn topology() -> &'static shove::QueueTopology {
             static T: std::sync::OnceLock<shove::QueueTopology> = std::sync::OnceLock::new();
             T.get_or_init(|| {

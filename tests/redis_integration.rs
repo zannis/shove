@@ -9,6 +9,7 @@
 #![cfg(feature = "redis-streams")]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,8 +23,8 @@ use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
 use shove::{
-    Broker, ConsumerOptions, MessageHandler, MessageMetadata, Outcome, Redis, SequenceFailure,
-    SequencedTopic, Topic, TopologyBuilder,
+    Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
+    SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -31,8 +32,45 @@ use shove::{
 // ---------------------------------------------------------------------------
 
 static REDIS_URL: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-// Keep the container alive for the duration of the test binary.
-static REDIS_CONTAINER: OnceLock<testcontainers::ContainerAsync<RedisContainer>> = OnceLock::new();
+// Keep the container alive for the duration of the test binary. The
+// `Mutex<Option<…>>` lets the atexit cleanup hook below `.take()` ownership
+// and run the synchronous `rm()` logic, since Rust never drops `static`
+// values at process exit and `ContainerAsync::rm()` takes `self` by value.
+static REDIS_CONTAINER: OnceLock<Mutex<Option<testcontainers::ContainerAsync<RedisContainer>>>> =
+    OnceLock::new();
+
+// Register a `libc::atexit` hook on first access so the shared container is
+// removed when the test binary exits normally. Using `libc::atexit` (already
+// a transitive dep) avoids pulling in a new `ctor` dev-dep.
+static ATEXIT_REGISTERED: std::sync::Once = std::sync::Once::new();
+
+extern "C" fn cleanup_shared_redis_container() {
+    let Some(slot) = REDIS_CONTAINER.get() else {
+        return;
+    };
+    let Ok(mut guard) = slot.lock() else {
+        return;
+    };
+    let Some(container) = guard.take() else {
+        return;
+    };
+    // Mirror `ContainerOnDrop::drop`: run async `rm()` synchronously on a
+    // dedicated single-threaded runtime in a dedicated OS thread so we don't
+    // re-enter any runtime that might still be tearing down.
+    let handle = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+        rt.block_on(async move {
+            let _ = container.rm().await;
+        });
+    });
+    let _ = handle.join();
+}
 
 /// RAII wrapper for per-test Redis containers. `ContainerAsync::rm()` is
 /// async, and the bare testcontainers Drop spawns a background tokio task
@@ -90,7 +128,17 @@ async fn redis_url() -> &'static str {
                 .await
                 .expect("failed to get Redis port");
             let url = format!("redis://{host}:{port}/");
-            REDIS_CONTAINER.set(container).ok();
+            REDIS_CONTAINER.set(Mutex::new(Some(container))).ok();
+            ATEXIT_REGISTERED.call_once(|| {
+                // SAFETY: `atexit` requires the registered function be safe to
+                // call at process exit; our cleanup is independent of static
+                // destructors and uses its own runtime/thread. Note that
+                // `std::thread::spawn` inside an `atexit` handler is not
+                // strictly guaranteed by POSIX, but is reliable on the
+                // platforms this crate targets (macOS, Linux with glibc/musl).
+                // Worst-case failure mode is a leaked container, not UB.
+                unsafe { libc::atexit(cleanup_shared_redis_container) };
+            });
             url
         })
         .await
@@ -143,6 +191,7 @@ struct Order {
 struct OrdersTopic;
 impl Topic for OrdersTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -157,6 +206,7 @@ impl Topic for OrdersTopic {
 struct RetryTopic;
 impl Topic for RetryTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -171,6 +221,7 @@ impl Topic for RetryTopic {
 struct RejectTopic;
 impl Topic for RejectTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -191,6 +242,7 @@ struct Event {
 struct LedgerTopic;
 impl Topic for LedgerTopic {
     type Message = Event;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -551,6 +603,7 @@ async fn fifo_same_key_in_order() {
 struct DlqDeliveryTopic;
 impl Topic for DlqDeliveryTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-dlq-delivery").dlq().build())
@@ -560,6 +613,7 @@ impl Topic for DlqDeliveryTopic {
 struct HeadersTopic;
 impl Topic for HeadersTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-headers").dlq().build())
@@ -569,6 +623,7 @@ impl Topic for HeadersTopic {
 struct BatchTopic;
 impl Topic for BatchTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-batch").build())
@@ -578,6 +633,7 @@ impl Topic for BatchTopic {
 struct DeferTopic;
 impl Topic for DeferTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -591,6 +647,7 @@ impl Topic for DeferTopic {
 struct StatsTopic;
 impl Topic for StatsTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| TopologyBuilder::new("redis-int-stats").build())
@@ -838,6 +895,7 @@ fn find_free_port() -> u16 {
 struct ReconnectTopic;
 impl Topic for ReconnectTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -852,6 +910,7 @@ impl Topic for ReconnectTopic {
 struct RequeuerRecoverTopic;
 impl Topic for RequeuerRecoverTopic {
     type Message = Order;
+    type Codec = JsonCodec;
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
@@ -1183,6 +1242,7 @@ async fn redis_with_handler_timeout_aborts_slow_handler() {
     struct SlowOrdersTopic;
     impl Topic for SlowOrdersTopic {
         type Message = SlowOrder;
+        type Codec = JsonCodec;
         fn topology() -> &'static shove::QueueTopology {
             static T: OnceLock<shove::QueueTopology> = OnceLock::new();
             T.get_or_init(|| {
@@ -1226,7 +1286,8 @@ async fn redis_with_handler_timeout_aborts_slow_handler() {
     group
         .register::<SlowOrdersTopic, _>(
             ConsumerGroupConfig::new(
-                RedisConsumerGroupConfig::new(1).with_handler_timeout(Duration::from_millis(100)),
+                RedisConsumerGroupConfig::new(1..=1)
+                    .with_handler_timeout(Duration::from_millis(100)),
             ),
             || SlowHandler,
         )
@@ -1296,6 +1357,7 @@ async fn redis_registry_default_handler_timeout_aborts_slow_handler() {
     struct DefSlowOrdersTopic;
     impl Topic for DefSlowOrdersTopic {
         type Message = DefSlowOrder;
+        type Codec = JsonCodec;
         fn topology() -> &'static shove::QueueTopology {
             static T: OnceLock<shove::QueueTopology> = OnceLock::new();
             T.get_or_init(|| {
@@ -1341,7 +1403,7 @@ async fn redis_registry_default_handler_timeout_aborts_slow_handler() {
         .with_default_handler_timeout(Duration::from_millis(100));
     group
         .register::<DefSlowOrdersTopic, _>(
-            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1)),
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1..=1)),
             || SlowHandler,
         )
         .await
@@ -1377,4 +1439,249 @@ async fn redis_registry_default_handler_timeout_aborts_slow_handler() {
         0,
         "handler completed its 400ms sleep despite a 100ms registry default handler_timeout",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent-processing topics
+// ---------------------------------------------------------------------------
+
+struct ConcurrentTopic;
+impl Topic for ConcurrentTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-concurrent").dlq().build())
+    }
+}
+
+struct SequentialTopic;
+impl Topic for SequentialTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-sequential").dlq().build())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent-processing test: handlers run in parallel up to prefetch_count
+// ---------------------------------------------------------------------------
+//
+// With concurrent_processing=true and prefetch_count=10, a single consumer
+// pulling 10 messages whose handlers each sleep 200ms should finish the wave
+// in ~200ms, not 2000ms.
+
+#[tokio::test]
+async fn concurrent_processing_runs_handlers_in_parallel() {
+    let broker = make_broker("redis-int-concurrent-grp").await;
+    broker
+        .topology()
+        .declare::<ConcurrentTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let total: usize = 10;
+    for i in 0..total {
+        publisher
+            .publish::<ConcurrentTopic>(&Order { id: i as u64 })
+            .await
+            .expect("publish");
+    }
+
+    let count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<ConcurrentTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let count_for_handler = count.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register::<ConcurrentTopic, _>(
+            ConsumerGroupConfig::new(
+                RedisConsumerGroupConfig::new(1..=1)
+                    .with_prefetch_count(total as u16)
+                    .with_concurrent_processing(true),
+            ),
+            move || H(Arc::clone(&count_for_handler)),
+        )
+        .await
+        .expect("register");
+
+    let probe = count.clone();
+    let started = std::time::Instant::now();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= total,
+            Duration::from_secs(10),
+        )
+        .await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        total,
+        "all {total} messages must be processed"
+    );
+    // Single-thread sequential would be ~2000ms (10 × 200ms). One concurrent
+    // wave is ~200ms. Allow generous headroom for Redis RTT + scheduling.
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "concurrent processing took {elapsed:?}; expected < 900ms (sequential would be ~2s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent-processing test: concurrent_processing=false stays sequential
+// even when prefetch_count is large
+// ---------------------------------------------------------------------------
+//
+// With prefetch_count=10 but concurrent_processing=false, handlers must run
+// one at a time. The registry clamps the effective prefetch to 1 for
+// non-concurrent groups so XREADGROUP returns at most one message per fetch.
+
+#[tokio::test]
+async fn concurrent_processing_false_serializes_handlers() {
+    let broker = make_broker("redis-int-sequential-grp").await;
+    broker
+        .topology()
+        .declare::<SequentialTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let total: usize = 5;
+    for i in 0..total {
+        publisher
+            .publish::<SequentialTopic>(&Order { id: i as u64 })
+            .await
+            .expect("publish");
+    }
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H {
+        in_flight: Arc<AtomicUsize>,
+        max_seen: Arc<AtomicUsize>,
+        count: Arc<AtomicUsize>,
+    }
+    impl MessageHandler<SequentialTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_seen.fetch_max(cur, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ack
+        }
+    }
+
+    let handler = H {
+        in_flight: in_flight.clone(),
+        max_seen: max_seen.clone(),
+        count: count.clone(),
+    };
+    let mut group = broker.consumer_group();
+    group
+        .register::<SequentialTopic, _>(
+            ConsumerGroupConfig::new(
+                RedisConsumerGroupConfig::new(1..=1)
+                    .with_prefetch_count(total as u16)
+                    .with_concurrent_processing(false),
+            ),
+            move || handler.clone(),
+        )
+        .await
+        .expect("register");
+
+    let probe = count.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::SeqCst) >= total,
+            Duration::from_secs(10),
+        )
+        .await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(count.load(Ordering::SeqCst), total);
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "concurrent_processing=false must keep at most one handler in-flight at a time"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent-processing test: register_fifo rejects concurrent_processing=true
+// ---------------------------------------------------------------------------
+//
+// FIFO ordering is broken if a single shard's messages are dispatched
+// concurrently, so `register_fifo` must reject configs with the flag set.
+
+#[tokio::test]
+async fn register_fifo_rejects_concurrent_processing() {
+    let broker = make_broker("redis-int-fifo-reject-grp").await;
+    broker
+        .topology()
+        .declare::<LedgerTopic>()
+        .await
+        .expect("declare");
+
+    struct NoopHandler;
+    impl MessageHandler<LedgerTopic> for NoopHandler {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    let mut group = broker.consumer_group();
+    let result = group
+        .register_fifo::<LedgerTopic, _>(
+            ConsumerGroupConfig::new(
+                RedisConsumerGroupConfig::new(1..=1).with_concurrent_processing(true),
+            ),
+            || NoopHandler,
+        )
+        .await;
+
+    match result {
+        Err(shove::ShoveError::Topology(msg)) => {
+            assert!(
+                msg.contains("concurrent_processing") && msg.contains("FIFO"),
+                "unexpected error message: {msg}"
+            );
+        }
+        other => panic!("expected Topology error, got {other:?}"),
+    }
+
+    // Group should drain cleanly even after the failed registration.
+    let outcome = group
+        .run_until_timeout(std::future::ready(()), Duration::from_millis(200))
+        .await;
+    assert_eq!(outcome.exit_code(), 0);
 }

@@ -284,6 +284,7 @@ mod tests {
     struct BS;
     impl Topic for BS {
         type Message = String;
+        type Codec = crate::JsonCodec;
         fn topology() -> &'static QueueTopology {
             static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
             T.get_or_init(|| TopologyBuilder::new("backend-stats").build())

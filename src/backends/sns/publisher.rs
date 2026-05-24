@@ -135,7 +135,7 @@ impl SnsPublisher {
         message: &T::Message,
         headers: Option<HashMap<String, String>>,
     ) -> Result<()> {
-        let payload = serde_json::to_string(message).map_err(ShoveError::Serialization)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_to_string(message)?;
         let topology = T::topology();
         let queue_name = topology.queue();
         let topic_arn = self.resolve_arn(queue_name).await?;
@@ -213,7 +213,7 @@ impl SnsPublisher {
         // Serialize all messages up front for fail-fast behaviour.
         let serialized: Result<Vec<String>> = messages
             .iter()
-            .map(|m| serde_json::to_string(m).map_err(ShoveError::Serialization))
+            .map(<T::Codec as crate::Codec<T::Message>>::encode_to_string)
             .collect();
 
         // Pre-compute routing keys while we still have access to messages.

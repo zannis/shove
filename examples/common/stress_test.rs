@@ -157,7 +157,10 @@ fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> 
         HandlerProfile::Slow => (messages as f64 * 175.0) / consumers as f64,
         HandlerProfile::Heavy => (messages as f64 * 3000.0) / consumers as f64,
     };
-    let deadline_ms = (expected_ms * 2.0).clamp(30_000.0, 300_000.0);
+    // 3× expected to absorb steady-state variance and scheduling jitter; 60 s
+    // floor keeps short scenarios from racing broker setup; 600 s ceiling
+    // prevents any single scenario from blocking the whole sweep.
+    let deadline_ms = (expected_ms * 3.0).clamp(60_000.0, 600_000.0);
     Duration::from_millis(deadline_ms as u64)
 }
 
@@ -704,7 +707,13 @@ where
         default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
     });
 
-    let mut supervisor = broker.consumer_supervisor();
+    // One supervisor per consumer task. `ConsumerSupervisor::register`
+    // enforces per-topic uniqueness, so we can't fan out N consumers from
+    // a single supervisor for the same topic — N supervisors × 1 register
+    // gives equivalent parallelism (each spawns its own `consumer.run` task
+    // against the shared SQS queue).
+    let scenario_stop = CancellationToken::new();
+    let mut supervisor_handles = Vec::with_capacity(scenario.consumers as usize);
     for _ in 0..scenario.consumers {
         let handler = StressTestHandler {
             epoch,
@@ -713,23 +722,21 @@ where
             profile: scenario.handler,
         };
         let opts = make_opts(prefetch, scenario.concurrent);
+        let mut supervisor = broker.consumer_supervisor();
         supervisor
             .register::<StressTestTopic, _>(handler, opts)
             .map_err(|e| e.to_string())?;
+        let run_stop = scenario_stop.clone();
+        let handle = tokio::spawn(async move {
+            supervisor
+                .run_until_timeout(
+                    async move { run_stop.cancelled().await },
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+        supervisor_handles.push(handle);
     }
-
-    // Per-scenario stop signal (distinct from the supervisor's own
-    // cancellation token so we don't trip global state between scenarios).
-    let scenario_stop = CancellationToken::new();
-    let run_stop = scenario_stop.clone();
-    let run_handle = tokio::spawn(async move {
-        supervisor
-            .run_until_timeout(
-                async move { run_stop.cancelled().await },
-                Duration::from_secs(30),
-            )
-            .await
-    });
 
     let start = Instant::now();
 
@@ -766,9 +773,11 @@ where
 
     let duration = start.elapsed();
 
-    // Signal the supervisor to stop and wait for the drain to complete.
+    // Signal every supervisor to stop and wait for all drains to complete.
     scenario_stop.cancel();
-    let _ = run_handle.await;
+    for handle in supervisor_handles {
+        let _ = handle.await;
+    }
 
     let resources = sampler.stop().await;
     drop(publisher);

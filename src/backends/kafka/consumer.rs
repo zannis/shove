@@ -831,7 +831,7 @@ impl KafkaConsumer {
                             }
 
                             // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match serde_json::from_slice(&payload_bytes) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(
@@ -1079,7 +1079,7 @@ impl KafkaConsumer {
                                 }
 
                                 // Deserialize payload; reject to DLQ on failure
-                                let payload: T::Message = match serde_json::from_slice(&payload_bytes) {
+                                let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
                                     Ok(m) => m,
                                     Err(e) => {
                                         tracing::error!(
@@ -1286,7 +1286,7 @@ impl KafkaConsumer {
                             }
 
                             // Deserialize payload; on failure, log and ack anyway
-                            let payload: T::Message = match serde_json::from_slice(&payload_bytes) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(

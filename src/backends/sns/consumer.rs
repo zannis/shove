@@ -512,7 +512,9 @@ where
                 continue;
             }
 
-            let message: T::Message = match serde_json::from_str(&body) {
+            let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(
+                body.as_bytes(),
+            ) {
                 Ok(m) => m,
                 Err(err) => {
                     error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting");
@@ -1244,7 +1246,9 @@ where
                         continue;
                     }
 
-                    let message: T::Message = match serde_json::from_str(&body) {
+                    let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(
+                        body.as_bytes(),
+                    ) {
                         Ok(m) => m,
                         Err(err) => {
                             error!(
@@ -1399,29 +1403,34 @@ async fn drain_pending_for_key<T, H>(
             continue;
         }
 
-        let message: T::Message = match serde_json::from_str(&body) {
-            Ok(m) => m,
-            Err(err) => {
-                error!(
-                    error = %err,
-                    queue_url,
-                    sequence_key = %key,
-                    "failed to deserialize buffered SQS message, rejecting"
-                );
-                metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Deserialize);
-                if on_failure == SequenceFailure::FailAll {
-                    poisoned_keys.insert(key.to_string());
-                    while let Some(pd) = pending.pop_front() {
-                        let rh = pd.receipt_handle().unwrap_or_default();
-                        router::route_reject(sqs, queue_url, rh, topology).await;
+        let message: T::Message =
+            match <T::Codec as crate::Codec<T::Message>>::decode(body.as_bytes()) {
+                Ok(m) => m,
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        queue_url,
+                        sequence_key = %key,
+                        "failed to deserialize buffered SQS message, rejecting"
+                    );
+                    metrics::record_failed(
+                        topic,
+                        group.as_deref(),
+                        metrics::FailReason::Deserialize,
+                    );
+                    if on_failure == SequenceFailure::FailAll {
+                        poisoned_keys.insert(key.to_string());
+                        while let Some(pd) = pending.pop_front() {
+                            let rh = pd.receipt_handle().unwrap_or_default();
+                            router::route_reject(sqs, queue_url, rh, topology).await;
+                        }
+                        pending_deliveries.remove(key);
+                        return;
                     }
-                    pending_deliveries.remove(key);
-                    return;
+                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                    continue;
                 }
-                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
-                continue;
-            }
-        };
+            };
 
         let metadata = extract_metadata(&msg);
 
@@ -1517,7 +1526,7 @@ where
                             "oversized DLQ message — discarding"
                         );
                     } else {
-                        match serde_json::from_str::<T::Message>(&body) {
+                        match <T::Codec as crate::Codec<T::Message>>::decode(body.as_bytes()) {
                             Err(err) => {
                                 error!(
                                     error = %err,

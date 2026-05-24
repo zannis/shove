@@ -1,17 +1,21 @@
-use serde::{Serialize, de::DeserializeOwned};
-
+use crate::codec::Codec;
 use crate::topology::QueueTopology;
 
-/// A logical message topic that binds a message type to its queue topology.
+/// A logical message topic that binds a message type, its codec, and its
+/// queue topology together.
 ///
-/// Implement this on a unit struct per logical topic. The topology is defined
-/// once and used by publishers, consumers, and topology declaration.
+/// Implement on a unit struct per topic. Prefer the `define_topic!` /
+/// `define_sequenced_topic!` macros — they generate the `OnceLock` for the
+/// static topology and default the codec to `JsonCodec`.
 ///
-/// Prefer using `define_topic!` or `define_sequenced_topic!` macros which
-/// handle the `OnceLock` boilerplate for static topology.
+/// Hand-rolled `impl Topic for X` blocks must set `type Codec` explicitly;
+/// associated type defaults are unstable, so there is no built-in fallback.
 pub trait Topic: Send + Sync + 'static {
     /// The message type that flows through this topic.
-    type Message: Serialize + DeserializeOwned + Send + Sync + 'static;
+    type Message: Send + Sync + 'static;
+
+    /// The codec used to encode and decode `Self::Message` on every backend.
+    type Codec: Codec<Self::Message>;
 
     /// Returns the queue topology for this topic.
     ///

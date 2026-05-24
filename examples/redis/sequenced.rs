@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
 use shove::{
-    Broker, MessageHandler, MessageMetadata, Outcome, Redis, SequenceFailure, SequencedTopic,
-    Topic, TopologyBuilder,
+    Broker, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis, SequenceFailure,
+    SequencedTopic, Topic, TopologyBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -39,6 +39,7 @@ struct Ledger;
 
 impl Topic for Ledger {
     type Message = LedgerEntry;
+    type Codec = JsonCodec;
 
     fn topology() -> &'static shove::QueueTopology {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
