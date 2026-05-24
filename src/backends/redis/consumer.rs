@@ -56,6 +56,60 @@ impl RedisConsumer {
         let uid = uuid::Uuid::new_v4();
         format!("{hostname}-{uid}")
     }
+
+    /// Run the consumer with concurrent in-flight handlers.
+    ///
+    /// Each XREADGROUP-returned entry is dispatched to a fresh tokio task
+    /// that owns its own multiplexed connection for outcome routing
+    /// (XACK / hold / DLQ). A semaphore caps in-flight handlers at
+    /// `options.prefetch_count`. On shutdown the main loop drains by
+    /// reacquiring all permits before returning.
+    ///
+    /// Sequential dispatch (the [`ConsumerImpl::run`] path) is preserved
+    /// untouched for groups that opt out of `concurrent_processing`.
+    pub(super) async fn run_concurrent<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T> + 'static,
+        H::Context: 'static,
+    {
+        let topology = T::topology();
+        let stream = topology.queue();
+        let hold_queues = topology.hold_queues();
+        let shutdown = options.shutdown.clone();
+
+        let hold_names: Vec<String> = hold_queues.iter().map(|hq| hq.name().to_owned()).collect();
+        let requeue_handle = if !hold_names.is_empty() {
+            Some(spawn_requeuer(
+                self.client.clone(),
+                hold_names,
+                shutdown.clone(),
+            ))
+        } else {
+            None
+        };
+
+        let result = run_stream_loop_concurrent::<T, H>(
+            self.client.clone(),
+            Arc::new(handler),
+            Arc::new(ctx),
+            options,
+            topology,
+            stream,
+            hold_queues,
+        )
+        .await;
+
+        if let Some(h) = requeue_handle {
+            h.abort();
+        }
+        result
+    }
 }
 
 impl ConsumerImpl for RedisConsumer {
@@ -573,6 +627,349 @@ where
                         hold_queues,
                     )
                     .await?;
+                }
+
+                if last_autoclaim.elapsed() >= autoclaim_interval {
+                    let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
+                    last_autoclaim = std::time::Instant::now();
+                }
+            }
+        }
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent core loop
+// ---------------------------------------------------------------------------
+
+/// Concurrent variant of [`run_stream_loop_arc`].
+///
+/// Differences vs. the sequential loop:
+///
+/// * A `tokio::sync::Semaphore` initialised with `options.prefetch_count`
+///   permits caps in-flight handlers. The main loop blocks on
+///   `acquire_owned()` before spawning, providing natural backpressure.
+/// * Each dispatched message gets its own tokio task that:
+///   1. runs the handler under its existing timeout,
+///   2. acquires a fresh `multiplexed_conn` (cheap — multiplexed clients
+///      share an underlying socket), and
+///   3. routes the outcome (XACK / hold / DLQ) using that connection,
+///   4. drops the permit so the next fetch can proceed.
+/// * On shutdown the main loop calls `acquire_many(prefetch_count)` to wait
+///   for every in-flight task to complete before returning.
+///
+/// XACK / hold-queue / DLQ routing are unchanged; they execute inside the
+/// spawned task instead of the polling task.
+#[allow(clippy::too_many_arguments)]
+async fn run_stream_loop_concurrent<T, H>(
+    client: RedisClient,
+    handler: Arc<H>,
+    ctx: Arc<H::Context>,
+    options: ConsumerOptionsInner,
+    topology: &'static QueueTopology,
+    stream: &str,
+    hold_queues: &'static [HoldQueue],
+) -> Result<()>
+where
+    T: Topic,
+    H: MessageHandler<T> + 'static,
+    H::Context: 'static,
+{
+    use tokio::sync::Semaphore;
+
+    let group = client.group().to_owned();
+    let shutdown = options.shutdown.clone();
+    let topic_name = topology.queue();
+    let consumer_group = options.consumer_group.as_deref();
+
+    let topic_arc: Arc<str> = Arc::from(topic_name);
+    let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);
+
+    let idle_ms = options
+        .handler_timeout
+        .unwrap_or(Duration::from_secs(30))
+        .as_millis() as u64;
+    let prefetch = options.prefetch_count.max(1) as usize;
+    let autoclaim_interval = Duration::from_millis(idle_ms.max(30_000));
+
+    let semaphore = Arc::new(Semaphore::new(prefetch));
+    let max_retries = options.max_retries;
+    let max_message_size = options.max_message_size;
+    let handler_timeout = options.handler_timeout;
+    let processing = options.processing.clone();
+
+    run_with_reconnect(&shutdown, stream, options.max_reconnect_attempts, || {
+        let client = client.clone();
+        let handler = Arc::clone(&handler);
+        let ctx = Arc::clone(&ctx);
+        let consumer = RedisConsumer::consumer_name();
+        let topic_arc = Arc::clone(&topic_arc);
+        let group_arc = group_arc.clone();
+        let shutdown = shutdown.clone();
+        let semaphore = Arc::clone(&semaphore);
+        let processing = Arc::clone(&processing);
+        let group = group.clone();
+
+        async move {
+            let mut conn = client.dedicated_conn().await?;
+            let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
+            let mut last_autoclaim = std::time::Instant::now();
+
+            loop {
+                if shutdown.is_cancelled() {
+                    // Drain in-flight handlers before returning.
+                    let _ = semaphore.acquire_many(prefetch as u32).await;
+                    return Ok(());
+                }
+
+                let mut xreadgroup_cmd = redis::cmd("XREADGROUP");
+                xreadgroup_cmd
+                    .arg("GROUP")
+                    .arg(&group)
+                    .arg(&consumer)
+                    .arg("COUNT")
+                    .arg(prefetch)
+                    .arg("BLOCK")
+                    .arg(BLOCK_MS)
+                    .arg("STREAMS")
+                    .arg(stream)
+                    .arg(">");
+                let xreadgroup_fut = conn.query(&mut xreadgroup_cmd);
+
+                let raw_reply: redis::Value = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        let _ = semaphore.acquire_many(prefetch as u32).await;
+                        return Ok(());
+                    }
+                    result = xreadgroup_fut => match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if e.to_string().contains("NOGROUP") {
+                                tracing::warn!(
+                                    stream,
+                                    error = %e,
+                                    "consumer group does not exist — topology may not be declared yet; will retry"
+                                );
+                                return Err(ShoveError::Connection(format!(
+                                    "consumer group does not exist on stream '{stream}': {e}"
+                                )));
+                            }
+                            tracing::warn!(error = %e, stream, "XREADGROUP failed");
+                            return Err(e);
+                        }
+                    }
+                };
+
+                let entries = parse_xreadgroup_reply(raw_reply);
+
+                for (entry_id, fields_vec) in entries {
+                    let fields: HashMap<String, String> = fields_vec.into_iter().collect();
+
+                    let payload_raw = match fields.get(PAYLOAD_FIELD) {
+                        Some(s) => s.clone(),
+                        None => {
+                            tracing::warn!(entry_id, "missing payload field — acking and skipping");
+                            if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
+                                tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
+                                metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                            }
+                            continue;
+                        }
+                    };
+
+                    let retry_count = fields
+                        .get(X_RETRY_COUNT)
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+
+                    if let Some(max) = max_message_size
+                        && payload_raw.len() > max
+                    {
+                        tracing::warn!(
+                            entry_id,
+                            size = payload_raw.len(),
+                            limit = max,
+                            "message exceeds size limit — sending to DLQ"
+                        );
+                        metrics::record_failed(
+                            topic_name,
+                            consumer_group,
+                            metrics::FailReason::Oversize,
+                        );
+                        route_to_dlq(
+                            &mut conn,
+                            topology,
+                            stream,
+                            &group,
+                            &entry_id,
+                            &fields,
+                            "oversize",
+                            retry_count,
+                        )
+                        .await?;
+                        continue;
+                    }
+
+                    let msg: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(
+                        payload_raw.as_bytes(),
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                entry_id,
+                                "deserialization failed — sending to DLQ"
+                            );
+                            metrics::record_failed(
+                                topic_name,
+                                consumer_group,
+                                metrics::FailReason::Deserialize,
+                            );
+                            route_to_dlq(
+                                &mut conn,
+                                topology,
+                                stream,
+                                &group,
+                                &entry_id,
+                                &fields,
+                                "deserialize",
+                                retry_count,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+
+                    let delivery_id = fields
+                        .get(X_MESSAGE_ID)
+                        .cloned()
+                        .unwrap_or_else(|| entry_id.clone());
+
+                    let meta = MessageMetadata {
+                        retry_count,
+                        delivery_id,
+                        redelivered: retry_count > 0,
+                        headers: build_headers(&fields),
+                    };
+
+                    // Block here once `prefetch` handlers are in-flight; the
+                    // permit is dropped when the spawned task finishes.
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Err(ShoveError::Connection(
+                                "concurrent consumer semaphore closed".to_string(),
+                            ));
+                        }
+                    };
+
+                    processing.store(true, std::sync::atomic::Ordering::Release);
+
+                    let task_handler = Arc::clone(&handler);
+                    let task_ctx = Arc::clone(&ctx);
+                    let task_client = client.clone();
+                    let task_topic = Arc::clone(&topic_arc);
+                    let task_group_metric = group_arc.clone();
+                    let task_group = group.clone();
+                    let task_stream = stream.to_owned();
+                    let task_processing = Arc::clone(&processing);
+                    let task_semaphore = Arc::clone(&semaphore);
+
+                    tokio::spawn(async move {
+                        let _inflight =
+                            metrics::InflightGuard::new(task_topic.clone(), task_group_metric.clone());
+                        let start = std::time::Instant::now();
+
+                        let outcome_opt = match handler_timeout {
+                            Some(timeout_dur) => {
+                                match tokio::time::timeout(
+                                    timeout_dur,
+                                    task_handler.handle(msg, meta, &task_ctx),
+                                )
+                                .await
+                                {
+                                    Ok(o) => Some(o),
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            entry_id,
+                                            timeout = ?timeout_dur,
+                                            "handler timed out — leaving in PEL for XAUTOCLAIM"
+                                        );
+                                        metrics::record_failed(
+                                            &task_topic,
+                                            task_group_metric.as_deref(),
+                                            metrics::FailReason::Timeout,
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            None => Some(task_handler.handle(msg, meta, &task_ctx).await),
+                        };
+
+                        let elapsed = start.elapsed().as_secs_f64();
+                        drop(permit);
+                        if task_semaphore.available_permits() == prefetch {
+                            task_processing
+                                .store(false, std::sync::atomic::Ordering::Release);
+                        }
+
+                        let Some(outcome) = outcome_opt else { return };
+
+                        metrics::record_consumed(
+                            &task_topic,
+                            task_group_metric.as_deref(),
+                            &outcome,
+                        );
+                        metrics::record_processing_duration(
+                            &task_topic,
+                            task_group_metric.as_deref(),
+                            &outcome,
+                            elapsed,
+                        );
+
+                        // Per-task multiplexed connection — multiplexed clients
+                        // share an underlying socket, so this is cheap and
+                        // concurrent ops across tasks do not serialize.
+                        let mut task_conn = match task_client.multiplexed_conn().await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    entry_id,
+                                    "failed to acquire connection for outcome routing; message left in PEL"
+                                );
+                                metrics::record_backend_error(
+                                    metrics::BackendLabel::Redis,
+                                    metrics::BackendErrorKind::Ack,
+                                );
+                                return;
+                            }
+                        };
+
+                        if let Err(e) = route_outcome(
+                            &mut task_conn,
+                            topology,
+                            &task_stream,
+                            &task_group,
+                            &entry_id,
+                            &fields,
+                            outcome,
+                            retry_count,
+                            max_retries,
+                            hold_queues,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                entry_id,
+                                "outcome routing failed; message left in PEL"
+                            );
+                        }
+                    });
                 }
 
                 if last_autoclaim.elapsed() >= autoclaim_interval {
@@ -1458,5 +1855,166 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(calls, 1, "non-retryable error must not trigger reconnect");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_with_reconnect_shutdown_during_sleep_returns_ok() {
+        // After a retryable error the function backs off in a select! that races
+        // tokio::time::sleep against shutdown.cancelled(). With paused time the
+        // sleep never elapses, so the cancellation arm is the only way the select
+        // can return — proving the cancellation-during-sleep branch is taken
+        // without depending on real wall-clock timing.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let canceller = shutdown.clone();
+        let calls_clone = Arc::clone(&calls);
+
+        // Cancel after yielding so run_with_reconnect has already:
+        //   1. invoked the closure (calls -> 1),
+        //   2. passed the is_cancelled() check after the error, and
+        //   3. entered the select!. With time paused, the sleep arm cannot
+        //      complete, so the cancellation arm must be what returns Ok.
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            canceller.cancel();
+        });
+
+        let result = run_with_reconnect(&shutdown, "test-stream", None, || {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            async { Err(ShoveError::Connection("transient".into())) }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "shutdown during backoff sleep must short-circuit to Ok"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "closure must not be re-invoked after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_reconnect_shutdown_between_error_and_sleep_returns_ok() {
+        // The `if shutdown.is_cancelled() { return Ok(()); }` check sits between the
+        // is_retryable check and the backoff sleep. Cancel the token before the closure
+        // even runs so that the first error returns immediately via that branch.
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let mut calls = 0u32;
+        let result = run_with_reconnect(&shutdown, "test-stream", None, || {
+            calls += 1;
+            async { Err(ShoveError::Connection("transient".into())) }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "cancellation observed after a retryable error must yield Ok"
+        );
+        assert_eq!(
+            calls, 1,
+            "closure runs exactly once before the cancellation check"
+        );
+    }
+
+    // --- parse_xreadgroup_reply: non-UTF-8 and multi-entry branches ---
+
+    #[test]
+    fn parse_xreadgroup_non_utf8_entry_id_skipped() {
+        // BulkString entry ID with invalid UTF-8 hits `Err(_) => continue` and skips
+        // the entry. The surrounding stream/reply structure stays well-formed so we
+        // can prove the skip is per-entry, not a structural failure.
+        let bad_id_entry = redis::Value::Array(vec![
+            redis::Value::BulkString(vec![0xff, 0xfe, 0xfd]), // invalid UTF-8
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"payload".to_vec()),
+                redis::Value::BulkString(b"x".to_vec()),
+            ]),
+        ]);
+        let good_entry = redis::Value::Array(vec![
+            redis::Value::BulkString(b"2-0".to_vec()),
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"payload".to_vec()),
+                redis::Value::BulkString(b"y".to_vec()),
+            ]),
+        ]);
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![bad_id_entry, good_entry]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(
+            result.len(),
+            1,
+            "non-UTF-8 entry ID must be skipped, leaving only the good entry"
+        );
+        assert_eq!(result[0].0, "2-0");
+    }
+
+    #[test]
+    fn parse_xreadgroup_non_utf8_field_key_breaks_loop() {
+        // A BulkString field key with invalid UTF-8 hits `Err(_) => break` in the key
+        // arm, terminating field collection but still emitting the entry with the
+        // fields gathered so far.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"1-0".to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"good-key".to_vec()),
+                    redis::Value::BulkString(b"good-val".to_vec()),
+                    redis::Value::BulkString(vec![0xff, 0xfe]), // invalid UTF-8 key
+                    redis::Value::BulkString(b"never-reached".to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].1.len(),
+            1,
+            "only the pair before the bad key survives"
+        );
+        assert_eq!(result[0].1[0].0, "good-key");
+    }
+
+    #[test]
+    fn parse_xreadgroup_multiple_entries_within_single_stream() {
+        // prefetch_count > 1 produces multiple entries under one stream key. The
+        // parser must emit them in order in the flat result list.
+        fn entry(id: &str, val: &str) -> redis::Value {
+            redis::Value::Array(vec![
+                redis::Value::BulkString(id.as_bytes().to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"payload".to_vec()),
+                    redis::Value::BulkString(val.as_bytes().to_vec()),
+                ]),
+            ])
+        }
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![
+                entry("1-0", "a"),
+                entry("2-0", "b"),
+                entry("3-0", "c"),
+            ]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, "1-0");
+        assert_eq!(result[1].0, "2-0");
+        assert_eq!(result[2].0, "3-0");
+        assert_eq!(result[0].1[0].1, "a");
+        assert_eq!(result[1].1[0].1, "b");
+        assert_eq!(result[2].1[0].1, "c");
     }
 }

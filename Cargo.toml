@@ -341,3 +341,8 @@ required-features = ["redis-streams"]
 name = "redis_sequenced"
 path = "examples/redis/sequenced.rs"
 required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_stress"
+path = "examples/redis/stress.rs"
+required-features = ["redis-streams"]

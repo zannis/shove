@@ -63,13 +63,21 @@ use shove::{ConsumerGroupConfig};
 let mut group = broker.consumer_group();
 group
     .register::<Orders, _>(
-        ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1)),
+        ConsumerGroupConfig::new(
+            RedisConsumerGroupConfig::new(1..=4)
+                .with_prefetch_count(10)
+                .with_concurrent_processing(true),
+        ),
         || Handler,
     )
     .await?;
 ```
 
-`RedisConsumerGroupConfig::new(n)` sets the number of concurrent consumer tasks. Each task polls its assigned shard stream with `XREADGROUP BLOCK`.
+`RedisConsumerGroupConfig::new(min..=max)` mirrors the other coordinated-group backends. The registry spawns `min_consumers` tasks at start; `max_consumers` is the ceiling reserved for a future autoscaler. Each task polls its assigned shard stream with `XREADGROUP BLOCK COUNT prefetch_count`.
+
+- **`.with_prefetch_count(N)`** — the `COUNT` argument to XREADGROUP. With concurrent processing on, also the in-flight cap per consumer task. Default: 10.
+- **`.with_concurrent_processing(true)`** — dispatch each fetched message to its own tokio task with a per-task multiplexed connection for outcome routing. A semaphore caps in-flight handlers at `prefetch_count`. Default: `false` (handlers serialize via prefetch clamped to 1).
+- **`.with_handler_timeout(Duration)`** — per-message handler deadline. Timed-out messages are left in the PEL for XAUTOCLAIM to reclaim.
 
 ## Sequenced delivery
 
@@ -87,7 +95,7 @@ group
     .await?;
 ```
 
-`register_fifo` wires consumer tasks for sequenced delivery. `RedisConsumerGroupConfig::default()` spawns one consumer task; use `RedisConsumerGroupConfig::new(n)` to run more. See [Sequenced Topics](/guides/sequenced) for the full ordering model.
+`register_fifo` wires consumer tasks for sequenced delivery. `RedisConsumerGroupConfig::default()` spawns one consumer task per shard; pass `RedisConsumerGroupConfig::new(min..=max)` to run more replicas. `with_concurrent_processing(true)` is rejected with a `Topology` error on this path — it would break per-key ordering within a shard. See [Sequenced Topics](/guides/sequenced) for the full ordering model.
 
 ## Gotchas
 
