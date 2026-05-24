@@ -346,3 +346,18 @@ required-features = ["redis-streams"]
 name = "redis_stress"
 path = "examples/redis/stress.rs"
 required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_consumer_groups"
+path = "examples/redis/consumer_groups.rs"
+required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_autoscaler"
+path = "examples/redis/autoscaler.rs"
+required-features = ["redis-streams"]
+
+[[example]]
+name = "redis_audited_consumer"
+path = "examples/redis/audited_consumer.rs"
+required-features = ["redis-streams", "audit"]

@@ -23,7 +23,7 @@ use crate::handler::MessageHandler;
 use crate::markers::Redis;
 use crate::topic::{SequencedTopic, Topic};
 
-use super::autoscaler::{RedisAutoscalerBackend, RedisQueueStatsProvider};
+use super::autoscaler::{RedisAutoscalerBackend, XlenStatsProvider};
 use super::client::{RedisClient, RedisConfig};
 use super::consumer::RedisConsumer;
 use super::consumer_group::{RedisConsumerGroupConfig, RedisConsumerGroupRegistry};
@@ -43,8 +43,8 @@ impl Backend for Redis {
     type PublisherImpl = RedisPublisher;
     type ConsumerImpl = RedisConsumer;
     type TopologyImpl = RedisTopologyDeclarer;
-    type AutoscalerImpl = RedisAutoscalerBackend;
-    type QueueStatsImpl = RedisQueueStatsProvider;
+    type AutoscalerImpl = RedisAutoscalerBackend<XlenStatsProvider>;
+    type QueueStatsImpl = XlenStatsProvider;
 
     async fn connect(config: Self::Config) -> Result<Self::Client> {
         RedisClient::connect(config).await
@@ -63,11 +63,14 @@ impl Backend for Redis {
     }
 
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
-        RedisAutoscalerBackend::new(client.clone())
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let registry = Arc::new(Mutex::new(RedisConsumerGroupRegistry::new(client.clone())));
+        RedisAutoscalerBackend::new(client.clone(), registry)
     }
 
     fn make_stats_provider(client: &Self::Client) -> Self::QueueStatsImpl {
-        RedisQueueStatsProvider::new(client.clone())
+        XlenStatsProvider::new(client.clone())
     }
 
     async fn close(_client: &Self::Client) {

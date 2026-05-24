@@ -309,9 +309,9 @@ pub mod redis {
     pub use crate::markers::Redis;
 
     pub use crate::backends::redis::{
-        RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer, RedisConsumerGroupConfig,
-        RedisConsumerGroupRegistry, RedisMode, RedisPublisher, RedisQueueStats,
-        RedisQueueStatsProvider, RedisTopologyDeclarer,
+        RedisAutoscalerBackend, RedisClient, RedisConfig, RedisConsumer, RedisConsumerGroup,
+        RedisConsumerGroupConfig, RedisConsumerGroupRegistry, RedisMode, RedisPublisher,
+        RedisQueueStats, RedisQueueStatsProvider, RedisTopologyDeclarer, XlenStatsProvider,
     };
 }
 

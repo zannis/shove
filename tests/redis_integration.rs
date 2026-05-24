@@ -21,7 +21,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
 use shove::consumer_group::ConsumerGroupConfig;
-use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
+use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider};
 use shove::{
     Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
     SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
@@ -1684,4 +1684,125 @@ async fn register_fifo_rejects_concurrent_processing() {
         .run_until_timeout(std::future::ready(()), Duration::from_millis(200))
         .await;
     assert_eq!(outcome.exit_code(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Autoscaler — end-to-end scale-up under load
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn autoscaler_scales_up_under_load() {
+    use shove::redis::{RedisAutoscalerBackend, RedisConsumerGroupRegistry};
+    use shove::{AutoscalerConfig, Backend, QueueTopology};
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TokioMutex;
+    use tokio_util::sync::CancellationToken;
+
+    struct SlowTopic;
+    impl Topic for SlowTopic {
+        type Message = u64;
+        type Codec = JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static T: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("redis-int-autoscaler").build())
+        }
+    }
+
+    struct SlowHandler;
+    impl MessageHandler<SlowTopic> for SlowHandler {
+        type Context = ();
+        async fn handle(&self, _m: u64, _meta: MessageMetadata, _ctx: &()) -> Outcome {
+            // Slow enough that the autoscaler will see backlog.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Outcome::Ack
+        }
+    }
+
+    let url = redis_url().await;
+    let cfg = RedisConfig {
+        mode: RedisMode::Standalone {
+            url: url.to_owned(),
+        },
+        group: Some("redis-int-autoscaler-grp".into()),
+    };
+
+    // Use the public Backend::connect trait method to obtain a RedisClient
+    // we can hand to both the registry and the autoscaler.
+    let client = <Redis as Backend>::connect(cfg).await.expect("connect");
+
+    // Declare topology via the standard topology declarer to avoid duplicating
+    // declarer-construction logic here.
+    let broker = Broker::<Redis>::from_client(client.clone());
+    broker
+        .topology()
+        .declare::<SlowTopic>()
+        .await
+        .expect("declare");
+
+    // Build a registry, register a single group, and start its consumers.
+    let mut registry = RedisConsumerGroupRegistry::new(client.clone());
+    registry
+        .register::<SlowTopic, SlowHandler>(
+            RedisConsumerGroupConfig::new(1..=5).with_prefetch_count(1),
+            || SlowHandler,
+            (),
+        )
+        .await
+        .expect("register");
+    registry.start_all();
+
+    // Publish enough slow messages to build a real backlog.
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..30u64 {
+        shove::Publisher::publish::<SlowTopic>(&publisher, &i)
+            .await
+            .expect("publish");
+    }
+
+    let registry = StdArc::new(TokioMutex::new(registry));
+
+    // Tight autoscaler config so the test finishes quickly.
+    let auto = AutoscalerConfig {
+        poll_interval: Duration::from_millis(500),
+        scale_up_multiplier: 1.5,
+        scale_down_multiplier: 0.3,
+        hysteresis_duration: Duration::from_millis(500),
+        cooldown_duration: Duration::from_millis(500),
+    };
+
+    let mut autoscaler = RedisAutoscalerBackend::autoscaler(client.clone(), registry.clone(), auto);
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let task = tokio::spawn(async move {
+        autoscaler.run(shutdown_clone).await;
+    });
+
+    // Wait until the group has scaled past min_consumers.
+    let registry_for_poll = registry.clone();
+    let scaled = poll_until(
+        || {
+            let r = registry_for_poll.try_lock();
+            match r {
+                Ok(reg) => reg
+                    .groups()
+                    .get("redis-int-autoscaler")
+                    .map(|g| g.active_consumers() > 1)
+                    .unwrap_or(false),
+                Err(_) => false,
+            }
+        },
+        Duration::from_secs(20),
+    )
+    .await;
+
+    shutdown.cancel();
+    let _ = task.await;
+
+    // Drain the registry's consumer groups before returning. We can't
+    // try_unwrap the Arc — `registry_for_poll` still holds a strong ref —
+    // so we go through the Mutex.
+    drop(registry_for_poll);
+    registry.lock().await.shutdown_all().await;
+
+    assert!(scaled, "autoscaler failed to scale up under load");
 }

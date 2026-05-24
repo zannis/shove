@@ -7,15 +7,17 @@
 
 use std::future::Future;
 use std::ops::RangeInclusive;
-use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::task::JoinSet;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
-use crate::consumer_supervisor::{SupervisorOutcome, tally_join_result};
+use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
@@ -27,11 +29,11 @@ use super::consumer::RedisConsumer;
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
-// TaskFactory type alias
+// Spawner type alias — captures `T`, `H`, the client, and the handler factory
+// so `RedisConsumerGroup::scale_up` can launch a fresh consumer on demand.
 // ---------------------------------------------------------------------------
 
-type BoxFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-type TaskFactory = Box<dyn FnOnce() -> BoxFuture + Send>;
+pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptionsInner) -> JoinHandle<()> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // RedisConsumerGroupConfig
@@ -49,8 +51,9 @@ type TaskFactory = Box<dyn FnOnce() -> BoxFuture + Send>;
 #[derive(Debug, Clone)]
 pub struct RedisConsumerGroupConfig {
     prefetch_count: u16,
-    min_consumers: u16,
-    max_consumers: u16,
+    max_retries: u32,
+    pub(crate) min_consumers: u16,
+    pub(crate) max_consumers: u16,
     concurrent_processing: bool,
     pub(crate) handler_timeout: HandlerTimeoutConfig,
 }
@@ -73,6 +76,7 @@ impl RedisConsumerGroupConfig {
         );
         Self {
             prefetch_count: 10,
+            max_retries: 10,
             min_consumers: min,
             max_consumers: max,
             concurrent_processing: false,
@@ -86,6 +90,13 @@ impl RedisConsumerGroupConfig {
     /// effective prefetch is clamped to 1 so handlers serialize regardless.
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Set the maximum number of retries before a message is dead-lettered.
+    /// Defaults to `10` (matches [`crate::ConsumerOptions::new`]).
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
         self
     }
 
@@ -115,6 +126,11 @@ impl RedisConsumerGroupConfig {
     /// Returns the configured prefetch count.
     pub fn prefetch_count(&self) -> u16 {
         self.prefetch_count
+    }
+
+    /// Returns the configured max retries before dead-lettering.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
     }
 
     /// Returns the minimum number of consumers.
@@ -150,19 +166,284 @@ impl Default for RedisConsumerGroupConfig {
 }
 
 // ---------------------------------------------------------------------------
+// RedisConsumerGroup
+// ---------------------------------------------------------------------------
+
+/// A single named consumer group inside the Redis registry. Holds one
+/// `Spawner` closure (capturing the topic, handler factory, and client) plus
+/// the live consumer tasks. `scale_up`/`scale_down` invoke the spawner or
+/// cancel the chosen consumer's child token.
+pub struct RedisConsumerGroup {
+    pub(crate) queue: String,
+    pub(crate) config: RedisConsumerGroupConfig,
+    pub(crate) spawner: Spawner,
+    pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
+    pub(crate) group_token: CancellationToken,
+    pub(crate) error_count: Arc<AtomicUsize>,
+    pub(crate) panic_count: Arc<AtomicUsize>,
+}
+
+impl RedisConsumerGroup {
+    /// Construct a non-FIFO consumer group. Captures `T`, `H`, and the client
+    /// in a `Spawner` closure so `start`/`scale_up` can launch fresh consumers
+    /// on demand.
+    pub fn new<T, H>(
+        queue: impl Into<String>,
+        client: RedisClient,
+        config: RedisConsumerGroupConfig,
+        group_token: CancellationToken,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Self
+    where
+        T: Topic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        let concurrent = config.concurrent_processing();
+        // Non-concurrent groups clamp prefetch to 1 so each XREADGROUP fetches
+        // at most one message, matching the other backends' "concurrent off"
+        // semantics. Concurrent groups use the configured value as the
+        // in-flight cap (semaphore size).
+        let effective_prefetch = if concurrent {
+            config.prefetch_count().max(1)
+        } else {
+            1
+        };
+
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
+        let client_for_spawner = client.clone();
+        let ctx_for_spawner = ctx;
+        let spawner: Spawner = Arc::new(move |mut options: ConsumerOptionsInner| {
+            let handler = handler_factory();
+            let consumer = RedisConsumer::new(client_for_spawner.clone());
+            let ctx = ctx_for_spawner.clone();
+            let ec = ec_for_spawner.clone();
+            // Pin prefetch to the group-derived value regardless of caller defaults.
+            options.prefetch_count = effective_prefetch;
+            tokio::spawn(async move {
+                let result = if concurrent {
+                    consumer.run_concurrent::<T, H>(handler, ctx, options).await
+                } else {
+                    <RedisConsumer as ConsumerImpl>::run::<T, H>(&consumer, handler, ctx, options)
+                        .await
+                };
+                if let Err(e) = result {
+                    ec.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!("consumer task exited with error: {e}");
+                }
+            })
+        });
+
+        Self {
+            queue: queue.into(),
+            consumers: Vec::with_capacity(config.max_consumers() as usize),
+            config,
+            spawner,
+            group_token,
+            error_count,
+            panic_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Construct a FIFO consumer group for a [`SequencedTopic`].
+    ///
+    /// FIFO replica count is pinned to 1 — FIFO concurrency comes from
+    /// shards, not from multiple replicas of the shard set.
+    pub fn new_fifo<T, H>(
+        queue: impl Into<String>,
+        client: RedisClient,
+        mut config: RedisConsumerGroupConfig,
+        group_token: CancellationToken,
+        handler_factory: impl Fn() -> H + Send + Sync + 'static,
+        ctx: H::Context,
+    ) -> Self
+    where
+        T: SequencedTopic + 'static,
+        H: MessageHandler<T> + 'static,
+    {
+        config.min_consumers = 1;
+        config.max_consumers = 1;
+
+        let prefetch = config.prefetch_count().max(1);
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let panic_count = Arc::new(AtomicUsize::new(0));
+        let ec_for_spawner = error_count.clone();
+        let pc_for_spawner = panic_count.clone();
+        let client_for_spawner = client.clone();
+        let ctx_for_spawner = ctx;
+
+        let spawner: Spawner = Arc::new(move |mut options: ConsumerOptionsInner| {
+            let handler = handler_factory();
+            let consumer = RedisConsumer::new(client_for_spawner.clone());
+            let ctx = ctx_for_spawner.clone();
+            let ec = ec_for_spawner.clone();
+            let pc = pc_for_spawner.clone();
+            options.prefetch_count = prefetch;
+            tokio::spawn(async move {
+                let handles = match <RedisConsumer as ConsumerImpl>::spawn_fifo_shards::<T, H>(
+                    &consumer, handler, ctx, options,
+                )
+                .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        ec.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!("FIFO registration failed: {e}");
+                        return;
+                    }
+                };
+                for handle in handles {
+                    match handle.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            ec.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard exited with error: {e}");
+                        }
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => {
+                            pc.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("sequenced shard panicked: {e}");
+                        }
+                    }
+                }
+            })
+        });
+
+        Self {
+            queue: queue.into(),
+            consumers: Vec::with_capacity(1),
+            config,
+            spawner,
+            group_token,
+            error_count,
+            panic_count,
+        }
+    }
+
+    /// Spawn `min_consumers` consumer tasks.
+    pub fn start(&mut self) {
+        let target = self.config.min_consumers() as usize;
+        info!(
+            group = %self.queue,
+            queue = %self.queue,
+            initial_consumers = target,
+            "starting consumer group"
+        );
+        for _ in 0..target {
+            self.spawn_one();
+        }
+    }
+
+    /// Spawn one additional consumer. Returns `false` at max capacity.
+    pub fn scale_up(&mut self) -> bool {
+        if self.consumers.len() >= self.config.max_consumers() as usize {
+            debug!(group = %self.queue, max = self.config.max_consumers(), "scale_up rejected: at max capacity");
+            return false;
+        }
+        self.spawn_one();
+        info!(
+            group = %self.queue,
+            consumers = self.consumers.len(),
+            "scaled up: spawned new consumer"
+        );
+        true
+    }
+
+    /// Cancel an idle consumer. Returns `false` at min capacity or if every
+    /// consumer is currently processing a message.
+    pub fn scale_down(&mut self) -> bool {
+        if self.consumers.len() <= self.config.min_consumers() as usize {
+            debug!(group = %self.queue, min = self.config.min_consumers(), "scale_down rejected: at min capacity");
+            return false;
+        }
+
+        let idle_index = self
+            .consumers
+            .iter()
+            .rposition(|(_, processing, _)| !processing.load(Ordering::Relaxed));
+
+        let Some(index) = idle_index else {
+            warn!(group = %self.queue, "scale_down rejected: all consumers are busy");
+            return false;
+        };
+
+        let (token, _, _handle) = self.consumers.swap_remove(index);
+        token.cancel();
+
+        info!(
+            group = %self.queue,
+            consumers = self.consumers.len(),
+            "scaled down: cancelled an idle consumer"
+        );
+        true
+    }
+
+    pub fn active_consumers(&self) -> usize {
+        self.consumers.len()
+    }
+
+    pub fn queue(&self) -> &str {
+        &self.queue
+    }
+
+    pub fn config(&self) -> &RedisConsumerGroupConfig {
+        &self.config
+    }
+
+    pub async fn shutdown(&mut self) {
+        let _ = self.shutdown_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
+        info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
+        self.group_token.cancel();
+        let mut panics = 0usize;
+        for (_token, _processing, handle) in self.consumers.drain(..) {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
+                    panics += 1;
+                }
+            }
+        }
+        let errors = self.error_count.swap(0, Ordering::Relaxed);
+        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
+        debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
+        ShutdownTally { errors, panics }
+    }
+
+    fn spawn_one(&mut self) {
+        let child_token = self.group_token.child_token();
+        let processing = Arc::new(AtomicBool::new(false));
+        let mut options = ConsumerOptionsInner::defaults_with_shutdown(child_token.clone());
+        options.prefetch_count = self.config.prefetch_count();
+        options.max_retries = self.config.max_retries();
+        options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
+        options.processing = processing.clone();
+        options.consumer_group = Some(Arc::from(self.queue.as_str()));
+
+        let handle = (self.spawner)(options);
+        self.consumers.push((child_token, processing, handle));
+        debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RedisConsumerGroupRegistry
 // ---------------------------------------------------------------------------
 
-/// Registry that accumulates consumer-task factories and then starts them all
-/// into a [`JoinSet`].
+/// Registry that owns one [`RedisConsumerGroup`] per registered topic.
 ///
 /// Typical lifecycle:
 /// 1. `let mut reg = RedisConsumerGroupRegistry::new(client);`
-/// 2. `reg.register::<T, H>(...).await?;`  — one call per topic
+/// 2. `reg.register::<T, H>(...).await?;` — one call per topic
 /// 3. `reg.run_until_timeout(signal, drain_timeout).await`
 pub struct RedisConsumerGroupRegistry {
-    client: RedisClient,
-    tasks: Vec<TaskFactory>,
+    pub(crate) groups: std::collections::HashMap<String, RedisConsumerGroup>,
+    client: Option<RedisClient>,
     shutdown: CancellationToken,
     pub(super) default_handler_timeout: Option<Duration>,
 }
@@ -171,8 +452,22 @@ impl RedisConsumerGroupRegistry {
     /// Create a new registry backed by the given Redis client.
     pub fn new(client: RedisClient) -> Self {
         Self {
-            client,
-            tasks: Vec::new(),
+            groups: std::collections::HashMap::new(),
+            client: Some(client),
+            shutdown: CancellationToken::new(),
+            default_handler_timeout: None,
+        }
+    }
+
+    /// Create a registry from a pre-populated map of groups (for testing).
+    /// The resulting registry cannot be used to call `register()`.
+    #[cfg(test)]
+    pub(crate) fn from_groups(
+        groups: std::collections::HashMap<String, RedisConsumerGroup>,
+    ) -> Self {
+        Self {
+            groups,
+            client: None,
             shutdown: CancellationToken::new(),
             default_handler_timeout: None,
         }
@@ -200,10 +495,10 @@ impl RedisConsumerGroupRegistry {
 
     /// Register a non-FIFO topic handler.
     ///
-    /// Spawns `config.min_consumers()` consumer tasks when [`start_all`] is
-    /// called. Each task gets its own clone of `ctx` (via `H::Context: Clone`,
-    /// already guaranteed by the [`MessageHandler`] trait bound). The
-    /// `max_consumers` ceiling will be honoured by a future autoscaler.
+    /// Builds a [`RedisConsumerGroup`] keyed on the topic's queue name. The
+    /// group's `min_consumers` tasks are spawned on the next call to
+    /// [`start_all`]; the `max_consumers` ceiling is honoured by the Redis
+    /// autoscaler ([`crate::redis::RedisAutoscalerBackend`]).
     ///
     /// Topology structures (stream + consumer group) are declared before
     /// returning.
@@ -217,62 +512,44 @@ impl RedisConsumerGroupRegistry {
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
-        let declarer = RedisTopologyDeclarer::new(self.client.clone());
+        let name = topology.queue().to_string();
+        if self.groups.contains_key(&name) {
+            return Err(ShoveError::Topology(format!(
+                "consumer group '{name}' is already registered"
+            )));
+        }
+        let client = self.client.as_ref().ok_or_else(|| {
+            ShoveError::Topology("registry has no client (test-only registry)".into())
+        })?;
+        let declarer = RedisTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
-        let resolved_handler_timeout =
-            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
-
-        // Non-concurrent groups clamp prefetch to 1 so each XREADGROUP fetches
-        // at most one message, matching the other backends' "concurrent off"
-        // semantics. Concurrent groups use the configured value as the
-        // in-flight cap (semaphore size).
-        let effective_prefetch = if config.concurrent_processing {
-            config.prefetch_count.max(1)
-        } else {
-            1
-        };
-        let concurrent = config.concurrent_processing;
-
-        let n = config.min_consumers() as usize;
-
-        for _ in 0..n {
-            let client = self.client.clone();
-            let shutdown = self.shutdown.clone();
-            let handler = factory();
-            let ctx = ctx.clone();
-            let handler_timeout = resolved_handler_timeout;
-
-            let task: TaskFactory = Box::new(move || {
-                Box::pin(async move {
-                    let consumer = RedisConsumer::new(client);
-                    let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
-                    options.handler_timeout = Some(handler_timeout);
-                    options.prefetch_count = effective_prefetch;
-                    if concurrent {
-                        consumer.run_concurrent::<T, H>(handler, ctx, options).await
-                    } else {
-                        consumer.run::<T, H>(handler, ctx, options).await
-                    }
-                })
-            });
-            self.tasks.push(task);
-        }
-
+        let group_token = self.shutdown.child_token();
+        let group = RedisConsumerGroup::new::<T, H>(
+            name.clone(),
+            client.clone(),
+            config,
+            group_token,
+            factory,
+            ctx,
+        );
+        self.groups.insert(name, group);
         Ok(())
     }
 
     /// Register a FIFO (sequenced) topic handler.
     ///
-    /// Spawns one task per shard. Each task fans out internally across that
-    /// shard's stream via [`RedisConsumer::run_fifo`], which internally calls
-    /// [`spawn_fifo_shards`] and awaits all shard handles.
-    ///
     /// Rejects configs with `concurrent_processing(true)` — concurrent
     /// dispatch within a sequenced shard would break FIFO ordering.
-    ///
-    /// Topology structures are declared before returning.
+    /// FIFO concurrency comes from shards, not replicas: the group's
+    /// replica count is pinned to 1 regardless of the config range.
     pub async fn register_fifo<T, H>(
         &mut self,
         config: RedisConsumerGroupConfig,
@@ -283,7 +560,7 @@ impl RedisConsumerGroupRegistry {
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
     {
-        if config.concurrent_processing {
+        if config.concurrent_processing() {
             return Err(ShoveError::Topology(format!(
                 "topic '{}' is sequenced; `concurrent_processing` on a FIFO consumer would \
                  break per-key ordering. Drop `with_concurrent_processing(true)` or use \
@@ -292,48 +569,77 @@ impl RedisConsumerGroupRegistry {
             )));
         }
 
+        let mut config = config;
+        config.handler_timeout = HandlerTimeoutConfig::Set(resolve_handler_timeout(
+            config.handler_timeout,
+            self.default_handler_timeout,
+        ));
+
         let topology = T::topology();
-        let declarer = RedisTopologyDeclarer::new(self.client.clone());
+        let name = topology.queue().to_string();
+        if self.groups.contains_key(&name) {
+            return Err(ShoveError::Topology(format!(
+                "consumer group '{name}' is already registered"
+            )));
+        }
+        let client = self.client.as_ref().ok_or_else(|| {
+            ShoveError::Topology("registry has no client (test-only registry)".into())
+        })?;
+        let declarer = RedisTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
-        let resolved_handler_timeout =
-            resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
-
-        let prefetch = config.prefetch_count.max(1);
-        let n = config.min_consumers() as usize;
-        for _ in 0..n {
-            let client = self.client.clone();
-            let shutdown = self.shutdown.clone();
-            let handler = factory();
-            let ctx = ctx.clone();
-            let handler_timeout = resolved_handler_timeout;
-
-            let task: TaskFactory = Box::new(move || {
-                Box::pin(async move {
-                    let consumer = RedisConsumer::new(client);
-                    let mut options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
-                    options.handler_timeout = Some(handler_timeout);
-                    options.prefetch_count = prefetch;
-                    consumer.run_fifo::<T, H>(handler, ctx, options).await
-                })
-            });
-            self.tasks.push(task);
-        }
+        let group_token = self.shutdown.child_token();
+        let group = RedisConsumerGroup::new_fifo::<T, H>(
+            name.clone(),
+            client.clone(),
+            config,
+            group_token,
+            factory,
+            ctx,
+        );
+        self.groups.insert(name, group);
         Ok(())
     }
 
-    /// Drain the accumulated task factories into `set`.
-    ///
-    /// Each factory is consumed (called once) and its returned future is
-    /// spawned as a new entry in the [`JoinSet`].
-    pub fn start_all(&mut self, set: &mut JoinSet<Result<()>>) {
-        for factory in self.tasks.drain(..) {
-            set.spawn(factory());
+    /// Spawn the initial `min_consumers` per registered group.
+    pub fn start_all(&mut self) {
+        info!(count = self.groups.len(), "starting all consumer groups");
+        for group in self.groups.values_mut() {
+            group.start();
         }
     }
 
-    /// Start all tasks, wait for `signal` or the internal shutdown token,
-    /// then drain with `drain_timeout`.
+    /// Borrow the registered groups by name. Used by
+    /// [`crate::redis::RedisAutoscalerBackend`] for `list_groups`/`fetch_metrics`.
+    pub fn groups(&self) -> &std::collections::HashMap<String, RedisConsumerGroup> {
+        &self.groups
+    }
+
+    /// Mutably borrow the registered groups by name. Used by the autoscaler
+    /// to invoke `scale_up`/`scale_down`.
+    pub fn groups_mut(&mut self) -> &mut std::collections::HashMap<String, RedisConsumerGroup> {
+        &mut self.groups
+    }
+
+    /// Shut every group down, then drain panics+errors as a tally.
+    pub async fn shutdown_all(&mut self) {
+        let _ = self.shutdown_all_with_tally().await;
+    }
+
+    pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
+        info!(
+            count = self.groups.len(),
+            "shutting down all consumer groups"
+        );
+        let mut tally = ShutdownTally::default();
+        for group in self.groups.values_mut() {
+            tally.add(group.shutdown_with_tally().await);
+        }
+        tally
+    }
+
+    /// Start every registered group, wait for `signal` or the internal
+    /// shutdown token, then drain with `drain_timeout`.
     ///
     /// Returns a [`SupervisorOutcome`] summarising errors, panics, and
     /// whether the drain timed out.
@@ -345,47 +651,30 @@ impl RedisConsumerGroupRegistry {
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        let mut set: JoinSet<Result<()>> = JoinSet::new();
-        self.start_all(&mut set);
+        self.start_all();
 
         let shutdown = self.shutdown.clone();
-
+        let signal_handle = tokio::spawn(signal);
         tokio::select! {
             _ = shutdown.cancelled() => {}
-            _ = signal => { shutdown.cancel(); }
+            res = signal_handle => {
+                let _ = res;
+                shutdown.cancel();
+            }
         }
 
-        let mut errors = 0usize;
-        let mut panics = 0usize;
-
-        let drain = async {
-            while let Some(res) = set.join_next().await {
-                tally_join_result(res, &mut errors, &mut panics);
-            }
-        };
-
+        let drain = self.shutdown_all_with_tally();
         match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(()) => SupervisorOutcome {
-                errors,
-                panics,
+            Ok(tally) => SupervisorOutcome {
+                errors: tally.errors,
+                panics: tally.panics,
                 timed_out: false,
             },
-            Err(_) => {
-                tracing::warn!(
-                    timeout_ms = drain_timeout.as_millis() as u64,
-                    "RedisConsumerGroupRegistry: drain timed out; aborting surviving tasks"
-                );
-                set.abort_all();
-                // Drain aborted tasks so the JoinSet is fully emptied.
-                while let Some(res) = set.join_next().await {
-                    tally_join_result(res, &mut errors, &mut panics);
-                }
-                SupervisorOutcome {
-                    errors,
-                    panics,
-                    timed_out: true,
-                }
-            }
+            Err(_) => SupervisorOutcome {
+                errors: 0,
+                panics: 0,
+                timed_out: true,
+            },
         }
     }
 }
@@ -481,6 +770,18 @@ mod tests {
     }
 
     #[test]
+    fn default_max_retries_is_ten() {
+        let cfg = RedisConsumerGroupConfig::default();
+        assert_eq!(cfg.max_retries(), 10);
+    }
+
+    #[test]
+    fn with_max_retries_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_max_retries(7);
+        assert_eq!(cfg.max_retries(), 7);
+    }
+
+    #[test]
     fn with_concurrent_processing_round_trips() {
         let cfg = RedisConsumerGroupConfig::new(1..=1).with_concurrent_processing(true);
         assert!(cfg.concurrent_processing());
@@ -505,5 +806,107 @@ mod tests {
     fn config_min_greater_than_max_panics() {
         // Intentionally inverted: the constructor must assert that min <= max.
         let _ = RedisConsumerGroupConfig::new(5..=2);
+    }
+
+    mod group {
+        use super::*;
+        use crate::backend::ConsumerOptionsInner;
+
+        fn default_config() -> RedisConsumerGroupConfig {
+            RedisConsumerGroupConfig::new(1..=4)
+        }
+
+        fn test_group(config: RedisConsumerGroupConfig) -> RedisConsumerGroup {
+            let group_token = CancellationToken::new();
+            let spawner: Spawner = Arc::new(|options: ConsumerOptionsInner| {
+                tokio::spawn(async move {
+                    options.shutdown.cancelled().await;
+                })
+            });
+            RedisConsumerGroup {
+                queue: "test-queue".into(),
+                consumers: Vec::with_capacity(config.max_consumers() as usize),
+                config,
+                spawner,
+                group_token,
+                error_count: Arc::new(AtomicUsize::new(0)),
+                panic_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        #[tokio::test]
+        async fn start_spawns_min_consumers() {
+            let mut group = test_group(RedisConsumerGroupConfig::new(3..=5));
+            group.start();
+            assert_eq!(group.active_consumers(), 3);
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn scale_up_adds_one_consumer() {
+            let mut group = test_group(default_config());
+            group.start();
+            assert_eq!(group.active_consumers(), 1);
+            assert!(group.scale_up());
+            assert_eq!(group.active_consumers(), 2);
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn scale_up_rejected_at_max() {
+            let mut group = test_group(RedisConsumerGroupConfig::new(2..=2));
+            group.start();
+            assert_eq!(group.active_consumers(), 2);
+            assert!(!group.scale_up());
+            assert_eq!(group.active_consumers(), 2);
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn scale_down_removes_one_consumer() {
+            let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
+            group.start();
+            assert!(group.scale_up());
+            assert_eq!(group.active_consumers(), 2);
+            assert!(group.scale_down());
+            assert_eq!(group.active_consumers(), 1);
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn scale_down_rejected_at_min() {
+            let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
+            group.start();
+            assert!(!group.scale_down());
+            assert_eq!(group.active_consumers(), 1);
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn scale_down_skips_busy_consumers() {
+            let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
+            // Replace spawner with one whose `processing` flag we control.
+            let busy_flag = Arc::new(AtomicBool::new(true));
+            let flag = busy_flag.clone();
+            let spawner: Spawner = Arc::new(move |options: ConsumerOptionsInner| {
+                // Mirror the real consumer's contract: set `options.processing`
+                // before awaiting shutdown so `scale_down` sees the task as busy.
+                options
+                    .processing
+                    .store(flag.load(Ordering::Relaxed), Ordering::Relaxed);
+                tokio::spawn(async move {
+                    options.shutdown.cancelled().await;
+                })
+            });
+            group.spawner = spawner;
+            group.start();
+            group.scale_up();
+            assert!(!group.scale_down(), "all consumers reporting busy");
+            busy_flag.store(false, Ordering::Relaxed);
+            // Spawn a fresh idle one and verify scale-down picks it.
+            group.scale_up();
+            assert!(group.scale_down());
+            group.shutdown().await;
+        }
     }
 }
