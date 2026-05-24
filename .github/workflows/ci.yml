@@ -52,6 +52,11 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for codecov-action v5 OIDC authentication; replaces the
+      # long-lived CODECOV_TOKEN secret on public repos.
+      id-token: write
     env:
       LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
     strategy:
@@ -80,7 +85,10 @@ jobs:
       - run: cargo llvm-cov nextest --features ${{ matrix.features }} --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
+          slug: ${{ github.repository }}
           files: lcov.info
+          disable_search: true
           flags: ${{ matrix.name }}
+          name: ${{ matrix.name }}
           fail_ci_if_error: true
