@@ -8,10 +8,13 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::ConsumerOptions;
 use crate::backend::ConsumerOptionsInner;
 use crate::backend::consumer::ConsumerImpl;
+use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
+use crate::markers::Redis;
 use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
@@ -109,6 +112,100 @@ impl RedisConsumer {
             h.abort();
         }
         result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inherent public API — mirrors the NatsConsumer/KafkaConsumer surface so
+// users who hold a RedisConsumer directly can drive it without going
+// through the generic ConsumerSupervisor<B>.
+// ---------------------------------------------------------------------------
+
+impl RedisConsumer {
+    /// Run the non-FIFO consumer loop until `options.shutdown` is cancelled.
+    ///
+    /// Always uses the sequential single-message XREADGROUP dispatch path.
+    /// To opt into concurrent in-flight dispatch (semaphore-gated), register
+    /// the topic through [`RedisConsumerGroupRegistry`] with
+    /// [`RedisConsumerGroupConfig::with_concurrent_processing(true)`].
+    ///
+    /// [`RedisConsumerGroupRegistry`]: super::consumer_group::RedisConsumerGroupRegistry
+    /// [`RedisConsumerGroupConfig::with_concurrent_processing(true)`]: super::consumer_group::RedisConsumerGroupConfig::with_concurrent_processing
+    pub async fn run<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions<Redis>,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        <Self as ConsumerImpl>::run::<T, H>(self, handler, ctx, options.into_inner()).await
+    }
+
+    /// Run a FIFO (sequenced) consumer loop until `options.shutdown` is
+    /// cancelled. Spawns one shard worker per `routing_shards` and awaits
+    /// every handle.
+    pub async fn run_fifo<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions<Redis>,
+    ) -> Result<()>
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+    {
+        <Self as ConsumerImpl>::run_fifo::<T, H>(self, handler, ctx, options.into_inner()).await
+    }
+
+    /// Drive `run_fifo` until `signal` fires, then drain shard tasks with
+    /// `drain_timeout`. Aborted shards are counted in the returned outcome.
+    pub async fn run_fifo_until_timeout<T, H, S>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions<Redis>,
+        signal: S,
+        drain_timeout: Duration,
+    ) -> SupervisorOutcome
+    where
+        T: SequencedTopic,
+        H: MessageHandler<T>,
+        S: Future<Output = ()> + Send + 'static,
+    {
+        let inner = options.into_inner();
+        let shutdown = inner.shutdown.clone();
+        let handles = match <Self as ConsumerImpl>::spawn_fifo_shards::<T, H>(
+            self, handler, ctx, inner,
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(error = %e, "run_fifo_until_timeout: shard spawn failed");
+                return SupervisorOutcome {
+                    errors: 1,
+                    panics: 0,
+                    timed_out: false,
+                };
+            }
+        };
+        drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
+    }
+
+    /// Drain the DLQ stream of topic `T` with the supplied handler.
+    ///
+    /// The loop runs until the underlying JoinHandle is aborted by the caller
+    /// — the DLQ consumer does not accept an external shutdown token (matches
+    /// the [`ConsumerImpl::run_dlq`] contract).
+    pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        <Self as ConsumerImpl>::run_dlq::<T, H>(self, handler, ctx).await
     }
 }
 
