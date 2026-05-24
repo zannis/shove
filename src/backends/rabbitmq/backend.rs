@@ -69,6 +69,28 @@ impl RabbitMqStatsBridge {
             inner: cfg.map(ManagementClient::new),
         }
     }
+
+    /// Read live queue stats from the Management API.
+    ///
+    /// Errors with `ShoveError::Topology` if `RabbitMqConfig::with_management(...)`
+    /// was not set; the message points the caller at the right builder.
+    pub async fn get_queue_stats(&self, queue: &str) -> Result<super::management::QueueStats> {
+        let mc = self.inner.as_ref().ok_or_else(|| {
+            ShoveError::Topology(
+                "RabbitMqStatsBridge::get_queue_stats requires \
+                 RabbitMqConfig::with_management(...) to be set"
+                    .into(),
+            )
+        })?;
+        <ManagementClient as super::management::QueueStatsProvider>::get_queue_stats(mc, queue)
+            .await
+    }
+}
+
+impl super::management::QueueStatsProvider for RabbitMqStatsBridge {
+    async fn get_queue_stats(&self, queue: &str) -> Result<super::management::QueueStats> {
+        RabbitMqStatsBridge::get_queue_stats(self, queue).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,16 +239,7 @@ impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<ManagementClient> {}
 
 impl QueueStatsProviderImpl for RabbitMqStatsBridge {
     async fn snapshot(&self, queue: &str) -> Result<AutoscaleMetrics> {
-        let mc = self.inner.as_ref().ok_or_else(|| {
-            ShoveError::Topology(
-                "Broker<RabbitMq>::queue_stats_provider().snapshot(...) requires \
-                 RabbitMqConfig::with_management(...) to be set"
-                    .into(),
-            )
-        })?;
-        let stats =
-            <ManagementClient as super::management::QueueStatsProvider>::get_queue_stats(mc, queue)
-                .await?;
+        let stats = self.get_queue_stats(queue).await?;
         Ok(AutoscaleMetrics {
             backlog: Some(stats.messages_ready),
             inflight: Some(stats.messages_unacknowledged),
