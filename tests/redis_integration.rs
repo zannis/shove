@@ -21,7 +21,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
 use shove::consumer_group::ConsumerGroupConfig;
-use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
+use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider};
 use shove::{
     Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
     SequenceFailure, SequencedTopic, Topic, TopologyBuilder,

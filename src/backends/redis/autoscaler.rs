@@ -20,24 +20,40 @@ pub struct RedisQueueStats {
 }
 
 // ---------------------------------------------------------------------------
-// RedisQueueStatsProvider
+// RedisQueueStatsProvider trait
 // ---------------------------------------------------------------------------
 
-/// Reads queue depth from Redis using XLEN and XPENDING.
+/// Abstraction over queue-depth lookup. Mirrors the
+/// `NatsQueueStatsProvider` / `KafkaQueueStatsProvider` pattern so tests
+/// (and downstream users) can swap a mock implementation into
+/// [`RedisAutoscalerBackend`].
+pub trait RedisQueueStatsProvider: Send + Sync {
+    fn get_queue_stats(
+        &self,
+        queue: &str,
+    ) -> impl std::future::Future<Output = Result<RedisQueueStats>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// XlenStatsProvider — default impl backed by XLEN + XPENDING
+// ---------------------------------------------------------------------------
+
+/// Reads queue depth from Redis using XLEN (total entries) and XPENDING
+/// (PEL / in-flight count).
 #[derive(Clone)]
-pub struct RedisQueueStatsProvider {
+pub struct XlenStatsProvider {
     client: RedisClient,
 }
 
-impl RedisQueueStatsProvider {
+impl XlenStatsProvider {
     /// Create a new stats provider backed by the given [`RedisClient`].
     pub fn new(client: RedisClient) -> Self {
         Self { client }
     }
+}
 
-    /// Fetch current stats for `queue` using XLEN (total entries) and
-    /// XPENDING (PEL / in-flight count).
-    pub async fn get_queue_stats(&self, queue: &str) -> Result<RedisQueueStats> {
+impl RedisQueueStatsProvider for XlenStatsProvider {
+    async fn get_queue_stats(&self, queue: &str) -> Result<RedisQueueStats> {
         let group = self.client.group().to_owned();
         let client = self.client.clone();
         let client2 = self.client.clone();
@@ -104,9 +120,9 @@ impl AutoscalerBackendImpl for RedisAutoscalerBackend {}
 // QueueStatsProviderImpl
 // ---------------------------------------------------------------------------
 
-impl QueueStatsProviderImpl for RedisQueueStatsProvider {
+impl QueueStatsProviderImpl for XlenStatsProvider {
     async fn snapshot(&self, queue: &str) -> Result<AutoscaleMetrics> {
-        let stats = self.get_queue_stats(queue).await?;
+        let stats = <Self as RedisQueueStatsProvider>::get_queue_stats(self, queue).await?;
         Ok(AutoscaleMetrics {
             backlog: Some(stats.messages_ready),
             inflight: Some(stats.messages_in_flight),
