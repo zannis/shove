@@ -43,10 +43,15 @@ async fn main() {
     let purge: harness::PurgeFn = Box::new(move || {
         let bootstrap = purge_bootstrap.clone();
         Box::pin(async move {
-            // Delete and recreate: removes leftover messages AND lets the next
-            // scenario re-declare with a partition count sized to its own
-            // `max_consumers`. Kafka's `ensure_partitions` only expands, so
-            // this is the simplest way to reset to a clean baseline.
+            // Delete the topics AND the consumer groups derived from them.
+            // The topic delete on its own resets storage and lets the next
+            // scenario re-declare with a fresh partition count sized to its
+            // own `max_consumers`, but it leaves the consumer group state
+            // (offsets, rebalance epoch, dead members) sitting in Kafka's
+            // group coordinator. With many short scenarios that residue
+            // accumulates and the next scenario eats a long rebalance
+            // before steady-state, flattening apparent throughput. Wiping
+            // the group too gives each scenario a clean baseline.
             let Ok(admin): Result<AdminClient<DefaultClientContext>, _> = ClientConfig::new()
                 .set("bootstrap.servers", &bootstrap)
                 .create()
@@ -55,6 +60,11 @@ async fn main() {
             };
             let _ = admin
                 .delete_topics(&[TOPIC_NAME, DLQ_NAME], &AdminOptions::new())
+                .await;
+            let main_group = format!("{TOPIC_NAME}-consumer");
+            let dlq_group = format!("{DLQ_NAME}-consumer");
+            let _ = admin
+                .delete_groups(&[&main_group, &dlq_group], &AdminOptions::new())
                 .await;
         })
     });
