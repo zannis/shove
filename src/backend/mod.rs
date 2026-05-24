@@ -4,6 +4,7 @@
 //!
 //! See `DESIGN_V2.md` §4.
 
+use crate::autoscaler::AutoscalerBackend;
 use crate::error::Result;
 
 pub(crate) mod autoscaler;
@@ -14,7 +15,7 @@ pub(crate) mod publisher;
 pub(crate) mod registry;
 pub(crate) mod topology;
 
-pub(crate) use autoscaler::{AutoscalerBackendImpl, QueueStatsProviderImpl};
+pub(crate) use autoscaler::QueueStatsProviderImpl;
 pub(crate) use consumer::ConsumerImpl;
 pub(crate) use options_inner::ConsumerOptionsInner;
 pub(crate) use publisher::PublisherImpl;
@@ -43,7 +44,7 @@ pub trait Backend: sealed::Sealed + Sized + Send + Sync + 'static {
     type PublisherImpl: PublisherImpl + Clone + Send + Sync + 'static;
     type ConsumerImpl: ConsumerImpl + Clone + Send + Sync + 'static;
     type TopologyImpl: TopologyImpl + Send + Sync + 'static;
-    type AutoscalerImpl: AutoscalerBackendImpl + Send + Sync + 'static;
+    type AutoscalerImpl: AutoscalerBackend + 'static;
     type QueueStatsImpl: QueueStatsProviderImpl + Send + Sync + 'static;
 
     fn connect(config: Self::Config) -> impl Future<Output = Result<Self::Client>> + Send;
@@ -232,8 +233,11 @@ mod bounds_smoke {
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_autoscaler_impl(_a: &<InMemory as Backend>::AutoscalerImpl) {
-        // AutoscalerBackendImpl has no methods in Phase 4.
+    async fn _anchor_autoscaler_impl(a: &<InMemory as Backend>::AutoscalerImpl) {
+        // The trait bound on Backend::AutoscalerImpl is now the public
+        // AutoscalerBackend trait — exercise list_groups so the bound is
+        // actually load-bearing at monomorphization.
+        let _ = <_ as AutoscalerBackend>::list_groups(a).await;
     }
 
     #[cfg(feature = "inmemory")]

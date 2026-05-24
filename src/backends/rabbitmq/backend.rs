@@ -12,8 +12,8 @@
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
+    Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl,
+    TopologyImpl, capability::HasCoordinatedGroups, sealed,
 };
 use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::{Result, ShoveError};
@@ -223,12 +223,6 @@ impl TopologyImpl for LazyRabbitMqTopologyDeclarer {
         RabbitMqTopologyDeclarer::declare(&declarer, T::topology()).await
     }
 }
-
-// ---------------------------------------------------------------------------
-// AutoscalerBackendImpl — trait has no methods in Phase 4
-// ---------------------------------------------------------------------------
-
-impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<ManagementClient> {}
 
 // ---------------------------------------------------------------------------
 // RabbitMqStatsBridge — maps Option<ManagementClient> into the

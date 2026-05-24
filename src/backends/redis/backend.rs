@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
-    capability::HasCoordinatedGroups, sealed,
+    Backend, QueueStatsProviderImpl, RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups,
+    sealed,
 };
 use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::Result;

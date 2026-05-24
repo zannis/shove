@@ -1,13 +1,13 @@
-//! Internal `AutoscalerBackendImpl` and `QueueStatsProviderImpl` traits.
-//! See DESIGN_V2.md §5, §9.1.
+//! Internal `QueueStatsProviderImpl` trait.
+//!
+//! `Backend::AutoscalerImpl` now binds directly to the public
+//! [`crate::autoscaler::AutoscalerBackend`] trait — that bound makes
+//! `list_groups` / `fetch_metrics` / `scale` a hard requirement of every
+//! backend, replacing the empty sealed marker that used to allow stub
+//! impls to satisfy the trait. See `DESIGN_V2.md` §5, §9.1.
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::error::Result;
-
-pub(crate) trait AutoscalerBackendImpl: Send + Sync {
-    // Kept as an empty trait for this phase; per-backend autoscaler bodies
-    // bind here when backends port in Phase 4/7-10.
-}
 
 // Method anchored by the InMemory port's `_anchor_*` helpers in
 // `backend::mod` under the `inmemory` feature. Under

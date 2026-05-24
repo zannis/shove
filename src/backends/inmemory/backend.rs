@@ -12,8 +12,8 @@
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
+    Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl,
+    TopologyImpl, capability::HasCoordinatedGroups, sealed,
 };
 use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::Result;
@@ -167,12 +167,6 @@ impl TopologyImpl for InMemoryTopologyDeclarer {
         InMemoryTopologyDeclarer::declare(self, T::topology()).await
     }
 }
-
-// ---------------------------------------------------------------------------
-// AutoscalerBackendImpl — trait has no methods in Phase 4
-// ---------------------------------------------------------------------------
-
-impl AutoscalerBackendImpl for InMemoryAutoscalerBackend<BrokerStatsProvider> {}
 
 // ---------------------------------------------------------------------------
 // QueueStatsProviderImpl — map the stats to AutoscaleMetrics
