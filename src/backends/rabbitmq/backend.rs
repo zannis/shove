@@ -49,13 +49,27 @@ impl LazyRabbitMqTopologyDeclarer {
 }
 
 // ---------------------------------------------------------------------------
-// Stats-provider placeholder — `RabbitMqAutoscalerBackend::new` requires
-// `ManagementConfig` which is not available from `RabbitMqClient` alone.
-// This no-op provider satisfies the `Backend` associated type; users who
-// need real queue stats should construct a `ManagementClient` directly.
+// RabbitMqStatsBridge — adapts the optional Management API client into the
+// `QueueStatsProviderImpl` shape that `Backend::QueueStatsImpl` requires.
+//
+// `make_stats_provider` is an infallible factory, so the bridge defers the
+// "management not configured" error to the first `snapshot` call — the
+// caller sees a clear `Topology` error pointing at `RabbitMqConfig::with_management`.
 // ---------------------------------------------------------------------------
 
-pub struct NoopQueueStatsProvider;
+use super::management::ManagementClient;
+
+pub struct RabbitMqStatsBridge {
+    inner: Option<ManagementClient>,
+}
+
+impl RabbitMqStatsBridge {
+    fn from_config(cfg: Option<super::management::ManagementConfig>) -> Self {
+        Self {
+            inner: cfg.map(ManagementClient::new),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Marker bindings
@@ -70,8 +84,8 @@ impl Backend for RabbitMq {
     type PublisherImpl = RabbitMqPublisher;
     type ConsumerImpl = RabbitMqConsumer;
     type TopologyImpl = LazyRabbitMqTopologyDeclarer;
-    type AutoscalerImpl = RabbitMqAutoscalerBackend<NoopQueueStatsProvider>;
-    type QueueStatsImpl = NoopQueueStatsProvider;
+    type AutoscalerImpl = RabbitMqAutoscalerBackend<ManagementClient>;
+    type QueueStatsImpl = RabbitMqStatsBridge;
 
     async fn connect(config: Self::Config) -> Result<Self::Client> {
         RabbitMqClient::connect(&config).await
@@ -89,15 +103,24 @@ impl Backend for RabbitMq {
         LazyRabbitMqTopologyDeclarer::new(client.clone())
     }
 
+    /// # Panics
+    ///
+    /// Panics if `RabbitMqConfig::with_management(...)` was not set. The
+    /// autoscaler is useless without management — loud failure at
+    /// construction is preferred over silent no-op decisions at scale time.
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
         use std::sync::Arc;
         use tokio::sync::Mutex;
+        let mc = ManagementClient::new(client.management_config().expect(
+            "Broker<RabbitMq>::autoscaler() requires \
+             RabbitMqConfig::with_management(...) to be set",
+        ));
         let registry = Arc::new(Mutex::new(ConsumerGroupRegistry::new(client.clone())));
-        RabbitMqAutoscalerBackend::with_stats_provider(NoopQueueStatsProvider, registry)
+        RabbitMqAutoscalerBackend::with_stats_provider(mc, registry)
     }
 
-    fn make_stats_provider(_client: &Self::Client) -> Self::QueueStatsImpl {
-        NoopQueueStatsProvider
+    fn make_stats_provider(client: &Self::Client) -> Self::QueueStatsImpl {
+        RabbitMqStatsBridge::from_config(client.management_config())
     }
 
     async fn close(client: &Self::Client) {
@@ -183,31 +206,33 @@ impl TopologyImpl for LazyRabbitMqTopologyDeclarer {
 // AutoscalerBackendImpl — trait has no methods in Phase 4
 // ---------------------------------------------------------------------------
 
-impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<NoopQueueStatsProvider> {}
+impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<ManagementClient> {}
 
 // ---------------------------------------------------------------------------
-// NoopQueueStatsProvider — implements the management.rs trait so it can
-// parameterise `RabbitMqAutoscalerBackend<S>`, and also implements the
-// `QueueStatsProviderImpl` internal trait for the `Backend` binding.
+// RabbitMqStatsBridge — maps Option<ManagementClient> into the
+// QueueStatsProviderImpl::snapshot contract. When management is not
+// configured, snapshot returns a Topology error directing the caller at
+// RabbitMqConfig::with_management.
 // ---------------------------------------------------------------------------
 
-impl super::management::QueueStatsProvider for NoopQueueStatsProvider {
-    async fn get_queue_stats(&self, _queue: &str) -> Result<super::management::QueueStats> {
-        Err(ShoveError::Topology(
-            "QueueStatsProvider requires ManagementConfig; \
-             construct a ManagementClient directly for real queue stats"
-                .into(),
-        ))
-    }
-}
-
-impl QueueStatsProviderImpl for NoopQueueStatsProvider {
-    async fn snapshot(&self, _queue: &str) -> Result<AutoscaleMetrics> {
-        Err(ShoveError::Topology(
-            "QueueStatsProvider requires ManagementConfig; \
-             construct a ManagementClient directly for real queue stats"
-                .into(),
-        ))
+impl QueueStatsProviderImpl for RabbitMqStatsBridge {
+    async fn snapshot(&self, queue: &str) -> Result<AutoscaleMetrics> {
+        let mc = self.inner.as_ref().ok_or_else(|| {
+            ShoveError::Topology(
+                "Broker<RabbitMq>::queue_stats_provider().snapshot(...) requires \
+                 RabbitMqConfig::with_management(...) to be set"
+                    .into(),
+            )
+        })?;
+        let stats =
+            <ManagementClient as super::management::QueueStatsProvider>::get_queue_stats(mc, queue)
+                .await?;
+        Ok(AutoscaleMetrics {
+            backlog: Some(stats.messages_ready),
+            inflight: Some(stats.messages_unacknowledged),
+            throughput_per_sec: None,
+            processing_latency: None,
+        })
     }
 }
 
@@ -290,23 +315,32 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn noop_stats_provider_snapshot_errors() {
-        let provider = NoopQueueStatsProvider;
-        let err =
-            <NoopQueueStatsProvider as QueueStatsProviderImpl>::snapshot(&provider, "whatever")
-                .await
-                .expect_err("NoopQueueStatsProvider must refuse to produce metrics");
+    async fn stats_bridge_without_management_errors() {
+        let bridge = RabbitMqStatsBridge { inner: None };
+        let err = <RabbitMqStatsBridge as QueueStatsProviderImpl>::snapshot(&bridge, "whatever")
+            .await
+            .expect_err("bridge with no management must refuse to produce metrics");
         assert!(matches!(err, ShoveError::Topology(_)));
-        assert!(err.to_string().contains("ManagementConfig"));
+        assert!(
+            err.to_string().contains("with_management"),
+            "error must direct caller at RabbitMqConfig::with_management; got: {err}"
+        );
     }
 
-    #[tokio::test]
-    async fn noop_stats_provider_queue_stats_errors() {
-        use super::super::management::QueueStatsProvider as MgmtProvider;
-        let provider = NoopQueueStatsProvider;
-        let err = <NoopQueueStatsProvider as MgmtProvider>::get_queue_stats(&provider, "whatever")
-            .await
-            .expect_err("NoopQueueStatsProvider must refuse to produce stats");
-        assert!(matches!(err, ShoveError::Topology(_)));
+    #[test]
+    fn stats_bridge_from_config_none_yields_unconfigured_bridge() {
+        let bridge = RabbitMqStatsBridge::from_config(None);
+        assert!(bridge.inner.is_none());
+    }
+
+    #[test]
+    fn stats_bridge_from_config_some_yields_configured_bridge() {
+        let cfg = super::super::management::ManagementConfig::new(
+            "http://localhost:15672",
+            "guest",
+            "guest",
+        );
+        let bridge = RabbitMqStatsBridge::from_config(Some(cfg));
+        assert!(bridge.inner.is_some());
     }
 }
