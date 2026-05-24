@@ -81,9 +81,7 @@ impl TestBroker {
     }
 
     fn rmq_config(&self) -> RabbitMqConfig {
-        RabbitMqConfig {
-            uri: self.amqp_url.clone(),
-        }
+        RabbitMqConfig::new(self.amqp_url.clone())
     }
 
     fn mgmt_config(&self) -> ManagementConfig {
@@ -5484,5 +5482,91 @@ async fn consumer_exits_after_max_reconnect_attempts_exhausted() {
     );
 
     client.shutdown().await;
+    broker.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// RabbitMqConfig::with_management — Broker<RabbitMq>::queue_stats_provider()
+// returns real backlog when management is wired through RabbitMqConfig.
+// ---------------------------------------------------------------------------
+
+define_topic!(
+    StatsTopic,
+    String,
+    TopologyBuilder::new("rabbitmq-int-stats").dlq().build()
+);
+
+#[tokio::test]
+async fn broker_queue_stats_provider_returns_real_management_stats() {
+    let broker = TestBroker::start().await;
+    let cfg = broker.rmq_config().with_management(broker.mgmt_config());
+
+    let shove_broker = Broker::<RabbitMqMarker>::new(cfg)
+        .await
+        .expect("connect with management");
+    shove_broker
+        .topology()
+        .declare::<StatsTopic>()
+        .await
+        .expect("declare");
+
+    // Publish 4 messages directly via the broker's publisher so the management
+    // API has something to report.
+    let publisher = shove_broker.publisher().await.expect("publisher");
+    for i in 0..4u32 {
+        publisher
+            .publish::<StatsTopic>(&format!("msg-{i}"))
+            .await
+            .expect("publish");
+    }
+
+    // The management API's stats interval is non-deterministic; poll until
+    // the bridge's stats reflect what we just published.
+    let stats_provider = shove_broker.queue_stats_provider();
+    let mut last_seen = 0u64;
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let stats = stats_provider
+            .get_queue_stats(StatsTopic::topology().queue())
+            .await
+            .expect("get_queue_stats");
+        last_seen = stats.messages_ready;
+        if last_seen >= 4 {
+            break;
+        }
+    }
+
+    assert!(
+        last_seen >= 4,
+        "management API never reported the published backlog; last_seen={last_seen}"
+    );
+
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn broker_queue_stats_provider_without_management_errors() {
+    let broker = TestBroker::start().await;
+    // Deliberately omit .with_management(...) — the bridge should error rather
+    // than silently returning zero or stale data.
+    let shove_broker = Broker::<RabbitMqMarker>::new(broker.rmq_config())
+        .await
+        .expect("connect without management");
+
+    let stats_provider = shove_broker.queue_stats_provider();
+    let err = stats_provider
+        .get_queue_stats("any-queue")
+        .await
+        .expect_err("bridge must refuse to produce stats without management");
+
+    assert!(
+        matches!(err, ShoveError::Topology(_)),
+        "expected Topology error, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("with_management"),
+        "error must direct the caller at RabbitMqConfig::with_management; got: {err}"
+    );
+
     broker.stop().await;
 }
