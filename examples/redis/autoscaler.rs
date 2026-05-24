@@ -115,8 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cooldown_duration: Duration::from_secs(3),
     };
 
-    let mut autoscaler =
-        RedisAutoscalerBackend::autoscaler(client.clone(), registry.clone(), auto);
+    let mut autoscaler = RedisAutoscalerBackend::autoscaler(client.clone(), registry.clone(), auto);
     let shutdown = CancellationToken::new();
     let shutdown_for_task = shutdown.clone();
     let autoscaler_task = tokio::spawn(async move { autoscaler.run(shutdown_for_task).await });
@@ -132,10 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get(WorkQueue::topology().queue())
             .map(|g| g.active_consumers())
             .unwrap_or(0);
-        match stats
-            .get_queue_stats(WorkQueue::topology().queue())
-            .await
-        {
+        match stats.get_queue_stats(WorkQueue::topology().queue()).await {
             Ok(s) => println!(
                 "[monitor] consumers={active} ready={} in_flight={}",
                 s.messages_ready, s.messages_in_flight

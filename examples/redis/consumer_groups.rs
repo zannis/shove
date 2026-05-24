@@ -97,9 +97,7 @@ async fn main() -> Result<(), shove::ShoveError> {
     let mut group = broker.consumer_group();
     group
         .register::<WorkQueue, _>(
-            ConsumerGroupConfig::new(
-                RedisConsumerGroupConfig::new(2..=4).with_prefetch_count(4),
-            ),
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(2..=4).with_prefetch_count(4)),
             || WorkHandler,
         )
         .await?;
