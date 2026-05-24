@@ -51,6 +51,7 @@ pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptionsInner) -> JoinHandle<()> + S
 #[derive(Debug, Clone)]
 pub struct RedisConsumerGroupConfig {
     prefetch_count: u16,
+    max_retries: u32,
     pub(crate) min_consumers: u16,
     pub(crate) max_consumers: u16,
     concurrent_processing: bool,
@@ -75,6 +76,7 @@ impl RedisConsumerGroupConfig {
         );
         Self {
             prefetch_count: 10,
+            max_retries: 10,
             min_consumers: min,
             max_consumers: max,
             concurrent_processing: false,
@@ -88,6 +90,13 @@ impl RedisConsumerGroupConfig {
     /// effective prefetch is clamped to 1 so handlers serialize regardless.
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Set the maximum number of retries before a message is dead-lettered.
+    /// Defaults to `10` (matches [`crate::ConsumerOptions::new`]).
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
         self
     }
 
@@ -117,6 +126,11 @@ impl RedisConsumerGroupConfig {
     /// Returns the configured prefetch count.
     pub fn prefetch_count(&self) -> u16 {
         self.prefetch_count
+    }
+
+    /// Returns the configured max retries before dead-lettering.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
     }
 
     /// Returns the minimum number of consumers.
@@ -406,6 +420,7 @@ impl RedisConsumerGroup {
         let processing = Arc::new(AtomicBool::new(false));
         let mut options = ConsumerOptionsInner::defaults_with_shutdown(child_token.clone());
         options.prefetch_count = self.config.prefetch_count();
+        options.max_retries = self.config.max_retries();
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.processing = processing.clone();
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
@@ -752,6 +767,18 @@ mod tests {
     fn with_prefetch_count_round_trips() {
         let cfg = RedisConsumerGroupConfig::new(1..=1).with_prefetch_count(64);
         assert_eq!(cfg.prefetch_count(), 64);
+    }
+
+    #[test]
+    fn default_max_retries_is_ten() {
+        let cfg = RedisConsumerGroupConfig::default();
+        assert_eq!(cfg.max_retries(), 10);
+    }
+
+    #[test]
+    fn with_max_retries_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_max_retries(7);
+        assert_eq!(cfg.max_retries(), 7);
     }
 
     #[test]
