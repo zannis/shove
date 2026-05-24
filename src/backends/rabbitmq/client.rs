@@ -18,6 +18,11 @@ use crate::retry::Backoff;
 pub struct RabbitMqConfig {
     /// AMQP connection string (e.g., "amqp://guest:guest@localhost:5672/%2f")
     pub uri: String,
+    /// Optional management-API config. When set, the broker's
+    /// `queue_stats_provider()` returns a working `ManagementClient` and
+    /// `RabbitMqAutoscalerBackend` can poll real backlog. When `None`,
+    /// `snapshot` returns a clear "management not configured" error.
+    pub management: Option<super::management::ManagementConfig>,
 }
 
 impl Debug for RabbitMqConfig {
@@ -31,18 +36,45 @@ impl Debug for RabbitMqConfig {
 
         f.debug_struct("RabbitMqConfig")
             .field("uri", &redacted_uri)
+            .field(
+                "management",
+                if self.management.is_some() {
+                    &"<configured>"
+                } else {
+                    &"<none>"
+                },
+            )
             .finish()
     }
 }
 
 impl RabbitMqConfig {
     pub fn new(uri: impl Into<String>) -> Self {
-        Self { uri: uri.into() }
+        Self {
+            uri: uri.into(),
+            management: None,
+        }
     }
 
     /// AMQP connection URI this config was built with.
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Attach management-API credentials.
+    ///
+    /// Required for `Broker<RabbitMq>::queue_stats_provider().snapshot(...)`
+    /// to return real data, and for `RabbitMqAutoscalerBackend` to poll
+    /// queue depth. Without management, those code paths surface a
+    /// `Topology` error directing the caller to set this.
+    pub fn with_management(mut self, management: super::management::ManagementConfig) -> Self {
+        self.management = Some(management);
+        self
+    }
+
+    /// Borrow the configured management-API credentials, if any.
+    pub fn management(&self) -> Option<&super::management::ManagementConfig> {
+        self.management.as_ref()
     }
 }
 
@@ -278,6 +310,13 @@ impl RabbitMqClient {
     /// client's shutdown sequence.
     pub fn shutdown_token(&self) -> CancellationToken {
         self.inner.shutdown_token.clone()
+    }
+
+    /// Snapshot the management-API credentials this client was constructed
+    /// with, if any. Returned by value so the caller can move it into a
+    /// `ManagementClient`.
+    pub fn management_config(&self) -> Option<super::management::ManagementConfig> {
+        self.inner.config.management.clone()
     }
 
     /// Return `true` if the underlying AMQP connection is still open.

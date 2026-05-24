@@ -81,9 +81,7 @@ impl TestBroker {
     }
 
     fn rmq_config(&self) -> RabbitMqConfig {
-        RabbitMqConfig {
-            uri: self.amqp_url.clone(),
-        }
+        RabbitMqConfig::new(self.amqp_url.clone())
     }
 
     fn mgmt_config(&self) -> ManagementConfig {
