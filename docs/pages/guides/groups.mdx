@@ -123,7 +123,7 @@ Each backend's consumer group config has backend-specific knobs beyond the share
 
 **Kafka (`kafka::KafkaConsumerGroupConfig`)** — adds `.with_concurrent_processing(bool)`. Kafka's consumer-group protocol handles partition assignment across instances automatically.
 
-**Redis (`redis::RedisConsumerGroupConfig`)** — adds `.with_handler_timeout(Duration)` mirroring every other backend. Redis Streams uses a fixed consumer count per registration (set via `RedisConsumerGroupConfig::new(consumer_count: u16)`); there is no concurrent-processing toggle.
+**Redis (`redis::RedisConsumerGroupConfig`)** — adds `.with_prefetch_count(u16)`, `.with_concurrent_processing(bool)`, and `.with_handler_timeout(Duration)`. Construct via `RedisConsumerGroupConfig::new(min..=max)`; the registry spawns `min_consumers` tasks today (`max_consumers` is reserved for a future autoscaler). With `concurrent_processing(true)` each consumer dispatches up to `prefetch_count` handlers in parallel via spawned tasks and per-task multiplexed connections; `register_fifo` rejects this flag to preserve per-key ordering.
 
 **InMemory (`inmemory::InMemoryConsumerGroupConfig`)** — adds knobs for `max_pending_per_key` (for sequenced topics) and `max_message_size`. Useful for test-environment configuration.
 

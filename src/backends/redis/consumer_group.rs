@@ -40,9 +40,11 @@ type TaskFactory = Box<dyn FnOnce() -> BoxFuture + Send>;
 /// Configuration for a [`RedisConsumerGroupRegistry`] registration.
 ///
 /// The consumer count range matches the other coordinated-group backends.
-/// Redis Streams has no native autoscaling integration here, so the registry
-/// spawns `max_consumers` consumer tasks up-front; `min_consumers` is
-/// informational. FIFO topics always spawn one task per shard regardless of
+/// The registry spawns `min_consumers` consumer tasks at start; the
+/// `max_consumers` ceiling will be honoured by a future autoscaler (Redis
+/// has no scaling loop wired today, so `min_consumers` is the effective
+/// in-flight count). Users who want a fixed `N` consumers pass
+/// `N..=N`. FIFO topics always spawn one task per shard regardless of
 /// this setting.
 #[derive(Debug, Clone)]
 pub struct RedisConsumerGroupConfig {
@@ -120,8 +122,9 @@ impl RedisConsumerGroupConfig {
         self.min_consumers
     }
 
-    /// Returns the maximum number of consumers (also the number of consumer
-    /// tasks that get spawned today — Redis has no in-tree autoscaler hook).
+    /// Returns the maximum number of consumers. Currently used only as the
+    /// upper bound for a future autoscaler — the registry spawns
+    /// `min_consumers` tasks at start.
     pub fn max_consumers(&self) -> u16 {
         self.max_consumers
     }
@@ -197,9 +200,10 @@ impl RedisConsumerGroupRegistry {
 
     /// Register a non-FIFO topic handler.
     ///
-    /// Spawns `config.max_consumers()` consumer tasks when [`start_all`] is
+    /// Spawns `config.min_consumers()` consumer tasks when [`start_all`] is
     /// called. Each task gets its own clone of `ctx` (via `H::Context: Clone`,
-    /// already guaranteed by the [`MessageHandler`] trait bound).
+    /// already guaranteed by the [`MessageHandler`] trait bound). The
+    /// `max_consumers` ceiling will be honoured by a future autoscaler.
     ///
     /// Topology structures (stream + consumer group) are declared before
     /// returning.
@@ -231,7 +235,7 @@ impl RedisConsumerGroupRegistry {
         };
         let concurrent = config.concurrent_processing;
 
-        let n = config.max_consumers() as usize;
+        let n = config.min_consumers() as usize;
 
         for _ in 0..n {
             let client = self.client.clone();
@@ -296,7 +300,7 @@ impl RedisConsumerGroupRegistry {
             resolve_handler_timeout(config.handler_timeout, self.default_handler_timeout);
 
         let prefetch = config.prefetch_count.max(1);
-        let n = config.max_consumers() as usize;
+        let n = config.min_consumers() as usize;
         for _ in 0..n {
             let client = self.client.clone();
             let shutdown = self.shutdown.clone();
