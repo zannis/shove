@@ -24,8 +24,7 @@ use tokio::sync::Mutex;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    TopologyImpl, sealed,
+    Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, TopologyImpl, sealed,
 };
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -153,12 +152,6 @@ impl TopologyImpl for SnsTopologyDeclarer {
         SnsTopologyDeclarer::declare(self, T::topology()).await
     }
 }
-
-// ---------------------------------------------------------------------------
-// AutoscalerBackendImpl — trait has no methods in Phase 4
-// ---------------------------------------------------------------------------
-
-impl AutoscalerBackendImpl for SqsAutoscalerBackend<SqsQueueStatsProvider> {}
 
 // ---------------------------------------------------------------------------
 // QueueStatsProviderImpl — map the SQS stats to AutoscaleMetrics

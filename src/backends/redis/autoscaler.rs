@@ -11,7 +11,7 @@ use crate::autoscaler::{
     Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics, Stabilized,
     ThresholdStrategy,
 };
-use crate::backend::{AutoscalerBackendImpl, QueueStatsProviderImpl};
+use crate::backend::QueueStatsProviderImpl;
 use crate::error::{Result, ShoveError};
 
 use super::client::RedisClient;
@@ -162,8 +162,6 @@ impl<S: RedisQueueStatsProvider> RedisAutoscalerBackend<S> {
         }
     }
 }
-
-impl<S: RedisQueueStatsProvider> AutoscalerBackendImpl for RedisAutoscalerBackend<S> {}
 
 impl<S: RedisQueueStatsProvider> AutoscalerBackend for RedisAutoscalerBackend<S> {
     type GroupId = String;

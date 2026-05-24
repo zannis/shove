@@ -32,6 +32,7 @@ pub struct InMemoryConsumerGroupConfig {
     min_consumers: u16,
     max_consumers: u16,
     max_retries: u32,
+    concurrent_processing: bool,
     pub(crate) handler_timeout: HandlerTimeoutConfig,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
@@ -64,6 +65,7 @@ impl InMemoryConsumerGroupConfig {
             min_consumers: min,
             max_consumers: max,
             max_retries: 10,
+            concurrent_processing: true,
             handler_timeout: HandlerTimeoutConfig::Inherit,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
@@ -72,6 +74,15 @@ impl InMemoryConsumerGroupConfig {
 
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Process prefetched messages concurrently (`true`, default) or one at a
+    /// time (`false`). When `false`, the effective prefetch is clamped to 1
+    /// regardless of `with_prefetch_count` — matching the same toggle on
+    /// every other coordinated-group backend.
+    pub fn with_concurrent_processing(mut self, concurrent: bool) -> Self {
+        self.concurrent_processing = concurrent;
         self
     }
 
@@ -120,6 +131,12 @@ impl InMemoryConsumerGroupConfig {
 
     pub fn max_retries(&self) -> u32 {
         self.max_retries
+    }
+
+    /// Returns whether concurrent processing is enabled. See
+    /// [`with_concurrent_processing`](Self::with_concurrent_processing).
+    pub fn concurrent_processing(&self) -> bool {
+        self.concurrent_processing
     }
 
     /// Returns the configured handler timeout. A freshly-constructed
@@ -376,7 +393,14 @@ impl InMemoryConsumerGroup {
         let processing = Arc::new(AtomicBool::new(false));
         let mut options = ConsumerOptionsInner::defaults_with_shutdown(child_token.clone());
         options.max_retries = self.config.max_retries;
-        options.prefetch_count = self.config.prefetch_count;
+        // Non-concurrent groups clamp prefetch to 1 so the inflight JoinSet
+        // serializes handlers regardless of the user-set prefetch — matches
+        // the same toggle on every other backend.
+        options.prefetch_count = if self.config.concurrent_processing {
+            self.config.prefetch_count
+        } else {
+            1
+        };
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.max_message_size = self.config.max_message_size;
         options.max_pending_per_key = self.config.max_pending_per_key;
