@@ -84,7 +84,51 @@ impl RedisPublisher {
 }
 
 // ---------------------------------------------------------------------------
-// PublisherImpl
+// Inherent API
+// ---------------------------------------------------------------------------
+
+impl RedisPublisher {
+    /// Publish `msg` to the topic's stream (or a sharded stream if `T` is
+    /// sequenced).
+    pub async fn publish<T: Topic>(&self, msg: &T::Message) -> Result<()> {
+        self.publish_inner::<T>(msg, HashMap::new(), None).await
+    }
+
+    /// Publish `msg` with caller-provided headers carried in the XADD entry.
+    pub async fn publish_with_headers<T: Topic>(
+        &self,
+        msg: &T::Message,
+        headers: HashMap<String, String>,
+    ) -> Result<()> {
+        self.publish_inner::<T>(msg, headers, None).await
+    }
+
+    /// Publish a batch on a single multiplexed connection.
+    ///
+    /// Returns `(succeeded, result)` per the [`PublisherImpl::publish_batch`]
+    /// contract — on `Ok(())` the caller may assume `succeeded == msgs.len()`;
+    /// on `Err(_)` `succeeded` is the count accepted before the failure.
+    pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> (u64, Result<()>) {
+        let mut conn = match self.client.multiplexed_conn().await {
+            Ok(c) => c,
+            Err(e) => return (0, Err(e)),
+        };
+        let mut succeeded: u64 = 0;
+        for msg in msgs {
+            match self
+                .publish_inner::<T>(msg, HashMap::new(), Some(&mut conn))
+                .await
+            {
+                Ok(()) => succeeded += 1,
+                Err(e) => return (succeeded, Err(e)),
+            }
+        }
+        (succeeded, Ok(()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PublisherImpl — thin forward over the inherent methods.
 // ---------------------------------------------------------------------------
 
 impl PublisherImpl for RedisPublisher {
@@ -92,7 +136,7 @@ impl PublisherImpl for RedisPublisher {
         &self,
         msg: &T::Message,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        self.publish_inner::<T>(msg, HashMap::new(), None)
+        RedisPublisher::publish::<T>(self, msg)
     }
 
     fn publish_with_headers<T: Topic>(
@@ -100,31 +144,14 @@ impl PublisherImpl for RedisPublisher {
         msg: &T::Message,
         headers: HashMap<String, String>,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        self.publish_inner::<T>(msg, headers, None)
+        RedisPublisher::publish_with_headers::<T>(self, msg, headers)
     }
 
-    #[allow(clippy::manual_async_fn)]
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
     ) -> impl std::future::Future<Output = (u64, Result<()>)> + Send {
-        async move {
-            let mut conn = match self.client.multiplexed_conn().await {
-                Ok(c) => c,
-                Err(e) => return (0, Err(e)),
-            };
-            let mut succeeded: u64 = 0;
-            for msg in msgs {
-                match self
-                    .publish_inner::<T>(msg, HashMap::new(), Some(&mut conn))
-                    .await
-                {
-                    Ok(()) => succeeded += 1,
-                    Err(e) => return (succeeded, Err(e)),
-                }
-            }
-            (succeeded, Ok(()))
-        }
+        RedisPublisher::publish_batch::<T>(self, msgs)
     }
 }
 
