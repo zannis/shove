@@ -1856,4 +1856,165 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(calls, 1, "non-retryable error must not trigger reconnect");
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_with_reconnect_shutdown_during_sleep_returns_ok() {
+        // After a retryable error the function backs off in a select! that races
+        // tokio::time::sleep against shutdown.cancelled(). With paused time the
+        // sleep never elapses, so the cancellation arm is the only way the select
+        // can return — proving the cancellation-during-sleep branch is taken
+        // without depending on real wall-clock timing.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let canceller = shutdown.clone();
+        let calls_clone = Arc::clone(&calls);
+
+        // Cancel after yielding so run_with_reconnect has already:
+        //   1. invoked the closure (calls -> 1),
+        //   2. passed the is_cancelled() check after the error, and
+        //   3. entered the select!. With time paused, the sleep arm cannot
+        //      complete, so the cancellation arm must be what returns Ok.
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            canceller.cancel();
+        });
+
+        let result = run_with_reconnect(&shutdown, "test-stream", None, || {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            async { Err(ShoveError::Connection("transient".into())) }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "shutdown during backoff sleep must short-circuit to Ok"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "closure must not be re-invoked after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_reconnect_shutdown_between_error_and_sleep_returns_ok() {
+        // The `if shutdown.is_cancelled() { return Ok(()); }` check sits between the
+        // is_retryable check and the backoff sleep. Cancel the token before the closure
+        // even runs so that the first error returns immediately via that branch.
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let mut calls = 0u32;
+        let result = run_with_reconnect(&shutdown, "test-stream", None, || {
+            calls += 1;
+            async { Err(ShoveError::Connection("transient".into())) }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "cancellation observed after a retryable error must yield Ok"
+        );
+        assert_eq!(
+            calls, 1,
+            "closure runs exactly once before the cancellation check"
+        );
+    }
+
+    // --- parse_xreadgroup_reply: non-UTF-8 and multi-entry branches ---
+
+    #[test]
+    fn parse_xreadgroup_non_utf8_entry_id_skipped() {
+        // BulkString entry ID with invalid UTF-8 hits `Err(_) => continue` and skips
+        // the entry. The surrounding stream/reply structure stays well-formed so we
+        // can prove the skip is per-entry, not a structural failure.
+        let bad_id_entry = redis::Value::Array(vec![
+            redis::Value::BulkString(vec![0xff, 0xfe, 0xfd]), // invalid UTF-8
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"payload".to_vec()),
+                redis::Value::BulkString(b"x".to_vec()),
+            ]),
+        ]);
+        let good_entry = redis::Value::Array(vec![
+            redis::Value::BulkString(b"2-0".to_vec()),
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"payload".to_vec()),
+                redis::Value::BulkString(b"y".to_vec()),
+            ]),
+        ]);
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![bad_id_entry, good_entry]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(
+            result.len(),
+            1,
+            "non-UTF-8 entry ID must be skipped, leaving only the good entry"
+        );
+        assert_eq!(result[0].0, "2-0");
+    }
+
+    #[test]
+    fn parse_xreadgroup_non_utf8_field_key_breaks_loop() {
+        // A BulkString field key with invalid UTF-8 hits `Err(_) => break` in the key
+        // arm, terminating field collection but still emitting the entry with the
+        // fields gathered so far.
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(b"1-0".to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"good-key".to_vec()),
+                    redis::Value::BulkString(b"good-val".to_vec()),
+                    redis::Value::BulkString(vec![0xff, 0xfe]), // invalid UTF-8 key
+                    redis::Value::BulkString(b"never-reached".to_vec()),
+                ]),
+            ])]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].1.len(),
+            1,
+            "only the pair before the bad key survives"
+        );
+        assert_eq!(result[0].1[0].0, "good-key");
+    }
+
+    #[test]
+    fn parse_xreadgroup_multiple_entries_within_single_stream() {
+        // prefetch_count > 1 produces multiple entries under one stream key. The
+        // parser must emit them in order in the flat result list.
+        fn entry(id: &str, val: &str) -> redis::Value {
+            redis::Value::Array(vec![
+                redis::Value::BulkString(id.as_bytes().to_vec()),
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"payload".to_vec()),
+                    redis::Value::BulkString(val.as_bytes().to_vec()),
+                ]),
+            ])
+        }
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"mystream".to_vec()),
+            redis::Value::Array(vec![
+                entry("1-0", "a"),
+                entry("2-0", "b"),
+                entry("3-0", "c"),
+            ]),
+        ])]);
+        let result = parse_xreadgroup_reply(reply);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, "1-0");
+        assert_eq!(result[1].0, "2-0");
+        assert_eq!(result[2].0, "3-0");
+        assert_eq!(result[0].1[0].1, "a");
+        assert_eq!(result[1].1[0].1, "b");
+        assert_eq!(result[2].1[0].1, "c");
+    }
 }
