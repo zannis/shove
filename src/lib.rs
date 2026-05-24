@@ -347,7 +347,7 @@ pub mod rabbitmq {
         consumer::RabbitMqConsumer,
         consumer_group::{ConsumerGroup, ConsumerGroupConfig},
         headers::MESSAGE_ID_KEY,
-        management::{QueueStats, QueueStatsProvider},
+        management::{ManagementClient, QueueStats, QueueStatsProvider},
         publisher::RabbitMqPublisher,
         registry::ConsumerGroupRegistry,
         topology::RabbitMqTopologyDeclarer,
