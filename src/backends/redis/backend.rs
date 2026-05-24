@@ -43,7 +43,7 @@ impl Backend for Redis {
     type PublisherImpl = RedisPublisher;
     type ConsumerImpl = RedisConsumer;
     type TopologyImpl = RedisTopologyDeclarer;
-    type AutoscalerImpl = RedisAutoscalerBackend;
+    type AutoscalerImpl = RedisAutoscalerBackend<XlenStatsProvider>;
     type QueueStatsImpl = XlenStatsProvider;
 
     async fn connect(config: Self::Config) -> Result<Self::Client> {
@@ -63,7 +63,10 @@ impl Backend for Redis {
     }
 
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
-        RedisAutoscalerBackend::new(client.clone())
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let registry = Arc::new(Mutex::new(RedisConsumerGroupRegistry::new(client.clone())));
+        RedisAutoscalerBackend::new(client.clone(), registry)
     }
 
     fn make_stats_provider(client: &Self::Client) -> Self::QueueStatsImpl {

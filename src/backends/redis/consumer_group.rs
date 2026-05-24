@@ -444,6 +444,20 @@ impl RedisConsumerGroupRegistry {
         }
     }
 
+    /// Create a registry from a pre-populated map of groups (for testing).
+    /// The resulting registry cannot be used to call `register()`.
+    #[cfg(test)]
+    pub(crate) fn from_groups(
+        groups: std::collections::HashMap<String, RedisConsumerGroup>,
+    ) -> Self {
+        Self {
+            groups,
+            client: None,
+            shutdown: CancellationToken::new(),
+            default_handler_timeout: None,
+        }
+    }
+
     /// Set the registry-level default handler timeout. Applies to every
     /// group whose `RedisConsumerGroupConfig` did not explicitly call
     /// `with_handler_timeout`. Per-group explicit settings always win.
