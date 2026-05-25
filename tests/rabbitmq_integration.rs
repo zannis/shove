@@ -325,6 +325,13 @@ define_topic!(
         .build()
 );
 
+// Topic for publisher pool concurrency tests
+define_topic!(
+    PublisherConcurrencyTopic,
+    SimpleMessage,
+    TopologyBuilder::new("test-publisher-concurrency").build()
+);
+
 // Message type and topic for deserialization-failure DLQ tests
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 struct StrictMessage {
@@ -5671,5 +5678,91 @@ async fn pool_spans_three_connections_and_routes_traffic() {
     );
 
     registry.shutdown_all().await;
+    broker.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Publisher pool concurrency: mutex must not be held during confirm await
+// ---------------------------------------------------------------------------
+
+/// With a single-channel pool, N concurrent publishes must NOT serialize
+/// through the `Mutex<Channel>` for the full publish-confirm round-trip.
+///
+/// The fix releases the mutex after cloning the channel and before any
+/// network I/O.  Observable effect: N concurrent publishes complete in
+/// roughly the same wall-clock time as 1 sequential publish (all confirms
+/// arrive together), whereas under the unfixed code they serialize to
+/// ~N × RTT.
+///
+/// Test strategy:
+/// 1. Measure sequential time for N publishes (establishes per-publish RTT).
+/// 2. Measure concurrent time for the same N publishes on the same
+///    single-channel publisher.
+/// 3. Assert concurrent < sequential / 2 — if the mutex were still held
+///    during the confirm wait both durations would be equal and the
+///    assertion would fail.
+#[tokio::test]
+async fn publisher_single_channel_pool_does_not_serialize_concurrent_publishes() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config())
+        .await
+        .expect("connect");
+
+    broker
+        .broker_from(client.clone())
+        .topology()
+        .declare::<PublisherConcurrencyTopic>()
+        .await
+        .expect("declare topology");
+
+    // One channel slot — every concurrent publish targets the same Mutex<Channel>.
+    let publisher = Arc::new(
+        RabbitMqPublisher::with_channel_count(client, 1)
+            .await
+            .expect("publisher"),
+    );
+
+    let msg = SimpleMessage {
+        body: "ping".into(),
+    };
+    const N: usize = 4;
+
+    // --- Sequential baseline: establishes per-publish RTT ---
+    let seq_start = Instant::now();
+    for _ in 0..N {
+        publisher
+            .publish::<PublisherConcurrencyTopic>(&msg)
+            .await
+            .expect("sequential publish");
+    }
+    let seq_elapsed = seq_start.elapsed();
+
+    // --- Concurrent: all N publishes fire at the same time ---
+    let conc_start = Instant::now();
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let p = Arc::clone(&publisher);
+            let m = msg.clone();
+            tokio::spawn(async move {
+                p.publish::<PublisherConcurrencyTopic>(&m)
+                    .await
+                    .expect("concurrent publish")
+            })
+        })
+        .collect();
+    for h in handles {
+        h.await.expect("task panicked");
+    }
+    let conc_elapsed = conc_start.elapsed();
+
+    // Concurrent must be at least 2× faster than sequential.
+    // If the mutex is held during the confirm await the two durations are
+    // nearly identical (both serialized), failing the assertion.
+    assert!(
+        conc_elapsed * 2 < seq_elapsed,
+        "concurrent ({conc_elapsed:?}) must be >2× faster than sequential ({seq_elapsed:?}); \
+         if durations are similar the Mutex<Channel> is still held during the confirm await"
+    );
+
     broker.stop().await;
 }
