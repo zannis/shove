@@ -59,7 +59,12 @@ fn reaper_consumer_name(group: &str) -> String {
 ///
 /// `min_idle_ms` is the XAUTOCLAIM idle threshold — entries whose PEL idle
 /// time is shorter than this are not reclaimed.
-pub(crate) fn spawn_reaper(
+/// `pub` (with `#[doc(hidden)]`) rather than `pub(crate)` so integration
+/// tests in `tests/` — which are compiled as separate crates — can spawn the
+/// reaper directly with arbitrary timing. Production code should not call
+/// this; the consumer-group registry owns reaper lifecycle.
+#[doc(hidden)]
+pub fn spawn_reaper(
     client: RedisClient,
     streams: Vec<String>,
     group: String,
