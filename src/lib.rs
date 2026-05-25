@@ -21,8 +21,8 @@
 //!
 //! # Capability gating
 //!
-//! - **Kafka, RabbitMQ, NATS, InMemory** implement the
-//!   [`HasCoordinatedGroups`] capability trait — they expose
+//! - **Kafka, RabbitMQ, NATS, InMemory, Redis** (`redis-streams`) implement
+//!   the [`HasCoordinatedGroups`] capability trait — they expose
 //!   [`Broker::consumer_group`] for min/max-bounded coordinated groups with
 //!   autoscaling.
 //! - **SQS** does **not**. A "group" on SQS is N parallel independent
