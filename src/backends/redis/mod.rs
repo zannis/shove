@@ -10,6 +10,7 @@ pub(super) mod constants;
 mod consumer;
 mod consumer_group;
 mod publisher;
+mod reaper;
 mod requeue;
 mod topology;
 

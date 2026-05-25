@@ -22,12 +22,10 @@ use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, QueueTopology};
 
-use redis::streams::StreamAutoClaimReply;
-
 use super::client::{RedisClient, RedisConnection};
 use super::constants::{
-    AUTOCLAIM_COUNT, BLOCK_MS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID,
-    X_ORIGINAL_QUEUE, X_RETRY_COUNT, X_SEQUENCE_KEY,
+    BLOCK_MS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID, X_ORIGINAL_QUEUE,
+    X_RETRY_COUNT, X_SEQUENCE_KEY,
 };
 use super::requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
 use super::topology::RedisTopologyDeclarer;
@@ -484,12 +482,7 @@ where
     let topic_arc: Arc<str> = Arc::from(topic_name);
     let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);
 
-    let idle_ms = options
-        .handler_timeout
-        .unwrap_or(Duration::from_secs(30))
-        .as_millis() as u64;
     let prefetch = options.prefetch_count.max(1) as usize;
-    let autoclaim_interval = Duration::from_millis(idle_ms.max(30_000));
 
     run_with_reconnect(&shutdown, stream, options.max_reconnect_attempts, || {
         let client = client.clone();
@@ -509,8 +502,9 @@ where
 
         async move {
             let mut conn = client.dedicated_conn().await?;
-            let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
-            let mut last_autoclaim = std::time::Instant::now();
+            // XAUTOCLAIM has been hoisted out of the per-consumer hot path —
+            // see `reaper.rs` for the consolidated sidecar that runs it on
+            // behalf of the whole group.
 
             loop {
                 if shutdown.is_cancelled() {
@@ -725,11 +719,8 @@ where
                     )
                     .await?;
                 }
-
-                if last_autoclaim.elapsed() >= autoclaim_interval {
-                    let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
-                    last_autoclaim = std::time::Instant::now();
-                }
+                // Periodic XAUTOCLAIM removed — handled by the group-wide
+                // reaper sidecar in `reaper.rs`.
             }
         }
     })
@@ -783,12 +774,7 @@ where
     let topic_arc: Arc<str> = Arc::from(topic_name);
     let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);
 
-    let idle_ms = options
-        .handler_timeout
-        .unwrap_or(Duration::from_secs(30))
-        .as_millis() as u64;
     let prefetch = options.prefetch_count.max(1) as usize;
-    let autoclaim_interval = Duration::from_millis(idle_ms.max(30_000));
 
     let semaphore = Arc::new(Semaphore::new(prefetch));
     let max_retries = options.max_retries;
@@ -821,8 +807,9 @@ where
             // dialed afresh, recovering from a dead socket without further
             // plumbing.
             let outcome_conn = client.multiplexed_conn().await?;
-            let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
-            let mut last_autoclaim = std::time::Instant::now();
+            // XAUTOCLAIM has been hoisted out of the per-consumer hot path —
+            // see `reaper.rs` for the consolidated sidecar that runs it on
+            // behalf of the whole group.
 
             loop {
                 if shutdown.is_cancelled() {
@@ -1065,10 +1052,8 @@ where
                     });
                 }
 
-                if last_autoclaim.elapsed() >= autoclaim_interval {
-                    let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
-                    last_autoclaim = std::time::Instant::now();
-                }
+                // Periodic XAUTOCLAIM removed — handled by the group-wide
+                // reaper sidecar in `reaper.rs`.
             }
         }
     })
@@ -1299,36 +1284,7 @@ async fn xack(conn: &mut RedisConnection, stream: &str, group: &str, entry_id: &
         .map_err(|e| ShoveError::Connection(format!("XACK failed: {e}")))
 }
 
-async fn autoclaim_all(
-    conn: &mut RedisConnection,
-    stream: &str,
-    group: &str,
-    consumer: &str,
-    min_idle_ms: u64,
-) -> Result<()> {
-    let mut cursor = "0-0".to_owned();
-    loop {
-        let reply: StreamAutoClaimReply = conn
-            .query(
-                redis::cmd("XAUTOCLAIM")
-                    .arg(stream)
-                    .arg(group)
-                    .arg(consumer)
-                    .arg(min_idle_ms)
-                    .arg(&cursor)
-                    .arg("COUNT")
-                    .arg(AUTOCLAIM_COUNT),
-            )
-            .await
-            .map_err(|e| ShoveError::Connection(format!("XAUTOCLAIM failed: {e}")))?;
-
-        if reply.next_stream_id == "0-0" || reply.next_stream_id.is_empty() {
-            break;
-        }
-        cursor = reply.next_stream_id;
-    }
-    Ok(())
-}
+// `autoclaim_all` moved to `reaper.rs` — see module docs there for why.
 
 // ---------------------------------------------------------------------------
 // XREADGROUP reply parser

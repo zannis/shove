@@ -26,6 +26,7 @@ use crate::backend::consumer::ConsumerImpl;
 
 use super::client::RedisClient;
 use super::consumer::RedisConsumer;
+use super::reaper::spawn_reaper;
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,50 @@ pub struct RedisConsumerGroup {
     pub(crate) group_token: CancellationToken,
     pub(crate) error_count: Arc<AtomicUsize>,
     pub(crate) panic_count: Arc<AtomicUsize>,
+    /// Factory for the per-group XAUTOCLAIM sidecar. Built once in `new` /
+    /// `new_fifo` so `start` can spawn the reaper without re-capturing
+    /// topology data.
+    pub(crate) reaper_factory: ReaperFactory,
+    /// Handle to the reaper task spawned on `start`. `None` until `start` is
+    /// called, taken back to `None` by `shutdown_with_tally`.
+    pub(crate) reaper_handle: Option<JoinHandle<()>>,
+}
+
+/// Type-erased "spawn me a reaper" closure. Captures the streams + group +
+/// timing knobs needed to call [`super::reaper::spawn_reaper`].
+pub(crate) type ReaperFactory = Arc<dyn Fn() -> JoinHandle<()> + Send + Sync>;
+
+/// Build a [`ReaperFactory`] for the given streams + group. Used by both
+/// `RedisConsumerGroup::new` (single stream) and `::new_fifo` (one stream
+/// per shard).
+///
+/// The reaper interval derives from the group's resolved `handler_timeout`,
+/// floored at 30 s — matches what the per-consumer autoclaim loop used to
+/// pick. `min_idle_ms` (the XAUTOCLAIM idle threshold) is set to the same
+/// value, so an entry must have been pending at least one handler-timeout
+/// before the reaper reclaims it.
+fn build_reaper_factory(
+    client: &RedisClient,
+    streams: Vec<String>,
+    config: &RedisConsumerGroupConfig,
+    group_token: &CancellationToken,
+) -> ReaperFactory {
+    let group = client.group().to_string();
+    let handler_timeout = resolve_handler_timeout(config.handler_timeout, None);
+    let min_idle_ms = handler_timeout.as_millis() as u64;
+    let interval = Duration::from_millis(min_idle_ms.max(30_000));
+    let client = client.clone();
+    let token = group_token.clone();
+    Arc::new(move || {
+        spawn_reaper(
+            client.clone(),
+            streams.clone(),
+            group.clone(),
+            interval,
+            min_idle_ms,
+            token.clone(),
+        )
+    })
 }
 
 impl RedisConsumerGroup {
@@ -235,6 +280,13 @@ impl RedisConsumerGroup {
             })
         });
 
+        let reaper_factory = build_reaper_factory(
+            &client,
+            vec![T::topology().queue().to_string()],
+            &config,
+            &group_token,
+        );
+
         Self {
             queue: queue.into(),
             consumers: Vec::with_capacity(config.max_consumers() as usize),
@@ -243,6 +295,8 @@ impl RedisConsumerGroup {
             group_token,
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
+            reaper_factory,
+            reaper_handle: None,
         }
     }
 
@@ -310,6 +364,18 @@ impl RedisConsumerGroup {
             })
         });
 
+        // FIFO topics own one stream per shard — pass all shard names so the
+        // reaper sweeps them as a group.
+        let topology = T::topology();
+        let n_shards = topology
+            .sequencing()
+            .expect("new_fifo requires sequencing config")
+            .routing_shards();
+        let reaper_streams: Vec<String> = (0..n_shards)
+            .map(|idx| RedisTopologyDeclarer::shard_stream_name(topology.queue(), idx))
+            .collect();
+        let reaper_factory = build_reaper_factory(&client, reaper_streams, &config, &group_token);
+
         Self {
             queue: queue.into(),
             consumers: Vec::with_capacity(1),
@@ -318,10 +384,12 @@ impl RedisConsumerGroup {
             group_token,
             error_count,
             panic_count,
+            reaper_factory,
+            reaper_handle: None,
         }
     }
 
-    /// Spawn `min_consumers` consumer tasks.
+    /// Spawn `min_consumers` consumer tasks and the per-group reaper sidecar.
     pub fn start(&mut self) {
         let target = self.config.min_consumers() as usize;
         info!(
@@ -332,6 +400,9 @@ impl RedisConsumerGroup {
         );
         for _ in 0..target {
             self.spawn_one();
+        }
+        if self.reaper_handle.is_none() {
+            self.reaper_handle = Some((self.reaper_factory)());
         }
     }
 
@@ -408,6 +479,12 @@ impl RedisConsumerGroup {
                     panics += 1;
                 }
             }
+        }
+        // The reaper shares `group_token`, so the cancel above already signals
+        // it to exit. Await its JoinHandle so we don't return before the
+        // sidecar is gone.
+        if let Some(h) = self.reaper_handle.take() {
+            let _ = h.await;
         }
         let errors = self.error_count.swap(0, Ordering::Relaxed);
         let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
@@ -823,6 +900,7 @@ mod tests {
                     options.shutdown.cancelled().await;
                 })
             });
+            let reaper_factory: ReaperFactory = Arc::new(|| tokio::spawn(async {}));
             RedisConsumerGroup {
                 queue: "test-queue".into(),
                 consumers: Vec::with_capacity(config.max_consumers() as usize),
@@ -831,6 +909,8 @@ mod tests {
                 group_token,
                 error_count: Arc::new(AtomicUsize::new(0)),
                 panic_count: Arc::new(AtomicUsize::new(0)),
+                reaper_factory,
+                reaper_handle: None,
             }
         }
 
