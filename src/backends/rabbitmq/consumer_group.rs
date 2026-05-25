@@ -217,6 +217,14 @@ impl ConsumerGroup {
 
         // Build the connection pool. Slot 0 is the caller-supplied client;
         // slots 1..pool_size are freshly dialed siblings.
+        //
+        // Partial-failure semantics: if `dial_sibling()` errors on iteration K
+        // (1..pool_size), `pool_vec` (holding K successfully dialed clients)
+        // is dropped via `?` returning Err. Lapin's `Connection::Drop` closes
+        // the underlying TCP socket — that's a hard close (TCP RST), not a
+        // graceful AMQP `Connection.Close` handshake. Acceptable: this only
+        // happens on a fatal registration error where the broker is already
+        // misbehaving, and the broker recovers via TCP timeout on its side.
         let pool_size = pool_size_for(config.max_consumers);
         let mut pool_vec: Vec<RabbitMqClient> = Vec::with_capacity(pool_size);
         pool_vec.push(client);

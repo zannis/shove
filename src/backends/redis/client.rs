@@ -178,6 +178,15 @@ impl RedisClient {
     /// multiplexed connection during peak traffic can exceed 1 s. Both surface
     /// as "connection error: timed out" mid-publish. We disable both timeouts
     /// here; TCP keepalive still surfaces a truly dead broker.
+    ///
+    /// Cluster path note: `ClusterConfig::new()` clears the response timeout
+    /// (the `with_config` impl unconditionally writes `config.response_timeout`
+    /// into the connection), but cluster's public `set_connection_timeout`
+    /// takes a non-optional `Duration` so there is no way to disable
+    /// `connection_timeout` for cluster connections via the current redis-rs
+    /// public API; the 1 s default still applies. Cluster users on high-fanout
+    /// workloads should keep an eye on this until upstream exposes
+    /// `Option<Duration>` setters or shove takes a pinned redis-rs.
     pub(super) async fn multiplexed_conn(&self) -> Result<RedisConnection> {
         match self.inner.as_ref() {
             ClientInner::Standalone(client) => client
@@ -186,7 +195,7 @@ impl RedisClient {
                 .map(RedisConnection::Standalone)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
             ClientInner::Cluster(client) => client
-                .get_async_connection()
+                .get_async_connection_with_config(ClusterConfig::new())
                 .await
                 .map(RedisConnection::Cluster)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
@@ -198,7 +207,8 @@ impl RedisClient {
     ///
     /// Uses the same no-timeout config as [`multiplexed_conn`](Self::multiplexed_conn)
     /// so blocking reads, batched publishes, and outcome routing all behave
-    /// consistently under load.
+    /// consistently under load. The cluster-path connection-timeout limitation
+    /// documented on `multiplexed_conn` applies here too.
     pub(super) async fn dedicated_conn(&self) -> Result<RedisConnection> {
         match self.inner.as_ref() {
             ClientInner::Standalone(client) => client
