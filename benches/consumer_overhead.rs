@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use mach2::traps::mach_task_self;
 use serde::{Deserialize, Serialize};
-use shove::rabbitmq::ConsumerGroupConfig;
+use shove::rabbitmq::RabbitMqConsumerGroupConfig;
 use shove::rabbitmq::*;
 use shove::*;
 use testcontainers::ImageExt;
@@ -421,7 +421,7 @@ async fn measure_rss(broker: &Broker, consumers: u16) -> Result<f64, String> {
     let rec = recorder.clone();
     registry
         .register::<OverheadTopic, BenchHandler>(
-            ConsumerGroupConfig::new(consumers..=consumers),
+            RabbitMqConsumerGroupConfig::new(consumers..=consumers),
             move || BenchHandler {
                 epoch,
                 processed: pc.clone(),
@@ -464,7 +464,7 @@ async fn run_once(
     let rec = recorder.clone();
     registry
         .register::<OverheadTopic, BenchHandler>(
-            ConsumerGroupConfig::new(consumers..=consumers),
+            RabbitMqConsumerGroupConfig::new(consumers..=consumers),
             move || BenchHandler {
                 epoch,
                 processed: pc.clone(),
