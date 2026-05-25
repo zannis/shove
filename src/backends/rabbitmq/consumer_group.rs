@@ -15,6 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::ShutdownTally;
+use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
@@ -151,7 +152,6 @@ impl Default for ConsumerGroupConfig {
 /// Lapin parses every inbound delivery on every channel through a single
 /// reader task; past ~50 channels per connection the socket becomes a
 /// serialisation point, so we fan out to multiple connections.
-#[allow(dead_code)]
 fn pool_size_for(max_consumers: u16) -> usize {
     const CHANNELS_PER_CONN: usize = 50;
     let max = (max_consumers as usize).max(1);
@@ -195,7 +195,7 @@ impl ConsumerGroup {
     /// `queue` must match `T::topology().queue()` — it is stored separately
     /// so the autoscaler can look up queue statistics without the `T` type
     /// parameter.
-    pub fn new<T, H>(
+    pub async fn new<T, H>(
         name: impl Into<String>,
         queue: impl Into<String>,
         config: ConsumerGroupConfig,
@@ -203,7 +203,7 @@ impl ConsumerGroup {
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
-    ) -> Self
+    ) -> Result<Self>
     where
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
@@ -211,9 +211,22 @@ impl ConsumerGroup {
         let concurrent = config.concurrent_processing;
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
+
+        // Build the connection pool. Slot 0 is the caller-supplied client;
+        // slots 1..pool_size are freshly dialed siblings.
+        let pool_size = pool_size_for(config.max_consumers);
+        let mut pool_vec: Vec<RabbitMqClient> = Vec::with_capacity(pool_size);
+        pool_vec.push(client);
+        for _ in 1..pool_size {
+            pool_vec.push(pool_vec[0].dial_sibling().await?);
+        }
+        let pool: Arc<Vec<RabbitMqClient>> = Arc::new(pool_vec);
+        let next: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(client.clone());
+            let consumer = RabbitMqConsumer::new(pool[idx].clone());
             let options = if concurrent {
                 options
             } else {
@@ -234,7 +247,7 @@ impl ConsumerGroup {
             })
         });
 
-        Self {
+        Ok(Self {
             name: name.into(),
             queue: queue.into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
@@ -243,7 +256,7 @@ impl ConsumerGroup {
             group_token,
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
-        }
+        })
     }
 
     /// Construct a FIFO consumer group for a [`SequencedTopic`].

@@ -96,7 +96,8 @@ impl ConsumerGroupRegistry {
             group_token,
             handler_factory,
             ctx,
-        );
+        )
+        .await?;
         self.groups.insert(name, group);
         Ok(())
     }
