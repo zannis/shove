@@ -144,6 +144,20 @@ impl Default for ConsumerGroupConfig {
     }
 }
 
+/// Number of AMQP connections to dial for a consumer group sized
+/// `max_consumers`.
+///
+/// One connection per 50 workers, rounded up, never less than 1.
+/// Lapin parses every inbound delivery on every channel through a single
+/// reader task; past ~50 channels per connection the socket becomes a
+/// serialisation point, so we fan out to multiple connections.
+#[allow(dead_code)]
+fn pool_size_for(max_consumers: u16) -> usize {
+    const CHANNELS_PER_CONN: usize = 50;
+    let max = (max_consumers as usize).max(1);
+    max.div_ceil(CHANNELS_PER_CONN)
+}
+
 /// A named group of identical consumers all reading from the same queue.
 ///
 /// The group owns the concrete consumers and is responsible for scaling them
@@ -830,5 +844,33 @@ mod tests {
     #[should_panic(expected = "handler_timeout must be positive")]
     fn with_handler_timeout_zero_panics() {
         let _ = ConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::ZERO);
+    }
+
+    // -- pool_size_for --
+
+    #[test]
+    fn pool_size_for_clamps_below_to_one() {
+        assert_eq!(pool_size_for(0), 1);
+        assert_eq!(pool_size_for(1), 1);
+        assert_eq!(pool_size_for(50), 1);
+    }
+
+    #[test]
+    fn pool_size_for_rolls_to_two_at_fifty_one() {
+        assert_eq!(pool_size_for(51), 2);
+        assert_eq!(pool_size_for(100), 2);
+    }
+
+    #[test]
+    fn pool_size_for_scales_linearly() {
+        assert_eq!(pool_size_for(101), 3);
+        assert_eq!(pool_size_for(200), 4);
+        assert_eq!(pool_size_for(800), 16);
+    }
+
+    #[test]
+    fn pool_size_for_does_not_overflow_at_u16_max() {
+        // u16::MAX = 65_535; ceil(65535 / 50) = 1311
+        assert_eq!(pool_size_for(u16::MAX), 1311);
     }
 }
