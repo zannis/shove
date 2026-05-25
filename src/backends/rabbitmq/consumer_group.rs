@@ -434,6 +434,7 @@ impl ConsumerGroup {
     /// publicly so integration tests can verify the pool spans multiple
     /// connections at high consumer counts. Production code should not
     /// depend on this value.
+    #[doc(hidden)]
     pub fn pool_len(&self) -> usize {
         self.pool.len()
     }
