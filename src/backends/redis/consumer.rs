@@ -810,6 +810,17 @@ where
 
         async move {
             let mut conn = client.dedicated_conn().await?;
+            // Acquire ONE multiplexed connection per reconnect cycle and hand
+            // `.clone()`s to each spawned handler. MultiplexedConnection clones
+            // share the underlying socket and multiplexer task, so this caps
+            // socket creation at one-per-consumer-task instead of
+            // one-per-message — the old per-spawn
+            // `task_client.multiplexed_conn().await` pattern exhausts the
+            // macOS ephemeral port range under fast handler workloads. On
+            // reconnect (this closure re-runs) the outcome connection is
+            // dialed afresh, recovering from a dead socket without further
+            // plumbing.
+            let outcome_conn = client.multiplexed_conn().await?;
             let _ = autoclaim_all(&mut conn, stream, &group, &consumer, idle_ms).await;
             let mut last_autoclaim = std::time::Instant::now();
 
@@ -966,7 +977,9 @@ where
 
                     let task_handler = Arc::clone(&handler);
                     let task_ctx = Arc::clone(&ctx);
-                    let task_client = client.clone();
+                    // Clone the hoisted outcome connection — cheap, shares the
+                    // multiplexer/socket from the parent task.
+                    let mut task_conn = outcome_conn.clone();
                     let task_topic = Arc::clone(&topic_arc);
                     let task_group_metric = group_arc.clone();
                     let task_group = group.clone();
@@ -1027,25 +1040,8 @@ where
                             elapsed,
                         );
 
-                        // Per-task multiplexed connection — multiplexed clients
-                        // share an underlying socket, so this is cheap and
-                        // concurrent ops across tasks do not serialize.
-                        let mut task_conn = match task_client.multiplexed_conn().await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    entry_id,
-                                    "failed to acquire connection for outcome routing; message left in PEL"
-                                );
-                                metrics::record_backend_error(
-                                    metrics::BackendLabel::Redis,
-                                    metrics::BackendErrorKind::Ack,
-                                );
-                                return;
-                            }
-                        };
-
+                        // `task_conn` was cloned from the parent's hoisted
+                        // outcome connection — no per-message socket churn.
                         if let Err(e) = route_outcome(
                             &mut task_conn,
                             topology,

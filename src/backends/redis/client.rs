@@ -46,11 +46,26 @@ impl RedisConfig {
 // ---------------------------------------------------------------------------
 
 /// A single Redis connection, abstracting over standalone vs cluster transports.
+///
+/// Both variants wrap a redis-rs connection type that is `Clone` — the clones
+/// share the underlying multiplexer task and TCP socket. That lets callers
+/// hoist one `RedisConnection` per long-lived task (e.g. consumer loop) and
+/// hand `.clone()`s to short-lived per-message work without opening a fresh
+/// TCP socket on every operation.
 pub(crate) enum RedisConnection {
     /// Multiplexed standalone connection – safe for BLOCK commands with finite timeouts (BLOCK 2000).
     Standalone(MultiplexedConnection),
     /// Cluster connection – safe to share; BLOCK commands work the same way.
     Cluster(ClusterConnection),
+}
+
+impl Clone for RedisConnection {
+    fn clone(&self) -> Self {
+        match self {
+            RedisConnection::Standalone(c) => RedisConnection::Standalone(c.clone()),
+            RedisConnection::Cluster(c) => RedisConnection::Cluster(c.clone()),
+        }
+    }
 }
 
 impl RedisConnection {
