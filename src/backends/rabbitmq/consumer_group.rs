@@ -182,6 +182,9 @@ pub struct ConsumerGroup {
     /// exits with a `JoinError` that is not a cancellation. Drained by
     /// [`ConsumerGroup::shutdown_with_tally`].
     panic_count: Arc<AtomicUsize>,
+    /// AMQP connection pool shared across all consumers in this group.
+    /// Sized at construction time from `ceil(max_consumers / 50)`.
+    pool: Arc<Vec<RabbitMqClient>>,
 }
 
 impl ConsumerGroup {
@@ -223,10 +226,11 @@ impl ConsumerGroup {
         let pool: Arc<Vec<RabbitMqClient>> = Arc::new(pool_vec);
         let next: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
+        let pool_for_spawner = pool.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
-            let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
+            let idx = next.fetch_add(1, Ordering::Relaxed) % pool_for_spawner.len();
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(pool[idx].clone());
+            let consumer = RabbitMqConsumer::new(pool_for_spawner[idx].clone());
             let options = if concurrent {
                 options
             } else {
@@ -256,6 +260,7 @@ impl ConsumerGroup {
             group_token,
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
+            pool,
         })
     }
 
@@ -297,10 +302,11 @@ impl ConsumerGroup {
         let pool: Arc<Vec<RabbitMqClient>> = Arc::new(pool_vec);
         let next: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
+        let pool_for_spawner = pool.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
-            let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
+            let idx = next.fetch_add(1, Ordering::Relaxed) % pool_for_spawner.len();
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(pool[idx].clone());
+            let consumer = RabbitMqConsumer::new(pool_for_spawner[idx].clone());
             let ec = ec_for_spawner.clone();
             let pc = pc_for_spawner.clone();
             let ctx = ctx.clone();
@@ -340,6 +346,7 @@ impl ConsumerGroup {
             group_token,
             error_count,
             panic_count,
+            pool,
         })
     }
 
@@ -421,6 +428,16 @@ impl ConsumerGroup {
         &self.config
     }
 
+    /// Number of AMQP connections backing this group's consumer pool.
+    ///
+    /// Sized at construction time from `ceil(max_consumers / 50)`. Exposed
+    /// publicly so integration tests can verify the pool spans multiple
+    /// connections at high consumer counts. Production code should not
+    /// depend on this value.
+    pub fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
     /// Cancel every consumer in the group and wait for all tasks to finish.
     pub async fn shutdown(&mut self) {
         let _ = self.shutdown_with_tally().await;
@@ -494,6 +511,7 @@ mod tests {
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
+            pool: Arc::new(Vec::new()),
         }
     }
 

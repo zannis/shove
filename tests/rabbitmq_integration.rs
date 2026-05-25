@@ -5570,3 +5570,55 @@ async fn broker_queue_stats_provider_without_management_errors() {
 
     broker.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Connection pool verification
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PoolTestMessage;
+
+define_topic!(
+    PoolTestTopic,
+    PoolTestMessage,
+    TopologyBuilder::new("shove-pool-test").build()
+);
+
+#[derive(Clone)]
+struct PoolTestHandler;
+
+impl MessageHandler<PoolTestTopic> for PoolTestHandler {
+    type Context = ();
+    async fn handle(&self, _: PoolTestMessage, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+/// At `max_consumers = 120` the connection pool should hold
+/// `ceil(120 / 50) = 3` AMQP connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_spans_three_connections_at_120_workers() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config())
+        .await
+        .expect("connect");
+
+    let mut registry = ConsumerGroupRegistry::new(client);
+    let config = ConsumerGroupConfig::new(120..=120);
+    registry
+        .register::<PoolTestTopic, _>(config, || PoolTestHandler, ())
+        .await
+        .expect("register");
+
+    let group = registry
+        .groups()
+        .get(PoolTestTopic::topology().queue())
+        .expect("group present");
+    assert_eq!(
+        group.pool_len(),
+        3,
+        "max_consumers=120 should produce 3 AMQP connections"
+    );
+
+    broker.stop().await;
+}
