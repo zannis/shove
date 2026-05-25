@@ -313,6 +313,13 @@ pub mod redis {
         RedisConsumerGroupConfig, RedisConsumerGroupRegistry, RedisMode, RedisPublisher,
         RedisQueueStats, RedisQueueStatsProvider, RedisTopologyDeclarer, XlenStatsProvider,
     };
+
+    /// Test-only escape hatch. `#[doc(hidden)]` so it doesn't appear in
+    /// rustdoc; integration tests in `tests/` (which are external crates)
+    /// import it directly. Production code should not call this; the
+    /// consumer-group registry owns reaper lifecycle.
+    #[doc(hidden)]
+    pub use crate::backends::redis::spawn_reaper;
 }
 
 /// In-process, non-durable broker backend.

@@ -72,10 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
-    let cfg = RedisConfig {
-        mode: RedisMode::Standalone { url },
-        group: Some("autoscaler-grp".into()),
-    };
+    let cfg = RedisConfig::new(RedisMode::Standalone { url }).with_group("autoscaler-grp");
 
     // Build the underlying client + Broker wrapper. We need both: the
     // registry/autoscaler talk directly to the client, while the broker is

@@ -10,6 +10,7 @@ pub(super) mod constants;
 mod consumer;
 mod consumer_group;
 mod publisher;
+mod reaper;
 mod requeue;
 mod topology;
 
@@ -22,5 +23,7 @@ pub use consumer_group::{
     RedisConsumerGroup, RedisConsumerGroupConfig, RedisConsumerGroupRegistry,
 };
 pub use publisher::{RedisPublisher, shard_for_key};
+#[doc(hidden)]
+pub use reaper::spawn_reaper;
 pub(crate) use requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
 pub use topology::RedisTopologyDeclarer;

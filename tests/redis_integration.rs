@@ -150,12 +150,12 @@ async fn make_broker(group: &str) -> Broker<Redis> {
     // is fully accepting connections, especially when multiple containers
     // start in parallel under nextest.
     for attempt in 0u32..5 {
-        match Broker::<Redis>::new(RedisConfig {
-            mode: RedisMode::Standalone {
+        match Broker::<Redis>::new(
+            RedisConfig::new(RedisMode::Standalone {
                 url: url.to_owned(),
-            },
-            group: Some(group.into()),
-        })
+            })
+            .with_group(group),
+        )
         .await
         {
             Ok(b) => return b,
@@ -949,10 +949,9 @@ async fn consumer_recovers_after_redis_restart() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("reconnect".into()),
-    })
+    let broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
+    )
     .await
     .expect("connect");
 
@@ -1035,10 +1034,9 @@ async fn consumer_recovers_after_redis_restart() {
 
     // Reconnect and redeclare topology (data was lost in the restart).
     // Redis is confirmed running at this point.
-    let broker2 = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("reconnect".into()),
-    })
+    let broker2 = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
+    )
     .await
     .expect("reconnect after restart");
 
@@ -1108,10 +1106,9 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("requeuer-recover".into()),
-    })
+    let broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
+    )
     .await
     .expect("connect");
 
@@ -1164,10 +1161,9 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Redeclare topology (data was wiped) and publish a message via a fresh broker.
-    let broker2 = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("requeuer-recover".into()),
-    })
+    let broker2 = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
+    )
     .await
     .expect("reconnect after restart");
 
@@ -1719,12 +1715,10 @@ async fn autoscaler_scales_up_under_load() {
     }
 
     let url = redis_url().await;
-    let cfg = RedisConfig {
-        mode: RedisMode::Standalone {
-            url: url.to_owned(),
-        },
-        group: Some("redis-int-autoscaler-grp".into()),
-    };
+    let cfg = RedisConfig::new(RedisMode::Standalone {
+        url: url.to_owned(),
+    })
+    .with_group("redis-int-autoscaler-grp");
 
     // Use the public Backend::connect trait method to obtain a RedisClient
     // we can hand to both the registry and the autoscaler.
@@ -1805,4 +1799,296 @@ async fn autoscaler_scales_up_under_load() {
     registry.lock().await.shutdown_all().await;
 
     assert!(scaled, "autoscaler failed to scale up under load");
+}
+
+// ---------------------------------------------------------------------------
+// Reaper sidecar
+// ---------------------------------------------------------------------------
+//
+// These tests exercise `spawn_reaper` directly so we can pass a sub-second
+// interval and a zero min_idle_ms — the registry-bound interval floor (30 s)
+// would otherwise make timing-based assertions painful.
+
+mod reaper_tests {
+    use super::*;
+    use redis::aio::MultiplexedConnection;
+    use shove::Backend;
+    use shove::redis::{RedisClient, spawn_reaper};
+    use tokio_util::sync::CancellationToken;
+
+    /// Open a raw multiplexed connection to the shared Redis URL for issuing
+    /// arbitrary commands (XADD / XGROUP / XREADGROUP / XPENDING). Each test
+    /// uses unique stream and group names so they can run in parallel without
+    /// touching one another's state.
+    ///
+    /// Mirrors `make_broker`'s retry: testcontainers occasionally returns
+    /// before Redis is fully accepting connections, especially when many
+    /// tests start in parallel under nextest.
+    async fn raw_conn(url: &str) -> MultiplexedConnection {
+        let client = redis::Client::open(url).expect("redis::Client::open");
+        for attempt in 0u32..5 {
+            match client.get_multiplexed_async_connection().await {
+                Ok(c) => return c,
+                Err(_) if attempt < 4 => {
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+                }
+                Err(e) => panic!("multiplexed conn after retries: {e}"),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Connect a `RedisClient` (the shove-level handle) with the same
+    /// container-init retry as `make_broker`. Used by the reaper tests so
+    /// we don't have to go through `Broker` just to get a raw client.
+    async fn connect_client_with_retry(url: &str, group: &str) -> RedisClient {
+        for attempt in 0u32..5 {
+            let cfg = RedisConfig::new(RedisMode::Standalone {
+                url: url.to_owned(),
+            })
+            .with_group(group);
+            match <Redis as Backend>::connect(cfg).await {
+                Ok(c) => return c,
+                Err(_) if attempt < 4 => {
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+                }
+                Err(e) => panic!("connect RedisClient after retries: {e}"),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Set up a stream + consumer group and claim one entry to a synthetic
+    /// "dead" consumer name. Returns the entry's stream ID for any follow-up
+    /// assertions.
+    async fn seed_stale_entry(
+        conn: &mut MultiplexedConnection,
+        stream: &str,
+        group: &str,
+    ) -> String {
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(conn).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("$")
+            .arg("MKSTREAM")
+            .query_async(conn)
+            .await;
+        let id: String = redis::cmd("XADD")
+            .arg(stream)
+            .arg("*")
+            .arg("payload")
+            .arg("v")
+            .query_async(conn)
+            .await
+            .expect("XADD");
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("dead-consumer")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(conn)
+            .await
+            .expect("XREADGROUP claim to dead consumer");
+        id
+    }
+
+    /// Return the number of XPENDING entries currently owned by
+    /// `consumer_name` on `stream`/`group`.
+    async fn pending_count_for(
+        conn: &mut MultiplexedConnection,
+        stream: &str,
+        group: &str,
+        consumer_name: &str,
+    ) -> usize {
+        let reply: redis::Value = redis::cmd("XPENDING")
+            .arg(stream)
+            .arg(group)
+            .arg("-")
+            .arg("+")
+            .arg(100)
+            .arg(consumer_name)
+            .query_async(conn)
+            .await
+            .expect("XPENDING");
+        match reply {
+            redis::Value::Array(entries) => entries.len(),
+            redis::Value::Nil => 0,
+            other => panic!("unexpected XPENDING reply: {other:?}"),
+        }
+    }
+
+    /// `spawn_reaper` must return promptly when the shutdown token is
+    /// cancelled while the loop is in its inter-tick sleep. Uses a long
+    /// interval so the sleep arm is the one that fires.
+    #[tokio::test]
+    async fn reaper_exits_promptly_on_shutdown_during_sleep() {
+        let url = redis_url().await;
+        let client = connect_client_with_retry(url, "reaper-exit-sleep").await;
+
+        let shutdown = CancellationToken::new();
+        // Long interval — the reaper will be parked in sleep almost immediately.
+        let handle = spawn_reaper(
+            client,
+            vec!["reaper-exit-sleep-stream".to_string()],
+            "reaper-exit-sleep".to_string(),
+            Duration::from_secs(60),
+            30_000,
+            shutdown.clone(),
+        );
+
+        // Give the spawn a moment to enter its select-on-sleep.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("reaper must exit within 500 ms of cancel")
+            .expect("reaper task must not panic");
+    }
+
+    /// The reaper actually transfers PEL ownership to its own consumer name
+    /// when entries are eligible (idle >= min_idle_ms).
+    #[tokio::test]
+    async fn reaper_claims_stale_pel_entries() {
+        let url = redis_url().await;
+        let stream = "reaper-stale-stream";
+        let group = "reaper-stale-grp";
+        let reaper_name = format!("shove-reaper-{group}");
+
+        let mut raw = raw_conn(url).await;
+        let _ = seed_stale_entry(&mut raw, stream, group).await;
+
+        let client = connect_client_with_retry(url, group).await;
+
+        let shutdown = CancellationToken::new();
+        // Short interval + zero min_idle so the reaper sweeps on its first tick.
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            0,
+            shutdown.clone(),
+        );
+
+        // Poll up to 2 s for the entry to transfer.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut count = 0usize;
+        while std::time::Instant::now() < deadline {
+            count = pending_count_for(&mut raw, stream, group, &reaper_name).await;
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert!(
+            count > 0,
+            "reaper did not transfer the stale PEL entry to {reaper_name}"
+        );
+    }
+
+    /// `spawn_reaper` accepts multiple streams and must sweep all of them
+    /// in a single tick — not just the first.
+    #[tokio::test]
+    async fn reaper_sweeps_all_provided_streams() {
+        let url = redis_url().await;
+        let group = "reaper-multi-grp";
+        let reaper_name = format!("shove-reaper-{group}");
+        let streams = ["reaper-multi-s1", "reaper-multi-s2"];
+
+        let mut raw = raw_conn(url).await;
+        for s in &streams {
+            let _ = seed_stale_entry(&mut raw, s, group).await;
+        }
+
+        let client = connect_client_with_retry(url, group).await;
+
+        let shutdown = CancellationToken::new();
+        let handle = spawn_reaper(
+            client,
+            streams.iter().map(|s| s.to_string()).collect(),
+            group.to_string(),
+            Duration::from_millis(100),
+            0,
+            shutdown.clone(),
+        );
+
+        // Poll both streams up to 2 s for the entries to transfer.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut counts = [0usize; 2];
+        while std::time::Instant::now() < deadline {
+            for (i, s) in streams.iter().enumerate() {
+                counts[i] = pending_count_for(&mut raw, s, group, &reaper_name).await;
+            }
+            if counts.iter().all(|c| *c > 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        for (i, s) in streams.iter().enumerate() {
+            assert!(
+                counts[i] > 0,
+                "reaper did not transfer stale entry on stream {s} (count={count})",
+                count = counts[i],
+            );
+        }
+    }
+
+    /// Even when the reaper is iterating its `streams` Vec — between
+    /// per-stream `autoclaim_all` calls — a shutdown signal should be
+    /// observed. Configure a long interval but many streams so we land
+    /// inside the for-loop, then cancel.
+    #[tokio::test]
+    async fn reaper_exits_promptly_on_shutdown_between_streams() {
+        let url = redis_url().await;
+        let group = "reaper-between-grp";
+
+        let mut raw = raw_conn(url).await;
+        let streams: Vec<String> = (0..8)
+            .map(|i| format!("reaper-between-stream-{i}"))
+            .collect();
+        // Seed all 8 with stale entries so each per-stream sweep does
+        // real work (even if tiny) — this gives the cancellation a
+        // realistic mid-iteration window to fire.
+        for s in &streams {
+            let _ = seed_stale_entry(&mut raw, s, group).await;
+        }
+
+        let client = connect_client_with_retry(url, group).await;
+
+        let shutdown = CancellationToken::new();
+        // 200 ms interval so the first tick fires quickly; the for-loop
+        // over 8 streams gives us the window.
+        let handle = spawn_reaper(
+            client,
+            streams.clone(),
+            group.to_string(),
+            Duration::from_millis(200),
+            0,
+            shutdown.clone(),
+        );
+
+        // Wait for the first interval to fire, then cancel mid-loop.
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("reaper must exit within 1 s of cancel during stream loop")
+            .expect("reaper task must not panic");
+    }
 }

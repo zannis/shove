@@ -9,7 +9,9 @@ use async_nats::header::NATS_MESSAGE_ID;
 use async_nats::jetstream::Message;
 use async_nats::jetstream::consumer::AckPolicy;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
-use async_nats::jetstream::context::{GetStreamError, GetStreamErrorKind};
+use async_nats::jetstream::context::{
+    ConsumerInfoError, ConsumerInfoErrorKind, GetStreamError, GetStreamErrorKind,
+};
 use async_nats::jetstream::message::AckKind;
 use futures_util::StreamExt;
 use tokio::sync::Semaphore;
@@ -510,25 +512,53 @@ impl NatsConsumer {
                     .await
                     .map_err(|e| map_get_stream_error(queue, e))?;
 
-                // `create_consumer` upserts the durable consumer — unlike
-                // `get_or_create_consumer`, which returns the pre-existing
-                // config verbatim and silently ignores the caller's config
-                // (including `max_ack_pending`). That path caused N-way
-                // parallel pullers to inherit whatever ack-budget the first
-                // registrant set, bottlenecking the whole group.
-                let pull_consumer = stream
-                    .create_consumer(PullConsumerConfig {
-                        durable_name: Some(consumer_name.clone()),
-                        ack_policy: AckPolicy::Explicit,
-                        max_ack_pending,
-                        ..Default::default()
-                    })
+                // Fast path: attach to the pre-declared durable consumer.
+                // `NatsTopologyDeclarer::declare_pull_consumer` does the
+                // upsert once at consumer-group registration, so the hot
+                // path stays read-only and there is no `CONSUMER.CREATE`
+                // storm on reconnect — every consumer just reads.
+                //
+                // Fallback (NotFound only): callers that use
+                // `NatsConsumer::run` directly (e.g. tests via
+                // `ConsumerSupervisor`) bypass the registry and don't
+                // pre-declare. In that case `get_consumer` returns
+                // `ConsumerInfoErrorKind::NotFound` and we one-shot
+                // `create_consumer` to bootstrap. Any other error
+                // (TimedOut, NoResponders, JetStream, …) means the
+                // server is in trouble, not that the consumer is
+                // missing — propagate so the reconnect loop retries
+                // instead of silently misreporting as a create failure.
+                let pull_consumer = match stream
+                    .get_consumer::<PullConsumerConfig>(&consumer_name)
                     .await
-                    .map_err(|e| {
-                        ShoveError::Connection(format!(
-                            "failed to create consumer {consumer_name}: {e}"
-                        ))
-                    })?;
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let is_not_found = e
+                            .downcast_ref::<ConsumerInfoError>()
+                            .is_some_and(|ce| {
+                                matches!(ce.kind(), ConsumerInfoErrorKind::NotFound)
+                            });
+                        if !is_not_found {
+                            return Err(ShoveError::Connection(format!(
+                                "get_consumer({consumer_name}) failed: {e}"
+                            )));
+                        }
+                        stream
+                            .create_consumer(PullConsumerConfig {
+                                durable_name: Some(consumer_name.clone()),
+                                ack_policy: AckPolicy::Explicit,
+                                max_ack_pending,
+                                ..Default::default()
+                            })
+                            .await
+                            .map_err(|e| {
+                                ShoveError::Connection(format!(
+                                    "create_consumer({consumer_name}) fallback failed: {e}"
+                                ))
+                            })?
+                    }
+                };
 
                 let mut messages = pull_consumer.messages().await.map_err(|e| {
                     ShoveError::Connection(format!("failed to get message stream: {e}"))

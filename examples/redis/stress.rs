@@ -58,12 +58,9 @@ async fn main() {
         || {
             let url = url.clone();
             async move {
-                Broker::<Redis>::new(RedisConfig {
-                    mode: RedisMode::Standalone { url },
-                    group: None,
-                })
-                .await
-                .expect("connect Redis")
+                Broker::<Redis>::new(RedisConfig::new(RedisMode::Standalone { url }))
+                    .await
+                    .expect("connect Redis")
             }
         },
         |consumers, prefetch, concurrent| {

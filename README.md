@@ -109,15 +109,21 @@ Handler timeouts convert to `Retry`. Full semantics: [Outcomes & Delivery](https
 
 ## Performance
 
-MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91. Reproducible via `cargo run -q --example rabbitmq_stress --features rabbitmq`.
+MacBook Pro M4 Max, Docker, Rust 1.91. Reproducible via `cargo run -q --release --example <backend>_stress --features <backend>`.
 
-| Handler          | 1 worker, prefetch=1 | 1 worker, prefetch=20 | 8 workers, prefetch=20 | 32 workers, prefetch=40 |
-|------------------|----------------------|-----------------------|------------------------|-------------------------|
-| Fast (1–5 ms)    | 179 msg/s            | 2,866 msg/s           | 19,669 msg/s           | 29,207 msg/s            |
-| Slow (50–300 ms) | 6 msg/s              | 75 msg/s              | 544 msg/s              | 4,076 msg/s             |
-| Heavy (1–5 s)    | 0.4 msg/s            | 5 msg/s               | 21 msg/s               | 199 msg/s               |
+Per-consumer scaling at the `high` tier with the `slow` handler (50–300 ms random sleep, ~175 ms avg), `--concurrent` enabled, `prefetch=32`. Each row is total throughput in msg/s across N parallel consumer tasks.
 
-`prefetch_count` is the primary throughput lever for I/O-bound handlers. Tuning notes: [Performance](https://shove.rs/ops/performance).
+| Backend  |    8c |   16c |   32c |   64c |
+|----------|------:|------:|------:|------:|
+| Redis    | 1,371 | 2,761 | 5,462 | 7,996 |
+| RabbitMQ |   946 | 1,903 | 3,799 | 7,585 |
+| Kafka    |   347 |   694 | 1,406 | 2,245 |
+
+RabbitMQ scales linearly past 50 channels via the per-`ConsumerGroup` AMQP connection pool (auto-sized `ceil(max_consumers / 50)`). Redis ships shove-tuned defaults (30 s response, 10 s connect) that replace redis-rs's 500 ms / 1 s defaults — those misfire under heavy concurrent XREADGROUP load. Tune via `RedisConfig::with_response_timeout` / `with_connection_timeout` if needed.
+
+Redis consumer groups also run a single XAUTOCLAIM "reaper" sidecar per group instead of each consumer firing its own autoclaim — at 1 024 consumers this cuts broker-side autoclaim CPU from ~17 s / run to zero in the steady-state bench window. Headline impact on a single Redis node, 1 024 consumers, slow handler, `prefetch=20`: **56 000 msg/s** (was 5 900 before the reaper, ~10× speedup).
+
+`prefetch_count` is the primary throughput lever for I/O-bound handlers. Per-backend tuning notes, NATS/SQS comparisons, and `fast`/`heavy` profile breakdowns: [Performance](https://shove.rs/ops/performance).
 
 ## Learn more
 

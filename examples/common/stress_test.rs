@@ -128,26 +128,28 @@ pub struct Scenario {
 struct TierConfig {
     name: &'static str,
     consumers: &'static [u16],
-    /// Message counts per handler: (zero, fast, slow, heavy).
-    messages: (u64, u64, u64, u64),
+    /// Per-consumer message count per handler profile, ordered
+    /// (zero, fast, slow, heavy). Total messages for a scenario is
+    /// `messages_per_consumer.X * scenario.consumers`.
+    messages_per_consumer: (u64, u64, u64, u64),
 }
 
 const MODERATE: TierConfig = TierConfig {
     name: "moderate",
     consumers: &[1, 4, 8, 16, 32],
-    messages: (50_000, 20_000, 5_000, 1_000),
+    messages_per_consumer: (5_000, 2_500, 500, 50),
 };
 
 const HIGH: TierConfig = TierConfig {
     name: "high",
     consumers: &[8, 16, 32, 64],
-    messages: (500_000, 100_000, 5_000, 100),
+    messages_per_consumer: (20_000, 10_000, 1_000, 10),
 };
 
 const EXTREME: TierConfig = TierConfig {
     name: "extreme",
     consumers: &[32, 64, 128, 256],
-    messages: (1_000_000, 500_000, 5_000, 500),
+    messages_per_consumer: (20_000, 10_000, 200, 5),
 };
 
 fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> Duration {
@@ -188,13 +190,14 @@ fn build_scenarios(cli: &Cli) -> Vec<Scenario> {
     let mut scenarios = Vec::new();
     for tier_cfg in &tiers {
         for &h in &handlers {
-            let messages = match h {
-                HandlerProfile::Zero => tier_cfg.messages.0,
-                HandlerProfile::Fast => tier_cfg.messages.1,
-                HandlerProfile::Slow => tier_cfg.messages.2,
-                HandlerProfile::Heavy => tier_cfg.messages.3,
+            let per_consumer = match h {
+                HandlerProfile::Zero => tier_cfg.messages_per_consumer.0,
+                HandlerProfile::Fast => tier_cfg.messages_per_consumer.1,
+                HandlerProfile::Slow => tier_cfg.messages_per_consumer.2,
+                HandlerProfile::Heavy => tier_cfg.messages_per_consumer.3,
             };
             for &c in tier_cfg.consumers {
+                let messages = per_consumer.saturating_mul(c as u64);
                 scenarios.push(Scenario {
                     tier: tier_cfg.name,
                     messages,
@@ -1123,4 +1126,58 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     }
 
     finalize_report(results, failures, hcfg.backend_name, cli.output);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cli(tier: &str, handler: &str) -> Cli {
+        Cli::parse_from(["stress", "--tier", tier, "--handler", handler])
+    }
+
+    #[test]
+    fn high_fast_at_32c_yields_320_000_messages() {
+        let scenarios = build_scenarios(&cli("high", "fast"));
+        let s = scenarios
+            .iter()
+            .find(|s| s.tier == "high" && s.consumers == 32)
+            .expect("high/32c present");
+        assert_eq!(s.messages, 320_000);
+    }
+
+    #[test]
+    fn moderate_heavy_at_16c_yields_800_messages() {
+        let scenarios = build_scenarios(&cli("moderate", "heavy"));
+        let s = scenarios
+            .iter()
+            .find(|s| s.tier == "moderate" && s.consumers == 16)
+            .expect("moderate/16c present");
+        assert_eq!(s.messages, 800);
+    }
+
+    #[test]
+    fn extreme_fast_at_256c_yields_2_560_000_messages() {
+        let scenarios = build_scenarios(&cli("extreme", "fast"));
+        let s = scenarios
+            .iter()
+            .find(|s| s.tier == "extreme" && s.consumers == 256)
+            .expect("extreme/256c present");
+        assert_eq!(s.messages, 2_560_000);
+    }
+
+    #[test]
+    fn messages_scale_linearly_with_consumer_count() {
+        let scenarios = build_scenarios(&cli("high", "fast"));
+        let at_8 = scenarios
+            .iter()
+            .find(|s| s.tier == "high" && s.consumers == 8)
+            .expect("high/8c present");
+        let at_64 = scenarios
+            .iter()
+            .find(|s| s.tier == "high" && s.consumers == 64)
+            .expect("high/64c present");
+        assert_eq!(at_64.messages, at_8.messages * 8);
+    }
 }

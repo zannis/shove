@@ -172,6 +172,29 @@ impl RabbitMqClient {
         Err(last_err.expect("loop ran at least once"))
     }
 
+    /// Dial an independent sibling `RabbitMqClient` that reuses this client's
+    /// stored [`RabbitMqConfig`] but owns its own `Connection`, its own
+    /// `reconnect_lock`, and shares this client's `shutdown_token` so the
+    /// parent's shutdown propagates.
+    ///
+    /// Used by `RabbitMqConsumerGroup` to fan a single user-supplied client
+    /// out into a small pool when `max_consumers > 50` — lapin serialises
+    /// all channels of one connection through one reader task, so multiple
+    /// connections are needed to scale past ~50 high-throughput channels.
+    ///
+    /// Returns [`ShoveError::Connection`] if the new dial fails.
+    pub async fn dial_sibling(&self) -> Result<Self> {
+        let connection = Self::dial(&self.inner.config).await?;
+        Ok(Self {
+            inner: Arc::new(ClientInner {
+                connection: arc_swap::ArcSwap::from_pointee(connection),
+                config: self.inner.config.clone(),
+                reconnect_lock: tokio::sync::Mutex::new(()),
+                shutdown_token: self.inner.shutdown_token.clone(),
+            }),
+        })
+    }
+
     /// Dial a fresh `Connection` using the stored config. Used by `connect`
     /// and by `reconnect` after a broker disconnect.
     ///

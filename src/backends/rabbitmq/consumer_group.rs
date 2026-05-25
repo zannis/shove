@@ -15,6 +15,7 @@ use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::ShutdownTally;
+use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
@@ -144,6 +145,19 @@ impl Default for ConsumerGroupConfig {
     }
 }
 
+/// Number of AMQP connections to dial for a consumer group sized
+/// `max_consumers`.
+///
+/// One connection per 50 workers, rounded up, never less than 1.
+/// Lapin parses every inbound delivery on every channel through a single
+/// reader task; past ~50 channels per connection the socket becomes a
+/// serialisation point, so we fan out to multiple connections.
+fn pool_size_for(max_consumers: u16) -> usize {
+    const CHANNELS_PER_CONN: usize = 50;
+    let max = (max_consumers as usize).max(1);
+    max.div_ceil(CHANNELS_PER_CONN)
+}
+
 /// A named group of identical consumers all reading from the same queue.
 ///
 /// The group owns the concrete consumers and is responsible for scaling them
@@ -168,6 +182,9 @@ pub struct ConsumerGroup {
     /// exits with a `JoinError` that is not a cancellation. Drained by
     /// [`ConsumerGroup::shutdown_with_tally`].
     panic_count: Arc<AtomicUsize>,
+    /// AMQP connection pool shared across all consumers in this group.
+    /// Sized at construction time from `ceil(max_consumers / 50)`.
+    pool: Arc<Vec<RabbitMqClient>>,
 }
 
 impl ConsumerGroup {
@@ -181,7 +198,7 @@ impl ConsumerGroup {
     /// `queue` must match `T::topology().queue()` — it is stored separately
     /// so the autoscaler can look up queue statistics without the `T` type
     /// parameter.
-    pub fn new<T, H>(
+    pub async fn new<T, H>(
         name: impl Into<String>,
         queue: impl Into<String>,
         config: ConsumerGroupConfig,
@@ -189,7 +206,7 @@ impl ConsumerGroup {
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
-    ) -> Self
+    ) -> Result<Self>
     where
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
@@ -197,9 +214,31 @@ impl ConsumerGroup {
         let concurrent = config.concurrent_processing;
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
+
+        // Build the connection pool. Slot 0 is the caller-supplied client;
+        // slots 1..pool_size are freshly dialed siblings.
+        //
+        // Partial-failure semantics: if `dial_sibling()` errors on iteration K
+        // (1..pool_size), `pool_vec` (holding K successfully dialed clients)
+        // is dropped via `?` returning Err. Lapin's `Connection::Drop` closes
+        // the underlying TCP socket — that's a hard close (TCP RST), not a
+        // graceful AMQP `Connection.Close` handshake. Acceptable: this only
+        // happens on a fatal registration error where the broker is already
+        // misbehaving, and the broker recovers via TCP timeout on its side.
+        let pool_size = pool_size_for(config.max_consumers);
+        let mut pool_vec: Vec<RabbitMqClient> = Vec::with_capacity(pool_size);
+        pool_vec.push(client);
+        for _ in 1..pool_size {
+            pool_vec.push(pool_vec[0].dial_sibling().await?);
+        }
+        let pool: Arc<Vec<RabbitMqClient>> = Arc::new(pool_vec);
+        let next: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+        let pool_for_spawner = pool.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let idx = next.fetch_add(1, Ordering::Relaxed) % pool_for_spawner.len();
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(client.clone());
+            let consumer = RabbitMqConsumer::new(pool_for_spawner[idx].clone());
             let options = if concurrent {
                 options
             } else {
@@ -220,7 +259,7 @@ impl ConsumerGroup {
             })
         });
 
-        Self {
+        Ok(Self {
             name: name.into(),
             queue: queue.into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
@@ -229,21 +268,22 @@ impl ConsumerGroup {
             group_token,
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
-        }
+            pool,
+        })
     }
 
     /// Construct a FIFO consumer group for a [`SequencedTopic`].
     ///
     /// FIFO replica count is fixed at 1 — concurrency comes from shards,
     /// not from multiple replicas of the shard set.
-    pub fn new_fifo<T, H>(
+    pub async fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: RabbitMqClient,
         mut config: ConsumerGroupConfig,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
-    ) -> Self
+    ) -> Result<Self>
     where
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
@@ -253,13 +293,28 @@ impl ConsumerGroup {
         let ec_for_spawner = error_count.clone();
         let pc_for_spawner = panic_count.clone();
 
-        // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
+        // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard,
+        // not per-replica.
         config.min_consumers = 1;
         config.max_consumers = 1;
 
+        // FIFO groups always sit at max_consumers=1, so pool_size is 1 and no
+        // siblings are dialed. The pool plumbing is still applied uniformly
+        // so the spawner code path stays identical to the non-FIFO group.
+        let pool_size = pool_size_for(config.max_consumers);
+        let mut pool_vec: Vec<RabbitMqClient> = Vec::with_capacity(pool_size);
+        pool_vec.push(client);
+        for _ in 1..pool_size {
+            pool_vec.push(pool_vec[0].dial_sibling().await?);
+        }
+        let pool: Arc<Vec<RabbitMqClient>> = Arc::new(pool_vec);
+        let next: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+        let pool_for_spawner = pool.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let idx = next.fetch_add(1, Ordering::Relaxed) % pool_for_spawner.len();
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(client.clone());
+            let consumer = RabbitMqConsumer::new(pool_for_spawner[idx].clone());
             let ec = ec_for_spawner.clone();
             let pc = pc_for_spawner.clone();
             let ctx = ctx.clone();
@@ -290,7 +345,7 @@ impl ConsumerGroup {
         });
 
         let queue_str: String = queue.into();
-        Self {
+        Ok(Self {
             name: queue_str.clone(),
             queue: queue_str,
             consumers: Vec::with_capacity(1),
@@ -299,7 +354,8 @@ impl ConsumerGroup {
             group_token,
             error_count,
             panic_count,
-        }
+            pool,
+        })
     }
 
     /// Spawn `min_consumers` consumers to get the group to its minimum size.
@@ -380,6 +436,17 @@ impl ConsumerGroup {
         &self.config
     }
 
+    /// Number of AMQP connections backing this group's consumer pool.
+    ///
+    /// Sized at construction time from `ceil(max_consumers / 50)`. Exposed
+    /// publicly so integration tests can verify the pool spans multiple
+    /// connections at high consumer counts. Production code should not
+    /// depend on this value.
+    #[doc(hidden)]
+    pub fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
     /// Cancel every consumer in the group and wait for all tasks to finish.
     pub async fn shutdown(&mut self) {
         let _ = self.shutdown_with_tally().await;
@@ -453,6 +520,7 @@ mod tests {
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
+            pool: Arc::new(Vec::new()),
         }
     }
 
@@ -830,5 +898,33 @@ mod tests {
     #[should_panic(expected = "handler_timeout must be positive")]
     fn with_handler_timeout_zero_panics() {
         let _ = ConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::ZERO);
+    }
+
+    // -- pool_size_for --
+
+    #[test]
+    fn pool_size_for_clamps_below_to_one() {
+        assert_eq!(pool_size_for(0), 1);
+        assert_eq!(pool_size_for(1), 1);
+        assert_eq!(pool_size_for(50), 1);
+    }
+
+    #[test]
+    fn pool_size_for_rolls_to_two_at_fifty_one() {
+        assert_eq!(pool_size_for(51), 2);
+        assert_eq!(pool_size_for(100), 2);
+    }
+
+    #[test]
+    fn pool_size_for_scales_linearly() {
+        assert_eq!(pool_size_for(101), 3);
+        assert_eq!(pool_size_for(200), 4);
+        assert_eq!(pool_size_for(800), 16);
+    }
+
+    #[test]
+    fn pool_size_for_does_not_overflow_at_u16_max() {
+        // u16::MAX = 65_535; ceil(65535 / 50) = 1311
+        assert_eq!(pool_size_for(u16::MAX), 1311);
     }
 }

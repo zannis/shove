@@ -156,11 +156,7 @@ impl NatsConsumerGroup {
         H: MessageHandler<T> + 'static,
     {
         let concurrent = config.concurrent_processing;
-        let max_ack_pending = if concurrent {
-            config.prefetch_count as i64 * config.max_consumers as i64
-        } else {
-            config.max_consumers as i64
-        };
+        let max_ack_pending = aggregate_max_ack_pending(&config);
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
@@ -475,6 +471,16 @@ impl NatsConsumerGroupRegistry {
         let declarer = NatsTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
+        // Pre-establish the durable pull consumer with the aggregate
+        // ack budget — eliminates N-way `CONSUMER.CREATE` storms on
+        // reconnect (one per consumer task). Per-consumer code now
+        // uses `get_consumer` (read-only) to attach.
+        let max_ack_pending = aggregate_max_ack_pending(&config);
+        let consumer_name = super::constants::consumer_name(topology.queue());
+        declarer
+            .declare_pull_consumer(topology.queue(), &consumer_name, max_ack_pending)
+            .await?;
+
         info!(group = %name, "registering consumer group");
         let group_token = client.shutdown_token().child_token();
         let group = NatsConsumerGroup::new::<T, H>(
@@ -527,6 +533,15 @@ impl NatsConsumerGroupRegistry {
         let declarer = NatsTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
+        // Note: unlike `register` above, FIFO does **not** call
+        // `declare_pull_consumer` here. FIFO consumer groups create
+        // one shard task per routing shard via `spawn_fifo_shards`,
+        // and each shard uses a distinct, shard-specific consumer
+        // name (`<group>-shard-<n>`) via `get_or_create_consumer`.
+        // The fan-out is therefore bounded by `routing_shards()`
+        // (typically 8-32), not by an arbitrary consumer count, so
+        // there is no thundering herd to consolidate.
+
         info!(group = %name, "registering FIFO consumer group");
         let group_token = client.shutdown_token().child_token();
         let group = NatsConsumerGroup::new_fifo::<T, H>(
@@ -575,6 +590,23 @@ impl NatsConsumerGroupRegistry {
             "all consumer groups shut down"
         );
         tally
+    }
+}
+
+/// Aggregate `max_ack_pending` budget for a consumer-group config.
+///
+/// In concurrent mode every consumer holds up to `prefetch_count` messages
+/// in flight, so the group as a whole can have `prefetch_count × max_consumers`
+/// pending acks. In sequential mode each consumer holds at most 1, so the
+/// budget is `max_consumers`. Used both by the topology declarer (to size
+/// the durable JetStream consumer once) and by `NatsConsumerGroup::new` (to
+/// communicate the same value to spawned consumer tasks, even though they
+/// only `get_consumer` now and don't re-write the config).
+pub(crate) fn aggregate_max_ack_pending(config: &NatsConsumerGroupConfig) -> i64 {
+    if config.concurrent_processing {
+        config.prefetch_count as i64 * config.max_consumers as i64
+    } else {
+        config.max_consumers as i64
     }
 }
 

@@ -344,7 +344,8 @@ mod tests {
         use crate::autoscaler::{AutoscalerBackend, ScalingDecision};
         use crate::backend::ConsumerOptionsInner;
         use crate::backends::redis::consumer_group::{
-            RedisConsumerGroup, RedisConsumerGroupConfig, RedisConsumerGroupRegistry, Spawner,
+            ReaperFactory, RedisConsumerGroup, RedisConsumerGroupConfig,
+            RedisConsumerGroupRegistry, Spawner,
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -376,6 +377,7 @@ mod tests {
                     options.shutdown.cancelled().await;
                 })
             });
+            let reaper_factory: ReaperFactory = Arc::new(|| tokio::spawn(async {}));
             let mut g = RedisConsumerGroup {
                 queue: queue.into(),
                 consumers: Vec::with_capacity(config.max_consumers() as usize),
@@ -384,6 +386,8 @@ mod tests {
                 group_token,
                 error_count: Arc::new(AtomicUsize::new(0)),
                 panic_count: Arc::new(AtomicUsize::new(0)),
+                reaper_factory,
+                reaper_handle: None,
             };
             if started {
                 g.start();

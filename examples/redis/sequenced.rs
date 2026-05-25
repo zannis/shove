@@ -88,11 +88,7 @@ async fn main() -> Result<(), shove::ShoveError> {
 
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
 
-    let broker = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url },
-        group: None,
-    })
-    .await?;
+    let broker = Broker::<Redis>::new(RedisConfig::new(RedisMode::Standalone { url })).await?;
 
     broker.topology().declare::<Ledger>().await?;
 

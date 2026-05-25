@@ -5570,3 +5570,106 @@ async fn broker_queue_stats_provider_without_management_errors() {
 
     broker.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Connection pool verification
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PoolTestMessage {
+    id: u32,
+}
+
+define_topic!(
+    PoolTestTopic,
+    PoolTestMessage,
+    TopologyBuilder::new("shove-pool-test").build()
+);
+
+#[derive(Clone)]
+struct PoolTestHandler {
+    count: Arc<AtomicU32>,
+}
+
+impl MessageHandler<PoolTestTopic> for PoolTestHandler {
+    type Context = ();
+    async fn handle(&self, _: PoolTestMessage, _: MessageMetadata, _: &()) -> Outcome {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        Outcome::Ack
+    }
+}
+
+/// At `max_consumers = 120` the connection pool should hold
+/// `ceil(120 / 50) = 3` AMQP connections, and messages published to the
+/// topic must flow through consumers spread across that pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_spans_three_connections_and_routes_traffic() {
+    let broker = TestBroker::start().await;
+    let client = RabbitMqClient::connect(&broker.rmq_config())
+        .await
+        .expect("connect");
+
+    let b = broker.broker_from(client.clone());
+    b.topology()
+        .declare::<PoolTestTopic>()
+        .await
+        .expect("declare");
+    let publisher = b.publisher().await.expect("publisher");
+
+    let count = Arc::new(AtomicU32::new(0));
+    let count_for_factory = count.clone();
+    let mut registry = ConsumerGroupRegistry::new(client);
+    let config = ConsumerGroupConfig::new(120..=120).with_prefetch_count(10);
+    registry
+        .register::<PoolTestTopic, _>(
+            config,
+            move || PoolTestHandler {
+                count: count_for_factory.clone(),
+            },
+            (),
+        )
+        .await
+        .expect("register");
+
+    {
+        let group = registry
+            .groups()
+            .get(PoolTestTopic::topology().queue())
+            .expect("group present");
+        assert_eq!(
+            group.pool_len(),
+            3,
+            "max_consumers=120 should produce 3 AMQP connections"
+        );
+    }
+
+    // Publish 300 messages — small enough to keep the test fast, large enough
+    // that with 120 round-robined consumers we exercise every pool slot.
+    let messages: Vec<PoolTestMessage> = (0..300).map(|id| PoolTestMessage { id }).collect();
+    publisher
+        .publish_batch::<PoolTestTopic>(&messages)
+        .await
+        .expect("publish_batch");
+
+    registry.start_all();
+
+    // Wait up to 30 s for all 300 messages to be consumed. Polling rather
+    // than relying on a Notify avoids embedding consumer-internal state in
+    // the test.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut consumed = 0u32;
+    while Instant::now() < deadline {
+        consumed = count.load(Ordering::Relaxed);
+        if consumed >= 300 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        consumed, 300,
+        "expected 300 messages consumed across the 3-connection pool, got {consumed}"
+    );
+
+    registry.shutdown_all().await;
+    broker.stop().await;
+}
