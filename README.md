@@ -109,15 +109,19 @@ Handler timeouts convert to `Retry`. Full semantics: [Outcomes & Delivery](https
 
 ## Performance
 
-MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91. Reproducible via `cargo run -q --example rabbitmq_stress --features rabbitmq`.
+MacBook Pro M4 Max, Docker, Rust 1.91. Reproducible via `cargo run -q --release --example <backend>_stress --features <backend>`.
 
-| Handler          | 1 worker, prefetch=1 | 1 worker, prefetch=20 | 8 workers, prefetch=20 | 32 workers, prefetch=40 |
-|------------------|----------------------|-----------------------|------------------------|-------------------------|
-| Fast (1–5 ms)    | 179 msg/s            | 2,866 msg/s           | 19,669 msg/s           | 29,207 msg/s            |
-| Slow (50–300 ms) | 6 msg/s              | 75 msg/s              | 544 msg/s              | 4,076 msg/s             |
-| Heavy (1–5 s)    | 0.4 msg/s            | 5 msg/s               | 21 msg/s               | 199 msg/s               |
+Per-consumer scaling at the `high` tier with the `slow` handler (50–300 ms random sleep, ~175 ms avg), `--concurrent` enabled, `prefetch=32`. Each row is total throughput in msg/s across N parallel consumer tasks.
 
-`prefetch_count` is the primary throughput lever for I/O-bound handlers. Tuning notes: [Performance](https://shove.rs/ops/performance).
+| Backend  |    8c |   16c |   32c |   64c |
+|----------|------:|------:|------:|------:|
+| Redis    | 1,371 | 2,761 | 5,462 | 7,996 |
+| RabbitMQ |   946 | 1,903 | 3,799 | 7,585 |
+| Kafka    |   347 |   694 | 1,406 | 2,245 |
+
+RabbitMQ scales linearly past 50 channels via the per-`ConsumerGroup` AMQP connection pool (auto-sized `ceil(max_consumers / 50)`). Redis disables the redis-rs default 500 ms response and 1 s connection timeouts on multiplexed connections — both fire spuriously under heavy concurrent XREADGROUP load.
+
+`prefetch_count` is the primary throughput lever for I/O-bound handlers. Per-backend tuning notes, NATS/SQS comparisons, and `fast`/`heavy` profile breakdowns: [Performance](https://shove.rs/ops/performance).
 
 ## Learn more
 
