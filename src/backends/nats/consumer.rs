@@ -510,25 +510,37 @@ impl NatsConsumer {
                     .await
                     .map_err(|e| map_get_stream_error(queue, e))?;
 
-                // `create_consumer` upserts the durable consumer — unlike
-                // `get_or_create_consumer`, which returns the pre-existing
-                // config verbatim and silently ignores the caller's config
-                // (including `max_ack_pending`). That path caused N-way
-                // parallel pullers to inherit whatever ack-budget the first
-                // registrant set, bottlenecking the whole group.
-                let pull_consumer = stream
-                    .create_consumer(PullConsumerConfig {
-                        durable_name: Some(consumer_name.clone()),
-                        ack_policy: AckPolicy::Explicit,
-                        max_ack_pending,
-                        ..Default::default()
-                    })
+                // Fast path: attach to the pre-declared durable consumer.
+                // `NatsTopologyDeclarer::declare_pull_consumer` does the
+                // upsert once at consumer-group registration, so the hot
+                // path stays read-only and there is no `CONSUMER.CREATE`
+                // storm on reconnect — every consumer just reads.
+                //
+                // Fallback: callers that use `NatsConsumer::run` directly
+                // (e.g. tests via `ConsumerSupervisor`) bypass the registry
+                // and don't pre-declare. In that case `get_consumer`
+                // returns NotFound; we one-shot `create_consumer` to
+                // bootstrap, and subsequent reconnects re-attach via the
+                // fast path.
+                let pull_consumer = match stream
+                    .get_consumer::<PullConsumerConfig>(&consumer_name)
                     .await
-                    .map_err(|e| {
-                        ShoveError::Connection(format!(
-                            "failed to create consumer {consumer_name}: {e}"
-                        ))
-                    })?;
+                {
+                    Ok(c) => c,
+                    Err(_) => stream
+                        .create_consumer(PullConsumerConfig {
+                            durable_name: Some(consumer_name.clone()),
+                            ack_policy: AckPolicy::Explicit,
+                            max_ack_pending,
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|e| {
+                            ShoveError::Connection(format!(
+                                "create_consumer({consumer_name}) fallback failed: {e}"
+                            ))
+                        })?,
+                };
 
                 let mut messages = pull_consumer.messages().await.map_err(|e| {
                     ShoveError::Connection(format!("failed to get message stream: {e}"))

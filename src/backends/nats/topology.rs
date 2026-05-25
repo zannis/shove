@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use async_nats::jetstream::consumer::AckPolicy;
+use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
 use async_nats::jetstream::stream::{
     Config as StreamConfig, DiscardPolicy, RetentionPolicy, StorageType,
 };
@@ -75,5 +77,45 @@ impl NatsTopologyDeclarer {
         } else {
             self.declare_standard(topology).await
         }
+    }
+
+    /// Establish (or upsert) the durable pull consumer on `stream` with the
+    /// given `max_ack_pending` budget.
+    ///
+    /// This is the single point where `CONSUMER.CREATE` is issued for a
+    /// consumer group. Previously every consumer task in the group called
+    /// `create_consumer` on its own reconnect, producing N redundant
+    /// upserts of the same durable object on every reconnect storm. The
+    /// per-consumer path now uses `get_consumer` instead (read-only).
+    ///
+    /// `max_ack_pending` must reflect the **aggregate** in-flight budget
+    /// for the whole group (typically `prefetch_count × max_consumers`).
+    pub(crate) async fn declare_pull_consumer(
+        &self,
+        stream: &str,
+        consumer_name: &str,
+        max_ack_pending: i64,
+    ) -> Result<()> {
+        let stream = self
+            .client
+            .jetstream()
+            .get_stream(stream)
+            .await
+            .map_err(|e| ShoveError::Topology(format!("get_stream({stream}) failed: {e}")))?;
+        stream
+            .create_consumer(PullConsumerConfig {
+                durable_name: Some(consumer_name.to_string()),
+                ack_policy: AckPolicy::Explicit,
+                max_ack_pending,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| {
+                ShoveError::Topology(format!(
+                    "create_consumer({consumer_name}) on stream {} failed: {e}",
+                    stream.cached_info().config.name
+                ))
+            })?;
+        Ok(())
     }
 }
