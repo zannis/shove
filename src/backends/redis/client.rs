@@ -46,15 +46,19 @@ pub struct RedisConfig {
     /// each message is delivered to exactly one consumer. Defaults to `"shove"`.
     pub group: Option<String>,
     /// Per-command response timeout. Defaults to [`DEFAULT_RESPONSE_TIMEOUT`].
-    /// Must exceed [`BLOCK_MS`] (2 s) — enforced by
-    /// [`with_response_timeout`](Self::with_response_timeout). The redis-rs
-    /// default of 500 ms is too tight for both XREADGROUP BLOCK and batched
-    /// XADDs under heavy concurrent load.
-    pub response_timeout: Duration,
+    /// Must exceed [`BLOCK_MS`] (2 s).
+    ///
+    /// Crate-private to force callers through
+    /// [`with_response_timeout`](Self::with_response_timeout), which
+    /// enforces the BLOCK_MS lower bound. Setting it via a struct
+    /// literal would bypass the assertion silently.
+    pub(crate) response_timeout: Duration,
     /// Connection-establishment timeout. Defaults to
-    /// [`DEFAULT_CONNECTION_TIMEOUT`]. Tune via
+    /// [`DEFAULT_CONNECTION_TIMEOUT`].
+    ///
+    /// Crate-private to mirror `response_timeout` — set via
     /// [`with_connection_timeout`](Self::with_connection_timeout).
-    pub connection_timeout: Duration,
+    pub(crate) connection_timeout: Duration,
 }
 
 impl Default for RedisConfig {
@@ -537,6 +541,14 @@ mod tests {
     #[should_panic(expected = "must exceed BLOCK_MS")]
     fn with_response_timeout_below_block_ms_panics() {
         let _ = RedisConfig::default().with_response_timeout(Duration::from_millis(BLOCK_MS));
+    }
+
+    #[test]
+    fn with_response_timeout_at_block_ms_plus_one_accepted() {
+        // Boundary regression guard: the assertion is `>`, not `>=`, so
+        // BLOCK_MS + 1 ms must be the smallest accepted value.
+        let cfg = RedisConfig::default().with_response_timeout(Duration::from_millis(BLOCK_MS + 1));
+        assert_eq!(cfg.response_timeout, Duration::from_millis(BLOCK_MS + 1));
     }
 
     #[test]

@@ -533,6 +533,15 @@ impl NatsConsumerGroupRegistry {
         let declarer = NatsTopologyDeclarer::new(client.clone());
         declarer.declare(topology).await?;
 
+        // Note: unlike `register` above, FIFO does **not** call
+        // `declare_pull_consumer` here. FIFO consumer groups create
+        // one shard task per routing shard via `spawn_fifo_shards`,
+        // and each shard uses a distinct, shard-specific consumer
+        // name (`<group>-shard-<n>`) via `get_or_create_consumer`.
+        // The fan-out is therefore bounded by `routing_shards()`
+        // (typically 8-32), not by an arbitrary consumer count, so
+        // there is no thundering herd to consolidate.
+
         info!(group = %name, "registering FIFO consumer group");
         let group_token = client.shutdown_token().child_token();
         let group = NatsConsumerGroup::new_fifo::<T, H>(

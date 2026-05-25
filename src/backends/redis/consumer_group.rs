@@ -963,6 +963,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn reaper_is_spawned_exactly_once_per_group() {
+            // `start()` is idempotent re: the reaper — calling it multiple
+            // times (e.g. after a no-op scale event) must not double-spawn.
+            // Verified by counting factory invocations.
+            let spawn_count = Arc::new(AtomicUsize::new(0));
+            let counter = spawn_count.clone();
+            let reaper_factory: ReaperFactory = Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async {})
+            });
+            let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
+            group.reaper_factory = reaper_factory;
+            assert_eq!(spawn_count.load(Ordering::Relaxed), 0);
+            group.start();
+            assert_eq!(spawn_count.load(Ordering::Relaxed), 1);
+            group.start();
+            assert_eq!(
+                spawn_count.load(Ordering::Relaxed),
+                1,
+                "second start() must not respawn the reaper"
+            );
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn shutdown_joins_the_reaper_handle() {
+            // After `shutdown`, the group's reaper_handle should be cleared
+            // — `shutdown_with_tally` takes() it and awaits.
+            let reaper_factory: ReaperFactory = Arc::new(|| tokio::spawn(async {}));
+            let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
+            group.reaper_factory = reaper_factory;
+            group.start();
+            assert!(group.reaper_handle.is_some());
+            group.shutdown().await;
+            assert!(
+                group.reaper_handle.is_none(),
+                "shutdown_with_tally must take() the reaper handle"
+            );
+        }
+
+        #[tokio::test]
         async fn scale_down_skips_busy_consumers() {
             let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
             // Replace spawner with one whose `processing` flag we control.

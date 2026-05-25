@@ -85,7 +85,8 @@ pub(crate) fn spawn_reaper(
                 if shutdown.is_cancelled() {
                     return;
                 }
-                if let Err(e) = autoclaim_all(&mut conn, stream, &group, &reaper, min_idle_ms).await
+                if let Err(e) =
+                    autoclaim_all(&mut conn, stream, &group, &reaper, min_idle_ms, &shutdown).await
                 {
                     tracing::warn!(
                         stream,
@@ -117,12 +118,20 @@ async fn autoclaim_all(
     group: &str,
     consumer: &str,
     min_idle_ms: u64,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     use crate::error::ShoveError;
     use redis::streams::StreamAutoClaimReply;
 
     let mut cursor = "0-0".to_owned();
     loop {
+        // Bail out between pages so a shutdown signal doesn't have to
+        // wait for the entire PEL walk to finish. Worst-case shutdown
+        // delay is now one in-flight XAUTOCLAIM round-trip rather than
+        // `ceil(PEL_size / AUTOCLAIM_COUNT)` round-trips per shard.
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
         let reply: StreamAutoClaimReply = conn
             .query(
                 redis::cmd("XAUTOCLAIM")

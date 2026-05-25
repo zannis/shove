@@ -76,11 +76,9 @@ impl AuditHandler<Payments> for StdoutAuditHandler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".into());
 
-    let broker = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url },
-        group: Some("redis-audited-grp".into()),
-        ..Default::default()
-    })
+    let broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url }).with_group("redis-audited-grp"),
+    )
     .await?;
     broker.topology().declare::<Payments>().await?;
     println!("topology declared\n");

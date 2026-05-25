@@ -150,13 +150,12 @@ async fn make_broker(group: &str) -> Broker<Redis> {
     // is fully accepting connections, especially when multiple containers
     // start in parallel under nextest.
     for attempt in 0u32..5 {
-        match Broker::<Redis>::new(RedisConfig {
-            mode: RedisMode::Standalone {
+        match Broker::<Redis>::new(
+            RedisConfig::new(RedisMode::Standalone {
                 url: url.to_owned(),
-            },
-            group: Some(group.into()),
-            ..Default::default()
-        })
+            })
+            .with_group(group),
+        )
         .await
         {
             Ok(b) => return b,
@@ -950,11 +949,9 @@ async fn consumer_recovers_after_redis_restart() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("reconnect".into()),
-        ..Default::default()
-    })
+    let broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
+    )
     .await
     .expect("connect");
 
@@ -1037,11 +1034,9 @@ async fn consumer_recovers_after_redis_restart() {
 
     // Reconnect and redeclare topology (data was lost in the restart).
     // Redis is confirmed running at this point.
-    let broker2 = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("reconnect".into()),
-        ..Default::default()
-    })
+    let broker2 = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
+    )
     .await
     .expect("reconnect after restart");
 
@@ -1111,11 +1106,9 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("requeuer-recover".into()),
-        ..Default::default()
-    })
+    let broker = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
+    )
     .await
     .expect("connect");
 
@@ -1168,11 +1161,9 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Redeclare topology (data was wiped) and publish a message via a fresh broker.
-    let broker2 = Broker::<Redis>::new(RedisConfig {
-        mode: RedisMode::Standalone { url: url.clone() },
-        group: Some("requeuer-recover".into()),
-        ..Default::default()
-    })
+    let broker2 = Broker::<Redis>::new(
+        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
+    )
     .await
     .expect("reconnect after restart");
 
@@ -1724,13 +1715,10 @@ async fn autoscaler_scales_up_under_load() {
     }
 
     let url = redis_url().await;
-    let cfg = RedisConfig {
-        mode: RedisMode::Standalone {
-            url: url.to_owned(),
-        },
-        group: Some("redis-int-autoscaler-grp".into()),
-        ..Default::default()
-    };
+    let cfg = RedisConfig::new(RedisMode::Standalone {
+        url: url.to_owned(),
+    })
+    .with_group("redis-int-autoscaler-grp");
 
     // Use the public Backend::connect trait method to obtain a RedisClient
     // we can hand to both the registry and the autoscaler.
