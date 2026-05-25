@@ -1,6 +1,7 @@
 //! Redis client abstraction supporting standalone, TLS (`rediss://`), and cluster modes.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use redis::aio::MultiplexedConnection;
 use redis::cluster::{ClusterClient, ClusterConfig};
@@ -8,7 +9,7 @@ use redis::cluster_async::ClusterConnection;
 
 use crate::error::{Result, ShoveError};
 
-use super::constants::DEFAULT_GROUP;
+use super::constants::{BLOCK_MS, DEFAULT_GROUP};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -25,6 +26,18 @@ pub enum RedisMode {
     Cluster { urls: Vec<String> },
 }
 
+/// Default per-command response timeout. Must exceed [`BLOCK_MS`] (currently
+/// 2 s) so XREADGROUP doesn't trip on the timeout instead of returning the
+/// blocking reply. The redis-rs default of 500 ms is too tight for both
+/// blocking reads and batched XADDs under heavy concurrent load.
+pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default connection-establishment timeout. A healthy Redis accepts in
+/// <100 ms; the redis-rs default of 1 s misfires when fresh multiplexed
+/// conns are acquired during peak traffic with many consumers blocked on
+/// XREADGROUP. 10 s gives margin without hiding a truly unreachable broker.
+pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configuration for [`RedisClient`].
 pub struct RedisConfig {
     /// Connection mode: standalone or cluster.
@@ -32,26 +45,85 @@ pub struct RedisConfig {
     /// Consumer group name. All consumers of a topic share this group so that
     /// each message is delivered to exactly one consumer. Defaults to `"shove"`.
     pub group: Option<String>,
+    /// Per-command response timeout. Defaults to [`DEFAULT_RESPONSE_TIMEOUT`].
+    /// Must exceed [`BLOCK_MS`] (2 s) — enforced by
+    /// [`with_response_timeout`](Self::with_response_timeout). The redis-rs
+    /// default of 500 ms is too tight for both XREADGROUP BLOCK and batched
+    /// XADDs under heavy concurrent load.
+    pub response_timeout: Duration,
+    /// Connection-establishment timeout. Defaults to
+    /// [`DEFAULT_CONNECTION_TIMEOUT`]. Tune via
+    /// [`with_connection_timeout`](Self::with_connection_timeout).
+    pub connection_timeout: Duration,
+}
+
+impl Default for RedisConfig {
+    /// Defaults to `redis://127.0.0.1:6379/`, no explicit group, and the
+    /// shove-tuned timeouts above. Useful with struct-update syntax:
+    ///
+    /// ```ignore
+    /// RedisConfig {
+    ///     mode: RedisMode::Standalone { url: my_url },
+    ///     ..Default::default()
+    /// }
+    /// ```
+    fn default() -> Self {
+        Self {
+            mode: RedisMode::Standalone {
+                url: "redis://127.0.0.1:6379/".to_string(),
+            },
+            group: None,
+            response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+            connection_timeout: DEFAULT_CONNECTION_TIMEOUT,
+        }
+    }
 }
 
 impl RedisConfig {
+    /// Construct a `RedisConfig` with the given mode and shove-tuned default
+    /// timeouts. Chain `.with_*` builders to customise further.
+    pub fn new(mode: RedisMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    /// Set the consumer-group name.
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    /// Set the per-command response timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timeout <= BLOCK_MS` (2 s). Setting it any lower would
+    /// cause every XREADGROUP BLOCK 2000 in the consumer loop to trip the
+    /// timeout instead of returning the reply.
+    pub fn with_response_timeout(mut self, timeout: Duration) -> Self {
+        assert!(
+            timeout > Duration::from_millis(BLOCK_MS),
+            "response_timeout ({} ms) must exceed BLOCK_MS ({} ms)",
+            timeout.as_millis(),
+            BLOCK_MS,
+        );
+        self.response_timeout = timeout;
+        self
+    }
+
+    /// Set the connection-establishment timeout.
+    pub fn with_connection_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "connection_timeout must be positive");
+        self.connection_timeout = timeout;
+        self
+    }
+
     /// Return the resolved consumer group name, defaulting to `"shove"` if not set.
     pub fn resolved_group(&self) -> &str {
         self.group.as_deref().unwrap_or(DEFAULT_GROUP)
     }
-}
-
-/// Build an [`AsyncConnectionConfig`](redis::AsyncConnectionConfig) with both
-/// `response_timeout` and `connection_timeout` disabled.
-///
-/// shove relies on Redis BLOCK semantics (XREADGROUP BLOCK 2000) and pushes
-/// large batched publishes under heavy concurrent load; the redis-rs defaults
-/// (500 ms response, 1 s connect) misfire in both situations. Disabling both
-/// timeouts uniformly is correct for every shove code path.
-fn no_timeout_config() -> redis::AsyncConnectionConfig {
-    redis::AsyncConnectionConfig::new()
-        .set_response_timeout(None)
-        .set_connection_timeout(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +193,8 @@ enum ClientInner {
 pub struct RedisClient {
     inner: Arc<ClientInner>,
     pub(super) group: String,
+    response_timeout: Duration,
+    connection_timeout: Duration,
 }
 
 impl RedisClient {
@@ -128,13 +202,18 @@ impl RedisClient {
     /// test connection.
     pub(super) async fn connect(config: RedisConfig) -> Result<Self> {
         let group = config.resolved_group().to_owned();
+        let response_timeout = config.response_timeout;
+        let connection_timeout = config.connection_timeout;
 
         let inner = match config.mode {
             RedisMode::Standalone { url } => {
                 let client = redis::Client::open(url.as_str())
                     .map_err(|e| ShoveError::Connection(e.to_string()))?;
                 client
-                    .get_multiplexed_async_connection()
+                    .get_multiplexed_async_connection_with_config(&async_config(
+                        response_timeout,
+                        connection_timeout,
+                    ))
                     .await
                     .map_err(|e| ShoveError::Connection(format!("standalone ping failed: {e}")))?;
                 ClientInner::Standalone(client)
@@ -150,7 +229,10 @@ impl RedisClient {
                     ClusterClient::new(nodes).map_err(|e| ShoveError::Connection(e.to_string()))?;
                 // Eagerly verify connectivity.
                 client
-                    .get_async_connection()
+                    .get_async_connection_with_config(cluster_config(
+                        response_timeout,
+                        connection_timeout,
+                    ))
                     .await
                     .map_err(|e| ShoveError::Connection(format!("cluster ping failed: {e}")))?;
                 ClientInner::Cluster(client)
@@ -160,6 +242,8 @@ impl RedisClient {
         let client = Self {
             inner: Arc::new(inner),
             group,
+            response_timeout,
+            connection_timeout,
         };
 
         let mut conn = client.multiplexed_conn().await?;
@@ -171,31 +255,26 @@ impl RedisClient {
     /// Return a multiplexed (shared) connection suitable for non-blocking operations
     /// such as XADD, XACK, ZADD, and XLEN.
     ///
-    /// The redis-rs defaults are `response_timeout=500 ms` and
-    /// `connection_timeout=1 s`. Both are too aggressive for shove's high-fanout
-    /// workloads: under heavy concurrent XREADGROUP load the server can take
-    /// longer than 500 ms to respond to a batched publish, and acquiring a fresh
-    /// multiplexed connection during peak traffic can exceed 1 s. Both surface
-    /// as "connection error: timed out" mid-publish. We disable both timeouts
-    /// here; TCP keepalive still surfaces a truly dead broker.
-    ///
-    /// Cluster path note: `ClusterConfig::new()` clears the response timeout
-    /// (the `with_config` impl unconditionally writes `config.response_timeout`
-    /// into the connection), but cluster's public `set_connection_timeout`
-    /// takes a non-optional `Duration` so there is no way to disable
-    /// `connection_timeout` for cluster connections via the current redis-rs
-    /// public API; the 1 s default still applies. Cluster users on high-fanout
-    /// workloads should keep an eye on this until upstream exposes
-    /// `Option<Duration>` setters or shove takes a pinned redis-rs.
+    /// Applies the [`RedisConfig::response_timeout`] /
+    /// [`RedisConfig::connection_timeout`] this client was built with. The
+    /// shove defaults (30 s response, 10 s connect) override the much tighter
+    /// redis-rs defaults (500 ms / 1 s) which trip under heavy concurrent
+    /// XREADGROUP load.
     pub(super) async fn multiplexed_conn(&self) -> Result<RedisConnection> {
         match self.inner.as_ref() {
             ClientInner::Standalone(client) => client
-                .get_multiplexed_async_connection_with_config(&no_timeout_config())
+                .get_multiplexed_async_connection_with_config(&async_config(
+                    self.response_timeout,
+                    self.connection_timeout,
+                ))
                 .await
                 .map(RedisConnection::Standalone)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
             ClientInner::Cluster(client) => client
-                .get_async_connection_with_config(ClusterConfig::new())
+                .get_async_connection_with_config(cluster_config(
+                    self.response_timeout,
+                    self.connection_timeout,
+                ))
                 .await
                 .map(RedisConnection::Cluster)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
@@ -205,29 +284,38 @@ impl RedisClient {
     /// Return a dedicated connection suitable for consumer loops that use BLOCK commands
     /// (e.g. XREADGROUP with `BLOCK 2000`).
     ///
-    /// Uses the same no-timeout config as [`multiplexed_conn`](Self::multiplexed_conn)
-    /// so blocking reads, batched publishes, and outcome routing all behave
-    /// consistently under load. The cluster-path connection-timeout limitation
-    /// documented on `multiplexed_conn` applies here too.
+    /// Equivalent to [`multiplexed_conn`](Self::multiplexed_conn) — the
+    /// previous distinction (one disabled timeouts, the other didn't) went
+    /// away when timeouts became configurable: the
+    /// [`RedisConfig::with_response_timeout`] builder enforces
+    /// `response_timeout > BLOCK_MS`, so blocking reads, batched publishes,
+    /// and outcome routing now share a single timeout policy.
     pub(super) async fn dedicated_conn(&self) -> Result<RedisConnection> {
-        match self.inner.as_ref() {
-            ClientInner::Standalone(client) => client
-                .get_multiplexed_async_connection_with_config(&no_timeout_config())
-                .await
-                .map(RedisConnection::Standalone)
-                .map_err(|e| ShoveError::Connection(e.to_string())),
-            ClientInner::Cluster(client) => client
-                .get_async_connection_with_config(ClusterConfig::new())
-                .await
-                .map(RedisConnection::Cluster)
-                .map_err(|e| ShoveError::Connection(e.to_string())),
-        }
+        self.multiplexed_conn().await
     }
 
     /// The consumer group name shared by all consumers on this client.
     pub(super) fn group(&self) -> &str {
         &self.group
     }
+}
+
+/// Build an [`AsyncConnectionConfig`](redis::AsyncConnectionConfig) from the
+/// configured timeouts. Used by both `connect()` (the eager ping) and
+/// `multiplexed_conn()` so the verification matches runtime behaviour.
+fn async_config(response: Duration, connection: Duration) -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(response))
+        .set_connection_timeout(Some(connection))
+}
+
+/// Build a [`ClusterConfig`](redis::cluster::ClusterConfig) with the configured
+/// timeouts. Cluster's setters take non-optional `Duration`, so both timeouts
+/// are always applied.
+fn cluster_config(response: Duration, connection: Duration) -> ClusterConfig {
+    ClusterConfig::new()
+        .set_response_timeout(response)
+        .set_connection_timeout(connection)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +380,7 @@ mod tests {
                 url: "redis://127.0.0.1:6379/".to_string(),
             },
             group: None,
+            ..RedisConfig::default()
         };
         assert_eq!(cfg.resolved_group(), "shove");
     }
@@ -303,6 +392,7 @@ mod tests {
                 url: "redis://127.0.0.1:6379/".to_string(),
             },
             group: Some("myapp".to_string()),
+            ..RedisConfig::default()
         };
         assert_eq!(cfg.resolved_group(), "myapp");
     }
@@ -313,6 +403,7 @@ mod tests {
         let config = RedisConfig {
             mode: RedisMode::Standalone { url: url.clone() },
             group: None,
+            ..RedisConfig::default()
         };
         match config.mode {
             RedisMode::Standalone { url: stored } => assert_eq!(stored, url),
@@ -330,6 +421,7 @@ mod tests {
         let config = RedisConfig {
             mode: RedisMode::Cluster { urls: urls.clone() },
             group: None,
+            ..RedisConfig::default()
         };
         match config.mode {
             RedisMode::Cluster { urls: stored } => assert_eq!(stored, urls),
@@ -345,6 +437,7 @@ mod tests {
                 url: "redis://127.0.0.1:6379/".to_string(),
             },
             group: Some(String::new()),
+            ..RedisConfig::default()
         };
         assert_eq!(cfg.resolved_group(), "");
     }
@@ -356,6 +449,7 @@ mod tests {
                 url: "redis://localhost/".to_string(),
             },
             group: None,
+            ..RedisConfig::default()
         };
         assert!(matches!(cfg.mode, RedisMode::Standalone { .. }));
     }
@@ -367,8 +461,51 @@ mod tests {
                 urls: vec!["redis://node1/".to_string()],
             },
             group: None,
+            ..RedisConfig::default()
         };
         assert!(matches!(cfg.mode, RedisMode::Cluster { .. }));
+    }
+
+    #[test]
+    fn default_has_shove_tuned_timeouts() {
+        let cfg = RedisConfig::default();
+        assert_eq!(cfg.response_timeout, DEFAULT_RESPONSE_TIMEOUT);
+        assert_eq!(cfg.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
+        assert!(cfg.response_timeout > Duration::from_millis(BLOCK_MS));
+    }
+
+    #[test]
+    fn new_constructor_seeds_defaults() {
+        let cfg = RedisConfig::new(RedisMode::Standalone {
+            url: "redis://127.0.0.1:6379/".to_string(),
+        });
+        assert_eq!(cfg.response_timeout, DEFAULT_RESPONSE_TIMEOUT);
+        assert_eq!(cfg.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
+        assert!(cfg.group.is_none());
+    }
+
+    #[test]
+    fn with_response_timeout_round_trips() {
+        let cfg = RedisConfig::default().with_response_timeout(Duration::from_secs(60));
+        assert_eq!(cfg.response_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    #[should_panic(expected = "must exceed BLOCK_MS")]
+    fn with_response_timeout_below_block_ms_panics() {
+        let _ = RedisConfig::default().with_response_timeout(Duration::from_millis(BLOCK_MS));
+    }
+
+    #[test]
+    fn with_connection_timeout_round_trips() {
+        let cfg = RedisConfig::default().with_connection_timeout(Duration::from_secs(5));
+        assert_eq!(cfg.connection_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "connection_timeout must be positive")]
+    fn with_connection_timeout_zero_panics() {
+        let _ = RedisConfig::default().with_connection_timeout(Duration::ZERO);
     }
 
     // -----------------------------------------------------------------------

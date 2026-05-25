@@ -155,6 +155,7 @@ async fn make_broker(group: &str) -> Broker<Redis> {
                 url: url.to_owned(),
             },
             group: Some(group.into()),
+            ..Default::default()
         })
         .await
         {
@@ -952,6 +953,7 @@ async fn consumer_recovers_after_redis_restart() {
     let broker = Broker::<Redis>::new(RedisConfig {
         mode: RedisMode::Standalone { url: url.clone() },
         group: Some("reconnect".into()),
+        ..Default::default()
     })
     .await
     .expect("connect");
@@ -1038,6 +1040,7 @@ async fn consumer_recovers_after_redis_restart() {
     let broker2 = Broker::<Redis>::new(RedisConfig {
         mode: RedisMode::Standalone { url: url.clone() },
         group: Some("reconnect".into()),
+        ..Default::default()
     })
     .await
     .expect("reconnect after restart");
@@ -1111,6 +1114,7 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     let broker = Broker::<Redis>::new(RedisConfig {
         mode: RedisMode::Standalone { url: url.clone() },
         group: Some("requeuer-recover".into()),
+        ..Default::default()
     })
     .await
     .expect("connect");
@@ -1167,6 +1171,7 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     let broker2 = Broker::<Redis>::new(RedisConfig {
         mode: RedisMode::Standalone { url: url.clone() },
         group: Some("requeuer-recover".into()),
+        ..Default::default()
     })
     .await
     .expect("reconnect after restart");
@@ -1724,6 +1729,7 @@ async fn autoscaler_scales_up_under_load() {
             url: url.to_owned(),
         },
         group: Some("redis-int-autoscaler-grp".into()),
+        ..Default::default()
     };
 
     // Use the public Backend::connect trait method to obtain a RedisClient

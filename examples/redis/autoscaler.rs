@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = RedisConfig {
         mode: RedisMode::Standalone { url },
         group: Some("autoscaler-grp".into()),
+        ..Default::default()
     };
 
     // Build the underlying client + Broker wrapper. We need both: the

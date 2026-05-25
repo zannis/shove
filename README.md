@@ -119,7 +119,7 @@ Per-consumer scaling at the `high` tier with the `slow` handler (50–300 ms ran
 | RabbitMQ |   946 | 1,903 | 3,799 | 7,585 |
 | Kafka    |   347 |   694 | 1,406 | 2,245 |
 
-RabbitMQ scales linearly past 50 channels via the per-`ConsumerGroup` AMQP connection pool (auto-sized `ceil(max_consumers / 50)`). Redis disables the redis-rs default 500 ms response and 1 s connection timeouts on multiplexed connections — both fire spuriously under heavy concurrent XREADGROUP load.
+RabbitMQ scales linearly past 50 channels via the per-`ConsumerGroup` AMQP connection pool (auto-sized `ceil(max_consumers / 50)`). Redis ships shove-tuned defaults (30 s response, 10 s connect) that replace redis-rs's 500 ms / 1 s defaults — those misfire under heavy concurrent XREADGROUP load. Tune via `RedisConfig::with_response_timeout` / `with_connection_timeout` if needed.
 
 `prefetch_count` is the primary throughput lever for I/O-bound handlers. Per-backend tuning notes, NATS/SQS comparisons, and `fast`/`heavy` profile breakdowns: [Performance](https://shove.rs/ops/performance).
 

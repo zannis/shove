@@ -79,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broker = Broker::<Redis>::new(RedisConfig {
         mode: RedisMode::Standalone { url },
         group: Some("redis-audited-grp".into()),
+        ..Default::default()
     })
     .await?;
     broker.topology().declare::<Payments>().await?;

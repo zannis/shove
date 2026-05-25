@@ -61,6 +61,7 @@ async fn main() {
                 Broker::<Redis>::new(RedisConfig {
                     mode: RedisMode::Standalone { url },
                     group: None,
+                    ..Default::default()
                 })
                 .await
                 .expect("connect Redis")

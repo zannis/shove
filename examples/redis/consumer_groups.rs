@@ -75,6 +75,7 @@ async fn main() -> Result<(), shove::ShoveError> {
     let broker = Broker::<Redis>::new(RedisConfig {
         mode: RedisMode::Standalone { url },
         group: Some("worker-group".into()),
+        ..Default::default()
     })
     .await?;
 
