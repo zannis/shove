@@ -16,7 +16,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner;
-use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
+use crate::consumer::{
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
+    resolve_handler_timeout,
+};
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -57,6 +60,10 @@ pub struct RedisConsumerGroupConfig {
     pub(crate) max_consumers: u16,
     concurrent_processing: bool,
     pub(crate) handler_timeout: HandlerTimeoutConfig,
+    /// Maximum locally buffered messages per sequence key (sequenced consumers).
+    max_pending_per_key: Option<usize>,
+    /// Maximum allowed message payload size in bytes.
+    max_message_size: Option<usize>,
 }
 
 impl RedisConsumerGroupConfig {
@@ -82,6 +89,8 @@ impl RedisConsumerGroupConfig {
             max_consumers: max,
             concurrent_processing: false,
             handler_timeout: HandlerTimeoutConfig::Inherit,
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -124,6 +133,20 @@ impl RedisConsumerGroupConfig {
         self
     }
 
+    /// Set the maximum number of locally buffered messages per sequence key.
+    /// When exceeded, new deliveries for that key are rejected to the DLQ.
+    pub fn with_max_pending_per_key(mut self, limit: usize) -> Self {
+        self.max_pending_per_key = Some(limit);
+        self
+    }
+
+    /// Set the maximum allowed message payload size in bytes.
+    /// Messages exceeding this limit are rejected before deserialization.
+    pub fn with_max_message_size(mut self, max: usize) -> Self {
+        self.max_message_size = Some(max);
+        self
+    }
+
     /// Returns the configured prefetch count.
     pub fn prefetch_count(&self) -> u16 {
         self.prefetch_count
@@ -157,6 +180,16 @@ impl RedisConsumerGroupConfig {
     /// about its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
         Some(resolve_handler_timeout(self.handler_timeout, None))
+    }
+
+    /// Returns the configured per-key pending buffer limit.
+    pub fn max_pending_per_key(&self) -> Option<usize> {
+        self.max_pending_per_key
+    }
+
+    /// Returns the configured maximum message payload size in bytes.
+    pub fn max_message_size(&self) -> Option<usize> {
+        self.max_message_size
     }
 }
 
@@ -559,6 +592,8 @@ impl RedisConsumerGroup {
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.processing = processing.clone();
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
+        options.max_pending_per_key = self.config.max_pending_per_key();
+        options.max_message_size = self.config.max_message_size();
 
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
@@ -951,16 +986,50 @@ mod tests {
     }
 
     #[test]
+    fn config_default_max_pending_per_key_is_library_default() {
+        use crate::consumer::DEFAULT_MAX_PENDING_PER_KEY;
+        let cfg = RedisConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.max_pending_per_key(), Some(DEFAULT_MAX_PENDING_PER_KEY));
+    }
+
+    #[test]
+    fn config_default_max_message_size_is_library_default() {
+        use crate::consumer::DEFAULT_MAX_MESSAGE_SIZE;
+        let cfg = RedisConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.max_message_size(), Some(DEFAULT_MAX_MESSAGE_SIZE));
+    }
+
+    #[test]
+    fn with_max_pending_per_key_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_max_pending_per_key(500);
+        assert_eq!(cfg.max_pending_per_key(), Some(500));
+    }
+
+    #[test]
+    fn with_max_message_size_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_max_message_size(1024);
+        assert_eq!(cfg.max_message_size(), Some(1024));
+    }
+
+    #[test]
     fn builder_chain_preserves_all_fields() {
+        use crate::consumer::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
         let cfg = RedisConsumerGroupConfig::new(2..=8)
             .with_prefetch_count(32)
             .with_concurrent_processing(true)
-            .with_handler_timeout(Duration::from_secs(3));
+            .with_handler_timeout(Duration::from_secs(3))
+            .with_max_pending_per_key(200)
+            .with_max_message_size(4096);
         assert_eq!(cfg.min_consumers(), 2);
         assert_eq!(cfg.max_consumers(), 8);
         assert_eq!(cfg.prefetch_count(), 32);
         assert!(cfg.concurrent_processing());
         assert_eq!(cfg.handler_timeout(), Some(Duration::from_secs(3)));
+        assert_eq!(cfg.max_pending_per_key(), Some(200));
+        assert_eq!(cfg.max_message_size(), Some(4096));
+        // Verify defaults are distinct from the values set above.
+        assert_ne!(Some(200), Some(DEFAULT_MAX_PENDING_PER_KEY));
+        assert_ne!(Some(4096usize), Some(DEFAULT_MAX_MESSAGE_SIZE));
     }
 
     #[test]
@@ -998,6 +1067,38 @@ mod tests {
                 reaper_factory,
                 reaper_handle: None,
             }
+        }
+
+        #[tokio::test]
+        async fn spawn_one_threads_max_pending_per_key_to_options() {
+            use std::sync::Mutex;
+            let captured: Arc<Mutex<Option<Option<usize>>>> = Arc::new(Mutex::new(None));
+            let cap = captured.clone();
+            let config = RedisConsumerGroupConfig::new(1..=1).with_max_pending_per_key(777);
+            let mut group = test_group(config);
+            group.spawner = Arc::new(move |options: ConsumerOptionsInner| {
+                *cap.lock().unwrap() = Some(options.max_pending_per_key);
+                tokio::spawn(async move { options.shutdown.cancelled().await })
+            });
+            group.start();
+            assert_eq!(*captured.lock().unwrap(), Some(Some(777)));
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn spawn_one_threads_max_message_size_to_options() {
+            use std::sync::Mutex;
+            let captured: Arc<Mutex<Option<Option<usize>>>> = Arc::new(Mutex::new(None));
+            let cap = captured.clone();
+            let config = RedisConsumerGroupConfig::new(1..=1).with_max_message_size(2048);
+            let mut group = test_group(config);
+            group.spawner = Arc::new(move |options: ConsumerOptionsInner| {
+                *cap.lock().unwrap() = Some(options.max_message_size);
+                tokio::spawn(async move { options.shutdown.cancelled().await })
+            });
+            group.start();
+            assert_eq!(*captured.lock().unwrap(), Some(Some(2048)));
+            group.shutdown().await;
         }
 
         #[tokio::test]
