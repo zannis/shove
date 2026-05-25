@@ -15,6 +15,7 @@
 //!    ├─ .topology()             → TopologyDeclarer<B>
 //!    ├─ .publisher().await      → Publisher<B>
 //!    ├─ .consumer_supervisor()  → ConsumerSupervisor<B>   (all backends)
+//!    ├─ .autoscaler()           → B::AutoscalerImpl       (all backends)
 //!    └─ .consumer_group()       → ConsumerGroup<B>        (B: HasCoordinatedGroups)
 //! ```
 //!

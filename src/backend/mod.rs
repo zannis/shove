@@ -232,8 +232,11 @@ mod bounds_smoke {
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_autoscaler_impl(_a: &<InMemory as Backend>::AutoscalerImpl) {
-        // AutoscalerBackendImpl has no methods in Phase 4.
+    async fn _anchor_autoscaler_impl(a: &<InMemory as Backend>::AutoscalerImpl) {
+        use crate::autoscaler::AutoscalerBackend;
+        // Verify that `AutoscalerImpl` exposes the full `AutoscalerBackend`
+        // interface through the generic `Backend` bound.
+        let _ = a.list_groups().await;
     }
 
     #[cfg(feature = "inmemory")]

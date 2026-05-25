@@ -73,12 +73,11 @@ impl Backend for InMemory {
     }
 
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
-        // `InMemoryAutoscalerBackend::new` needs a shared registry handle too;
-        // the public `Broker::autoscaler()` path (Phase 5+) supplies one. For
-        // the trait-dispatch factory we build a fresh empty registry: callers
-        // that want to observe scaling decisions go through the typed
-        // `InMemoryAutoscalerBackend::autoscaler` constructor which is the
-        // real wiring point until Phase 8's `Autoscaler<B>` harness lands.
+        // Creates a fresh registry separate from the one used by
+        // `ConsumerGroup<InMemory>`. Consumer groups registered through
+        // `Broker::consumer_group()` are not visible to this autoscaler;
+        // wire them via `InMemoryAutoscalerBackend::new` with the shared
+        // registry if cross-visibility is required.
         use std::sync::Arc;
         use tokio::sync::Mutex;
         let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(

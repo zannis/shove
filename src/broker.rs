@@ -44,6 +44,17 @@ impl<B: Backend> Broker<B> {
     pub fn queue_stats_provider(&self) -> B::QueueStatsImpl {
         B::make_stats_provider(&self.client)
     }
+
+    /// Return a [`Backend::AutoscalerImpl`](crate::backend::Backend::AutoscalerImpl)
+    /// for driving generic autoscaling through the
+    /// [`AutoscalerBackend`](crate::autoscaler::AutoscalerBackend) interface.
+    ///
+    /// The returned value implements [`AutoscalerBackend`](crate::autoscaler::AutoscalerBackend)
+    /// and can be passed directly to
+    /// [`Autoscaler::new`](crate::autoscaler::Autoscaler::new).
+    pub fn autoscaler(&self) -> B::AutoscalerImpl {
+        B::make_autoscaler(&self.client)
+    }
 }
 
 impl<B: HasCoordinatedGroups> Broker<B> {
