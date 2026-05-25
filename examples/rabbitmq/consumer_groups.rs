@@ -1,6 +1,6 @@
 //! Consumer group and autoscaler example.
 //!
-//! Demonstrates: `ConsumerGroup`, `ConsumerGroupConfig`, `ConsumerGroupRegistry`,
+//! Demonstrates: `RabbitMqConsumerGroup`, `RabbitMqConsumerGroupConfig`, `ConsumerGroupRegistry`,
 //! `Autoscaler`, `AutoscalerConfig`, `ManagementClient`, and dynamic scaling
 //! based on queue depth.
 //!
@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::{
-    ConsumerGroupConfig, ConsumerGroupRegistry, ManagementConfig, RabbitMqAutoscalerBackend,
-    RabbitMqClient, RabbitMqConfig, RabbitMqPublisher,
+    ConsumerGroupRegistry, ManagementConfig, RabbitMqAutoscalerBackend, RabbitMqClient,
+    RabbitMqConfig, RabbitMqConsumerGroupConfig, RabbitMqPublisher,
 };
 use shove::{
     AutoscalerConfig, MessageHandler, MessageMetadata, Outcome, Topic, TopologyBuilder,
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     registry
         .register::<WorkQueue, TaskHandler>(
-            ConsumerGroupConfig::new(1..=5) // min..=max consumers
+            RabbitMqConsumerGroupConfig::new(1..=5) // min..=max consumers
                 .with_prefetch_count(10) // messages per consumer
                 .with_max_retries(3),
             || TaskHandler, // factory — called once per spawned consumer

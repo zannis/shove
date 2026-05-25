@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 // Explicit import to disambiguate from shove::consumer_group::ConsumerGroupConfig (the wrapper).
-use shove::rabbitmq::ConsumerGroupConfig;
+use shove::rabbitmq::RabbitMqConsumerGroupConfig;
 use shove::*;
 
 use testcontainers::core::ExecCommand;
@@ -1654,7 +1654,11 @@ async fn registry_register_declares_topology_and_starts() {
 
     // register auto-declares topology
     registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=3), move || h.clone(), ())
+        .register::<SimpleWork, _>(
+            RabbitMqConsumerGroupConfig::new(1..=3),
+            move || h.clone(),
+            (),
+        )
         .await
         .unwrap();
 
@@ -1894,7 +1898,7 @@ async fn autoscaler_scales_up_under_load() {
     let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
             (),
         )
@@ -1990,7 +1994,7 @@ async fn autoscaler_scales_down_when_idle() {
     let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
             move || h.clone(),
             (),
         )
@@ -2106,7 +2110,7 @@ async fn autoscaler_custom_strategy_pluggable() {
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
             || SlowScalableHandler,
             (),
         )
@@ -2197,7 +2201,7 @@ async fn autoscaler_without_stabilization_scales_immediately() {
     let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
             (),
         )
@@ -2298,7 +2302,7 @@ async fn autoscaler_scale_up_magnitude() {
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(1..=5).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(1..=5).with_prefetch_count(5),
             || SlowScalableHandler,
             (),
         )
@@ -2877,7 +2881,7 @@ async fn consumer_group_concurrent_processing() {
 
     registry
         .register::<ConcurrentWork, _>(
-            ConsumerGroupConfig::new(2..=2)
+            RabbitMqConsumerGroupConfig::new(2..=2)
                 .with_prefetch_count(10)
                 .with_concurrent_processing(true),
             move || h.clone(),
@@ -3043,7 +3047,7 @@ async fn registry_default_handler_timeout_triggers_retry() {
         .register::<TimeoutWork, _>(
             #[allow(clippy::absolute_paths)]
             shove::consumer_group::ConsumerGroupConfig::new(
-                ConsumerGroupConfig::new(1..=1)
+                RabbitMqConsumerGroupConfig::new(1..=1)
                     .with_prefetch_count(1)
                     .with_max_retries(3),
             ),
@@ -4307,7 +4311,7 @@ async fn registry_concurrent_processing_consumes_messages() {
 
     registry
         .register::<SimpleWork, _>(
-            ConsumerGroupConfig::new(1..=3)
+            RabbitMqConsumerGroupConfig::new(1..=3)
                 .with_concurrent_processing(true)
                 .with_prefetch_count(5),
             move || h.clone(),
@@ -4349,14 +4353,22 @@ async fn registry_duplicate_registration_fails() {
     let h = handler.clone();
 
     registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h.clone(), ())
+        .register::<SimpleWork, _>(
+            RabbitMqConsumerGroupConfig::new(1..=2),
+            move || h.clone(),
+            (),
+        )
         .await
         .unwrap();
 
     let handler2 = CountingHandler::new();
     let h2 = handler2.clone();
     let result = registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h2.clone(), ())
+        .register::<SimpleWork, _>(
+            RabbitMqConsumerGroupConfig::new(1..=2),
+            move || h2.clone(),
+            (),
+        )
         .await;
 
     assert!(result.is_err(), "duplicate registration should fail");
@@ -4381,7 +4393,7 @@ async fn registry_concurrent_with_timeout_processes_messages() {
 
     registry
         .register::<SimpleWork, _>(
-            ConsumerGroupConfig::new(1..=2)
+            RabbitMqConsumerGroupConfig::new(1..=2)
                 .with_concurrent_processing(true)
                 .with_prefetch_count(5)
                 .with_handler_timeout(Duration::from_secs(10)),
@@ -5335,7 +5347,7 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     group
         .register_fifo::<OrderTopic, _>(
             #[allow(clippy::absolute_paths)]
-            shove::consumer_group::ConsumerGroupConfig::new(ConsumerGroupConfig::default()),
+            shove::consumer_group::ConsumerGroupConfig::new(RabbitMqConsumerGroupConfig::default()),
             {
                 let h = handler.clone();
                 move || h.clone()
@@ -5626,7 +5638,7 @@ async fn pool_spans_three_connections_and_routes_traffic() {
     let count = Arc::new(AtomicU32::new(0));
     let count_for_factory = count.clone();
     let mut registry = ConsumerGroupRegistry::new(client);
-    let config = ConsumerGroupConfig::new(120..=120).with_prefetch_count(10);
+    let config = RabbitMqConsumerGroupConfig::new(120..=120).with_prefetch_count(10);
     registry
         .register::<PoolTestTopic, _>(
             config,

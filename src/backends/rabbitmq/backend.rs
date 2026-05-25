@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use super::autoscaler::RabbitMqAutoscalerBackend;
 use super::client::{RabbitMqClient, RabbitMqConfig};
 use super::consumer::RabbitMqConsumer;
-use super::consumer_group::ConsumerGroupConfig;
+use super::consumer_group::RabbitMqConsumerGroupConfig;
 use super::publisher::RabbitMqPublisher;
 use super::registry::ConsumerGroupRegistry;
 use super::topology::RabbitMqTopologyDeclarer;
@@ -151,7 +151,7 @@ impl Backend for RabbitMq {
 }
 
 impl HasCoordinatedGroups for RabbitMq {
-    type ConsumerGroupConfig = ConsumerGroupConfig;
+    type ConsumerGroupConfig = RabbitMqConsumerGroupConfig;
     type RegistryImpl = ConsumerGroupRegistry;
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl {
@@ -255,7 +255,7 @@ impl QueueStatsProviderImpl for RabbitMqStatsBridge {
 // ---------------------------------------------------------------------------
 
 impl RegistryImpl for ConsumerGroupRegistry {
-    type GroupConfig = ConsumerGroupConfig;
+    type GroupConfig = RabbitMqConsumerGroupConfig;
 
     async fn register<T, H>(
         &mut self,

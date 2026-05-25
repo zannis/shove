@@ -26,9 +26,9 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 /// options, returning the `JoinHandle` of the spawned task.
 type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
-/// Configuration that governs the behaviour of a [`ConsumerGroup`].
+/// Configuration that governs the behaviour of a [`RabbitMqConsumerGroup`].
 #[derive(Clone)]
-pub struct ConsumerGroupConfig {
+pub struct RabbitMqConsumerGroupConfig {
     pub(crate) prefetch_count: u16,
     pub(crate) min_consumers: u16,
     pub(crate) max_consumers: u16,
@@ -45,7 +45,7 @@ pub struct ConsumerGroupConfig {
     pub(crate) max_message_size: Option<usize>,
 }
 
-impl ConsumerGroupConfig {
+impl RabbitMqConsumerGroupConfig {
     /// Create a new config with the given consumer count range.
     ///
     /// `range` sets `min_consumers..=max_consumers`.
@@ -114,7 +114,7 @@ impl ConsumerGroupConfig {
 
     /// Returns the configured handler timeout. A freshly-constructed
     /// config reports `Some(DEFAULT_HANDLER_TIMEOUT)`; a registry-level
-    /// default set via `ConsumerGroup::with_default_handler_timeout`
+    /// default set via `RabbitMqConsumerGroup::with_default_handler_timeout`
     /// is not reflected here because the config does not know about
     /// its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
@@ -139,7 +139,7 @@ impl ConsumerGroupConfig {
     }
 }
 
-impl Default for ConsumerGroupConfig {
+impl Default for RabbitMqConsumerGroupConfig {
     fn default() -> Self {
         Self::new(1..=4)
     }
@@ -163,12 +163,12 @@ fn pool_size_for(max_consumers: u16) -> usize {
 /// The group owns the concrete consumers and is responsible for scaling them
 /// up and down.  It keeps a [`CancellationToken`] per consumer so that
 /// individual consumers can be stopped without affecting the rest of the group.
-pub struct ConsumerGroup {
+pub struct RabbitMqConsumerGroup {
     name: String,
     /// The queue that every consumer in this group reads from (derived from
     /// `T::topology()` at construction time and stored for stats lookups).
     queue: String,
-    config: ConsumerGroupConfig,
+    config: RabbitMqConsumerGroupConfig,
     spawner: Spawner,
     /// One entry per active consumer: (per-consumer token, processing flag, task handle).
     consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
@@ -176,18 +176,18 @@ pub struct ConsumerGroup {
     group_token: CancellationToken,
     /// Non-retryable error count incremented by each spawned task when its
     /// inner `run_with_inner` returns `Err`. Drained by
-    /// [`ConsumerGroup::shutdown_with_tally`].
+    /// [`RabbitMqConsumerGroup::shutdown_with_tally`].
     error_count: Arc<AtomicUsize>,
     /// Panic count incremented by the FIFO spawner wrapper when a shard task
     /// exits with a `JoinError` that is not a cancellation. Drained by
-    /// [`ConsumerGroup::shutdown_with_tally`].
+    /// [`RabbitMqConsumerGroup::shutdown_with_tally`].
     panic_count: Arc<AtomicUsize>,
     /// AMQP connection pool shared across all consumers in this group.
     /// Sized at construction time from `ceil(max_consumers / 50)`.
     pool: Arc<Vec<RabbitMqClient>>,
 }
 
-impl ConsumerGroup {
+impl RabbitMqConsumerGroup {
     /// Create a new consumer group.
     ///
     /// `handler_factory` is called once per consumer spawn to produce a fresh
@@ -201,7 +201,7 @@ impl ConsumerGroup {
     pub async fn new<T, H>(
         name: impl Into<String>,
         queue: impl Into<String>,
-        config: ConsumerGroupConfig,
+        config: RabbitMqConsumerGroupConfig,
         client: RabbitMqClient,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
@@ -279,7 +279,7 @@ impl ConsumerGroup {
     pub async fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: RabbitMqClient,
-        mut config: ConsumerGroupConfig,
+        mut config: RabbitMqConsumerGroupConfig,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
@@ -432,7 +432,7 @@ impl ConsumerGroup {
     }
 
     /// Access the group's configuration.
-    pub fn config(&self) -> &ConsumerGroupConfig {
+    pub fn config(&self) -> &RabbitMqConsumerGroupConfig {
         &self.config
     }
 
@@ -558,9 +558,9 @@ mod tests {
     use super::*;
     use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
-    /// Build a `ConsumerGroup` with a test spawner that simply waits on the
+    /// Build a `RabbitMqConsumerGroup` with a test spawner that simply waits on the
     /// cancellation token (no RabbitMQ connection needed).
-    fn test_group(config: ConsumerGroupConfig) -> ConsumerGroup {
+    fn test_group(config: RabbitMqConsumerGroupConfig) -> RabbitMqConsumerGroup {
         let group_token = CancellationToken::new();
         let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
             tokio::spawn(async move {
@@ -568,7 +568,7 @@ mod tests {
             })
         });
 
-        ConsumerGroup {
+        RabbitMqConsumerGroup {
             name: "test-group".into(),
             queue: "test-queue".into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
@@ -581,8 +581,8 @@ mod tests {
         }
     }
 
-    fn default_config() -> ConsumerGroupConfig {
-        ConsumerGroupConfig::new(1..=4)
+    fn default_config() -> RabbitMqConsumerGroupConfig {
+        RabbitMqConsumerGroupConfig::new(1..=4)
     }
 
     // -- start --
@@ -594,7 +594,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig::new(3..=5));
+            let mut group = test_group(RabbitMqConsumerGroupConfig::new(3..=5));
             group.start();
             assert_eq!(group.active_consumers(), 3);
             group.shutdown().await;
@@ -608,7 +608,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig::new(0..=4));
+            let mut group = test_group(RabbitMqConsumerGroupConfig::new(0..=4));
             group.start();
             assert_eq!(group.active_consumers(), 0);
             group.shutdown().await;
@@ -641,7 +641,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig::new(2..=2));
+            let mut group = test_group(RabbitMqConsumerGroupConfig::new(2..=2));
             group.start();
             assert_eq!(group.active_consumers(), 2);
 
@@ -695,7 +695,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig::new(0..=3));
+            let mut group = test_group(RabbitMqConsumerGroupConfig::new(0..=3));
             group.scale_up();
             group.scale_up();
             group.scale_up();
@@ -719,7 +719,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig::new(0..=3));
+            let mut group = test_group(RabbitMqConsumerGroupConfig::new(0..=3));
             group.scale_up();
             group.scale_up();
             group.scale_up();
@@ -750,7 +750,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut group = test_group(ConsumerGroupConfig::new(0..=2));
+            let mut group = test_group(RabbitMqConsumerGroupConfig::new(0..=2));
             group.scale_up();
             group.scale_up();
 
@@ -779,9 +779,9 @@ mod tests {
         assert_eq!(group.active_consumers(), 0);
     }
 
-    /// Build a `ConsumerGroup` whose spawned consumers ignore cancellation,
+    /// Build a `RabbitMqConsumerGroup` whose spawned consumers ignore cancellation,
     /// so `drain_into` can only progress via the abort escalation path.
-    fn hanging_test_group(config: ConsumerGroupConfig) -> ConsumerGroup {
+    fn hanging_test_group(config: RabbitMqConsumerGroupConfig) -> RabbitMqConsumerGroup {
         let mut group = test_group(config);
         group.spawner = Arc::new(|_options: ConsumerOptions| {
             tokio::spawn(async {
@@ -814,7 +814,7 @@ mod tests {
         // accumulated by `shutdown_all_with_tally` because the future was
         // simply dropped. The fix lifts the tally outside the timeout so
         // pre-cancel error / panic counts survive even when consumers hang.
-        let mut group = hanging_test_group(ConsumerGroupConfig::new(2..=2));
+        let mut group = hanging_test_group(RabbitMqConsumerGroupConfig::new(2..=2));
         group.start();
         assert_eq!(group.active_consumers(), 2);
 
@@ -838,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_remaining_into_kills_hanging_consumers_and_keeps_tally() {
-        let mut group = hanging_test_group(ConsumerGroupConfig::new(2..=2));
+        let mut group = hanging_test_group(RabbitMqConsumerGroupConfig::new(2..=2));
         group.start();
         assert_eq!(group.active_consumers(), 2);
 
@@ -868,7 +868,7 @@ mod tests {
     #[test]
     fn config_returns_reference() {
         let group = test_group(
-            ConsumerGroupConfig::new(2..=8)
+            RabbitMqConsumerGroupConfig::new(2..=8)
                 .with_prefetch_count(5)
                 .with_max_retries(3)
                 .with_handler_timeout(Duration::from_secs(30)),
@@ -881,18 +881,18 @@ mod tests {
         assert_eq!(config.handler_timeout(), Some(Duration::from_secs(30)));
     }
 
-    // -- ConsumerGroupConfig constructor validation --
+    // -- RabbitMqConsumerGroupConfig constructor validation --
 
     #[test]
     fn new_with_valid_range() {
-        let config = ConsumerGroupConfig::new(2..=8);
+        let config = RabbitMqConsumerGroupConfig::new(2..=8);
         assert_eq!(config.min_consumers(), 2);
         assert_eq!(config.max_consumers(), 8);
     }
 
     #[test]
     fn new_sets_defaults() {
-        let config = ConsumerGroupConfig::new(1..=4);
+        let config = RabbitMqConsumerGroupConfig::new(1..=4);
         assert_eq!(config.prefetch_count(), 10);
         assert_eq!(config.max_retries(), 10);
         assert_eq!(config.handler_timeout(), Some(DEFAULT_HANDLER_TIMEOUT));
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn new_with_equal_min_max() {
-        let config = ConsumerGroupConfig::new(3..=3);
+        let config = RabbitMqConsumerGroupConfig::new(3..=3);
         assert_eq!(config.min_consumers(), 3);
         assert_eq!(config.max_consumers(), 3);
     }
@@ -909,32 +909,33 @@ mod tests {
     #[should_panic]
     #[allow(clippy::reversed_empty_ranges)]
     fn new_panics_if_min_greater_than_max() {
-        let _ = ConsumerGroupConfig::new(5..=2);
+        let _ = RabbitMqConsumerGroupConfig::new(5..=2);
     }
 
-    // -- ConsumerGroupConfig builder methods --
+    // -- RabbitMqConsumerGroupConfig builder methods --
 
     #[test]
     fn with_prefetch_count_sets_value() {
-        let config = ConsumerGroupConfig::new(1..=4).with_prefetch_count(25);
+        let config = RabbitMqConsumerGroupConfig::new(1..=4).with_prefetch_count(25);
         assert_eq!(config.prefetch_count(), 25);
     }
 
     #[test]
     fn with_max_retries_sets_value() {
-        let config = ConsumerGroupConfig::new(1..=4).with_max_retries(5);
+        let config = RabbitMqConsumerGroupConfig::new(1..=4).with_max_retries(5);
         assert_eq!(config.max_retries(), 5);
     }
 
     #[test]
     fn with_handler_timeout_sets_value() {
-        let config = ConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(60));
+        let config =
+            RabbitMqConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(60));
         assert_eq!(config.handler_timeout(), Some(Duration::from_secs(60)));
     }
 
     #[test]
     fn builder_chaining_sets_all_values() {
-        let config = ConsumerGroupConfig::new(1..=5)
+        let config = RabbitMqConsumerGroupConfig::new(1..=5)
             .with_prefetch_count(20)
             .with_max_retries(3)
             .with_handler_timeout(Duration::from_secs(30));
@@ -949,19 +950,19 @@ mod tests {
 
     #[test]
     fn concurrent_processing_defaults_to_false() {
-        let config = ConsumerGroupConfig::new(1..=4);
+        let config = RabbitMqConsumerGroupConfig::new(1..=4);
         assert!(!config.concurrent_processing());
     }
 
     #[test]
     fn with_concurrent_processing_sets_value() {
-        let config = ConsumerGroupConfig::new(1..=4).with_concurrent_processing(true);
+        let config = RabbitMqConsumerGroupConfig::new(1..=4).with_concurrent_processing(true);
         assert!(config.concurrent_processing());
     }
 
     #[test]
     fn with_concurrent_processing_false_explicit() {
-        let config = ConsumerGroupConfig::new(1..=4)
+        let config = RabbitMqConsumerGroupConfig::new(1..=4)
             .with_concurrent_processing(true)
             .with_concurrent_processing(false);
         assert!(!config.concurrent_processing());
@@ -969,7 +970,7 @@ mod tests {
 
     #[test]
     fn builder_chaining_with_concurrent_processing() {
-        let config = ConsumerGroupConfig::new(1..=8)
+        let config = RabbitMqConsumerGroupConfig::new(1..=8)
             .with_prefetch_count(20)
             .with_max_retries(3)
             .with_handler_timeout(Duration::from_secs(30))
@@ -1004,7 +1005,7 @@ mod tests {
 
     #[test]
     fn inherit_config_uses_library_default_with_no_registry_default() {
-        let cfg = ConsumerGroupConfig::new(1..=4);
+        let cfg = RabbitMqConsumerGroupConfig::new(1..=4);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, None),
             DEFAULT_HANDLER_TIMEOUT,
@@ -1013,7 +1014,7 @@ mod tests {
 
     #[test]
     fn inherit_config_uses_registry_default_when_set() {
-        let cfg = ConsumerGroupConfig::new(1..=4);
+        let cfg = RabbitMqConsumerGroupConfig::new(1..=4);
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
             Duration::from_secs(45),
@@ -1022,7 +1023,8 @@ mod tests {
 
     #[test]
     fn with_handler_timeout_beats_registry_default() {
-        let cfg = ConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(5));
+        let cfg =
+            RabbitMqConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::from_secs(5));
         assert_eq!(
             resolve_handler_timeout(cfg.handler_timeout, Some(Duration::from_secs(45))),
             Duration::from_secs(5),
@@ -1032,7 +1034,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "handler_timeout must be positive")]
     fn with_handler_timeout_zero_panics() {
-        let _ = ConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::ZERO);
+        let _ = RabbitMqConsumerGroupConfig::new(1..=4).with_handler_timeout(Duration::ZERO);
     }
 
     // -- pool_size_for --

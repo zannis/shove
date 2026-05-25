@@ -5,7 +5,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::backends::rabbitmq::client::RabbitMqClient;
-use crate::backends::rabbitmq::consumer_group::{ConsumerGroup, ConsumerGroupConfig};
+use crate::backends::rabbitmq::consumer_group::{
+    RabbitMqConsumerGroup, RabbitMqConsumerGroupConfig,
+};
 use crate::backends::rabbitmq::topology::RabbitMqTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::ShutdownTally;
@@ -14,13 +16,13 @@ use crate::handler::MessageHandler;
 use crate::metrics;
 use crate::topic::{SequencedTopic, Topic};
 
-/// Registry of all [`ConsumerGroup`]s managed by the autoscaler.
+/// Registry of all [`RabbitMqConsumerGroup`]s managed by the autoscaler.
 ///
 /// Every group shares the same underlying [`RabbitMqClient`].  Each group gets
 /// its own child [`CancellationToken`] derived from the client so that the
 /// whole registry can be shut down with a single cancellation.
 pub struct ConsumerGroupRegistry {
-    groups: HashMap<String, ConsumerGroup>,
+    groups: HashMap<String, RabbitMqConsumerGroup>,
     client: RabbitMqClient,
     pub(super) default_handler_timeout: Option<Duration>,
 }
@@ -35,7 +37,7 @@ impl ConsumerGroupRegistry {
     }
 
     /// Set the registry-level default handler timeout. Applies to every
-    /// group whose `ConsumerGroupConfig` did not explicitly call
+    /// group whose `RabbitMqConsumerGroupConfig` did not explicitly call
     /// `with_handler_timeout`. Per-group explicit settings always win.
     pub fn with_default_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(
@@ -55,7 +57,7 @@ impl ConsumerGroupRegistry {
     /// [`start_all`]: Self::start_all
     pub async fn register<T, H>(
         &mut self,
-        config: ConsumerGroupConfig,
+        config: RabbitMqConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -88,7 +90,7 @@ impl ConsumerGroupRegistry {
 
         info!(group = %name, "registering consumer group");
         let group_token = self.client.shutdown_token().child_token();
-        let group = ConsumerGroup::new::<T, H>(
+        let group = RabbitMqConsumerGroup::new::<T, H>(
             name.clone(),
             name.clone(),
             config,
@@ -110,7 +112,7 @@ impl ConsumerGroupRegistry {
     /// [`start_all`]: Self::start_all
     pub async fn register_fifo<T, H>(
         &mut self,
-        config: ConsumerGroupConfig,
+        config: RabbitMqConsumerGroupConfig,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
     ) -> Result<()>
@@ -139,7 +141,7 @@ impl ConsumerGroupRegistry {
 
         info!(group = %name, "registering FIFO consumer group");
         let group_token = self.client.shutdown_token().child_token();
-        let group = ConsumerGroup::new_fifo::<T, H>(
+        let group = RabbitMqConsumerGroup::new_fifo::<T, H>(
             name.clone(),
             self.client.clone(),
             config,
@@ -152,7 +154,7 @@ impl ConsumerGroupRegistry {
         Ok(())
     }
 
-    /// Call [`ConsumerGroup::start`] on every registered group.
+    /// Call [`RabbitMqConsumerGroup::start`] on every registered group.
     pub fn start_all(&mut self) {
         info!(count = self.groups.len(), "starting all consumer groups");
         for group in self.groups.values_mut() {
@@ -161,12 +163,12 @@ impl ConsumerGroupRegistry {
     }
 
     /// Read-only access to the underlying group map.
-    pub fn groups(&self) -> &HashMap<String, ConsumerGroup> {
+    pub fn groups(&self) -> &HashMap<String, RabbitMqConsumerGroup> {
         &self.groups
     }
 
     /// Mutable access to the underlying group map.
-    pub fn groups_mut(&mut self) -> &mut HashMap<String, ConsumerGroup> {
+    pub fn groups_mut(&mut self) -> &mut HashMap<String, RabbitMqConsumerGroup> {
         &mut self.groups
     }
 

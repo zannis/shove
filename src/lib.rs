@@ -353,7 +353,7 @@ pub mod rabbitmq {
         autoscaler::RabbitMqAutoscalerBackend,
         client::RabbitMqClient,
         consumer::RabbitMqConsumer,
-        consumer_group::{ConsumerGroup, ConsumerGroupConfig},
+        consumer_group::{RabbitMqConsumerGroup, RabbitMqConsumerGroupConfig},
         headers::MESSAGE_ID_KEY,
         management::{QueueStats, QueueStatsProvider},
         publisher::RabbitMqPublisher,
