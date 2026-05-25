@@ -357,12 +357,55 @@ fn check_version_info(info: &str) -> Result<()> {
 }
 
 async fn check_min_version(conn: &mut RedisConnection) -> Result<()> {
-    let info: String = conn
+    let reply: redis::Value = conn
         .query(redis::cmd("INFO").arg("server"))
         .await
         .map_err(|e| ShoveError::Connection(format!("INFO server failed: {e}")))?;
 
-    check_version_info(&info)
+    for info in info_payloads(reply)? {
+        check_version_info(&info)?;
+    }
+    Ok(())
+}
+
+/// Extract one or more `INFO server` text payloads from a raw redis reply.
+///
+/// Standalone connections return a `BulkString` / `SimpleString` with the full
+/// INFO text. Cluster connections fan `INFO server` out to every master and
+/// return a `Map` keyed by `host:port` with each node's payload as the value,
+/// so we have to walk the map and validate every master.
+fn info_payloads(value: redis::Value) -> Result<Vec<String>> {
+    fn decode_string(v: redis::Value) -> Result<String> {
+        match v {
+            redis::Value::SimpleString(s) => Ok(s),
+            redis::Value::BulkString(b) => String::from_utf8(b)
+                .map_err(|e| ShoveError::Connection(format!("INFO server not UTF-8: {e}"))),
+            // VerbatimString carries a format prefix we don't care about — the
+            // INFO text we want lives in the `text` field.
+            redis::Value::VerbatimString { text, .. } => Ok(text),
+            other => Err(ShoveError::Connection(format!(
+                "unexpected INFO payload: {other:?}"
+            ))),
+        }
+    }
+
+    match value {
+        redis::Value::SimpleString(_)
+        | redis::Value::BulkString(_)
+        | redis::Value::VerbatimString { .. } => Ok(vec![decode_string(value)?]),
+        redis::Value::Map(entries) => {
+            if entries.is_empty() {
+                return Err(ShoveError::Connection("INFO server: empty map".into()));
+            }
+            entries
+                .into_iter()
+                .map(|(_node, payload)| decode_string(payload))
+                .collect()
+        }
+        other => Err(ShoveError::Connection(format!(
+            "unexpected INFO server reply: {other:?}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,5 +632,63 @@ mod tests {
         // Valkey sets redis_version to a 7.x compat value for backwards compatibility.
         let info = "# Server\r\nredis_version:7.2.4\r\nvalkey_version:8.0.0\r\n";
         assert!(check_version_info(info).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // info_payloads
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn info_payloads_handles_standalone_bulk_string() {
+        let value = redis::Value::BulkString(make_info("7.0.0").into_bytes());
+        let payloads = info_payloads(value).unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].contains("redis_version:7.0.0"));
+    }
+
+    #[test]
+    fn info_payloads_handles_standalone_simple_string() {
+        let value = redis::Value::SimpleString(make_info("7.0.0"));
+        let payloads = info_payloads(value).unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].contains("redis_version:7.0.0"));
+    }
+
+    #[test]
+    fn info_payloads_handles_cluster_map_with_one_entry_per_master() {
+        // Cluster INFO server fans out to every master and returns a map
+        // keyed by host:port; the values are each node's INFO payload.
+        let value = redis::Value::Map(vec![
+            (
+                redis::Value::BulkString(b"127.0.0.1:7001".to_vec()),
+                redis::Value::BulkString(make_info("7.0.10").into_bytes()),
+            ),
+            (
+                redis::Value::BulkString(b"127.0.0.1:7002".to_vec()),
+                redis::Value::BulkString(make_info("7.0.10").into_bytes()),
+            ),
+            (
+                redis::Value::BulkString(b"127.0.0.1:7000".to_vec()),
+                redis::Value::BulkString(make_info("7.0.10").into_bytes()),
+            ),
+        ]);
+        let payloads = info_payloads(value).unwrap();
+        assert_eq!(payloads.len(), 3);
+        for payload in &payloads {
+            assert!(payload.contains("redis_version:7.0.10"));
+        }
+    }
+
+    #[test]
+    fn info_payloads_empty_map_is_an_error() {
+        let err = info_payloads(redis::Value::Map(vec![])).unwrap_err();
+        assert!(err.to_string().contains("empty map"));
+    }
+
+    #[test]
+    fn info_payloads_unexpected_reply_is_an_error() {
+        // An integer reply makes no sense for INFO; we should refuse it.
+        let err = info_payloads(redis::Value::Int(42)).unwrap_err();
+        assert!(err.to_string().contains("unexpected INFO server reply"));
     }
 }
