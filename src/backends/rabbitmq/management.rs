@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing::debug;
+use url::Url;
 
 use crate::error::{Result, ShoveError};
 use crate::metrics;
@@ -12,7 +13,11 @@ pub struct ManagementConfig {
     pub base_url: String,
     pub username: String,
     pub password: String,
-    /// URL-encoded vhost, default `"%2F"` for `"/"`
+    /// Raw (unencoded) vhost name. Default: `"/"` (the default RabbitMQ virtual host).
+    ///
+    /// Pass the vhost exactly as it appears in RabbitMQ — e.g. `"my-vhost"` or
+    /// `"/"`. Percent-encoding is applied automatically when the management URL
+    /// is constructed.
     pub vhost: String,
     /// Skip TLS certificate verification (insecure; only for testing/dev environments).
     pub tls_skip_verify: bool,
@@ -41,7 +46,7 @@ impl ManagementConfig {
             base_url: base_url.into(),
             username: username.into(),
             password: password.into(),
-            vhost: "%2F".into(),
+            vhost: "/".into(),
             tls_skip_verify: false,
             tls_ca_cert: None,
         }
@@ -85,10 +90,32 @@ pub trait QueueStatsProvider: Send + Sync {
 pub struct ManagementClient {
     http: reqwest::Client,
     config: ManagementConfig,
+    /// Parsed and validated at construction. Stored to avoid re-parsing on
+    /// every request and to ensure the scheme / userinfo checks are done once.
+    base_url: Url,
 }
 
 impl ManagementClient {
     pub fn new(config: ManagementConfig) -> Self {
+        let base_url = Url::parse(&config.base_url).unwrap_or_else(|e| {
+            panic!(
+                "ManagementConfig::base_url is not a valid URL ({e}): {:?}",
+                config.base_url
+            )
+        });
+
+        let scheme = base_url.scheme();
+        assert!(
+            scheme == "http" || scheme == "https",
+            "ManagementConfig::base_url scheme must be \"http\" or \"https\", got {scheme:?}",
+        );
+
+        assert!(
+            base_url.username().is_empty() && base_url.password().is_none(),
+            "ManagementConfig::base_url must not embed credentials (found userinfo in {:?})",
+            config.base_url,
+        );
+
         let mut builder = reqwest::ClientBuilder::new()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
@@ -102,20 +129,54 @@ impl ManagementClient {
         }
 
         let http = builder.build().expect("failed to build HTTP client");
-        Self { http, config }
+        Self {
+            http,
+            config,
+            base_url,
+        }
     }
+}
+
+/// Build the management API URL for a specific vhost + queue.
+///
+/// Uses [`Url::path_segments_mut`] so each component is percent-encoded as an
+/// opaque path segment — `/` in a vhost or queue name becomes `%2F` and cannot
+/// be confused with a path separator.
+///
+/// Dot-segment names (`"."` and `".."`) are rejected before URL construction.
+/// `path_segments_mut` does not encode `.`/`..`, and the url crate silently
+/// normalises them away during serialisation, which would silently corrupt the
+/// path (RFC 3986 §5.2.4). Checking the raw inputs avoids that silent
+/// corruption.  A string like `"../nodes"` is safe — the interior `/` gets
+/// encoded to `%2F`, making it one opaque segment.
+fn build_queue_url(base: &Url, vhost: &str, queue: &str) -> Result<Url> {
+    for (label, value) in [("vhost", vhost), ("queue", queue)] {
+        if value == ".." || value == "." {
+            return Err(ShoveError::Topology(format!(
+                "management API {label} must not be a dot-segment; \
+                 got {value:?} — this would silently corrupt the request URL"
+            )));
+        }
+    }
+
+    let mut url = base.clone();
+
+    // `path_segments_mut` fails only for cannot-be-a-base URLs (e.g. `data:`).
+    // We validated http/https at construction, so this should never fail.
+    url.path_segments_mut()
+        .expect("base_url is a hierarchical URL (validated at ManagementClient::new)")
+        .extend(["api", "queues", vhost, queue]);
+
+    Ok(url)
 }
 
 impl QueueStatsProvider for ManagementClient {
     async fn get_queue_stats(&self, queue: &str) -> Result<QueueStats> {
-        let encoded_queue = queue.replace('/', "%2F");
-        let url = format!(
-            "{}/api/queues/{}/{}",
-            self.config.base_url, self.config.vhost, encoded_queue
-        );
+        let url = build_queue_url(&self.base_url, &self.config.vhost, queue)?;
+
         let request = self
             .http
-            .get(&url)
+            .get(url)
             .basic_auth(&self.config.username, Some(&self.config.password))
             .build()
             .map_err(|e| {
@@ -160,6 +221,10 @@ impl QueueStatsProvider for ManagementClient {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------------
+    // ManagementConfig
+    // ---------------------------------------------------------------------------
+
     #[test]
     fn management_config_debug_redacts_password() {
         let config = ManagementConfig::new("http://localhost:15672", "admin", "s3cret!");
@@ -176,7 +241,8 @@ mod tests {
         assert_eq!(config.base_url, "http://localhost:15672");
         assert_eq!(config.username, "guest");
         assert_eq!(config.password, "guest");
-        assert_eq!(config.vhost, "%2F");
+        // Default vhost is the raw "/" — encoding happens at URL construction time.
+        assert_eq!(config.vhost, "/");
     }
 
     #[test]
@@ -185,6 +251,10 @@ mod tests {
             .with_vhost("my-vhost");
         assert_eq!(config.vhost, "my-vhost");
     }
+
+    // ---------------------------------------------------------------------------
+    // QueueStats
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn queue_stats_defaults() {
@@ -226,5 +296,153 @@ mod tests {
         let json = r#"{"messages_ready": 5, "node": "rabbit@host", "state": "running"}"#;
         let stats: QueueStats = serde_json::from_str(json).unwrap();
         assert_eq!(stats.messages_ready, 5);
+    }
+
+    // ---------------------------------------------------------------------------
+    // URL construction — build_queue_url
+    // ---------------------------------------------------------------------------
+
+    fn base(url: &str) -> Url {
+        Url::parse(url).unwrap()
+    }
+
+    #[test]
+    fn url_default_vhost_encoded_as_slash() {
+        // Raw "/" vhost must be percent-encoded to "%2F" in the URL path.
+        let url = build_queue_url(&base("http://localhost:15672"), "/", "my-queue").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:15672/api/queues/%2F/my-queue"
+        );
+    }
+
+    #[test]
+    fn url_named_vhost_passes_through() {
+        let url = build_queue_url(&base("http://localhost:15672"), "staging", "orders").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:15672/api/queues/staging/orders"
+        );
+    }
+
+    #[test]
+    fn url_vhost_with_slash_encoded() {
+        // A vhost name that legitimately contains "/" must be encoded, not
+        // interpreted as a path separator.
+        let url = build_queue_url(&base("http://localhost:15672"), "ns/vhost", "q").unwrap();
+        assert!(
+            url.as_str().contains("ns%2Fvhost"),
+            "slash in vhost not encoded: {url}"
+        );
+    }
+
+    #[test]
+    fn url_queue_with_slash_encoded() {
+        // Queue names may legally contain "/" (e.g. namespaced queues); each
+        // slash must be encoded so it doesn't introduce an extra path segment.
+        let url = build_queue_url(&base("http://localhost:15672"), "/", "ns/queue").unwrap();
+        assert!(
+            url.as_str().contains("ns%2Fqueue"),
+            "slash in queue not encoded: {url}"
+        );
+    }
+
+    #[test]
+    fn url_queue_with_hash_encoded() {
+        let url = build_queue_url(&base("http://localhost:15672"), "/", "q#1").unwrap();
+        assert!(url.as_str().contains("q%231"), "# not encoded: {url}");
+    }
+
+    #[test]
+    fn url_queue_with_question_mark_encoded() {
+        let url = build_queue_url(&base("http://localhost:15672"), "/", "q?1").unwrap();
+        assert!(url.as_str().contains("q%3F1"), "? not encoded: {url}");
+    }
+
+    // --- dot-segment traversal rejection ---
+
+    #[test]
+    fn url_rejects_dotdot_vhost() {
+        // ".." as a path segment causes HTTP servers to navigate to the parent
+        // directory, reaching unrelated management endpoints.
+        let result = build_queue_url(&base("http://localhost:15672"), "..", "queue");
+        assert!(
+            result.is_err(),
+            "expected error for '..' vhost, got: {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("dot-segment"),
+            "error should mention dot-segment: {msg}"
+        );
+    }
+
+    #[test]
+    fn url_rejects_dot_vhost() {
+        let result = build_queue_url(&base("http://localhost:15672"), ".", "queue");
+        assert!(result.is_err(), "expected error for '.' vhost");
+    }
+
+    #[test]
+    fn url_rejects_dotdot_queue() {
+        let result = build_queue_url(&base("http://localhost:15672"), "/", "..");
+        assert!(result.is_err(), "expected error for '..' queue");
+    }
+
+    #[test]
+    fn url_slash_in_vhost_does_not_traverse() {
+        // "../nodes" contains a slash which path_segments_mut encodes as %2F,
+        // so the full string becomes "..%2Fnodes" — one opaque segment, not a
+        // traversal. This must succeed (the vhost is odd but not dangerous).
+        let result = build_queue_url(&base("http://localhost:15672"), "../nodes", "q");
+        assert!(
+            result.is_ok(),
+            "unexpected error for '../nodes' vhost: {result:?}"
+        );
+        let url = result.unwrap();
+        assert!(
+            url.as_str().contains("..%2Fnodes"),
+            "slash not encoded within segment: {url}"
+        );
+    }
+
+    // --- base_url validation (panics) ---
+
+    #[test]
+    #[should_panic(expected = "scheme must be")]
+    fn management_client_rejects_file_scheme() {
+        ManagementClient::new(ManagementConfig::new("file:///etc/passwd", "u", "p"));
+    }
+
+    #[test]
+    #[should_panic(expected = "scheme must be")]
+    fn management_client_rejects_ftp_scheme() {
+        ManagementClient::new(ManagementConfig::new("ftp://host/path", "u", "p"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed credentials")]
+    fn management_client_rejects_embedded_userinfo() {
+        ManagementClient::new(ManagementConfig::new(
+            "http://admin:secret@localhost:15672",
+            "u",
+            "p",
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "must not embed credentials")]
+    fn management_client_rejects_embedded_username_only() {
+        ManagementClient::new(ManagementConfig::new(
+            "http://admin@localhost:15672",
+            "u",
+            "p",
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a valid URL")]
+    fn management_client_rejects_invalid_url() {
+        ManagementClient::new(ManagementConfig::new("not a url", "u", "p"));
     }
 }
