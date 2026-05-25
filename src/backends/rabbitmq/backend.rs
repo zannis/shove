@@ -15,7 +15,7 @@ use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
     RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
 };
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::markers::RabbitMq;
@@ -307,18 +307,29 @@ impl RegistryImpl for ConsumerGroupRegistry {
             }
         }
 
-        let drain = self.shutdown_all_with_tally();
-        match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(tally) => SupervisorOutcome {
+        // Mirror the supervisor pattern in `ConsumerSupervisor::run_until_timeout`:
+        // accumulate the tally outside the timeout so a drain-timeout
+        // escalation can abort survivors and finish tallying instead of
+        // discarding what was already counted.
+        let mut tally = ShutdownTally::default();
+        match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
+            Ok(()) => SupervisorOutcome {
                 errors: tally.errors,
                 panics: tally.panics,
                 timed_out: false,
             },
-            Err(_) => SupervisorOutcome {
-                errors: 0,
-                panics: 0,
-                timed_out: true,
-            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving consumer tasks"
+                );
+                self.abort_all_remaining_into(&mut tally).await;
+                SupervisorOutcome {
+                    errors: tally.errors,
+                    panics: tally.panics,
+                    timed_out: true,
+                }
+            }
         }
     }
 }

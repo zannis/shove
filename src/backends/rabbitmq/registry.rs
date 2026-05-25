@@ -184,19 +184,35 @@ impl ConsumerGroupRegistry {
     }
 
     pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
+        let mut tally = ShutdownTally::default();
+        self.drain_all_into(&mut tally).await;
+        tally
+    }
+
+    /// Drain every consumer group, accumulating errors/panics into `tally`.
+    ///
+    /// Caller may race this against a timeout: each per-group `drain_into`
+    /// captures atomic counts before awaiting handles, so the tally retains
+    /// pre-cancel state even if the outer future is dropped mid-iteration.
+    pub(crate) async fn drain_all_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
-        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            tally.add(group.shutdown_with_tally().await);
+            group.drain_into(tally).await;
         }
         debug!(
             errors = tally.errors,
             panics = tally.panics,
             "all consumer groups shut down"
         );
-        tally
+    }
+
+    /// Abort surviving consumers across every group after a drain timeout.
+    pub(crate) async fn abort_all_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        for group in self.groups.values_mut() {
+            group.abort_remaining_into(tally).await;
+        }
     }
 }

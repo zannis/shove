@@ -339,28 +339,75 @@ impl KafkaConsumerGroup {
     }
 
     pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
-        info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
+        let mut tally = ShutdownTally::default();
+        self.drain_into(&mut tally).await;
+        debug!(
+            group = %self.queue,
+            errors = tally.errors,
+            panics = tally.panics,
+            "consumer group shutdown complete"
+        );
+        tally
+    }
+
+    /// Cancel the group token and await every consumer handle, accumulating
+    /// errors and panics into the caller-owned `tally`.
+    ///
+    /// Atomic counts are swapped into `tally` **before** any handle is
+    /// awaited, so a caller that races this against a timeout (see
+    /// `RegistryImpl::run_until_timeout`) preserves pre-cancel state even if
+    /// the future is dropped mid-await. The consumer list is drained via
+    /// `pop()` so dropped futures leave unawaited handles in place for a
+    /// subsequent escalation via [`Self::abort_remaining_into`].
+    pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
+        info!(
+            group = %self.queue,
+            consumers = self.consumers.len(),
+            "shutting down consumer group"
+        );
         self.group_token.cancel();
-        let mut panics = 0usize;
-        for (_token, _processing, handle) in self.consumers.drain(..) {
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
                 Ok(()) => {}
-                // Defensive: shutdown is cooperative via `group_token`; no
-                // code path currently calls `JoinHandle::abort()` on these
-                // handles, so this arm is unreachable today. Mirrors the
-                // `ConsumerSupervisor` drain and keeps parity if a future
-                // timeout escalation adds `abort_all`.
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    panics += 1;
+                    tally.panics += 1;
                 }
             }
         }
-        let errors = self.error_count.swap(0, Ordering::Relaxed);
-        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
-        debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
-        ShutdownTally { errors, panics }
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+    }
+
+    /// Abort surviving consumer handles after a drain timeout, accumulating
+    /// any results into `tally`.
+    pub(crate) async fn abort_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        self.group_token.cancel();
+        for (_token, _processing, handle) in &self.consumers {
+            handle.abort();
+        }
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        group = %self.queue,
+                        "consumer task panicked during abort escalation"
+                    );
+                    tally.panics += 1;
+                }
+            }
+        }
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
 
     fn spawn_one(&mut self) {
@@ -557,20 +604,32 @@ impl KafkaConsumerGroupRegistry {
     }
 
     pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
+        let mut tally = ShutdownTally::default();
+        self.drain_all_into(&mut tally).await;
+        tally
+    }
+
+    /// Drain every consumer group, accumulating errors/panics into `tally`.
+    pub(crate) async fn drain_all_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
-        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            tally.add(group.shutdown_with_tally().await);
+            group.drain_into(tally).await;
         }
         debug!(
             errors = tally.errors,
             panics = tally.panics,
             "all consumer groups shut down"
         );
-        tally
+    }
+
+    /// Abort surviving consumers across every group after a drain timeout.
+    pub(crate) async fn abort_all_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        for group in self.groups.values_mut() {
+            group.abort_remaining_into(tally).await;
+        }
     }
 }
 
@@ -758,6 +817,51 @@ mod tests {
         group.shutdown().await;
         assert!(group_token.is_cancelled());
         assert_eq!(group.active_consumers(), 0);
+    }
+
+    fn hanging_test_group(config: KafkaConsumerGroupConfig) -> KafkaConsumerGroup {
+        let mut group = test_group(config);
+        group.spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })
+        });
+        group
+    }
+
+    #[tokio::test]
+    async fn drain_into_timeout_preserves_atomics_in_tally() {
+        let mut group = hanging_test_group(KafkaConsumerGroupConfig::new(2..=2));
+        group.start();
+        assert_eq!(group.active_consumers(), 2);
+
+        group.error_count.store(7, Ordering::Relaxed);
+        group.panic_count.store(2, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally::default();
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+        assert!(result.is_err(), "drain must time out on hanging consumers");
+
+        assert_eq!(tally.errors, 7);
+        assert_eq!(tally.panics, 2);
+    }
+
+    #[tokio::test]
+    async fn abort_remaining_into_kills_hanging_consumers_and_keeps_tally() {
+        let mut group = hanging_test_group(KafkaConsumerGroupConfig::new(2..=2));
+        group.start();
+
+        group.error_count.store(5, Ordering::Relaxed);
+        group.panic_count.store(1, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally::default();
+        let _ = tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+        group.abort_remaining_into(&mut tally).await;
+
+        assert_eq!(group.active_consumers(), 0);
+        assert_eq!(tally.errors, 5);
+        assert_eq!(tally.panics, 1);
     }
 
     // -- accessors --

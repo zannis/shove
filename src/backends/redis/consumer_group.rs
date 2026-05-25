@@ -467,16 +467,44 @@ impl RedisConsumerGroup {
     }
 
     pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
-        info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
+        let mut tally = ShutdownTally::default();
+        self.drain_into(&mut tally).await;
+        debug!(
+            group = %self.queue,
+            errors = tally.errors,
+            panics = tally.panics,
+            "consumer group shutdown complete"
+        );
+        tally
+    }
+
+    /// Cancel the group token and await every consumer handle, accumulating
+    /// errors and panics into the caller-owned `tally`.
+    ///
+    /// Atomic counts are swapped into `tally` **before** any handle is
+    /// awaited, so a caller that races this against a timeout (see
+    /// `RegistryImpl::run_until_timeout`) preserves pre-cancel state even if
+    /// the future is dropped mid-await. The consumer list is drained via
+    /// `pop()` so dropped futures leave unawaited handles in place for a
+    /// subsequent escalation via [`Self::abort_remaining_into`].
+    pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
+        info!(
+            group = %self.queue,
+            consumers = self.consumers.len(),
+            "shutting down consumer group"
+        );
         self.group_token.cancel();
-        let mut panics = 0usize;
-        for (_token, _processing, handle) in self.consumers.drain(..) {
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    panics += 1;
+                    tally.panics += 1;
                 }
             }
         }
@@ -486,10 +514,40 @@ impl RedisConsumerGroup {
         if let Some(h) = self.reaper_handle.take() {
             let _ = h.await;
         }
-        let errors = self.error_count.swap(0, Ordering::Relaxed);
-        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
-        debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
-        ShutdownTally { errors, panics }
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+    }
+
+    /// Abort surviving consumer handles (and the reaper) after a drain
+    /// timeout, accumulating any results into `tally`.
+    pub(crate) async fn abort_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        self.group_token.cancel();
+        for (_token, _processing, handle) in &self.consumers {
+            handle.abort();
+        }
+        if let Some(h) = &self.reaper_handle {
+            h.abort();
+        }
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        group = %self.queue,
+                        "consumer task panicked during abort escalation"
+                    );
+                    tally.panics += 1;
+                }
+            }
+        }
+        if let Some(h) = self.reaper_handle.take() {
+            let _ = h.await;
+        }
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
 
     fn spawn_one(&mut self) {
@@ -704,15 +762,32 @@ impl RedisConsumerGroupRegistry {
     }
 
     pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
+        let mut tally = ShutdownTally::default();
+        self.drain_all_into(&mut tally).await;
+        tally
+    }
+
+    /// Drain every consumer group, accumulating errors/panics into `tally`.
+    pub(crate) async fn drain_all_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
-        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            tally.add(group.shutdown_with_tally().await);
+            group.drain_into(tally).await;
         }
-        tally
+        debug!(
+            errors = tally.errors,
+            panics = tally.panics,
+            "all consumer groups shut down"
+        );
+    }
+
+    /// Abort surviving consumers across every group after a drain timeout.
+    pub(crate) async fn abort_all_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        for group in self.groups.values_mut() {
+            group.abort_remaining_into(tally).await;
+        }
     }
 
     /// Start every registered group, wait for `signal` or the internal
@@ -740,18 +815,29 @@ impl RedisConsumerGroupRegistry {
             }
         }
 
-        let drain = self.shutdown_all_with_tally();
-        match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(tally) => SupervisorOutcome {
+        // Mirror the supervisor pattern in `ConsumerSupervisor::run_until_timeout`:
+        // accumulate the tally outside the timeout so a drain-timeout
+        // escalation can abort survivors and finish tallying instead of
+        // discarding what was already counted.
+        let mut tally = ShutdownTally::default();
+        match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
+            Ok(()) => SupervisorOutcome {
                 errors: tally.errors,
                 panics: tally.panics,
                 timed_out: false,
             },
-            Err(_) => SupervisorOutcome {
-                errors: 0,
-                panics: 0,
-                timed_out: true,
-            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving consumer tasks"
+                );
+                self.abort_all_remaining_into(&mut tally).await;
+                SupervisorOutcome {
+                    errors: tally.errors,
+                    panics: tally.panics,
+                    timed_out: true,
+                }
+            }
         }
     }
 }
@@ -1001,6 +1087,63 @@ mod tests {
                 group.reaper_handle.is_none(),
                 "shutdown_with_tally must take() the reaper handle"
             );
+        }
+
+        fn hanging_test_group(config: RedisConsumerGroupConfig) -> RedisConsumerGroup {
+            let mut group = test_group(config);
+            group.spawner = Arc::new(|_options: ConsumerOptionsInner| {
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                })
+            });
+            // Reaper that also never exits, exercising the abort-on-escalation path.
+            group.reaper_factory = Arc::new(|| {
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                })
+            });
+            group
+        }
+
+        #[tokio::test]
+        async fn drain_into_timeout_preserves_atomics_in_tally() {
+            let mut group = hanging_test_group(RedisConsumerGroupConfig::new(2..=2));
+            group.start();
+            assert_eq!(group.active_consumers(), 2);
+
+            group.error_count.store(7, Ordering::Relaxed);
+            group.panic_count.store(2, Ordering::Relaxed);
+
+            let mut tally = ShutdownTally::default();
+            let result =
+                tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+            assert!(result.is_err(), "drain must time out on hanging consumers");
+
+            assert_eq!(tally.errors, 7);
+            assert_eq!(tally.panics, 2);
+        }
+
+        #[tokio::test]
+        async fn abort_remaining_into_kills_hanging_consumers_and_reaper() {
+            let mut group = hanging_test_group(RedisConsumerGroupConfig::new(2..=2));
+            group.start();
+            assert!(group.reaper_handle.is_some());
+
+            group.error_count.store(5, Ordering::Relaxed);
+            group.panic_count.store(1, Ordering::Relaxed);
+
+            let mut tally = ShutdownTally::default();
+            let _ =
+                tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+            group.abort_remaining_into(&mut tally).await;
+
+            assert_eq!(group.active_consumers(), 0);
+            assert!(
+                group.reaper_handle.is_none(),
+                "abort_remaining_into must take() the reaper handle"
+            );
+            assert_eq!(tally.errors, 5);
+            assert_eq!(tally.panics, 1);
         }
 
         #[tokio::test]
