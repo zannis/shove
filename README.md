@@ -121,6 +121,8 @@ Per-consumer scaling at the `high` tier with the `slow` handler (50–300 ms ran
 
 RabbitMQ scales linearly past 50 channels via the per-`ConsumerGroup` AMQP connection pool (auto-sized `ceil(max_consumers / 50)`). Redis ships shove-tuned defaults (30 s response, 10 s connect) that replace redis-rs's 500 ms / 1 s defaults — those misfire under heavy concurrent XREADGROUP load. Tune via `RedisConfig::with_response_timeout` / `with_connection_timeout` if needed.
 
+Redis consumer groups also run a single XAUTOCLAIM "reaper" sidecar per group instead of each consumer firing its own autoclaim — at 1 024 consumers this cuts broker-side autoclaim CPU from ~17 s / run to zero in the steady-state bench window. Headline impact on a single Redis node, 1 024 consumers, slow handler, `prefetch=20`: **56 000 msg/s** (was 5 900 before the reaper, ~10× speedup).
+
 `prefetch_count` is the primary throughput lever for I/O-bound handlers. Per-backend tuning notes, NATS/SQS comparisons, and `fast`/`heavy` profile breakdowns: [Performance](https://shove.rs/ops/performance).
 
 ## Learn more
