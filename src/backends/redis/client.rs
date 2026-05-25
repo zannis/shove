@@ -41,6 +41,19 @@ impl RedisConfig {
     }
 }
 
+/// Build an [`AsyncConnectionConfig`](redis::AsyncConnectionConfig) with both
+/// `response_timeout` and `connection_timeout` disabled.
+///
+/// shove relies on Redis BLOCK semantics (XREADGROUP BLOCK 2000) and pushes
+/// large batched publishes under heavy concurrent load; the redis-rs defaults
+/// (500 ms response, 1 s connect) misfire in both situations. Disabling both
+/// timeouts uniformly is correct for every shove code path.
+fn no_timeout_config() -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_response_timeout(None)
+        .set_connection_timeout(None)
+}
+
 // ---------------------------------------------------------------------------
 // Internal connection enum
 // ---------------------------------------------------------------------------
@@ -157,10 +170,18 @@ impl RedisClient {
 
     /// Return a multiplexed (shared) connection suitable for non-blocking operations
     /// such as XADD, XACK, ZADD, and XLEN.
+    ///
+    /// The redis-rs defaults are `response_timeout=500 ms` and
+    /// `connection_timeout=1 s`. Both are too aggressive for shove's high-fanout
+    /// workloads: under heavy concurrent XREADGROUP load the server can take
+    /// longer than 500 ms to respond to a batched publish, and acquiring a fresh
+    /// multiplexed connection during peak traffic can exceed 1 s. Both surface
+    /// as "connection error: timed out" mid-publish. We disable both timeouts
+    /// here; TCP keepalive still surfaces a truly dead broker.
     pub(super) async fn multiplexed_conn(&self) -> Result<RedisConnection> {
         match self.inner.as_ref() {
             ClientInner::Standalone(client) => client
-                .get_multiplexed_async_connection()
+                .get_multiplexed_async_connection_with_config(&no_timeout_config())
                 .await
                 .map(RedisConnection::Standalone)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
@@ -175,15 +196,13 @@ impl RedisClient {
     /// Return a dedicated connection suitable for consumer loops that use BLOCK commands
     /// (e.g. XREADGROUP with `BLOCK 2000`).
     ///
-    /// The default response timeout (500 ms) is shorter than BLOCK_MS (2000 ms), causing
-    /// spurious "connection error: timed out" on every blocking read. We disable the response
-    /// timeout here so the connection waits however long Redis needs to reply.
+    /// Uses the same no-timeout config as [`multiplexed_conn`](Self::multiplexed_conn)
+    /// so blocking reads, batched publishes, and outcome routing all behave
+    /// consistently under load.
     pub(super) async fn dedicated_conn(&self) -> Result<RedisConnection> {
         match self.inner.as_ref() {
             ClientInner::Standalone(client) => client
-                .get_multiplexed_async_connection_with_config(
-                    &redis::AsyncConnectionConfig::new().set_response_timeout(None),
-                )
+                .get_multiplexed_async_connection_with_config(&no_timeout_config())
                 .await
                 .map(RedisConnection::Standalone)
                 .map_err(|e| ShoveError::Connection(e.to_string())),
