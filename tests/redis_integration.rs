@@ -1952,8 +1952,10 @@ mod reaper_tests {
             .expect("reaper task must not panic");
     }
 
-    /// The reaper actually transfers PEL ownership to its own consumer name
-    /// when entries are eligible (idle >= min_idle_ms).
+    /// The reaper claims stale PEL entries and immediately re-delivers them:
+    /// it XADDs the entry back to the stream and XACKs the original, leaving
+    /// the reaper PEL empty. A fresh consumer must be able to receive the
+    /// re-added entry via `XREADGROUP ... >`.
     #[tokio::test]
     async fn reaper_claims_stale_pel_entries() {
         let url = redis_url().await;
@@ -1977,12 +1979,31 @@ mod reaper_tests {
             shutdown.clone(),
         );
 
-        // Poll up to 2 s for the entry to transfer.
+        // Poll up to 2 s for the re-delivered entry to appear via XREADGROUP >.
+        // The reaper XADDs then XACKs each claimed entry, so the reaper PEL
+        // stays empty; the entry appears as a new stream message instead.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut count = 0usize;
+        let mut redelivered = 0usize;
         while std::time::Instant::now() < deadline {
-            count = pending_count_for(&mut raw, stream, group, &reaper_name).await;
-            if count > 0 {
+            let raw_reply: redis::Value = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(group)
+                .arg("stale-verify-consumer")
+                .arg("COUNT")
+                .arg(10)
+                .arg("STREAMS")
+                .arg(stream)
+                .arg(">")
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(redis::Value::Nil);
+            if let redis::Value::Array(ref outer) = raw_reply
+                && let Some(redis::Value::Array(stream_pair)) = outer.first()
+                && let Some(redis::Value::Array(entries)) = stream_pair.get(1)
+            {
+                redelivered = entries.len();
+            }
+            if redelivered > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1991,19 +2012,28 @@ mod reaper_tests {
         shutdown.cancel();
         let _ = handle.await;
 
+        // Reaper PEL must be empty — it XACKed after re-XADD.
+        let reaper_pel = pending_count_for(&mut raw, stream, group, &reaper_name).await;
+
         assert!(
-            count > 0,
-            "reaper did not transfer the stale PEL entry to {reaper_name}"
+            redelivered > 0,
+            "reaper did not redeliver the stale entry via XREADGROUP '>'"
+        );
+        assert_eq!(
+            reaper_pel, 0,
+            "reaper PEL must be empty after re-XADD + XACK (was {reaper_pel})"
         );
     }
 
     /// `spawn_reaper` accepts multiple streams and must sweep all of them
-    /// in a single tick — not just the first.
+    /// in a single tick — not just the first. Evidence: after the reaper
+    /// processes both streams, each one must have a re-delivered entry
+    /// visible via `XREADGROUP ... >` (the reaper re-XADDs and XACKs each
+    /// claimed entry, so the reaper PEL stays empty).
     #[tokio::test]
     async fn reaper_sweeps_all_provided_streams() {
         let url = redis_url().await;
         let group = "reaper-multi-grp";
-        let reaper_name = format!("shove-reaper-{group}");
         let streams = ["reaper-multi-s1", "reaper-multi-s2"];
 
         let mut raw = raw_conn(url).await;
@@ -2023,14 +2053,37 @@ mod reaper_tests {
             shutdown.clone(),
         );
 
-        // Poll both streams up to 2 s for the entries to transfer.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut counts = [0usize; 2];
+        // Poll both streams up to 3 s. The reaper re-XADDs and XACKs every
+        // claimed entry, so entries appear as new stream messages deliverable
+        // via `XREADGROUP ... >` rather than accumulating in the reaper PEL.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut redelivered = [0usize; 2];
         while std::time::Instant::now() < deadline {
             for (i, s) in streams.iter().enumerate() {
-                counts[i] = pending_count_for(&mut raw, s, group, &reaper_name).await;
+                if redelivered[i] > 0 {
+                    continue;
+                }
+                let consumer = format!("verify-consumer-{i}");
+                let raw_reply: redis::Value = redis::cmd("XREADGROUP")
+                    .arg("GROUP")
+                    .arg(group)
+                    .arg(&consumer)
+                    .arg("COUNT")
+                    .arg(10)
+                    .arg("STREAMS")
+                    .arg(s)
+                    .arg(">")
+                    .query_async(&mut raw)
+                    .await
+                    .unwrap_or(redis::Value::Nil);
+                if let redis::Value::Array(ref outer) = raw_reply
+                    && let Some(redis::Value::Array(stream_pair)) = outer.first()
+                    && let Some(redis::Value::Array(entries)) = stream_pair.get(1)
+                {
+                    redelivered[i] = entries.len();
+                }
             }
-            if counts.iter().all(|c| *c > 0) {
+            if redelivered.iter().all(|c| *c > 0) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2041,9 +2094,8 @@ mod reaper_tests {
 
         for (i, s) in streams.iter().enumerate() {
             assert!(
-                counts[i] > 0,
-                "reaper did not transfer stale entry on stream {s} (count={count})",
-                count = counts[i],
+                redelivered[i] > 0,
+                "reaper did not redeliver stale entry on stream {s}"
             );
         }
     }
@@ -2090,5 +2142,92 @@ mod reaper_tests {
             .await
             .expect("reaper must exit within 1 s of cancel during stream loop")
             .expect("reaper task must not panic");
+    }
+
+    /// After the reaper claims stale PEL entries via XAUTOCLAIM it must
+    /// re-XADD them to the stream so that regular consumers can receive them
+    /// through `XREADGROUP ... >`. Without this, claimed entries accumulate
+    /// in the reaper's own PEL with nothing consuming them.
+    ///
+    /// Scenario:
+    /// 1. A "dead" consumer holds an entry in its PEL (simulating a handler
+    ///    that timed out without XACK'ing).
+    /// 2. The reaper runs XAUTOCLAIM, transferring ownership to itself.
+    /// 3. The reaper must immediately re-XADD the entry and XACK the original,
+    ///    leaving the reaper PEL empty.
+    /// 4. A fresh consumer then receives the re-added entry via
+    ///    `XREADGROUP GROUP g fresh COUNT n STREAMS s >`.
+    #[tokio::test]
+    async fn reaper_redelivers_claimed_entries_to_stream() {
+        let url = redis_url().await;
+        let stream = "reaper-redeliver-stream";
+        let group = "reaper-redeliver-grp";
+        let reaper_name = format!("shove-reaper-{group}");
+
+        let mut raw = raw_conn(url).await;
+        // Seed one entry owned by a "dead" consumer — its PEL clock starts now.
+        let _ = seed_stale_entry(&mut raw, stream, group).await;
+
+        let client = connect_client_with_retry(url, group).await;
+
+        let shutdown = CancellationToken::new();
+        // min_idle = 0 → the entry is eligible for XAUTOCLAIM immediately.
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            0,
+            shutdown.clone(),
+        );
+
+        // Poll until a fresh consumer can read a re-delivered entry OR we
+        // time out. The delivery happens in two stages:
+        //   a) XAUTOCLAIM moves the entry to the reaper's PEL.
+        //   b) The reaper re-XADDs it and XACKs the original.
+        // After (b) the entry appears as a new stream entry visible to `>`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut redelivered = 0usize;
+        while std::time::Instant::now() < deadline {
+            let raw_reply: redis::Value = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(group)
+                .arg("fresh-verification-consumer")
+                .arg("COUNT")
+                .arg(10)
+                .arg("STREAMS")
+                .arg(stream)
+                .arg(">")
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(redis::Value::Nil);
+
+            if let redis::Value::Array(ref outer) = raw_reply
+                && let Some(redis::Value::Array(stream_pair)) = outer.first()
+                && let Some(redis::Value::Array(entries)) = stream_pair.get(1)
+            {
+                redelivered = entries.len();
+            }
+
+            if redelivered > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        // Also verify the reaper's own PEL is empty (it XACKed the original).
+        let reaper_pel = pending_count_for(&mut raw, stream, group, &reaper_name).await;
+
+        assert!(
+            redelivered > 0,
+            "reaper must re-XADD claimed entries so they are visible to new consumers via XREADGROUP '>'"
+        );
+        assert_eq!(
+            reaper_pel, 0,
+            "reaper PEL must be empty after re-XADD + XACK (was {reaper_pel})"
+        );
     }
 }
