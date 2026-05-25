@@ -263,14 +263,14 @@ impl ConsumerGroup {
     ///
     /// FIFO replica count is fixed at 1 — concurrency comes from shards,
     /// not from multiple replicas of the shard set.
-    pub fn new_fifo<T, H>(
+    pub async fn new_fifo<T, H>(
         queue: impl Into<String>,
         client: RabbitMqClient,
         mut config: ConsumerGroupConfig,
         group_token: CancellationToken,
         handler_factory: impl Fn() -> H + Send + Sync + 'static,
         ctx: H::Context,
-    ) -> Self
+    ) -> Result<Self>
     where
         T: SequencedTopic + 'static,
         H: MessageHandler<T> + 'static,
@@ -280,13 +280,27 @@ impl ConsumerGroup {
         let ec_for_spawner = error_count.clone();
         let pc_for_spawner = panic_count.clone();
 
-        // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard, not per-replica.
+        // FIFO replica count is fixed at 1 — FIFO concurrency is per-shard,
+        // not per-replica.
         config.min_consumers = 1;
         config.max_consumers = 1;
 
+        // FIFO groups always sit at max_consumers=1, so pool_size is 1 and no
+        // siblings are dialed. The pool plumbing is still applied uniformly
+        // so the spawner code path stays identical to the non-FIFO group.
+        let pool_size = pool_size_for(config.max_consumers);
+        let mut pool_vec: Vec<RabbitMqClient> = Vec::with_capacity(pool_size);
+        pool_vec.push(client);
+        for _ in 1..pool_size {
+            pool_vec.push(pool_vec[0].dial_sibling().await?);
+        }
+        let pool: Arc<Vec<RabbitMqClient>> = Arc::new(pool_vec);
+        let next: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
             let handler = handler_factory();
-            let consumer = RabbitMqConsumer::new(client.clone());
+            let consumer = RabbitMqConsumer::new(pool[idx].clone());
             let ec = ec_for_spawner.clone();
             let pc = pc_for_spawner.clone();
             let ctx = ctx.clone();
@@ -317,7 +331,7 @@ impl ConsumerGroup {
         });
 
         let queue_str: String = queue.into();
-        Self {
+        Ok(Self {
             name: queue_str.clone(),
             queue: queue_str,
             consumers: Vec::with_capacity(1),
@@ -326,7 +340,7 @@ impl ConsumerGroup {
             group_token,
             error_count,
             panic_count,
-        }
+        })
     }
 
     /// Spawn `min_consumers` consumers to get the group to its minimum size.
