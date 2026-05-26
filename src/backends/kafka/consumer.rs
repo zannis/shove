@@ -747,7 +747,13 @@ impl KafkaConsumer {
                 let queue_owned = queue.to_string();
                 let tracker = Arc::new(Mutex::new(OffsetTracker::new(queue_owned.clone())));
                 let consumer = Arc::new(consumer);
-                let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(i32, i64)>();
+                // Bounded to prefetch_count: the semaphore already limits in-flight
+                // handler tasks to this count, so the channel can never grow beyond
+                // it under correct operation. An Err from try_send would indicate a
+                // logic bug (handler completing without holding a permit) and is
+                // surfaced immediately rather than silently accumulating (sec-K-4).
+                let (completion_tx, mut completion_rx) =
+                    mpsc::channel::<(i32, i64)>(prefetch_count as usize);
 
                 loop {
                     // Drain completed offsets and commit
@@ -830,7 +836,9 @@ impl KafkaConsumer {
                                         "failed to publish oversized message to DLQ"
                                     );
                                 }
-                                completion_tx.send((partition, offset)).ok();
+                                if completion_tx.try_send((partition, offset)).is_err() {
+                                    tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                }
                                 continue;
                             }
 
@@ -861,7 +869,9 @@ impl KafkaConsumer {
                                             "failed to publish bad message to DLQ"
                                         );
                                     }
-                                    completion_tx.send((partition, offset)).ok();
+                                    if completion_tx.try_send((partition, offset)).is_err() {
+                                        tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                    }
                                     continue;
                                 }
                             };
@@ -912,7 +922,14 @@ impl KafkaConsumer {
                                 )
                                 .await;
 
-                                task_tx.send((partition, offset)).ok();
+                                if task_tx.try_send((partition, offset)).is_err() {
+                                    tracing::error!(
+                                        queue = task_topic.as_ref(),
+                                        partition,
+                                        offset,
+                                        "completion channel full — logic bug in offset tracker"
+                                    );
+                                }
                                 drop(permit);
 
                                 if task_semaphore.available_permits() == task_prefetch as usize {
