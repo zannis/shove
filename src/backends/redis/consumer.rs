@@ -1242,8 +1242,10 @@ async fn route_to_dlq(
         }
     };
 
-    let mut cmd = redis::cmd("XADD");
-    cmd.arg(dlq).arg("*");
+    // Pre-size: "XADD", dlq, "*", all field pairs, 3 extra k/v pairs (reason, count, original).
+    let arg_count = fields.len() * 2 + 9;
+    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count * 16);
+    cmd.arg("XADD").arg(dlq).arg("*");
     for (k, v) in fields {
         cmd.arg(k.as_str()).arg(v.as_str());
     }
@@ -1269,8 +1271,10 @@ async fn requeue_to_stream(
     fields: &HashMap<String, String>,
     retry_count: u32,
 ) {
-    let mut cmd = redis::cmd("XADD");
-    cmd.arg(stream).arg("*");
+    // Pre-size: "XADD", stream, "*", all field pairs (one key filtered at runtime), 1 extra k/v pair.
+    let arg_count = fields.len() * 2 + 4;
+    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count * 16);
+    cmd.arg("XADD").arg(stream).arg("*");
     for (k, v) in fields {
         if k.as_str() != X_RETRY_COUNT {
             cmd.arg(k.as_str()).arg(v.as_str());
