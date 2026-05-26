@@ -37,7 +37,9 @@
 //! | Feature                    | What it enables                                                                             |
 //! |----------------------------|---------------------------------------------------------------------------------------------|
 //! | `inmemory`                 | In-process broker, publisher, consumer, topology, groups, autoscaler (no external broker)   |
-//! | `kafka`                    | Apache Kafka publisher, consumer, topology, consumer groups, autoscaling                    |
+//! | `kafka`                    | Apache Kafka publisher, consumer, topology, consumer groups, autoscaling (plaintext only)   |
+//! | `kafka-ssl`                | TLS + SASL mechanisms for Kafka — required for any authenticated cluster (implies `kafka`)  |
+//! | `kafka-msk-iam`            | AWS MSK IAM OAUTHBEARER auth (implies `kafka-ssl`)                                         |
 //! | `nats`                     | NATS JetStream publisher, consumer, topology, consumer groups, autoscaling                  |
 //! | `rabbitmq`                 | RabbitMQ publisher, consumer, topology, consumer groups, autoscaling                        |
 //! | `rabbitmq-transactional`   | RabbitMQ exactly-once routing via AMQP transactions (implies `rabbitmq`)                    |
