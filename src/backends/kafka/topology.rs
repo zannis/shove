@@ -77,6 +77,19 @@ impl KafkaTopologyDeclarer {
 
 impl KafkaTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // arch-K-9: Kafka simulates retry delays via deferred republish to
+        // the same topic — no broker-side hold-queue topics are created.
+        // Document the intentional omission so operators searching for
+        // "where's my `{queue}-hold-{n}s` topic?" find the answer.
+        let hold_count = topology.hold_queues().len();
+        if hold_count > 0 {
+            tracing::debug!(
+                queue = topology.queue(),
+                hold_queues = hold_count,
+                "Kafka simulates retry delays via deferred republish — no broker-side \
+                 hold-queue topics declared"
+            );
+        }
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {
