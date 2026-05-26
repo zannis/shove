@@ -3,10 +3,12 @@ set -euo pipefail
 
 CONTAINER_NAME="shove-rmq-test"
 
-# Remove any orphan from a previous run (stop + remove if running, or just
-# remove if stopped).  The --rm flag on `docker run` auto-removes the
-# container once it stops, so after a clean exit there is nothing to remove;
-# this guard handles SIGKILL'd runs where --rm never fired.
+# Capture the parent (cargo-nextest) PID before spawning anything else; the
+# background watcher below uses it to know when the test run has finished.
+NEXTEST_PID=$PPID
+
+# Remove any orphan from a previous run (the previous run's watcher should
+# have cleaned up, but we guard against SIGKILL'd runs where it could not).
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 # Start the broker.  --rm ensures auto-removal when the container stops.
@@ -29,6 +31,7 @@ for i in $(seq 1 90); do
   fi
   if [ "$i" -eq 90 ]; then
     echo "ERROR: RabbitMQ did not start within 90 s" >&2
+    docker kill "$CONTAINER_NAME" 2>/dev/null || true
     exit 1
   fi
   sleep 1
@@ -37,11 +40,23 @@ done
 # Enable the consistent-hash exchange plugin (needed for sequenced topics).
 docker exec "$CONTAINER_NAME" rabbitmq-plugins enable rabbitmq_consistent_hash_exchange
 
-# Publish URLs into the nextest environment file, then exit.
-# nextest starts tests as soon as this script exits with code 0.
-# The container continues running as a daemon; cleanup happens at the start
-# of the next run via `docker rm -f` above.
+# Publish URLs into the nextest environment file.  nextest starts tests as
+# soon as this script exits with code 0.
 printf 'RABBITMQ_AMQP_URL=amqp://guest:guest@127.0.0.1:%s\n' "$AMQP_PORT" >> "$NEXTEST_ENV"
 printf 'RABBITMQ_MGMT_URL=http://127.0.0.1:%s\n'              "$MGMT_PORT" >> "$NEXTEST_ENV"
 
 echo "RabbitMQ ready — AMQP :${AMQP_PORT}  MGMT :${MGMT_PORT}"
+
+# Spawn a detached watcher that polls for cargo-nextest's exit and then
+# tears down the container.  Stdio is redirected to /dev/null and SIGHUP is
+# ignored so the watcher survives our own exit and is not killed when the
+# launching shell exits.  --rm on the container ensures `docker kill` also
+# removes it.
+{
+  trap '' HUP
+  while kill -0 "$NEXTEST_PID" 2>/dev/null; do
+    sleep 2
+  done
+  docker kill "$CONTAINER_NAME" 2>/dev/null || true
+} </dev/null >/dev/null 2>&1 &
+disown
