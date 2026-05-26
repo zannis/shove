@@ -82,7 +82,7 @@ fn extract_message_metadata(msg: &Message) -> MessageMetadata {
         retry_count,
         delivery_id,
         redelivered,
-        headers,
+        headers: Arc::new(headers),
     }
 }
 

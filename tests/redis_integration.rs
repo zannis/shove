@@ -692,7 +692,7 @@ async fn publish_with_headers_visible_in_metadata() {
     impl MessageHandler<HeadersTopic> for H {
         type Context = ();
         async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
-            *self.0.lock().await = Some(meta.headers.clone());
+            *self.0.lock().await = Some((*meta.headers).clone());
             self.1.fetch_add(1, Ordering::Relaxed);
             Outcome::Ack
         }

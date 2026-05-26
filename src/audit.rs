@@ -311,7 +311,7 @@ mod tests {
             retry_count: 0,
             delivery_id: "d-1".into(),
             redelivered: false,
-            headers: HashMap::new(),
+            headers: Arc::new(HashMap::new()),
         }
     }
 
@@ -400,9 +400,12 @@ mod tests {
         let tracker = TrackingAuditHandler::new();
         let audited = Audited::new(FixedOutcomeHandler(Outcome::Ack), tracker.clone());
 
-        let mut meta = test_metadata();
-        meta.headers
-            .insert("x-trace-id".into(), "my-trace-123".into());
+        let mut headers = HashMap::new();
+        headers.insert("x-trace-id".into(), "my-trace-123".into());
+        let meta = MessageMetadata {
+            headers: Arc::new(headers),
+            ..test_metadata()
+        };
 
         audited.handle(test_message(), meta, &()).await;
         let captured: tokio::sync::MutexGuard<'_, Option<String>> = tracker.trace_id.lock().await;
@@ -456,7 +459,7 @@ mod tests {
             retry_count: 0,
             delivery_id: "d-1".into(),
             redelivered: false,
-            headers: HashMap::new(),
+            headers: Arc::new(HashMap::new()),
         };
 
         let msg = serde_json::from_value::<<AuditLog as Topic>::Message>(

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use lapin::message::Delivery;
 use lapin::types::{AMQPValue, FieldArray, FieldTable, LongString};
@@ -50,7 +51,7 @@ pub(crate) fn extract_message_metadata(delivery: &Delivery) -> MessageMetadata {
         retry_count: get_retry_count(delivery),
         delivery_id: delivery.delivery_tag.to_string(),
         redelivered: delivery.redelivered,
-        headers,
+        headers: Arc::new(headers),
     }
 }
 

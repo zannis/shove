@@ -95,7 +95,7 @@ fn extract_metadata(msg: &Message) -> MessageMetadata {
         retry_count,
         delivery_id: msg.message_id().unwrap_or_default().to_string(),
         redelivered: retry_count > 0,
-        headers: router::extract_message_attributes(msg),
+        headers: Arc::new(router::extract_message_attributes(msg)),
     }
 }
 

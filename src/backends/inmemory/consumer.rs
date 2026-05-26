@@ -1017,7 +1017,7 @@ fn metadata_from(env: &Envelope) -> MessageMetadata {
         retry_count,
         delivery_id,
         redelivered: retry_count > 0,
-        headers: env.headers.clone(),
+        headers: Arc::new(env.headers.clone()),
     }
 }
 

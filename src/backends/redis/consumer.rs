@@ -645,7 +645,7 @@ where
                         retry_count,
                         delivery_id,
                         redelivered: retry_count > 0,
-                        headers: user_headers,
+                        headers: Arc::new(user_headers),
                     };
 
                     options
@@ -951,7 +951,7 @@ where
                         retry_count,
                         delivery_id,
                         redelivered: retry_count > 0,
-                        headers: user_headers,
+                        headers: Arc::new(user_headers),
                     };
 
                     // Block here once `prefetch` handlers are in-flight; the

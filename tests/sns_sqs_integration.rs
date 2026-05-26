@@ -683,7 +683,7 @@ async fn publish_and_consume_with_headers() {
     impl MessageHandler<WorkTopic> for HeaderCapture {
         type Context = ();
         async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
-            *self.0.lock().await = meta.headers;
+            *self.0.lock().await = (*meta.headers).clone();
             Outcome::Ack
         }
     }

@@ -114,7 +114,7 @@ impl OffsetTracker {
 // Metadata extraction functions
 // ---------------------------------------------------------------------------
 
-fn extract_string_headers(msg: &BorrowedMessage<'_>) -> HashMap<String, String> {
+fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, String>> {
     let mut out = HashMap::new();
     if let Some(headers) = msg.headers() {
         for idx in 0..headers.count() {
@@ -126,7 +126,7 @@ fn extract_string_headers(msg: &BorrowedMessage<'_>) -> HashMap<String, String> 
             }
         }
     }
-    out
+    Arc::new(out)
 }
 
 fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
@@ -136,18 +136,21 @@ fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
         .unwrap_or(0)
 }
 
-fn build_message_metadata(headers: &HashMap<String, String>, redelivered: bool) -> MessageMetadata {
+fn build_message_metadata(
+    headers: &Arc<HashMap<String, String>>,
+    redelivered: bool,
+) -> MessageMetadata {
     let retry_count = get_retry_count(headers);
     let delivery_id = headers.get(MESSAGE_ID_HEADER).cloned().unwrap_or_default();
     MessageMetadata {
         retry_count,
         delivery_id,
         redelivered,
-        headers: headers.clone(),
+        headers: Arc::clone(headers),
     }
 }
 
-fn build_dead_metadata(headers: &HashMap<String, String>) -> DeadMessageMetadata {
+fn build_dead_metadata(headers: &Arc<HashMap<String, String>>) -> DeadMessageMetadata {
     let message = build_message_metadata(headers, false);
     let reason = headers.get(DEATH_REASON_HEADER).cloned();
     let original_queue = headers.get(ORIGINAL_QUEUE_HEADER).cloned();
