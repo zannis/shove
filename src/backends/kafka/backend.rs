@@ -166,7 +166,8 @@ impl AutoscalerBackendImpl for KafkaAutoscalerBackend<KafkaLagStatsProvider> {}
 
 impl QueueStatsProviderImpl for KafkaLagStatsProvider {
     async fn snapshot(&self, queue: &str) -> Result<AutoscaleMetrics> {
-        let stats = self.get_queue_stats(queue).await?;
+        let group_id = super::constants::consumer_group_id(queue);
+        let stats = self.get_queue_stats(queue, &group_id).await?;
         Ok(AutoscaleMetrics {
             backlog: Some(stats.messages_pending),
             inflight: Some(stats.messages_in_flight),

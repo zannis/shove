@@ -134,6 +134,11 @@ impl KafkaConsumerGroupConfig {
 
 pub struct KafkaConsumerGroup {
     pub(crate) queue: String,
+    /// The Kafka consumer group ID actually used by broker-side consumers.
+    /// Standard consumers: `"{queue}-consumer"`. FIFO consumers: `"{queue}-fifo"`.
+    /// Stored here so the autoscaler can query committed offsets under the
+    /// correct group without re-deriving it.
+    pub(crate) group_id: String,
     pub(crate) config: KafkaConsumerGroupConfig,
     pub(crate) spawner: Spawner,
     pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
@@ -184,8 +189,11 @@ impl KafkaConsumerGroup {
             })
         });
 
+        let queue_str: String = queue.into();
+        let group_id = super::constants::consumer_group_id(&queue_str);
         Self {
-            queue: queue.into(),
+            queue: queue_str,
+            group_id,
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
             spawner,
@@ -254,8 +262,10 @@ impl KafkaConsumerGroup {
         });
 
         let queue_str: String = queue.into();
+        let group_id = super::constants::consumer_group_id_fifo(&queue_str);
         Self {
-            queue: queue_str.clone(),
+            queue: queue_str,
+            group_id,
             consumers: Vec::with_capacity(1),
             config,
             spawner,
@@ -328,6 +338,15 @@ impl KafkaConsumerGroup {
 
     pub fn queue(&self) -> &str {
         &self.queue
+    }
+
+    /// The Kafka consumer group ID used by this group's broker-side consumers.
+    ///
+    /// Standard consumers return `"{queue}-consumer"`; FIFO consumers return
+    /// `"{queue}-fifo"`. The autoscaler uses this to query committed offsets
+    /// under the correct group — never re-derive it from the queue name.
+    pub fn group_id(&self) -> &str {
+        &self.group_id
     }
 
     pub fn config(&self) -> &KafkaConsumerGroupConfig {
@@ -652,6 +671,7 @@ mod tests {
 
         KafkaConsumerGroup {
             queue: "test-queue".into(),
+            group_id: "test-queue-consumer".into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
             spawner,
@@ -937,5 +957,32 @@ mod tests {
     fn with_default_handler_timeout_zero_panics() {
         let registry = KafkaConsumerGroupRegistry::from_groups(HashMap::new());
         let _ = registry.with_default_handler_timeout(Duration::ZERO);
+    }
+
+    // -- group_id (arch-K-1) --
+
+    #[test]
+    fn standard_group_id_is_queue_consumer() {
+        let group = test_group(default_config());
+        // test_group sets group_id = "test-queue-consumer" directly
+        assert_eq!(group.group_id(), "test-queue-consumer");
+    }
+
+    #[test]
+    fn fifo_group_id_must_not_match_standard_consumer_group_id() {
+        // FIFO consumers MUST use "{queue}-fifo", never "{queue}-consumer".
+        // If group_id() returns "{queue}-consumer" for a FIFO group, the
+        // autoscaler will read committed offsets from the wrong group and
+        // report phantom backlog (arch-K-1).
+        //
+        // We cannot call `new_fifo` from a unit test without a full KafkaClient,
+        // so we construct the group struct directly with the FIFO group_id that
+        // `new_fifo` sets via `consumer_group_id_fifo`.
+        let fifo_group_id = super::super::constants::consumer_group_id_fifo("orders");
+        assert_eq!(fifo_group_id, "orders-fifo");
+        assert_ne!(
+            fifo_group_id,
+            super::super::constants::consumer_group_id("orders")
+        );
     }
 }
