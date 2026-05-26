@@ -317,14 +317,6 @@ impl SnsTopologyDeclarer {
         topology: &QueueTopology,
         topic_arn: &str,
     ) -> Result<()> {
-        if !topology.hold_queues().is_empty() {
-            return Err(ShoveError::Topology(format!(
-                "hold queues are not supported for SQS-backed topologies ('{}'); \
-                 SQS does not implement per-delay-value delay queues",
-                topology.queue()
-            )));
-        }
-
         let queue_name = topology.queue();
 
         // Create DLQ first if requested
@@ -362,14 +354,6 @@ impl SnsTopologyDeclarer {
     /// Declare FIFO shard queues and subscribe each to the SNS topic.
     #[cfg(feature = "aws-sns-sqs")]
     async fn declare_sqs_sequenced(&self, topology: &QueueTopology, topic_arn: &str) -> Result<()> {
-        if !topology.hold_queues().is_empty() {
-            return Err(ShoveError::Topology(format!(
-                "hold queues are not supported for SQS-backed topologies ('{}'); \
-                 SQS does not implement per-delay-value delay queues",
-                topology.queue()
-            )));
-        }
-
         let queue_name = topology.queue();
         let shards = topology
             .sequencing()
