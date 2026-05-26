@@ -192,7 +192,20 @@ impl KafkaConsumerGroup {
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let queue_str: String = queue.into();
         let concurrent = config.concurrent_processing;
+        // arch-K-8: surface the silent override of prefetch_count when the
+        // caller configured >1 but left concurrent_processing=false. Logged
+        // once at construction (vs. inside the spawner, which would fire on
+        // every scale-up).
+        if !concurrent && config.prefetch_count > 1 {
+            tracing::warn!(
+                queue = %queue_str,
+                configured_prefetch_count = config.prefetch_count,
+                "prefetch_count > 1 with concurrent_processing=false is being clamped to 1 — \
+                 call .with_concurrent_processing(true) to honor the configured value"
+            );
+        }
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
@@ -218,7 +231,6 @@ impl KafkaConsumerGroup {
             })
         });
 
-        let queue_str: String = queue.into();
         let group_id = super::constants::consumer_group_id(&queue_str);
         Self {
             queue: queue_str,
