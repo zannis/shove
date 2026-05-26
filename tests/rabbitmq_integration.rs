@@ -117,6 +117,167 @@ impl TestBroker {
 }
 
 // ---------------------------------------------------------------------------
+// Shared-container test context (replaces TestBroker once migration is done)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct TestContext {
+    amqp_url: String,
+    mgmt_url: String,
+    vhost: String,
+    _container: Option<testcontainers::ContainerAsync<RabbitMq>>,
+}
+
+#[allow(dead_code)]
+impl TestContext {
+    async fn new() -> Self {
+        let http = reqwest::Client::new();
+
+        if let Ok(base_amqp) = std::env::var("RABBITMQ_AMQP_URL") {
+            // ----------------------------------------------------------------
+            // Shared mode — a container was started by the nextest setup script.
+            // Create a unique vhost for this test so queue names never collide.
+            // ----------------------------------------------------------------
+            let mgmt_url = std::env::var("RABBITMQ_MGMT_URL")
+                .expect("RABBITMQ_MGMT_URL must be set when RABBITMQ_AMQP_URL is set");
+
+            let vhost = format!("test-{}", uuid::Uuid::new_v4());
+
+            // Create the vhost.
+            let status = http
+                .put(format!("{mgmt_url}/api/vhosts/{vhost}"))
+                .basic_auth("guest", Some("guest"))
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await
+                .expect("failed to create vhost")
+                .status();
+            assert!(status.is_success(), "create vhost returned {status}");
+
+            // Grant the guest user full permissions on this vhost.
+            let status = http
+                .put(format!("{mgmt_url}/api/permissions/{vhost}/guest"))
+                .basic_auth("guest", Some("guest"))
+                .json(&std::collections::HashMap::from([
+                    ("configure", ".*"),
+                    ("write", ".*"),
+                    ("read", ".*"),
+                ]))
+                .send()
+                .await
+                .expect("failed to set vhost permissions")
+                .status();
+            assert!(status.is_success(), "set permissions returned {status}");
+
+            // Append the vhost to the AMQP URL.
+            let amqp_url = format!("{base_amqp}/{vhost}");
+
+            Self {
+                amqp_url,
+                mgmt_url,
+                vhost,
+                _container: None,
+            }
+        } else {
+            // ----------------------------------------------------------------
+            // Standalone mode — no setup script; start our own container.
+            // Uses the default vhost "/".
+            // ----------------------------------------------------------------
+            let container = RabbitMq::default()
+                .start()
+                .await
+                .expect("failed to start RabbitMQ container");
+
+            let host = container.get_host().await.expect("failed to get host");
+            let amqp_port = container
+                .get_host_port_ipv4(5672)
+                .await
+                .expect("failed to get AMQP port");
+            let mgmt_port = container
+                .get_host_port_ipv4(15672)
+                .await
+                .expect("failed to get mgmt port");
+
+            let amqp_url = format!("amqp://guest:guest@{host}:{amqp_port}");
+            let mgmt_url = format!("http://{host}:{mgmt_port}");
+
+            // Enable the consistent-hash exchange plugin.
+            let mut result = container
+                .exec(ExecCommand::new([
+                    "rabbitmq-plugins",
+                    "enable",
+                    "rabbitmq_consistent_hash_exchange",
+                ]))
+                .await
+                .expect("failed to enable consistent hash plugin");
+            let _ = result.stdout_to_vec().await;
+
+            // Give RabbitMQ time to load the plugin and the management API.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            Self {
+                amqp_url,
+                mgmt_url,
+                vhost: "/".into(),
+                _container: Some(container),
+            }
+        }
+    }
+
+    fn rmq_config(&self) -> RabbitMqConfig {
+        RabbitMqConfig::new(self.amqp_url.clone())
+    }
+
+    fn mgmt_config(&self) -> ManagementConfig {
+        ManagementConfig::new(&self.mgmt_url, "guest", "guest").with_vhost(&self.vhost)
+    }
+
+    fn broker_from(&self, client: RabbitMqClient) -> Broker<RabbitMqMarker> {
+        Broker::<RabbitMqMarker>::from_client(client)
+    }
+
+    /// Build a management API URL for a queue in this test's vhost.
+    ///
+    /// The default vhost "/" is encoded as "%2F"; UUID-based vhost names are
+    /// all ASCII alphanumeric + hyphens and need no encoding.
+    fn queue_api_url(&self, queue: &str) -> String {
+        let vhost_path = if self.vhost == "/" {
+            "%2F".to_string()
+        } else {
+            self.vhost.clone()
+        };
+        format!("{}/api/queues/{vhost_path}/{queue}", self.mgmt_url)
+    }
+
+    async fn cleanup(self) {
+        match self._container {
+            Some(container) => {
+                // Standalone mode: stop and remove the container.
+                container
+                    .stop_with_timeout(Some(0))
+                    .await
+                    .expect("failed to stop container");
+                container.rm().await.expect("failed to remove container");
+            }
+            None => {
+                // Shared mode: delete the vhost (queues and messages inside it
+                // are removed automatically by RabbitMQ).
+                let http = reqwest::Client::new();
+                let status = http
+                    .delete(format!("{}/api/vhosts/{}", self.mgmt_url, self.vhost))
+                    .basic_auth("guest", Some("guest"))
+                    .send()
+                    .await
+                    .expect("failed to delete vhost")
+                    .status();
+                assert!(status.is_success(), "delete vhost returned {status}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test topics and handlers
 // ---------------------------------------------------------------------------
 
