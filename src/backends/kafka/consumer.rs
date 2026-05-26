@@ -802,7 +802,12 @@ impl KafkaConsumer {
                                 }
                             };
 
-                            let payload_bytes = msg.payload().unwrap_or_default().to_vec();
+                            // perf-K-5: defer Vec<u8> allocation until after decode succeeds.
+                            // Oversize and decode-fail paths use msg.payload() directly for
+                            // their DLQ publish (no copy). The happy path owns the bytes
+                            // only because the handler runs in a spawned task that outlives
+                            // this loop iteration.
+                            let payload_slice = msg.payload().unwrap_or_default();
                             let headers = extract_string_headers(&msg);
                             let partition = msg.partition();
                             let offset = msg.offset();
@@ -812,10 +817,10 @@ impl KafkaConsumer {
                                 tracker.lock().await.track_received(partition, offset);
                             }
 
-                            metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+                            metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -829,7 +834,7 @@ impl KafkaConsumer {
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
                                     topology,
-                                    &payload_bytes,
+                                    payload_slice,
                                     key.as_deref(),
                                     &headers,
                                     &e.to_string(),
@@ -846,7 +851,7 @@ impl KafkaConsumer {
                             }
 
                             // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(
@@ -862,7 +867,7 @@ impl KafkaConsumer {
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
-                                        &payload_bytes,
+                                        payload_slice,
                                         key.as_deref(),
                                         &headers,
                                         &format!("deserialization_error: {e}"),
@@ -878,6 +883,10 @@ impl KafkaConsumer {
                                     continue;
                                 }
                             };
+
+                            // Decode succeeded — copy bytes for the spawned task's
+                            // route_outcome (msg goes out of scope after this loop iteration).
+                            let payload_bytes = payload_slice.to_vec();
 
                             let metadata = build_message_metadata(&headers, false);
                             let retry_count = metadata.retry_count;
@@ -1067,7 +1076,10 @@ impl KafkaConsumer {
                                     }
                                 };
 
-                                let payload_bytes = msg.payload().unwrap_or_default().to_vec();
+                                // perf-K-5: FIFO is sequential — msg lives through this whole
+                                // iteration (commit_message at the end), so use msg.payload()
+                                // directly instead of allocating a Vec<u8> copy.
+                                let payload_bytes = msg.payload().unwrap_or_default();
                                 let headers = extract_string_headers(&msg);
                                 let key = msg.key().map(|k| k.to_vec());
 
@@ -1088,7 +1100,7 @@ impl KafkaConsumer {
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
-                                        &payload_bytes,
+                                        payload_bytes,
                                         key.as_deref(),
                                         &headers,
                                         &e.to_string(),
@@ -1103,7 +1115,7 @@ impl KafkaConsumer {
                                 }
 
                                 // Deserialize payload; reject to DLQ on failure
-                                let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
+                                let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
                                     Ok(m) => m,
                                     Err(e) => {
                                         tracing::error!(
@@ -1119,7 +1131,7 @@ impl KafkaConsumer {
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &client,
                                             topology,
-                                            &payload_bytes,
+                                            payload_bytes,
                                             key.as_deref(),
                                             &headers,
                                             &format!("deserialization_error: {e}"),
@@ -1158,7 +1170,7 @@ impl KafkaConsumer {
                                 route_outcome(
                                     &client,
                                     &queue,
-                                    &payload_bytes,
+                                    payload_bytes,
                                     key.as_deref(),
                                     &headers,
                                     outcome,
@@ -1294,7 +1306,10 @@ impl KafkaConsumer {
                                 }
                             };
 
-                            let payload_bytes = msg.payload().unwrap_or_default().to_vec();
+                            // perf-K-5: msg lives through commit_message at the end of this
+                            // iteration and we never spawn — decode from msg.payload() directly
+                            // instead of allocating a Vec<u8> copy.
+                            let payload_bytes = msg.payload().unwrap_or_default();
                             let headers = extract_string_headers(&msg);
 
                             // Discard oversized DLQ messages
@@ -1310,7 +1325,7 @@ impl KafkaConsumer {
                             }
 
                             // Deserialize payload; on failure, log and ack anyway
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(
