@@ -176,7 +176,9 @@ fn headers_with_retry_count(
     retry_count: u32,
     message_id_suffix: &str,
 ) -> OwnedHeaders {
-    let mut headers = OwnedHeaders::new();
+    // perf-K-8: original.len() bounds the carried-over headers; +2 for the
+    // RETRY_COUNT_HEADER and MESSAGE_ID_HEADER we always re-insert.
+    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 2);
     for (k, v) in original {
         if k == RETRY_COUNT_HEADER || k == MESSAGE_ID_HEADER {
             continue;
@@ -205,7 +207,9 @@ fn headers_for_dlq(
     reason: &str,
     original_queue: &str,
 ) -> OwnedHeaders {
-    let mut headers = OwnedHeaders::new();
+    // perf-K-8: original.len() bounds the carried-over headers; +4 for the
+    // DEATH_REASON / ORIGINAL_QUEUE / DEATH_COUNT / MESSAGE_ID we re-insert.
+    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 4);
     for (k, v) in original {
         if k == DEATH_REASON_HEADER
             || k == ORIGINAL_QUEUE_HEADER
