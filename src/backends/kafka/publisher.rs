@@ -87,8 +87,10 @@ impl KafkaPublisher {
     fn resolve_topic_and_key<T: Topic>(
         topology: &'static QueueTopology,
         message: &T::Message,
-    ) -> (String, Option<Vec<u8>>) {
-        let topic = topology.queue().to_string();
+    ) -> (&'static str, Option<Vec<u8>>) {
+        // perf-K-3: topology is &'static so queue() is &'static str —
+        // no allocation needed; the topic string lives forever.
+        let topic = topology.queue();
         let key = T::SEQUENCE_KEY_FN.map(|key_fn| key_fn(message).into_bytes());
         (topic, key)
     }
@@ -127,7 +129,7 @@ impl KafkaPublisher {
         let headers = Self::build_headers(None);
         self.client
             .publish_with_retry(
-                &topic,
+                topic,
                 key.as_deref(),
                 headers,
                 &payload,
@@ -149,7 +151,7 @@ impl KafkaPublisher {
         let headers = Self::build_headers(Some(&extra_headers));
         self.client
             .publish_with_retry(
-                &topic,
+                topic,
                 key.as_deref(),
                 headers,
                 &payload,
@@ -164,15 +166,16 @@ impl KafkaPublisher {
 
         let topology = T::topology();
         #[allow(clippy::type_complexity)]
-        let prepared: Result<Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> = messages
-            .iter()
-            .map(|msg| {
-                let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
-                let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
-                let headers = Self::build_headers(None);
-                Ok((topic, key, headers, payload))
-            })
-            .collect();
+        let prepared: Result<Vec<(&'static str, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> =
+            messages
+                .iter()
+                .map(|msg| {
+                    let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
+                    let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
+                    let headers = Self::build_headers(None);
+                    Ok((topic, key, headers, payload))
+                })
+                .collect();
         let prepared = match prepared {
             Ok(v) => v,
             Err(e) => return (0, Err(e)),
@@ -192,7 +195,7 @@ impl KafkaPublisher {
                 async move {
                     client
                         .publish_with_retry(
-                            &topic,
+                            topic,
                             key.as_deref(),
                             headers,
                             &payload,
