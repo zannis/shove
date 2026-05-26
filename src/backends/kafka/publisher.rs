@@ -86,10 +86,13 @@ impl KafkaPublisher {
     }
 
     fn build_headers(extra: Option<&HashMap<String, String>>) -> OwnedHeaders {
+        // perf-K-2: encode UUID into a stack buffer — no heap alloc
+        let mut uuid_buf = Uuid::encode_buffer();
+        let uuid_str = Uuid::new_v4().hyphenated().encode_lower(&mut uuid_buf);
         let mut headers = OwnedHeaders::new()
             .insert(Header {
                 key: MESSAGE_ID_HEADER,
-                value: Some(Uuid::new_v4().to_string().as_bytes()),
+                value: Some(uuid_str.as_bytes()),
             })
             .insert(Header {
                 key: RETRY_COUNT_HEADER,
