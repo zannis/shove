@@ -112,8 +112,7 @@ impl RabbitMqPublisher {
             // concurrent callers on the same slot can pipeline their
             // publishes instead of serializing for the full RTT.
             let channel = slot.lock().await.clone();
-            match Self::do_publish(&channel, exchange, routing_key, payload, headers.clone()).await
-            {
+            match Self::do_publish(&channel, exchange, routing_key, payload, &headers).await {
                 Ok(()) => {
                     debug!(exchange, routing_key, "message published and confirmed");
                     return Ok(());
@@ -142,10 +141,10 @@ impl RabbitMqPublisher {
         exchange: &str,
         routing_key: &str,
         payload: &[u8],
-        headers: Option<FieldTable>,
+        headers: &Option<FieldTable>,
     ) -> Result<()> {
         let props = match headers {
-            Some(h) => base_properties().with_headers(h),
+            Some(h) => base_properties().with_headers(h.clone()),
             None => base_properties(),
         };
 
