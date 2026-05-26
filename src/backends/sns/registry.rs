@@ -21,6 +21,13 @@ use crate::topic::Topic;
 /// topology declarers built from the same client. Each group gets its own
 /// child [`CancellationToken`] derived from the client so that the whole
 /// registry can be shut down with a single cancellation.
+///
+/// # Autoscaling
+///
+/// This registry is the **only** SQS consumer path visible to
+/// [`Broker::autoscaler`](crate::broker::Broker::autoscaler). Consumers
+/// started through [`Broker::consumer_supervisor`](crate::broker::Broker::consumer_supervisor)
+/// are not registered here and will not be autoscaled.
 pub struct SqsConsumerGroupRegistry {
     groups: HashMap<String, SqsConsumerGroup>,
     client: SnsClient,

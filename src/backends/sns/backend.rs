@@ -9,6 +9,25 @@
 //! covered by `Broker<Sqs>::consumer_supervisor()`. A `compile_fail`
 //! doctest in `tests/sqs_no_consumer_group.rs` pins this property.
 //!
+//! ## Consumer paths and autoscaling
+//!
+//! SQS exposes two consumer paths with different autoscaling implications:
+//!
+//! * **`Broker<Sqs>::consumer_supervisor()`** — spawns a fixed number of
+//!   independent pollers. These tasks are not tracked by any
+//!   `SqsConsumerGroupRegistry`, so `Broker<Sqs>::autoscaler()` observes
+//!   zero groups and cannot scale when this path is used.
+//!
+//! * **`SqsConsumerGroupRegistry`** — manages dynamically-scaled groups of
+//!   consumers with configurable min/max bounds. This is the only path
+//!   compatible with `Broker<Sqs>::autoscaler()`:
+//!
+//!   ```ignore
+//!   let mut registry = SqsConsumerGroupRegistry::new(client);
+//!   registry.register::<MyTopic, _>(config, factory, ctx).await?;
+//!   registry.start_all();
+//!   ```
+//!
 //! The whole `crate::backends::sns` module is gated on `pub-aws-sns`;
 //! this file is further gated on `aws-sns-sqs` by `mod.rs` so the
 //! SQS-specific types (`SqsConsumer`, `SqsAutoscalerBackend`, …) are
