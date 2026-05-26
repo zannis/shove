@@ -84,9 +84,11 @@ impl RabbitMqPublisher {
         // publish-then-ack race produces a second delivery of this message.
         let mut headers = headers.unwrap_or_default();
         if !headers.inner().contains_key(MESSAGE_ID_KEY) {
+            let mut buf = [0u8; 36];
+            let id = Uuid::new_v4().hyphenated().encode_lower(&mut buf);
             headers.insert(
                 MESSAGE_ID_KEY.into(),
-                AMQPValue::LongString(Uuid::new_v4().to_string().into()),
+                AMQPValue::LongString(id.as_bytes().into()),
             );
         }
         let headers = Some(headers);
