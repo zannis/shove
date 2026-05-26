@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use rdkafka::TopicPartitionList;
 use rdkafka::consumer::{BaseConsumer, Consumer as RdkafkaConsumer};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -39,113 +41,153 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
 }
 
 /// Default stats provider that queries Kafka consumer lag.
+///
+/// perf-K-10: caches one BaseConsumer per group_id so each autoscaler poll
+/// reuses the connection + metadata cache instead of doing a fresh broker
+/// handshake. Typical deployments have one or two distinct group_ids
+/// (`{queue}-consumer` for standard groups, `{queue}-fifo` for FIFO).
 pub struct KafkaLagStatsProvider {
     client: KafkaClient,
+    consumers: StdMutex<HashMap<String, Arc<BaseConsumer>>>,
 }
 
 impl KafkaLagStatsProvider {
     pub fn new(client: KafkaClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            consumers: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_create_consumer(&self, group_id: &str) -> Result<Arc<BaseConsumer>> {
+        let mut guard = self
+            .consumers
+            .lock()
+            .map_err(|_| ShoveError::Topology("stats consumer cache poisoned".into()))?;
+        if let Some(c) = guard.get(group_id) {
+            return Ok(Arc::clone(c));
+        }
+        let consumer: BaseConsumer = self
+            .client
+            .base_config()
+            .set("group.id", group_id)
+            .create()
+            .map_err(|e| ShoveError::Topology(format!("failed to create stats consumer: {e}")))?;
+        let arc = Arc::new(consumer);
+        guard.insert(group_id.to_string(), Arc::clone(&arc));
+        Ok(arc)
     }
 }
 
 impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
     async fn get_queue_stats(&self, queue: &str, group_id: &str) -> Result<KafkaQueueStats> {
-        let group_id = group_id.to_string();
-        let base = self.client.base_config();
+        // perf-K-10: reuse a cached BaseConsumer keyed by group_id.
+        let consumer = self.get_or_create_consumer(group_id)?;
         let queue = queue.to_string();
 
-        let stats = tokio::task::spawn_blocking(move || -> Result<KafkaQueueStats> {
-            let consumer: BaseConsumer =
-                base.clone()
-                    .set("group.id", &group_id)
-                    .create()
+        // Fetch metadata to enumerate partitions.
+        let partitions: Vec<i32> = {
+            let c = Arc::clone(&consumer);
+            let q = queue.clone();
+            tokio::task::spawn_blocking(move || -> Result<Vec<i32>> {
+                let metadata = c
+                    .fetch_metadata(Some(&q), Duration::from_secs(5))
                     .map_err(|e| {
-                        ShoveError::Topology(format!("failed to create stats consumer: {e}"))
+                        ShoveError::Connection(format!("failed to fetch metadata for {q}: {e}"))
                     })?;
-
-            // Get topic metadata to find all partitions
-            let metadata = consumer
-                .fetch_metadata(Some(&queue), Duration::from_secs(5))
-                .map_err(|e| {
-                    ShoveError::Connection(format!("failed to fetch metadata for {queue}: {e}"))
-                })?;
-
-            let topic_metadata = metadata
-                .topics()
-                .first()
-                .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {queue}")))?;
-
-            // Build a single TopicPartitionList for all partitions so we
-            // fetch committed offsets in one RPC instead of N.
-            let partitions: Vec<i32> = topic_metadata.partitions().iter().map(|p| p.id()).collect();
-            let mut tpl = rdkafka::TopicPartitionList::new();
-            for &pid in &partitions {
-                tpl.add_partition(&queue, pid);
-            }
-            // committed_offsets can fail with transient errors (e.g. NotCoordinator)
-            // when the group coordinator hasn't been elected yet. Retry a few times
-            // with a short delay before giving up.
-            let committed = {
-                let mut last_err = None;
-                let mut committed_result = None;
-                for attempt in 0..5u32 {
-                    match consumer.committed_offsets(tpl.clone(), Duration::from_secs(5)) {
-                        Ok(result) => {
-                            committed_result = Some(result);
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                            if attempt < 4 {
-                                std::thread::sleep(Duration::from_millis(
-                                    500 * (attempt as u64 + 1),
-                                ));
-                            }
-                        }
-                    }
-                }
-                committed_result.ok_or_else(|| {
-                    ShoveError::Connection(format!(
-                        "failed to get committed offsets for {queue}: {}",
-                        last_err.unwrap()
-                    ))
-                })?
-            };
-
-            let mut total_lag: u64 = 0;
-
-            for &pid in &partitions {
-                let (_low, high) = consumer
-                    .fetch_watermarks(&queue, pid, Duration::from_secs(5))
-                    .map_err(|e| {
-                        ShoveError::Connection(format!(
-                            "failed to fetch watermarks for {queue}/{pid}: {e}"
-                        ))
-                    })?;
-
-                if let Some(elem) = committed.find_partition(&queue, pid) {
-                    let committed_offset = match elem.offset() {
-                        rdkafka::Offset::Offset(o) => o,
-                        _ => 0,
-                    };
-                    if high > committed_offset {
-                        total_lag += (high - committed_offset) as u64;
-                    }
-                } else {
-                    total_lag += high as u64;
-                }
-            }
-
-            Ok(KafkaQueueStats {
-                messages_pending: total_lag,
-                messages_in_flight: 0, // Kafka doesn't expose in-flight count easily
+                let topic_metadata = metadata
+                    .topics()
+                    .first()
+                    .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {q}")))?;
+                Ok(topic_metadata.partitions().iter().map(|p| p.id()).collect())
             })
-        })
-        .await
-        .map_err(|e| ShoveError::Topology(format!("stats task failed: {e}")))??;
+            .await
+            .map_err(|e| ShoveError::Topology(format!("metadata task failed: {e}")))??
+        };
 
-        Ok(stats)
+        // Build a single TopicPartitionList for all partitions so we
+        // fetch committed offsets in one RPC instead of N.
+        let mut tpl = TopicPartitionList::new();
+        for &pid in &partitions {
+            tpl.add_partition(&queue, pid);
+        }
+
+        // perf-K-11: committed_offsets can fail with transient errors (e.g.
+        // NotCoordinator) when the group coordinator hasn't been elected.
+        // Drive the retry loop with tokio::time::sleep between attempts so
+        // we don't hold a spawn_blocking worker across the backoff (the old
+        // code used std::thread::sleep, which could pin a worker for up to
+        // 5 seconds under coordinator-election races).
+        let committed = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 0..5u32 {
+                let c = Arc::clone(&consumer);
+                let tpl_clone = tpl.clone();
+                let r = tokio::task::spawn_blocking(move || {
+                    c.committed_offsets(tpl_clone, Duration::from_secs(5))
+                })
+                .await
+                .map_err(|e| ShoveError::Topology(format!("committed task failed: {e}")))?;
+                match r {
+                    Ok(c) => {
+                        result = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < 4 {
+                            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1)))
+                                .await;
+                        }
+                    }
+                }
+            }
+            result.ok_or_else(|| {
+                ShoveError::Connection(format!(
+                    "failed to get committed offsets for {queue}: {}",
+                    last_err.unwrap()
+                ))
+            })?
+        };
+
+        // Per-partition watermark fetch is still serial (perf-K-12 — rdkafka
+        // doesn't expose a batched end-watermarks API; staying serial here).
+        let total_lag: u64 = {
+            let c = Arc::clone(&consumer);
+            let q = queue.clone();
+            tokio::task::spawn_blocking(move || -> Result<u64> {
+                let mut total: u64 = 0;
+                for pid in partitions {
+                    let (_low, high) = c
+                        .fetch_watermarks(&q, pid, Duration::from_secs(5))
+                        .map_err(|e| {
+                            ShoveError::Connection(format!(
+                                "failed to fetch watermarks for {q}/{pid}: {e}"
+                            ))
+                        })?;
+                    if let Some(elem) = committed.find_partition(&q, pid) {
+                        let committed_offset = match elem.offset() {
+                            rdkafka::Offset::Offset(o) => o,
+                            _ => 0,
+                        };
+                        if high > committed_offset {
+                            total += (high - committed_offset) as u64;
+                        }
+                    } else {
+                        total += high as u64;
+                    }
+                }
+                Ok(total)
+            })
+            .await
+            .map_err(|e| ShoveError::Topology(format!("watermarks task failed: {e}")))??
+        };
+
+        Ok(KafkaQueueStats {
+            messages_pending: total_lag,
+            messages_in_flight: 0, // Kafka doesn't expose in-flight count easily
+        })
     }
 }
 
