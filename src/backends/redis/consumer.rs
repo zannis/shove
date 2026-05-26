@@ -711,6 +711,7 @@ where
                         .processing
                         .store(false, std::sync::atomic::Ordering::Release);
 
+                    fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     route_outcome(
                         &mut conn,
                         topology,
@@ -983,6 +984,7 @@ where
                     let task_processing = Arc::clone(&processing);
                     let task_semaphore = Arc::clone(&semaphore);
 
+                    fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     tokio::spawn(async move {
                         let _inflight =
                             metrics::InflightGuard::new(task_topic.clone(), task_group_metric.clone());
