@@ -450,6 +450,9 @@ where
                 }
             }
             let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
+            // Collect Acks into a batch; non-Ack outcomes still need
+            // per-message routing (Retry/Reject/Defer touch distinct queues).
+            let mut drain_acks: Vec<String> = Vec::with_capacity(in_flight.len());
             for pending in in_flight {
                 let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
                     .await
@@ -461,17 +464,29 @@ where
                         Ok(Outcome::Retry)
                     })
                     .unwrap_or(Outcome::Retry);
-                route_outcome(
-                    sqs,
+                if matches!(outcome, Outcome::Ack) {
+                    drain_acks.push(pending.receipt_handle);
+                } else {
+                    route_outcome(
+                        sqs,
+                        queue_url,
+                        &pending.receipt_handle,
+                        &pending.body,
+                        &pending.message_attributes,
+                        outcome,
+                        topology,
+                        pending.retry_count,
+                    )
+                    .await;
+                }
+            }
+            if !drain_acks.is_empty() {
+                let batch_size = drain_acks.len();
+                debug!(
                     queue_url,
-                    &pending.receipt_handle,
-                    &pending.body,
-                    &pending.message_attributes,
-                    outcome,
-                    topology,
-                    pending.retry_count,
-                )
-                .await;
+                    batch_size, "flushing ack batch on drain completion"
+                );
+                router::route_ack_batch(sqs, queue_url, drain_acks).await;
             }
             return Ok(());
         }
