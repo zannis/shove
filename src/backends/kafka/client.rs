@@ -214,6 +214,10 @@ pub struct KafkaConfig {
     pub tls: Option<KafkaTls>,
     #[cfg(feature = "kafka-ssl")]
     pub sasl: Option<KafkaSasl>,
+    /// When `true`, bypass the SASL-without-TLS refusal for development
+    /// environments. **Never set this in production.** Default: `false`.
+    #[cfg(feature = "kafka-ssl")]
+    pub(crate) allow_plaintext_credentials: bool,
 }
 
 impl KafkaConfig {
@@ -224,6 +228,8 @@ impl KafkaConfig {
             tls: None,
             #[cfg(feature = "kafka-ssl")]
             sasl: None,
+            #[cfg(feature = "kafka-ssl")]
+            allow_plaintext_credentials: false,
         }
     }
 
@@ -241,6 +247,17 @@ impl KafkaConfig {
     #[cfg(feature = "kafka-ssl")]
     pub fn with_sasl(mut self, sasl: KafkaSasl) -> Self {
         self.sasl = Some(sasl);
+        self
+    }
+
+    /// Allow SASL credentials to be sent over a plaintext (non-TLS) connection.
+    ///
+    /// **For development use only.** Sending a static username/password over
+    /// plaintext exposes credentials to any network observer. In production,
+    /// always pair SASL with TLS via `with_tls(...)`.
+    #[cfg(feature = "kafka-ssl")]
+    pub fn allow_plaintext_credentials(mut self) -> Self {
+        self.allow_plaintext_credentials = true;
         self
     }
 }
@@ -305,17 +322,28 @@ impl KafkaClient {
             // Only warn for mechanisms that actually transmit a static
             // username/password. OAUTHBEARER (MSK IAM) sends a signed token
             // instead, and MSK IAM is rejected outright below if TLS is off —
-            // suppressing the warning here keeps the eventual Topology error
+            // suppressing the warn here keeps the eventual Topology error
             // the only thing the operator sees.
+            //
+            // sec-K-2: static credentials over plaintext is refused outright.
+            // A warning is too easy to miss in production logs; the password
+            // would already be on the wire by the time anyone reads it.
+            // Use KafkaConfig::allow_plaintext_credentials() to opt in
+            // explicitly for development environments.
             if config
                 .sasl
                 .as_ref()
                 .is_some_and(|s| s.credentials().is_some())
                 && config.tls.is_none()
+                && !config.allow_plaintext_credentials
             {
-                tracing::warn!(
-                    "Kafka SASL enabled without TLS; credentials will be sent in plaintext over the network"
-                );
+                return Err(ShoveError::Topology(
+                    "Kafka SASL credentials require TLS: set KafkaConfig::with_tls(...) before \
+                     connecting. Sending a static username/password over plaintext exposes \
+                     credentials to any network observer. To allow this for development, call \
+                     KafkaConfig::allow_plaintext_credentials()."
+                        .into(),
+                ));
             }
             if let Some(p) = protocol {
                 base_config.set("security.protocol", p);
@@ -784,5 +812,26 @@ mod tests {
         assert!(!rendered.contains("NESTED-PASSWORD"));
         assert!(rendered.contains("broker:9093"));
         assert!(rendered.contains("bob"));
+    }
+
+    // -- sec-K-2: SASL over plaintext must be refused, not warned --
+
+    #[cfg(feature = "kafka-ssl")]
+    #[tokio::test]
+    async fn sasl_plaintext_without_tls_is_rejected() {
+        // Before the fix this produced a warn! and continued; it must now Err.
+        let cfg =
+            KafkaConfig::new("localhost:9092").with_sasl(KafkaSasl::plain("alice", "password"));
+        // No TLS → should be a topology error, not a warn.
+        let result = KafkaClient::connect(&cfg).await.map(|_| ());
+        assert!(
+            result.is_err(),
+            "SASL over plaintext must be refused at connect() time, not just warned"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("TLS") || msg.contains("plaintext") || msg.contains("credentials"),
+            "error message should describe the plaintext-credentials risk, got: {msg}"
+        );
     }
 }
