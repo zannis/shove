@@ -2,6 +2,7 @@ use std::fmt;
 #[cfg(feature = "kafka-ssl")]
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
@@ -13,9 +14,6 @@ use rdkafka::producer::{FutureProducer, Producer};
 
 use super::publisher::publish_with_retry as publisher_publish_with_retry;
 use tokio_util::sync::CancellationToken;
-
-#[cfg(feature = "kafka-msk-iam")]
-use std::sync::Arc;
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::{MskIamContext, MskIamTokenProvider};
@@ -288,9 +286,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 pub struct KafkaClient {
     brokers: String,
     /// Pre-populated ClientConfig containing `bootstrap.servers` plus any
-    /// TLS/SASL settings. Every consumer/admin/metadata call clones this
-    /// so security settings never have to be re-applied at call sites.
-    base_config: ClientConfig,
+    /// TLS/SASL settings. Every consumer/admin/metadata call clones from
+    /// this so security settings never have to be re-applied at call sites.
+    ///
+    /// perf-K-14: stored as `Arc<ClientConfig>` so `KafkaClient::clone()` —
+    /// done for every per-consumer, per-publisher, per-autoscaler-poll
+    /// handle — is a refcount bump instead of a multi-KB copy of the inner
+    /// HashMap (which can include large PEM blobs when TLS is configured).
+    base_config: Arc<ClientConfig>,
     producer: KafkaProducerInner,
     #[cfg(feature = "kafka-msk-iam")]
     msk_context: Option<MskIamContext>,
@@ -452,7 +455,7 @@ impl KafkaClient {
 
         Ok(Self {
             brokers: config.brokers.clone(),
-            base_config,
+            base_config: Arc::new(base_config),
             producer,
             #[cfg(feature = "kafka-msk-iam")]
             msk_context,
@@ -524,7 +527,7 @@ impl KafkaClient {
     /// would dump raw PEM including private keys. Internal call sites only
     /// use the returned config to create consumers/admins — they do not log it.
     pub(super) fn base_config(&self) -> ClientConfig {
-        self.base_config.clone()
+        (*self.base_config).clone()
     }
 
     /// Look up a single non-sensitive rdkafka configuration entry.
@@ -659,7 +662,7 @@ impl KafkaClient {
         // Fetch current partition count from metadata. The blocking work is
         // pushed onto a dedicated thread because librdkafka's metadata fetch
         // is synchronous; the helper owns all the cfg-gated context selection.
-        let base = self.base_config.clone();
+        let base = (*self.base_config).clone();
         let topic_name = name.to_string();
         #[cfg(feature = "kafka-msk-iam")]
         let msk_ctx = self.msk_context();
