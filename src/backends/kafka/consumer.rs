@@ -693,7 +693,11 @@ impl KafkaConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
-        let group_id = super::constants::consumer_group_id(queue);
+        let group_id = options
+            .kafka_group_id
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| super::constants::consumer_group_id(queue));
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();

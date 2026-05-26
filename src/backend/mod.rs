@@ -202,6 +202,8 @@ mod bounds_smoke {
             shutdown: CancellationToken::new(),
             processing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             consumer_group: None,
+            #[cfg(feature = "kafka")]
+            kafka_group_id: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

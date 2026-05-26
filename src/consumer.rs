@@ -344,6 +344,8 @@ impl<B: Backend> ConsumerOptions<B> {
             shutdown: self.shutdown.unwrap_or_default(),
             processing: self.processing,
             consumer_group: self.consumer_group,
+            #[cfg(feature = "kafka")]
+            kafka_group_id: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]

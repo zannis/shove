@@ -37,6 +37,13 @@ pub struct KafkaConsumerGroupConfig {
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
+    /// Optional Kafka consumer group ID override.
+    ///
+    /// When `None` (the default), the group ID is derived from the topic name as
+    /// `"{queue}-consumer"`. Set this when two independent services must each
+    /// receive every message from the same topic (fan-out) — without separate
+    /// group IDs they share the same consumer group and compete for partitions.
+    group_id: Option<String>,
 }
 
 impl Default for KafkaConsumerGroupConfig {
@@ -70,6 +77,7 @@ impl KafkaConsumerGroupConfig {
             concurrent_processing: false,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
+            group_id: None,
         }
     }
 
@@ -92,6 +100,27 @@ impl KafkaConsumerGroupConfig {
     pub fn with_concurrent_processing(mut self, concurrent: bool) -> Self {
         self.concurrent_processing = concurrent;
         self
+    }
+
+    /// Override the Kafka consumer group ID for this consumer group.
+    ///
+    /// By default the group ID is `"{queue}-consumer"`. Call this when two
+    /// independent services consume the same topic and each must receive all
+    /// messages (fan-out): they must use different group IDs so they are
+    /// assigned independent partition sets rather than competing for the same
+    /// partitions.
+    ///
+    /// This overrides only the rdkafka `group.id`; the group is still
+    /// identified within the registry by the topic name.
+    pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = Some(group_id.into());
+        self
+    }
+
+    /// Returns the explicitly configured consumer group ID, or `None` if the
+    /// default (`"{queue}-consumer"`) should be used.
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
     }
 
     pub fn prefetch_count(&self) -> u16 {
@@ -442,6 +471,9 @@ impl KafkaConsumerGroup {
         }
         options.max_message_size = self.config.max_message_size;
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
+        if let Some(ref gid) = self.config.group_id {
+            options.kafka_group_id = Some(Arc::from(gid.as_str()));
+        }
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
@@ -957,6 +989,21 @@ mod tests {
     fn with_default_handler_timeout_zero_panics() {
         let registry = KafkaConsumerGroupRegistry::from_groups(HashMap::new());
         let _ = registry.with_default_handler_timeout(Duration::ZERO);
+    }
+
+    // -- configurable group_id (arch-K-3) --
+
+    #[test]
+    fn with_group_id_overrides_default() {
+        // with_group_id() must exist and store the override
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
+        assert_eq!(cfg.group_id(), Some("my-service"));
+    }
+
+    #[test]
+    fn without_group_id_returns_none() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.group_id(), None);
     }
 
     // -- group_id (arch-K-1) --
