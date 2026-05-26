@@ -7,7 +7,10 @@ use redis::aio::MultiplexedConnection;
 use redis::cluster::{ClusterClient, ClusterConfig};
 use redis::cluster_async::ClusterConnection;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::error::{Result, ShoveError};
+use crate::retry::Backoff;
 
 use super::constants::{BLOCK_MS, DEFAULT_GROUP};
 
@@ -409,6 +412,43 @@ fn info_payloads(value: redis::Value) -> Result<Vec<String>> {
         other => Err(ShoveError::Connection(format!(
             "unexpected INFO server reply: {other:?}"
         ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared sidecar helper
+// ---------------------------------------------------------------------------
+
+/// Acquire a multiplexed Redis connection, retrying with exponential backoff
+/// (1 s → 30 s, full jitter) until `shutdown` is cancelled.
+///
+/// Returns `None` if the token is cancelled before a connection is obtained.
+/// The `task` label is embedded in the log line so callers don't need their
+/// own copy of this loop.
+pub(super) async fn acquire_conn_with_retry(
+    client: &RedisClient,
+    shutdown: &CancellationToken,
+    task: &str,
+) -> Option<RedisConnection> {
+    let mut backoff = Backoff::default();
+    loop {
+        match client.multiplexed_conn().await {
+            Ok(c) => return Some(c),
+            Err(e) => {
+                if shutdown.is_cancelled() {
+                    return None;
+                }
+                let delay = backoff.next().expect("backoff is infinite");
+                tracing::warn!(
+                    "{task}: connection failed ({e}), retrying in {:.1}s",
+                    delay.as_secs_f64()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => return None,
+                }
+            }
+        }
     }
 }
 
