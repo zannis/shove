@@ -110,6 +110,9 @@ rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = tr
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats", "kafka", "redis"] }
+# RUSTSEC-2026-0145: testcontainers 0.27.3 pulls in astral-tokio-tar 0.6.1 which
+# has a known vulnerability. Pin to 0.6.2 until testcontainers ships a fix.
+astral-tokio-tar = "0.6.2"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
