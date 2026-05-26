@@ -554,11 +554,11 @@ where
                 let entries = parse_xreadgroup_reply(raw_reply);
 
                 for (entry_id, fields_vec) in entries {
-                    let fields: HashMap<String, String> = fields_vec.into_iter().collect();
+                    let mut fields: HashMap<String, String> = fields_vec.into_iter().collect();
 
-                    // Extract payload.
-                    let payload_raw = match fields.get(PAYLOAD_FIELD) {
-                        Some(s) => s.clone(),
+                    // Extract payload — take ownership to avoid cloning on the hot path.
+                    let payload_raw = match fields.remove(PAYLOAD_FIELD) {
+                        Some(s) => s,
                         None => {
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
                             if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
@@ -589,6 +589,7 @@ where
                             consumer_group,
                             metrics::FailReason::Oversize,
                         );
+                        fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                         route_to_dlq(
                             &mut conn,
                             topology,
@@ -619,6 +620,7 @@ where
                                 consumer_group,
                                 metrics::FailReason::Deserialize,
                             );
+                            fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                             route_to_dlq(
                                 &mut conn,
                                 topology,
@@ -860,10 +862,11 @@ where
                 let entries = parse_xreadgroup_reply(raw_reply);
 
                 for (entry_id, fields_vec) in entries {
-                    let fields: HashMap<String, String> = fields_vec.into_iter().collect();
+                    let mut fields: HashMap<String, String> = fields_vec.into_iter().collect();
 
-                    let payload_raw = match fields.get(PAYLOAD_FIELD) {
-                        Some(s) => s.clone(),
+                    // Extract payload — take ownership to avoid cloning on the hot path.
+                    let payload_raw = match fields.remove(PAYLOAD_FIELD) {
+                        Some(s) => s,
                         None => {
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
                             if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
@@ -893,6 +896,7 @@ where
                             consumer_group,
                             metrics::FailReason::Oversize,
                         );
+                        fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                         route_to_dlq(
                             &mut conn,
                             topology,
@@ -922,6 +926,7 @@ where
                                 consumer_group,
                                 metrics::FailReason::Deserialize,
                             );
+                            fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                             route_to_dlq(
                                 &mut conn,
                                 topology,
