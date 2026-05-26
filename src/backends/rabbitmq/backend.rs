@@ -119,7 +119,7 @@ impl Backend for RabbitMq {
     type PublisherImpl = RabbitMqPublisher;
     type ConsumerImpl = RabbitMqConsumer;
     type TopologyImpl = LazyRabbitMqTopologyDeclarer;
-    type AutoscalerImpl = RabbitMqAutoscalerBackend<ManagementClient>;
+    type AutoscalerImpl = RabbitMqAutoscalerBackend<RabbitMqStatsBridge>;
     type QueueStatsImpl = RabbitMqStatsBridge;
 
     async fn connect(config: Self::Config) -> Result<Self::Client> {
@@ -138,21 +138,18 @@ impl Backend for RabbitMq {
         LazyRabbitMqTopologyDeclarer::new(client.clone())
     }
 
-    /// # Panics
+    /// Returns an autoscaler backend backed by a [`RabbitMqStatsBridge`].
     ///
-    /// Panics if `RabbitMqConfig::with_management(...)` was not set. The
-    /// autoscaler is useless without management — loud failure at
-    /// construction is preferred over silent no-op decisions at scale time.
+    /// If `RabbitMqConfig::with_management(...)` was not set, or the management
+    /// client fails to initialise (e.g. unreadable CA certificate), the error is
+    /// deferred to the first metrics poll — consistent with
+    /// [`make_stats_provider`](Self::make_stats_provider).
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
         use std::sync::Arc;
         use tokio::sync::Mutex;
-        let mc = ManagementClient::new(client.management_config().expect(
-            "Broker<RabbitMq>::autoscaler() requires \
-                 RabbitMqConfig::with_management(...) to be set",
-        ))
-        .expect("failed to build management HTTP client for autoscaler");
+        let stats = RabbitMqStatsBridge::from_config(client.management_config());
         let registry = Arc::new(Mutex::new(ConsumerGroupRegistry::new(client.clone())));
-        RabbitMqAutoscalerBackend::with_stats_provider(mc, registry)
+        RabbitMqAutoscalerBackend::with_stats_provider(stats, registry)
     }
 
     fn make_stats_provider(client: &Self::Client) -> Self::QueueStatsImpl {
@@ -242,7 +239,7 @@ impl TopologyImpl for LazyRabbitMqTopologyDeclarer {
 // AutoscalerBackendImpl — trait has no methods in Phase 4
 // ---------------------------------------------------------------------------
 
-impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<ManagementClient> {}
+impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<RabbitMqStatsBridge> {}
 
 // ---------------------------------------------------------------------------
 // RabbitMqStatsBridge — maps Option<ManagementClient> into the
