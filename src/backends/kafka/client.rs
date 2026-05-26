@@ -745,7 +745,13 @@ fn fetch_topic_partition_count_blocking(
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
 
     let mut cfg = base;
-    cfg.set("group.id", "shove-partition-check");
+    // arch-K-10: per-process suffix on the group id so multiple shove
+    // processes don't collide in kafka-consumer-groups.sh / Kafka UI /
+    // MSK console under a single shared "shove-partition-check" name.
+    cfg.set(
+        "group.id",
+        format!("shove-partition-check-{}", process::id()),
+    );
 
     #[cfg(feature = "kafka-msk-iam")]
     let metadata = if let Some(ctx) = msk_ctx {
