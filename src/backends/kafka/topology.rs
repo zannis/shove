@@ -56,9 +56,16 @@ impl KafkaTopologyDeclarer {
 
     async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
-        let seq = topology
-            .sequencing()
-            .expect("sequenced topology must have sequencing config");
+        // sec-K-9: surface misuse as a typed error instead of panicking. The
+        // caller path is gated by `topology.sequencing().is_some()` in
+        // `declare`, so this branch is unreachable under correct callers —
+        // but a Result keeps misuse from this internal helper recoverable
+        // (vs. process abort) if a future caller wires it up wrong.
+        let seq = topology.sequencing().ok_or_else(|| {
+            crate::ShoveError::Topology(format!(
+                "declare_sequenced called for {queue} without sequencing config"
+            ))
+        })?;
 
         let num_partitions = self.effective_partitions(seq.routing_shards() as i32);
         self.client

@@ -1035,9 +1035,15 @@ impl KafkaConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue().to_string();
-        let _seq_config = topology
-            .sequencing()
-            .expect("run_fifo requires a sequenced topology");
+        // sec-K-9: T is bound by SequencedTopic at the trait level, so this
+        // is unreachable under correct callers. Returning an error instead
+        // of expect()-panicking keeps misuse (e.g. from a future caller
+        // path) recoverable.
+        let _seq_config = topology.sequencing().ok_or_else(|| {
+            ShoveError::Topology(format!(
+                "run_fifo called on {queue} without sequencing config"
+            ))
+        })?;
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
