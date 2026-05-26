@@ -43,7 +43,7 @@ impl TopicRegistry {
         self.arns.read().await.get(queue_name).cloned()
     }
 
-    pub async fn insert(&self, queue_name: String, arn: String) {
+    pub(crate) async fn insert(&self, queue_name: String, arn: String) {
         self.arns.write().await.insert(queue_name, arn);
     }
 }
@@ -73,7 +73,7 @@ impl QueueRegistry {
         self.urls.read().await.get(queue_name).cloned()
     }
 
-    pub async fn insert(&self, queue_name: String, url: String) {
+    pub(crate) async fn insert(&self, queue_name: String, url: String) {
         self.urls.write().await.insert(queue_name, url);
     }
 }
