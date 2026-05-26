@@ -141,11 +141,18 @@ impl ConsumerImpl for SqsConsumer {
         SqsConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        _options: ConsumerOptionsInner,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
+        // SQS DLQ consumer does not enforce max_message_size — SQS already
+        // bounds individual message size at 256 KiB (broker-side).
         SqsConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 

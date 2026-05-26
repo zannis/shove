@@ -214,9 +214,15 @@ mod bounds_smoke {
         let _ =
             <_ as ConsumerImpl>::run::<Dummy, DummyHandler>(c, DummyHandler, (), options.clone())
                 .await;
-        let _ = <_ as ConsumerImpl>::run_fifo::<Dummy, DummyHandler>(c, DummyHandler, (), options)
-            .await;
-        let _ = <_ as ConsumerImpl>::run_dlq::<Dummy, DummyHandler>(c, DummyHandler, ()).await;
+        let _ = <_ as ConsumerImpl>::run_fifo::<Dummy, DummyHandler>(
+            c,
+            DummyHandler,
+            (),
+            options.clone(),
+        )
+        .await;
+        let _ =
+            <_ as ConsumerImpl>::run_dlq::<Dummy, DummyHandler>(c, DummyHandler, (), options).await;
     }
 
     #[cfg(feature = "inmemory")]

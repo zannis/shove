@@ -119,11 +119,18 @@ impl ConsumerImpl for NatsConsumer {
         NatsConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        _options: ConsumerOptionsInner,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
+        // NATS JetStream DLQ consumer does not consult max_message_size —
+        // message size is enforced stream-side at declaration time.
         NatsConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 

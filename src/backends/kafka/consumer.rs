@@ -24,7 +24,7 @@ use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
+use crate::{HoldQueue, Kafka, ShoveError};
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
@@ -1265,7 +1265,25 @@ impl KafkaConsumer {
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
+    /// Public DLQ entrypoint with default options (no max_message_size cap).
+    /// Equivalent to `run_dlq_with_inner` with `ConsumerOptions::default()`
+    /// inner; kept for backward compatibility with users who don't need to
+    /// thread per-consumer options into the DLQ loop.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        let options = crate::ConsumerOptions::<Kafka>::new().into_inner();
+        self.run_dlq_with_inner::<T, H>(handler, ctx, options).await
+    }
+
+    pub(crate) async fn run_dlq_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
@@ -1280,6 +1298,9 @@ impl KafkaConsumer {
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
+        // sec-K-7: respect the same max_message_size the main consumer uses
+        // rather than the DEFAULT_MAX_MESSAGE_SIZE constant.
+        let max_message_size = options.max_message_size;
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
@@ -1324,11 +1345,15 @@ impl KafkaConsumer {
                             let payload_bytes = msg.payload().unwrap_or_default();
                             let headers = extract_string_headers(&msg);
 
-                            // Discard oversized DLQ messages
-                            if payload_bytes.len() > DEFAULT_MAX_MESSAGE_SIZE {
+                            // sec-K-7: honor options.max_message_size (same as the main
+                            // consumer) instead of the DEFAULT_MAX_MESSAGE_SIZE constant.
+                            // None means no limit.
+                            if let Some(max) = max_message_size
+                                && payload_bytes.len() > max
+                            {
                                 tracing::warn!(
                                     bytes = payload_bytes.len(),
-                                    max = DEFAULT_MAX_MESSAGE_SIZE,
+                                    max,
                                     dlq,
                                     "oversized DLQ message — discarding"
                                 );

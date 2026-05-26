@@ -198,12 +198,16 @@ impl RedisConsumer {
     /// The loop runs until the underlying JoinHandle is aborted by the caller
     /// — the DLQ consumer does not accept an external shutdown token (matches
     /// the [`ConsumerImpl::run_dlq`] contract).
+    /// Public DLQ entrypoint with default options. The DLQ loop spins until
+    /// the underlying JoinHandle is aborted by the caller (matches the
+    /// [`ConsumerImpl::run_dlq`] contract).
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
-        <Self as ConsumerImpl>::run_dlq::<T, H>(self, handler, ctx).await
+        let options = crate::ConsumerOptions::<crate::Redis>::new().into_inner();
+        <Self as ConsumerImpl>::run_dlq::<T, H>(self, handler, ctx, options).await
     }
 }
 
@@ -252,7 +256,12 @@ impl ConsumerImpl for RedisConsumer {
         }
     }
 
-    fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> impl Future<Output = Result<()>> + Send
+    fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
         H: MessageHandler<T>,
@@ -266,11 +275,6 @@ impl ConsumerImpl for RedisConsumer {
                     topology.queue()
                 ))
             })?;
-            // DLQ consumers intentionally run until their JoinHandle is
-            // aborted by the caller — the `ConsumerImpl::run_dlq` trait
-            // contract does not accept an external shutdown token.
-            let shutdown = CancellationToken::new();
-            let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
             run_stream_loop::<T, H>(client, handler, ctx, options, topology, dlq_name).await
         }
     }

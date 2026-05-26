@@ -122,12 +122,17 @@ impl ConsumerImpl for KafkaConsumer {
         KafkaConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
-        KafkaConsumer::run_dlq::<T, H>(self, handler, ctx).await
+        KafkaConsumer::run_dlq_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
     async fn spawn_fifo_shards<T, H>(

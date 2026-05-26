@@ -135,11 +135,18 @@ impl ConsumerImpl for InMemoryConsumer {
         InMemoryConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        _options: ConsumerOptionsInner,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
+        // In-memory DLQ has no size validation (messages never leave the
+        // process); the options arg is accepted for trait conformance.
         InMemoryConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 
