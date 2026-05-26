@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer as RdkafkaConsumer, StreamConsumer};
 use rdkafka::error::{KafkaError, KafkaResult};
@@ -293,7 +294,10 @@ async fn route_outcome(
     client: &KafkaClient,
     topic: &str,
     payload: &[u8],
-    key: Option<&[u8]>,
+    // perf-K-9: take key as Option<Bytes> by value. Each match arm uses it
+    // once, so we move it instead of cloning. The receive loop's Bytes
+    // refcount machinery makes any further sharing a refcount bump.
+    key: Option<Bytes>,
     headers: &HashMap<String, String>,
     outcome: Outcome,
     topology: &'static QueueTopology,
@@ -310,7 +314,7 @@ async fn route_outcome(
                     client,
                     topology,
                     payload,
-                    key,
+                    key.as_deref(),
                     headers,
                     "max_retries_exceeded",
                 )
@@ -334,7 +338,6 @@ async fn route_outcome(
             let client = client.clone();
             let topic = topic.to_string();
             let payload = payload.to_vec();
-            let key = key.map(|k| k.to_vec());
             let retry_headers =
                 headers_with_retry_count(headers, new_count, &format!("-r{new_count}"));
 
@@ -357,7 +360,16 @@ async fn route_outcome(
             true
         }
         Outcome::Reject => {
-            match publish_to_dlq(client, topology, payload, key, headers, "rejected").await {
+            match publish_to_dlq(
+                client,
+                topology,
+                payload,
+                key.as_deref(),
+                headers,
+                "rejected",
+            )
+            .await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to publish rejected message to DLQ");
@@ -375,7 +387,6 @@ async fn route_outcome(
             let client = client.clone();
             let topic = topic.to_string();
             let payload = payload.to_vec();
-            let key = key.map(|k| k.to_vec());
             // Defer does NOT increment retry count
             let defer_headers = headers_with_retry_count(
                 headers,
@@ -791,7 +802,9 @@ impl KafkaConsumer {
                             let headers = extract_string_headers(&msg);
                             let partition = msg.partition();
                             let offset = msg.offset();
-                            let key = msg.key().map(|k| k.to_vec());
+                            // perf-K-9: store key as bytes::Bytes — cloning into spawned
+                            // delay tasks becomes a refcount bump instead of a memcpy.
+                            let key = msg.key().map(Bytes::copy_from_slice);
 
                             tracker.track_received(partition, offset);
 
@@ -906,7 +919,7 @@ impl KafkaConsumer {
                                     &task_client,
                                     &task_topic,
                                     &payload_bytes,
-                                    key.as_deref(),
+                                    key,
                                     &headers,
                                     outcome,
                                     topology,
@@ -1063,7 +1076,8 @@ impl KafkaConsumer {
                                 // directly instead of allocating a Vec<u8> copy.
                                 let payload_bytes = msg.payload().unwrap_or_default();
                                 let headers = extract_string_headers(&msg);
-                                let key = msg.key().map(|k| k.to_vec());
+                                // perf-K-9: Bytes for cheap refcount-clone semantics.
+                                let key = msg.key().map(Bytes::copy_from_slice);
 
                                 metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
 
@@ -1155,7 +1169,7 @@ impl KafkaConsumer {
                                     &client,
                                     &queue,
                                     payload_bytes,
-                                    key.as_deref(),
+                                    key,
                                     &headers,
                                     outcome,
                                     topology,
