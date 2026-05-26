@@ -1158,7 +1158,24 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
         .expect("docker start");
     assert!(status.success(), "docker start failed");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Poll redis-cli ping until the container accepts connections; under
+    // heavy parallel container load on this host a fixed 3s sleep is not
+    // enough and the subsequent Broker::new races the daemon.
+    let mut ready = false;
+    for _ in 0..30 {
+        let probe = std::process::Command::new("docker")
+            .args(["exec", &container_id, "redis-cli", "ping"])
+            .output();
+        if let Ok(out) = probe
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).trim() == "PONG"
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(ready, "Redis did not become ready within 30s after restart");
 
     // Redeclare topology (data was wiped) and publish a message via a fresh broker.
     let broker2 = Broker::<Redis>::new(
