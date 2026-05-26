@@ -35,11 +35,19 @@ where
     C: ClientContext + 'static,
 {
     let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
+    // perf-K-1: avoid cloning headers on the last (or only) attempt.
+    // Take from the Option on the final attempt to move instead of clone;
+    // earlier attempts still clone because we may need them for retries.
+    let mut headers_opt = Some(headers);
 
     for attempt in 1..=max_attempts {
-        let mut record = FutureRecord::to(topic)
-            .payload(payload)
-            .headers(headers.clone());
+        let h = if attempt < max_attempts {
+            // Safety: headers_opt is Some until the final attempt.
+            headers_opt.as_ref().unwrap().clone()
+        } else {
+            headers_opt.take().unwrap()
+        };
+        let mut record = FutureRecord::to(topic).payload(payload).headers(h);
         if let Some(k) = key {
             record = record.key(k);
         }
