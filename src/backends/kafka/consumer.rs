@@ -407,11 +407,15 @@ async fn route_outcome(
 /// Invoke the handler future with an optional timeout, emitting inflight /
 /// consumed / duration metrics. Returns `Outcome::Retry` on timeout or panic.
 ///
-/// The future is run inside a child `tokio::spawn` so a panic inside the
-/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
-/// `Outcome::Retry` with metrics recorded — without this, the spawned task
-/// aborts before the metric calls and panicked handlers disappear from the
-/// consumed/latency series even though the caller still requeues them.
+/// Awaits the handler future with timeout + panic isolation, recording
+/// per-outcome metrics. A panic inside the user's handler is caught via
+/// `AssertUnwindSafe(...).catch_unwind()` and surfaced as `Outcome::Retry`.
+///
+/// perf-K-7: this previously spawned an inner `tokio::spawn` to catch panics
+/// via JoinError. The spawn allocated a task struct + scheduler enqueue per
+/// message — combined with the wrapper spawn (now removed) and outer outcome
+/// spawn, that was 3 spawns per message. catch_unwind achieves the same
+/// panic-isolation outcome without the task alloc.
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
@@ -419,29 +423,31 @@ async fn invoke_handler<F>(
     group: Option<&str>,
 ) -> Outcome
 where
-    F: std::future::Future<Output = Outcome> + Send + 'static,
+    F: std::future::Future<Output = Outcome> + Send,
 {
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let mut join = tokio::spawn(fut);
+    let safe_fut = AssertUnwindSafe(fut).catch_unwind();
     let outcome = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
+        Some(duration) => match tokio::time::timeout(duration, safe_fut).await {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
+            Ok(Err(_panic)) => {
+                tracing::warn!("handler panicked, retrying message");
                 Outcome::Retry
             }
             Err(_) => {
-                join.abort();
                 tracing::warn!("handler timed out after {duration:?}, retrying");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
             }
         },
-        None => match join.await {
+        None => match safe_fut.await {
             Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
+            Err(_panic) => {
+                tracing::warn!("handler panicked, retrying message");
                 Outcome::Retry
             }
         },
@@ -450,34 +456,6 @@ where
     metrics::record_consumed(topic, group, &outcome);
     metrics::record_processing_duration(topic, group, &outcome, elapsed);
     outcome
-}
-
-/// Spawns a handler task and returns a oneshot receiver for the outcome.
-fn spawn_handler<T, H>(
-    handler: Arc<H>,
-    ctx: Arc<H::Context>,
-    message: T::Message,
-    metadata: MessageMetadata,
-    timeout: Option<Duration>,
-    topic: Arc<str>,
-    group: Option<Arc<str>>,
-) -> tokio::sync::oneshot::Receiver<Outcome>
-where
-    T: Topic,
-    H: MessageHandler<T>,
-{
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let outcome = invoke_handler(
-            async move { handler.handle(message, metadata, ctx.as_ref()).await },
-            timeout,
-            &topic,
-            group.as_deref(),
-        )
-        .await;
-        let _ = tx.send(outcome);
-    });
-    rx
 }
 
 // ---------------------------------------------------------------------------
@@ -897,24 +875,28 @@ impl KafkaConsumer {
                             let task_prefetch = prefetch_count;
                             let task_tx = completion_tx.clone();
                             let task_topic = topic.clone();
+                            let task_handler = handler.clone();
+                            let task_ctx = ctx.clone();
+                            let task_group = group.clone();
 
-                            let outcome_rx = spawn_handler::<T, H>(
-                                handler.clone(),
-                                ctx.clone(),
-                                payload,
-                                metadata,
-                                handler_timeout,
-                                topic.clone(),
-                                group.clone(),
-                            );
-
+                            // perf-K-7: single spawn per message (was three).
+                            // invoke_handler awaits the handler with catch_unwind +
+                            // timeout in-place, then route_outcome runs in the same
+                            // task — no inner spawn, no oneshot relay.
                             tokio::spawn(async move {
                                 task_processing.store(true, Ordering::Release);
 
-                                let outcome = outcome_rx.await.unwrap_or_else(|_| {
-                                    tracing::warn!(queue = task_topic.as_ref(), "handler task panicked, retrying message");
-                                    Outcome::Retry
-                                });
+                                let outcome = invoke_handler(
+                                    async move {
+                                        task_handler
+                                            .handle(payload, metadata, task_ctx.as_ref())
+                                            .await
+                                    },
+                                    handler_timeout,
+                                    &task_topic,
+                                    task_group.as_deref(),
+                                )
+                                .await;
 
                                 route_outcome(
                                     &task_client,
@@ -1147,20 +1129,22 @@ impl KafkaConsumer {
 
                                 processing.store(true, Ordering::Release);
 
-                                let outcome = spawn_handler::<T, H>(
-                                    handler.clone(),
-                                    ctx.clone(),
-                                    payload,
-                                    metadata,
+                                // perf-K-7: call invoke_handler directly (no inner spawn).
+                                // FIFO awaits the outcome inline anyway, so no task alloc
+                                // is needed for panic isolation — catch_unwind covers it.
+                                let handler_clone = handler.clone();
+                                let ctx_clone = ctx.clone();
+                                let outcome = invoke_handler(
+                                    async move {
+                                        handler_clone
+                                            .handle(payload, metadata, ctx_clone.as_ref())
+                                            .await
+                                    },
                                     handler_timeout,
-                                    topic.clone(),
-                                    group.clone(),
+                                    &topic,
+                                    group.as_deref(),
                                 )
-                                .await
-                                .unwrap_or_else(|_| {
-                                    tracing::warn!(queue, "handler task panicked, retrying message");
-                                    Outcome::Retry
-                                });
+                                .await;
                                 let outcome = adjust_outcome_for_fifo(outcome);
 
                                 route_outcome(
