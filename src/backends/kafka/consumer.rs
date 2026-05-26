@@ -99,11 +99,19 @@ impl OffsetTracker {
         }
     }
 
-    fn drain_committable(&mut self) -> TopicPartitionList {
-        let mut tpl = TopicPartitionList::new();
+    /// Returns the partitions that have new contiguous-from-start offsets to
+    /// commit, or `None` if nothing has advanced since the last call.
+    ///
+    /// perf-K-16: the previous impl allocated a fresh `TopicPartitionList` on
+    /// every receive-loop iteration even when no partition had progress to
+    /// commit (the common case). Returning `Option` skips the C-heap (librdkafka
+    /// FFI) allocation when there's nothing to do.
+    fn drain_committable(&mut self) -> Option<TopicPartitionList> {
+        let mut tpl: Option<TopicPartitionList> = None;
         for (&partition, tracker) in &mut self.partitions {
             if let Some(commit_offset) = tracker.drain_committable() {
-                tpl.add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
+                tpl.get_or_insert_with(TopicPartitionList::new)
+                    .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
                     .ok();
             }
         }
@@ -760,11 +768,10 @@ impl KafkaConsumer {
                     while let Ok((partition, offset)) = completion_rx.try_recv() {
                         tracker.mark_complete(partition, offset);
                     }
-                    let tpl = tracker.drain_committable();
-                    if tpl.count() > 0 {
-                        consumer.commit(&tpl, CommitMode::Async).map_err(|e| {
-                            map_kafka_error("commit failed", e)
-                        })?;
+                    if let Some(tpl) = tracker.drain_committable() {
+                        consumer
+                            .commit(&tpl, CommitMode::Async)
+                            .map_err(|e| map_kafka_error("commit failed", e))?;
                     }
 
                     tokio::select! {
@@ -775,8 +782,7 @@ impl KafkaConsumer {
                             while let Ok((partition, offset)) = completion_rx.try_recv() {
                                 tracker.mark_complete(partition, offset);
                             }
-                            let tpl = tracker.drain_committable();
-                            if tpl.count() > 0 {
+                            if let Some(tpl) = tracker.drain_committable() {
                                 consumer.commit(&tpl, CommitMode::Async).ok();
                             }
                             return Ok(());
