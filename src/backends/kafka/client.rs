@@ -414,6 +414,14 @@ impl KafkaClient {
         }
 
         // Phase C — build the producer with whichever context applies.
+        // sec-K-10: enable idempotent producer. The publisher.rs retry loop
+        // (publish_with_retry) retries on timeouts; without idempotence a
+        // timeout-then-retry can produce duplicates at the broker even if
+        // the first send actually succeeded. enable.idempotence=true makes
+        // the broker dedupe by producer id + sequence, restoring at-least-
+        // once into exactly-once-on-the-broker semantics. Requires Kafka
+        // ≥ 0.11 (universal today) and caps in-flight requests per
+        // connection at 5.
         #[cfg(feature = "kafka-msk-iam")]
         let producer = if let Some(ctx) = msk_context.clone() {
             let p: FutureProducer<MskIamContext> = base_config
@@ -421,6 +429,7 @@ impl KafkaClient {
                 .set("client.id", &client_name)
                 .set("message.timeout.ms", "5000")
                 .set("acks", "all")
+                .set("enable.idempotence", "true")
                 .create_with_context(ctx)
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create MSK IAM producer: {e}"))
@@ -432,6 +441,7 @@ impl KafkaClient {
                 .set("client.id", &client_name)
                 .set("message.timeout.ms", "5000")
                 .set("acks", "all")
+                .set("enable.idempotence", "true")
                 .create()
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
@@ -446,6 +456,7 @@ impl KafkaClient {
                 .set("client.id", &client_name)
                 .set("message.timeout.ms", "5000")
                 .set("acks", "all")
+                .set("enable.idempotence", "true")
                 .create()
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
