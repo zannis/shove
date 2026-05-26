@@ -551,7 +551,7 @@ where
                     }
                 };
 
-                let entries = parse_xreadgroup_reply(raw_reply);
+                let entries = parse_xreadgroup_reply(raw_reply, prefetch);
 
                 for (entry_id, fields_vec) in entries {
                     let mut fields: HashMap<String, String> = fields_vec.into_iter().collect();
@@ -859,7 +859,7 @@ where
                     }
                 };
 
-                let entries = parse_xreadgroup_reply(raw_reply);
+                let entries = parse_xreadgroup_reply(raw_reply, prefetch);
 
                 for (entry_id, fields_vec) in entries {
                     let mut fields: HashMap<String, String> = fields_vec.into_iter().collect();
@@ -1313,14 +1313,17 @@ async fn xack(conn: &mut RedisConnection, stream: &str, group: &str, entry_id: &
 ///   ]
 /// ]
 /// ```
-pub(super) fn parse_xreadgroup_reply(value: redis::Value) -> Vec<(String, Vec<(String, String)>)> {
+pub(super) fn parse_xreadgroup_reply(
+    value: redis::Value,
+    capacity_hint: usize,
+) -> Vec<(String, Vec<(String, String)>)> {
     let streams = match value {
-        redis::Value::Nil => return vec![],
+        redis::Value::Nil => return Vec::new(),
         redis::Value::Array(arr) => arr,
-        _ => return vec![],
+        _ => return Vec::new(),
     };
 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(capacity_hint);
 
     for stream_item in streams {
         let stream_pair = match stream_item {
@@ -1447,13 +1450,13 @@ mod tests {
 
     #[test]
     fn parse_xreadgroup_nil_returns_empty() {
-        let result = parse_xreadgroup_reply(redis::Value::Nil);
+        let result = parse_xreadgroup_reply(redis::Value::Nil, 0);
         assert!(result.is_empty());
     }
 
     #[test]
     fn parse_xreadgroup_empty_array_returns_empty() {
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![]), 0);
         assert!(result.is_empty());
     }
 
@@ -1474,7 +1477,7 @@ mod tests {
         ]);
         let reply = redis::Value::Array(vec![stream]);
 
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "1234-0");
         assert_eq!(result[0].1.len(), 2);
@@ -1499,7 +1502,7 @@ mod tests {
             redis::Value::BulkString(b"s".to_vec()),
             redis::Value::Array(vec![entry]),
         ]);
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "9999-1");
     }
@@ -1518,7 +1521,7 @@ mod tests {
             redis::Value::BulkString(b"s".to_vec()),
             redis::Value::Array(vec![entry]),
         ]);
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1[0], ("payload".to_string(), String::new()));
     }
@@ -1539,7 +1542,7 @@ mod tests {
             redis::Value::BulkString(b"s".to_vec()),
             redis::Value::Array(vec![entry]),
         ]);
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]), 0);
         assert_eq!(result.len(), 1);
         // Only the complete pair should be present.
         assert_eq!(result[0].1.len(), 1);
@@ -1548,7 +1551,7 @@ mod tests {
 
     #[test]
     fn parse_xreadgroup_wrong_root_type_returns_empty() {
-        let result = parse_xreadgroup_reply(redis::Value::Int(0));
+        let result = parse_xreadgroup_reply(redis::Value::Int(0), 0);
         assert!(result.is_empty());
     }
 
@@ -1609,7 +1612,7 @@ mod tests {
         let reply = redis::Value::Array(vec![
             redis::Value::Int(42), // not an array — should be skipped
         ]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1619,7 +1622,7 @@ mod tests {
         let reply = redis::Value::Array(vec![redis::Value::Array(vec![redis::Value::BulkString(
             b"only-one".to_vec(),
         )])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1630,7 +1633,7 @@ mod tests {
             redis::Value::BulkString(b"mystream".to_vec()),
             redis::Value::Int(99), // entries list is not an array
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1644,7 +1647,7 @@ mod tests {
                 redis::Value::Array(vec![redis::Value::BulkString(b"1-0".to_vec())]),
             ]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1658,7 +1661,7 @@ mod tests {
                 redis::Value::Array(vec![]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1672,7 +1675,7 @@ mod tests {
                 redis::Value::Int(0), // field list is not an array
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1689,7 +1692,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1.len(), 1);
         assert_eq!(result[0].1[0].0, "myfieldkey");
@@ -1712,7 +1715,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         // The entry IS emitted (the break only ends field collection, not the entry).
         assert_eq!(result.len(), 1);
         // Only the pair before the Int key should be present.
@@ -1733,7 +1736,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1[0].1, "simplevalue");
     }
@@ -1753,7 +1756,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         // Only the pair before the Int value should be present.
         assert_eq!(result[0].1.len(), 1);
@@ -1780,7 +1783,7 @@ mod tests {
             make_stream("stream-b", "2-0", "msg-b"),
             make_stream("stream-c", "3-0", "msg-c"),
         ]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "1-0");
         assert_eq!(result[1].0, "2-0");
@@ -2005,7 +2008,7 @@ mod tests {
             redis::Value::BulkString(b"mystream".to_vec()),
             redis::Value::Array(vec![bad_id_entry, good_entry]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(
             result.len(),
             1,
@@ -2031,7 +2034,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].1.len(),
@@ -2062,7 +2065,7 @@ mod tests {
                 entry("3-0", "c"),
             ]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "1-0");
         assert_eq!(result[1].0, "2-0");
