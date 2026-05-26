@@ -9,7 +9,7 @@ use rdkafka::consumer::{CommitMode, Consumer as RdkafkaConsumer, StreamConsumer}
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::{Offset, TopicPartitionList};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
@@ -748,7 +748,11 @@ impl KafkaConsumer {
                     .map_err(|e| map_kafka_error("failed to subscribe", e))?;
 
                 let queue_owned = queue.to_string();
-                let tracker = Arc::new(Mutex::new(OffsetTracker::new(queue_owned.clone())));
+                // perf-K-6: OffsetTracker is touched only by this receive loop; handler
+                // completions arrive via completion_tx/_rx. Drop the Mutex so the loop
+                // owns the tracker directly — saves two async-lock acquisitions per
+                // message (drain at top + track_received in the message branch).
+                let mut tracker = OffsetTracker::new(queue_owned.clone());
                 let consumer = Arc::new(consumer);
                 // Bounded to prefetch_count: the semaphore already limits in-flight
                 // handler tasks to this count, so the channel can never grow beyond
@@ -760,17 +764,14 @@ impl KafkaConsumer {
 
                 loop {
                     // Drain completed offsets and commit
-                    {
-                        let mut t = tracker.lock().await;
-                        while let Ok((partition, offset)) = completion_rx.try_recv() {
-                            t.mark_complete(partition, offset);
-                        }
-                        let tpl = t.drain_committable();
-                        if tpl.count() > 0 {
-                            consumer.commit(&tpl, CommitMode::Async).map_err(|e| {
-                                map_kafka_error("commit failed", e)
-                            })?;
-                        }
+                    while let Ok((partition, offset)) = completion_rx.try_recv() {
+                        tracker.mark_complete(partition, offset);
+                    }
+                    let tpl = tracker.drain_committable();
+                    if tpl.count() > 0 {
+                        consumer.commit(&tpl, CommitMode::Async).map_err(|e| {
+                            map_kafka_error("commit failed", e)
+                        })?;
                     }
 
                     tokio::select! {
@@ -778,15 +779,12 @@ impl KafkaConsumer {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             // Final commit
-                            {
-                                let mut t = tracker.lock().await;
-                                while let Ok((partition, offset)) = completion_rx.try_recv() {
-                                    t.mark_complete(partition, offset);
-                                }
-                                let tpl = t.drain_committable();
-                                if tpl.count() > 0 {
-                                    consumer.commit(&tpl, CommitMode::Async).ok();
-                                }
+                            while let Ok((partition, offset)) = completion_rx.try_recv() {
+                                tracker.mark_complete(partition, offset);
+                            }
+                            let tpl = tracker.drain_committable();
+                            if tpl.count() > 0 {
+                                consumer.commit(&tpl, CommitMode::Async).ok();
                             }
                             return Ok(());
                         }
@@ -813,9 +811,7 @@ impl KafkaConsumer {
                             let offset = msg.offset();
                             let key = msg.key().map(|k| k.to_vec());
 
-                            {
-                                tracker.lock().await.track_received(partition, offset);
-                            }
+                            tracker.track_received(partition, offset);
 
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
 
