@@ -312,6 +312,11 @@ async fn route_outcome(
     retry_count: u32,
     max_retries: u32,
     hold_queues: &[HoldQueue],
+    // sec-K-8: retry/defer arms move this permit into the delayed-republish
+    // spawn so the prefetch semaphore stays bounded across delayed work.
+    // None on the FIFO path (no semaphore in play there) and on the
+    // outer-task's Ack/Reject arms (permit drops at end of scope).
+    retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> bool {
     match outcome {
         Outcome::Ack => true,
@@ -364,6 +369,10 @@ async fn route_outcome(
                 {
                     tracing::error!(error = %e, "delayed retry republish failed");
                 }
+                // sec-K-8: hold the prefetch permit until the delayed retry
+                // republish finishes so the inflight-task count stays
+                // bounded by the prefetch limit.
+                drop(retry_permit);
             });
             true
         }
@@ -417,6 +426,8 @@ async fn route_outcome(
                 {
                     tracing::error!(error = %e, "deferred republish failed");
                 }
+                // sec-K-8: same permit-lifetime contract as Retry.
+                drop(retry_permit);
             });
             true
         }
@@ -925,6 +936,10 @@ impl KafkaConsumer {
                                 )
                                 .await;
 
+                                // sec-K-8: hand the prefetch permit to route_outcome
+                                // so Retry/Defer's delayed republish spawn stays
+                                // bounded by the prefetch limit instead of running
+                                // outside the cap.
                                 route_outcome(
                                     &task_client,
                                     &task_topic,
@@ -936,6 +951,7 @@ impl KafkaConsumer {
                                     retry_count,
                                     max_retries,
                                     hold_queues,
+                                    Some(permit),
                                 )
                                 .await;
 
@@ -947,7 +963,9 @@ impl KafkaConsumer {
                                         "completion channel full — logic bug in offset tracker"
                                     );
                                 }
-                                drop(permit);
+                                // sec-K-8: permit was passed to route_outcome —
+                                // either dropped at end of Ack/Reject arms, or
+                                // moved into the Retry/Defer republish spawn.
 
                                 if task_semaphore.available_permits() == task_prefetch as usize {
                                     task_processing.store(false, Ordering::Release);
@@ -1190,6 +1208,8 @@ impl KafkaConsumer {
                                     retry_count,
                                     max_retries,
                                     hold_queues,
+                                    // FIFO is sequential — no prefetch semaphore in play.
+                                    None,
                                 )
                                 .await;
 
