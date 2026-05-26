@@ -40,6 +40,14 @@ impl NatsTopologyDeclarer {
     }
 
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
+        if !topology.hold_queues().is_empty() {
+            return Err(ShoveError::Topology(format!(
+                "hold queues are not supported for NATS-backed topologies ('{}'); \
+                 NATS delayed redelivery is not yet implemented",
+                topology.queue()
+            )));
+        }
+
         let queue = topology.queue();
 
         self.create_stream(queue, vec![queue.to_string()]).await?;
@@ -52,6 +60,14 @@ impl NatsTopologyDeclarer {
     }
 
     async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<()> {
+        if !topology.hold_queues().is_empty() {
+            return Err(ShoveError::Topology(format!(
+                "hold queues are not supported for NATS-backed topologies ('{}'); \
+                 NATS delayed redelivery is not yet implemented",
+                topology.queue()
+            )));
+        }
+
         let queue = topology.queue();
         let seq = topology
             .sequencing()
