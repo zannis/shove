@@ -867,7 +867,11 @@ impl KafkaConsumer {
                                         payload_slice,
                                         key.as_deref(),
                                         &headers,
-                                        &format!("deserialization_error: {e}"),
+                                        // sec-K-5: do NOT append the codec error message to
+                                        // the DLQ death-reason header — serde_json errors can
+                                        // carry fragments of attacker-controlled payload bytes.
+                                        // The full error is recorded via tracing above.
+                                        "deserialization_error",
                                     ).await {
                                         tracing::error!(
                                             error = %dlq_err,
@@ -1136,7 +1140,11 @@ impl KafkaConsumer {
                                             payload_bytes,
                                             key.as_deref(),
                                             &headers,
-                                            &format!("deserialization_error: {e}"),
+                                            // sec-K-5: do NOT append the codec error message to
+                                        // the DLQ death-reason header — serde_json errors can
+                                        // carry fragments of attacker-controlled payload bytes.
+                                        // The full error is recorded via tracing above.
+                                        "deserialization_error",
                                         ).await {
                                             tracing::error!(
                                                 error = %dlq_err,
