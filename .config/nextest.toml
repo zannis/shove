@@ -9,7 +9,7 @@ retries = 1
 
 [scripts.setup.rabbitmq-setup]
 command = 'tests/scripts/rmq_setup.sh'
-slow-timeout = { period = "90s", terminate-after = 2 }
+slow-timeout = { period = "90s" }
 
 [[profile.default.scripts]]
 filter = 'binary_id(shove::rabbitmq_integration)'
