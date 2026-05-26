@@ -36,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backends::redis::client::{RedisClient, RedisConnection};
 use crate::error::Result;
-use crate::retry::Backoff;
 
+use super::client::acquire_conn_with_retry;
 use super::constants::AUTOCLAIM_COUNT;
 
 /// Reaper consumer name used as the XAUTOCLAIM target. Stable per group so
@@ -73,7 +73,7 @@ pub fn spawn_reaper(
 ) -> JoinHandle<()> {
     let reaper = reaper_consumer_name(&group);
     tokio::spawn(async move {
-        let mut conn = match acquire_conn_with_retry(&client, &shutdown).await {
+        let mut conn = match acquire_conn_with_retry(&client, &shutdown, "reaper").await {
             Some(c) => c,
             None => return,
         };
@@ -103,7 +103,7 @@ pub fn spawn_reaper(
             }
 
             if needs_reconnect {
-                match acquire_conn_with_retry(&client, &shutdown).await {
+                match acquire_conn_with_retry(&client, &shutdown, "reaper").await {
                     Some(c) => conn = c,
                     None => return,
                 }
@@ -204,37 +204,6 @@ async fn autoclaim_all(
         cursor = reply.next_stream_id;
     }
     Ok(())
-}
-
-/// Acquire a multiplexed Redis connection, retrying with exponential backoff
-/// (1 s → 30 s, full jitter) until the shutdown token is cancelled. Mirrors
-/// `requeue::acquire_conn_with_retry` — they're kept separate so each
-/// sidecar can evolve independently.
-async fn acquire_conn_with_retry(
-    client: &RedisClient,
-    shutdown: &CancellationToken,
-) -> Option<RedisConnection> {
-    let mut backoff = Backoff::default();
-    loop {
-        match client.multiplexed_conn().await {
-            Ok(c) => return Some(c),
-            Err(e) => {
-                if shutdown.is_cancelled() {
-                    return None;
-                }
-                let delay = backoff.next().expect("backoff is infinite");
-                tracing::warn!(
-                    "reaper: connection failed ({}), retrying in {:.1}s",
-                    e,
-                    delay.as_secs_f64()
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = shutdown.cancelled() => return None,
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
