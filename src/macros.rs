@@ -50,8 +50,9 @@ macro_rules! define_topic {
 /// and `SequencedTopic`.
 ///
 /// `$key_fn` must be a non-capturing closure or bare function pointer.
-/// Capturing closures will produce a compile error because they cannot be
-/// coerced to `fn(&Message) -> String`.
+/// Capturing closures produce a compile error; the diagnostic includes the
+/// name `SEQUENCE_KEY_FN_MUST_NOT_CAPTURE_VARIABLES` to make the restriction
+/// self-evident.
 ///
 /// The codec defaults to `JsonCodec`; pass `codec = MyCodec` as the final
 /// argument to override.
@@ -88,8 +89,13 @@ macro_rules! define_sequenced_topic {
         }
         impl $crate::SequencedTopic for $name {
             fn sequence_key(message: &$message) -> String {
-                let f: fn(&$message) -> String = $key_fn;
-                f(message)
+                // Using a named const makes the constraint self-evident in the
+                // compiler error: if `$key_fn` captures variables, rustc will
+                // print `SEQUENCE_KEY_FN_MUST_NOT_CAPTURE_VARIABLES` in the
+                // "expected fn pointer" diagnostic, pointing directly at the rule.
+                const SEQUENCE_KEY_FN_MUST_NOT_CAPTURE_VARIABLES:
+                    fn(&$message) -> String = $key_fn;
+                SEQUENCE_KEY_FN_MUST_NOT_CAPTURE_VARIABLES(message)
             }
         }
     };
