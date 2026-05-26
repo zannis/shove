@@ -1,4 +1,16 @@
 # Retry docker-backed integration tests once to handle occasional
 # container startup races under load.
+
+[experimental]
+setup-scripts = true
+
 [profile.default]
 retries = 1
+
+[scripts.setup.rabbitmq-setup]
+command = 'tests/scripts/rmq_setup.sh'
+slow-timeout = { period = "90s", terminate-after = 2 }
+
+[[profile.default.scripts]]
+filter = 'binary_id(shove::rabbitmq_integration)'
+setup = ['rabbitmq-setup']
