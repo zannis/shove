@@ -146,10 +146,18 @@ async fn redis_url() -> &'static str {
 
 async fn make_broker(group: &str) -> Broker<Redis> {
     let url = redis_url().await;
-    // Retry a few times — testcontainers occasionally returns before Redis
-    // is fully accepting connections, especially when multiple containers
-    // start in parallel under nextest.
-    for attempt in 0u32..5 {
+    connect_with_retry(url, group, Duration::from_secs(30)).await
+}
+
+/// Connect to Redis with a bounded retry loop.
+///
+/// Used by tests that manage their own per-test container (the two reconnect
+/// tests) since testcontainers can return before Redis is bound, and used as
+/// the underlying helper for [`make_broker`] against the shared container.
+async fn connect_with_retry(url: &str, group: &str, budget: Duration) -> Broker<Redis> {
+    let start = std::time::Instant::now();
+    let mut last_err: Option<shove::ShoveError> = None;
+    while start.elapsed() < budget {
         match Broker::<Redis>::new(
             RedisConfig::new(RedisMode::Standalone {
                 url: url.to_owned(),
@@ -159,13 +167,16 @@ async fn make_broker(group: &str) -> Broker<Redis> {
         .await
         {
             Ok(b) => return b,
-            Err(_) if attempt < 4 => {
-                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            Err(e) => panic!("connect to Redis after retries: {e}"),
         }
     }
-    unreachable!()
+    panic!(
+        "connect to Redis at {url} after {budget:?}: {}",
+        last_err.expect("must have at least one error before timeout")
+    );
 }
 
 async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
@@ -949,11 +960,7 @@ async fn consumer_recovers_after_redis_restart() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
-    )
-    .await
-    .expect("connect");
+    let broker = connect_with_retry(&url, "reconnect", Duration::from_secs(30)).await;
 
     broker
         .topology()
@@ -1018,27 +1025,9 @@ async fn consumer_recovers_after_redis_restart() {
         .expect("docker start");
     assert!(status.success(), "docker start failed");
 
-    // Give Redis time to initialise and accept connections.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Verify Redis is reachable before proceeding.
-    let ping = std::process::Command::new("docker")
-        .args(["exec", &container_id, "redis-cli", "ping"])
-        .output()
-        .expect("docker exec redis-cli");
-    assert!(
-        ping.status.success(),
-        "redis-cli ping failed: {:?}",
-        String::from_utf8_lossy(&ping.stderr)
-    );
-
     // Reconnect and redeclare topology (data was lost in the restart).
-    // Redis is confirmed running at this point.
-    let broker2 = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
-    )
-    .await
-    .expect("reconnect after restart");
+    // connect_with_retry covers the post-restart bind race.
+    let broker2 = connect_with_retry(&url, "reconnect", Duration::from_secs(30)).await;
 
     broker2
         .topology()
@@ -1106,11 +1095,7 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
-    )
-    .await
-    .expect("connect");
+    let broker = connect_with_retry(&url, "requeuer-recover", Duration::from_secs(30)).await;
 
     broker
         .topology()
@@ -1158,31 +1143,9 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
         .expect("docker start");
     assert!(status.success(), "docker start failed");
 
-    // Poll redis-cli ping until the container accepts connections; under
-    // heavy parallel container load on this host a fixed 3s sleep is not
-    // enough and the subsequent Broker::new races the daemon.
-    let mut ready = false;
-    for _ in 0..30 {
-        let probe = std::process::Command::new("docker")
-            .args(["exec", &container_id, "redis-cli", "ping"])
-            .output();
-        if let Ok(out) = probe
-            && out.status.success()
-            && String::from_utf8_lossy(&out.stdout).trim() == "PONG"
-        {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert!(ready, "Redis did not become ready within 30s after restart");
-
-    // Redeclare topology (data was wiped) and publish a message via a fresh broker.
-    let broker2 = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
-    )
-    .await
-    .expect("reconnect after restart");
+    // Redeclare topology (data was wiped) and publish a message via a fresh
+    // broker. connect_with_retry covers the post-restart bind race.
+    let broker2 = connect_with_retry(&url, "requeuer-recover", Duration::from_secs(30)).await;
 
     broker2
         .topology()
