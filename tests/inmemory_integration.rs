@@ -109,6 +109,30 @@ impl SequencedTopic for LedgerSkipTopic {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ping(u32);
 
+/// Topic used to test that `register_fifo` auto-declares shard queues without
+/// a prior explicit `topology().declare()` call.
+struct RegAutoDeclareFifoTopic;
+impl Topic for RegAutoDeclareFifoTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("mem-int-reg-auto-fifo")
+                .sequenced(SequenceFailure::Skip)
+                .routing_shards(2)
+                .allow_message_loss()
+                .build()
+        })
+    }
+    const SEQUENCE_KEY_FN: Option<fn(&Self::Message) -> String> = Some(Self::sequence_key);
+}
+impl SequencedTopic for RegAutoDeclareFifoTopic {
+    fn sequence_key(msg: &Event) -> String {
+        msg.account.clone()
+    }
+}
+
 struct GroupTopic;
 impl Topic for GroupTopic {
     type Message = Ping;
@@ -1819,4 +1843,68 @@ async fn registry_default_handler_timeout_applies_to_fifo_registrations() {
         observed && ctx.redelivered.load(Ordering::SeqCst) >= 1,
         "registry default handler timeout did not propagate to FIFO registrations",
     );
+}
+
+// ---------------------------------------------------------------------------
+// arch-8: register / register_fifo must auto-declare topology
+// ---------------------------------------------------------------------------
+
+/// `consumer_group().register_fifo()` must create shard queues without
+/// requiring a prior `topology().declare()` call — matching RabbitMQ, NATS,
+/// Kafka, and Redis which all auto-declare inside `register_fifo`.
+#[tokio::test]
+async fn consumer_group_register_fifo_auto_declares_topology() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
+
+    // register_fifo must internally declare the shard queues.
+    // No explicit topology().declare() here.
+    let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct H(Arc<std::sync::atomic::AtomicUsize>);
+    impl MessageHandler<RegAutoDeclareFifoTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut group = broker.consumer_group();
+    let counter = consumed.clone();
+    group
+        .register_fifo::<RegAutoDeclareFifoTopic, _>(
+            ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
+            move || H(counter.clone()),
+        )
+        .await
+        .expect("register_fifo must succeed and auto-declare shard queues");
+
+    // Publish after register — shard queues must exist by now.
+    let publisher = broker.publisher().await.unwrap();
+    for seq in 0..3u64 {
+        publisher
+            .publish::<RegAutoDeclareFifoTopic>(&Event {
+                account: "A".into(),
+                seq,
+            })
+            .await
+            .expect("publish");
+    }
+
+    let probe = consumed.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 3,
+            Duration::from_secs(5),
+        )
+        .await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(1))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(consumed.load(Ordering::Relaxed), 3);
 }

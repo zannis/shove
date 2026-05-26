@@ -1683,6 +1683,75 @@ async fn register_fifo_rejects_concurrent_processing() {
 }
 
 // ---------------------------------------------------------------------------
+// arch-8: register / register_fifo must auto-declare topology
+// ---------------------------------------------------------------------------
+
+struct RegAutoDeclareTopic;
+impl Topic for RegAutoDeclareTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-reg-auto-decl").build())
+    }
+}
+
+/// `consumer_group().register()` must create the Redis stream and consumer
+/// group without requiring a prior `topology().declare()` call — identical to
+/// RabbitMQ, NATS, Kafka, and InMemory which all auto-declare inside
+/// `register`.
+#[tokio::test]
+async fn consumer_group_register_auto_declares_topology() {
+    let broker = make_broker("redis-int-reg-auto-decl").await;
+
+    // register must internally declare the stream and consumer group.
+    // No explicit topology().declare() here.
+    let count = Arc::new(AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<RegAutoDeclareTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut group = broker.consumer_group();
+    let counter = count.clone();
+    group
+        .register::<RegAutoDeclareTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1..=1)),
+            move || H(counter.clone()),
+        )
+        .await
+        .expect("register must succeed and auto-declare stream + consumer group");
+
+    // Publish after register — stream and group must exist by now, so these
+    // messages will land after the group's $ start-ID and be visible.
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<RegAutoDeclareTopic>(&Order { id: 1 })
+        .await
+        .expect("publish");
+
+    let probe = count.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Autoscaler — end-to-end scale-up under load
 // ---------------------------------------------------------------------------
 

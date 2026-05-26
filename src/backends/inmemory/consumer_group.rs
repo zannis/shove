@@ -557,6 +557,9 @@ impl InMemoryConsumerGroupRegistry {
             .ok_or_else(|| ShoveError::Topology("registry not initialized".into()))?
             .clone();
 
+        let declarer = InMemoryTopologyDeclarer::new(broker.clone());
+        declarer.declare(topology).await?;
+
         let group_token = broker.shutdown_token().child_token();
         let group = InMemoryConsumerGroup::new_fifo::<T, H>(
             queue.clone(),
