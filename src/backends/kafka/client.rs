@@ -517,8 +517,40 @@ impl KafkaClient {
     /// Base `ClientConfig` with `bootstrap.servers` and any TLS/SASL settings
     /// already applied. Clone this, then layer per-client settings (group.id,
     /// client.id, ...) before `.create()`.
-    pub fn base_config(&self) -> ClientConfig {
+    ///
+    /// `pub(super)` — intentionally not `pub`. rdkafka's `ClientConfig` Debug
+    /// impl does **not** redact `ssl.ca.pem`, `ssl.certificate.pem`, or
+    /// `ssl.key.pem`; any external caller that logs this value via `{:?}`
+    /// would dump raw PEM including private keys. Internal call sites only
+    /// use the returned config to create consumers/admins — they do not log it.
+    pub(super) fn base_config(&self) -> ClientConfig {
         self.base_config.clone()
+    }
+
+    /// Look up a single non-sensitive rdkafka configuration entry.
+    ///
+    /// Sensitive keys (`ssl.ca.pem`, `ssl.certificate.pem`, `ssl.key.pem`,
+    /// `ssl.key.password`, `sasl.password`) always return `None` — callers
+    /// cannot reach raw PEM or credentials through this method.
+    ///
+    /// Intended for integration tests that verify the client's rdkafka config
+    /// without exposing the full `ClientConfig` (which includes raw PEM in its
+    /// `Debug` representation).
+    pub fn config_entry(&self, key: &str) -> Option<String> {
+        const SENSITIVE: &[&str] = &[
+            "ssl.ca.pem",
+            "ssl.certificate.pem",
+            "ssl.key.pem",
+            "ssl.key.password",
+            "sasl.password",
+        ];
+        if SENSITIVE.contains(&key) {
+            return None;
+        }
+        self.base_config
+            .config_map()
+            .get(key)
+            .map(|v| v.to_string())
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {

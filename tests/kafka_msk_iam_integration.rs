@@ -200,16 +200,14 @@ async fn msk_iam_connect_overlays_sasl_ssl_and_oauthbearer_into_base_config() {
         .with_sasl(KafkaSasl::msk_iam(AWS_REGION));
 
     let client = KafkaClient::connect(&cfg).await.expect("connect");
-    let base = client.base_config();
-    let map = base.config_map();
 
     assert_eq!(
-        map.get("security.protocol").copied(),
+        client.config_entry("security.protocol").as_deref(),
         Some("SASL_SSL"),
         "MSK IAM must overlay security.protocol=SASL_SSL"
     );
     assert_eq!(
-        map.get("sasl.mechanism").copied(),
+        client.config_entry("sasl.mechanism").as_deref(),
         Some("OAUTHBEARER"),
         "MSK IAM must overlay sasl.mechanism=OAUTHBEARER"
     );
