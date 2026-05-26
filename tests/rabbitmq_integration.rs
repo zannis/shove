@@ -5548,8 +5548,17 @@ async fn sequenced_consumer_hold_queue_timeout_evicts_stuck_key_within_1_5x() {
 /// Verify that a consumer configured with `max_reconnect_attempts(N)` exits
 /// with a `ShoveError::Connection` after N failed reconnect attempts instead
 /// of spinning indefinitely.
+///
+/// Requires standalone mode: the test stops the broker application mid-run to
+/// force reconnect failures. In shared mode (`RABBITMQ_AMQP_URL` is set by the
+/// nextest setup script) `stop_broker_app` is unavailable and the test is
+/// skipped to protect the shared container used by the rest of the suite.
 #[tokio::test]
 async fn consumer_exits_after_max_reconnect_attempts_exhausted() {
+    if std::env::var("RABBITMQ_AMQP_URL").is_ok() {
+        // Cannot stop the shared broker app without disrupting all other tests.
+        return;
+    }
     let ctx = TestContext::new().await;
     let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let b = ctx.broker_from(client.clone());
