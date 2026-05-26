@@ -2,9 +2,10 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "aws-sns-sqs")]
+use crate::backends::sns::topology::QueueRegistry;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::Result;
-use crate::sns::QueueRegistry;
 
 /// AWS SNS connection configuration.
 #[derive(Clone)]

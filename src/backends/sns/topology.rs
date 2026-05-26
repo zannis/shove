@@ -1,3 +1,4 @@
+#[cfg(feature = "aws-sns-sqs")]
 use aws_sdk_sqs::types::QueueAttributeName;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
