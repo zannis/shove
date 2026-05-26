@@ -2020,7 +2020,8 @@ async fn autoscaler_scales_up_under_load() {
                     cooldown_duration: Duration::from_secs(1),
                     ..AutoscalerConfig::default()
                 },
-            );
+            )
+            .unwrap();
             autoscaler.run(token_clone).await;
         }
     });
@@ -2113,7 +2114,8 @@ async fn autoscaler_scales_down_when_idle() {
                     cooldown_duration: Duration::from_secs(1),
                     ..AutoscalerConfig::default()
                 },
-            );
+            )
+            .unwrap();
             autoscaler.run(token_clone).await;
         }
     });
@@ -2221,7 +2223,7 @@ async fn autoscaler_custom_strategy_pluggable() {
 
     let registry = Arc::new(Mutex::new(registry));
     let mgmt_config = ctx.mgmt_config();
-    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone()).unwrap();
     let mut autoscaler =
         Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(500));
 
@@ -2308,7 +2310,7 @@ async fn autoscaler_without_stabilization_scales_immediately() {
 
     let registry = Arc::new(Mutex::new(registry));
     let mgmt_config = ctx.mgmt_config();
-    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone()).unwrap();
     // Raw ThresholdStrategy with no Stabilized wrapper — no hysteresis/cooldown delay
     let mut autoscaler = Autoscaler::new(
         backend,
@@ -2409,7 +2411,7 @@ async fn autoscaler_scale_up_magnitude() {
 
     let registry = Arc::new(Mutex::new(registry));
     let mgmt_config = ctx.mgmt_config();
-    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone()).unwrap();
     let mut autoscaler = Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(500));
 
     let autoscaler_token = CancellationToken::new();

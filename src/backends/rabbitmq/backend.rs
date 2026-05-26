@@ -60,28 +60,41 @@ impl LazyRabbitMqTopologyDeclarer {
 use super::management::ManagementClient;
 
 pub struct RabbitMqStatsBridge {
-    inner: Option<ManagementClient>,
+    /// `Ok(Some(mc))` — management configured and client built successfully.
+    /// `Ok(None)`     — management not configured; error deferred to first use.
+    /// `Err(e)`       — management configured but client init failed (bad cert,
+    ///                  unreadable file, etc.); error deferred to first use.
+    inner: Result<Option<ManagementClient>>,
 }
 
 impl RabbitMqStatsBridge {
     fn from_config(cfg: Option<super::management::ManagementConfig>) -> Self {
         Self {
-            inner: cfg.map(ManagementClient::new),
+            inner: cfg.map(ManagementClient::new).transpose(),
         }
     }
 
     /// Read live queue stats from the Management API.
     ///
     /// Errors with `ShoveError::Topology` if `RabbitMqConfig::with_management(...)`
-    /// was not set; the message points the caller at the right builder.
+    /// was not set; errors with `ShoveError::Connection` if the client failed to
+    /// initialise (e.g. unreadable or malformed CA certificate).
     pub async fn get_queue_stats(&self, queue: &str) -> Result<super::management::QueueStats> {
-        let mc = self.inner.as_ref().ok_or_else(|| {
-            ShoveError::Topology(
-                "RabbitMqStatsBridge::get_queue_stats requires \
-                 RabbitMqConfig::with_management(...) to be set"
-                    .into(),
-            )
-        })?;
+        let mc = match &self.inner {
+            Err(e) => {
+                return Err(ShoveError::Connection(format!(
+                    "management client init failed: {e}"
+                )));
+            }
+            Ok(None) => {
+                return Err(ShoveError::Topology(
+                    "RabbitMqStatsBridge::get_queue_stats requires \
+                     RabbitMqConfig::with_management(...) to be set"
+                        .into(),
+                ));
+            }
+            Ok(Some(mc)) => mc,
+        };
         <ManagementClient as super::management::QueueStatsProvider>::get_queue_stats(mc, queue)
             .await
     }
@@ -135,8 +148,9 @@ impl Backend for RabbitMq {
         use tokio::sync::Mutex;
         let mc = ManagementClient::new(client.management_config().expect(
             "Broker<RabbitMq>::autoscaler() requires \
-             RabbitMqConfig::with_management(...) to be set",
-        ));
+                 RabbitMqConfig::with_management(...) to be set",
+        ))
+        .expect("failed to build management HTTP client for autoscaler");
         let registry = Arc::new(Mutex::new(ConsumerGroupRegistry::new(client.clone())));
         RabbitMqAutoscalerBackend::with_stats_provider(mc, registry)
     }
@@ -340,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_bridge_without_management_errors() {
-        let bridge = RabbitMqStatsBridge { inner: None };
+        let bridge = RabbitMqStatsBridge { inner: Ok(None) };
         let err = <RabbitMqStatsBridge as QueueStatsProviderImpl>::snapshot(&bridge, "whatever")
             .await
             .expect_err("bridge with no management must refuse to produce metrics");
@@ -354,7 +368,7 @@ mod tests {
     #[test]
     fn stats_bridge_from_config_none_yields_unconfigured_bridge() {
         let bridge = RabbitMqStatsBridge::from_config(None);
-        assert!(bridge.inner.is_none());
+        assert!(matches!(bridge.inner, Ok(None)));
     }
 
     #[test]
@@ -365,6 +379,6 @@ mod tests {
             "guest",
         );
         let bridge = RabbitMqStatsBridge::from_config(Some(cfg));
-        assert!(bridge.inner.is_some());
+        assert!(matches!(bridge.inner, Ok(Some(_))));
     }
 }

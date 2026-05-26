@@ -87,6 +87,7 @@ pub trait QueueStatsProvider: Send + Sync {
 }
 
 /// HTTP client that talks to the RabbitMQ Management Plugin REST API.
+#[derive(Debug)]
 pub struct ManagementClient {
     http: reqwest::Client,
     config: ManagementConfig,
@@ -96,25 +97,28 @@ pub struct ManagementClient {
 }
 
 impl ManagementClient {
-    pub fn new(config: ManagementConfig) -> Self {
-        let base_url = Url::parse(&config.base_url).unwrap_or_else(|e| {
-            panic!(
+    pub fn new(config: ManagementConfig) -> Result<Self> {
+        let base_url = Url::parse(&config.base_url).map_err(|e| {
+            ShoveError::Connection(format!(
                 "ManagementConfig::base_url is not a valid URL ({e}): {:?}",
                 config.base_url
-            )
-        });
+            ))
+        })?;
 
         let scheme = base_url.scheme();
-        assert!(
-            scheme == "http" || scheme == "https",
-            "ManagementConfig::base_url scheme must be \"http\" or \"https\", got {scheme:?}",
-        );
+        if scheme != "http" && scheme != "https" {
+            return Err(ShoveError::Connection(format!(
+                "ManagementConfig::base_url scheme must be \"http\" or \"https\", got {scheme:?}"
+            )));
+        }
 
-        assert!(
-            base_url.username().is_empty() && base_url.password().is_none(),
-            "ManagementConfig::base_url must not embed credentials (found userinfo in {:?})",
-            config.base_url,
-        );
+        if !base_url.username().is_empty() || base_url.password().is_some() {
+            return Err(ShoveError::Connection(format!(
+                "ManagementConfig::base_url must not embed credentials \
+                 (found userinfo in {:?})",
+                config.base_url
+            )));
+        }
 
         let mut builder = reqwest::ClientBuilder::new()
             .connect_timeout(Duration::from_secs(5))
@@ -122,18 +126,29 @@ impl ManagementClient {
             .danger_accept_invalid_certs(config.tls_skip_verify);
 
         if let Some(ca_path) = &config.tls_ca_cert {
-            let pem = std::fs::read(ca_path).expect("failed to read management API CA certificate");
-            let cert = reqwest::Certificate::from_pem(&pem)
-                .expect("failed to parse management API CA certificate");
+            let pem = std::fs::read(ca_path).map_err(|e| {
+                ShoveError::Connection(format!(
+                    "failed to read management API CA certificate at {}: {e}",
+                    ca_path.display()
+                ))
+            })?;
+            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
+                ShoveError::Connection(format!(
+                    "failed to parse management API CA certificate: {e}"
+                ))
+            })?;
             builder = builder.add_root_certificate(cert);
         }
 
-        let http = builder.build().expect("failed to build HTTP client");
-        Self {
+        let http = builder
+            .build()
+            .map_err(|e| ShoveError::Connection(format!("failed to build HTTP client: {e}")))?;
+
+        Ok(Self {
             http,
             config,
             base_url,
-        }
+        })
     }
 }
 
@@ -406,43 +421,62 @@ mod tests {
         );
     }
 
-    // --- base_url validation (panics) ---
+    // --- base_url validation ---
 
     #[test]
-    #[should_panic(expected = "scheme must be")]
     fn management_client_rejects_file_scheme() {
-        ManagementClient::new(ManagementConfig::new("file:///etc/passwd", "u", "p"));
+        let err = ManagementClient::new(ManagementConfig::new("file:///etc/passwd", "u", "p"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("scheme must be"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "scheme must be")]
     fn management_client_rejects_ftp_scheme() {
-        ManagementClient::new(ManagementConfig::new("ftp://host/path", "u", "p"));
+        let err =
+            ManagementClient::new(ManagementConfig::new("ftp://host/path", "u", "p")).unwrap_err();
+        assert!(
+            err.to_string().contains("scheme must be"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "must not embed credentials")]
     fn management_client_rejects_embedded_userinfo() {
-        ManagementClient::new(ManagementConfig::new(
+        let err = ManagementClient::new(ManagementConfig::new(
             "http://admin:secret@localhost:15672",
             "u",
             "p",
-        ));
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must not embed credentials"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "must not embed credentials")]
     fn management_client_rejects_embedded_username_only() {
-        ManagementClient::new(ManagementConfig::new(
+        let err = ManagementClient::new(ManagementConfig::new(
             "http://admin@localhost:15672",
             "u",
             "p",
-        ));
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must not embed credentials"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "not a valid URL")]
     fn management_client_rejects_invalid_url() {
-        ManagementClient::new(ManagementConfig::new("not a url", "u", "p"));
+        let err = ManagementClient::new(ManagementConfig::new("not a url", "u", "p")).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid URL"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -146,7 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // At least 8 s between consecutive scaling actions per group.
             cooldown_duration: Duration::from_secs(8),
         },
-    );
+    )
+    .expect("failed to create autoscaler");
 
     let shutdown = client.shutdown_token();
     let s = shutdown.clone();

@@ -186,7 +186,8 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
                         cooldown_duration: Duration::ZERO,
                         ..Default::default()
                     },
-                );
+                )
+                .expect("failed to create autoscaler");
 
                 let shutdown = CancellationToken::new();
                 let handle = tokio::spawn({
@@ -324,7 +325,8 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                                     cooldown_duration: Duration::from_secs(3),
                                     ..Default::default()
                                 },
-                            );
+                            )
+                            .expect("failed to create autoscaler");
                             let s = shutdown.clone();
                             Some(tokio::spawn(async move { autoscaler.run(s).await }))
                         } else {
