@@ -12,6 +12,7 @@ use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, Producer};
 
+use super::constants::{MESSAGE_TIMEOUT_MS, SHUTDOWN_GRACE};
 use super::publisher::publish_with_retry as publisher_publish_with_retry;
 use tokio_util::sync::CancellationToken;
 
@@ -280,8 +281,6 @@ impl fmt::Debug for KafkaConfig {
     }
 }
 
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
-
 #[derive(Clone)]
 pub struct KafkaClient {
     brokers: String,
@@ -427,7 +426,7 @@ impl KafkaClient {
             let p: FutureProducer<MskIamContext> = base_config
                 .clone()
                 .set("client.id", &client_name)
-                .set("message.timeout.ms", "5000")
+                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
                 .set("acks", "all")
                 .set("enable.idempotence", "true")
                 .create_with_context(ctx)
@@ -439,7 +438,7 @@ impl KafkaClient {
             let p: FutureProducer<DefaultClientContext> = base_config
                 .clone()
                 .set("client.id", &client_name)
-                .set("message.timeout.ms", "5000")
+                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
                 .set("acks", "all")
                 .set("enable.idempotence", "true")
                 .create()
@@ -454,7 +453,7 @@ impl KafkaClient {
             let p: FutureProducer<DefaultClientContext> = base_config
                 .clone()
                 .set("client.id", &client_name)
-                .set("message.timeout.ms", "5000")
+                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
                 .set("acks", "all")
                 .set("enable.idempotence", "true")
                 .create()

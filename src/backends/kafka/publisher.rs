@@ -15,10 +15,9 @@ use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
 
 use super::client::KafkaClient;
-use super::constants::{MESSAGE_ID_HEADER, RETRY_COUNT_HEADER};
-
-const MAX_PUBLISH_ATTEMPTS: u32 = 3;
-const PRODUCE_TIMEOUT: Duration = Duration::from_secs(5);
+use super::constants::{
+    MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, PRODUCE_TIMEOUT, RETRY_COUNT_HEADER,
+};
 
 /// Publish a message to Kafka with retry on transient failures.
 /// Shared by both the publisher and consumer (for DLQ / retry publishes).
