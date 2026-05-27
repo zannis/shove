@@ -309,6 +309,10 @@ async fn publish_to_dlq(
 async fn route_outcome(
     client: &KafkaClient,
     topic: &str,
+    // Optional consumer-group label propagated to `metrics::record_failed`
+    // on DLQ-terminal outcomes (max_retries_exceeded, Rejected). Matches the
+    // shape `invoke_handler` already uses.
+    group: Option<&str>,
     payload: &[u8],
     // perf-K-9: take key as Option<Bytes> by value. Each match arm uses it
     // once, so we move it instead of cloning. The receive loop's Bytes
@@ -331,6 +335,10 @@ async fn route_outcome(
         Outcome::Retry => {
             let new_count = retry_count + 1;
             if new_count >= max_retries {
+                // Emit before the DLQ publish so the metric fires regardless
+                // of DLQ outcome — silent loss on DLQ failure is what the
+                // counter has to surface to alerting.
+                metrics::record_failed(topic, group, metrics::FailReason::MaxRetriesExceeded);
                 return match publish_to_dlq(
                     client,
                     topology,
@@ -385,6 +393,9 @@ async fn route_outcome(
             true
         }
         Outcome::Reject => {
+            // Emit before the DLQ publish — see the symmetric note in the
+            // max_retries_exceeded arm above.
+            metrics::record_failed(topic, group, metrics::FailReason::Rejected);
             match publish_to_dlq(
                 client,
                 topology,
@@ -951,6 +962,7 @@ impl KafkaConsumer {
                                 route_outcome(
                                     &task_client,
                                     &task_topic,
+                                    task_group.as_deref(),
                                     &payload_bytes,
                                     key,
                                     &headers,
@@ -1214,6 +1226,7 @@ impl KafkaConsumer {
                                 route_outcome(
                                     &client,
                                     &queue,
+                                    group.as_deref(),
                                     payload_bytes,
                                     key,
                                     &headers,
