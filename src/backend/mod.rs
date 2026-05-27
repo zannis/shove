@@ -204,6 +204,8 @@ mod bounds_smoke {
             consumer_group: None,
             #[cfg(feature = "kafka")]
             kafka_group_id: None,
+            #[cfg(feature = "kafka")]
+            kafka_auto_offset_reset: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

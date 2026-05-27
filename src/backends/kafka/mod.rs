@@ -17,7 +17,7 @@ pub use client::{KafkaClient, KafkaConfig};
 pub use client::{KafkaSasl, KafkaTls};
 pub use consumer::KafkaConsumer;
 pub use consumer_group::{
-    KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
+    KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
 };
 pub use publisher::KafkaPublisher;
 pub use topology::KafkaTopologyDeclarer;
