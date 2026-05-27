@@ -123,6 +123,19 @@ impl KafkaConsumerGroupConfig {
         self.group_id.as_deref()
     }
 
+    /// Resolves the broker-side consumer group ID for `queue`: the explicit
+    /// override if set via [`with_group_id`], otherwise the default
+    /// `"{queue}-consumer"`. The autoscaler and broker-side consumer must
+    /// resolve the same value — keeping this in one place is the regression
+    /// guard for the arch-K-1-style "phantom backlog" footgun.
+    ///
+    /// [`with_group_id`]: Self::with_group_id
+    pub(crate) fn resolved_group_id(&self, queue: &str) -> String {
+        self.group_id
+            .clone()
+            .unwrap_or_else(|| super::constants::consumer_group_id(queue))
+    }
+
     pub fn prefetch_count(&self) -> u16 {
         self.prefetch_count
     }
@@ -233,7 +246,11 @@ impl KafkaConsumerGroup {
             })
         });
 
-        let group_id = super::constants::consumer_group_id(&queue_str);
+        // arch-K-1 follow-up: honor the per-group `with_group_id` override here
+        // so the autoscaler queries committed offsets under the same group the
+        // broker-side consumer actually joined. Falling back to the default
+        // `"{queue}-consumer"` keeps existing callers unchanged.
+        let group_id = config.resolved_group_id(&queue_str);
         Self {
             queue: queue_str,
             group_id,
@@ -385,7 +402,8 @@ impl KafkaConsumerGroup {
 
     /// The Kafka consumer group ID used by this group's broker-side consumers.
     ///
-    /// Standard consumers return `"{queue}-consumer"`; FIFO consumers return
+    /// Standard consumers return `"{queue}-consumer"` (or the override supplied
+    /// via [`KafkaConsumerGroupConfig::with_group_id`]); FIFO consumers return
     /// `"{queue}-fifo"`. The autoscaler uses this to query committed offsets
     /// under the correct group — never re-derive it from the queue name.
     pub fn group_id(&self) -> &str {
@@ -1018,6 +1036,25 @@ mod tests {
     fn without_group_id_returns_none() {
         let cfg = KafkaConsumerGroupConfig::new(1..=1);
         assert_eq!(cfg.group_id(), None);
+    }
+
+    // Regression test for the `with_group_id` propagation bug: the autoscaler
+    // and the broker-side consumer must resolve the same group ID. Before the
+    // fix, `KafkaConsumerGroup::new` stored `"{queue}-consumer"` regardless of
+    // the override, while the broker-side consumer honored it — the autoscaler
+    // then queried committed offsets under the wrong group and reported the
+    // full partition watermark as backlog (phantom backlog → runaway scale-up).
+    // Same class of bug as arch-K-1 on the FIFO path.
+    #[test]
+    fn resolved_group_id_returns_override_when_set() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
+        assert_eq!(cfg.resolved_group_id("orders"), "my-service");
+    }
+
+    #[test]
+    fn resolved_group_id_falls_back_to_default_derivation() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.resolved_group_id("orders"), "orders-consumer");
     }
 
     // -- group_id (arch-K-1) --

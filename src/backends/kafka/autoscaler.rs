@@ -644,39 +644,6 @@ mod tests {
 
     // -- arch-K-1: autoscaler uses the group's actual consumer group ID --
 
-    /// A stats provider that records which (queue, group_id) pairs it is called with.
-    struct RecordingStatsProvider {
-        stats: HashMap<String, KafkaQueueStats>,
-        calls: std::sync::Mutex<Vec<(String, String)>>,
-    }
-
-    impl RecordingStatsProvider {
-        fn new(stats: HashMap<String, KafkaQueueStats>) -> Self {
-            Self {
-                stats,
-                calls: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
-        #[allow(dead_code)]
-        fn recorded_calls(&self) -> Vec<(String, String)> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl KafkaQueueStatsProvider for RecordingStatsProvider {
-        async fn get_queue_stats(&self, queue: &str, group_id: &str) -> Result<KafkaQueueStats> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((queue.to_string(), group_id.to_string()));
-            self.stats
-                .get(queue)
-                .cloned()
-                .ok_or_else(|| ShoveError::Topology(format!("not found: {queue}")))
-        }
-    }
-
     fn make_group_registry_with_group_id(
         queue: &str,
         group_id: &str,
@@ -708,44 +675,47 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_metrics_passes_stored_group_id_to_stats_provider() {
-        // Standard group: group_id = "{queue}-consumer"
+        // Standard group: group_id defaults to "{queue}-consumer". Regression
+        // test for arch-K-1 on the standard path — without it the FIFO test
+        // alone left the default-derivation case uncovered.
         let queue = "orders";
-        let registry = make_group_registry_with_group_id(queue, &format!("{queue}-consumer"));
+        let expected_group_id = format!("{queue}-consumer");
+        let registry = make_group_registry_with_group_id(queue, &expected_group_id);
 
-        let mut stats = HashMap::new();
-        stats.insert(
-            queue.to_string(),
-            KafkaQueueStats {
-                messages_pending: 10,
-                messages_in_flight: 0,
-            },
-        );
-        let provider = RecordingStatsProvider::new(stats);
-        let calls_ref = &provider;
+        struct AssertGroupIdProvider {
+            expected_group_id: String,
+            stats: KafkaQueueStats,
+        }
+        impl KafkaQueueStatsProvider for AssertGroupIdProvider {
+            async fn get_queue_stats(
+                &self,
+                _queue: &str,
+                group_id: &str,
+            ) -> Result<KafkaQueueStats> {
+                assert_eq!(
+                    group_id, self.expected_group_id,
+                    "autoscaler must pass the stored group_id to the stats provider"
+                );
+                Ok(self.stats.clone())
+            }
+        }
 
         let backend = KafkaAutoscalerBackend::with_stats_provider(
-            RecordingStatsProvider::new({
-                let mut m = HashMap::new();
-                m.insert(
-                    queue.to_string(),
-                    KafkaQueueStats {
-                        messages_pending: 10,
-                        messages_in_flight: 0,
-                    },
-                );
-                m
-            }),
+            AssertGroupIdProvider {
+                expected_group_id,
+                stats: KafkaQueueStats {
+                    messages_pending: 10,
+                    messages_in_flight: 0,
+                },
+            },
             registry,
         );
-        let _ = calls_ref; // suppress unused warning
 
-        // We can't easily inspect calls via the backend since the provider is moved in.
-        // Test via the registry's group_id field instead:
-        // This test verifies the plumbing compiles and executes without panicking.
-        backend
+        let metrics = backend
             .fetch_metrics(&"test-group".to_string())
             .await
             .unwrap();
+        assert_eq!(metrics.messages_ready, 10);
     }
 
     #[tokio::test]
