@@ -24,23 +24,28 @@ pub struct RabbitMqAutoscalerBackend<S: QueueStatsProvider = ManagementClient> {
 
 impl RabbitMqAutoscalerBackend<ManagementClient> {
     /// Create a backend that talks to the RabbitMQ Management HTTP API.
+    ///
+    /// Returns an error if the management client cannot be initialised (e.g.
+    /// the CA certificate file is missing or malformed).
     pub fn new(
         mgmt_config: &ManagementConfig,
         registry: Arc<Mutex<ConsumerGroupRegistry>>,
-    ) -> Self {
-        Self {
-            stats_provider: ManagementClient::new(mgmt_config.clone()),
+    ) -> Result<Self> {
+        Ok(Self {
+            stats_provider: ManagementClient::new(mgmt_config.clone())?,
             registry,
-        }
+        })
     }
 
     /// Convenience constructor that wires up a fully-configured autoscaler with
     /// [`Stabilized<ThresholdStrategy>`] from a single [`AutoscalerConfig`].
+    ///
+    /// Returns an error if the management client cannot be initialised.
     pub fn autoscaler(
         mgmt_config: &ManagementConfig,
         registry: Arc<Mutex<ConsumerGroupRegistry>>,
         config: AutoscalerConfig,
-    ) -> Autoscaler<Self, Stabilized<ThresholdStrategy>> {
+    ) -> Result<Autoscaler<Self, Stabilized<ThresholdStrategy>>> {
         let strategy = Stabilized::new(
             ThresholdStrategy {
                 scale_up_multiplier: config.scale_up_multiplier,
@@ -49,8 +54,8 @@ impl RabbitMqAutoscalerBackend<ManagementClient> {
             config.hysteresis_duration,
             config.cooldown_duration,
         );
-        let backend = Self::new(mgmt_config, registry);
-        Autoscaler::new(backend, strategy, config.poll_interval)
+        let backend = Self::new(mgmt_config, registry)?;
+        Ok(Autoscaler::new(backend, strategy, config.poll_interval))
     }
 }
 

@@ -146,10 +146,18 @@ async fn redis_url() -> &'static str {
 
 async fn make_broker(group: &str) -> Broker<Redis> {
     let url = redis_url().await;
-    // Retry a few times — testcontainers occasionally returns before Redis
-    // is fully accepting connections, especially when multiple containers
-    // start in parallel under nextest.
-    for attempt in 0u32..5 {
+    connect_with_retry(url, group, Duration::from_secs(30)).await
+}
+
+/// Connect to Redis with a bounded retry loop.
+///
+/// Used by tests that manage their own per-test container (the two reconnect
+/// tests) since testcontainers can return before Redis is bound, and used as
+/// the underlying helper for [`make_broker`] against the shared container.
+async fn connect_with_retry(url: &str, group: &str, budget: Duration) -> Broker<Redis> {
+    let start = std::time::Instant::now();
+    let mut last_err: Option<shove::ShoveError> = None;
+    while start.elapsed() < budget {
         match Broker::<Redis>::new(
             RedisConfig::new(RedisMode::Standalone {
                 url: url.to_owned(),
@@ -159,13 +167,16 @@ async fn make_broker(group: &str) -> Broker<Redis> {
         .await
         {
             Ok(b) => return b,
-            Err(_) if attempt < 4 => {
-                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            Err(e) => panic!("connect to Redis after retries: {e}"),
         }
     }
-    unreachable!()
+    panic!(
+        "connect to Redis at {url} after {budget:?}: {}",
+        last_err.expect("must have at least one error before timeout")
+    );
 }
 
 async fn poll_until<F: Fn() -> bool>(cond: F, timeout: Duration) -> bool {
@@ -692,7 +703,7 @@ async fn publish_with_headers_visible_in_metadata() {
     impl MessageHandler<HeadersTopic> for H {
         type Context = ();
         async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
-            *self.0.lock().await = Some(meta.headers.clone());
+            *self.0.lock().await = Some((*meta.headers).clone());
             self.1.fetch_add(1, Ordering::Relaxed);
             Outcome::Ack
         }
@@ -949,11 +960,7 @@ async fn consumer_recovers_after_redis_restart() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
-    )
-    .await
-    .expect("connect");
+    let broker = connect_with_retry(&url, "reconnect", Duration::from_secs(30)).await;
 
     broker
         .topology()
@@ -1018,27 +1025,9 @@ async fn consumer_recovers_after_redis_restart() {
         .expect("docker start");
     assert!(status.success(), "docker start failed");
 
-    // Give Redis time to initialise and accept connections.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Verify Redis is reachable before proceeding.
-    let ping = std::process::Command::new("docker")
-        .args(["exec", &container_id, "redis-cli", "ping"])
-        .output()
-        .expect("docker exec redis-cli");
-    assert!(
-        ping.status.success(),
-        "redis-cli ping failed: {:?}",
-        String::from_utf8_lossy(&ping.stderr)
-    );
-
     // Reconnect and redeclare topology (data was lost in the restart).
-    // Redis is confirmed running at this point.
-    let broker2 = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("reconnect"),
-    )
-    .await
-    .expect("reconnect after restart");
+    // connect_with_retry covers the post-restart bind race.
+    let broker2 = connect_with_retry(&url, "reconnect", Duration::from_secs(30)).await;
 
     broker2
         .topology()
@@ -1106,11 +1095,7 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
     let host = container.get_host().await.expect("get host");
     let url = format!("redis://{host}:{host_port}/");
 
-    let broker = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
-    )
-    .await
-    .expect("connect");
+    let broker = connect_with_retry(&url, "requeuer-recover", Duration::from_secs(30)).await;
 
     broker
         .topology()
@@ -1158,14 +1143,9 @@ async fn requeuer_reconnects_after_redis_restart_and_delivers_hold_entries() {
         .expect("docker start");
     assert!(status.success(), "docker start failed");
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Redeclare topology (data was wiped) and publish a message via a fresh broker.
-    let broker2 = Broker::<Redis>::new(
-        RedisConfig::new(RedisMode::Standalone { url: url.clone() }).with_group("requeuer-recover"),
-    )
-    .await
-    .expect("reconnect after restart");
+    // Redeclare topology (data was wiped) and publish a message via a fresh
+    // broker. connect_with_retry covers the post-restart bind race.
+    let broker2 = connect_with_retry(&url, "requeuer-recover", Duration::from_secs(30)).await;
 
     broker2
         .topology()
@@ -1683,6 +1663,75 @@ async fn register_fifo_rejects_concurrent_processing() {
 }
 
 // ---------------------------------------------------------------------------
+// arch-8: register / register_fifo must auto-declare topology
+// ---------------------------------------------------------------------------
+
+struct RegAutoDeclareTopic;
+impl Topic for RegAutoDeclareTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-reg-auto-decl").build())
+    }
+}
+
+/// `consumer_group().register()` must create the Redis stream and consumer
+/// group without requiring a prior `topology().declare()` call — identical to
+/// RabbitMQ, NATS, Kafka, and InMemory which all auto-declare inside
+/// `register`.
+#[tokio::test]
+async fn consumer_group_register_auto_declares_topology() {
+    let broker = make_broker("redis-int-reg-auto-decl").await;
+
+    // register must internally declare the stream and consumer group.
+    // No explicit topology().declare() here.
+    let count = Arc::new(AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<RegAutoDeclareTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut group = broker.consumer_group();
+    let counter = count.clone();
+    group
+        .register::<RegAutoDeclareTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::new(1..=1)),
+            move || H(counter.clone()),
+        )
+        .await
+        .expect("register must succeed and auto-declare stream + consumer group");
+
+    // Publish after register — stream and group must exist by now, so these
+    // messages will land after the group's $ start-ID and be visible.
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<RegAutoDeclareTopic>(&Order { id: 1 })
+        .await
+        .expect("publish");
+
+    let probe = count.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Autoscaler — end-to-end scale-up under load
 // ---------------------------------------------------------------------------
 
@@ -1952,8 +2001,10 @@ mod reaper_tests {
             .expect("reaper task must not panic");
     }
 
-    /// The reaper actually transfers PEL ownership to its own consumer name
-    /// when entries are eligible (idle >= min_idle_ms).
+    /// The reaper claims stale PEL entries and immediately re-delivers them:
+    /// it XADDs the entry back to the stream and XACKs the original, leaving
+    /// the reaper PEL empty. A fresh consumer must be able to receive the
+    /// re-added entry via `XREADGROUP ... >`.
     #[tokio::test]
     async fn reaper_claims_stale_pel_entries() {
         let url = redis_url().await;
@@ -1977,12 +2028,31 @@ mod reaper_tests {
             shutdown.clone(),
         );
 
-        // Poll up to 2 s for the entry to transfer.
+        // Poll up to 2 s for the re-delivered entry to appear via XREADGROUP >.
+        // The reaper XADDs then XACKs each claimed entry, so the reaper PEL
+        // stays empty; the entry appears as a new stream message instead.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut count = 0usize;
+        let mut redelivered = 0usize;
         while std::time::Instant::now() < deadline {
-            count = pending_count_for(&mut raw, stream, group, &reaper_name).await;
-            if count > 0 {
+            let raw_reply: redis::Value = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(group)
+                .arg("stale-verify-consumer")
+                .arg("COUNT")
+                .arg(10)
+                .arg("STREAMS")
+                .arg(stream)
+                .arg(">")
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(redis::Value::Nil);
+            if let redis::Value::Array(ref outer) = raw_reply
+                && let Some(redis::Value::Array(stream_pair)) = outer.first()
+                && let Some(redis::Value::Array(entries)) = stream_pair.get(1)
+            {
+                redelivered = entries.len();
+            }
+            if redelivered > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1991,19 +2061,28 @@ mod reaper_tests {
         shutdown.cancel();
         let _ = handle.await;
 
+        // Reaper PEL must be empty — it XACKed after re-XADD.
+        let reaper_pel = pending_count_for(&mut raw, stream, group, &reaper_name).await;
+
         assert!(
-            count > 0,
-            "reaper did not transfer the stale PEL entry to {reaper_name}"
+            redelivered > 0,
+            "reaper did not redeliver the stale entry via XREADGROUP '>'"
+        );
+        assert_eq!(
+            reaper_pel, 0,
+            "reaper PEL must be empty after re-XADD + XACK (was {reaper_pel})"
         );
     }
 
     /// `spawn_reaper` accepts multiple streams and must sweep all of them
-    /// in a single tick — not just the first.
+    /// in a single tick — not just the first. Evidence: after the reaper
+    /// processes both streams, each one must have a re-delivered entry
+    /// visible via `XREADGROUP ... >` (the reaper re-XADDs and XACKs each
+    /// claimed entry, so the reaper PEL stays empty).
     #[tokio::test]
     async fn reaper_sweeps_all_provided_streams() {
         let url = redis_url().await;
         let group = "reaper-multi-grp";
-        let reaper_name = format!("shove-reaper-{group}");
         let streams = ["reaper-multi-s1", "reaper-multi-s2"];
 
         let mut raw = raw_conn(url).await;
@@ -2023,14 +2102,37 @@ mod reaper_tests {
             shutdown.clone(),
         );
 
-        // Poll both streams up to 2 s for the entries to transfer.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut counts = [0usize; 2];
+        // Poll both streams up to 3 s. The reaper re-XADDs and XACKs every
+        // claimed entry, so entries appear as new stream messages deliverable
+        // via `XREADGROUP ... >` rather than accumulating in the reaper PEL.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut redelivered = [0usize; 2];
         while std::time::Instant::now() < deadline {
             for (i, s) in streams.iter().enumerate() {
-                counts[i] = pending_count_for(&mut raw, s, group, &reaper_name).await;
+                if redelivered[i] > 0 {
+                    continue;
+                }
+                let consumer = format!("verify-consumer-{i}");
+                let raw_reply: redis::Value = redis::cmd("XREADGROUP")
+                    .arg("GROUP")
+                    .arg(group)
+                    .arg(&consumer)
+                    .arg("COUNT")
+                    .arg(10)
+                    .arg("STREAMS")
+                    .arg(s)
+                    .arg(">")
+                    .query_async(&mut raw)
+                    .await
+                    .unwrap_or(redis::Value::Nil);
+                if let redis::Value::Array(ref outer) = raw_reply
+                    && let Some(redis::Value::Array(stream_pair)) = outer.first()
+                    && let Some(redis::Value::Array(entries)) = stream_pair.get(1)
+                {
+                    redelivered[i] = entries.len();
+                }
             }
-            if counts.iter().all(|c| *c > 0) {
+            if redelivered.iter().all(|c| *c > 0) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2041,9 +2143,8 @@ mod reaper_tests {
 
         for (i, s) in streams.iter().enumerate() {
             assert!(
-                counts[i] > 0,
-                "reaper did not transfer stale entry on stream {s} (count={count})",
-                count = counts[i],
+                redelivered[i] > 0,
+                "reaper did not redeliver stale entry on stream {s}"
             );
         }
     }
@@ -2090,5 +2191,92 @@ mod reaper_tests {
             .await
             .expect("reaper must exit within 1 s of cancel during stream loop")
             .expect("reaper task must not panic");
+    }
+
+    /// After the reaper claims stale PEL entries via XAUTOCLAIM it must
+    /// re-XADD them to the stream so that regular consumers can receive them
+    /// through `XREADGROUP ... >`. Without this, claimed entries accumulate
+    /// in the reaper's own PEL with nothing consuming them.
+    ///
+    /// Scenario:
+    /// 1. A "dead" consumer holds an entry in its PEL (simulating a handler
+    ///    that timed out without XACK'ing).
+    /// 2. The reaper runs XAUTOCLAIM, transferring ownership to itself.
+    /// 3. The reaper must immediately re-XADD the entry and XACK the original,
+    ///    leaving the reaper PEL empty.
+    /// 4. A fresh consumer then receives the re-added entry via
+    ///    `XREADGROUP GROUP g fresh COUNT n STREAMS s >`.
+    #[tokio::test]
+    async fn reaper_redelivers_claimed_entries_to_stream() {
+        let url = redis_url().await;
+        let stream = "reaper-redeliver-stream";
+        let group = "reaper-redeliver-grp";
+        let reaper_name = format!("shove-reaper-{group}");
+
+        let mut raw = raw_conn(url).await;
+        // Seed one entry owned by a "dead" consumer — its PEL clock starts now.
+        let _ = seed_stale_entry(&mut raw, stream, group).await;
+
+        let client = connect_client_with_retry(url, group).await;
+
+        let shutdown = CancellationToken::new();
+        // min_idle = 0 → the entry is eligible for XAUTOCLAIM immediately.
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            0,
+            shutdown.clone(),
+        );
+
+        // Poll until a fresh consumer can read a re-delivered entry OR we
+        // time out. The delivery happens in two stages:
+        //   a) XAUTOCLAIM moves the entry to the reaper's PEL.
+        //   b) The reaper re-XADDs it and XACKs the original.
+        // After (b) the entry appears as a new stream entry visible to `>`.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut redelivered = 0usize;
+        while std::time::Instant::now() < deadline {
+            let raw_reply: redis::Value = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(group)
+                .arg("fresh-verification-consumer")
+                .arg("COUNT")
+                .arg(10)
+                .arg("STREAMS")
+                .arg(stream)
+                .arg(">")
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(redis::Value::Nil);
+
+            if let redis::Value::Array(ref outer) = raw_reply
+                && let Some(redis::Value::Array(stream_pair)) = outer.first()
+                && let Some(redis::Value::Array(entries)) = stream_pair.get(1)
+            {
+                redelivered = entries.len();
+            }
+
+            if redelivered > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        // Also verify the reaper's own PEL is empty (it XACKed the original).
+        let reaper_pel = pending_count_for(&mut raw, stream, group, &reaper_name).await;
+
+        assert!(
+            redelivered > 0,
+            "reaper must re-XADD claimed entries so they are visible to new consumers via XREADGROUP '>'"
+        );
+        assert_eq!(
+            reaper_pel, 0,
+            "reaper PEL must be empty after re-XADD + XACK (was {reaper_pel})"
+        );
     }
 }

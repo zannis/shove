@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Metadata about a consumed message, extracted from broker headers/properties.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +43,11 @@ pub struct MessageMetadata {
     /// The header is stamped when the message first enters a hold queue, so
     /// deduplication becomes available from the *second* retry onward for those
     /// messages.
-    pub headers: HashMap<String, String>,
+    ///
+    /// Stored as `Arc<HashMap>` so cloning the metadata only bumps the
+    /// refcount; the underlying map is shared across delivery, handler, and
+    /// outcome-routing paths.
+    pub headers: Arc<HashMap<String, String>>,
 }
 
 /// Metadata about a dead-lettered message.

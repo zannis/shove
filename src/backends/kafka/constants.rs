@@ -10,6 +10,13 @@ pub(super) fn consumer_group_id(queue: &str) -> String {
     format!("{queue}-consumer")
 }
 
+/// Derives the FIFO consumer group ID from a queue name.
+/// FIFO consumers use a distinct group so the autoscaler can query committed
+/// offsets under the correct group — not `{queue}-consumer`.
+pub(super) fn consumer_group_id_fifo(queue: &str) -> String {
+    format!("{queue}-fifo")
+}
+
 /// Derives the DLQ consumer group ID from a DLQ topic name.
 pub(super) fn dlq_consumer_group_id(dlq: &str) -> String {
     format!("{dlq}-consumer")

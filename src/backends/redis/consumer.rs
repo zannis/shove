@@ -198,12 +198,16 @@ impl RedisConsumer {
     /// The loop runs until the underlying JoinHandle is aborted by the caller
     /// — the DLQ consumer does not accept an external shutdown token (matches
     /// the [`ConsumerImpl::run_dlq`] contract).
+    /// Public DLQ entrypoint with default options. The DLQ loop spins until
+    /// the underlying JoinHandle is aborted by the caller (matches the
+    /// [`ConsumerImpl::run_dlq`] contract).
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
-        <Self as ConsumerImpl>::run_dlq::<T, H>(self, handler, ctx).await
+        let options = crate::ConsumerOptions::<crate::Redis>::new().into_inner();
+        <Self as ConsumerImpl>::run_dlq::<T, H>(self, handler, ctx, options).await
     }
 }
 
@@ -252,7 +256,12 @@ impl ConsumerImpl for RedisConsumer {
         }
     }
 
-    fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> impl Future<Output = Result<()>> + Send
+    fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> impl Future<Output = Result<()>> + Send
     where
         T: Topic,
         H: MessageHandler<T>,
@@ -266,11 +275,6 @@ impl ConsumerImpl for RedisConsumer {
                     topology.queue()
                 ))
             })?;
-            // DLQ consumers intentionally run until their JoinHandle is
-            // aborted by the caller — the `ConsumerImpl::run_dlq` trait
-            // contract does not accept an external shutdown token.
-            let shutdown = CancellationToken::new();
-            let options = ConsumerOptionsInner::defaults_with_shutdown(shutdown);
             run_stream_loop::<T, H>(client, handler, ctx, options, topology, dlq_name).await
         }
     }
@@ -551,14 +555,14 @@ where
                     }
                 };
 
-                let entries = parse_xreadgroup_reply(raw_reply);
+                let entries = parse_xreadgroup_reply(raw_reply, prefetch);
 
                 for (entry_id, fields_vec) in entries {
-                    let fields: HashMap<String, String> = fields_vec.into_iter().collect();
+                    let (mut fields, user_headers) = partition_entry_fields(fields_vec);
 
-                    // Extract payload.
-                    let payload_raw = match fields.get(PAYLOAD_FIELD) {
-                        Some(s) => s.clone(),
+                    // Extract payload — take ownership to avoid cloning on the hot path.
+                    let payload_raw = match fields.remove(PAYLOAD_FIELD) {
+                        Some(s) => s,
                         None => {
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
                             if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
@@ -589,6 +593,7 @@ where
                             consumer_group,
                             metrics::FailReason::Oversize,
                         );
+                        fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                         route_to_dlq(
                             &mut conn,
                             topology,
@@ -619,6 +624,7 @@ where
                                 consumer_group,
                                 metrics::FailReason::Deserialize,
                             );
+                            fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                             route_to_dlq(
                                 &mut conn,
                                 topology,
@@ -643,7 +649,7 @@ where
                         retry_count,
                         delivery_id,
                         redelivered: retry_count > 0,
-                        headers: build_headers(&fields),
+                        headers: Arc::new(user_headers),
                     };
 
                     options
@@ -705,6 +711,7 @@ where
                         .processing
                         .store(false, std::sync::atomic::Ordering::Release);
 
+                    fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     route_outcome(
                         &mut conn,
                         topology,
@@ -857,13 +864,14 @@ where
                     }
                 };
 
-                let entries = parse_xreadgroup_reply(raw_reply);
+                let entries = parse_xreadgroup_reply(raw_reply, prefetch);
 
                 for (entry_id, fields_vec) in entries {
-                    let fields: HashMap<String, String> = fields_vec.into_iter().collect();
+                    let (mut fields, user_headers) = partition_entry_fields(fields_vec);
 
-                    let payload_raw = match fields.get(PAYLOAD_FIELD) {
-                        Some(s) => s.clone(),
+                    // Extract payload — take ownership to avoid cloning on the hot path.
+                    let payload_raw = match fields.remove(PAYLOAD_FIELD) {
+                        Some(s) => s,
                         None => {
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
                             if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
@@ -893,6 +901,7 @@ where
                             consumer_group,
                             metrics::FailReason::Oversize,
                         );
+                        fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                         route_to_dlq(
                             &mut conn,
                             topology,
@@ -922,6 +931,7 @@ where
                                 consumer_group,
                                 metrics::FailReason::Deserialize,
                             );
+                            fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                             route_to_dlq(
                                 &mut conn,
                                 topology,
@@ -946,7 +956,7 @@ where
                         retry_count,
                         delivery_id,
                         redelivered: retry_count > 0,
-                        headers: build_headers(&fields),
+                        headers: Arc::new(user_headers),
                     };
 
                     // Block here once `prefetch` handlers are in-flight; the
@@ -974,6 +984,7 @@ where
                     let task_processing = Arc::clone(&processing);
                     let task_semaphore = Arc::clone(&semaphore);
 
+                    fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     tokio::spawn(async move {
                         let _inflight =
                             metrics::InflightGuard::new(task_topic.clone(), task_group_metric.clone());
@@ -1237,8 +1248,10 @@ async fn route_to_dlq(
         }
     };
 
-    let mut cmd = redis::cmd("XADD");
-    cmd.arg(dlq).arg("*");
+    // Pre-size: "XADD", dlq, "*", all field pairs, 3 extra k/v pairs (reason, count, original).
+    let arg_count = fields.len() * 2 + 9;
+    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count * 16);
+    cmd.arg("XADD").arg(dlq).arg("*");
     for (k, v) in fields {
         cmd.arg(k.as_str()).arg(v.as_str());
     }
@@ -1264,8 +1277,10 @@ async fn requeue_to_stream(
     fields: &HashMap<String, String>,
     retry_count: u32,
 ) {
-    let mut cmd = redis::cmd("XADD");
-    cmd.arg(stream).arg("*");
+    // Pre-size: "XADD", stream, "*", all field pairs (one key filtered at runtime), 1 extra k/v pair.
+    let arg_count = fields.len() * 2 + 4;
+    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count * 16);
+    cmd.arg("XADD").arg(stream).arg("*");
     for (k, v) in fields {
         if k.as_str() != X_RETRY_COUNT {
             cmd.arg(k.as_str()).arg(v.as_str());
@@ -1308,14 +1323,17 @@ async fn xack(conn: &mut RedisConnection, stream: &str, group: &str, entry_id: &
 ///   ]
 /// ]
 /// ```
-pub(super) fn parse_xreadgroup_reply(value: redis::Value) -> Vec<(String, Vec<(String, String)>)> {
+pub(super) fn parse_xreadgroup_reply(
+    value: redis::Value,
+    capacity_hint: usize,
+) -> Vec<(String, Vec<(String, String)>)> {
     let streams = match value {
-        redis::Value::Nil => return vec![],
+        redis::Value::Nil => return Vec::new(),
         redis::Value::Array(arr) => arr,
-        _ => return vec![],
+        _ => return Vec::new(),
     };
 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(capacity_hint);
 
     for stream_item in streams {
         let stream_pair = match stream_item {
@@ -1382,24 +1400,37 @@ pub(super) fn parse_xreadgroup_reply(value: redis::Value) -> Vec<(String, Vec<(S
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build the `headers` map for `MessageMetadata` from stream entry fields,
-/// excluding internal shove fields that are exposed via dedicated metadata
-/// fields.
-fn build_headers(fields: &HashMap<String, String>) -> HashMap<String, String> {
-    const SKIP: &[&str] = &[
-        PAYLOAD_FIELD,
-        X_RETRY_COUNT,
-        X_SEQUENCE_KEY,
-        X_MESSAGE_ID,
-        X_DEATH_REASON,
-        X_DEATH_COUNT,
-        X_ORIGINAL_QUEUE,
-    ];
-    fields
-        .iter()
-        .filter(|(k, _)| !SKIP.contains(&k.as_str()))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+/// Shove-internal field names that are exposed via dedicated `MessageMetadata`
+/// fields and must be excluded from the user-visible `headers` map.
+const INTERNAL_KEYS: &[&str] = &[
+    PAYLOAD_FIELD,
+    X_RETRY_COUNT,
+    X_SEQUENCE_KEY,
+    X_MESSAGE_ID,
+    X_DEATH_REASON,
+    X_DEATH_COUNT,
+    X_ORIGINAL_QUEUE,
+];
+
+/// Partition raw XREADGROUP entry fields into `(internal_fields, user_headers)`
+/// in a single pass, consuming `fields_vec` without cloning any values.
+///
+/// `internal_fields` contains the shove-internal keys (routing, metadata);
+/// `user_headers` contains everything else and is moved directly into
+/// [`MessageMetadata::headers`].
+fn partition_entry_fields(
+    fields_vec: Vec<(String, String)>,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut internal = HashMap::with_capacity(INTERNAL_KEYS.len());
+    let mut user = HashMap::new();
+    for (k, v) in fields_vec {
+        if INTERNAL_KEYS.contains(&k.as_str()) {
+            internal.insert(k, v);
+        } else {
+            user.insert(k, v);
+        }
+    }
+    (internal, user)
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,13 +1473,13 @@ mod tests {
 
     #[test]
     fn parse_xreadgroup_nil_returns_empty() {
-        let result = parse_xreadgroup_reply(redis::Value::Nil);
+        let result = parse_xreadgroup_reply(redis::Value::Nil, 0);
         assert!(result.is_empty());
     }
 
     #[test]
     fn parse_xreadgroup_empty_array_returns_empty() {
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![]), 0);
         assert!(result.is_empty());
     }
 
@@ -1469,7 +1500,7 @@ mod tests {
         ]);
         let reply = redis::Value::Array(vec![stream]);
 
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "1234-0");
         assert_eq!(result[0].1.len(), 2);
@@ -1494,7 +1525,7 @@ mod tests {
             redis::Value::BulkString(b"s".to_vec()),
             redis::Value::Array(vec![entry]),
         ]);
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "9999-1");
     }
@@ -1513,7 +1544,7 @@ mod tests {
             redis::Value::BulkString(b"s".to_vec()),
             redis::Value::Array(vec![entry]),
         ]);
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]), 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1[0], ("payload".to_string(), String::new()));
     }
@@ -1534,7 +1565,7 @@ mod tests {
             redis::Value::BulkString(b"s".to_vec()),
             redis::Value::Array(vec![entry]),
         ]);
-        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]));
+        let result = parse_xreadgroup_reply(redis::Value::Array(vec![stream]), 0);
         assert_eq!(result.len(), 1);
         // Only the complete pair should be present.
         assert_eq!(result[0].1.len(), 1);
@@ -1543,50 +1574,60 @@ mod tests {
 
     #[test]
     fn parse_xreadgroup_wrong_root_type_returns_empty() {
-        let result = parse_xreadgroup_reply(redis::Value::Int(0));
+        let result = parse_xreadgroup_reply(redis::Value::Int(0), 0);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn build_headers_excludes_internal_fields() {
-        let mut fields = std::collections::HashMap::new();
-        fields.insert(PAYLOAD_FIELD.to_string(), "data".to_string());
-        fields.insert(X_RETRY_COUNT.to_string(), "2".to_string());
-        fields.insert(X_SEQUENCE_KEY.to_string(), "acct-1".to_string());
-        fields.insert("x-custom".to_string(), "val".to_string());
-
-        let headers = build_headers(&fields);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers.get("x-custom").map(String::as_str), Some("val"));
+    fn partition_entry_fields_separates_user_headers() {
+        let fields_vec = vec![
+            (PAYLOAD_FIELD.to_string(), "data".to_string()),
+            (X_RETRY_COUNT.to_string(), "2".to_string()),
+            (X_SEQUENCE_KEY.to_string(), "acct-1".to_string()),
+            ("x-custom".to_string(), "val".to_string()),
+        ];
+        let (internal, user) = partition_entry_fields(fields_vec);
+        assert_eq!(user.len(), 1);
+        assert_eq!(user.get("x-custom").map(String::as_str), Some("val"));
+        assert!(internal.contains_key(PAYLOAD_FIELD));
+        assert!(internal.contains_key(X_RETRY_COUNT));
+        assert!(internal.contains_key(X_SEQUENCE_KEY));
     }
 
     #[test]
-    fn build_headers_excludes_all_internal_fields() {
-        let mut fields = std::collections::HashMap::new();
-        fields.insert(PAYLOAD_FIELD.to_string(), "data".to_string());
-        fields.insert(X_RETRY_COUNT.to_string(), "2".to_string());
-        fields.insert(X_SEQUENCE_KEY.to_string(), "acct-1".to_string());
-        fields.insert(X_MESSAGE_ID.to_string(), "msg-abc".to_string());
-        fields.insert(X_DEATH_REASON.to_string(), "max-retries".to_string());
-        fields.insert(X_DEATH_COUNT.to_string(), "5".to_string());
-        fields.insert(X_ORIGINAL_QUEUE.to_string(), "orders".to_string());
-        fields.insert("x-custom".to_string(), "val".to_string());
-
-        let headers = build_headers(&fields);
-        // Only x-custom must survive; all internal fields must be stripped.
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers.get("x-custom").map(String::as_str), Some("val"));
-        assert!(!headers.contains_key(X_MESSAGE_ID));
-        assert!(!headers.contains_key(X_DEATH_REASON));
-        assert!(!headers.contains_key(X_DEATH_COUNT));
-        assert!(!headers.contains_key(X_ORIGINAL_QUEUE));
+    fn partition_entry_fields_all_internal_keys_go_to_internal() {
+        let fields_vec = vec![
+            (PAYLOAD_FIELD.to_string(), "data".to_string()),
+            (X_RETRY_COUNT.to_string(), "2".to_string()),
+            (X_SEQUENCE_KEY.to_string(), "acct-1".to_string()),
+            (X_MESSAGE_ID.to_string(), "msg-abc".to_string()),
+            (X_DEATH_REASON.to_string(), "max-retries".to_string()),
+            (X_DEATH_COUNT.to_string(), "5".to_string()),
+            (X_ORIGINAL_QUEUE.to_string(), "orders".to_string()),
+            ("x-custom".to_string(), "val".to_string()),
+        ];
+        let (internal, user) = partition_entry_fields(fields_vec);
+        // Only x-custom must appear in user headers.
+        assert_eq!(user.len(), 1);
+        assert_eq!(user.get("x-custom").map(String::as_str), Some("val"));
+        // All internal keys must be in the internal map, not the user map.
+        for key in INTERNAL_KEYS {
+            assert!(
+                !user.contains_key(*key),
+                "internal key {key:?} leaked into user headers"
+            );
+            assert!(
+                internal.contains_key(*key),
+                "internal key {key:?} missing from internal map"
+            );
+        }
     }
 
     #[test]
-    fn build_headers_empty_input_returns_empty() {
-        let fields = std::collections::HashMap::new();
-        let headers = build_headers(&fields);
-        assert!(headers.is_empty());
+    fn partition_entry_fields_empty_input_returns_empty_maps() {
+        let (internal, user) = partition_entry_fields(vec![]);
+        assert!(internal.is_empty());
+        assert!(user.is_empty());
     }
 
     #[test]
@@ -1604,7 +1645,7 @@ mod tests {
         let reply = redis::Value::Array(vec![
             redis::Value::Int(42), // not an array — should be skipped
         ]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1614,7 +1655,7 @@ mod tests {
         let reply = redis::Value::Array(vec![redis::Value::Array(vec![redis::Value::BulkString(
             b"only-one".to_vec(),
         )])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1625,7 +1666,7 @@ mod tests {
             redis::Value::BulkString(b"mystream".to_vec()),
             redis::Value::Int(99), // entries list is not an array
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1639,7 +1680,7 @@ mod tests {
                 redis::Value::Array(vec![redis::Value::BulkString(b"1-0".to_vec())]),
             ]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1653,7 +1694,7 @@ mod tests {
                 redis::Value::Array(vec![]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1667,7 +1708,7 @@ mod tests {
                 redis::Value::Int(0), // field list is not an array
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert!(result.is_empty());
     }
 
@@ -1684,7 +1725,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1.len(), 1);
         assert_eq!(result[0].1[0].0, "myfieldkey");
@@ -1707,7 +1748,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         // The entry IS emitted (the break only ends field collection, not the entry).
         assert_eq!(result.len(), 1);
         // Only the pair before the Int key should be present.
@@ -1728,7 +1769,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].1[0].1, "simplevalue");
     }
@@ -1748,7 +1789,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         // Only the pair before the Int value should be present.
         assert_eq!(result[0].1.len(), 1);
@@ -1775,7 +1816,7 @@ mod tests {
             make_stream("stream-b", "2-0", "msg-b"),
             make_stream("stream-c", "3-0", "msg-c"),
         ]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "1-0");
         assert_eq!(result[1].0, "2-0");
@@ -2000,7 +2041,7 @@ mod tests {
             redis::Value::BulkString(b"mystream".to_vec()),
             redis::Value::Array(vec![bad_id_entry, good_entry]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(
             result.len(),
             1,
@@ -2026,7 +2067,7 @@ mod tests {
                 ]),
             ])]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].1.len(),
@@ -2057,7 +2098,7 @@ mod tests {
                 entry("3-0", "c"),
             ]),
         ])]);
-        let result = parse_xreadgroup_reply(reply);
+        let result = parse_xreadgroup_reply(reply, 0);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "1-0");
         assert_eq!(result[1].0, "2-0");

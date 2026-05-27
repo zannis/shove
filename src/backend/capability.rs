@@ -6,14 +6,14 @@ use crate::backend::{Backend, RegistryImpl};
 
 /// Capability: this backend has a broker-level coordinated-group primitive
 /// (Kafka consumer groups, RabbitMQ consistent-hash exchange, NATS
-/// JetStream work queue, InMemory model). SQS does not implement this
-/// trait — its "group" is N parallel independent pollers, handled by
-/// `ConsumerSupervisor`.
+/// JetStream work queue, InMemory model, Redis Streams consumer groups).
+/// SQS does not implement this trait — its "group" is N parallel
+/// independent pollers, handled by `ConsumerSupervisor`.
 ///
 /// Sealed via `Backend`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` has no coordinated consumer-group primitive; use `broker.consumer_supervisor()` instead.",
-    note = "Only Kafka, RabbitMQ, NATS, and InMemory implement `HasCoordinatedGroups`. SQS runs N parallel independent consumers via the supervisor."
+    note = "Kafka, RabbitMQ, NATS, InMemory, and Redis (redis-streams) implement `HasCoordinatedGroups`. SQS runs N parallel independent consumers via the supervisor."
 )]
 #[allow(private_interfaces, private_bounds)]
 pub trait HasCoordinatedGroups: Backend {

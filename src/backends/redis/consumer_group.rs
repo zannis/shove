@@ -16,7 +16,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner;
-use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
+use crate::consumer::{
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
+    resolve_handler_timeout,
+};
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -57,6 +60,10 @@ pub struct RedisConsumerGroupConfig {
     pub(crate) max_consumers: u16,
     concurrent_processing: bool,
     pub(crate) handler_timeout: HandlerTimeoutConfig,
+    /// Maximum locally buffered messages per sequence key (sequenced consumers).
+    max_pending_per_key: Option<usize>,
+    /// Maximum allowed message payload size in bytes.
+    max_message_size: Option<usize>,
 }
 
 impl RedisConsumerGroupConfig {
@@ -82,6 +89,8 @@ impl RedisConsumerGroupConfig {
             max_consumers: max,
             concurrent_processing: false,
             handler_timeout: HandlerTimeoutConfig::Inherit,
+            max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
         }
     }
 
@@ -124,6 +133,20 @@ impl RedisConsumerGroupConfig {
         self
     }
 
+    /// Set the maximum number of locally buffered messages per sequence key.
+    /// When exceeded, new deliveries for that key are rejected to the DLQ.
+    pub fn with_max_pending_per_key(mut self, limit: usize) -> Self {
+        self.max_pending_per_key = Some(limit);
+        self
+    }
+
+    /// Set the maximum allowed message payload size in bytes.
+    /// Messages exceeding this limit are rejected before deserialization.
+    pub fn with_max_message_size(mut self, max: usize) -> Self {
+        self.max_message_size = Some(max);
+        self
+    }
+
     /// Returns the configured prefetch count.
     pub fn prefetch_count(&self) -> u16 {
         self.prefetch_count
@@ -157,6 +180,16 @@ impl RedisConsumerGroupConfig {
     /// about its registry.
     pub fn handler_timeout(&self) -> Option<Duration> {
         Some(resolve_handler_timeout(self.handler_timeout, None))
+    }
+
+    /// Returns the configured per-key pending buffer limit.
+    pub fn max_pending_per_key(&self) -> Option<usize> {
+        self.max_pending_per_key
+    }
+
+    /// Returns the configured maximum message payload size in bytes.
+    pub fn max_message_size(&self) -> Option<usize> {
+        self.max_message_size
     }
 }
 
@@ -467,16 +500,44 @@ impl RedisConsumerGroup {
     }
 
     pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
-        info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
+        let mut tally = ShutdownTally::default();
+        self.drain_into(&mut tally).await;
+        debug!(
+            group = %self.queue,
+            errors = tally.errors,
+            panics = tally.panics,
+            "consumer group shutdown complete"
+        );
+        tally
+    }
+
+    /// Cancel the group token and await every consumer handle, accumulating
+    /// errors and panics into the caller-owned `tally`.
+    ///
+    /// Atomic counts are swapped into `tally` **before** any handle is
+    /// awaited, so a caller that races this against a timeout (see
+    /// `RegistryImpl::run_until_timeout`) preserves pre-cancel state even if
+    /// the future is dropped mid-await. The consumer list is drained via
+    /// `pop()` so dropped futures leave unawaited handles in place for a
+    /// subsequent escalation via [`Self::abort_remaining_into`].
+    pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
+        info!(
+            group = %self.queue,
+            consumers = self.consumers.len(),
+            "shutting down consumer group"
+        );
         self.group_token.cancel();
-        let mut panics = 0usize;
-        for (_token, _processing, handle) in self.consumers.drain(..) {
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    panics += 1;
+                    tally.panics += 1;
                 }
             }
         }
@@ -486,10 +547,40 @@ impl RedisConsumerGroup {
         if let Some(h) = self.reaper_handle.take() {
             let _ = h.await;
         }
-        let errors = self.error_count.swap(0, Ordering::Relaxed);
-        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
-        debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
-        ShutdownTally { errors, panics }
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+    }
+
+    /// Abort surviving consumer handles (and the reaper) after a drain
+    /// timeout, accumulating any results into `tally`.
+    pub(crate) async fn abort_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        self.group_token.cancel();
+        for (_token, _processing, handle) in &self.consumers {
+            handle.abort();
+        }
+        if let Some(h) = &self.reaper_handle {
+            h.abort();
+        }
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        group = %self.queue,
+                        "consumer task panicked during abort escalation"
+                    );
+                    tally.panics += 1;
+                }
+            }
+        }
+        if let Some(h) = self.reaper_handle.take() {
+            let _ = h.await;
+        }
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
 
     fn spawn_one(&mut self) {
@@ -501,6 +592,8 @@ impl RedisConsumerGroup {
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
         options.processing = processing.clone();
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
+        options.max_pending_per_key = self.config.max_pending_per_key();
+        options.max_message_size = self.config.max_message_size();
 
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
@@ -704,15 +797,32 @@ impl RedisConsumerGroupRegistry {
     }
 
     pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
+        let mut tally = ShutdownTally::default();
+        self.drain_all_into(&mut tally).await;
+        tally
+    }
+
+    /// Drain every consumer group, accumulating errors/panics into `tally`.
+    pub(crate) async fn drain_all_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
-        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            tally.add(group.shutdown_with_tally().await);
+            group.drain_into(tally).await;
         }
-        tally
+        debug!(
+            errors = tally.errors,
+            panics = tally.panics,
+            "all consumer groups shut down"
+        );
+    }
+
+    /// Abort surviving consumers across every group after a drain timeout.
+    pub(crate) async fn abort_all_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        for group in self.groups.values_mut() {
+            group.abort_remaining_into(tally).await;
+        }
     }
 
     /// Start every registered group, wait for `signal` or the internal
@@ -740,18 +850,29 @@ impl RedisConsumerGroupRegistry {
             }
         }
 
-        let drain = self.shutdown_all_with_tally();
-        match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(tally) => SupervisorOutcome {
+        // Mirror the supervisor pattern in `ConsumerSupervisor::run_until_timeout`:
+        // accumulate the tally outside the timeout so a drain-timeout
+        // escalation can abort survivors and finish tallying instead of
+        // discarding what was already counted.
+        let mut tally = ShutdownTally::default();
+        match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
+            Ok(()) => SupervisorOutcome {
                 errors: tally.errors,
                 panics: tally.panics,
                 timed_out: false,
             },
-            Err(_) => SupervisorOutcome {
-                errors: 0,
-                panics: 0,
-                timed_out: true,
-            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving consumer tasks"
+                );
+                self.abort_all_remaining_into(&mut tally).await;
+                SupervisorOutcome {
+                    errors: tally.errors,
+                    panics: tally.panics,
+                    timed_out: true,
+                }
+            }
         }
     }
 }
@@ -865,16 +986,50 @@ mod tests {
     }
 
     #[test]
+    fn config_default_max_pending_per_key_is_library_default() {
+        use crate::consumer::DEFAULT_MAX_PENDING_PER_KEY;
+        let cfg = RedisConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.max_pending_per_key(), Some(DEFAULT_MAX_PENDING_PER_KEY));
+    }
+
+    #[test]
+    fn config_default_max_message_size_is_library_default() {
+        use crate::consumer::DEFAULT_MAX_MESSAGE_SIZE;
+        let cfg = RedisConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.max_message_size(), Some(DEFAULT_MAX_MESSAGE_SIZE));
+    }
+
+    #[test]
+    fn with_max_pending_per_key_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_max_pending_per_key(500);
+        assert_eq!(cfg.max_pending_per_key(), Some(500));
+    }
+
+    #[test]
+    fn with_max_message_size_round_trips() {
+        let cfg = RedisConsumerGroupConfig::new(1..=1).with_max_message_size(1024);
+        assert_eq!(cfg.max_message_size(), Some(1024));
+    }
+
+    #[test]
     fn builder_chain_preserves_all_fields() {
+        use crate::consumer::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
         let cfg = RedisConsumerGroupConfig::new(2..=8)
             .with_prefetch_count(32)
             .with_concurrent_processing(true)
-            .with_handler_timeout(Duration::from_secs(3));
+            .with_handler_timeout(Duration::from_secs(3))
+            .with_max_pending_per_key(200)
+            .with_max_message_size(4096);
         assert_eq!(cfg.min_consumers(), 2);
         assert_eq!(cfg.max_consumers(), 8);
         assert_eq!(cfg.prefetch_count(), 32);
         assert!(cfg.concurrent_processing());
         assert_eq!(cfg.handler_timeout(), Some(Duration::from_secs(3)));
+        assert_eq!(cfg.max_pending_per_key(), Some(200));
+        assert_eq!(cfg.max_message_size(), Some(4096));
+        // Verify defaults are distinct from the values set above.
+        assert_ne!(Some(200), Some(DEFAULT_MAX_PENDING_PER_KEY));
+        assert_ne!(Some(4096usize), Some(DEFAULT_MAX_MESSAGE_SIZE));
     }
 
     #[test]
@@ -912,6 +1067,38 @@ mod tests {
                 reaper_factory,
                 reaper_handle: None,
             }
+        }
+
+        #[tokio::test]
+        async fn spawn_one_threads_max_pending_per_key_to_options() {
+            use std::sync::Mutex;
+            let captured: Arc<Mutex<Option<Option<usize>>>> = Arc::new(Mutex::new(None));
+            let cap = captured.clone();
+            let config = RedisConsumerGroupConfig::new(1..=1).with_max_pending_per_key(777);
+            let mut group = test_group(config);
+            group.spawner = Arc::new(move |options: ConsumerOptionsInner| {
+                *cap.lock().unwrap() = Some(options.max_pending_per_key);
+                tokio::spawn(async move { options.shutdown.cancelled().await })
+            });
+            group.start();
+            assert_eq!(*captured.lock().unwrap(), Some(Some(777)));
+            group.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn spawn_one_threads_max_message_size_to_options() {
+            use std::sync::Mutex;
+            let captured: Arc<Mutex<Option<Option<usize>>>> = Arc::new(Mutex::new(None));
+            let cap = captured.clone();
+            let config = RedisConsumerGroupConfig::new(1..=1).with_max_message_size(2048);
+            let mut group = test_group(config);
+            group.spawner = Arc::new(move |options: ConsumerOptionsInner| {
+                *cap.lock().unwrap() = Some(options.max_message_size);
+                tokio::spawn(async move { options.shutdown.cancelled().await })
+            });
+            group.start();
+            assert_eq!(*captured.lock().unwrap(), Some(Some(2048)));
+            group.shutdown().await;
         }
 
         #[tokio::test]
@@ -1001,6 +1188,63 @@ mod tests {
                 group.reaper_handle.is_none(),
                 "shutdown_with_tally must take() the reaper handle"
             );
+        }
+
+        fn hanging_test_group(config: RedisConsumerGroupConfig) -> RedisConsumerGroup {
+            let mut group = test_group(config);
+            group.spawner = Arc::new(|_options: ConsumerOptionsInner| {
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                })
+            });
+            // Reaper that also never exits, exercising the abort-on-escalation path.
+            group.reaper_factory = Arc::new(|| {
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                })
+            });
+            group
+        }
+
+        #[tokio::test]
+        async fn drain_into_timeout_preserves_atomics_in_tally() {
+            let mut group = hanging_test_group(RedisConsumerGroupConfig::new(2..=2));
+            group.start();
+            assert_eq!(group.active_consumers(), 2);
+
+            group.error_count.store(7, Ordering::Relaxed);
+            group.panic_count.store(2, Ordering::Relaxed);
+
+            let mut tally = ShutdownTally::default();
+            let result =
+                tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+            assert!(result.is_err(), "drain must time out on hanging consumers");
+
+            assert_eq!(tally.errors, 7);
+            assert_eq!(tally.panics, 2);
+        }
+
+        #[tokio::test]
+        async fn abort_remaining_into_kills_hanging_consumers_and_reaper() {
+            let mut group = hanging_test_group(RedisConsumerGroupConfig::new(2..=2));
+            group.start();
+            assert!(group.reaper_handle.is_some());
+
+            group.error_count.store(5, Ordering::Relaxed);
+            group.panic_count.store(1, Ordering::Relaxed);
+
+            let mut tally = ShutdownTally::default();
+            let _ =
+                tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+            group.abort_remaining_into(&mut tally).await;
+
+            assert_eq!(group.active_consumers(), 0);
+            assert!(
+                group.reaper_handle.is_none(),
+                "abort_remaining_into must take() the reaper handle"
+            );
+            assert_eq!(tally.errors, 5);
+            assert_eq!(tally.panics, 1);
         }
 
         #[tokio::test]

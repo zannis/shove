@@ -202,6 +202,8 @@ mod bounds_smoke {
             shutdown: CancellationToken::new(),
             processing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             consumer_group: None,
+            #[cfg(feature = "kafka")]
+            kafka_group_id: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
@@ -212,9 +214,15 @@ mod bounds_smoke {
         let _ =
             <_ as ConsumerImpl>::run::<Dummy, DummyHandler>(c, DummyHandler, (), options.clone())
                 .await;
-        let _ = <_ as ConsumerImpl>::run_fifo::<Dummy, DummyHandler>(c, DummyHandler, (), options)
-            .await;
-        let _ = <_ as ConsumerImpl>::run_dlq::<Dummy, DummyHandler>(c, DummyHandler, ()).await;
+        let _ = <_ as ConsumerImpl>::run_fifo::<Dummy, DummyHandler>(
+            c,
+            DummyHandler,
+            (),
+            options.clone(),
+        )
+        .await;
+        let _ =
+            <_ as ConsumerImpl>::run_dlq::<Dummy, DummyHandler>(c, DummyHandler, (), options).await;
     }
 
     #[cfg(feature = "inmemory")]
@@ -232,8 +240,11 @@ mod bounds_smoke {
     }
 
     #[cfg(feature = "inmemory")]
-    async fn _anchor_autoscaler_impl(_a: &<InMemory as Backend>::AutoscalerImpl) {
-        // AutoscalerBackendImpl has no methods in Phase 4.
+    async fn _anchor_autoscaler_impl(a: &<InMemory as Backend>::AutoscalerImpl) {
+        use crate::autoscaler::AutoscalerBackend;
+        // Verify that `AutoscalerImpl` exposes the full `AutoscalerBackend`
+        // interface through the generic `Backend` bound.
+        let _ = a.list_groups().await;
     }
 
     #[cfg(feature = "inmemory")]

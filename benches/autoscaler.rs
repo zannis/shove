@@ -22,9 +22,8 @@ fn require_docker() {
 use criterion::{Criterion, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
-// Disambiguate against the generic `shove::ConsumerGroupConfig<B>` wrapper
-// in favour of the rabbitmq-specific config this bench uses.
-use shove::rabbitmq::ConsumerGroupConfig;
+// Explicit import to disambiguate from shove::consumer_group::ConsumerGroupConfig (the wrapper).
+use shove::rabbitmq::RabbitMqConsumerGroupConfig;
 use shove::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -165,7 +164,7 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
                 let mut registry = rabbit.new_registry();
                 registry
                     .register::<BenchTopic, LatencyHandler>(
-                        ConsumerGroupConfig::new(1..=1),
+                        RabbitMqConsumerGroupConfig::new(1..=1),
                         || LatencyHandler {
                             processed: Arc::new(AtomicU64::new(0)),
                             delay: Duration::ZERO,
@@ -187,7 +186,8 @@ fn bench_autoscaler_decisions(c: &mut Criterion) {
                         cooldown_duration: Duration::ZERO,
                         ..Default::default()
                     },
-                );
+                )
+                .expect("failed to create autoscaler");
 
                 let shutdown = CancellationToken::new();
                 let handle = tokio::spawn({
@@ -239,7 +239,7 @@ fn bench_throughput(c: &mut Criterion) {
                         let mut registry = rabbit.new_registry();
                         registry
                             .register::<BenchTopic, LatencyHandler>(
-                                ConsumerGroupConfig::new(consumers..=consumers)
+                                RabbitMqConsumerGroupConfig::new(consumers..=consumers)
                                     .with_prefetch_count(prefetch),
                                 move || LatencyHandler {
                                     processed: pc.clone(),
@@ -297,7 +297,8 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                         let mut registry = rabbit.new_registry();
                         registry
                             .register::<BenchTopic, LatencyHandler>(
-                                ConsumerGroupConfig::new(min..=max).with_prefetch_count(prefetch),
+                                RabbitMqConsumerGroupConfig::new(min..=max)
+                                    .with_prefetch_count(prefetch),
                                 move || LatencyHandler {
                                     processed: pc.clone(),
                                     delay,
@@ -324,7 +325,8 @@ fn bench_burst_autoscaling(c: &mut Criterion) {
                                     cooldown_duration: Duration::from_secs(3),
                                     ..Default::default()
                                 },
-                            );
+                            )
+                            .expect("failed to create autoscaler");
                             let s = shutdown.clone();
                             Some(tokio::spawn(async move { autoscaler.run(s).await }))
                         } else {

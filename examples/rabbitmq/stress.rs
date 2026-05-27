@@ -79,7 +79,7 @@ async fn main() {
             }
         },
         |consumers, prefetch, concurrent| {
-            rmq::ConsumerGroupConfig::new(consumers..=consumers)
+            rmq::RabbitMqConsumerGroupConfig::new(consumers..=consumers)
                 .with_prefetch_count(prefetch)
                 .with_concurrent_processing(concurrent)
         },

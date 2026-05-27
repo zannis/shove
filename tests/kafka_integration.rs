@@ -458,7 +458,7 @@ async fn publish_and_consume_with_headers() {
     impl MessageHandler<WorkTopic> for HeaderCapture {
         type Context = ();
         async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
-            *self.0.lock().await = meta.headers;
+            *self.0.lock().await = (*meta.headers).clone();
             Outcome::Ack
         }
     }
@@ -1705,7 +1705,7 @@ async fn lag_stats_provider_reports_pending_messages() {
 
     let stats_provider = KafkaLagStatsProvider::new(client.clone());
     let stats: KafkaQueueStats = stats_provider
-        .get_queue_stats("kafka-work")
+        .get_queue_stats("kafka-work", "kafka-work-consumer")
         .await
         .expect("get_queue_stats should succeed");
 
@@ -1784,7 +1784,7 @@ async fn lag_stats_provider_reports_zero_after_consumption() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stats: KafkaQueueStats = stats_provider
-            .get_queue_stats("kafka-lag-test")
+            .get_queue_stats("kafka-lag-test", "kafka-lag-test-consumer")
             .await
             .expect("get_queue_stats should succeed");
         if stats.messages_pending == 0 {

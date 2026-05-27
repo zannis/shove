@@ -2,6 +2,7 @@ use std::fmt;
 #[cfg(feature = "kafka-ssl")]
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
@@ -13,9 +14,6 @@ use rdkafka::producer::{FutureProducer, Producer};
 
 use super::publisher::publish_with_retry as publisher_publish_with_retry;
 use tokio_util::sync::CancellationToken;
-
-#[cfg(feature = "kafka-msk-iam")]
-use std::sync::Arc;
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::{MskIamContext, MskIamTokenProvider};
@@ -214,6 +212,10 @@ pub struct KafkaConfig {
     pub tls: Option<KafkaTls>,
     #[cfg(feature = "kafka-ssl")]
     pub sasl: Option<KafkaSasl>,
+    /// When `true`, bypass the SASL-without-TLS refusal for development
+    /// environments. **Never set this in production.** Default: `false`.
+    #[cfg(feature = "kafka-ssl")]
+    pub(crate) allow_plaintext_credentials: bool,
 }
 
 impl KafkaConfig {
@@ -224,6 +226,8 @@ impl KafkaConfig {
             tls: None,
             #[cfg(feature = "kafka-ssl")]
             sasl: None,
+            #[cfg(feature = "kafka-ssl")]
+            allow_plaintext_credentials: false,
         }
     }
 
@@ -241,6 +245,17 @@ impl KafkaConfig {
     #[cfg(feature = "kafka-ssl")]
     pub fn with_sasl(mut self, sasl: KafkaSasl) -> Self {
         self.sasl = Some(sasl);
+        self
+    }
+
+    /// Allow SASL credentials to be sent over a plaintext (non-TLS) connection.
+    ///
+    /// **For development use only.** Sending a static username/password over
+    /// plaintext exposes credentials to any network observer. In production,
+    /// always pair SASL with TLS via `with_tls(...)`.
+    #[cfg(feature = "kafka-ssl")]
+    pub fn allow_plaintext_credentials(mut self) -> Self {
+        self.allow_plaintext_credentials = true;
         self
     }
 }
@@ -271,9 +286,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 pub struct KafkaClient {
     brokers: String,
     /// Pre-populated ClientConfig containing `bootstrap.servers` plus any
-    /// TLS/SASL settings. Every consumer/admin/metadata call clones this
-    /// so security settings never have to be re-applied at call sites.
-    base_config: ClientConfig,
+    /// TLS/SASL settings. Every consumer/admin/metadata call clones from
+    /// this so security settings never have to be re-applied at call sites.
+    ///
+    /// perf-K-14: stored as `Arc<ClientConfig>` so `KafkaClient::clone()` —
+    /// done for every per-consumer, per-publisher, per-autoscaler-poll
+    /// handle — is a refcount bump instead of a multi-KB copy of the inner
+    /// HashMap (which can include large PEM blobs when TLS is configured).
+    base_config: Arc<ClientConfig>,
     producer: KafkaProducerInner,
     #[cfg(feature = "kafka-msk-iam")]
     msk_context: Option<MskIamContext>,
@@ -305,17 +325,28 @@ impl KafkaClient {
             // Only warn for mechanisms that actually transmit a static
             // username/password. OAUTHBEARER (MSK IAM) sends a signed token
             // instead, and MSK IAM is rejected outright below if TLS is off —
-            // suppressing the warning here keeps the eventual Topology error
+            // suppressing the warn here keeps the eventual Topology error
             // the only thing the operator sees.
+            //
+            // sec-K-2: static credentials over plaintext is refused outright.
+            // A warning is too easy to miss in production logs; the password
+            // would already be on the wire by the time anyone reads it.
+            // Use KafkaConfig::allow_plaintext_credentials() to opt in
+            // explicitly for development environments.
             if config
                 .sasl
                 .as_ref()
                 .is_some_and(|s| s.credentials().is_some())
                 && config.tls.is_none()
+                && !config.allow_plaintext_credentials
             {
-                tracing::warn!(
-                    "Kafka SASL enabled without TLS; credentials will be sent in plaintext over the network"
-                );
+                return Err(ShoveError::Topology(
+                    "Kafka SASL credentials require TLS: set KafkaConfig::with_tls(...) before \
+                     connecting. Sending a static username/password over plaintext exposes \
+                     credentials to any network observer. To allow this for development, call \
+                     KafkaConfig::allow_plaintext_credentials()."
+                        .into(),
+                ));
             }
             if let Some(p) = protocol {
                 base_config.set("security.protocol", p);
@@ -383,6 +414,14 @@ impl KafkaClient {
         }
 
         // Phase C — build the producer with whichever context applies.
+        // sec-K-10: enable idempotent producer. The publisher.rs retry loop
+        // (publish_with_retry) retries on timeouts; without idempotence a
+        // timeout-then-retry can produce duplicates at the broker even if
+        // the first send actually succeeded. enable.idempotence=true makes
+        // the broker dedupe by producer id + sequence, restoring at-least-
+        // once into exactly-once-on-the-broker semantics. Requires Kafka
+        // ≥ 0.11 (universal today) and caps in-flight requests per
+        // connection at 5.
         #[cfg(feature = "kafka-msk-iam")]
         let producer = if let Some(ctx) = msk_context.clone() {
             let p: FutureProducer<MskIamContext> = base_config
@@ -390,6 +429,7 @@ impl KafkaClient {
                 .set("client.id", &client_name)
                 .set("message.timeout.ms", "5000")
                 .set("acks", "all")
+                .set("enable.idempotence", "true")
                 .create_with_context(ctx)
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create MSK IAM producer: {e}"))
@@ -401,6 +441,7 @@ impl KafkaClient {
                 .set("client.id", &client_name)
                 .set("message.timeout.ms", "5000")
                 .set("acks", "all")
+                .set("enable.idempotence", "true")
                 .create()
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
@@ -415,6 +456,7 @@ impl KafkaClient {
                 .set("client.id", &client_name)
                 .set("message.timeout.ms", "5000")
                 .set("acks", "all")
+                .set("enable.idempotence", "true")
                 .create()
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
@@ -424,7 +466,7 @@ impl KafkaClient {
 
         Ok(Self {
             brokers: config.brokers.clone(),
-            base_config,
+            base_config: Arc::new(base_config),
             producer,
             #[cfg(feature = "kafka-msk-iam")]
             msk_context,
@@ -489,8 +531,40 @@ impl KafkaClient {
     /// Base `ClientConfig` with `bootstrap.servers` and any TLS/SASL settings
     /// already applied. Clone this, then layer per-client settings (group.id,
     /// client.id, ...) before `.create()`.
-    pub fn base_config(&self) -> ClientConfig {
-        self.base_config.clone()
+    ///
+    /// `pub(super)` — intentionally not `pub`. rdkafka's `ClientConfig` Debug
+    /// impl does **not** redact `ssl.ca.pem`, `ssl.certificate.pem`, or
+    /// `ssl.key.pem`; any external caller that logs this value via `{:?}`
+    /// would dump raw PEM including private keys. Internal call sites only
+    /// use the returned config to create consumers/admins — they do not log it.
+    pub(super) fn base_config(&self) -> ClientConfig {
+        (*self.base_config).clone()
+    }
+
+    /// Look up a single non-sensitive rdkafka configuration entry.
+    ///
+    /// Sensitive keys (`ssl.ca.pem`, `ssl.certificate.pem`, `ssl.key.pem`,
+    /// `ssl.key.password`, `sasl.password`) always return `None` — callers
+    /// cannot reach raw PEM or credentials through this method.
+    ///
+    /// Intended for integration tests that verify the client's rdkafka config
+    /// without exposing the full `ClientConfig` (which includes raw PEM in its
+    /// `Debug` representation).
+    pub fn config_entry(&self, key: &str) -> Option<String> {
+        const SENSITIVE: &[&str] = &[
+            "ssl.ca.pem",
+            "ssl.certificate.pem",
+            "ssl.key.pem",
+            "ssl.key.password",
+            "sasl.password",
+        ];
+        if SENSITIVE.contains(&key) {
+            return None;
+        }
+        self.base_config
+            .config_map()
+            .get(key)
+            .map(|v| v.to_string())
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {
@@ -599,7 +673,7 @@ impl KafkaClient {
         // Fetch current partition count from metadata. The blocking work is
         // pushed onto a dedicated thread because librdkafka's metadata fetch
         // is synchronous; the helper owns all the cfg-gated context selection.
-        let base = self.base_config.clone();
+        let base = (*self.base_config).clone();
         let topic_name = name.to_string();
         #[cfg(feature = "kafka-msk-iam")]
         let msk_ctx = self.msk_context();
@@ -682,7 +756,13 @@ fn fetch_topic_partition_count_blocking(
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
 
     let mut cfg = base;
-    cfg.set("group.id", "shove-partition-check");
+    // arch-K-10: per-process suffix on the group id so multiple shove
+    // processes don't collide in kafka-consumer-groups.sh / Kafka UI /
+    // MSK console under a single shared "shove-partition-check" name.
+    cfg.set(
+        "group.id",
+        format!("shove-partition-check-{}", process::id()),
+    );
 
     #[cfg(feature = "kafka-msk-iam")]
     let metadata = if let Some(ctx) = msk_ctx {
@@ -784,5 +864,26 @@ mod tests {
         assert!(!rendered.contains("NESTED-PASSWORD"));
         assert!(rendered.contains("broker:9093"));
         assert!(rendered.contains("bob"));
+    }
+
+    // -- sec-K-2: SASL over plaintext must be refused, not warned --
+
+    #[cfg(feature = "kafka-ssl")]
+    #[tokio::test]
+    async fn sasl_plaintext_without_tls_is_rejected() {
+        // Before the fix this produced a warn! and continued; it must now Err.
+        let cfg =
+            KafkaConfig::new("localhost:9092").with_sasl(KafkaSasl::plain("alice", "password"));
+        // No TLS → should be a topology error, not a warn.
+        let result = KafkaClient::connect(&cfg).await.map(|_| ());
+        assert!(
+            result.is_err(),
+            "SASL over plaintext must be refused at connect() time, not just warned"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("TLS") || msg.contains("plaintext") || msg.contains("credentials"),
+            "error message should describe the plaintext-credentials risk, got: {msg}"
+        );
     }
 }

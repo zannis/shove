@@ -15,13 +15,14 @@
 //!    ├─ .topology()             → TopologyDeclarer<B>
 //!    ├─ .publisher().await      → Publisher<B>
 //!    ├─ .consumer_supervisor()  → ConsumerSupervisor<B>   (all backends)
+//!    ├─ .autoscaler()           → B::AutoscalerImpl       (all backends)
 //!    └─ .consumer_group()       → ConsumerGroup<B>        (B: HasCoordinatedGroups)
 //! ```
 //!
 //! # Capability gating
 //!
-//! - **Kafka, RabbitMQ, NATS, InMemory** implement the
-//!   [`HasCoordinatedGroups`] capability trait — they expose
+//! - **Kafka, RabbitMQ, NATS, InMemory, Redis** (`redis-streams`) implement
+//!   the [`HasCoordinatedGroups`] capability trait — they expose
 //!   [`Broker::consumer_group`] for min/max-bounded coordinated groups with
 //!   autoscaling.
 //! - **SQS** does **not**. A "group" on SQS is N parallel independent
@@ -36,7 +37,9 @@
 //! | Feature                    | What it enables                                                                             |
 //! |----------------------------|---------------------------------------------------------------------------------------------|
 //! | `inmemory`                 | In-process broker, publisher, consumer, topology, groups, autoscaler (no external broker)   |
-//! | `kafka`                    | Apache Kafka publisher, consumer, topology, consumer groups, autoscaling                    |
+//! | `kafka`                    | Apache Kafka publisher, consumer, topology, consumer groups, autoscaling (plaintext only)   |
+//! | `kafka-ssl`                | TLS + SASL mechanisms for Kafka — required for any authenticated cluster (implies `kafka`)  |
+//! | `kafka-msk-iam`            | AWS MSK IAM OAUTHBEARER auth (implies `kafka-ssl`)                                         |
 //! | `nats`                     | NATS JetStream publisher, consumer, topology, consumer groups, autoscaling                  |
 //! | `rabbitmq`                 | RabbitMQ publisher, consumer, topology, consumer groups, autoscaling                        |
 //! | `rabbitmq-transactional`   | RabbitMQ exactly-once routing via AMQP transactions (implies `rabbitmq`)                    |
@@ -352,7 +355,7 @@ pub mod rabbitmq {
         autoscaler::RabbitMqAutoscalerBackend,
         client::RabbitMqClient,
         consumer::RabbitMqConsumer,
-        consumer_group::{ConsumerGroup, ConsumerGroupConfig},
+        consumer_group::{RabbitMqConsumerGroup, RabbitMqConsumerGroupConfig},
         headers::MESSAGE_ID_KEY,
         management::{QueueStats, QueueStatsProvider},
         publisher::RabbitMqPublisher,

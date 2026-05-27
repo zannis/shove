@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 // Explicit import to disambiguate from shove::consumer_group::ConsumerGroupConfig (the wrapper).
-use shove::rabbitmq::ConsumerGroupConfig;
+use shove::rabbitmq::RabbitMqConsumerGroupConfig;
 use shove::*;
 
 use testcontainers::core::ExecCommand;
@@ -32,51 +32,110 @@ use tokio_util::sync::CancellationToken;
 // Test harness: shared setup
 // ---------------------------------------------------------------------------
 
-struct TestBroker {
-    container: testcontainers::ContainerAsync<RabbitMq>,
+// ---------------------------------------------------------------------------
+// Shared-container test context
+// ---------------------------------------------------------------------------
+
+struct TestContext {
     amqp_url: String,
     mgmt_url: String,
+    vhost: String,
+    _container: Option<testcontainers::ContainerAsync<RabbitMq>>,
 }
 
-impl TestBroker {
-    async fn start() -> Self {
-        let container = RabbitMq::default()
-            .start()
-            .await
-            .expect("failed to start RabbitMQ container");
-        let host = container.get_host().await.expect("failed to get host");
-        let amqp_port = container
-            .get_host_port_ipv4(5672)
-            .await
-            .expect("failed to get AMQP port");
-        let mgmt_port = container
-            .get_host_port_ipv4(15672)
-            .await
-            .expect("failed to get management port");
+impl TestContext {
+    async fn new() -> Self {
+        let http = reqwest::Client::new();
 
-        let amqp_url = format!("amqp://{host}:{amqp_port}");
-        let mgmt_url = format!("http://{host}:{mgmt_port}");
+        if let Ok(base_amqp) = std::env::var("RABBITMQ_AMQP_URL") {
+            // ----------------------------------------------------------------
+            // Shared mode — a container was started by the nextest setup script.
+            // Create a unique vhost for this test so queue names never collide.
+            // ----------------------------------------------------------------
+            let mgmt_url = std::env::var("RABBITMQ_MGMT_URL")
+                .expect("RABBITMQ_MGMT_URL must be set when RABBITMQ_AMQP_URL is set");
 
-        // Enable the consistent-hash exchange plugin (needed for sequenced topics).
-        // We must wait for the command to complete (read stdout) before proceeding.
-        let mut result = container
-            .exec(ExecCommand::new([
-                "rabbitmq-plugins",
-                "enable",
-                "rabbitmq_consistent_hash_exchange",
-            ]))
-            .await
-            .expect("failed to enable consistent hash plugin");
-        // Block until the command finishes
-        let _ = result.stdout_to_vec().await;
+            let vhost = format!("test-{}", uuid::Uuid::new_v4());
 
-        // Give RabbitMQ time to load the plugin and for the management API to initialize
-        tokio::time::sleep(Duration::from_secs(3)).await;
+            // Create the vhost.
+            let status = http
+                .put(format!("{mgmt_url}/api/vhosts/{vhost}"))
+                .basic_auth("guest", Some("guest"))
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await
+                .expect("failed to create vhost")
+                .status();
+            assert!(status.is_success(), "create vhost returned {status}");
 
-        Self {
-            container,
-            amqp_url,
-            mgmt_url,
+            // Grant the guest user full permissions on this vhost.
+            let status = http
+                .put(format!("{mgmt_url}/api/permissions/{vhost}/guest"))
+                .basic_auth("guest", Some("guest"))
+                .json(&std::collections::HashMap::from([
+                    ("configure", ".*"),
+                    ("write", ".*"),
+                    ("read", ".*"),
+                ]))
+                .send()
+                .await
+                .expect("failed to set vhost permissions")
+                .status();
+            assert!(status.is_success(), "set permissions returned {status}");
+
+            // Append the vhost to the AMQP URL.
+            let amqp_url = format!("{base_amqp}/{vhost}");
+
+            Self {
+                amqp_url,
+                mgmt_url,
+                vhost,
+                _container: None,
+            }
+        } else {
+            // ----------------------------------------------------------------
+            // Standalone mode — no setup script; start our own container.
+            // Uses the default vhost "/".
+            // ----------------------------------------------------------------
+            let container = RabbitMq::default()
+                .start()
+                .await
+                .expect("failed to start RabbitMQ container");
+
+            let host = container.get_host().await.expect("failed to get host");
+            let amqp_port = container
+                .get_host_port_ipv4(5672)
+                .await
+                .expect("failed to get AMQP port");
+            let mgmt_port = container
+                .get_host_port_ipv4(15672)
+                .await
+                .expect("failed to get mgmt port");
+
+            let amqp_url = format!("amqp://guest:guest@{host}:{amqp_port}");
+            let mgmt_url = format!("http://{host}:{mgmt_port}");
+
+            // Enable the consistent-hash exchange plugin.
+            let mut result = container
+                .exec(ExecCommand::new([
+                    "rabbitmq-plugins",
+                    "enable",
+                    "rabbitmq_consistent_hash_exchange",
+                ]))
+                .await
+                .expect("failed to enable consistent hash plugin");
+            let _ = result.stdout_to_vec().await;
+
+            // Give RabbitMQ time to load the plugin and the management API.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            Self {
+                amqp_url,
+                mgmt_url,
+                vhost: "/".into(),
+                _container: Some(container),
+            }
         }
     }
 
@@ -85,34 +144,66 @@ impl TestBroker {
     }
 
     fn mgmt_config(&self) -> ManagementConfig {
-        ManagementConfig::new(&self.mgmt_url, "guest", "guest")
+        ManagementConfig::new(&self.mgmt_url, "guest", "guest").with_vhost(&self.vhost)
     }
 
     fn broker_from(&self, client: RabbitMqClient) -> Broker<RabbitMqMarker> {
         Broker::<RabbitMqMarker>::from_client(client)
     }
 
+    /// Build a management API URL for a queue in this test's vhost.
+    ///
+    /// The default vhost "/" is encoded as "%2F"; UUID-based vhost names are
+    /// all ASCII alphanumeric + hyphens and need no encoding.
+    fn queue_api_url(&self, queue: &str) -> String {
+        let vhost_path = if self.vhost == "/" {
+            "%2F".to_string()
+        } else {
+            self.vhost.clone()
+        };
+        format!("{}/api/queues/{vhost_path}/{queue}", self.mgmt_url)
+    }
+
     /// Stop only the AMQP broker application (not the container).
+    /// Only valid in standalone mode (when the context owns a container).
     /// Existing TCP connections will drop; the container remains alive so
-    /// `broker.stop()` can still clean up.
+    /// `ctx.cleanup()` can still clean up.
     async fn stop_broker_app(&self) {
-        let mut result = self
-            .container
+        let container = self
+            ._container
+            .as_ref()
+            .expect("stop_broker_app requires a container (standalone mode only)");
+        let mut result = container
             .exec(ExecCommand::new(["rabbitmqctl", "stop_app"]))
             .await
             .expect("failed to exec rabbitmqctl stop_app");
         let _ = result.stdout_to_vec().await;
     }
 
-    async fn stop(self) {
-        self.container
-            .stop_with_timeout(Some(0))
-            .await
-            .expect("failed to stop container");
-        self.container
-            .rm()
-            .await
-            .expect("failed to remove container");
+    async fn cleanup(self) {
+        match self._container {
+            Some(container) => {
+                // Standalone mode: stop and remove the container.
+                container
+                    .stop_with_timeout(Some(0))
+                    .await
+                    .expect("failed to stop container");
+                container.rm().await.expect("failed to remove container");
+            }
+            None => {
+                // Shared mode: delete the vhost (queues and messages inside it
+                // are removed automatically by RabbitMQ).
+                let http = reqwest::Client::new();
+                let status = http
+                    .delete(format!("{}/api/vhosts/{}", self.mgmt_url, self.vhost))
+                    .basic_auth("guest", Some("guest"))
+                    .send()
+                    .await
+                    .expect("failed to delete vhost")
+                    .status();
+                assert!(status.is_success(), "delete vhost returned {status}");
+            }
+        }
     }
 }
 
@@ -323,6 +414,13 @@ define_topic!(
         .dlq()
         .hold_queue(Duration::from_secs(1))
         .build()
+);
+
+// Topic for publisher pool concurrency tests
+define_topic!(
+    PublisherConcurrencyTopic,
+    SimpleMessage,
+    TopologyBuilder::new("test-publisher-concurrency").build()
 );
 
 // Message type and topic for deserialization-failure DLQ tests
@@ -1312,8 +1410,8 @@ impl MessageHandler<DeferWithHold> for RetryThenDeferHandler {
 
 #[tokio::test]
 async fn client_connect_and_create_channel() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
 
     assert!(client.is_connected());
 
@@ -1322,37 +1420,37 @@ async fn client_connect_and_create_channel() {
 
     client.shutdown().await;
     // After shutdown the connection is closed
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn client_shutdown_cancels_token() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let token = client.shutdown_token();
 
     assert!(!token.is_cancelled());
     client.shutdown().await;
     assert!(token.is_cancelled());
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Topology ---
 
 #[tokio::test]
 async fn topology_declare_creates_queues() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     // Verify by checking management API
-    let mgmt = ManagementConfig::new(&broker.mgmt_url, "guest", "guest");
+    let mgmt = ctx.mgmt_config();
     let stats_client = reqwest::Client::new();
 
     // Main queue should exist
     let resp = stats_client
-        .get(format!("{}/api/queues/%2F/test-simple", broker.mgmt_url))
+        .get(ctx.queue_api_url("test-simple"))
         .basic_auth(&mgmt.username, Some(&mgmt.password))
         .send()
         .await
@@ -1361,10 +1459,7 @@ async fn topology_declare_creates_queues() {
 
     // DLQ should exist
     let resp = stats_client
-        .get(format!(
-            "{}/api/queues/%2F/test-simple-dlq",
-            broker.mgmt_url
-        ))
+        .get(ctx.queue_api_url("test-simple-dlq"))
         .basic_auth(&mgmt.username, Some(&mgmt.password))
         .send()
         .await
@@ -1373,10 +1468,7 @@ async fn topology_declare_creates_queues() {
 
     // Hold queue should exist
     let resp = stats_client
-        .get(format!(
-            "{}/api/queues/%2F/test-simple-hold-1s",
-            broker.mgmt_url
-        ))
+        .get(ctx.queue_api_url("test-simple-hold-1s"))
         .basic_auth(&mgmt.username, Some(&mgmt.password))
         .send()
         .await
@@ -1384,14 +1476,14 @@ async fn topology_declare_creates_queues() {
     assert!(resp.status().is_success(), "hold queue should exist");
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn topology_declare_sequenced_creates_sub_queues() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let stats_client = reqwest::Client::new();
@@ -1399,10 +1491,7 @@ async fn topology_declare_sequenced_creates_sub_queues() {
     // Sub-queues should exist (2 shards)
     for i in 0..2 {
         let resp = stats_client
-            .get(format!(
-                "{}/api/queues/%2F/test-orders-seq-{i}",
-                broker.mgmt_url
-            ))
+            .get(ctx.queue_api_url(&format!("test-orders-seq-{i}")))
             .basic_auth("guest", Some("guest"))
             .send()
             .await
@@ -1414,16 +1503,16 @@ async fn topology_declare_sequenced_creates_sub_queues() {
     }
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Publisher ---
 
 #[tokio::test]
 async fn publish_and_consume_simple_message() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     // Publish
@@ -1453,14 +1542,14 @@ async fn publish_and_consume_simple_message() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn publish_with_headers() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -1491,14 +1580,14 @@ async fn publish_with_headers() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn publish_batch() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -1531,16 +1620,16 @@ async fn publish_batch() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Reject → DLQ ---
 
 #[tokio::test]
 async fn rejected_message_lands_in_dlq() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     // Publish one message
@@ -1580,16 +1669,16 @@ async fn rejected_message_lands_in_dlq() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Management API ---
 
 #[tokio::test]
 async fn management_client_fetches_queue_stats() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     // Publish some messages
@@ -1604,13 +1693,13 @@ async fn management_client_fetches_queue_stats() {
     }
 
     // Management API stats update interval can be slow — poll until ready
-    let mgmt_config = broker.mgmt_config();
+    let mgmt_config = ctx.mgmt_config();
     let http = reqwest::Client::new();
     let mut stats: Option<QueueStats> = None;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let resp = http
-            .get(format!("{}/api/queues/%2F/test-simple", broker.mgmt_url))
+            .get(ctx.queue_api_url("test-simple"))
             .basic_auth(&mgmt_config.username, Some(&mgmt_config.password))
             .send()
             .await
@@ -1630,16 +1719,16 @@ async fn management_client_fetches_queue_stats() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Consumer Group + Registry ---
 
 #[tokio::test]
 async fn registry_register_declares_topology_and_starts() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     let handler = CountingHandler::new();
@@ -1647,7 +1736,11 @@ async fn registry_register_declares_topology_and_starts() {
 
     // register auto-declares topology
     registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=3), move || h.clone(), ())
+        .register::<SimpleWork, _>(
+            RabbitMqConsumerGroupConfig::new(1..=3),
+            move || h.clone(),
+            (),
+        )
         .await
         .unwrap();
 
@@ -1667,16 +1760,16 @@ async fn registry_register_declares_topology_and_starts() {
 
     registry.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced consumer ---
 
 #[tokio::test]
 async fn sequenced_consume_preserves_order() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -1710,16 +1803,16 @@ async fn sequenced_consume_preserves_order() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Retry via hold queue ---
 
 #[tokio::test]
 async fn retry_via_hold_queue_then_ack() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<RetryWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -1763,16 +1856,16 @@ async fn retry_via_hold_queue_then_ack() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Defer with hold queue ---
 
 #[tokio::test]
 async fn defer_with_hold_queue_redelivers() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<DeferWithHold>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -1815,16 +1908,16 @@ async fn defer_with_hold_queue_redelivers() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Defer without hold queue (nack+requeue fallback) ---
 
 #[tokio::test]
 async fn defer_without_hold_queue_requeues() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<DeferNoHold>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -1867,7 +1960,7 @@ async fn defer_without_hold_queue_requeues() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Autoscaler scales up under load ---
@@ -1876,9 +1969,9 @@ async fn defer_without_hold_queue_requeues() {
 async fn autoscaler_scales_up_under_load() {
     use tokio::sync::Mutex;
 
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
 
     // Use min_consumers=0 so start_all spawns no consumers, letting messages
     // accumulate in the queue so the autoscaler sees the load and scales up.
@@ -1887,7 +1980,7 @@ async fn autoscaler_scales_up_under_load() {
     let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
             (),
         )
@@ -1914,7 +2007,7 @@ async fn autoscaler_scales_up_under_load() {
     let registry = Arc::new(Mutex::new(registry));
     let autoscaler_token = CancellationToken::new();
     let token_clone = autoscaler_token.clone();
-    let mgmt_config = broker.mgmt_config();
+    let mgmt_config = ctx.mgmt_config();
     let autoscaler_handle = tokio::spawn({
         let registry = registry.clone();
         async move {
@@ -1927,7 +2020,8 @@ async fn autoscaler_scales_up_under_load() {
                     cooldown_duration: Duration::from_secs(1),
                     ..AutoscalerConfig::default()
                 },
-            );
+            )
+            .unwrap();
             autoscaler.run(token_clone).await;
         }
     });
@@ -1966,7 +2060,7 @@ async fn autoscaler_scales_up_under_load() {
     let mut reg = registry.lock().await;
     reg.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Autoscaler scales down when idle ---
@@ -1975,15 +2069,15 @@ async fn autoscaler_scales_up_under_load() {
 async fn autoscaler_scales_down_when_idle() {
     use tokio::sync::Mutex;
 
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     let handler = CountingHandler::new();
     let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
             move || h.clone(),
             (),
         )
@@ -2007,7 +2101,7 @@ async fn autoscaler_scales_down_when_idle() {
     let registry = Arc::new(Mutex::new(registry));
     let autoscaler_token = CancellationToken::new();
     let token_clone = autoscaler_token.clone();
-    let mgmt_config = broker.mgmt_config();
+    let mgmt_config = ctx.mgmt_config();
     let autoscaler_handle = tokio::spawn({
         let registry = registry.clone();
         async move {
@@ -2020,7 +2114,8 @@ async fn autoscaler_scales_down_when_idle() {
                     cooldown_duration: Duration::from_secs(1),
                     ..AutoscalerConfig::default()
                 },
-            );
+            )
+            .unwrap();
             autoscaler.run(token_clone).await;
         }
     });
@@ -2059,7 +2154,7 @@ async fn autoscaler_scales_down_when_idle() {
     let mut reg = registry.lock().await;
     reg.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Autoscaler custom strategy (pluggable) ---
@@ -2092,14 +2187,14 @@ async fn autoscaler_custom_strategy_pluggable() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(1..=4).with_prefetch_count(5),
             || SlowScalableHandler,
             (),
         )
@@ -2127,8 +2222,8 @@ async fn autoscaler_custom_strategy_pluggable() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let registry = Arc::new(Mutex::new(registry));
-    let mgmt_config = broker.mgmt_config();
-    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let mgmt_config = ctx.mgmt_config();
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone()).unwrap();
     let mut autoscaler =
         Autoscaler::new(backend, AlwaysScaleUpStrategy, Duration::from_millis(500));
 
@@ -2172,7 +2267,7 @@ async fn autoscaler_custom_strategy_pluggable() {
     let mut reg = registry.lock().await;
     reg.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Autoscaler without Stabilized scales immediately ---
@@ -2181,16 +2276,16 @@ async fn autoscaler_custom_strategy_pluggable() {
 async fn autoscaler_without_stabilization_scales_immediately() {
     use tokio::sync::Mutex;
 
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     let handler = CountingHandler::new();
     let h = handler.clone();
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(0..=4).with_prefetch_count(5),
             move || h.clone(),
             (),
         )
@@ -2214,8 +2309,8 @@ async fn autoscaler_without_stabilization_scales_immediately() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let registry = Arc::new(Mutex::new(registry));
-    let mgmt_config = broker.mgmt_config();
-    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let mgmt_config = ctx.mgmt_config();
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone()).unwrap();
     // Raw ThresholdStrategy with no Stabilized wrapper — no hysteresis/cooldown delay
     let mut autoscaler = Autoscaler::new(
         backend,
@@ -2263,7 +2358,7 @@ async fn autoscaler_without_stabilization_scales_immediately() {
     let mut reg = registry.lock().await;
     reg.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Autoscaler ScaleUp magnitude > 1 ---
@@ -2283,15 +2378,15 @@ async fn autoscaler_scale_up_magnitude() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
 
     // Use SlowScalableHandler (2s per message) so the queue stays deep.
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     registry
         .register::<ScalableWork, _>(
-            ConsumerGroupConfig::new(1..=5).with_prefetch_count(5),
+            RabbitMqConsumerGroupConfig::new(1..=5).with_prefetch_count(5),
             || SlowScalableHandler,
             (),
         )
@@ -2315,8 +2410,8 @@ async fn autoscaler_scale_up_magnitude() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let registry = Arc::new(Mutex::new(registry));
-    let mgmt_config = broker.mgmt_config();
-    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone());
+    let mgmt_config = ctx.mgmt_config();
+    let backend = RabbitMqAutoscalerBackend::new(&mgmt_config, registry.clone()).unwrap();
     let mut autoscaler = Autoscaler::new(backend, ScaleByTwoStrategy, Duration::from_millis(500));
 
     let autoscaler_token = CancellationToken::new();
@@ -2359,7 +2454,7 @@ async fn autoscaler_scale_up_magnitude() {
     let mut reg = registry.lock().await;
     reg.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Audit wrapper captures records ---
@@ -2395,9 +2490,9 @@ async fn audited_handler_captures_audit_records() {
         }
     }
 
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<AuditedWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -2454,7 +2549,7 @@ async fn audited_handler_captures_audit_records() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced: Skip mode ---
@@ -2464,9 +2559,9 @@ async fn audited_handler_captures_audit_records() {
 /// should be acked, and only the rejected one lands in the DLQ.
 #[tokio::test]
 async fn sequenced_skip_continues_after_rejection() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SkipOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -2526,7 +2621,7 @@ async fn sequenced_skip_continues_after_rejection() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced: FailAll mode ---
@@ -2536,9 +2631,9 @@ async fn sequenced_skip_continues_after_rejection() {
 /// Messages for OTHER keys should be unaffected.
 #[tokio::test]
 async fn sequenced_failall_poisons_key_after_rejection() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<FailAllOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -2621,7 +2716,7 @@ async fn sequenced_failall_poisons_key_after_rejection() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // ===========================================================================
@@ -2631,9 +2726,9 @@ async fn sequenced_failall_poisons_key_after_rejection() {
 /// Basic concurrent consumption: all messages are processed and acked.
 #[tokio::test]
 async fn concurrent_consume_processes_all_messages() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<ConcurrentWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -2670,15 +2765,15 @@ async fn concurrent_consume_processes_all_messages() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Concurrent consumption with slow handlers is faster than sequential.
 #[tokio::test]
 async fn concurrent_consume_slow_handler_faster_than_sequential() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -2731,15 +2826,15 @@ async fn concurrent_consume_slow_handler_faster_than_sequential() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Concurrent consumption with prefetch_count=1 behaves like sequential.
 #[tokio::test]
 async fn concurrent_consume_prefetch_one_is_sequential() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<ConcurrentWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -2785,15 +2880,15 @@ async fn concurrent_consume_prefetch_one_is_sequential() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Concurrent consumption correctly routes rejected messages to DLQ.
 #[tokio::test]
 async fn concurrent_consume_mixed_outcomes_routes_correctly() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology()
         .declare::<ConcurrentRejectWork>()
         .await
@@ -2854,15 +2949,15 @@ async fn concurrent_consume_mixed_outcomes_routes_correctly() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Concurrent consumption via consumer group with concurrent_processing enabled.
 #[tokio::test]
 async fn consumer_group_concurrent_processing() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     let handler = CountingHandler::new();
@@ -2870,7 +2965,7 @@ async fn consumer_group_concurrent_processing() {
 
     registry
         .register::<ConcurrentWork, _>(
-            ConsumerGroupConfig::new(2..=2)
+            RabbitMqConsumerGroupConfig::new(2..=2)
                 .with_prefetch_count(10)
                 .with_concurrent_processing(true),
             move || h.clone(),
@@ -2901,15 +2996,15 @@ async fn consumer_group_concurrent_processing() {
 
     registry.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Concurrent consumption gracefully drains in-flight messages on shutdown.
 #[tokio::test]
 async fn concurrent_consume_graceful_shutdown_drains() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<ConcurrentWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -2955,7 +3050,7 @@ async fn concurrent_consume_graceful_shutdown_drains() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Handler timeout ---
@@ -2964,9 +3059,9 @@ async fn concurrent_consume_graceful_shutdown_drains() {
 /// retried via the hold queue. On the second delivery the handler returns Ack.
 #[tokio::test]
 async fn handler_timeout_triggers_retry() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<TimeoutWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3004,7 +3099,7 @@ async fn handler_timeout_triggers_retry() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Registry default handler timeout reaches a registered handler when the
@@ -3013,9 +3108,9 @@ async fn handler_timeout_triggers_retry() {
 /// pre-resolution path.
 #[tokio::test]
 async fn registry_default_handler_timeout_triggers_retry() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<TimeoutWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3036,7 +3131,7 @@ async fn registry_default_handler_timeout_triggers_retry() {
         .register::<TimeoutWork, _>(
             #[allow(clippy::absolute_paths)]
             shove::consumer_group::ConsumerGroupConfig::new(
-                ConsumerGroupConfig::new(1..=1)
+                RabbitMqConsumerGroupConfig::new(1..=1)
                     .with_prefetch_count(1)
                     .with_max_retries(3),
             ),
@@ -3068,7 +3163,7 @@ async fn registry_default_handler_timeout_triggers_retry() {
         handler.delivery_count()
     );
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Ungraceful shutdown recovery ---
@@ -3077,9 +3172,9 @@ async fn registry_default_handler_timeout_triggers_retry() {
 /// messages are returned to the queue and a new consumer picks them all up.
 #[tokio::test]
 async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<UngracefulSeq1>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3121,7 +3216,7 @@ async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
     client.shutdown().await;
 
     // Create a fresh client and consumer for recovery.
-    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let client2 = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let handler = CountingHandler::new();
     let shutdown2 = CancellationToken::new();
     let consumer2 = RabbitMqConsumer::new(client2.clone());
@@ -3145,16 +3240,16 @@ async fn ungraceful_shutdown_sequential_prefetch_1_recovers_messages() {
     shutdown2.cancel();
     consume_handle2.await.unwrap().unwrap();
     client2.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// When a sequential consumer (prefetch=3) is aborted mid-flight, up to 3
 /// unacked messages are returned to the queue and all 5 are recovered.
 #[tokio::test]
 async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<UngracefulSeq3>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3191,7 +3286,7 @@ async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
     // Close first connection so RabbitMQ releases unacked messages.
     client.shutdown().await;
 
-    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let client2 = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let handler = CountingHandler::new();
     let shutdown2 = CancellationToken::new();
     let consumer2 = RabbitMqConsumer::new(client2.clone());
@@ -3215,16 +3310,16 @@ async fn ungraceful_shutdown_sequential_prefetch_3_recovers_messages() {
     shutdown2.cancel();
     consume_handle2.await.unwrap().unwrap();
     client2.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// When a concurrent consumer (prefetch=1) is aborted mid-flight, unacked
 /// messages are returned to the queue and a new consumer picks them all up.
 #[tokio::test]
 async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<UngracefulConc1>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3261,7 +3356,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
     // Close first connection so RabbitMQ releases unacked messages.
     client.shutdown().await;
 
-    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let client2 = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let handler = CountingHandler::new();
     let shutdown2 = CancellationToken::new();
     let consumer2 = RabbitMqConsumer::new(client2.clone());
@@ -3291,9 +3386,9 @@ async fn ungraceful_shutdown_concurrent_prefetch_1_recovers_messages() {
 /// unacked messages are returned to the queue and all 5 are recovered.
 #[tokio::test]
 async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<UngracefulConc3>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3330,7 +3425,7 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
     // Close first connection so RabbitMQ releases unacked messages.
     client.shutdown().await;
 
-    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let client2 = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let handler = CountingHandler::new();
     let shutdown2 = CancellationToken::new();
     let consumer2 = RabbitMqConsumer::new(client2.clone());
@@ -3359,9 +3454,9 @@ async fn ungraceful_shutdown_concurrent_prefetch_3_recovers_messages() {
 /// Concurrent consumer: message that retries twice then acks.
 #[tokio::test]
 async fn concurrent_consumer_retry_then_ack() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<ConcurrentRetryWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3403,16 +3498,16 @@ async fn concurrent_consumer_retry_then_ack() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Concurrent consumer — max retries sends to DLQ ---
 
 #[tokio::test]
 async fn concurrent_consumer_max_retries_sends_to_dlq() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<ConcurrentMaxRetry>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3465,16 +3560,16 @@ async fn concurrent_consumer_max_retries_sends_to_dlq() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Concurrent consumer — graceful shutdown drains in-flight ---
 
 #[tokio::test]
 async fn concurrent_consumer_graceful_shutdown_drains_inflight() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<ConcurrentWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3512,16 +3607,16 @@ async fn concurrent_consumer_graceful_shutdown_drains_inflight() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Deserialization failure rejects to DLQ ---
 
 #[tokio::test]
 async fn deserialization_failure_rejects_to_dlq() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<StrictWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3571,15 +3666,12 @@ async fn deserialization_failure_rejects_to_dlq() {
     // We can't use run_dlq here because the DLQ consumer also can't deserialize the malformed
     // message — it logs and acks without calling handle_dead.
     let http = reqwest::Client::new();
-    let mgmt = broker.mgmt_config();
+    let mgmt = ctx.mgmt_config();
     let mut dlq_ready = 0u64;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let resp = http
-            .get(format!(
-                "{}/api/queues/%2F/test-strict-dlq",
-                broker.mgmt_url
-            ))
+            .get(ctx.queue_api_url("test-strict-dlq"))
             .basic_auth(&mgmt.username, Some(&mgmt.password))
             .send()
             .await
@@ -3596,16 +3688,16 @@ async fn deserialization_failure_rejects_to_dlq() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Concurrent consumer — mixed outcomes routes correctly ---
 
 #[tokio::test]
 async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology()
         .declare::<ConcurrentRejectWork>()
         .await
@@ -3665,16 +3757,16 @@ async fn concurrent_consumer_mixed_outcomes_routes_correctly() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequential consumer — max retries to DLQ ---
 
 #[tokio::test]
 async fn sequential_consumer_max_retries_sends_to_dlq() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<RetryWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3726,16 +3818,16 @@ async fn sequential_consumer_max_retries_sends_to_dlq() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Concurrent consumer — handler timeout triggers retry ---
 
 #[tokio::test]
 async fn concurrent_consumer_handler_timeout_triggers_retry() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<ConcurrentWork>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3765,16 +3857,16 @@ async fn concurrent_consumer_handler_timeout_triggers_retry() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced consumer — retry via shard hold queues ---
 
 #[tokio::test]
 async fn sequenced_consumer_retry_via_shard_hold_queues() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<RetrySeqOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3806,16 +3898,16 @@ async fn sequenced_consumer_retry_via_shard_hold_queues() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced consumer — defer via shard hold queues ---
 
 #[tokio::test]
 async fn sequenced_consumer_defer_via_shard_hold_queues() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<DeferSeqOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3847,16 +3939,16 @@ async fn sequenced_consumer_defer_via_shard_hold_queues() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced FailAll — max retries poisons key ---
 
 #[tokio::test]
 async fn sequenced_failall_max_retries_poisons_key() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<FailAllOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3917,16 +4009,16 @@ async fn sequenced_failall_max_retries_poisons_key() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced consumer — graceful shutdown drain ---
 
 #[tokio::test]
 async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SkipOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -3992,16 +4084,16 @@ async fn sequenced_consumer_graceful_shutdown_drains_inflight() {
     }
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Publisher — sequenced batch via exchange ---
 
 #[tokio::test]
 async fn sequenced_publish_batch_routes_via_exchange() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -4034,16 +4126,16 @@ async fn sequenced_publish_batch_routes_via_exchange() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Publisher — sequenced publish with headers ---
 
 #[tokio::test]
 async fn sequenced_publish_with_headers() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -4077,16 +4169,16 @@ async fn sequenced_publish_with_headers() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- DLQ consumer — deserialization failure acked ---
 
 #[tokio::test]
 async fn dlq_consumer_handles_deserialization_failure() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     let raw_channel = client.create_confirm_channel().await.unwrap();
@@ -4133,7 +4225,7 @@ async fn dlq_consumer_handles_deserialization_failure() {
 
     client.shutdown().await;
     dlq_handle.abort();
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Client shutdown guard ---
@@ -4141,8 +4233,8 @@ async fn dlq_consumer_handles_deserialization_failure() {
 /// Creating channels after shutdown returns an error.
 #[tokio::test]
 async fn client_create_channel_fails_after_shutdown() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
 
     client.shutdown().await;
 
@@ -4155,7 +4247,7 @@ async fn client_create_channel_fails_after_shutdown() {
         "create_confirm_channel should fail after shutdown"
     );
 
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Publisher channel pool ---
@@ -4163,9 +4255,9 @@ async fn client_create_channel_fails_after_shutdown() {
 /// Publisher with custom channel count still publishes correctly.
 #[tokio::test]
 async fn publisher_with_channel_count_publishes() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2)
@@ -4200,15 +4292,15 @@ async fn publisher_with_channel_count_publishes() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Publisher with channel_count=0 clamps to 1 and works.
 #[tokio::test]
 async fn publisher_with_zero_channels_clamps_to_one() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 0)
@@ -4239,7 +4331,7 @@ async fn publisher_with_zero_channels_clamps_to_one() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced batch with channel pool ---
@@ -4247,9 +4339,9 @@ async fn publisher_with_zero_channels_clamps_to_one() {
 /// Batch publish on sequenced topic with channel pool.
 #[tokio::test]
 async fn sequenced_batch_publish_with_pool() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let publisher = RabbitMqPublisher::with_channel_count(client.clone(), 2)
@@ -4282,7 +4374,7 @@ async fn sequenced_batch_publish_with_pool() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Consumer group concurrent processing ---
@@ -4290,9 +4382,9 @@ async fn sequenced_batch_publish_with_pool() {
 /// Consumer group with concurrent_processing=true processes messages.
 #[tokio::test]
 async fn registry_concurrent_processing_consumes_messages() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     let handler = CountingHandler::new();
@@ -4300,7 +4392,7 @@ async fn registry_concurrent_processing_consumes_messages() {
 
     registry
         .register::<SimpleWork, _>(
-            ConsumerGroupConfig::new(1..=3)
+            RabbitMqConsumerGroupConfig::new(1..=3)
                 .with_concurrent_processing(true)
                 .with_prefetch_count(5),
             move || h.clone(),
@@ -4326,7 +4418,7 @@ async fn registry_concurrent_processing_consumes_messages() {
 
     registry.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Duplicate registration error ---
@@ -4334,39 +4426,8 @@ async fn registry_concurrent_processing_consumes_messages() {
 /// Registering the same topic twice returns an error.
 #[tokio::test]
 async fn registry_duplicate_registration_fails() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-
-    let mut registry = ConsumerGroupRegistry::new(client.clone());
-    let handler = CountingHandler::new();
-    let h = handler.clone();
-
-    registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h.clone(), ())
-        .await
-        .unwrap();
-
-    let handler2 = CountingHandler::new();
-    let h2 = handler2.clone();
-    let result = registry
-        .register::<SimpleWork, _>(ConsumerGroupConfig::new(1..=2), move || h2.clone(), ())
-        .await;
-
-    assert!(result.is_err(), "duplicate registration should fail");
-
-    registry.shutdown_all().await;
-    client.shutdown().await;
-    broker.stop().await;
-}
-
-// --- Consumer group concurrent + handler timeout ---
-
-/// Consumer group with concurrent + handler timeout processes messages correctly.
-#[tokio::test]
-async fn registry_concurrent_with_timeout_processes_messages() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
 
     let mut registry = ConsumerGroupRegistry::new(client.clone());
     let handler = CountingHandler::new();
@@ -4374,7 +4435,46 @@ async fn registry_concurrent_with_timeout_processes_messages() {
 
     registry
         .register::<SimpleWork, _>(
-            ConsumerGroupConfig::new(1..=2)
+            RabbitMqConsumerGroupConfig::new(1..=2),
+            move || h.clone(),
+            (),
+        )
+        .await
+        .unwrap();
+
+    let handler2 = CountingHandler::new();
+    let h2 = handler2.clone();
+    let result = registry
+        .register::<SimpleWork, _>(
+            RabbitMqConsumerGroupConfig::new(1..=2),
+            move || h2.clone(),
+            (),
+        )
+        .await;
+
+    assert!(result.is_err(), "duplicate registration should fail");
+
+    registry.shutdown_all().await;
+    client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+// --- Consumer group concurrent + handler timeout ---
+
+/// Consumer group with concurrent + handler timeout processes messages correctly.
+#[tokio::test]
+async fn registry_concurrent_with_timeout_processes_messages() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+
+    let mut registry = ConsumerGroupRegistry::new(client.clone());
+    let handler = CountingHandler::new();
+    let h = handler.clone();
+
+    registry
+        .register::<SimpleWork, _>(
+            RabbitMqConsumerGroupConfig::new(1..=2)
                 .with_concurrent_processing(true)
                 .with_prefetch_count(5)
                 .with_handler_timeout(Duration::from_secs(10)),
@@ -4401,16 +4501,16 @@ async fn registry_concurrent_with_timeout_processes_messages() {
 
     registry.shutdown_all().await;
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced consumer — multiple keys concurrent ---
 
 #[tokio::test]
 async fn sequenced_consumer_multiple_keys_concurrent() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SkipOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -4447,7 +4547,7 @@ async fn sequenced_consumer_multiple_keys_concurrent() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // ===========================================================================
@@ -4534,22 +4634,22 @@ mod exactly_once {
     /// `create_tx_channel` succeeds and returns a usable channel.
     #[tokio::test]
     async fn client_create_tx_channel() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
 
         let _channel = client.create_tx_channel().await.unwrap();
 
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 
     /// A consumer with exactly-once enabled processes messages and acks them
     /// exactly once — same observable result as the default confirm-mode path.
     #[tokio::test]
     async fn exactly_once_consumer_basic_ack() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-        let b = broker.broker_from(client.clone());
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
         b.topology().declare::<ExactlyOnceWork>().await.unwrap();
 
         let publisher = b.publisher().await.unwrap();
@@ -4586,16 +4686,16 @@ mod exactly_once {
         shutdown.cancel();
         consume_handle.await.unwrap().unwrap();
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 
     /// Retry-then-ack works correctly under exactly-once: the message visits the
     /// hold queue the expected number of times and is ultimately acked once.
     #[tokio::test]
     async fn exactly_once_consumer_retry_then_ack() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-        let b = broker.broker_from(client.clone());
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
         b.topology().declare::<ExactlyOnceRetry>().await.unwrap();
 
         let publisher = b.publisher().await.unwrap();
@@ -4642,7 +4742,7 @@ mod exactly_once {
         shutdown.cancel();
         consume_handle.await.unwrap().unwrap();
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 
     define_topic!(
@@ -4740,9 +4840,9 @@ mod exactly_once {
     /// once and is acked on redelivery — no duplicates from the tx path.
     #[tokio::test]
     async fn exactly_once_consumer_defer() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-        let b = broker.broker_from(client.clone());
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
         b.topology().declare::<ExactlyOnceDefer>().await.unwrap();
 
         let publisher = b.publisher().await.unwrap();
@@ -4787,16 +4887,16 @@ mod exactly_once {
         shutdown.cancel();
         consume_handle.await.unwrap().unwrap();
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 
     /// When max_retries is exhausted under exactly-once the message lands in
     /// the DLQ exactly once — no duplicate DLQ entries from the tx path.
     #[tokio::test]
     async fn exactly_once_consumer_max_retries_to_dlq() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-        let b = broker.broker_from(client.clone());
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
         b.topology()
             .declare::<ExactlyOnceMaxRetries>()
             .await
@@ -4855,16 +4955,16 @@ mod exactly_once {
         main_handle.await.unwrap().unwrap();
         dlq_handle.abort();
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 
     /// Graceful shutdown drains in-flight messages under exactly-once mode —
     /// every in-progress message is committed before the consumer exits.
     #[tokio::test]
     async fn exactly_once_consumer_graceful_shutdown() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-        let b = broker.broker_from(client.clone());
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
         b.topology().declare::<ExactlyOnceShutdown>().await.unwrap();
 
         let publisher = b.publisher().await.unwrap();
@@ -4901,16 +5001,16 @@ mod exactly_once {
         // Consumer must exit cleanly (no panic, no error).
         consume_handle.await.unwrap().unwrap();
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 
     /// Concurrent prefetch > 1 under exactly-once: multiple messages in-flight
     /// per consumer must all be committed without duplicates.
     #[tokio::test]
     async fn exactly_once_consumer_concurrent_prefetch() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-        let b = broker.broker_from(client.clone());
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
         b.topology()
             .declare::<ExactlyOnceConcurrent>()
             .await
@@ -4952,16 +5052,16 @@ mod exactly_once {
         shutdown.cancel();
         consume_handle.await.unwrap().unwrap();
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 
     /// Messages rejected by the handler are routed to the DLQ exactly once
     /// under exactly-once mode — no duplicate DLQ entries.
     #[tokio::test]
     async fn exactly_once_consumer_reject_to_dlq() {
-        let broker = TestBroker::start().await;
-        let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-        let b = broker.broker_from(client.clone());
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
         b.topology().declare::<ExactlyOnceReject>().await.unwrap();
 
         let publisher = b.publisher().await.unwrap();
@@ -5012,7 +5112,7 @@ mod exactly_once {
         main_handle.await.unwrap().unwrap();
         dlq_handle.abort();
         client.shutdown().await;
-        broker.stop().await;
+        ctx.cleanup().await;
     }
 }
 
@@ -5020,9 +5120,9 @@ mod exactly_once {
 
 #[tokio::test]
 async fn defer_preserves_retry_count() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<DeferWithHold>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -5072,16 +5172,16 @@ async fn defer_preserves_retry_count() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- Sequenced defer without hold queues (nack+requeue fallback) ---
 
 #[tokio::test]
 async fn sequenced_defer_without_hold_queue_requeues() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<DeferSeqNoHold>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -5114,7 +5214,7 @@ async fn sequenced_defer_without_hold_queue_requeues() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -5123,9 +5223,9 @@ async fn sequenced_defer_without_hold_queue_requeues() {
 
 #[tokio::test]
 async fn run_fifo_until_timeout_clean_drain() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     // Publish a small batch.
@@ -5172,7 +5272,7 @@ async fn run_fifo_until_timeout_clean_drain() {
     assert_eq!(handler.count(), 5);
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
@@ -5186,9 +5286,9 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
     // As a result, `outcome.panics` and `outcome.errors` will both be zero.
     // This test documents and verifies that contract: the harness does not
     // crash or deadlock when handlers panic, and the outcome is clean.
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -5245,7 +5345,7 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
@@ -5256,9 +5356,9 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     // completes. With a slow handler (60 s sleep) and a short drain budget
     // (500 ms), the timeout fires before the shard finishes, the JoinSet
     // abort_all's the handles, and timed_out is set to true.
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -5301,15 +5401,15 @@ async fn run_fifo_until_timeout_flags_timeout_when_drain_overruns() {
     assert_eq!(outcome.exit_code(), 3);
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 /// Consumer group `register_fifo` drains all messages via `run_until_timeout`.
 #[tokio::test]
 async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<OrderTopic>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -5328,7 +5428,7 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     group
         .register_fifo::<OrderTopic, _>(
             #[allow(clippy::absolute_paths)]
-            shove::consumer_group::ConsumerGroupConfig::new(ConsumerGroupConfig::default()),
+            shove::consumer_group::ConsumerGroupConfig::new(RabbitMqConsumerGroupConfig::default()),
             {
                 let h = handler.clone();
                 move || h.clone()
@@ -5350,7 +5450,7 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     assert_eq!(handler.count(), 5);
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- hold_queue_timeout eviction ---
@@ -5363,9 +5463,9 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
 /// the *next* tick (one full period) before the check at `1.5×` clears it.
 #[tokio::test]
 async fn sequenced_consumer_hold_queue_timeout_evicts_stuck_key_within_1_5x() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<EvictSeqOrders>().await.unwrap();
 
     let publisher = b.publisher().await.unwrap();
@@ -5404,7 +5504,7 @@ async fn sequenced_consumer_hold_queue_timeout_evicts_stuck_key_within_1_5x() {
 
     // DLQ consumer watches for msg2 to be dead-lettered by the eviction.
     let dlq_handler = OrderDlqHandler::new();
-    let client2 = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
+    let client2 = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
     let consumer2 = RabbitMqConsumer::new(client2.clone());
     let dh = dlq_handler.clone();
     let dlq_handle =
@@ -5440,7 +5540,7 @@ async fn sequenced_consumer_hold_queue_timeout_evicts_stuck_key_within_1_5x() {
     client2.shutdown().await;
     dlq_handle.abort();
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // --- max_reconnect_attempts ---
@@ -5448,11 +5548,20 @@ async fn sequenced_consumer_hold_queue_timeout_evicts_stuck_key_within_1_5x() {
 /// Verify that a consumer configured with `max_reconnect_attempts(N)` exits
 /// with a `ShoveError::Connection` after N failed reconnect attempts instead
 /// of spinning indefinitely.
+///
+/// Requires standalone mode: the test stops the broker application mid-run to
+/// force reconnect failures. In shared mode (`RABBITMQ_AMQP_URL` is set by the
+/// nextest setup script) `stop_broker_app` is unavailable and the test is
+/// skipped to protect the shared container used by the rest of the suite.
 #[tokio::test]
 async fn consumer_exits_after_max_reconnect_attempts_exhausted() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config()).await.unwrap();
-    let b = broker.broker_from(client.clone());
+    if std::env::var("RABBITMQ_AMQP_URL").is_ok() {
+        // Cannot stop the shared broker app without disrupting all other tests.
+        return;
+    }
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
     b.topology().declare::<SimpleWork>().await.unwrap();
 
     let consumer = RabbitMqConsumer::new(client.clone());
@@ -5465,7 +5574,7 @@ async fn consumer_exits_after_max_reconnect_attempts_exhausted() {
     });
 
     // Kill the broker app so all reconnect attempts fail.
-    broker.stop_broker_app().await;
+    ctx.stop_broker_app().await;
 
     // Consumer should exit with an error after 2 reconnect attempts (not spin
     // forever). Allow up to 45 s: connection-drop detection (~1–5 s) +
@@ -5482,7 +5591,7 @@ async fn consumer_exits_after_max_reconnect_attempts_exhausted() {
     );
 
     client.shutdown().await;
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -5498,8 +5607,8 @@ define_topic!(
 
 #[tokio::test]
 async fn broker_queue_stats_provider_returns_real_management_stats() {
-    let broker = TestBroker::start().await;
-    let cfg = broker.rmq_config().with_management(broker.mgmt_config());
+    let ctx = TestContext::new().await;
+    let cfg = ctx.rmq_config().with_management(ctx.mgmt_config());
 
     let shove_broker = Broker::<RabbitMqMarker>::new(cfg)
         .await
@@ -5541,15 +5650,15 @@ async fn broker_queue_stats_provider_returns_real_management_stats() {
         "management API never reported the published backlog; last_seen={last_seen}"
     );
 
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn broker_queue_stats_provider_without_management_errors() {
-    let broker = TestBroker::start().await;
+    let ctx = TestContext::new().await;
     // Deliberately omit .with_management(...) — the bridge should error rather
     // than silently returning zero or stale data.
-    let shove_broker = Broker::<RabbitMqMarker>::new(broker.rmq_config())
+    let shove_broker = Broker::<RabbitMqMarker>::new(ctx.rmq_config())
         .await
         .expect("connect without management");
 
@@ -5568,7 +5677,7 @@ async fn broker_queue_stats_provider_without_management_errors() {
         "error must direct the caller at RabbitMqConfig::with_management; got: {err}"
     );
 
-    broker.stop().await;
+    ctx.cleanup().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -5604,12 +5713,12 @@ impl MessageHandler<PoolTestTopic> for PoolTestHandler {
 /// topic must flow through consumers spread across that pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pool_spans_three_connections_and_routes_traffic() {
-    let broker = TestBroker::start().await;
-    let client = RabbitMqClient::connect(&broker.rmq_config())
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config())
         .await
         .expect("connect");
 
-    let b = broker.broker_from(client.clone());
+    let b = ctx.broker_from(client.clone());
     b.topology()
         .declare::<PoolTestTopic>()
         .await
@@ -5619,7 +5728,7 @@ async fn pool_spans_three_connections_and_routes_traffic() {
     let count = Arc::new(AtomicU32::new(0));
     let count_for_factory = count.clone();
     let mut registry = ConsumerGroupRegistry::new(client);
-    let config = ConsumerGroupConfig::new(120..=120).with_prefetch_count(10);
+    let config = RabbitMqConsumerGroupConfig::new(120..=120).with_prefetch_count(10);
     registry
         .register::<PoolTestTopic, _>(
             config,
@@ -5671,5 +5780,90 @@ async fn pool_spans_three_connections_and_routes_traffic() {
     );
 
     registry.shutdown_all().await;
-    broker.stop().await;
+    ctx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Publisher pool concurrency: mutex must not be held during confirm await
+// ---------------------------------------------------------------------------
+
+/// With a single-channel pool, N concurrent publishes must NOT serialize
+/// through the `Mutex<Channel>` for the full publish-confirm round-trip.
+///
+/// The fix releases the mutex after cloning the channel and before any
+/// network I/O.  Observable effect: N concurrent publishes complete in
+/// roughly the same wall-clock time as 1 sequential publish (all confirms
+/// arrive together), whereas under the unfixed code they serialize to
+/// ~N × RTT.
+///
+/// Test strategy:
+/// 1. Measure sequential time for N publishes (establishes per-publish RTT).
+/// 2. Measure concurrent time for the same N publishes on the same
+///    single-channel publisher.
+/// 3. Assert concurrent < sequential / 2 — if the mutex were still held
+///    during the confirm wait both durations would be equal and the
+///    assertion would fail.
+#[tokio::test]
+async fn publisher_single_channel_pool_does_not_serialize_concurrent_publishes() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config())
+        .await
+        .expect("connect");
+
+    ctx.broker_from(client.clone())
+        .topology()
+        .declare::<PublisherConcurrencyTopic>()
+        .await
+        .expect("declare topology");
+
+    // One channel slot — every concurrent publish targets the same Mutex<Channel>.
+    let publisher = Arc::new(
+        RabbitMqPublisher::with_channel_count(client, 1)
+            .await
+            .expect("publisher"),
+    );
+
+    let msg = SimpleMessage {
+        body: "ping".into(),
+    };
+    const N: usize = 4;
+
+    // --- Sequential baseline: establishes per-publish RTT ---
+    let seq_start = Instant::now();
+    for _ in 0..N {
+        publisher
+            .publish::<PublisherConcurrencyTopic>(&msg)
+            .await
+            .expect("sequential publish");
+    }
+    let seq_elapsed = seq_start.elapsed();
+
+    // --- Concurrent: all N publishes fire at the same time ---
+    let conc_start = Instant::now();
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let p = Arc::clone(&publisher);
+            let m = msg.clone();
+            tokio::spawn(async move {
+                p.publish::<PublisherConcurrencyTopic>(&m)
+                    .await
+                    .expect("concurrent publish")
+            })
+        })
+        .collect();
+    for h in handles {
+        h.await.expect("task panicked");
+    }
+    let conc_elapsed = conc_start.elapsed();
+
+    // Concurrent must be at least 2× faster than sequential.
+    // If the mutex is held during the confirm await the two durations are
+    // nearly identical (both serialized), failing the assertion.
+    assert!(
+        conc_elapsed * 2 < seq_elapsed,
+        "concurrent ({conc_elapsed:?}) must be >2× faster than sequential ({seq_elapsed:?}); \
+         if durations are similar the Mutex<Channel> is still held during the confirm await"
+    );
+
+    ctx.cleanup().await;
 }

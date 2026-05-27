@@ -12,9 +12,19 @@ use crate::error::Result;
 /// Signs short-lived presigned URLs against `kafka-cluster:Connect` using
 /// the AWS credential chain. Held inside `MskIamContext` and called from
 /// librdkafka's OAUTHBEARER refresh thread.
+///
+/// **Multi-threaded runtime required.** `generate_oauth_token` is called
+/// synchronously on librdkafka's C poll thread and uses `Handle::block_on`
+/// to drive the AWS signer future (typically 50-200 ms per call). On a
+/// single-threaded runtime this can deadlock; on a multi-threaded runtime
+/// it pays a worker-thread stall during refresh (every ~12 minutes per
+/// client).
 #[allow(dead_code)]
 pub(super) struct MskIamTokenProvider {
-    region: String,
+    // perf-K-13: build the Region once in `new` and clone it on each token
+    // refresh — the previous implementation re-built `aws_config::Region`
+    // from the region string on every refresh.
+    region: aws_config::Region,
     credentials: SharedCredentialsProvider,
     /// Tokio runtime handle captured at construction time (inside an async
     /// context). Used by `generate_oauth_token` to bridge from librdkafka's
@@ -25,8 +35,8 @@ pub(super) struct MskIamTokenProvider {
 #[allow(dead_code)]
 impl MskIamTokenProvider {
     pub(super) async fn new(region: String, profile: Option<String>) -> Result<Self> {
-        let mut loader = aws_config::defaults(BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.clone()));
+        let region = aws_config::Region::new(region);
+        let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(region.clone());
         if let Some(p) = profile {
             loader = loader.profile_name(p);
         }
@@ -80,7 +90,7 @@ impl ClientContext for MskIamContext {
         let handle = provider.handle.clone();
         let (token, expiry_ms) = handle.block_on(async move {
             generate_auth_token_from_credentials_provider(
-                aws_config::Region::new(provider.region.clone()),
+                provider.region.clone(),
                 provider.credentials.clone(),
             )
             .await

@@ -79,15 +79,16 @@ impl RabbitMqPublisher {
         headers: Option<FieldTable>,
     ) -> Result<()> {
         let slot = self.pool.get();
-        let mut channel_guard = slot.lock().await;
 
         // Stamp a stable x-message-id so consumers can deduplicate if the
         // publish-then-ack race produces a second delivery of this message.
         let mut headers = headers.unwrap_or_default();
         if !headers.inner().contains_key(MESSAGE_ID_KEY) {
+            let mut buf = [0u8; 36];
+            let id = Uuid::new_v4().hyphenated().encode_lower(&mut buf);
             headers.insert(
                 MESSAGE_ID_KEY.into(),
-                AMQPValue::LongString(Uuid::new_v4().to_string().into()),
+                AMQPValue::LongString(id.as_bytes().into()),
             );
         }
         let headers = Some(headers);
@@ -103,15 +104,15 @@ impl RabbitMqPublisher {
         let mut last_err = None;
 
         for attempt in 0..3u32 {
-            match Self::do_publish(
-                &channel_guard,
-                exchange,
-                routing_key,
-                payload,
-                headers.clone(),
-            )
-            .await
-            {
+            // Clone the channel while holding the lock, then release
+            // immediately. `lapin::Channel` is Arc-backed — cloning is
+            // O(1) and the clone shares the same underlying AMQP channel.
+            // Releasing before `do_publish` means the mutex is not held
+            // during `basic_publish` or the confirm round-trip, so
+            // concurrent callers on the same slot can pipeline their
+            // publishes instead of serializing for the full RTT.
+            let channel = slot.lock().await.clone();
+            match Self::do_publish(&channel, exchange, routing_key, payload, &headers).await {
                 Ok(()) => {
                     debug!(exchange, routing_key, "message published and confirmed");
                     return Ok(());
@@ -126,7 +127,7 @@ impl RabbitMqPublisher {
                         let delay = backoff.next().expect("backoff is infinite");
                         tokio::time::sleep(delay).await;
                         let fresh = self.client.create_confirm_channel().await?;
-                        *channel_guard = fresh;
+                        *slot.lock().await = fresh;
                     }
                 }
             }
@@ -140,10 +141,10 @@ impl RabbitMqPublisher {
         exchange: &str,
         routing_key: &str,
         payload: &[u8],
-        headers: Option<FieldTable>,
+        headers: &Option<FieldTable>,
     ) -> Result<()> {
         let props = match headers {
-            Some(h) => base_properties().with_headers(h),
+            Some(h) => base_properties().with_headers(h.clone()),
             None => base_properties(),
         };
 
@@ -184,7 +185,6 @@ impl RabbitMqPublisher {
         items: &[(&str, Vec<u8>)],
     ) -> (u64, Result<()>) {
         let slot = self.pool.get();
-        let mut channel_guard = slot.lock().await;
 
         debug!(exchange, count = items.len(), "publishing batch");
 
@@ -192,7 +192,11 @@ impl RabbitMqPublisher {
         let mut last: (u64, Result<()>) = (0, Ok(()));
 
         for attempt in 0..3u32 {
-            let (succeeded, result) = Self::do_publish_batch(&channel_guard, exchange, items).await;
+            // Clone the channel before releasing the lock — same rationale as
+            // `publish_raw`: the mutex is held only for the Arc clone, not for
+            // the network round-trips inside `do_publish_batch`.
+            let channel = slot.lock().await.clone();
+            let (succeeded, result) = Self::do_publish_batch(&channel, exchange, items).await;
             match result {
                 Ok(()) => {
                     debug!(
@@ -209,7 +213,7 @@ impl RabbitMqPublisher {
                         let delay = backoff.next().expect("backoff is infinite");
                         tokio::time::sleep(delay).await;
                         match self.client.create_confirm_channel().await {
-                            Ok(fresh) => *channel_guard = fresh,
+                            Ok(fresh) => *slot.lock().await = fresh,
                             Err(e) => return (last.0, Err(e)),
                         }
                     }

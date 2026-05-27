@@ -15,7 +15,7 @@ use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
     RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
 };
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::markers::InMemory;
@@ -73,12 +73,11 @@ impl Backend for InMemory {
     }
 
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
-        // `InMemoryAutoscalerBackend::new` needs a shared registry handle too;
-        // the public `Broker::autoscaler()` path (Phase 5+) supplies one. For
-        // the trait-dispatch factory we build a fresh empty registry: callers
-        // that want to observe scaling decisions go through the typed
-        // `InMemoryAutoscalerBackend::autoscaler` constructor which is the
-        // real wiring point until Phase 8's `Autoscaler<B>` harness lands.
+        // Creates a fresh registry separate from the one used by
+        // `ConsumerGroup<InMemory>`. Consumer groups registered through
+        // `Broker::consumer_group()` are not visible to this autoscaler;
+        // wire them via `InMemoryAutoscalerBackend::new` with the shared
+        // registry if cross-visibility is required.
         use std::sync::Arc;
         use tokio::sync::Mutex;
         let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
@@ -136,11 +135,18 @@ impl ConsumerImpl for InMemoryConsumer {
         InMemoryConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        _options: ConsumerOptionsInner,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
+        // In-memory DLQ has no size validation (messages never leave the
+        // process); the options arg is accepted for trait conformance.
         InMemoryConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 
@@ -258,18 +264,29 @@ impl RegistryImpl for InMemoryConsumerGroupRegistry {
             }
         }
 
-        let drain = self.shutdown_all_with_tally();
-        match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(tally) => SupervisorOutcome {
+        // Mirror the supervisor pattern in `ConsumerSupervisor::run_until_timeout`:
+        // accumulate the tally outside the timeout so a drain-timeout
+        // escalation can abort survivors and finish tallying instead of
+        // discarding what was already counted.
+        let mut tally = ShutdownTally::default();
+        match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
+            Ok(()) => SupervisorOutcome {
                 errors: tally.errors,
                 panics: tally.panics,
                 timed_out: false,
             },
-            Err(_) => SupervisorOutcome {
-                errors: 0,
-                panics: 0,
-                timed_out: true,
-            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving consumer tasks"
+                );
+                self.abort_all_remaining_into(&mut tally).await;
+                SupervisorOutcome {
+                    errors: tally.errors,
+                    panics: tally.panics,
+                    timed_out: true,
+                }
+            }
         }
     }
 }

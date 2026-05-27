@@ -1,6 +1,6 @@
 use aws_sdk_sqs::config::http::HttpResponse;
 use aws_sdk_sqs::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_sqs::types::{Message, MessageAttributeValue, MessageSystemAttributeName};
+use aws_sdk_sqs::types::{Message, MessageSystemAttributeName};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
@@ -95,7 +95,7 @@ fn extract_metadata(msg: &Message) -> MessageMetadata {
         retry_count,
         delivery_id: msg.message_id().unwrap_or_default().to_string(),
         redelivered: retry_count > 0,
-        headers: router::extract_message_attributes(msg),
+        headers: Arc::new(router::extract_message_attributes(msg)),
     }
 }
 
@@ -281,8 +281,9 @@ where
 
 struct PendingMessage {
     receipt_handle: String,
-    body: String,
-    message_attributes: HashMap<String, MessageAttributeValue>,
+    /// The original SQS message, kept for lazy access on retry/defer paths.
+    /// Arc avoids cloning the body and attributes for the common Ack outcome.
+    msg: Arc<Message>,
     retry_count: u32,
     outcome_rx: oneshot::Receiver<Outcome>,
 }
@@ -385,8 +386,7 @@ where
                         sqs,
                         queue_url,
                         &msg.receipt_handle,
-                        &msg.body,
-                        &msg.message_attributes,
+                        &msg.msg,
                         outcome,
                         topology,
                         msg.retry_count,
@@ -411,8 +411,7 @@ where
                         sqs,
                         queue_url,
                         &msg.receipt_handle,
-                        &msg.body,
-                        &msg.message_attributes,
+                        &msg.msg,
                         Outcome::Retry,
                         topology,
                         msg.retry_count,
@@ -450,6 +449,9 @@ where
                 }
             }
             let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
+            // Collect Acks into a batch; non-Ack outcomes still need
+            // per-message routing (Retry/Reject/Defer touch distinct queues).
+            let mut drain_acks: Vec<String> = Vec::with_capacity(in_flight.len());
             for pending in in_flight {
                 let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
                     .await
@@ -461,17 +463,28 @@ where
                         Ok(Outcome::Retry)
                     })
                     .unwrap_or(Outcome::Retry);
-                route_outcome(
-                    sqs,
+                if matches!(outcome, Outcome::Ack) {
+                    drain_acks.push(pending.receipt_handle);
+                } else {
+                    route_outcome(
+                        sqs,
+                        queue_url,
+                        &pending.receipt_handle,
+                        &pending.msg,
+                        outcome,
+                        topology,
+                        pending.retry_count,
+                    )
+                    .await;
+                }
+            }
+            if !drain_acks.is_empty() {
+                let batch_size = drain_acks.len();
+                debug!(
                     queue_url,
-                    &pending.receipt_handle,
-                    &pending.body,
-                    &pending.message_attributes,
-                    outcome,
-                    topology,
-                    pending.retry_count,
-                )
-                .await;
+                    batch_size, "flushing ack batch on drain completion"
+                );
+                router::route_ack_batch(sqs, queue_url, drain_acks).await;
             }
             return Ok(());
         }
@@ -547,8 +560,7 @@ where
             );
             in_flight.push_back(PendingMessage {
                 receipt_handle,
-                body: msg.body().unwrap_or_default().to_string(),
-                message_attributes: msg.message_attributes().cloned().unwrap_or_default(),
+                msg: Arc::new(msg),
                 retry_count,
                 outcome_rx: rx,
             });
@@ -637,13 +649,14 @@ where
 }
 
 /// Route a completed message based on its outcome.
-#[allow(clippy::too_many_arguments)]
+///
+/// `body` and `message_attributes` are accessed lazily: only the Retry and
+/// Defer arms need them, so the common Ack path pays no extraction cost.
 async fn route_outcome(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     receipt_handle: &str,
-    body: &str,
-    message_attributes: &HashMap<String, MessageAttributeValue>,
+    msg: &Message,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
@@ -651,12 +664,15 @@ async fn route_outcome(
     match outcome {
         Outcome::Ack => router::route_ack(sqs, queue_url, receipt_handle).await,
         Outcome::Retry => {
+            let body = msg.body().unwrap_or_default();
+            let empty_attrs = HashMap::new();
+            let attrs = msg.message_attributes().unwrap_or(&empty_attrs);
             router::route_retry(
                 sqs,
                 queue_url,
                 receipt_handle,
                 body,
-                message_attributes,
+                attrs,
                 topology,
                 retry_count,
             )
@@ -664,12 +680,15 @@ async fn route_outcome(
         }
         Outcome::Reject => router::route_reject(sqs, queue_url, receipt_handle, topology).await,
         Outcome::Defer => {
+            let body = msg.body().unwrap_or_default();
+            let empty_attrs = HashMap::new();
+            let attrs = msg.message_attributes().unwrap_or(&empty_attrs);
             router::route_defer(
                 sqs,
                 queue_url,
                 receipt_handle,
                 body,
-                message_attributes,
+                attrs,
                 topology,
                 retry_count,
             )
@@ -688,8 +707,8 @@ enum KeyState {
     /// A handler is currently running for this key.
     InFlight {
         receipt_handle: String,
-        body: String,
-        message_attributes: HashMap<String, MessageAttributeValue>,
+        /// Original SQS message kept for lazy body/attribute access on retry/defer.
+        msg: Arc<Message>,
         retry_count: u32,
         outcome_rx: oneshot::Receiver<Outcome>,
     },
@@ -864,8 +883,7 @@ where
             };
             let KeyState::InFlight {
                 receipt_handle,
-                body,
-                message_attributes,
+                msg,
                 retry_count,
                 mut outcome_rx,
             } = state
@@ -886,8 +904,7 @@ where
                         key,
                         KeyState::InFlight {
                             receipt_handle,
-                            body,
-                            message_attributes,
+                            msg,
                             retry_count,
                             outcome_rx,
                         },
@@ -998,7 +1015,7 @@ where
                 );
                 // Wait for all in-flight handlers to complete.
                 for (key, state) in key_states.drain() {
-                    if let KeyState::InFlight { receipt_handle, body: _, message_attributes: _, retry_count, outcome_rx } = state {
+                    if let KeyState::InFlight { receipt_handle, msg: _, retry_count, outcome_rx } = state {
                         let outcome = outcome_rx.await.unwrap_or(Outcome::Retry);
                         debug!(
                             queue_url,
@@ -1294,11 +1311,7 @@ where
                         seq_key,
                         KeyState::InFlight {
                             receipt_handle,
-                            body: msg.body().unwrap_or_default().to_string(),
-                            message_attributes: msg
-                                .message_attributes()
-                                .cloned()
-                                .unwrap_or_default(),
+                            msg: Arc::new(msg),
                             retry_count,
                             outcome_rx: rx,
                         },
@@ -1450,8 +1463,7 @@ async fn drain_pending_for_key<T, H>(
             key.to_string(),
             KeyState::InFlight {
                 receipt_handle,
-                body: msg.body().unwrap_or_default().to_string(),
-                message_attributes: msg.message_attributes().cloned().unwrap_or_default(),
+                msg: Arc::new(msg),
                 retry_count,
                 outcome_rx: rx,
             },

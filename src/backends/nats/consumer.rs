@@ -82,7 +82,7 @@ fn extract_message_metadata(msg: &Message) -> MessageMetadata {
         retry_count,
         delivery_id,
         redelivered,
-        headers,
+        headers: Arc::new(headers),
     }
 }
 
@@ -679,8 +679,9 @@ impl NatsConsumer {
                             let task_topic = topic.clone();
                             let task_group = group.clone();
 
-                            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
                             tokio::spawn(async move {
+                                task_processing.store(true, Ordering::Release);
+
                                 let outcome = invoke_handler(
                                     async move {
                                         task_handler.handle(payload, metadata, task_ctx.as_ref()).await
@@ -690,16 +691,6 @@ impl NatsConsumer {
                                     task_group.as_deref(),
                                 )
                                 .await;
-                                let _ = outcome_tx.send(outcome);
-                            });
-
-                            tokio::spawn(async move {
-                                task_processing.store(true, Ordering::Release);
-
-                                let outcome = outcome_rx.await.unwrap_or_else(|_| {
-                                    tracing::warn!(queue = topology.queue(), "handler task panicked, retrying message");
-                                    Outcome::Retry
-                                });
 
                                 route_outcome(
                                     &task_client,

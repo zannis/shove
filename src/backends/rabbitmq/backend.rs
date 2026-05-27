@@ -15,7 +15,7 @@ use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
     RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
 };
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::markers::RabbitMq;
@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use super::autoscaler::RabbitMqAutoscalerBackend;
 use super::client::{RabbitMqClient, RabbitMqConfig};
 use super::consumer::RabbitMqConsumer;
-use super::consumer_group::ConsumerGroupConfig;
+use super::consumer_group::RabbitMqConsumerGroupConfig;
 use super::publisher::RabbitMqPublisher;
 use super::registry::ConsumerGroupRegistry;
 use super::topology::RabbitMqTopologyDeclarer;
@@ -60,28 +60,41 @@ impl LazyRabbitMqTopologyDeclarer {
 use super::management::ManagementClient;
 
 pub struct RabbitMqStatsBridge {
-    inner: Option<ManagementClient>,
+    /// `Ok(Some(mc))` — management configured and client built successfully.
+    /// `Ok(None)`     — management not configured; error deferred to first use.
+    /// `Err(e)`       — management configured but client init failed (bad cert,
+    ///                  unreadable file, etc.); error deferred to first use.
+    inner: Result<Option<ManagementClient>>,
 }
 
 impl RabbitMqStatsBridge {
     fn from_config(cfg: Option<super::management::ManagementConfig>) -> Self {
         Self {
-            inner: cfg.map(ManagementClient::new),
+            inner: cfg.map(ManagementClient::new).transpose(),
         }
     }
 
     /// Read live queue stats from the Management API.
     ///
     /// Errors with `ShoveError::Topology` if `RabbitMqConfig::with_management(...)`
-    /// was not set; the message points the caller at the right builder.
+    /// was not set; errors with `ShoveError::Connection` if the client failed to
+    /// initialise (e.g. unreadable or malformed CA certificate).
     pub async fn get_queue_stats(&self, queue: &str) -> Result<super::management::QueueStats> {
-        let mc = self.inner.as_ref().ok_or_else(|| {
-            ShoveError::Topology(
-                "RabbitMqStatsBridge::get_queue_stats requires \
-                 RabbitMqConfig::with_management(...) to be set"
-                    .into(),
-            )
-        })?;
+        let mc = match &self.inner {
+            Err(e) => {
+                return Err(ShoveError::Connection(format!(
+                    "management client init failed: {e}"
+                )));
+            }
+            Ok(None) => {
+                return Err(ShoveError::Topology(
+                    "RabbitMqStatsBridge::get_queue_stats requires \
+                     RabbitMqConfig::with_management(...) to be set"
+                        .into(),
+                ));
+            }
+            Ok(Some(mc)) => mc,
+        };
         <ManagementClient as super::management::QueueStatsProvider>::get_queue_stats(mc, queue)
             .await
     }
@@ -106,7 +119,7 @@ impl Backend for RabbitMq {
     type PublisherImpl = RabbitMqPublisher;
     type ConsumerImpl = RabbitMqConsumer;
     type TopologyImpl = LazyRabbitMqTopologyDeclarer;
-    type AutoscalerImpl = RabbitMqAutoscalerBackend<ManagementClient>;
+    type AutoscalerImpl = RabbitMqAutoscalerBackend<RabbitMqStatsBridge>;
     type QueueStatsImpl = RabbitMqStatsBridge;
 
     async fn connect(config: Self::Config) -> Result<Self::Client> {
@@ -125,20 +138,18 @@ impl Backend for RabbitMq {
         LazyRabbitMqTopologyDeclarer::new(client.clone())
     }
 
-    /// # Panics
+    /// Returns an autoscaler backend backed by a [`RabbitMqStatsBridge`].
     ///
-    /// Panics if `RabbitMqConfig::with_management(...)` was not set. The
-    /// autoscaler is useless without management — loud failure at
-    /// construction is preferred over silent no-op decisions at scale time.
+    /// If `RabbitMqConfig::with_management(...)` was not set, or the management
+    /// client fails to initialise (e.g. unreadable CA certificate), the error is
+    /// deferred to the first metrics poll — consistent with
+    /// [`make_stats_provider`](Self::make_stats_provider).
     fn make_autoscaler(client: &Self::Client) -> Self::AutoscalerImpl {
         use std::sync::Arc;
         use tokio::sync::Mutex;
-        let mc = ManagementClient::new(client.management_config().expect(
-            "Broker<RabbitMq>::autoscaler() requires \
-             RabbitMqConfig::with_management(...) to be set",
-        ));
+        let stats = RabbitMqStatsBridge::from_config(client.management_config());
         let registry = Arc::new(Mutex::new(ConsumerGroupRegistry::new(client.clone())));
-        RabbitMqAutoscalerBackend::with_stats_provider(mc, registry)
+        RabbitMqAutoscalerBackend::with_stats_provider(stats, registry)
     }
 
     fn make_stats_provider(client: &Self::Client) -> Self::QueueStatsImpl {
@@ -151,7 +162,7 @@ impl Backend for RabbitMq {
 }
 
 impl HasCoordinatedGroups for RabbitMq {
-    type ConsumerGroupConfig = ConsumerGroupConfig;
+    type ConsumerGroupConfig = RabbitMqConsumerGroupConfig;
     type RegistryImpl = ConsumerGroupRegistry;
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl {
@@ -190,11 +201,18 @@ impl ConsumerImpl for RabbitMqConsumer {
         RabbitMqConsumer::run_fifo_with_inner::<T, H>(self, handler, ctx, options).await
     }
 
-    async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    async fn run_dlq<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        _options: ConsumerOptionsInner,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
+        // RabbitMQ DLQ consumer does not consult max_message_size — message
+        // size is enforced broker-side via x-max-length-bytes.
         RabbitMqConsumer::run_dlq::<T, H>(self, handler, ctx).await
     }
 
@@ -228,7 +246,7 @@ impl TopologyImpl for LazyRabbitMqTopologyDeclarer {
 // AutoscalerBackendImpl — trait has no methods in Phase 4
 // ---------------------------------------------------------------------------
 
-impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<ManagementClient> {}
+impl AutoscalerBackendImpl for RabbitMqAutoscalerBackend<RabbitMqStatsBridge> {}
 
 // ---------------------------------------------------------------------------
 // RabbitMqStatsBridge — maps Option<ManagementClient> into the
@@ -255,7 +273,7 @@ impl QueueStatsProviderImpl for RabbitMqStatsBridge {
 // ---------------------------------------------------------------------------
 
 impl RegistryImpl for ConsumerGroupRegistry {
-    type GroupConfig = ConsumerGroupConfig;
+    type GroupConfig = RabbitMqConsumerGroupConfig;
 
     async fn register<T, H>(
         &mut self,
@@ -307,18 +325,29 @@ impl RegistryImpl for ConsumerGroupRegistry {
             }
         }
 
-        let drain = self.shutdown_all_with_tally();
-        match tokio::time::timeout(drain_timeout, drain).await {
-            Ok(tally) => SupervisorOutcome {
+        // Mirror the supervisor pattern in `ConsumerSupervisor::run_until_timeout`:
+        // accumulate the tally outside the timeout so a drain-timeout
+        // escalation can abort survivors and finish tallying instead of
+        // discarding what was already counted.
+        let mut tally = ShutdownTally::default();
+        match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
+            Ok(()) => SupervisorOutcome {
                 errors: tally.errors,
                 panics: tally.panics,
                 timed_out: false,
             },
-            Err(_) => SupervisorOutcome {
-                errors: 0,
-                panics: 0,
-                timed_out: true,
-            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving consumer tasks"
+                );
+                self.abort_all_remaining_into(&mut tally).await;
+                SupervisorOutcome {
+                    errors: tally.errors,
+                    panics: tally.panics,
+                    timed_out: true,
+                }
+            }
         }
     }
 }
@@ -329,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_bridge_without_management_errors() {
-        let bridge = RabbitMqStatsBridge { inner: None };
+        let bridge = RabbitMqStatsBridge { inner: Ok(None) };
         let err = <RabbitMqStatsBridge as QueueStatsProviderImpl>::snapshot(&bridge, "whatever")
             .await
             .expect_err("bridge with no management must refuse to produce metrics");
@@ -343,7 +372,7 @@ mod tests {
     #[test]
     fn stats_bridge_from_config_none_yields_unconfigured_bridge() {
         let bridge = RabbitMqStatsBridge::from_config(None);
-        assert!(bridge.inner.is_none());
+        assert!(matches!(bridge.inner, Ok(None)));
     }
 
     #[test]
@@ -354,6 +383,6 @@ mod tests {
             "guest",
         );
         let bridge = RabbitMqStatsBridge::from_config(Some(cfg));
-        assert!(bridge.inner.is_some());
+        assert!(matches!(bridge.inner, Ok(Some(_))));
     }
 }

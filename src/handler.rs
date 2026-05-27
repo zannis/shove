@@ -135,7 +135,7 @@ mod tests {
             retry_count: 0,
             delivery_id: "d-1".into(),
             redelivered: false,
-            headers: HashMap::new(),
+            headers: Arc::new(HashMap::new()),
         }
     }
 

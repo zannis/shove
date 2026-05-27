@@ -32,6 +32,13 @@ pub(crate) struct ConsumerOptionsInner {
     /// Consumer-group name for metrics labels. `None` is treated as `"default"`.
     pub consumer_group: Option<Arc<str>>,
 
+    /// Kafka-only: explicit `group.id` to pass to rdkafka instead of the
+    /// default `"{queue}-consumer"`. Used to implement fan-out (arch-K-3):
+    /// two independent services consuming the same topic need distinct group
+    /// IDs so they each receive all messages rather than sharing partitions.
+    #[cfg(feature = "kafka")]
+    pub kafka_group_id: Option<Arc<str>>,
+
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
     #[cfg(feature = "aws-sns-sqs")]
@@ -58,6 +65,8 @@ impl ConsumerOptionsInner {
             shutdown,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
+            #[cfg(feature = "kafka")]
+            kafka_group_id: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

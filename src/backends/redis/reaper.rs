@@ -20,15 +20,14 @@
 //!
 //! ## Redelivery
 //!
-//! XAUTOCLAIM transfers PEL ownership but does **not** re-deliver the entry
-//! — the new owner sees it only by issuing `XREADGROUP ... 0` (its own PEL).
-//! The current implementation pairs with the existing consumer-loop
-//! behaviour, which is `XREADGROUP ... >` (new deliveries only). That means
-//! claimed entries sit in the reaper's PEL until either (a) the operator
-//! drains them manually or (b) a follow-up change implements PEL drain in
-//! the reaper. This module deliberately stops at the XAUTOCLAIM step so the
-//! diff stays focused on removing the thundering herd; PEL-drain redelivery
-//! is tracked as follow-up work.
+//! After each XAUTOCLAIM page the reaper immediately re-delivers every
+//! claimed entry: it XADDs the entry data back to the stream (making it
+//! visible to regular consumers via `XREADGROUP ... >`) and then XACKs the
+//! original ID to clear its own PEL. If XADD fails the entry stays in the
+//! reaper's PEL and will be re-attempted on the next autoclaim cycle. If XACK
+//! fails after a successful XADD the entry also stays in the PEL; the next
+//! cycle will re-XADD it, producing an at-most-one-extra delivery — consistent
+//! with the at-least-once guarantee this module provides.
 
 use std::time::Duration;
 
@@ -37,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backends::redis::client::{RedisClient, RedisConnection};
 use crate::error::Result;
-use crate::retry::Backoff;
 
+use super::client::acquire_conn_with_retry;
 use super::constants::AUTOCLAIM_COUNT;
 
 /// Reaper consumer name used as the XAUTOCLAIM target. Stable per group so
@@ -74,7 +73,7 @@ pub fn spawn_reaper(
 ) -> JoinHandle<()> {
     let reaper = reaper_consumer_name(&group);
     tokio::spawn(async move {
-        let mut conn = match acquire_conn_with_retry(&client, &shutdown).await {
+        let mut conn = match acquire_conn_with_retry(&client, &shutdown, "reaper").await {
             Some(c) => c,
             None => return,
         };
@@ -104,7 +103,7 @@ pub fn spawn_reaper(
             }
 
             if needs_reconnect {
-                match acquire_conn_with_retry(&client, &shutdown).await {
+                match acquire_conn_with_retry(&client, &shutdown, "reaper").await {
                     Some(c) => conn = c,
                     None => return,
                 }
@@ -151,43 +150,60 @@ async fn autoclaim_all(
             .await
             .map_err(|e| ShoveError::Connection(format!("XAUTOCLAIM failed: {e}")))?;
 
+        // Redeliver every claimed entry: XADD it back so regular consumers
+        // see it via `XREADGROUP ... >`, then XACK the original to clear it
+        // from the reaper's PEL. If XADD fails the entry stays in the PEL
+        // for the next cycle; if XACK fails after a successful XADD the
+        // next cycle will re-XADD (at-least-once duplicate), which is
+        // acceptable under the at-least-once delivery guarantee.
+        for entry in &reply.claimed {
+            let mut xadd_cmd = redis::cmd("XADD");
+            xadd_cmd.arg(stream).arg("*");
+            for (field, value) in &entry.map {
+                match value {
+                    redis::Value::BulkString(bytes) => {
+                        xadd_cmd.arg(field.as_str()).arg(bytes.as_slice());
+                    }
+                    redis::Value::SimpleString(s) => {
+                        xadd_cmd.arg(field.as_str()).arg(s.as_str());
+                    }
+                    // Integer or other types are not expected in stream
+                    // entries written by shove; skip silently.
+                    _ => {}
+                }
+            }
+
+            match conn.query::<redis::Value>(&mut xadd_cmd).await {
+                Ok(_) => {
+                    if let Err(e) = conn
+                        .query::<i64>(redis::cmd("XACK").arg(stream).arg(group).arg(&entry.id))
+                        .await
+                    {
+                        tracing::warn!(
+                            stream,
+                            entry_id = %entry.id,
+                            error = %e,
+                            "reaper: XACK failed after redeliver — entry stays in PEL",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        stream,
+                        entry_id = %entry.id,
+                        error = %e,
+                        "reaper: XADD redeliver failed — entry stays in PEL for next cycle",
+                    );
+                }
+            }
+        }
+
         if reply.next_stream_id == "0-0" || reply.next_stream_id.is_empty() {
             break;
         }
         cursor = reply.next_stream_id;
     }
     Ok(())
-}
-
-/// Acquire a multiplexed Redis connection, retrying with exponential backoff
-/// (1 s → 30 s, full jitter) until the shutdown token is cancelled. Mirrors
-/// `requeue::acquire_conn_with_retry` — they're kept separate so each
-/// sidecar can evolve independently.
-async fn acquire_conn_with_retry(
-    client: &RedisClient,
-    shutdown: &CancellationToken,
-) -> Option<RedisConnection> {
-    let mut backoff = Backoff::default();
-    loop {
-        match client.multiplexed_conn().await {
-            Ok(c) => return Some(c),
-            Err(e) => {
-                if shutdown.is_cancelled() {
-                    return None;
-                }
-                let delay = backoff.next().expect("backoff is infinite");
-                tracing::warn!(
-                    "reaper: connection failed ({}), retrying in {:.1}s",
-                    e,
-                    delay.as_secs_f64()
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = shutdown.cancelled() => return None,
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

@@ -35,11 +35,19 @@ where
     C: ClientContext + 'static,
 {
     let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
+    // perf-K-1: avoid cloning headers on the last (or only) attempt.
+    // Take from the Option on the final attempt to move instead of clone;
+    // earlier attempts still clone because we may need them for retries.
+    let mut headers_opt = Some(headers);
 
     for attempt in 1..=max_attempts {
-        let mut record = FutureRecord::to(topic)
-            .payload(payload)
-            .headers(headers.clone());
+        let h = if attempt < max_attempts {
+            // Safety: headers_opt is Some until the final attempt.
+            headers_opt.as_ref().unwrap().clone()
+        } else {
+            headers_opt.take().unwrap()
+        };
+        let mut record = FutureRecord::to(topic).payload(payload).headers(h);
         if let Some(k) = key {
             record = record.key(k);
         }
@@ -79,17 +87,22 @@ impl KafkaPublisher {
     fn resolve_topic_and_key<T: Topic>(
         topology: &'static QueueTopology,
         message: &T::Message,
-    ) -> (String, Option<Vec<u8>>) {
-        let topic = topology.queue().to_string();
+    ) -> (&'static str, Option<Vec<u8>>) {
+        // perf-K-3: topology is &'static so queue() is &'static str —
+        // no allocation needed; the topic string lives forever.
+        let topic = topology.queue();
         let key = T::SEQUENCE_KEY_FN.map(|key_fn| key_fn(message).into_bytes());
         (topic, key)
     }
 
     fn build_headers(extra: Option<&HashMap<String, String>>) -> OwnedHeaders {
+        // perf-K-2: encode UUID into a stack buffer — no heap alloc
+        let mut uuid_buf = Uuid::encode_buffer();
+        let uuid_str = Uuid::new_v4().hyphenated().encode_lower(&mut uuid_buf);
         let mut headers = OwnedHeaders::new()
             .insert(Header {
                 key: MESSAGE_ID_HEADER,
-                value: Some(Uuid::new_v4().to_string().as_bytes()),
+                value: Some(uuid_str.as_bytes()),
             })
             .insert(Header {
                 key: RETRY_COUNT_HEADER,
@@ -116,7 +129,7 @@ impl KafkaPublisher {
         let headers = Self::build_headers(None);
         self.client
             .publish_with_retry(
-                &topic,
+                topic,
                 key.as_deref(),
                 headers,
                 &payload,
@@ -138,7 +151,7 @@ impl KafkaPublisher {
         let headers = Self::build_headers(Some(&extra_headers));
         self.client
             .publish_with_retry(
-                &topic,
+                topic,
                 key.as_deref(),
                 headers,
                 &payload,
@@ -153,15 +166,16 @@ impl KafkaPublisher {
 
         let topology = T::topology();
         #[allow(clippy::type_complexity)]
-        let prepared: Result<Vec<(String, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> = messages
-            .iter()
-            .map(|msg| {
-                let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
-                let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
-                let headers = Self::build_headers(None);
-                Ok((topic, key, headers, payload))
-            })
-            .collect();
+        let prepared: Result<Vec<(&'static str, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> =
+            messages
+                .iter()
+                .map(|msg| {
+                    let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
+                    let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
+                    let headers = Self::build_headers(None);
+                    Ok((topic, key, headers, payload))
+                })
+                .collect();
         let prepared = match prepared {
             Ok(v) => v,
             Err(e) => return (0, Err(e)),
@@ -181,7 +195,7 @@ impl KafkaPublisher {
                 async move {
                     client
                         .publish_with_retry(
-                            &topic,
+                            topic,
                             key.as_deref(),
                             headers,
                             &payload,

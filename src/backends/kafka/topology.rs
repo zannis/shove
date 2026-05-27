@@ -56,9 +56,16 @@ impl KafkaTopologyDeclarer {
 
     async fn declare_sequenced(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
-        let seq = topology
-            .sequencing()
-            .expect("sequenced topology must have sequencing config");
+        // sec-K-9: surface misuse as a typed error instead of panicking. The
+        // caller path is gated by `topology.sequencing().is_some()` in
+        // `declare`, so this branch is unreachable under correct callers —
+        // but a Result keeps misuse from this internal helper recoverable
+        // (vs. process abort) if a future caller wires it up wrong.
+        let seq = topology.sequencing().ok_or_else(|| {
+            crate::ShoveError::Topology(format!(
+                "declare_sequenced called for {queue} without sequencing config"
+            ))
+        })?;
 
         let num_partitions = self.effective_partitions(seq.routing_shards() as i32);
         self.client
@@ -77,6 +84,19 @@ impl KafkaTopologyDeclarer {
 
 impl KafkaTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // arch-K-9: Kafka simulates retry delays via deferred republish to
+        // the same topic — no broker-side hold-queue topics are created.
+        // Document the intentional omission so operators searching for
+        // "where's my `{queue}-hold-{n}s` topic?" find the answer.
+        let hold_count = topology.hold_queues().len();
+        if hold_count > 0 {
+            tracing::debug!(
+                queue = topology.queue(),
+                hold_queues = hold_count,
+                "Kafka simulates retry delays via deferred republish — no broker-side \
+                 hold-queue topics declared"
+            );
+        }
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {

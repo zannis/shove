@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use super::client::{RedisClient, RedisConnection};
+use super::client::{RedisClient, RedisConnection, acquire_conn_with_retry};
 use super::constants::{REQUEUE_BATCH_SIZE, REQUEUE_POLL_MS};
 use super::topology::RedisTopologyDeclarer;
 use crate::error::{Result, ShoveError};
@@ -104,7 +104,7 @@ pub(crate) fn spawn_requeuer(
         .collect();
 
     tokio::spawn(async move {
-        let mut conn = match acquire_conn_with_retry(&client, &shutdown).await {
+        let mut conn = match acquire_conn_with_retry(&client, &shutdown, "requeuer").await {
             Some(c) => c,
             None => return,
         };
@@ -120,7 +120,7 @@ pub(crate) fn spawn_requeuer(
             }
 
             if needs_reconnect {
-                match acquire_conn_with_retry(&client, &shutdown).await {
+                match acquire_conn_with_retry(&client, &shutdown, "requeuer").await {
                     Some(c) => {
                         conn = c;
                         continue;
@@ -140,35 +140,6 @@ pub(crate) fn spawn_requeuer(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
-
-/// Acquire a multiplexed Redis connection, retrying with exponential backoff
-/// (1 s → 30 s, full jitter) until the shutdown token is cancelled.
-async fn acquire_conn_with_retry(
-    client: &RedisClient,
-    shutdown: &CancellationToken,
-) -> Option<RedisConnection> {
-    let mut backoff = Backoff::default();
-    loop {
-        match client.multiplexed_conn().await {
-            Ok(c) => return Some(c),
-            Err(e) => {
-                if shutdown.is_cancelled() {
-                    return None;
-                }
-                let delay = backoff.next().expect("backoff is infinite");
-                tracing::warn!(
-                    "requeuer: connection failed ({}), retrying in {:.1}s",
-                    e,
-                    delay.as_secs_f64()
-                );
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = shutdown.cancelled() => return None,
-                }
-            }
-        }
-    }
-}
 
 /// Current Unix timestamp in milliseconds, saturating at `u64::MAX`.
 fn now_ms() -> u64 {

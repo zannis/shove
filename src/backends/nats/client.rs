@@ -78,7 +78,7 @@ impl fmt::Debug for NatsConfig {
             .field("url", &redacted)
             .field("tls_ca_cert", &self.tls_ca_cert)
             .field("tls_client_cert", &self.tls_client_cert)
-            .field("username", &self.username)
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("nkey_seed", &self.nkey_seed.as_ref().map(|_| "<redacted>"))
             .field("creds_file", &self.creds_file)
@@ -95,8 +95,32 @@ pub struct NatsClient {
 
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
+/// Returns `true` when any TLS option (CA cert, client cert/key) is set.
+fn has_tls_options(config: &NatsConfig) -> bool {
+    config.tls_ca_cert.is_some()
+        || config.tls_client_cert.is_some()
+        || config.tls_client_key.is_some()
+}
+
+/// Returns `true` when the URL scheme requests an encrypted transport.
+///
+/// Both `tls://` and `nats+tls://` are accepted; `nats://` is plaintext.
+fn url_scheme_is_tls(url: &str) -> bool {
+    url.starts_with("tls://") || url.starts_with("nats+tls://")
+}
+
 impl NatsClient {
     pub async fn connect(config: &NatsConfig) -> Result<Self> {
+        // Guard: TLS options configured but URL scheme is plaintext — this
+        // would silently connect without encryption, so we reject it outright.
+        if has_tls_options(config) && !url_scheme_is_tls(&config.url) {
+            return Err(ShoveError::Connection(format!(
+                "TLS options are configured but NATS URL '{}' uses a plaintext scheme; \
+                 change the URL scheme to tls:// or nats+tls:// to prevent silent downgrade",
+                config.url
+            )));
+        }
+
         let client_name = format!("shove-rs-{}", process::id());
         let mut opts = async_nats::ConnectOptions::new().name(client_name);
 
@@ -251,5 +275,56 @@ mod tests {
         .take(200)
         .collect();
         assert_eq!(delays.len(), 200, "Backoff must never return None");
+    }
+
+    // --- sec-2: username must be redacted in Debug output ---
+
+    #[test]
+    fn debug_redacts_username() {
+        let mut cfg = NatsConfig::new("nats://localhost:4222");
+        cfg.username = Some("alice".into());
+        cfg.password = Some("hunter2".into());
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("alice"),
+            "username must not appear in debug output"
+        );
+        assert!(
+            !debug.contains("hunter2"),
+            "password must not appear in debug output"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "redacted sentinel must appear"
+        );
+    }
+
+    // --- sec-7: TLS options + plaintext URL scheme must be rejected ---
+
+    #[test]
+    fn tls_options_with_plain_url_is_rejected() {
+        let mut cfg = NatsConfig::new("nats://broker.example.com:4222");
+        cfg.tls_ca_cert = Some(std::path::PathBuf::from("/etc/certs/ca.pem"));
+        assert!(
+            has_tls_options(&cfg),
+            "config with ca_cert must be detected as having TLS options"
+        );
+        assert!(
+            !url_scheme_is_tls(&cfg.url),
+            "nats:// must not be considered a TLS scheme"
+        );
+    }
+
+    #[test]
+    fn tls_scheme_is_accepted() {
+        assert!(url_scheme_is_tls("tls://broker.example.com:4222"));
+        assert!(url_scheme_is_tls("nats+tls://broker.example.com:4222"));
+        assert!(!url_scheme_is_tls("nats://broker.example.com:4222"));
+    }
+
+    #[test]
+    fn no_tls_options_with_plain_url_is_not_flagged() {
+        let cfg = NatsConfig::new("nats://broker.example.com:4222");
+        assert!(!has_tls_options(&cfg));
     }
 }

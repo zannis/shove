@@ -24,6 +24,13 @@ use crate::topic::{SequencedTopic, Topic};
 pub(crate) trait RegistryImpl: Send {
     type GroupConfig;
 
+    /// Register a concurrent (unsequenced) topic handler.
+    ///
+    /// **Implementors must declare the broker topology** (queues, streams,
+    /// consumer groups, etc.) inside this method before returning `Ok`. The
+    /// public [`ConsumerGroup::register`] API guarantees callers that no
+    /// prior `topology().declare()` call is required; every backend must
+    /// uphold this invariant.
     fn register<T, H>(
         &mut self,
         config: Self::GroupConfig,
@@ -34,6 +41,13 @@ pub(crate) trait RegistryImpl: Send {
         T: Topic,
         H: MessageHandler<T>;
 
+    /// Register a FIFO (sequenced) topic handler.
+    ///
+    /// **Implementors must declare the broker topology** (including any
+    /// per-shard queues or consumer groups) inside this method before
+    /// returning `Ok`. The public [`ConsumerGroup::register_fifo`] API
+    /// guarantees callers that no prior `topology().declare()` call is
+    /// required; every backend must uphold this invariant.
     fn register_fifo<T, H>(
         &mut self,
         _config: Self::GroupConfig,

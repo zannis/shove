@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rdkafka::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer as RdkafkaConsumer, StreamConsumer};
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::{Offset, TopicPartitionList};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
@@ -23,7 +24,7 @@ use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
+use crate::{HoldQueue, Kafka, ShoveError};
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
@@ -98,11 +99,19 @@ impl OffsetTracker {
         }
     }
 
-    fn drain_committable(&mut self) -> TopicPartitionList {
-        let mut tpl = TopicPartitionList::new();
+    /// Returns the partitions that have new contiguous-from-start offsets to
+    /// commit, or `None` if nothing has advanced since the last call.
+    ///
+    /// perf-K-16: the previous impl allocated a fresh `TopicPartitionList` on
+    /// every receive-loop iteration even when no partition had progress to
+    /// commit (the common case). Returning `Option` skips the C-heap (librdkafka
+    /// FFI) allocation when there's nothing to do.
+    fn drain_committable(&mut self) -> Option<TopicPartitionList> {
+        let mut tpl: Option<TopicPartitionList> = None;
         for (&partition, tracker) in &mut self.partitions {
             if let Some(commit_offset) = tracker.drain_committable() {
-                tpl.add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
+                tpl.get_or_insert_with(TopicPartitionList::new)
+                    .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
                     .ok();
             }
         }
@@ -114,7 +123,7 @@ impl OffsetTracker {
 // Metadata extraction functions
 // ---------------------------------------------------------------------------
 
-fn extract_string_headers(msg: &BorrowedMessage<'_>) -> HashMap<String, String> {
+fn extract_string_headers(msg: &BorrowedMessage<'_>) -> Arc<HashMap<String, String>> {
     let mut out = HashMap::new();
     if let Some(headers) = msg.headers() {
         for idx in 0..headers.count() {
@@ -126,7 +135,7 @@ fn extract_string_headers(msg: &BorrowedMessage<'_>) -> HashMap<String, String> 
             }
         }
     }
-    out
+    Arc::new(out)
 }
 
 fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
@@ -136,18 +145,21 @@ fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
         .unwrap_or(0)
 }
 
-fn build_message_metadata(headers: &HashMap<String, String>, redelivered: bool) -> MessageMetadata {
+fn build_message_metadata(
+    headers: &Arc<HashMap<String, String>>,
+    redelivered: bool,
+) -> MessageMetadata {
     let retry_count = get_retry_count(headers);
     let delivery_id = headers.get(MESSAGE_ID_HEADER).cloned().unwrap_or_default();
     MessageMetadata {
         retry_count,
         delivery_id,
         redelivered,
-        headers: headers.clone(),
+        headers: Arc::clone(headers),
     }
 }
 
-fn build_dead_metadata(headers: &HashMap<String, String>) -> DeadMessageMetadata {
+fn build_dead_metadata(headers: &Arc<HashMap<String, String>>) -> DeadMessageMetadata {
     let message = build_message_metadata(headers, false);
     let reason = headers.get(DEATH_REASON_HEADER).cloned();
     let original_queue = headers.get(ORIGINAL_QUEUE_HEADER).cloned();
@@ -173,7 +185,9 @@ fn headers_with_retry_count(
     retry_count: u32,
     message_id_suffix: &str,
 ) -> OwnedHeaders {
-    let mut headers = OwnedHeaders::new();
+    // perf-K-8: original.len() bounds the carried-over headers; +2 for the
+    // RETRY_COUNT_HEADER and MESSAGE_ID_HEADER we always re-insert.
+    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 2);
     for (k, v) in original {
         if k == RETRY_COUNT_HEADER || k == MESSAGE_ID_HEADER {
             continue;
@@ -202,7 +216,9 @@ fn headers_for_dlq(
     reason: &str,
     original_queue: &str,
 ) -> OwnedHeaders {
-    let mut headers = OwnedHeaders::new();
+    // perf-K-8: original.len() bounds the carried-over headers; +4 for the
+    // DEATH_REASON / ORIGINAL_QUEUE / DEATH_COUNT / MESSAGE_ID we re-insert.
+    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 4);
     for (k, v) in original {
         if k == DEATH_REASON_HEADER
             || k == ORIGINAL_QUEUE_HEADER
@@ -286,13 +302,21 @@ async fn route_outcome(
     client: &KafkaClient,
     topic: &str,
     payload: &[u8],
-    key: Option<&[u8]>,
+    // perf-K-9: take key as Option<Bytes> by value. Each match arm uses it
+    // once, so we move it instead of cloning. The receive loop's Bytes
+    // refcount machinery makes any further sharing a refcount bump.
+    key: Option<Bytes>,
     headers: &HashMap<String, String>,
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
     max_retries: u32,
     hold_queues: &[HoldQueue],
+    // sec-K-8: retry/defer arms move this permit into the delayed-republish
+    // spawn so the prefetch semaphore stays bounded across delayed work.
+    // None on the FIFO path (no semaphore in play there) and on the
+    // outer-task's Ack/Reject arms (permit drops at end of scope).
+    retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> bool {
     match outcome {
         Outcome::Ack => true,
@@ -303,7 +327,7 @@ async fn route_outcome(
                     client,
                     topology,
                     payload,
-                    key,
+                    key.as_deref(),
                     headers,
                     "max_retries_exceeded",
                 )
@@ -327,7 +351,6 @@ async fn route_outcome(
             let client = client.clone();
             let topic = topic.to_string();
             let payload = payload.to_vec();
-            let key = key.map(|k| k.to_vec());
             let retry_headers =
                 headers_with_retry_count(headers, new_count, &format!("-r{new_count}"));
 
@@ -346,11 +369,24 @@ async fn route_outcome(
                 {
                     tracing::error!(error = %e, "delayed retry republish failed");
                 }
+                // sec-K-8: hold the prefetch permit until the delayed retry
+                // republish finishes so the inflight-task count stays
+                // bounded by the prefetch limit.
+                drop(retry_permit);
             });
             true
         }
         Outcome::Reject => {
-            match publish_to_dlq(client, topology, payload, key, headers, "rejected").await {
+            match publish_to_dlq(
+                client,
+                topology,
+                payload,
+                key.as_deref(),
+                headers,
+                "rejected",
+            )
+            .await
+            {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to publish rejected message to DLQ");
@@ -368,7 +404,6 @@ async fn route_outcome(
             let client = client.clone();
             let topic = topic.to_string();
             let payload = payload.to_vec();
-            let key = key.map(|k| k.to_vec());
             // Defer does NOT increment retry count
             let defer_headers = headers_with_retry_count(
                 headers,
@@ -391,6 +426,8 @@ async fn route_outcome(
                 {
                     tracing::error!(error = %e, "deferred republish failed");
                 }
+                // sec-K-8: same permit-lifetime contract as Retry.
+                drop(retry_permit);
             });
             true
         }
@@ -404,11 +441,15 @@ async fn route_outcome(
 /// Invoke the handler future with an optional timeout, emitting inflight /
 /// consumed / duration metrics. Returns `Outcome::Retry` on timeout or panic.
 ///
-/// The future is run inside a child `tokio::spawn` so a panic inside the
-/// user's handler is caught here (as `JoinError::is_panic`) and surfaced as
-/// `Outcome::Retry` with metrics recorded — without this, the spawned task
-/// aborts before the metric calls and panicked handlers disappear from the
-/// consumed/latency series even though the caller still requeues them.
+/// Awaits the handler future with timeout + panic isolation, recording
+/// per-outcome metrics. A panic inside the user's handler is caught via
+/// `AssertUnwindSafe(...).catch_unwind()` and surfaced as `Outcome::Retry`.
+///
+/// perf-K-7: this previously spawned an inner `tokio::spawn` to catch panics
+/// via JoinError. The spawn allocated a task struct + scheduler enqueue per
+/// message — combined with the wrapper spawn (now removed) and outer outcome
+/// spawn, that was 3 spawns per message. catch_unwind achieves the same
+/// panic-isolation outcome without the task alloc.
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
@@ -416,29 +457,31 @@ async fn invoke_handler<F>(
     group: Option<&str>,
 ) -> Outcome
 where
-    F: std::future::Future<Output = Outcome> + Send + 'static,
+    F: std::future::Future<Output = Outcome> + Send,
 {
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let mut join = tokio::spawn(fut);
+    let safe_fut = AssertUnwindSafe(fut).catch_unwind();
     let outcome = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, &mut join).await {
+        Some(duration) => match tokio::time::timeout(duration, safe_fut).await {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
+            Ok(Err(_panic)) => {
+                tracing::warn!("handler panicked, retrying message");
                 Outcome::Retry
             }
             Err(_) => {
-                join.abort();
                 tracing::warn!("handler timed out after {duration:?}, retrying");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
                 Outcome::Retry
             }
         },
-        None => match join.await {
+        None => match safe_fut.await {
             Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(error = %e, "handler task panicked, retrying message");
+            Err(_panic) => {
+                tracing::warn!("handler panicked, retrying message");
                 Outcome::Retry
             }
         },
@@ -447,34 +490,6 @@ where
     metrics::record_consumed(topic, group, &outcome);
     metrics::record_processing_duration(topic, group, &outcome, elapsed);
     outcome
-}
-
-/// Spawns a handler task and returns a oneshot receiver for the outcome.
-fn spawn_handler<T, H>(
-    handler: Arc<H>,
-    ctx: Arc<H::Context>,
-    message: T::Message,
-    metadata: MessageMetadata,
-    timeout: Option<Duration>,
-    topic: Arc<str>,
-    group: Option<Arc<str>>,
-) -> tokio::sync::oneshot::Receiver<Outcome>
-where
-    T: Topic,
-    H: MessageHandler<T>,
-{
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let outcome = invoke_handler(
-            async move { handler.handle(message, metadata, ctx.as_ref()).await },
-            timeout,
-            &topic,
-            group.as_deref(),
-        )
-        .await;
-        let _ = tx.send(outcome);
-    });
-    rx
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +708,11 @@ impl KafkaConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
-        let group_id = super::constants::consumer_group_id(queue);
+        let group_id = options
+            .kafka_group_id
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| super::constants::consumer_group_id(queue));
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -741,23 +760,29 @@ impl KafkaConsumer {
                     .map_err(|e| map_kafka_error("failed to subscribe", e))?;
 
                 let queue_owned = queue.to_string();
-                let tracker = Arc::new(Mutex::new(OffsetTracker::new(queue_owned.clone())));
+                // perf-K-6: OffsetTracker is touched only by this receive loop; handler
+                // completions arrive via completion_tx/_rx. Drop the Mutex so the loop
+                // owns the tracker directly — saves two async-lock acquisitions per
+                // message (drain at top + track_received in the message branch).
+                let mut tracker = OffsetTracker::new(queue_owned.clone());
                 let consumer = Arc::new(consumer);
-                let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<(i32, i64)>();
+                // Bounded to prefetch_count: the semaphore already limits in-flight
+                // handler tasks to this count, so the channel can never grow beyond
+                // it under correct operation. An Err from try_send would indicate a
+                // logic bug (handler completing without holding a permit) and is
+                // surfaced immediately rather than silently accumulating (sec-K-4).
+                let (completion_tx, mut completion_rx) =
+                    mpsc::channel::<(i32, i64)>(prefetch_count as usize);
 
                 loop {
                     // Drain completed offsets and commit
-                    {
-                        let mut t = tracker.lock().await;
-                        while let Ok((partition, offset)) = completion_rx.try_recv() {
-                            t.mark_complete(partition, offset);
-                        }
-                        let tpl = t.drain_committable();
-                        if tpl.count() > 0 {
-                            consumer.commit(&tpl, CommitMode::Async).map_err(|e| {
-                                map_kafka_error("commit failed", e)
-                            })?;
-                        }
+                    while let Ok((partition, offset)) = completion_rx.try_recv() {
+                        tracker.mark_complete(partition, offset);
+                    }
+                    if let Some(tpl) = tracker.drain_committable() {
+                        consumer
+                            .commit(&tpl, CommitMode::Async)
+                            .map_err(|e| map_kafka_error("commit failed", e))?;
                     }
 
                     tokio::select! {
@@ -765,15 +790,11 @@ impl KafkaConsumer {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             // Final commit
-                            {
-                                let mut t = tracker.lock().await;
-                                while let Ok((partition, offset)) = completion_rx.try_recv() {
-                                    t.mark_complete(partition, offset);
-                                }
-                                let tpl = t.drain_committable();
-                                if tpl.count() > 0 {
-                                    consumer.commit(&tpl, CommitMode::Async).ok();
-                                }
+                            while let Ok((partition, offset)) = completion_rx.try_recv() {
+                                tracker.mark_complete(partition, offset);
+                            }
+                            if let Some(tpl) = tracker.drain_committable() {
+                                consumer.commit(&tpl, CommitMode::Async).ok();
                             }
                             return Ok(());
                         }
@@ -789,20 +810,25 @@ impl KafkaConsumer {
                                 }
                             };
 
-                            let payload_bytes = msg.payload().unwrap_or_default().to_vec();
+                            // perf-K-5: defer Vec<u8> allocation until after decode succeeds.
+                            // Oversize and decode-fail paths use msg.payload() directly for
+                            // their DLQ publish (no copy). The happy path owns the bytes
+                            // only because the handler runs in a spawned task that outlives
+                            // this loop iteration.
+                            let payload_slice = msg.payload().unwrap_or_default();
                             let headers = extract_string_headers(&msg);
                             let partition = msg.partition();
                             let offset = msg.offset();
-                            let key = msg.key().map(|k| k.to_vec());
+                            // perf-K-9: store key as bytes::Bytes — cloning into spawned
+                            // delay tasks becomes a refcount bump instead of a memcpy.
+                            let key = msg.key().map(Bytes::copy_from_slice);
 
-                            {
-                                tracker.lock().await.track_received(partition, offset);
-                            }
+                            tracker.track_received(partition, offset);
 
-                            metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+                            metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
 
                             // Reject oversized messages before deserialization
-                            if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
+                            if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
                                 tracing::warn!(
                                     error = %e,
                                     queue,
@@ -816,7 +842,7 @@ impl KafkaConsumer {
                                 if let Err(dlq_err) = publish_to_dlq(
                                     &client,
                                     topology,
-                                    &payload_bytes,
+                                    payload_slice,
                                     key.as_deref(),
                                     &headers,
                                     &e.to_string(),
@@ -826,12 +852,14 @@ impl KafkaConsumer {
                                         "failed to publish oversized message to DLQ"
                                     );
                                 }
-                                completion_tx.send((partition, offset)).ok();
+                                if completion_tx.try_send((partition, offset)).is_err() {
+                                    tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                }
                                 continue;
                             }
 
                             // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(
@@ -847,20 +875,30 @@ impl KafkaConsumer {
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
-                                        &payload_bytes,
+                                        payload_slice,
                                         key.as_deref(),
                                         &headers,
-                                        &format!("deserialization_error: {e}"),
+                                        // sec-K-5: do NOT append the codec error message to
+                                        // the DLQ death-reason header — serde_json errors can
+                                        // carry fragments of attacker-controlled payload bytes.
+                                        // The full error is recorded via tracing above.
+                                        "deserialization_error",
                                     ).await {
                                         tracing::error!(
                                             error = %dlq_err,
                                             "failed to publish bad message to DLQ"
                                         );
                                     }
-                                    completion_tx.send((partition, offset)).ok();
+                                    if completion_tx.try_send((partition, offset)).is_err() {
+                                        tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                    }
                                     continue;
                                 }
                             };
+
+                            // Decode succeeded — copy bytes for the spawned task's
+                            // route_outcome (msg goes out of scope after this loop iteration).
+                            let payload_bytes = payload_slice.to_vec();
 
                             let metadata = build_message_metadata(&headers, false);
                             let retry_count = metadata.retry_count;
@@ -875,41 +913,59 @@ impl KafkaConsumer {
                             let task_prefetch = prefetch_count;
                             let task_tx = completion_tx.clone();
                             let task_topic = topic.clone();
+                            let task_handler = handler.clone();
+                            let task_ctx = ctx.clone();
+                            let task_group = group.clone();
 
-                            let outcome_rx = spawn_handler::<T, H>(
-                                handler.clone(),
-                                ctx.clone(),
-                                payload,
-                                metadata,
-                                handler_timeout,
-                                topic.clone(),
-                                group.clone(),
-                            );
-
+                            // perf-K-7: single spawn per message (was three).
+                            // invoke_handler awaits the handler with catch_unwind +
+                            // timeout in-place, then route_outcome runs in the same
+                            // task — no inner spawn, no oneshot relay.
                             tokio::spawn(async move {
                                 task_processing.store(true, Ordering::Release);
 
-                                let outcome = outcome_rx.await.unwrap_or_else(|_| {
-                                    tracing::warn!(queue = task_topic.as_ref(), "handler task panicked, retrying message");
-                                    Outcome::Retry
-                                });
+                                let outcome = invoke_handler(
+                                    async move {
+                                        task_handler
+                                            .handle(payload, metadata, task_ctx.as_ref())
+                                            .await
+                                    },
+                                    handler_timeout,
+                                    &task_topic,
+                                    task_group.as_deref(),
+                                )
+                                .await;
 
+                                // sec-K-8: hand the prefetch permit to route_outcome
+                                // so Retry/Defer's delayed republish spawn stays
+                                // bounded by the prefetch limit instead of running
+                                // outside the cap.
                                 route_outcome(
                                     &task_client,
                                     &task_topic,
                                     &payload_bytes,
-                                    key.as_deref(),
+                                    key,
                                     &headers,
                                     outcome,
                                     topology,
                                     retry_count,
                                     max_retries,
                                     hold_queues,
+                                    Some(permit),
                                 )
                                 .await;
 
-                                task_tx.send((partition, offset)).ok();
-                                drop(permit);
+                                if task_tx.try_send((partition, offset)).is_err() {
+                                    tracing::error!(
+                                        queue = task_topic.as_ref(),
+                                        partition,
+                                        offset,
+                                        "completion channel full — logic bug in offset tracker"
+                                    );
+                                }
+                                // sec-K-8: permit was passed to route_outcome —
+                                // either dropped at end of Ack/Reject arms, or
+                                // moved into the Retry/Defer republish spawn.
 
                                 if task_semaphore.available_permits() == task_prefetch as usize {
                                     task_processing.store(false, Ordering::Release);
@@ -979,9 +1035,15 @@ impl KafkaConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue().to_string();
-        let _seq_config = topology
-            .sequencing()
-            .expect("run_fifo requires a sequenced topology");
+        // sec-K-9: T is bound by SequencedTopic at the trait level, so this
+        // is unreachable under correct callers. Returning an error instead
+        // of expect()-panicking keeps misuse (e.g. from a future caller
+        // path) recoverable.
+        let _seq_config = topology.sequencing().ok_or_else(|| {
+            ShoveError::Topology(format!(
+                "run_fifo called on {queue} without sequencing config"
+            ))
+        })?;
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -1043,9 +1105,13 @@ impl KafkaConsumer {
                                     }
                                 };
 
-                                let payload_bytes = msg.payload().unwrap_or_default().to_vec();
+                                // perf-K-5: FIFO is sequential — msg lives through this whole
+                                // iteration (commit_message at the end), so use msg.payload()
+                                // directly instead of allocating a Vec<u8> copy.
+                                let payload_bytes = msg.payload().unwrap_or_default();
                                 let headers = extract_string_headers(&msg);
-                                let key = msg.key().map(|k| k.to_vec());
+                                // perf-K-9: Bytes for cheap refcount-clone semantics.
+                                let key = msg.key().map(Bytes::copy_from_slice);
 
                                 metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
 
@@ -1064,7 +1130,7 @@ impl KafkaConsumer {
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
-                                        &payload_bytes,
+                                        payload_bytes,
                                         key.as_deref(),
                                         &headers,
                                         &e.to_string(),
@@ -1079,7 +1145,7 @@ impl KafkaConsumer {
                                 }
 
                                 // Deserialize payload; reject to DLQ on failure
-                                let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
+                                let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
                                     Ok(m) => m,
                                     Err(e) => {
                                         tracing::error!(
@@ -1095,10 +1161,14 @@ impl KafkaConsumer {
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &client,
                                             topology,
-                                            &payload_bytes,
+                                            payload_bytes,
                                             key.as_deref(),
                                             &headers,
-                                            &format!("deserialization_error: {e}"),
+                                            // sec-K-5: do NOT append the codec error message to
+                                        // the DLQ death-reason header — serde_json errors can
+                                        // carry fragments of attacker-controlled payload bytes.
+                                        // The full error is recorded via tracing above.
+                                        "deserialization_error",
                                         ).await {
                                             tracing::error!(
                                                 error = %dlq_err,
@@ -1115,33 +1185,37 @@ impl KafkaConsumer {
 
                                 processing.store(true, Ordering::Release);
 
-                                let outcome = spawn_handler::<T, H>(
-                                    handler.clone(),
-                                    ctx.clone(),
-                                    payload,
-                                    metadata,
+                                // perf-K-7: call invoke_handler directly (no inner spawn).
+                                // FIFO awaits the outcome inline anyway, so no task alloc
+                                // is needed for panic isolation — catch_unwind covers it.
+                                let handler_clone = handler.clone();
+                                let ctx_clone = ctx.clone();
+                                let outcome = invoke_handler(
+                                    async move {
+                                        handler_clone
+                                            .handle(payload, metadata, ctx_clone.as_ref())
+                                            .await
+                                    },
                                     handler_timeout,
-                                    topic.clone(),
-                                    group.clone(),
+                                    &topic,
+                                    group.as_deref(),
                                 )
-                                .await
-                                .unwrap_or_else(|_| {
-                                    tracing::warn!(queue, "handler task panicked, retrying message");
-                                    Outcome::Retry
-                                });
+                                .await;
                                 let outcome = adjust_outcome_for_fifo(outcome);
 
                                 route_outcome(
                                     &client,
                                     &queue,
-                                    &payload_bytes,
-                                    key.as_deref(),
+                                    payload_bytes,
+                                    key,
                                     &headers,
                                     outcome,
                                     topology,
                                     retry_count,
                                     max_retries,
                                     hold_queues,
+                                    // FIFO is sequential — no prefetch semaphore in play.
+                                    None,
                                 )
                                 .await;
 
@@ -1217,7 +1291,25 @@ impl KafkaConsumer {
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
+    /// Public DLQ entrypoint with default options (no max_message_size cap).
+    /// Equivalent to `run_dlq_with_inner` with `ConsumerOptions::default()`
+    /// inner; kept for backward compatibility with users who don't need to
+    /// thread per-consumer options into the DLQ loop.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        let options = crate::ConsumerOptions::<Kafka>::new().into_inner();
+        self.run_dlq_with_inner::<T, H>(handler, ctx, options).await
+    }
+
+    pub(crate) async fn run_dlq_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
@@ -1232,6 +1324,9 @@ impl KafkaConsumer {
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
+        // sec-K-7: respect the same max_message_size the main consumer uses
+        // rather than the DEFAULT_MAX_MESSAGE_SIZE constant.
+        let max_message_size = options.max_message_size;
 
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
@@ -1270,14 +1365,21 @@ impl KafkaConsumer {
                                 }
                             };
 
-                            let payload_bytes = msg.payload().unwrap_or_default().to_vec();
+                            // perf-K-5: msg lives through commit_message at the end of this
+                            // iteration and we never spawn — decode from msg.payload() directly
+                            // instead of allocating a Vec<u8> copy.
+                            let payload_bytes = msg.payload().unwrap_or_default();
                             let headers = extract_string_headers(&msg);
 
-                            // Discard oversized DLQ messages
-                            if payload_bytes.len() > DEFAULT_MAX_MESSAGE_SIZE {
+                            // sec-K-7: honor options.max_message_size (same as the main
+                            // consumer) instead of the DEFAULT_MAX_MESSAGE_SIZE constant.
+                            // None means no limit.
+                            if let Some(max) = max_message_size
+                                && payload_bytes.len() > max
+                            {
                                 tracing::warn!(
                                     bytes = payload_bytes.len(),
-                                    max = DEFAULT_MAX_MESSAGE_SIZE,
+                                    max,
                                     dlq,
                                     "oversized DLQ message — discarding"
                                 );
@@ -1286,7 +1388,7 @@ impl KafkaConsumer {
                             }
 
                             // Deserialize payload; on failure, log and ack anyway
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&payload_bytes) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(

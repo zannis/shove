@@ -37,6 +37,13 @@ pub struct KafkaConsumerGroupConfig {
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
+    /// Optional Kafka consumer group ID override.
+    ///
+    /// When `None` (the default), the group ID is derived from the topic name as
+    /// `"{queue}-consumer"`. Set this when two independent services must each
+    /// receive every message from the same topic (fan-out) — without separate
+    /// group IDs they share the same consumer group and compete for partitions.
+    group_id: Option<String>,
 }
 
 impl Default for KafkaConsumerGroupConfig {
@@ -70,6 +77,7 @@ impl KafkaConsumerGroupConfig {
             concurrent_processing: false,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
+            group_id: None,
         }
     }
 
@@ -94,6 +102,27 @@ impl KafkaConsumerGroupConfig {
         self
     }
 
+    /// Override the Kafka consumer group ID for this consumer group.
+    ///
+    /// By default the group ID is `"{queue}-consumer"`. Call this when two
+    /// independent services consume the same topic and each must receive all
+    /// messages (fan-out): they must use different group IDs so they are
+    /// assigned independent partition sets rather than competing for the same
+    /// partitions.
+    ///
+    /// This overrides only the rdkafka `group.id`; the group is still
+    /// identified within the registry by the topic name.
+    pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = Some(group_id.into());
+        self
+    }
+
+    /// Returns the explicitly configured consumer group ID, or `None` if the
+    /// default (`"{queue}-consumer"`) should be used.
+    pub fn group_id(&self) -> Option<&str> {
+        self.group_id.as_deref()
+    }
+
     pub fn prefetch_count(&self) -> u16 {
         self.prefetch_count
     }
@@ -110,11 +139,13 @@ impl KafkaConsumerGroupConfig {
         self.max_retries
     }
 
-    /// Returns the configured handler timeout. A freshly-constructed
-    /// config reports `Some(DEFAULT_HANDLER_TIMEOUT)`; a registry-level
-    /// default set via `ConsumerGroup::with_default_handler_timeout`
-    /// is not reflected here because the config does not know about
-    /// its registry.
+    /// Returns the explicitly-set per-group handler timeout if any, otherwise
+    /// the library default [`DEFAULT_HANDLER_TIMEOUT`].
+    ///
+    /// **Does not reflect the registry-level default** (set via
+    /// [`KafkaConsumerGroupRegistry::with_default_handler_timeout`]).
+    /// The registry-level default is resolved at consumer-registration time
+    /// and is not visible from this config object.
     pub fn handler_timeout(&self) -> Option<Duration> {
         Some(resolve_handler_timeout(self.handler_timeout, None))
     }
@@ -134,6 +165,11 @@ impl KafkaConsumerGroupConfig {
 
 pub struct KafkaConsumerGroup {
     pub(crate) queue: String,
+    /// The Kafka consumer group ID actually used by broker-side consumers.
+    /// Standard consumers: `"{queue}-consumer"`. FIFO consumers: `"{queue}-fifo"`.
+    /// Stored here so the autoscaler can query committed offsets under the
+    /// correct group without re-deriving it.
+    pub(crate) group_id: String,
     pub(crate) config: KafkaConsumerGroupConfig,
     pub(crate) spawner: Spawner,
     pub(crate) consumers: Vec<(CancellationToken, Arc<AtomicBool>, JoinHandle<()>)>,
@@ -158,7 +194,20 @@ impl KafkaConsumerGroup {
         T: Topic + 'static,
         H: MessageHandler<T> + 'static,
     {
+        let queue_str: String = queue.into();
         let concurrent = config.concurrent_processing;
+        // arch-K-8: surface the silent override of prefetch_count when the
+        // caller configured >1 but left concurrent_processing=false. Logged
+        // once at construction (vs. inside the spawner, which would fire on
+        // every scale-up).
+        if !concurrent && config.prefetch_count > 1 {
+            tracing::warn!(
+                queue = %queue_str,
+                configured_prefetch_count = config.prefetch_count,
+                "prefetch_count > 1 with concurrent_processing=false is being clamped to 1 — \
+                 call .with_concurrent_processing(true) to honor the configured value"
+            );
+        }
         let error_count = Arc::new(AtomicUsize::new(0));
         let ec_for_spawner = error_count.clone();
         let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
@@ -184,8 +233,10 @@ impl KafkaConsumerGroup {
             })
         });
 
+        let group_id = super::constants::consumer_group_id(&queue_str);
         Self {
-            queue: queue.into(),
+            queue: queue_str,
+            group_id,
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
             spawner,
@@ -254,8 +305,10 @@ impl KafkaConsumerGroup {
         });
 
         let queue_str: String = queue.into();
+        let group_id = super::constants::consumer_group_id_fifo(&queue_str);
         Self {
-            queue: queue_str.clone(),
+            queue: queue_str,
+            group_id,
             consumers: Vec::with_capacity(1),
             config,
             spawner,
@@ -330,6 +383,15 @@ impl KafkaConsumerGroup {
         &self.queue
     }
 
+    /// The Kafka consumer group ID used by this group's broker-side consumers.
+    ///
+    /// Standard consumers return `"{queue}-consumer"`; FIFO consumers return
+    /// `"{queue}-fifo"`. The autoscaler uses this to query committed offsets
+    /// under the correct group — never re-derive it from the queue name.
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
     pub fn config(&self) -> &KafkaConsumerGroupConfig {
         &self.config
     }
@@ -339,28 +401,75 @@ impl KafkaConsumerGroup {
     }
 
     pub(crate) async fn shutdown_with_tally(&mut self) -> ShutdownTally {
-        info!(group = %self.queue, consumers = self.consumers.len(), "shutting down consumer group");
+        let mut tally = ShutdownTally::default();
+        self.drain_into(&mut tally).await;
+        debug!(
+            group = %self.queue,
+            errors = tally.errors,
+            panics = tally.panics,
+            "consumer group shutdown complete"
+        );
+        tally
+    }
+
+    /// Cancel the group token and await every consumer handle, accumulating
+    /// errors and panics into the caller-owned `tally`.
+    ///
+    /// Atomic counts are swapped into `tally` **before** any handle is
+    /// awaited, so a caller that races this against a timeout (see
+    /// `RegistryImpl::run_until_timeout`) preserves pre-cancel state even if
+    /// the future is dropped mid-await. The consumer list is drained via
+    /// `pop()` so dropped futures leave unawaited handles in place for a
+    /// subsequent escalation via [`Self::abort_remaining_into`].
+    pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
+        info!(
+            group = %self.queue,
+            consumers = self.consumers.len(),
+            "shutting down consumer group"
+        );
         self.group_token.cancel();
-        let mut panics = 0usize;
-        for (_token, _processing, handle) in self.consumers.drain(..) {
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
                 Ok(()) => {}
-                // Defensive: shutdown is cooperative via `group_token`; no
-                // code path currently calls `JoinHandle::abort()` on these
-                // handles, so this arm is unreachable today. Mirrors the
-                // `ConsumerSupervisor` drain and keeps parity if a future
-                // timeout escalation adds `abort_all`.
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
-                    panics += 1;
+                    tally.panics += 1;
                 }
             }
         }
-        let errors = self.error_count.swap(0, Ordering::Relaxed);
-        let panics = panics + self.panic_count.swap(0, Ordering::Relaxed);
-        debug!(group = %self.queue, errors, panics, "consumer group shutdown complete");
-        ShutdownTally { errors, panics }
+
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
+    }
+
+    /// Abort surviving consumer handles after a drain timeout, accumulating
+    /// any results into `tally`.
+    pub(crate) async fn abort_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        self.group_token.cancel();
+        for (_token, _processing, handle) in &self.consumers {
+            handle.abort();
+        }
+        while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        group = %self.queue,
+                        "consumer task panicked during abort escalation"
+                    );
+                    tally.panics += 1;
+                }
+            }
+        }
+        tally.errors += self.error_count.swap(0, Ordering::Relaxed);
+        tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
 
     fn spawn_one(&mut self) {
@@ -376,6 +485,9 @@ impl KafkaConsumerGroup {
         }
         options.max_message_size = self.config.max_message_size;
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
+        if let Some(ref gid) = self.config.group_id {
+            options.kafka_group_id = Some(Arc::from(gid.as_str()));
+        }
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
@@ -557,20 +669,32 @@ impl KafkaConsumerGroupRegistry {
     }
 
     pub(crate) async fn shutdown_all_with_tally(&mut self) -> ShutdownTally {
+        let mut tally = ShutdownTally::default();
+        self.drain_all_into(&mut tally).await;
+        tally
+    }
+
+    /// Drain every consumer group, accumulating errors/panics into `tally`.
+    pub(crate) async fn drain_all_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             count = self.groups.len(),
             "shutting down all consumer groups"
         );
-        let mut tally = ShutdownTally::default();
         for group in self.groups.values_mut() {
-            tally.add(group.shutdown_with_tally().await);
+            group.drain_into(tally).await;
         }
         debug!(
             errors = tally.errors,
             panics = tally.panics,
             "all consumer groups shut down"
         );
-        tally
+    }
+
+    /// Abort surviving consumers across every group after a drain timeout.
+    pub(crate) async fn abort_all_remaining_into(&mut self, tally: &mut ShutdownTally) {
+        for group in self.groups.values_mut() {
+            group.abort_remaining_into(tally).await;
+        }
     }
 }
 
@@ -593,6 +717,7 @@ mod tests {
 
         KafkaConsumerGroup {
             queue: "test-queue".into(),
+            group_id: "test-queue-consumer".into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
             spawner,
@@ -760,6 +885,51 @@ mod tests {
         assert_eq!(group.active_consumers(), 0);
     }
 
+    fn hanging_test_group(config: KafkaConsumerGroupConfig) -> KafkaConsumerGroup {
+        let mut group = test_group(config);
+        group.spawner = Arc::new(|_options: ConsumerOptions| {
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            })
+        });
+        group
+    }
+
+    #[tokio::test]
+    async fn drain_into_timeout_preserves_atomics_in_tally() {
+        let mut group = hanging_test_group(KafkaConsumerGroupConfig::new(2..=2));
+        group.start();
+        assert_eq!(group.active_consumers(), 2);
+
+        group.error_count.store(7, Ordering::Relaxed);
+        group.panic_count.store(2, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally::default();
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+        assert!(result.is_err(), "drain must time out on hanging consumers");
+
+        assert_eq!(tally.errors, 7);
+        assert_eq!(tally.panics, 2);
+    }
+
+    #[tokio::test]
+    async fn abort_remaining_into_kills_hanging_consumers_and_keeps_tally() {
+        let mut group = hanging_test_group(KafkaConsumerGroupConfig::new(2..=2));
+        group.start();
+
+        group.error_count.store(5, Ordering::Relaxed);
+        group.panic_count.store(1, Ordering::Relaxed);
+
+        let mut tally = ShutdownTally::default();
+        let _ = tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+        group.abort_remaining_into(&mut tally).await;
+
+        assert_eq!(group.active_consumers(), 0);
+        assert_eq!(tally.errors, 5);
+        assert_eq!(tally.panics, 1);
+    }
+
     // -- accessors --
 
     #[test]
@@ -833,5 +1003,47 @@ mod tests {
     fn with_default_handler_timeout_zero_panics() {
         let registry = KafkaConsumerGroupRegistry::from_groups(HashMap::new());
         let _ = registry.with_default_handler_timeout(Duration::ZERO);
+    }
+
+    // -- configurable group_id (arch-K-3) --
+
+    #[test]
+    fn with_group_id_overrides_default() {
+        // with_group_id() must exist and store the override
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
+        assert_eq!(cfg.group_id(), Some("my-service"));
+    }
+
+    #[test]
+    fn without_group_id_returns_none() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.group_id(), None);
+    }
+
+    // -- group_id (arch-K-1) --
+
+    #[test]
+    fn standard_group_id_is_queue_consumer() {
+        let group = test_group(default_config());
+        // test_group sets group_id = "test-queue-consumer" directly
+        assert_eq!(group.group_id(), "test-queue-consumer");
+    }
+
+    #[test]
+    fn fifo_group_id_must_not_match_standard_consumer_group_id() {
+        // FIFO consumers MUST use "{queue}-fifo", never "{queue}-consumer".
+        // If group_id() returns "{queue}-consumer" for a FIFO group, the
+        // autoscaler will read committed offsets from the wrong group and
+        // report phantom backlog (arch-K-1).
+        //
+        // We cannot call `new_fifo` from a unit test without a full KafkaClient,
+        // so we construct the group struct directly with the FIFO group_id that
+        // `new_fifo` sets via `consumer_group_id_fifo`.
+        let fifo_group_id = super::super::constants::consumer_group_id_fifo("orders");
+        assert_eq!(fifo_group_id, "orders-fifo");
+        assert_ne!(
+            fifo_group_id,
+            super::super::constants::consumer_group_id("orders")
+        );
     }
 }

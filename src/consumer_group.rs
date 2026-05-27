@@ -44,6 +44,21 @@ impl<B: HasCoordinatedGroups> ConsumerGroup<B, ()> {
 }
 
 impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<B, Ctx> {
+    /// Register a concurrent (unsequenced) topic handler.
+    ///
+    /// The backend **automatically declares** the required broker topology
+    /// (queues, streams, topics, consumer groups — whatever the backend
+    /// needs) before returning. Callers do **not** need to call
+    /// `broker.topology().declare::<T>()` first; doing so is harmless but
+    /// redundant. This guarantee holds across all backends (Redis, InMemory,
+    /// RabbitMQ, NATS, Kafka, SQS).
+    ///
+    /// Returns an error if:
+    /// - `T` has a sequencing config — use [`register_fifo`] instead.
+    /// - The topic is already registered in this registry.
+    /// - Topology declaration fails (e.g. broker unreachable).
+    ///
+    /// [`register_fifo`]: Self::register_fifo
     pub async fn register<T, H>(
         &mut self,
         config: ConsumerGroupConfig<B>,
@@ -65,6 +80,21 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
             .await
     }
 
+    /// Register a FIFO (sequenced) topic handler.
+    ///
+    /// The backend **automatically declares** the required broker topology
+    /// (queues, streams, shard queues, consumer groups — whatever the backend
+    /// needs) before returning. Callers do **not** need to call
+    /// `broker.topology().declare::<T>()` first; doing so is harmless but
+    /// redundant. This guarantee holds across all backends (Redis, InMemory,
+    /// RabbitMQ, NATS, Kafka, SQS).
+    ///
+    /// Returns an error if:
+    /// - `T`'s topology has no sequencing config — use [`register`] instead.
+    /// - The topic is already registered in this registry.
+    /// - Topology declaration fails (e.g. broker unreachable).
+    ///
+    /// [`register`]: Self::register
     pub async fn register_fifo<T, H>(
         &mut self,
         config: ConsumerGroupConfig<B>,

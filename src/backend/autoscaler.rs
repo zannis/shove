@@ -2,12 +2,17 @@
 //! See DESIGN_V2.md §5, §9.1.
 
 use crate::autoscale_metrics::AutoscaleMetrics;
+use crate::autoscaler::AutoscalerBackend;
 use crate::error::Result;
 
-pub(crate) trait AutoscalerBackendImpl: Send + Sync {
-    // Kept as an empty trait for this phase; per-backend autoscaler bodies
-    // bind here when backends port in Phase 4/7-10.
-}
+/// Internal sealing trait for [`crate::backend::Backend::AutoscalerImpl`].
+///
+/// Requiring [`AutoscalerBackend`] as a supertrait ensures every concrete
+/// `AutoscalerImpl` exposes the full public autoscaling interface
+/// (`list_groups` / `fetch_metrics` / `scale`) through generic
+/// `Broker<B>`-based code, while the `pub(crate)` visibility of this trait
+/// preserves the sealed-`Backend` invariant.
+pub(crate) trait AutoscalerBackendImpl: AutoscalerBackend + Send + Sync {}
 
 // Method anchored by the InMemory port's `_anchor_*` helpers in
 // `backend::mod` under the `inmemory` feature. Under

@@ -47,7 +47,7 @@ audit = []
 nats = ["dep:async-nats", "dep:bytes", "dep:futures-util"]
 
 # Apache Kafka pubsub
-kafka = ["dep:rdkafka", "dep:futures-util"]
+kafka = ["dep:rdkafka", "dep:futures-util", "dep:bytes"]
 
 # TLS + SASL support for Kafka. Pulls in rdkafka's `ssl` (OpenSSL) and `sasl`
 # (Cyrus SASL) features. For GSSAPI/Kerberos or a vendored OpenSSL, users can
@@ -75,7 +75,7 @@ metrics = ["dep:metrics"]
 protobuf = ["dep:prost"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
@@ -87,7 +87,7 @@ lapin = { version = "4", features = ["rustls--ring"], optional = true }
 futures-lite = { version = "2", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
-aws-credential-types = { version = "1", features = ["hardcoded-credentials"], optional = true }
+aws-credential-types = { version = "1", optional = true }
 aws-msk-iam-sasl-signer = { version = "1", optional = true }
 aws-sdk-sns = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
 aws-sdk-sqs = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
@@ -110,6 +110,9 @@ rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = tr
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats", "kafka", "redis"] }
+# RUSTSEC-2026-0145: testcontainers 0.27.3 pulls in astral-tokio-tar 0.6.1 which
+# has a known vulnerability. Pin to 0.6.2 until testcontainers ships a fix.
+astral-tokio-tar = "0.6.2"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
@@ -239,7 +242,7 @@ required-features = ["rabbitmq"]
 
 [[test]]
 name = "sns_integration"
-required-features = ["pub-aws-sns"]
+required-features = ["aws-sns-sqs"]
 
 [[test]]
 name = "sns_sqs_integration"
