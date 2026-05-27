@@ -1,0 +1,21 @@
+src/backends/redis/consumer.rs
+  s_80d93bdfda1e22::t_99a08a1a0ebb3c 648
+  s_80d93bdfda1e22::t_2ee87b9df3e984 493
+  s_80d93bdfda1e22::t_cee5b05c334b19 784
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2d6b914f33849285009a798a6d3ea193fd1696ab",
+  "prompts": {},
+  "sessions": {
+    "s_80d93bdfda1e22": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b22502-baee-4e5a-9e07-4b245fea3dd6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
