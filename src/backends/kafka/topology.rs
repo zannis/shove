@@ -2,11 +2,7 @@ use crate::error::Result;
 use crate::topology::QueueTopology;
 
 use super::client::KafkaClient;
-
-/// Default number of partitions for standard (non-sequenced) topics.
-const DEFAULT_PARTITIONS: i32 = 8;
-/// Default replication factor.
-const DEFAULT_REPLICATION: i32 = 1;
+use super::constants::{DEFAULT_PARTITIONS, DEFAULT_REPLICATION};
 
 pub struct KafkaTopologyDeclarer {
     client: KafkaClient,

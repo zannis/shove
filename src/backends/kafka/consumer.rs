@@ -31,8 +31,9 @@ use super::msk_iam::MskIamContext;
 
 use super::client::KafkaClient;
 use super::constants::{
-    DEATH_COUNT_HEADER, DEATH_REASON_HEADER, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
-    RETRY_COUNT_HEADER,
+    DEATH_COUNT_HEADER, DEATH_REASON_HEADER, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
+    MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
+    RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS,
 };
 
 // ---------------------------------------------------------------------------
@@ -293,7 +294,14 @@ async fn publish_to_dlq(
 
     let dlq_headers = headers_for_dlq(headers, reason, topology.queue());
     client
-        .publish_with_retry(&dlq_topic, key, dlq_headers, payload, 3, "DLQ publish")
+        .publish_with_retry(
+            &dlq_topic,
+            key,
+            dlq_headers,
+            payload,
+            MAX_PUBLISH_ATTEMPTS,
+            "DLQ publish",
+        )
         .await
 }
 
@@ -585,14 +593,14 @@ fn create_stream_consumer(
         .set("partition.assignment.strategy", "cooperative-sticky")
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
-        .set("session.timeout.ms", "10000")
-        .set("max.poll.interval.ms", "300000")
+        .set("session.timeout.ms", SESSION_TIMEOUT_MS.to_string())
+        .set("max.poll.interval.ms", MAX_POLL_INTERVAL_MS.to_string())
         // Minimise fetch-latency so small-payload workloads aren't bottlenecked
-        // by the default 500 ms broker dwell. `fetch.min.bytes=1` returns as
-        // soon as any data is available; `fetch.wait.max.ms=50` caps the
+        // by the default 500 ms broker dwell. `FETCH_MIN_BYTES=1` returns as
+        // soon as any data is available; `FETCH_WAIT_MAX_MS=50` caps the
         // blocking dwell so the broker doesn't hold the connection open.
-        .set("fetch.min.bytes", "1")
-        .set("fetch.wait.max.ms", "50");
+        .set("fetch.min.bytes", FETCH_MIN_BYTES.to_string())
+        .set("fetch.wait.max.ms", FETCH_WAIT_MAX_MS.to_string());
 
     #[cfg(feature = "kafka-msk-iam")]
     if let Some(ctx) = msk_context {
