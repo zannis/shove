@@ -90,7 +90,12 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
     }
 }
 
-/// Reason categories for messages that failed before reaching the handler.
+/// Reason categories for messages that failed in the consumer pipeline.
+///
+/// Includes both pre-handler failures (oversize, deserialize, pending_full)
+/// and post-handler terminal outcomes (timeout, max_retries_exceeded,
+/// rejected) so operators can alert on every code path that retires a
+/// message without an Ack.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) enum FailReason {
@@ -98,6 +103,8 @@ pub(crate) enum FailReason {
     Deserialize,
     PendingFull,
     Timeout,
+    MaxRetriesExceeded,
+    Rejected,
 }
 
 #[allow(dead_code)]
@@ -108,6 +115,8 @@ impl FailReason {
             FailReason::Deserialize => "deserialize",
             FailReason::PendingFull => "pending_full",
             FailReason::Timeout => "timeout",
+            FailReason::MaxRetriesExceeded => "max_retries_exceeded",
+            FailReason::Rejected => "rejected",
         }
     }
 }
