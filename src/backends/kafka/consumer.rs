@@ -306,6 +306,33 @@ async fn publish_to_dlq(
         .await
 }
 
+/// Completion handle for the concurrent (non-FIFO) consumer path.
+///
+/// Threaded into [`route_outcome`] so the function can signal offset-commit
+/// readiness exactly once per message — synchronously for terminal outcomes
+/// (Ack, DLQ-terminal Retry/Reject), or from inside the delayed-republish
+/// spawn for Retry/Defer **after** the republish has actually landed. This
+/// closes the at-least-once gap that existed when the outer task signaled
+/// completion before the delayed publish had been attempted.
+///
+/// `None` selects the FIFO path: no async signaling, [`route_outcome`]
+/// instead awaits the republish inline and returns whether the caller may
+/// proceed with `consumer.commit_message`.
+type CompletionHandle = Option<(mpsc::Sender<(i32, i64)>, i32, i64)>;
+
+fn signal_completion(handle: CompletionHandle, queue: &str) {
+    if let Some((tx, partition, offset)) = handle
+        && tx.try_send((partition, offset)).is_err()
+    {
+        tracing::error!(
+            queue,
+            partition,
+            offset,
+            "completion channel full — logic bug in offset tracker"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn route_outcome(
     client: &KafkaClient,
@@ -330,9 +357,18 @@ async fn route_outcome(
     // None on the FIFO path (no semaphore in play there) and on the
     // outer-task's Ack/Reject arms (permit drops at end of scope).
     retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    completion: CompletionHandle,
+    // Threaded into the Retry/Defer republish spawn so a graceful shutdown
+    // can short-circuit the (potentially minute-long) hold-queue delay
+    // instead of stalling `acquire_many(prefetch)` until every delayed
+    // permit-holder finishes naturally.
+    shutdown: CancellationToken,
 ) -> bool {
     match outcome {
-        Outcome::Ack => true,
+        Outcome::Ack => {
+            signal_completion(completion, topic);
+            true
+        }
         Outcome::Retry => {
             let new_count = retry_count + 1;
             if new_count >= max_retries {
@@ -340,7 +376,7 @@ async fn route_outcome(
                 // of DLQ outcome — silent loss on DLQ failure is what the
                 // counter has to surface to alerting.
                 metrics::record_failed(topic, group, metrics::FailReason::MaxRetriesExceeded);
-                return match publish_to_dlq(
+                let dlq_ok = publish_to_dlq(
                     client,
                     topology,
                     payload,
@@ -348,8 +384,14 @@ async fn route_outcome(
                     headers,
                     "max_retries_exceeded",
                 )
-                .await
-                {
+                .await;
+                // Commit even if the DLQ publish failed: the message has
+                // exhausted retries and looping it forever produces a poison
+                // hot-spot. The error trace + metric give operators what they
+                // need to investigate. Matches the existing pre-refactor
+                // semantic (the outer task committed regardless).
+                signal_completion(completion, topic);
+                return match dlq_ok {
                     Ok(()) => true,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to publish to DLQ after exhausting retries");
@@ -365,39 +407,28 @@ async fn route_outcome(
                 hold_queues[idx].delay()
             };
 
-            let client = client.clone();
-            let topic = topic.to_string();
-            let payload = payload.to_vec();
             let retry_headers =
                 headers_with_retry_count(headers, new_count, &format!("-r{new_count}"));
 
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                if let Err(e) = client
-                    .publish_with_retry(
-                        &topic,
-                        key.as_deref(),
-                        retry_headers,
-                        &payload,
-                        3,
-                        "retry republish",
-                    )
-                    .await
-                {
-                    tracing::error!(error = %e, "delayed retry republish failed");
-                }
-                // sec-K-8: hold the prefetch permit until the delayed retry
-                // republish finishes so the inflight-task count stays
-                // bounded by the prefetch limit.
-                drop(retry_permit);
-            });
-            true
+            run_delayed_republish(
+                client.clone(),
+                topic.to_string(),
+                key,
+                retry_headers,
+                payload.to_vec(),
+                delay,
+                retry_permit,
+                completion,
+                shutdown,
+                "retry republish",
+            )
+            .await
         }
         Outcome::Reject => {
             // Emit before the DLQ publish — see the symmetric note in the
             // max_retries_exceeded arm above.
             metrics::record_failed(topic, group, metrics::FailReason::Rejected);
-            match publish_to_dlq(
+            let dlq_ok = publish_to_dlq(
                 client,
                 topology,
                 payload,
@@ -405,8 +436,11 @@ async fn route_outcome(
                 headers,
                 "rejected",
             )
-            .await
-            {
+            .await;
+            // Same rationale as max_retries_exceeded: commit regardless of
+            // DLQ outcome to prevent a Reject from looping forever.
+            signal_completion(completion, topic);
+            match dlq_ok {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to publish rejected message to DLQ");
@@ -421,35 +455,146 @@ async fn route_outcome(
                 hold_queues[0].delay()
             };
 
-            let client = client.clone();
-            let topic = topic.to_string();
-            let payload = payload.to_vec();
-            // Defer does NOT increment retry count
+            // Defer does NOT increment retry count.
             let defer_headers = headers_with_retry_count(
                 headers,
                 retry_count,
                 &format!("-d{}", uuid::Uuid::new_v4()),
             );
 
+            run_delayed_republish(
+                client.clone(),
+                topic.to_string(),
+                key,
+                defer_headers,
+                payload.to_vec(),
+                delay,
+                retry_permit,
+                completion,
+                shutdown,
+                "defer republish",
+            )
+            .await
+        }
+    }
+}
+
+/// Drive the Retry/Defer delayed republish.
+///
+/// **Concurrent path** (`completion: Some`): spawns the work and returns
+/// immediately. The spawn races `sleep(delay)` against the shutdown token —
+/// if shutdown wins, the spawn drops the permit without publishing or
+/// signaling, so the message will be redelivered on next start. If sleep
+/// wins, it publishes; on success it signals completion (offset gets
+/// committed), on failure it logs and drops without signaling so the
+/// message is redelivered.
+///
+/// **FIFO path** (`completion: None`): awaits the republish inline. Returns
+/// `true` iff publish succeeded and the caller may proceed with
+/// `consumer.commit_message`. On shutdown or publish failure returns
+/// `false` — the FIFO loop will see the same shutdown via its own polling
+/// path.
+#[allow(clippy::too_many_arguments)]
+async fn run_delayed_republish(
+    client: KafkaClient,
+    topic: String,
+    key: Option<Bytes>,
+    headers: OwnedHeaders,
+    payload: Vec<u8>,
+    delay: Duration,
+    retry_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    completion: CompletionHandle,
+    shutdown: CancellationToken,
+    label: &'static str,
+) -> bool {
+    match completion {
+        Some(_) => {
             tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                if let Err(e) = client
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.cancelled() => {
+                        tracing::debug!(
+                            queue = %topic,
+                            label,
+                            "shutdown fired before delayed republish; dropping permit — \
+                             offset stays uncommitted, message will be redelivered on restart"
+                        );
+                        drop(retry_permit);
+                        return;
+                    }
+                }
+                match client
                     .publish_with_retry(
                         &topic,
                         key.as_deref(),
-                        defer_headers,
+                        headers,
                         &payload,
-                        3,
-                        "defer republish",
+                        MAX_PUBLISH_ATTEMPTS,
+                        label,
                     )
                     .await
                 {
-                    tracing::error!(error = %e, "deferred republish failed");
+                    Ok(()) => {
+                        signal_completion(completion, &topic);
+                    }
+                    Err(e) => {
+                        // Don't signal — leaving the offset uncommitted is the
+                        // only thing preserving at-least-once delivery if the
+                        // republish itself fails. The next poll/restart will
+                        // redeliver the original message.
+                        tracing::error!(
+                            error = %e,
+                            label,
+                            "delayed republish failed — leaving offset uncommitted for redelivery"
+                        );
+                    }
                 }
-                // sec-K-8: same permit-lifetime contract as Retry.
+                // sec-K-8: permit lifetime = full processing including
+                // delayed republish, so prefetch bounds inflight work.
                 drop(retry_permit);
             });
             true
+        }
+        None => {
+            // FIFO path: serialize inline so the per-partition ordering
+            // contract is preserved (a spawn would let the next message
+            // run before the current republish lands).
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(
+                        queue = %topic,
+                        label,
+                        "shutdown fired before FIFO republish; skipping — \
+                         message will be redelivered on restart"
+                    );
+                    drop(retry_permit);
+                    return false;
+                }
+            }
+            let ok = match client
+                .publish_with_retry(
+                    &topic,
+                    key.as_deref(),
+                    headers,
+                    &payload,
+                    MAX_PUBLISH_ATTEMPTS,
+                    label,
+                )
+                .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        label,
+                        "FIFO delayed republish failed — leaving offset uncommitted for redelivery"
+                    );
+                    false
+                }
+            };
+            drop(retry_permit);
+            ok
         }
     }
 }
@@ -941,6 +1086,7 @@ impl KafkaConsumer {
                             let task_handler = handler.clone();
                             let task_ctx = ctx.clone();
                             let task_group = group.clone();
+                            let task_shutdown = shutdown.clone();
 
                             // perf-K-7: single spawn per message (was three).
                             // invoke_handler awaits the handler with catch_unwind +
@@ -965,6 +1111,13 @@ impl KafkaConsumer {
                                 // so Retry/Defer's delayed republish spawn stays
                                 // bounded by the prefetch limit instead of running
                                 // outside the cap.
+                                //
+                                // Completion signaling now lives inside route_outcome:
+                                // terminal outcomes signal sync; delayed republish
+                                // signals from the spawn only on successful publish.
+                                // Without this gating the offset would commit before
+                                // the republish landed, silently dropping the message
+                                // on republish failure.
                                 route_outcome(
                                     &task_client,
                                     &task_topic,
@@ -978,20 +1131,10 @@ impl KafkaConsumer {
                                     max_retries,
                                     hold_queues,
                                     Some(permit),
+                                    Some((task_tx, partition, offset)),
+                                    task_shutdown,
                                 )
                                 .await;
-
-                                if task_tx.try_send((partition, offset)).is_err() {
-                                    tracing::error!(
-                                        queue = task_topic.as_ref(),
-                                        partition,
-                                        offset,
-                                        "completion channel full — logic bug in offset tracker"
-                                    );
-                                }
-                                // sec-K-8: permit was passed to route_outcome —
-                                // either dropped at end of Ack/Reject arms, or
-                                // moved into the Retry/Defer republish spawn.
 
                                 if task_semaphore.available_permits() == task_prefetch as usize {
                                     task_processing.store(false, Ordering::Release);
@@ -1233,7 +1376,7 @@ impl KafkaConsumer {
                                 .await;
                                 let outcome = adjust_outcome_for_fifo(outcome);
 
-                                route_outcome(
+                                let route_ok = route_outcome(
                                     &client,
                                     &queue,
                                     group.as_deref(),
@@ -1247,10 +1390,22 @@ impl KafkaConsumer {
                                     hold_queues,
                                     // FIFO is sequential — no prefetch semaphore in play.
                                     None,
+                                    // No async completion: route_outcome awaits
+                                    // the Retry/Defer republish inline and reports
+                                    // via the bool return whether the message has
+                                    // been retired (Ack / DLQ / republished OK).
+                                    None,
+                                    shutdown.clone(),
                                 )
                                 .await;
 
-                                consumer.commit_message(&msg, CommitMode::Async).ok();
+                                // Only commit when the message has been retired —
+                                // skipping the commit on republish failure or
+                                // shutdown is how at-least-once delivery survives
+                                // a missed delayed publish on the FIFO path.
+                                if route_ok {
+                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                }
                                 processing.store(false, Ordering::Release);
                             }
                         }
