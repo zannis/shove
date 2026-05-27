@@ -35,6 +35,7 @@ use super::constants::{
     MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
     RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS,
 };
+use super::consumer_group::KafkaAutoOffsetReset;
 
 // ---------------------------------------------------------------------------
 // Offset tracking for concurrent consumption
@@ -588,6 +589,7 @@ impl KafkaStreamConsumer {
 fn create_stream_consumer(
     mut base: ClientConfig,
     group_id: &str,
+    auto_offset_reset: KafkaAutoOffsetReset,
     #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
 ) -> Result<KafkaStreamConsumer> {
     // Each consumer task within a group gets a distinct `client.id` so
@@ -603,7 +605,7 @@ fn create_stream_consumer(
         // freezes the entire group for the heartbeat window.
         .set("partition.assignment.strategy", "cooperative-sticky")
         .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
+        .set("auto.offset.reset", auto_offset_reset.as_rdkafka_str())
         .set("session.timeout.ms", SESSION_TIMEOUT_MS.to_string())
         .set("max.poll.interval.ms", MAX_POLL_INTERVAL_MS.to_string())
         // Minimise fetch-latency so small-payload workloads aren't bottlenecked
@@ -732,6 +734,9 @@ impl KafkaConsumer {
             .as_deref()
             .map(str::to_string)
             .unwrap_or_else(|| super::constants::consumer_group_id(queue));
+        let auto_offset_reset = options
+            .kafka_auto_offset_reset
+            .unwrap_or(KafkaAutoOffsetReset::Earliest);
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -771,6 +776,7 @@ impl KafkaConsumer {
                 let consumer = create_stream_consumer(
                     client.base_config(),
                     &group_id,
+                    auto_offset_reset,
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
                 )?;
@@ -1080,6 +1086,9 @@ impl KafkaConsumer {
         // processing one message at a time guarantees FIFO per key (all
         // messages for the same key land in the same partition).
         let group_id = format!("{queue}-fifo");
+        let auto_offset_reset = options
+            .kafka_auto_offset_reset
+            .unwrap_or(KafkaAutoOffsetReset::Earliest);
         let topic: Arc<str> = Arc::from(queue.as_str());
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
@@ -1100,6 +1109,7 @@ impl KafkaConsumer {
                     let consumer = create_stream_consumer(
                         client.base_config(),
                         &group_id,
+                        auto_offset_reset,
                         #[cfg(feature = "kafka-msk-iam")]
                         client.msk_context(),
                     )?;
@@ -1358,9 +1368,15 @@ impl KafkaConsumer {
             let shutdown = shutdown.clone();
             let dlq_group_id = dlq_group_id.clone();
             async move {
+                // DLQ consumers always drain from the earliest available
+                // offset — skipping dead messages on a tail-only join would
+                // silently lose audit data the operator explicitly opted in
+                // to. Keep the policy fixed regardless of the user's main
+                // consumer `auto_offset_reset` override.
                 let consumer = create_stream_consumer(
                     client_clone.base_config(),
                     &dlq_group_id,
+                    KafkaAutoOffsetReset::Earliest,
                     #[cfg(feature = "kafka-msk-iam")]
                     client_clone.msk_context(),
                 )?;

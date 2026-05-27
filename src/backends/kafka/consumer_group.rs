@@ -23,6 +23,36 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 /// Type-erased factory that spawns a single consumer task.
 pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
 
+/// `auto.offset.reset` policy applied when a consumer group joins a topic
+/// for the first time (no committed offsets yet) or after offsets have
+/// expired. Maps to the rdkafka client config value of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaAutoOffsetReset {
+    /// Replay from the earliest available record on the topic. Suitable for
+    /// at-least-once pipelines starting from a clean slate or for DLQ
+    /// drains where the goal is to consume the full history.
+    Earliest,
+    /// Resume from the latest record at the moment the group joins —
+    /// historical messages on the topic are skipped. Use this for high-
+    /// volume metrics / telemetry streams or blue-green deploys where
+    /// crawling backlog is wasteful.
+    Latest,
+    /// Refuse to start without a committed offset; the consumer raises an
+    /// error if no offset exists. Use this when accidentally replaying or
+    /// skipping history would be a correctness bug.
+    None,
+}
+
+impl KafkaAutoOffsetReset {
+    pub(crate) fn as_rdkafka_str(self) -> &'static str {
+        match self {
+            KafkaAutoOffsetReset::Earliest => "earliest",
+            KafkaAutoOffsetReset::Latest => "latest",
+            KafkaAutoOffsetReset::None => "none",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KafkaConsumerGroupConfig
 // ---------------------------------------------------------------------------
@@ -44,6 +74,10 @@ pub struct KafkaConsumerGroupConfig {
     /// receive every message from the same topic (fan-out) — without separate
     /// group IDs they share the same consumer group and compete for partitions.
     group_id: Option<String>,
+    /// Optional `auto.offset.reset` policy. `None` keeps the library default
+    /// of `Earliest` (replay history). Override to `Latest` for tail-only
+    /// consumers or to `None` to refuse silent replay/skip on a fresh group.
+    auto_offset_reset: Option<KafkaAutoOffsetReset>,
 }
 
 impl Default for KafkaConsumerGroupConfig {
@@ -78,6 +112,7 @@ impl KafkaConsumerGroupConfig {
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             group_id: None,
+            auto_offset_reset: None,
         }
     }
 
@@ -134,6 +169,21 @@ impl KafkaConsumerGroupConfig {
         self.group_id
             .clone()
             .unwrap_or_else(|| super::constants::consumer_group_id(queue))
+    }
+
+    /// Override the rdkafka `auto.offset.reset` policy for this consumer
+    /// group. Defaults to [`KafkaAutoOffsetReset::Earliest`] (replay history)
+    /// when unset.
+    pub fn with_auto_offset_reset(mut self, policy: KafkaAutoOffsetReset) -> Self {
+        self.auto_offset_reset = Some(policy);
+        self
+    }
+
+    /// Returns the explicitly configured `auto.offset.reset` policy, or
+    /// `None` if the library default ([`KafkaAutoOffsetReset::Earliest`])
+    /// should apply.
+    pub fn auto_offset_reset(&self) -> Option<KafkaAutoOffsetReset> {
+        self.auto_offset_reset
     }
 
     pub fn prefetch_count(&self) -> u16 {
@@ -506,6 +556,7 @@ impl KafkaConsumerGroup {
         if let Some(ref gid) = self.config.group_id {
             options.kafka_group_id = Some(Arc::from(gid.as_str()));
         }
+        options.kafka_auto_offset_reset = self.config.auto_offset_reset;
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
@@ -520,6 +571,14 @@ pub struct KafkaConsumerGroupRegistry {
     pub(crate) groups: HashMap<String, KafkaConsumerGroup>,
     client: Option<KafkaClient>,
     pub(super) default_handler_timeout: Option<Duration>,
+    /// Replication factor applied to every auto-created topic (main + DLQ)
+    /// declared via `register` / `register_fifo`. `None` keeps the topology
+    /// declarer default (`1`) — suitable for single-broker dev clusters.
+    /// Production clusters must set this via
+    /// [`with_default_replication_factor`].
+    ///
+    /// [`with_default_replication_factor`]: Self::with_default_replication_factor
+    default_replication_factor: Option<i32>,
 }
 
 impl KafkaConsumerGroupRegistry {
@@ -528,6 +587,7 @@ impl KafkaConsumerGroupRegistry {
             groups: HashMap::new(),
             client: Some(client),
             default_handler_timeout: None,
+            default_replication_factor: None,
         }
     }
 
@@ -538,6 +598,7 @@ impl KafkaConsumerGroupRegistry {
             groups,
             client: None,
             default_handler_timeout: None,
+            default_replication_factor: None,
         }
     }
 
@@ -550,6 +611,22 @@ impl KafkaConsumerGroupRegistry {
             "default_handler_timeout must be positive"
         );
         self.default_handler_timeout = Some(timeout);
+        self
+    }
+
+    /// Replication factor applied to every auto-created topic when groups
+    /// register. Defaults to `1` (single-broker dev) when unset — production
+    /// clusters should call this with `≥ 3` (or whatever the cluster's
+    /// quorum sizing demands) or pre-create topics out-of-band via
+    /// Terraform / MSK console. `create_topic` is idempotent and will not
+    /// alter the replication of an already-existing topic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 1`.
+    pub fn with_default_replication_factor(mut self, n: i32) -> Self {
+        assert!(n >= 1, "default_replication_factor must be >= 1 (got {n})");
+        self.default_replication_factor = Some(n);
         self
     }
 
@@ -597,8 +674,11 @@ impl KafkaConsumerGroupRegistry {
             ShoveError::Topology("registry has no client (test-only registry)".into())
         })?;
 
-        let declarer = KafkaTopologyDeclarer::new(client.clone())
+        let mut declarer = KafkaTopologyDeclarer::new(client.clone())
             .with_min_partitions(config.max_consumers as i32);
+        if let Some(rf) = self.default_replication_factor {
+            declarer = declarer.with_replication_factor(rf);
+        }
         declarer.declare(topology).await?;
 
         info!(group = %name, "registering consumer group");
@@ -650,7 +730,10 @@ impl KafkaConsumerGroupRegistry {
             ShoveError::Topology("registry has no client (test-only registry)".into())
         })?;
 
-        let declarer = KafkaTopologyDeclarer::new(client.clone()).with_min_partitions(1);
+        let mut declarer = KafkaTopologyDeclarer::new(client.clone()).with_min_partitions(1);
+        if let Some(rf) = self.default_replication_factor {
+            declarer = declarer.with_replication_factor(rf);
+        }
         declarer.declare(topology).await?;
 
         info!(group = %name, "registering FIFO consumer group");
@@ -1055,6 +1138,28 @@ mod tests {
     fn resolved_group_id_falls_back_to_default_derivation() {
         let cfg = KafkaConsumerGroupConfig::new(1..=1);
         assert_eq!(cfg.resolved_group_id("orders"), "orders-consumer");
+    }
+
+    // -- auto.offset.reset --
+
+    #[test]
+    fn auto_offset_reset_defaults_to_none() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.auto_offset_reset(), None);
+    }
+
+    #[test]
+    fn with_auto_offset_reset_stores_override() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1)
+            .with_auto_offset_reset(KafkaAutoOffsetReset::Latest);
+        assert_eq!(cfg.auto_offset_reset(), Some(KafkaAutoOffsetReset::Latest));
+    }
+
+    #[test]
+    fn auto_offset_reset_rdkafka_strings_are_canonical() {
+        assert_eq!(KafkaAutoOffsetReset::Earliest.as_rdkafka_str(), "earliest");
+        assert_eq!(KafkaAutoOffsetReset::Latest.as_rdkafka_str(), "latest");
+        assert_eq!(KafkaAutoOffsetReset::None.as_rdkafka_str(), "none");
     }
 
     // -- group_id (arch-K-1) --

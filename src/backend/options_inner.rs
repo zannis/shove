@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "kafka")]
+use crate::backends::kafka::KafkaAutoOffsetReset;
 use crate::consumer::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
     validate_message_size,
@@ -39,6 +41,12 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka")]
     pub kafka_group_id: Option<Arc<str>>,
 
+    /// Kafka-only: rdkafka `auto.offset.reset` override. `None` falls back
+    /// to the library default of `earliest`. Propagated from
+    /// `KafkaConsumerGroupConfig::with_auto_offset_reset`.
+    #[cfg(feature = "kafka")]
+    pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
     #[cfg(feature = "aws-sns-sqs")]
@@ -67,6 +75,8 @@ impl ConsumerOptionsInner {
             consumer_group: None,
             #[cfg(feature = "kafka")]
             kafka_group_id: None,
+            #[cfg(feature = "kafka")]
+            kafka_auto_offset_reset: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
