@@ -1,0 +1,23 @@
+# Redis — Stress
+
+Throughput benchmark for the Redis backend. Publishes a configurable burst of messages on a non-sequenced topic and consumes them through a coordinated consumer group with concurrent processing. Useful for sanity-checking client tuning (`prefetch_count`, `max_consumers`, `response_timeout`) against your Redis or Valkey deployment before rolling production traffic.
+
+## Prerequisites
+
+- Redis 6.2+ or Valkey running locally (see command below)
+- Cargo feature: `redis-streams`
+
+## Run
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+cargo run --example redis_stress --features redis-streams --release
+```
+
+Pass `--release` — the JSON codec and XADD batching show their real cost only with optimisations on.
+
+## Source
+
+```rust
+// [!include ~/examples/redis/stress.rs]
+```

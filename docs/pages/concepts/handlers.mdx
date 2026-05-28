@@ -79,6 +79,36 @@ group.register::<Orders, _>(cfg, || Handler).await?;
 
 `Context` should be cheap to clone. `Arc<AppState>` is the canonical pattern; the clone is a refcount bump and does not copy any data.
 
+## Handler timeouts
+
+Every handler call runs under a wall-clock deadline. If it does not return within the timeout, the future is dropped, `Outcome::Retry` is recorded, and `metrics::record_failed(..., FailReason::Timeout)` is emitted. The default is 30 seconds.
+
+Three layers control the timeout, in priority order — the first one set wins:
+
+1. **Per-group override** — `<Backend>ConsumerGroupConfig::with_handler_timeout(Duration)`. Lives on the group config; rebuilt per `register` call.
+2. **Registry default** — `<Backend>ConsumerGroupRegistry::with_default_handler_timeout(Duration)`. Applies to every group that did not set its own. Use this when most groups in a service share a sensible deadline and a few outliers override it.
+3. **Library default** — `DEFAULT_HANDLER_TIMEOUT = 30s`.
+
+```rust,no_run
+let mut group = broker
+    .consumer_group()
+    .with_default_handler_timeout(Duration::from_secs(15));
+
+group
+    .register::<Orders, _>(
+        ConsumerGroupConfig::new(
+            KafkaConsumerGroupConfig::new(1..=4)
+                .with_handler_timeout(Duration::from_secs(60)),  // overrides the registry default for this topic
+        ),
+        || OrderHandler,
+    )
+    .await?;
+```
+
+Per-supervisor consumers (`ConsumerSupervisor::register`) use `ConsumerOptions::<Backend>::new().with_handler_timeout(Duration)` instead — the same three-layer resolution applies, with the supervisor's registry default sitting between per-consumer overrides and the library default.
+
+The timeout enforces deadlines on the handler future itself. It does not cancel work that has escaped into a `spawn`ed task or a long-running blocking call; if you need to bound those, you must wire the cancellation yourself. The default is generous because the library cannot tell whether your handler is doing IO or compute — set a shorter one when you know the work is bounded.
+
 ## MessageMetadata
 
 Every `handle()` invocation receives a `MessageMetadata` describing the delivery:

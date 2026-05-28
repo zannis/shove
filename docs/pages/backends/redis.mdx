@@ -37,6 +37,22 @@ let broker = Broker::<Redis>::new(RedisConfig {
 
 `group` sets the consumer group name shared by all consumers. Defaults to `"shove"` if `None`.
 
+`RedisConfig` exposes three builder methods on top of the struct fields:
+
+```rust,no_run
+use shove::redis::{RedisConfig, RedisMode};
+use std::time::Duration;
+
+let config = RedisConfig::new(RedisMode::Standalone {
+    url: "redis://127.0.0.1:6379/".into(),
+})
+.with_group("billing")                                // overrides the default "shove" group name
+.with_connection_timeout(Duration::from_secs(10))     // TCP connect deadline; default 10s
+.with_response_timeout(Duration::from_secs(30));      // per-command deadline; default 30s
+```
+
+`response_timeout` must be longer than the consumer's `XREADGROUP BLOCK` window (the consumer derives this from `prefetch_count` and the polling interval) — otherwise the client cancels the long-poll mid-block and treats the resulting timeout as a connection error. The defaults are sized to leave headroom.
+
 ## Declare topology
 
 ```rust
@@ -77,7 +93,12 @@ group
 
 - **`.with_prefetch_count(N)`** — the `COUNT` argument to XREADGROUP. With concurrent processing on, also the in-flight cap per consumer task. Default: 10.
 - **`.with_concurrent_processing(true)`** — dispatch each fetched message to its own tokio task with a per-task multiplexed connection for outcome routing. A semaphore caps in-flight handlers at `prefetch_count`. Default: `false` (handlers serialize via prefetch clamped to 1).
-- **`.with_handler_timeout(Duration)`** — per-message handler deadline. Timed-out messages are left in the PEL for XAUTOCLAIM to reclaim.
+- **`.with_handler_timeout(Duration)`** — per-message handler deadline. Timed-out messages are left in the PEL for XAUTOCLAIM to reclaim. Default `30s`; the registry-level default can be set via `RedisConsumerGroupRegistry::with_default_handler_timeout(Duration)`.
+- **`.with_max_retries(u32)`** — retry budget before a message is dead-lettered. Default `10`.
+- **`.with_max_pending_per_key(usize)`** — caps the per-key pending buffer for sequenced topics. Default `100`.
+- **`.with_max_message_size(usize)`** — payload ceiling in bytes; oversize messages route to the DLQ without invoking the handler. Default `1 MiB`.
+
+`ConsumerOptions::<Redis>::new().with_max_reconnect_attempts(N)` bounds how many times a consumer redials Redis after a connection drop before surfacing a `Connection` error. Default: unlimited.
 
 ## Sequenced delivery
 
@@ -108,3 +129,7 @@ group
 
 - [Basic](/backends/redis/examples/basic) — publish/consume round trip with hold queues and DLQ
 - [Sequenced](/backends/redis/examples/sequenced) — FNV-1a shard routing for per-key ordering
+- [Consumer Groups](/backends/redis/examples/consumer-groups) — coordinated `min..=max` group with a burst-and-drain workload
+- [Autoscaler](/backends/redis/examples/autoscaler) — XLEN-driven scale up/down within a `min..=max` range
+- [Audited Consumer](/backends/redis/examples/audited) — `MessageHandlerExt::audited` wrapping
+- [Stress](/backends/redis/examples/stress) — throughput benchmarking
