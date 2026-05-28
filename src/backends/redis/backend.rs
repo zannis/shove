@@ -78,10 +78,8 @@ impl Backend for Redis {
         // Nothing to do here.
     }
 
-    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
-        Err(crate::ShoveError::Connection(
-            "ping not yet implemented for Redis".into(),
-        ))
+    async fn ping(client: &Self::Client, timeout: std::time::Duration) -> Result<()> {
+        client.ping(timeout).await
     }
 }
 
