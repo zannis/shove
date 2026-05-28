@@ -92,3 +92,7 @@ All builder methods mirror the durable backends, so test code written against th
 - [Consumer Groups](/backends/inmemory/examples/consumer-groups) — coordinated groups with autoscaling
 - [Audited Consumer](/backends/inmemory/examples/audited) — `MessageHandlerExt::audited` wrapping
 - [Stress](/backends/inmemory/examples/stress) — throughput benchmarking
+
+## See also
+
+- [Liveness Probes](/guides/liveness) — wire `Broker::ping` into a k8s health endpoint. The in-process backend's `ping` checks the shutdown token and performs no I/O.

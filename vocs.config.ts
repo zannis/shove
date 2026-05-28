@@ -172,6 +172,7 @@ export default defineConfig({
         { text: 'Consumer Groups & Autoscaling', link: '/guides/groups' },
         { text: 'Exactly-Once (RabbitMQ)', link: '/guides/exactly-once' },
         { text: 'Shutdown & Exit Codes', link: '/guides/shutdown' },
+        { text: 'Liveness Probes', link: '/guides/liveness' },
         { text: 'Observability', link: '/guides/observability' },
       ],
     },
