@@ -32,8 +32,6 @@
 //! this file is further gated on `aws-sns-sqs` by `mod.rs` so the
 //! SQS-specific types (`SqsConsumer`, `SqsAutoscalerBackend`, …) are
 //! available.
-//!
-//! See DESIGN_V2.md §4 and Phase 10 of the v2 plan.
 
 #![cfg(feature = "aws-sns-sqs")]
 

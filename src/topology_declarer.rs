@@ -1,4 +1,4 @@
-//! Public `TopologyDeclarer<B>` + `Topics` tuple trait. See DESIGN_V2.md §6.4, §11.4.
+//! Public `TopologyDeclarer<B>` + `Topics` tuple trait.
 
 use crate::backend::{Backend, TopologyImpl};
 use crate::error::Result;

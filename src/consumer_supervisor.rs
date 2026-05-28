@@ -1,4 +1,4 @@
-//! Consumer supervisor harness and its outcome type. See DESIGN_V2.md §6.5.
+//! Consumer supervisor harness and its outcome type.
 
 use std::time::Duration;
 

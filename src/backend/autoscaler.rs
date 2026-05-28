@@ -1,5 +1,4 @@
 //! Internal `AutoscalerBackendImpl` and `QueueStatsProviderImpl` traits.
-//! See DESIGN_V2.md §5, §9.1.
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerBackend;

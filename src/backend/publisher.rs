@@ -1,6 +1,6 @@
 //! Internal `PublisherImpl` trait. Backend-specific publisher structs
 //! implement this; users call the public `Publisher<B>` wrapper that
-//! delegates here. See DESIGN_V2.md §5.
+//! delegates here.
 
 use std::collections::HashMap;
 

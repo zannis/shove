@@ -1,5 +1,5 @@
 //! Internal `RegistryImpl` trait for coordinated consumer groups (Kafka,
-//! RabbitMQ, NATS, InMemory). Not implemented by SQS. See DESIGN_V2.md §5.
+//! RabbitMQ, NATS, InMemory). Not implemented by SQS.
 //!
 //! `register` accepts an `H::Context` that each backend clones into every
 //! spawned task so handlers with a non-unit

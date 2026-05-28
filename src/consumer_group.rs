@@ -1,5 +1,5 @@
 //! Public `ConsumerGroup<B, Ctx>` -- specialist harness for coordinated
-//! consumer groups. Gated on `B: HasCoordinatedGroups`. See DESIGN_V2.md §6.3.
+//! consumer groups. Gated on `B: HasCoordinatedGroups`.
 
 use std::time::Duration;
 

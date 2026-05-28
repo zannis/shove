@@ -1,6 +1,6 @@
 //! `ConsumerOptionsInner` — un-generic lowering of `ConsumerOptions<B>`
 //! passed across the internal trait boundary so backend impls don't need
-//! to name `B`. See DESIGN_V2.md §8.3.
+//! to name `B`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

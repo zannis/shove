@@ -1,4 +1,4 @@
-//! Public `Broker<B>` hub. See DESIGN_V2.md §6.1.
+//! Public `Broker<B>` hub.
 
 use std::time::Duration;
 
