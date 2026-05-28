@@ -160,10 +160,8 @@ impl Backend for RabbitMq {
         client.shutdown().await;
     }
 
-    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
-        Err(ShoveError::Connection(
-            "ping not yet implemented for RabbitMQ".into(),
-        ))
+    async fn ping(client: &Self::Client, timeout: std::time::Duration) -> Result<()> {
+        client.ping(timeout).await
     }
 }
 

@@ -347,6 +347,26 @@ impl RabbitMqClient {
         self.snapshot().status().connected()
     }
 
+    /// Liveness check. Opens a transient channel and closes it immediately.
+    ///
+    /// Both operations require a real AMQP round-trip, proving the connection
+    /// is alive. `create_channel` already checks the shutdown token and
+    /// triggers a single reconnect on dead-connection errors — that behavior
+    /// is desirable for a liveness probe (broker reachable, our cached
+    /// connection went stale).
+    pub async fn ping(&self, timeout: Duration) -> Result<()> {
+        let fut = async {
+            let chan = self.create_channel().await?;
+            chan.close(200, "ping".into()).await.map_err(|e| {
+                ShoveError::Connection(format!("rabbitmq ping channel close failed: {e}"))
+            })?;
+            Ok::<(), ShoveError>(())
+        };
+        tokio::time::timeout(timeout, fut).await.map_err(|_| {
+            ShoveError::Connection(format!("rabbitmq ping timed out after {timeout:?}"))
+        })?
+    }
+
     /// Initiate a graceful shutdown.
     ///
     /// Cancels the shutdown token so that dependent tasks can begin winding
