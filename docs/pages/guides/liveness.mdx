@@ -7,6 +7,7 @@ Kubernetes liveness and readiness probes need a single, fast, bounded answer to 
 `Broker<B>::ping` uses the default 5-second deadline. Use `ping_with_timeout` to tighten or relax it.
 
 ```rust,no_run
+// Requires the `http` crate (or your web framework's re-export of it).
 use std::time::Duration;
 use shove::{Broker, Kafka};
 
@@ -28,7 +29,7 @@ Every backend issues a single real round-trip. There are no local-state shortcut
 |-----------|----------------------------------------------------|--------------------------|
 | Kafka     | `fetch_metadata(None, timeout)` on producer client | none                     |
 | Redis     | `PING` on the multiplexed connection               | none                     |
-| NATS      | subscribe + publish + await echo on a unique inbox | none                     |
+| NATS      | subscribe + flush + publish + await echo on a unique inbox | none |
 | RabbitMQ  | transient channel open + close                     | none                     |
 | SQS       | `ListQueues` with `max_results=1`                  | one AWS API call billed  |
 | InMemory  | shutdown-token check (no I/O)                      | none                     |
@@ -37,22 +38,7 @@ The SQS call is the only one with a meaningful operational cost: each probe is o
 
 ## Timeouts
 
-`Broker::ping` uses `DEFAULT_PING_TIMEOUT` (5 s). Match it to your platform's probe configuration:
-
-```rust,no_run
-use std::time::Duration;
-use shove::{Broker, Kafka};
-
-async fn readiness(broker: &Broker<Kafka>) -> http::StatusCode {
-    let deadline = Duration::from_secs(2);
-    match broker.ping_with_timeout(deadline).await {
-        Ok(()) => http::StatusCode::OK,
-        Err(_) => http::StatusCode::SERVICE_UNAVAILABLE,
-    }
-}
-```
-
-Align `deadline` with your k8s `timeoutSeconds`. If the underlying RPC exceeds the deadline, `ping` returns `Err(ShoveError::Connection(...))` whose message names the timeout.
+`Broker::ping` uses `DEFAULT_PING_TIMEOUT` (5 s). Pass a tighter or looser bound via `ping_with_timeout(Duration)` and align it with your platform's probe configuration. In Kubernetes, the deadline should sit comfortably below `timeoutSeconds` on the probe spec so that a slow but recovering broker can flake one probe without the kubelet timing the handler out on its end. If the underlying RPC exceeds the deadline, `ping` returns `Err(ShoveError::Connection(...))` whose message names the timeout.
 
 ## Reconnect policy
 
@@ -64,7 +50,7 @@ After `Broker::close`, every backend's `ping` returns `Err(ShoveError::Connectio
 
 - **No retries.** A single probe is a single observation. Use k8s `failureThreshold`, HTTP retries, or your circuit breaker to filter transient blips.
 - **No metrics.** Probe handlers are called frequently; emitting a metric per call would drown out failure signal.
-- **No per-topic check.** `ping` answers "can I talk to the cluster", and that alone — declaring topic X is a topology concern, handled elsewhere.
+- **No per-topic check.** `ping` answers "can I talk to the cluster". Whether a specific topic is declared is a topology concern, handled separately.
 - **No `PingInfo` payload.** `Result<()>` is the only return.
 
 ## What's next
