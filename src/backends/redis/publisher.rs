@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::backend::publisher::PublisherImpl;
 use crate::error::{Result, ShoveError};
+use crate::publisher_internal::validate_headers;
 use crate::topic::Topic;
 
 use super::client::{RedisClient, RedisConnection};
@@ -95,11 +96,17 @@ impl RedisPublisher {
     }
 
     /// Publish `msg` with caller-provided headers carried in the XADD entry.
+    ///
+    /// Rejects headers using a reserved prefix (e.g. `x-retry-count`,
+    /// `x-message-id`, `x-sequence-key`) so a publisher cannot forge the
+    /// internal routing/accounting fields the consumer reads off the stream
+    /// entry — matching the other backends.
     pub async fn publish_with_headers<T: Topic>(
         &self,
         msg: &T::Message,
         headers: HashMap<String, String>,
     ) -> Result<()> {
+        validate_headers(&headers)?;
         self.publish_inner::<T>(msg, headers, None).await
     }
 

@@ -743,6 +743,32 @@ async fn publish_with_headers_visible_in_metadata() {
     );
 }
 
+#[tokio::test]
+async fn publish_with_reserved_header_rejected() {
+    let broker = make_broker("redis-int-headers-reserved-grp").await;
+    broker
+        .topology()
+        .declare::<HeadersTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+
+    // A publisher must not be able to forge an internal routing field; the
+    // Redis consumer reads `x-retry-count` off the stream entry to drive
+    // retry/DLQ routing, so accepting it would let a publisher poison delivery.
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-retry-count".to_string(), "999".to_string());
+    let err = publisher
+        .publish_with_headers::<HeadersTopic>(&Order { id: 11 }, headers)
+        .await
+        .expect_err("reserved header must be rejected");
+    assert!(
+        matches!(err, shove::ShoveError::Validation(_)),
+        "expected Validation error, got: {err:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 6: publish_batch_returns_correct_count
 // ---------------------------------------------------------------------------
