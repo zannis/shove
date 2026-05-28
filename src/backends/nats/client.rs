@@ -215,9 +215,16 @@ impl NatsClient {
                 .subscribe(inbox.clone())
                 .await
                 .map_err(|e| ShoveError::Connection(format!("nats ping subscribe failed: {e}")))?;
-            // Flush so the SUB frame is on the wire to the server before the
-            // PUB races ahead of it. Without this, the server may receive PUB
-            // before SUB and drop the message (no interest).
+            // Auto-unsubscribe after one delivery so a probe timeout cannot
+            // leak a long-lived subscription on the server. Without this the
+            // Subscriber's Drop impl schedules UNSUB via tokio::spawn
+            // (fire-and-forget), which can accumulate under repeated timeouts.
+            sub.unsubscribe_after(1).await.map_err(|e| {
+                ShoveError::Connection(format!("nats ping unsubscribe_after failed: {e}"))
+            })?;
+            // Flush so the SUB and UNSUB-with-max frames are on the wire
+            // before the PUB races ahead of them. Without this, the server may
+            // receive PUB before SUB and drop the message (no interest).
             client
                 .flush()
                 .await
