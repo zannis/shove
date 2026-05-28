@@ -257,6 +257,10 @@ name = "kafka_integration"
 required-features = ["kafka"]
 
 [[test]]
+name = "kafka_ping"
+required-features = ["kafka"]
+
+[[test]]
 name = "kafka_msk_iam_unit"
 required-features = ["kafka-msk-iam"]
 
@@ -299,6 +303,10 @@ name = "inmemory_integration"
 required-features = ["inmemory"]
 
 [[test]]
+name = "inmemory_ping"
+required-features = ["inmemory"]
+
+[[test]]
 name = "metrics_inmemory"
 required-features = ["inmemory", "metrics"]
 
@@ -333,6 +341,10 @@ required-features = ["inmemory"]
 
 [[test]]
 name = "redis_integration"
+required-features = ["redis-streams"]
+
+[[test]]
+name = "redis_ping"
 required-features = ["redis-streams"]
 
 [[example]]
