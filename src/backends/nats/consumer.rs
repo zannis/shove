@@ -186,7 +186,105 @@ async fn publish_to_dlq(
     .await
 }
 
+/// Retries a message after `delay` without the at-least-once gap the old
+/// ack-then-republish path had.
+///
+/// The original message is held *un-acked* for the whole backoff, so a crash or
+/// a failed republish can never drop it. JetStream redelivers any un-acked
+/// message once `ack_wait` elapses, so WIP progress acks are sent during the
+/// wait to keep extending that timer (the same enqueue/republish-before-ack
+/// ordering the Redis and Kafka paths use). Once `delay` has passed, an
+/// incremented copy is published durably (the PubAck is awaited) and only then
+/// is the original acked. On shutdown the hold is abandoned with the message
+/// still un-acked so it is redelivered on restart; on republish failure the
+/// original is nak'd for immediate redelivery.
+///
+/// Retry counting stays header-based — the republished copy carries an
+/// incremented `RETRY_COUNT_HEADER` — so, unlike a `Nak`-driven redelivery, a
+/// `Defer` (which uses `Nak(Some(delay))` and leaves the header untouched) does
+/// not consume the retry budget. That keeps parity with the other backends.
+async fn hold_then_republish(
+    client: &NatsClient,
+    msg: &Message,
+    delay: Duration,
+    new_count: u32,
+    ack_wait: Duration,
+    shutdown: &CancellationToken,
+) {
+    // Heartbeat well inside ack_wait so the server never redelivers mid-hold.
+    // `ack_wait` of zero means "unknown"; fall back to a value safely under
+    // JetStream's 30s default.
+    let heartbeat = if ack_wait.is_zero() {
+        Duration::from_secs(15)
+    } else {
+        (ack_wait / 2).max(Duration::from_secs(1))
+    };
+
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let tick = (deadline - now).min(heartbeat);
+        tokio::select! {
+            _ = tokio::time::sleep(tick) => {}
+            _ = shutdown.cancelled() => {
+                // Leave the message un-acked — it redelivers on restart.
+                return;
+            }
+        }
+        if tokio::time::Instant::now() < deadline
+            && let Err(e) = msg.ack_with(AckKind::Progress).await
+        {
+            tracing::warn!(error = %e, "failed to send progress ack during retry hold");
+        }
+    }
+
+    let mut hdrs = msg.headers.clone().unwrap_or_default();
+    hdrs.insert(RETRY_COUNT_HEADER, new_count.to_string().as_str());
+
+    // New message ID so JetStream dedup doesn't reject the republished copy.
+    // Our publisher always sets a UUID message ID, so `original_id` is normally
+    // present; the empty fallback only applies to externally-published messages
+    // and at worst weakens dedup within the short dedup window.
+    let original_id = hdrs
+        .get(NATS_MESSAGE_ID)
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_default();
+    hdrs.insert(
+        NATS_MESSAGE_ID,
+        format!("{original_id}-r{new_count}").as_str(),
+    );
+
+    // Publish the copy durably BEFORE acking the original: a failure leaves the
+    // original for redelivery instead of silently dropping the message.
+    match publish_with_retry(
+        client.jetstream(),
+        msg.subject.to_string(),
+        hdrs,
+        msg.payload.clone(),
+        3,
+        "retry republish",
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Err(e) = msg.ack().await {
+                tracing::error!(error = %e, "failed to ack after retry republish");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "retry republish failed, nak-ing original for redelivery");
+            if let Err(nak_err) = msg.ack_with(AckKind::Nak(None)).await {
+                tracing::error!(error = %nak_err, "failed to nak after retry republish failure");
+            }
+        }
+    }
+}
+
 /// Dispatches message routing based on the handler's outcome.
+#[allow(clippy::too_many_arguments)]
 async fn route_outcome(
     client: &NatsClient,
     msg: &Message,
@@ -195,6 +293,8 @@ async fn route_outcome(
     retry_count: u32,
     max_retries: u32,
     hold_queues: &[HoldQueue],
+    ack_wait: Duration,
+    shutdown: &CancellationToken,
 ) {
     let result: Result<()> = match outcome {
         Outcome::Ack => {
@@ -224,41 +324,11 @@ async fn route_outcome(
                     hold_queues[idx].delay()
                 };
 
-                // Ack first, then spawn delayed republish independently
-                // so the semaphore permit is not held during sleep.
-                if let Err(e) = msg.ack().await {
-                    tracing::error!(error = %e, "failed to ack before retry republish");
-                    return;
-                }
-
-                let client = client.clone();
-                let subject = msg.subject.to_string();
-                let headers = msg.headers.clone();
-                let payload = msg.payload.clone();
-
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-
-                    let mut hdrs = headers.unwrap_or_default();
-                    hdrs.insert(RETRY_COUNT_HEADER, new_count.to_string().as_str());
-
-                    let original_id = hdrs
-                        .get(NATS_MESSAGE_ID)
-                        .map(|v| v.as_str().to_string())
-                        .unwrap_or_default();
-                    hdrs.insert(
-                        NATS_MESSAGE_ID,
-                        format!("{original_id}-r{new_count}").as_str(),
-                    );
-
-                    if let Err(e) = client
-                        .jetstream()
-                        .publish_with_headers(subject, hdrs, payload)
-                        .await
-                    {
-                        tracing::error!(error = %e, "delayed retry republish send failed");
-                    }
-                });
+                // Hold the original un-acked through the backoff, then durably
+                // republish an incremented copy and ack — see
+                // `hold_then_republish`. Keeps at-least-once across crashes and
+                // republish failures while leaving the retry count header-based.
+                hold_then_republish(client, msg, delay, new_count, ack_wait, shutdown).await;
                 return;
             }
         }
@@ -560,6 +630,10 @@ impl NatsConsumer {
                     }
                 };
 
+                // Effective server-side ack_wait, used to pace the WIP progress
+                // acks that keep retried messages alive during their backoff.
+                let ack_wait = pull_consumer.cached_info().config.ack_wait;
+
                 let mut messages = pull_consumer.messages().await.map_err(|e| {
                     ShoveError::Connection(format!("failed to get message stream: {e}"))
                 })?;
@@ -678,6 +752,7 @@ impl NatsConsumer {
                             let task_prefetch = prefetch_count;
                             let task_topic = topic.clone();
                             let task_group = group.clone();
+                            let task_shutdown = shutdown.clone();
 
                             tokio::spawn(async move {
                                 task_processing.store(true, Ordering::Release);
@@ -700,6 +775,8 @@ impl NatsConsumer {
                                     retry_count,
                                     max_retries,
                                     hold_queues,
+                                    ack_wait,
+                                    &task_shutdown,
                                 )
                                 .await;
 
@@ -902,6 +979,8 @@ impl NatsConsumer {
                                 ))
                             })?;
 
+                        let ack_wait = pull_consumer.cached_info().config.ack_wait;
+
                         let mut messages = pull_consumer.messages().await.map_err(|e| {
                             ShoveError::Connection(format!(
                                 "failed to get message stream for shard {shard}: {e}"
@@ -1041,6 +1120,8 @@ impl NatsConsumer {
                                         retry_count,
                                         max_retries,
                                         hold_queues,
+                                        ack_wait,
+                                        &shard_shutdown,
                                     )
                                     .await;
                                 }
