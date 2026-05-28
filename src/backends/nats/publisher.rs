@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::backend::PublisherImpl;
 use crate::error::Result;
 use crate::metrics;
-use crate::publisher_internal::validate_headers;
+use crate::publisher_internal::{shard_for_key, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
@@ -89,7 +89,7 @@ impl NatsPublisher {
             && let Some(key_fn) = T::SEQUENCE_KEY_FN
         {
             let key = key_fn(message);
-            let shard = fnv1a_hash(&key) % seq.routing_shards() as u64;
+            let shard = shard_for_key(&key, seq.routing_shards());
             return format!("{}.shard.{shard}", topology.queue());
         }
         topology.queue().to_string()
@@ -230,15 +230,4 @@ impl PublisherImpl for NatsPublisher {
     ) -> impl Future<Output = (u64, Result<()>)> + Send {
         NatsPublisher::publish_batch::<T>(self, msgs)
     }
-}
-
-fn fnv1a_hash(key: &str) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in key.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
 }

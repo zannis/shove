@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::backend::publisher::PublisherImpl;
 use crate::error::{Result, ShoveError};
-use crate::publisher_internal::validate_headers;
+use crate::publisher_internal::{shard_for_key as shared_shard_for_key, validate_headers};
 use crate::topic::Topic;
 
 use super::client::{RedisClient, RedisConnection};
@@ -16,15 +16,13 @@ use super::topology::RedisTopologyDeclarer;
 // FNV-1a shard routing
 // ---------------------------------------------------------------------------
 
-/// Map a sequence key to a shard index using FNV-1a 32-bit hash mod `routing_shards`.
+/// Map a sequence key to a shard index using the shared FNV-1a hash.
+///
+/// Delegates to [`crate::publisher_internal::shard_for_key`] so a given key
+/// routes to the same shard on every backend. Re-exported as
+/// `redis::shard_for_key`.
 pub fn shard_for_key(key: &str, routing_shards: u16) -> u16 {
-    assert!(routing_shards > 0, "routing_shards must be > 0");
-    let mut hash: u32 = 2_166_136_261;
-    for byte in key.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    (hash % routing_shards as u32) as u16
+    shared_shard_for_key(key, routing_shards)
 }
 
 // ---------------------------------------------------------------------------

@@ -11,29 +11,12 @@ use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
 use crate::metrics;
-use crate::publisher_internal::validate_headers;
+use crate::publisher_internal::{fnv1a_64, shard_for_key, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
-
-/// FNV-1a 64-bit hash over arbitrary bytes (stable across versions).
-fn fnv1a_64(data: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    let mut hash = FNV_OFFSET;
-    for byte in data {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-/// Compute shard index using FNV-1a hash (stable across versions).
-fn compute_shard(key: &str, shards: u16) -> u16 {
-    (fnv1a_64(key.as_bytes()) % shards as u64) as u16
-}
 
 /// Derive a deterministic SNS `MessageDeduplicationId` from the serialised
 /// payload.  Using the same ID for every attempt of the same payload means
@@ -155,7 +138,7 @@ impl SnsPublisher {
                 .message_deduplication_id(content_dedup_id(payload));
 
             if let Some(shards) = routing_shards {
-                let shard = compute_shard(gid, shards);
+                let shard = shard_for_key(gid, shards);
                 let shard_attr = MessageAttributeValue::builder()
                     .data_type("String")
                     .string_value(shard.to_string())
@@ -320,7 +303,7 @@ impl SnsPublisher {
                         .message_deduplication_id(content_dedup_id(payload));
 
                     if let Some(seq) = topology.sequencing() {
-                        let shard = compute_shard(&keys[i], seq.routing_shards());
+                        let shard = shard_for_key(&keys[i], seq.routing_shards());
                         let shard_attr = MessageAttributeValue::builder()
                             .data_type("String")
                             .string_value(shard.to_string())
@@ -534,16 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn fnv1a_64_deterministic() {
-        assert_eq!(fnv1a_64(b"hello"), fnv1a_64(b"hello"));
-    }
-
-    #[test]
-    fn fnv1a_64_different_inputs_differ() {
-        assert_ne!(fnv1a_64(b"hello"), fnv1a_64(b"world"));
-    }
-
-    #[test]
     fn content_dedup_id_deterministic() {
         let a = content_dedup_id(r#"{"id":1}"#);
         let b = content_dedup_id(r#"{"id":1}"#);
@@ -562,36 +535,5 @@ mod tests {
         let id = content_dedup_id(r#"{"foo":"bar"}"#);
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn compute_shard_deterministic() {
-        let a = compute_shard("order-123", 8);
-        let b = compute_shard("order-123", 8);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn compute_shard_within_range() {
-        for i in 0..100 {
-            let key = format!("key-{i}");
-            let shard = compute_shard(&key, 4);
-            assert!(shard < 4, "shard {shard} out of range for 4 shards");
-        }
-    }
-
-    #[test]
-    fn compute_shard_distributes() {
-        let mut counts = [0u32; 8];
-        for i in 0..1000 {
-            let shard = compute_shard(&format!("key-{i}"), 8) as usize;
-            counts[shard] += 1;
-        }
-        for (i, count) in counts.iter().enumerate() {
-            assert!(
-                *count > 50,
-                "shard {i} only got {count} messages out of 1000"
-            );
-        }
     }
 }
