@@ -1,0 +1,65 @@
+docs/pages/backends/redis/examples/audited.mdx
+  s_d2ac4de65d983b::t_a6472c3da51d3e 1-33
+docs/pages/backends/nats.mdx
+  s_d2ac4de65d983b::t_2afefb0747c033 108-110
+  s_d2ac4de65d983b::t_d1db93cb9dd3b7 27-47
+docs/pages/backends/sqs.mdx
+  s_d2ac4de65d983b::t_59babece0cd901 80-101
+vocs.config.ts
+  s_d2ac4de65d983b::t_3b2bf8e5617b2c 53-56
+  s_d2ac4de65d983b::t_82a6d2ef4b0a07 145-148
+docs/pages/index.mdx
+  s_d2ac4de65d983b::t_4a99628b2aad23 44
+  s_d2ac4de65d983b::t_a484e8e4e7b0f7 38
+docs/pages/backends/redis/examples/consumer-groups.mdx
+  s_d2ac4de65d983b::t_c35561496319df 1-34
+docs/pages/backends/inmemory.mdx
+  s_d2ac4de65d983b::t_35c3aea75616bc 62,68-73,80
+docs/pages/reference.mdx
+  s_d2ac4de65d983b::t_aa14a586eda1da 29
+docs/pages/backends/redis/examples/autoscaler.mdx
+  s_d2ac4de65d983b::t_10ed9d3b17bae0 1-39
+docs/pages/getting-started.mdx
+  s_d2ac4de65d983b::t_cec23ac634f8f6 60
+docs/pages/guides/exactly-once.mdx
+  s_d2ac4de65d983b::t_7fc20c88a0ec7d 79-80
+  s_d2ac4de65d983b::t_94b9d88d79d894 43
+docs/pages/backends/redis.mdx
+  s_d2ac4de65d983b::t_b95e1691bfe28d 40-55
+  s_d2ac4de65d983b::t_31834d9a051fdf 96-101
+  s_d2ac4de65d983b::t_c9a75d61dab0f3 132-135
+docs/pages/backends/redis/examples/stress.mdx
+  s_d2ac4de65d983b::t_4b31df1b1af490 1-23
+docs/pages/guides/observability.mdx
+  s_d2ac4de65d983b::t_47e2ae8fda1213 218
+  s_d2ac4de65d983b::t_1872c318587539 17
+  s_d2ac4de65d983b::t_e23569d420e38e 77,79
+docs/pages/backends/rabbitmq.mdx
+  s_d2ac4de65d983b::t_f4a56f860f1e94 37-54
+  s_d2ac4de65d983b::t_d7a167f2077602 110-121
+  s_d2ac4de65d983b::t_d8a250f2e43d94 132
+docs/pages/backends/kafka.mdx
+  s_d2ac4de65d983b::t_9a60bb3fe2d367 175-194
+  s_d2ac4de65d983b::t_b8c1bdef5e51a6 197
+  s_d2ac4de65d983b::t_d56e709e0e068b 101-143
+docs/pages/concepts/codecs.mdx
+  s_d2ac4de65d983b::t_48f806959ed91e 66
+docs/pages/concepts/handlers.mdx
+  s_d2ac4de65d983b::t_47a6db3bf95828 82-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d96296a22bf95ce522a230cc9e9843da4565268a",
+  "prompts": {},
+  "sessions": {
+    "s_d2ac4de65d983b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf4e8900-7f84-4a4d-8bf4-9d9ae482ca41",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
