@@ -1,0 +1,20 @@
+src/backends/nats/client.rs
+  s_12c83afaad42aa::t_4e2ba748e406ef 200-206,211-236
+  s_12c83afaad42aa::t_7a785069d01a49 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e1b44ceec11fb774f137b4686a89f9c84a7e1d26",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
