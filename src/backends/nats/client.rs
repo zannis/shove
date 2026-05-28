@@ -196,6 +196,18 @@ impl NatsClient {
         matches!(self.client.connection_state(), State::Connected)
     }
 
+    /// Liveness check. Calls `Client::flush`, which forces a server PING/PONG
+    /// round-trip and returns when PONG arrives. Bounded by `timeout`.
+    pub(super) async fn ping(&self, timeout: std::time::Duration) -> Result<()> {
+        if self.shutdown_token.is_cancelled() {
+            return Err(ShoveError::Connection("client is shut down".into()));
+        }
+        tokio::time::timeout(timeout, self.client.flush())
+            .await
+            .map_err(|_| ShoveError::Connection(format!("nats ping timed out after {timeout:?}")))?
+            .map_err(|e| ShoveError::Connection(format!("nats ping failed: {e}")))
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
