@@ -1,0 +1,24 @@
+src/backends/nats/client.rs
+  s_12c83afaad42aa::t_003047dc321892 199-210
+tests/nats_ping.rs
+  s_12c83afaad42aa::t_2ee5ac1db7f0a1 9
+  s_12c83afaad42aa::t_d07b2259b3ef8b 1-8,10-70
+src/backends/nats/backend.rs
+  s_12c83afaad42aa::t_02d41188675b61 81-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c6e359b9b1ec20414114a3cb4a9665770d1a987c",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
