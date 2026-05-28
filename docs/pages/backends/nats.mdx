@@ -24,7 +24,27 @@ cargo add shove --features nats
 // [!include ~/examples/nats/basic.rs:connect]
 ```
 
-`NatsConfig::new` takes a NATS server URL. Authentication (user/password, token, NKey, credentials file) is configured via the `async-nats` connection options — extend `NatsConfig` with the relevant builder if your server requires auth.
+`NatsConfig::new` takes a NATS server URL. Authentication and TLS are populated by writing the matching public fields on the struct after `new` — there are no setter builders, just plain field assignment:
+
+```rust,no_run
+use shove::nats::NatsConfig;
+use std::path::PathBuf;
+
+let mut config = NatsConfig::new("tls://broker.example.com:4222");
+// One of the auth slots — pick whichever the server expects:
+config.username = Some("svc-billing".into());
+config.password = Some(std::env::var("NATS_PASSWORD")?);
+// or token / nkey_seed / creds_file
+config.token = Some(std::env::var("NATS_TOKEN")?);
+config.nkey_seed = Some(std::env::var("NATS_NKEY_SEED")?);
+config.creds_file = Some(PathBuf::from("/etc/nats/user.creds"));
+// TLS material:
+config.tls_ca_cert = Some(PathBuf::from("/etc/nats/ca.pem"));
+config.tls_client_cert = Some(PathBuf::from("/etc/nats/client.pem"));
+config.tls_client_key  = Some(PathBuf::from("/etc/nats/client.key"));
+```
+
+All slots are `Option<…>` — set only the ones your deployment uses. The `Debug` impl redacts every credential and the user-info portion of the URL.
 
 ## Declare topology
 
@@ -85,6 +105,9 @@ See the [Basic example](/backends/nats/examples/basic) for a complete runnable w
 - **De-duplication via `Nats-Msg-Id`.** shove sets the `Nats-Msg-Id` header on every publish (a fresh UUID per call). JetStream de-duplicates within a configurable window (default 120 seconds) — if a publisher retries the same logical message inside that window, JetStream rejects the duplicate. Note that the header is generated per-publish-call, so deduplicating across application-level retries requires the caller to pass a stable id via `publish_with_headers`.
 - **Work-queue semantics assumed.** shove provisions JetStream streams with work-queue (interest-based delete-on-ack) semantics. Streams are not shared across consumer groups with different group names — each `consumer_group()` registration gets its own durable consumer on the shared stream.
 - **JetStream must be enabled on the server.** Connecting to a server without JetStream and calling `topology().declare::<T>()` will return an error. The `-js` flag is required on the NATS server.
+- **TLS scheme must match TLS options.** Setting any of `tls_ca_cert`, `tls_client_cert`, or `tls_client_key` on a plaintext `nats://` URL is rejected at connect time. Use `tls://` or `nats+tls://` to make the encrypted transport explicit — this guards against silent downgrade.
+- **Reconnect bounds.** `ConsumerOptions::<Nats>::new().with_max_reconnect_attempts(N)` caps reconnect attempts after a connection drop; default is unlimited. Set this when you want the consumer to surface `Connection` errors after `N` failed redials rather than retry forever.
+- **JetStream consumer tuning is fixed.** Streams are declared with `RetentionPolicy::WorkQueue`, `StorageType::File`, and `DiscardPolicy::New`; durable consumers use `AckPolicy::Explicit` with `max_ack_pending = prefetch × max_consumers` and a 120 s deduplication window. These are not yet user-configurable — open an issue if you need them surfaced as knobs.
 
 ## Examples
 

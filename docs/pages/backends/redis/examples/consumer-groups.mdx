@@ -1,0 +1,34 @@
+# Redis — Consumer Groups
+
+Registers a single coordinated consumer group with `min_consumers=2, max_consumers=4`, publishes a batch of twenty work items, and lets the group drain them on Ctrl-C (or a 30 s timeout). Demonstrates the `RedisConsumerGroupConfig` builder shape that mirrors every other coordinated-group backend in shove.
+
+## Prerequisites
+
+- Redis 6.2+ or Valkey running locally (see command below)
+- Cargo feature: `redis-streams`
+
+## Run
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+cargo run --example redis_consumer_groups --features redis-streams
+```
+
+## Expected output
+
+```text
+published 20 work items
+consuming with 2 initial consumers — Ctrl-C to stop
+
+[worker] id=0 payload=item-0
+[worker] id=1 payload=item-1
+...
+[worker] id=19 payload=item-19
+shutting down…
+```
+
+## Source
+
+```rust
+// [!include ~/examples/redis/consumer_groups.rs]
+```

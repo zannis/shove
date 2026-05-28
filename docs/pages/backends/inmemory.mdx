@@ -59,17 +59,25 @@ Configure via `InMemoryConsumerGroupConfig`:
 ```rust,no_run
 use shove::inmemory::InMemoryConsumerGroupConfig;
 use shove::{Broker, ConsumerGroupConfig, InMemory};
+use std::time::Duration;
 
 let mut group = broker.consumer_group();
 group
     .register::<PingTopic, _>(
         ConsumerGroupConfig::new(
-            InMemoryConsumerGroupConfig::new(1..=4).with_prefetch_count(8),
+            InMemoryConsumerGroupConfig::new(1..=4)
+                .with_prefetch_count(8)
+                .with_max_retries(5)
+                .with_handler_timeout(Duration::from_secs(10))
+                .with_max_message_size(64 * 1024)
+                .with_max_pending_per_key(50),
         ),
         || MyHandler,
     )
     .await?;
 ```
+
+All builder methods mirror the durable backends, so test code written against the in-process backend is structurally identical to production code on RabbitMQ/Kafka/Redis. `with_default_handler_timeout(Duration)` on `consumer_group()` sets a registry-wide default — useful when most test topics share a deadline.
 
 ## Gotchas
 

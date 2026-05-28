@@ -34,6 +34,24 @@ cargo add shove --features rabbitmq-transactional
 
 `RabbitMqConfig::new` takes a standard AMQP URL. TLS and authentication are configured via the URL (e.g. `amqps://user:pass@host:5671`).
 
+### Management API
+
+Autoscaling needs queue depth from the RabbitMQ management plugin. Attach credentials via `.with_management(...)`:
+
+```rust,no_run
+use shove::rabbitmq::{ManagementConfig, RabbitMqConfig};
+
+let config = RabbitMqConfig::new("amqp://guest:guest@localhost:5672")
+    .with_management(
+        ManagementConfig::new("http://localhost:15672", "guest", "guest")
+            .with_vhost("my-vhost")              // non-default vhost
+            .with_tls_ca_cert("/path/to/ca.pem") // custom CA for self-signed mgmt certs
+            .with_tls_skip_verify(),             // dev only — disables verification
+    );
+```
+
+When `management` is `None`, `Broker::queue_stats_provider().snapshot(...)` and `RabbitMqAutoscalerBackend` return a `Topology` error directing the caller to configure it. The `consumer_supervisor()` path does not need the plugin; only autoscaling does.
+
 ## Declare topology
 
 ```rust
@@ -89,6 +107,18 @@ group
 
 The autoscaler reads queue depth from the RabbitMQ management HTTP API and scales the number of active consumers within the `min..=max` range. The management plugin must be running and reachable for autoscaling to work.
 
+### Connection pooling
+
+When `max_consumers > 50`, the group automatically pools AMQP connections — one per ~50 workers, rounded up. Lapin parses every inbound delivery on a connection through a single reader task, so a high-throughput group of 200 consumers on one connection bottlenecks on that task. The pool is transparent; all clones of the underlying `RabbitMqClient` share broker config and reconnect logic.
+
+### Stuck-retry eviction
+
+If a transient broker error kills the consumer mid-republish, a delivery can land in the per-consumer `AwaitingRetry` map and never escape. `ConsumerOptions::<RabbitMq>::new().with_hold_queue_timeout(Duration)` evicts any entry that has been waiting longer than the timeout and requeues it to the main queue. The eviction ticker fires at half the configured timeout, so a 30 s setting checks every 15 s. Default: no eviction — set it explicitly to enable.
+
+### Reconnect bounds
+
+`ConsumerOptions::<RabbitMq>::new().with_max_reconnect_attempts(N)` caps how many times the consumer redials after a connection drop before surfacing a `Connection` error. Default: unlimited (retries forever).
+
 See the [Consumer Groups example](/backends/rabbitmq/examples/consumer-groups) for a full runnable walkthrough.
 
 ## Exactly-once mode
@@ -99,7 +129,7 @@ See the [Exactly-Once example](/backends/rabbitmq/examples/exactly-once) and the
 
 ## Gotchas
 
-- **Management plugin is required** for autoscaler queue-depth polling. If the plugin is missing or unreachable, `consumer_group()` autoscaling will not function.
+- **Management plugin is required** for autoscaler queue-depth polling. Attach credentials via `RabbitMqConfig::with_management(ManagementConfig::new(...))` — when absent, `queue_stats_provider().snapshot(...)` and the autoscaler return a `Topology` error rather than silently using a no-op provider.
 - **TLS and authentication** are configured via the AMQP URL passed to `RabbitMqConfig::new(...)`. Use `amqps://` for TLS; embed credentials in the URL or configure them via environment variables before constructing the config.
 - **`lapin` handles the AMQP connection.** `rustls--ring` is the default TLS feature pulled in by shove. Downstream crates that need a different TLS stack (e.g. vendored OpenSSL) can activate alternative `rdkafka` or `lapin` feature flags without changing shove's API.
 - **Auto-reconnect** is built in at the consumer level. Transient broker failures — network blips, broker restarts — recover automatically without operator intervention.

@@ -98,6 +98,49 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 
 `consumer_group()` registers a native Kafka consumer group. `KafkaConsumerGroupConfig::new(min..=max)` sets the autoscale bounds. Kafka handles partition assignment and rebalance automatically when the group membership changes.
 
+### Group configuration
+
+```rust,no_run
+use shove::kafka::{KafkaAutoOffsetReset, KafkaConsumerGroupConfig};
+
+let cfg = KafkaConsumerGroupConfig::new(1..=8)
+    .with_prefetch_count(20)
+    .with_max_retries(5)
+    .with_handler_timeout(Duration::from_secs(30))
+    .with_concurrent_processing(true)
+    .with_group_id("billing-orders-consumer")          // override the default `{queue}-consumer`
+    .with_auto_offset_reset(KafkaAutoOffsetReset::Latest);
+```
+
+- **`with_prefetch_count(u16)`** — librdkafka in-flight cap per consumer task. Default `10`.
+- **`with_max_retries(u32)`** — retry budget before dead-lettering. Default `10`.
+- **`with_handler_timeout(Duration)`** — per-message wall-clock deadline. Default `30s` (see [Handlers & Context](/concepts/handlers#handler-timeouts)).
+- **`with_concurrent_processing(bool)`** — dispatch each fetched message to its own tokio task (rejected for sequenced topics). Default `false`.
+- **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions.
+- **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
+
+### Replication factor
+
+Auto-created topics get replication factor `1` by default, which is fine for single-broker dev but unsafe in production. Set a cluster-wide default on the registry:
+
+```rust,no_run
+let mut group = broker
+    .consumer_group()
+    .with_default_replication_factor(3);                // applied to every auto-created topic
+```
+
+Or set it per-declaration on the topology declarer:
+
+```rust,no_run
+broker
+    .topology()
+    .with_replication_factor(3)
+    .declare::<Orders>()
+    .await?;
+```
+
+`create_topic` is idempotent and will not lower an existing topic's replication. Pre-creating topics out of band (Terraform, MSK console) is also fine — the declarer is a no-op when the topic already exists.
+
 ## Sequenced delivery
 
 Messages for the same key stay in order. Kafka uses partition-key routing: `T::sequence_key()` becomes the Kafka message key, so messages with the same key always land on the same partition. A single consumer handles each partition at a time, guaranteeing that messages for the same key are never processed concurrently.
@@ -129,8 +172,29 @@ Note: consumer-group rebalances occur during scale-up and scale-down events. Reb
 
 See the [Basic example](/backends/kafka/examples/basic) for a full runnable walkthrough.
 
+## Offset commit semantics
+
+`Outcome::Ack` commits the offset immediately after the handler returns. `Outcome::Retry` and `Outcome::Defer` defer the offset commit until the delayed republish to the hold topic has been acknowledged by the broker. This closes the publish-then-commit race: a broker crash or process kill between handler return and republish redelivers the message on restart rather than silently dropping it.
+
+On shutdown the consumer drains the in-flight republish queue before exiting the poll loop, so pending Retry/Defer messages are persisted even if the shutdown signal arrives mid-batch.
+
+`Outcome::Reject` routes to the DLQ (if configured) and commits the offset; the original is not redelivered. Messages that exhaust `max_retries` follow the same DLQ-then-commit path.
+
+## Metrics
+
+The Kafka backend emits `shove_messages_failed_total` with the following `reason` labels (see [Observability](/guides/observability#metric-reference)):
+
+- `oversize` — payload exceeds `max_message_size` before deserialization.
+- `deserialize` — JSON/codec decode failed; routed to DLQ.
+- `timeout` — handler exceeded `handler_timeout`; retried.
+- `max_retries_exceeded` — retry budget exhausted; routed to DLQ.
+- `rejected` — handler returned `Outcome::Reject`; routed to DLQ.
+
+`shove_backend_errors_total` carries the `backend="kafka"` label for connection drops, produce failures, and consume-stream errors.
+
 ## Gotchas
 
+- **Replication factor defaults to `1`** — safe for single-broker dev, unsafe in production. Set `with_default_replication_factor(3)` on the registry (or `with_replication_factor` on the topology declarer) before the first declaration. The default exists so the no-config dev path works; the constant lives in `kafka::constants::DEFAULT_REPLICATION`.
 - **Partition count is set at topic creation time** and is rarely changed after the fact. Choose carefully — partition count caps the maximum degree of parallelism a consumer group can achieve (one consumer per partition maximum).
 - **Consumer-group rebalances** during scale events cause brief delivery pauses. The larger the group and the more topics, the longer the rebalance. Tune `session.timeout.ms` and `max.poll.interval.ms` in `KafkaConfig` if handlers are slow.
 - **On Windows**, the `cmake-build` feature is required for `rdkafka` (the underlying C library). This is handled automatically via the `[target.'cfg(windows)'.dependencies]` entry in `Cargo.toml`.

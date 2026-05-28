@@ -77,7 +77,28 @@ let outcome = supervisor.run_until_timeout(signal, drain_timeout).await;
 
 `consumer_supervisor()` does not scale poller count on its own — `register` accepts one set of `ConsumerOptions` and runs exactly one consumer per topic.
 
-For autoscaling within a `min..=max` range driven by `ApproximateNumberOfMessages`, use the backend-specific `SqsConsumerGroupRegistry` directly. It accepts an `SqsConsumerGroupConfig::new(min..=max)` and spawns/retires independent pollers within that range as queue depth changes. See the [Consumer Groups example](/backends/sqs/examples/consumer-groups) for the full path.
+### Tuning ConsumerOptions
+
+```rust,no_run
+use shove::{ConsumerOptions, Sqs};
+use std::time::Duration;
+
+let opts = ConsumerOptions::<Sqs>::new()
+    .with_prefetch_count(10)
+    .with_receive_batch_size(10)                         // SQS max is 10
+    .with_handler_timeout(Duration::from_secs(30))
+    .with_max_reconnect_attempts(5);
+```
+
+- **`with_receive_batch_size(u16)`** — messages requested per `ReceiveMessage` call. SQS's hard max is `10`; SQS returns batches up to this size. Default: `0` (= use the prefetch count).
+- **`with_handler_timeout(Duration)`** — per-message wall-clock deadline; must be less than the queue's `VisibilityTimeout` so a slow handler doesn't race the broker re-delivering the same message. Default: `30s`.
+- **`with_max_reconnect_attempts(u32)`** — cap on SQS client redials before surfacing a `Connection` error. Default: unlimited.
+
+`SqsConsumerGroupConfig` exposes the same knobs for the group registry (`with_prefetch_count`, `with_max_retries`, `with_handler_timeout`, `with_concurrent_processing`).
+
+### Autoscaling
+
+For autoscaling within a `min..=max` range driven by `ApproximateNumberOfMessages`, use the backend-specific `SqsConsumerGroupRegistry` directly. It accepts an `SqsConsumerGroupConfig::new(min..=max)` and spawns/retires independent pollers within that range as queue depth changes. The registry also accepts a service-wide handler timeout default via `SqsConsumerGroupRegistry::with_default_handler_timeout(Duration)` — applied to every group that did not set its own. See the [Consumer Groups example](/backends/sqs/examples/consumer-groups) for the full path.
 
 ## Gotchas
 

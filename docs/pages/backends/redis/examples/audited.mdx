@@ -1,0 +1,33 @@
+# Redis — Audited Consumer
+
+Wraps a payment handler in `MessageHandlerExt::audited` and pipes audit records through a simple stdout `AuditHandler` impl. Every delivery emits one structured audit line with the payload, outcome, duration, and trace ID — exactly what the [Audit Logging guide](/guides/audit) describes, applied to the Redis backend.
+
+## Prerequisites
+
+- Redis 6.2+ or Valkey running locally (see command below)
+- Cargo features: `redis-streams`, `audit`
+
+## Run
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+cargo run --example redis_audited_consumer --features "redis-streams audit"
+```
+
+## Expected output
+
+```text
+topology declared
+
+published payment
+
+[handler] processing payment PAY-0001
+[audit] {"topic":"payments","outcome":"ack","duration_ms":1,...}
+done
+```
+
+## Source
+
+```rust
+// [!include ~/examples/redis/audited_consumer.rs]
+```

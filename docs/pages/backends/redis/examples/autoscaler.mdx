@@ -1,0 +1,39 @@
+# Redis — Autoscaler
+
+Wires the Redis backend into the autoscaler. A consumer group with `min=1, max=5` starts with a single worker; the autoscaler polls stream depth (`XLEN` minus the group's last-delivered ID) and spawns workers up to `max` while a burst of forty messages is pending, then drains back down to `min` as the backlog clears. The driver thread prints periodic stats so you can watch the scale decisions.
+
+## Prerequisites
+
+- Redis 6.2+ or Valkey running locally (see command below)
+- Cargo feature: `redis-streams`
+
+## Run
+
+```sh
+docker run --rm -p 6379:6379 redis:7-alpine
+cargo run --example redis_autoscaler --features redis-streams
+```
+
+## Expected output
+
+```text
+consumer group started (min=1, max=5)
+published 40 work items
+
+[worker] handling id=0
+[worker] handling id=1
+[monitor] active_consumers=3 pending=37 lag=37
+[worker] handling id=2
+...
+[monitor] active_consumers=5 pending=12 lag=12
+...
+[monitor] active_consumers=1 pending=0 lag=0
+
+shutting down…
+```
+
+## Source
+
+```rust
+// [!include ~/examples/redis/autoscaler.rs]
+```

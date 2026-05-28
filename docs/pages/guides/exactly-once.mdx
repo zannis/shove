@@ -40,7 +40,7 @@ Enable the feature in `Cargo.toml`:
 
 ```toml
 [dependencies]
-shove = { version = "0.x", features = ["rabbitmq-transactional"] }
+shove = { version = "0.11", features = ["rabbitmq-transactional"] }
 ```
 
 With the feature enabled, `ConsumerOptions\<RabbitMq\>` gains the `.with_exactly_once()` builder method. When set, the consumer channel is put in AMQP transaction mode (`tx_select`) before the first delivery. Every routing decision — publish-to-hold-queue AND ack/nack of the original — is wrapped in a `tx_commit`. The broker either applies both operations or neither. The publish-then-ack race is gone.
@@ -75,6 +75,8 @@ supervisor.register::<PaymentTopic, _>(PaymentHandler::new(), opts)?;
 No other changes are required. The feature flag gates the method: if `rabbitmq-transactional` is not enabled, `with_exactly_once()` does not exist and code that calls it will not compile.
 
 `with_exactly_once()` can be combined with all other `ConsumerOptions` builder methods. The transactional mode applies only to the routing layer — prefetch count, handler timeout, and max retries work as usual.
+
+If a `tx_commit` itself fails (e.g. the broker drops the channel mid-commit), the consumer surfaces the error and reconnects rather than silently dropping the routing decision. On shutdown the consumer drains in-flight transactions inside the supervisor's drain timeout so pending commits land before the process exits.
 
 ## What it does NOT give you
 
