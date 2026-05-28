@@ -1,3 +1,5 @@
+use aws_sdk_sns::config::http::HttpResponse;
+use aws_sdk_sns::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,6 +42,56 @@ fn compute_shard(key: &str, shards: u16) -> u16 {
 /// already landed at the broker).
 fn content_dedup_id(payload: &str) -> String {
     format!("{:016x}", fnv1a_64(payload.as_bytes()))
+}
+
+/// Whether an SNS service-error code represents a transient failure worth
+/// retrying.
+///
+/// These are AWS *wire* codes as returned by [`ProvideErrorMetadata::code`],
+/// which for SNS's query protocol are the short forms — NOT the Rust variant
+/// names (`InternalErrorException`) and NOT the SQS/JSON-protocol codes
+/// (`RequestThrottled`, `OverLimit`, …). `InternalError` and `KMSThrottling`
+/// are modeled in the `Publish` error set (see the SDK's
+/// `protocol_serde::shape_publish` deserializer); `Throttling`/
+/// `ThrottlingException` cover generic request throttling that surfaces
+/// unmodeled. Everything else (authorization, invalid parameters, topic not
+/// found) is permanent.
+fn is_transient_sns_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("InternalError" | "KMSThrottling" | "Throttling" | "ThrottlingException")
+    )
+}
+
+/// Maps an SNS `SdkError` to the appropriate `ShoveError` variant.
+///
+/// Transport-level failures (timeout, dispatch, response parse) are transient →
+/// `Connection`; construction failures are code/config bugs → `Topology`;
+/// service errors are classified by their AWS wire code via
+/// [`is_transient_sns_code`] so the publish loop can stop retrying permanent
+/// failures early.
+fn map_sns_error<E>(context: &str, e: SdkError<E, HttpResponse>) -> ShoveError
+where
+    E: std::fmt::Debug + std::fmt::Display + ProvideErrorMetadata,
+{
+    match &e {
+        // Transient transport-level errors
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            ShoveError::Connection(format!("{context}: {e}"))
+        }
+        // Construction failures are config/code bugs — permanent
+        SdkError::ConstructionFailure(_) => ShoveError::Topology(format!("{context}: {e}")),
+        // Service errors — classify by AWS wire code
+        SdkError::ServiceError(se) => {
+            if is_transient_sns_code(ProvideErrorMetadata::code(se.err())) {
+                ShoveError::Connection(format!("{context}: {e}"))
+            } else {
+                ShoveError::Topology(format!("{context}: {e}"))
+            }
+        }
+        // SdkError is #[non_exhaustive]; all current variants are handled above.
+        _ => ShoveError::Unknown(format!("unrecognized AWS SDK error in {context}: {e}")),
+    }
 }
 
 /// Convert a `HashMap<String, String>` into SNS message attributes.
@@ -124,7 +176,7 @@ impl SnsPublisher {
                 metrics::BackendLabel::SnsSqs,
                 metrics::BackendErrorKind::Publish,
             );
-            ShoveError::Connection(format!("SNS publish failed: {e}"))
+            map_sns_error("SNS publish failed", e)
         })?;
 
         Ok(())
@@ -178,6 +230,13 @@ impl SnsPublisher {
                     return Ok(());
                 }
                 Err(e) => {
+                    // Permanent failures (authorization, invalid parameters,
+                    // topic not found) cannot succeed on retry — surface
+                    // immediately instead of sleeping through the remaining
+                    // attempts.
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
                     warn!(queue_name, attempt, error = %e, "SNS publish failed, retrying");
                     last_err = Some(e);
                     if attempt < 2 {
@@ -330,10 +389,16 @@ impl SnsPublisher {
                             metrics::BackendLabel::SnsSqs,
                             metrics::BackendErrorKind::Publish,
                         );
-                        let err = ShoveError::Connection(format!("SNS batch publish failed: {e}"));
+                        let err = map_sns_error("SNS batch publish failed", e);
+                        chunk_succeeded = 0;
+                        // Permanent failures (auth, invalid params, topic not
+                        // found) can't succeed on retry — stop early.
+                        if !err.is_retryable() {
+                            chunk_err = Some(err);
+                            break;
+                        }
                         warn!(queue_name, attempt, error = %err, "SNS batch chunk failed, retrying");
                         chunk_err = Some(err);
-                        chunk_succeeded = 0;
                         if attempt < 2 {
                             let delay = backoff.next().expect("backoff is infinite");
                             tokio::time::sleep(delay).await;
@@ -383,6 +448,60 @@ impl PublisherImpl for SnsPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_sns_codes_are_retryable() {
+        for code in [
+            "InternalError",
+            "KMSThrottling",
+            "Throttling",
+            "ThrottlingException",
+        ] {
+            assert!(
+                is_transient_sns_code(Some(code)),
+                "{code} should be classified transient"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_sns_codes_are_not_retryable() {
+        for code in [
+            "AuthorizationError",
+            "InvalidParameter",
+            "ParameterValueInvalid",
+            "NotFound",
+            "EndpointDisabled",
+            "KMSAccessDenied",
+        ] {
+            assert!(
+                !is_transient_sns_code(Some(code)),
+                "{code} should be classified permanent"
+            );
+        }
+        assert!(!is_transient_sns_code(None));
+    }
+
+    // `ProvideErrorMetadata::code()` returns the AWS wire code, not the Rust
+    // variant name. Guard against regressing to the variant names (or to the
+    // SQS/JSON-protocol codes), which never match a real SNS Publish error and
+    // would silently make transient failures permanent.
+    #[test]
+    fn rust_variant_names_and_sqs_codes_do_not_match() {
+        for code in [
+            "InternalErrorException",  // Rust variant, not the wire code
+            "KMSThrottlingException",  // Rust variant, not the wire code
+            "ThrottledException",      // not in the Publish error set
+            "RequestThrottled",        // SQS code
+            "OverLimit",               // SQS code
+            "KMS.ThrottlingException", // SQS code
+        ] {
+            assert!(
+                !is_transient_sns_code(Some(code)),
+                "{code} is not a real SNS Publish wire code and must not match"
+            );
+        }
+    }
 
     #[test]
     fn hashmap_to_message_attributes_empty() {
