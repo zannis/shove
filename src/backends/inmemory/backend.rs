@@ -93,6 +93,10 @@ impl Backend for InMemory {
     async fn close(client: &Self::Client) {
         client.shutdown();
     }
+
+    async fn ping(client: &Self::Client, timeout: std::time::Duration) -> Result<()> {
+        client.ping(timeout).await
+    }
 }
 
 impl HasCoordinatedGroups for InMemory {

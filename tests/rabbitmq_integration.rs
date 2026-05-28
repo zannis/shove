@@ -1,3 +1,5 @@
+#![cfg(feature = "rabbitmq")]
+
 //! Integration tests for the RabbitMQ backend.
 //!
 //! Migrated to `Broker<RabbitMq>` + `Publisher<B>` + `TopologyDeclarer<B>` +

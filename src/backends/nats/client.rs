@@ -1,5 +1,6 @@
 use async_nats::connection::State;
 use async_nats::jetstream;
+use futures_util::StreamExt;
 use std::fmt;
 use std::path::PathBuf;
 use std::process;
@@ -194,6 +195,54 @@ impl NatsClient {
 
     pub fn is_connected(&self) -> bool {
         matches!(self.client.connection_state(), State::Connected)
+    }
+
+    /// Liveness check. Subscribes to a unique inbox subject, publishes to it,
+    /// and awaits the echoed message — a genuine server round-trip that proves
+    /// the NATS broker is processing protocol messages (not just accepting TCP).
+    ///
+    /// Bounded by `timeout`. Returns `Err(ShoveError::Connection)` on timeout,
+    /// subscription error, publish error, or if the subscription closes before
+    /// the echo arrives.
+    pub(super) async fn ping(&self, timeout: std::time::Duration) -> Result<()> {
+        if self.shutdown_token.is_cancelled() {
+            return Err(ShoveError::Connection("client is shut down".into()));
+        }
+        let client = self.client.clone();
+        let fut = async move {
+            let inbox = client.new_inbox();
+            let mut sub = client
+                .subscribe(inbox.clone())
+                .await
+                .map_err(|e| ShoveError::Connection(format!("nats ping subscribe failed: {e}")))?;
+            // Auto-unsubscribe after one delivery so a probe timeout cannot
+            // leak a long-lived subscription on the server. Without this the
+            // Subscriber's Drop impl schedules UNSUB via tokio::spawn
+            // (fire-and-forget), which can accumulate under repeated timeouts.
+            sub.unsubscribe_after(1).await.map_err(|e| {
+                ShoveError::Connection(format!("nats ping unsubscribe_after failed: {e}"))
+            })?;
+            // Flush so the SUB and UNSUB-with-max frames are on the wire
+            // before the PUB races ahead of them. Without this, the server may
+            // receive PUB before SUB and drop the message (no interest).
+            client
+                .flush()
+                .await
+                .map_err(|e| ShoveError::Connection(format!("nats ping flush failed: {e}")))?;
+            client
+                .publish(inbox, bytes::Bytes::from_static(b"ping"))
+                .await
+                .map_err(|e| ShoveError::Connection(format!("nats ping publish failed: {e}")))?;
+            match sub.next().await {
+                Some(_) => Ok::<(), ShoveError>(()),
+                None => Err(ShoveError::Connection(
+                    "nats ping subscription closed before echo arrived".into(),
+                )),
+            }
+        };
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| ShoveError::Connection(format!("nats ping timed out after {timeout:?}")))?
     }
 
     pub async fn shutdown(&self) {

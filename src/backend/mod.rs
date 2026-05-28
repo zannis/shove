@@ -61,6 +61,13 @@ pub trait Backend: sealed::Sealed + Sized + Send + Sync + 'static {
     /// (not owned) so it works on an `Arc<Broker<B>>`. Subsequent calls
     /// after close are no-ops.
     fn close(client: &Self::Client) -> impl Future<Output = ()> + Send;
+
+    /// Bounded liveness probe. Returns `Ok(())` iff a single RPC against
+    /// the underlying broker completed within `timeout`.
+    fn ping(
+        client: &Self::Client,
+        timeout: std::time::Duration,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[cfg(test)]

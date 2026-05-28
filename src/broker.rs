@@ -1,5 +1,7 @@
 //! Public `Broker<B>` hub. See DESIGN_V2.md §6.1.
 
+use std::time::Duration;
+
 use crate::backend::Backend;
 use crate::backend::capability::HasCoordinatedGroups;
 use crate::consumer_group::ConsumerGroup;
@@ -7,6 +9,11 @@ use crate::consumer_supervisor::ConsumerSupervisor;
 use crate::error::Result;
 use crate::publisher::Publisher;
 use crate::topology_declarer::TopologyDeclarer;
+
+/// Default deadline for `Broker::ping`. Matches the rest of shove's 5 s
+/// timeout constants (kafka `PRODUCE_TIMEOUT`, autoscaler metadata fetch,
+/// `MESSAGE_TIMEOUT_MS`). Override via [`Broker::ping_with_timeout`].
+pub const DEFAULT_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Broker<B: Backend> {
     client: B::Client,
@@ -48,6 +55,39 @@ impl<B: Backend> Broker<B> {
 
     pub async fn close(&self) {
         B::close(&self.client).await
+    }
+
+    /// Verify the broker is reachable. Issues a single bounded RPC against
+    /// the cluster and returns `Ok(())` iff it completes within
+    /// [`DEFAULT_PING_TIMEOUT`].
+    ///
+    /// Designed for liveness / readiness probes:
+    ///
+    /// - **No retries** — a failed probe is returned to the caller as-is.
+    ///   Probe policy (retry counts, failure thresholds) belongs to the caller
+    ///   (k8s `failureThreshold`, an HTTP middleware, etc.).
+    /// - **No metrics emitted** — probes are called frequently; recording a
+    ///   metric per call would drown out failure signal.
+    /// - **Post-`close()` semantics are backend-specific.** Backends with a
+    ///   meaningful close (Kafka, RabbitMQ, NATS, SQS, InMemory) check a
+    ///   shutdown token and return `Err(ShoveError::Connection)` before any
+    ///   I/O. The Redis backend's `close` is a no-op — its connections drop
+    ///   on last `Arc` release — so ping continues to function until the
+    ///   broker itself becomes unreachable.
+    /// - **Backends may transparently recover stale internal state.**
+    ///   For example, the RabbitMQ backend dials a fresh AMQP connection if
+    ///   the cached one died, librdkafka maintains its own broker connection
+    ///   pool, and async-nats heartbeats keep the underlying connection
+    ///   healthy. A probe that succeeds after such recovery is reported as
+    ///   `Ok(())` — the broker is reachable now, which is what liveness asks.
+    pub async fn ping(&self) -> Result<()> {
+        self.ping_with_timeout(DEFAULT_PING_TIMEOUT).await
+    }
+
+    /// Same as [`ping`](Self::ping), with a caller-supplied deadline. Exceeding
+    /// `timeout` returns `Err(ShoveError::Connection)`.
+    pub async fn ping_with_timeout(&self, timeout: Duration) -> Result<()> {
+        B::ping(&self.client, timeout).await
     }
 
     /// Return a [`QueueStatsImpl`](crate::backend::Backend::QueueStatsImpl) for

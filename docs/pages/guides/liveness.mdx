@@ -1,0 +1,59 @@
+# Liveness Probes
+
+Kubernetes liveness and readiness probes need a single, fast, bounded answer to "can this process still talk to the broker?". `shove` exposes `Broker<B>::ping` for exactly that question: one bounded RPC against the cluster, returning `Ok(())` iff it completes within the deadline. Probe policy — retries, failure thresholds, reconnect — belongs to the caller, so `ping` itself does none of those things.
+
+## The probe contract
+
+`Broker<B>::ping` uses the default 5-second deadline. Use `ping_with_timeout` to tighten or relax it.
+
+```rust,no_run
+// Requires the `http` crate (or your web framework's re-export of it).
+use std::time::Duration;
+use shove::{Broker, Kafka};
+
+async fn healthz(broker: &Broker<Kafka>) -> http::StatusCode {
+    match broker.ping_with_timeout(Duration::from_secs(2)).await {
+        Ok(()) => http::StatusCode::OK,
+        Err(_) => http::StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+```
+
+Wire this into your HTTP framework of choice. Retry policy, failure thresholds, and probe intervals live with your runtime (Kubernetes `failureThreshold`, an HTTP middleware, a circuit breaker). `ping` itself does not retry.
+
+## What happens on the wire
+
+Every production backend issues a real round-trip. There are no local-state shortcuts on the network path — a half-closed socket cannot lie its way to a green probe. The InMemory backend is the exception: it performs a shutdown-token check only, since it has no underlying transport.
+
+| Backend   | RPC                                                | Side effects             |
+|-----------|----------------------------------------------------|--------------------------|
+| Kafka     | `fetch_metadata(None, timeout)` on producer client | none                     |
+| Redis     | `PING` on the multiplexed connection               | none                     |
+| NATS      | subscribe + unsubscribe-after(1) + flush + publish + await echo on a unique inbox | none |
+| RabbitMQ  | transient channel open + close                     | none                     |
+| SQS       | `ListQueues` with `max_results=1`                  | one AWS API call billed  |
+| InMemory  | shutdown-token check (no I/O)                      | none                     |
+
+The SQS call is the only one with a meaningful operational cost: each probe is one billable `ListQueues` request. Sized k8s probes (one every few seconds) put this well under a dollar a month per pod, but plan accordingly for very large fleets.
+
+## Timeouts
+
+`Broker::ping` uses `DEFAULT_PING_TIMEOUT` (5 s). Pass a tighter or looser bound via `ping_with_timeout(Duration)` and align it with your platform's probe configuration. In Kubernetes, the deadline should sit comfortably below `timeoutSeconds` on the probe spec so that a slow but recovering broker can flake one probe without the kubelet timing the handler out on its end. If the underlying RPC exceeds the deadline, `ping` returns `Err(ShoveError::Connection(...))` whose message names the timeout.
+
+## Reconnect policy
+
+`ping` does not retry a failed probe. It does, however, allow backends to transparently recover stale internal state during the probe. The RabbitMQ backend dials a fresh AMQP connection if the cached one died, librdkafka maintains its own broker pool, and async-nats heartbeats keep the underlying connection alive. A probe that succeeds after such recovery is reported as `Ok(())`; the broker is reachable now, which is what liveness asks.
+
+After `Broker::close`, most backends' `ping` returns `Err(ShoveError::Connection)` immediately via a shutdown-token check. Redis is the exception: its `close` is a no-op because connections drop on last `Arc` release, so `ping` continues to function against a closed broker until the underlying server becomes unreachable.
+
+## What `ping` does not do
+
+- **No retries.** A single probe is a single observation. Use k8s `failureThreshold`, HTTP retries, or your circuit breaker to filter transient blips.
+- **No metrics.** Probe handlers are called frequently; emitting a metric per call would drown out failure signal.
+- **No per-topic check.** `ping` answers "can I talk to the cluster". Whether a specific topic is declared is a topology concern, handled separately.
+- **No `PingInfo` payload.** `Result<()>` is the only return.
+
+## What's next
+
+- [Shutdown & Exit Codes](/guides/shutdown) — `ping` after `Broker::close` is a permanent failure state.
+- [Observability](/guides/observability) — surface probe failures through your tracing/metrics pipeline so a flapping probe shows up as signal rather than getting retried into silence.

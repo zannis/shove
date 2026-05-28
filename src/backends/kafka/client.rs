@@ -570,6 +570,33 @@ impl KafkaClient {
         self.shutdown_token.clone()
     }
 
+    /// Liveness check. Issues a single `fetch_metadata(None, timeout)` against
+    /// the cluster via the producer's existing librdkafka client. No new
+    /// socket, no consumer-group churn, no side effects.
+    ///
+    /// Returns `Err(ShoveError::Connection)` if the client is shut down, the
+    /// metadata fetch fails, or `spawn_blocking` itself fails.
+    pub(super) async fn ping(&self, timeout: Duration) -> Result<()> {
+        if self.shutdown_token.is_cancelled() {
+            return Err(ShoveError::Connection("client is shut down".into()));
+        }
+        let producer = self.producer.clone();
+        let join = tokio::task::spawn_blocking(move || match &producer {
+            KafkaProducerInner::Default(p) => p.client().fetch_metadata(None, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            KafkaProducerInner::MskIam(p) => p.client().fetch_metadata(None, timeout),
+        });
+
+        let metadata_result = tokio::time::timeout(timeout, join)
+            .await
+            .map_err(|_| ShoveError::Connection(format!("kafka ping timed out after {timeout:?}")))?
+            .map_err(|e| ShoveError::Connection(format!("kafka ping task failed: {e}")))?;
+
+        metadata_result
+            .map(|_| ())
+            .map_err(|e| ShoveError::Connection(format!("kafka ping failed: {e}")))
+    }
+
     pub(super) async fn create_admin_default(&self) -> Result<AdminClient<DefaultClientContext>> {
         let admin: AdminClient<DefaultClientContext> = self
             .base_config

@@ -77,6 +77,10 @@ impl Backend for Redis {
         // Redis connections are closed when the last Arc<ClientInner> drops.
         // Nothing to do here.
     }
+
+    async fn ping(client: &Self::Client, timeout: std::time::Duration) -> Result<()> {
+        client.ping(timeout).await
+    }
 }
 
 impl HasCoordinatedGroups for Redis {

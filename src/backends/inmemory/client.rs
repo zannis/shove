@@ -119,6 +119,15 @@ impl InMemoryBroker {
         self.inner.shutdown.cancel();
     }
 
+    /// Liveness check. Returns `Err(ShoveError::Connection)` if the broker has
+    /// been shut down; otherwise `Ok(())`. No I/O — the `timeout` is unused.
+    pub(super) async fn ping(&self, _timeout: std::time::Duration) -> Result<()> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(ShoveError::Connection("client is shut down".into()));
+        }
+        Ok(())
+    }
+
     pub(super) fn lookup(&self, name: &str) -> Result<Arc<QueueState>> {
         self.inner
             .queues
