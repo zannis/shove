@@ -142,6 +142,23 @@ impl SnsClient {
         self.shutdown_token.clone()
     }
 
+    /// Liveness check. Issues `ListQueues` with `max_results=1` against SQS —
+    /// cheapest real AWS SDK call that proves credentials work and the regional
+    /// endpoint is reachable without depending on a specific queue name.
+    #[cfg(feature = "aws-sns-sqs")]
+    pub(super) async fn ping(&self, timeout: std::time::Duration) -> Result<()> {
+        use crate::ShoveError;
+        if self.shutdown_token.is_cancelled() {
+            return Err(ShoveError::Connection("client is shut down".into()));
+        }
+        let fut = self.sqs_client.list_queues().max_results(1).send();
+        tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| ShoveError::Connection(format!("sqs ping timed out after {timeout:?}")))?
+            .map_err(|e| ShoveError::Connection(format!("sqs ping failed: {e}")))?;
+        Ok(())
+    }
+
     /// Initiate a graceful shutdown.
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
