@@ -581,13 +581,16 @@ impl KafkaClient {
             return Err(ShoveError::Connection("client is shut down".into()));
         }
         let producer = self.producer.clone();
-        let metadata_result = tokio::task::spawn_blocking(move || match &producer {
+        let join = tokio::task::spawn_blocking(move || match &producer {
             KafkaProducerInner::Default(p) => p.client().fetch_metadata(None, timeout),
             #[cfg(feature = "kafka-msk-iam")]
             KafkaProducerInner::MskIam(p) => p.client().fetch_metadata(None, timeout),
-        })
-        .await
-        .map_err(|e| ShoveError::Connection(format!("kafka ping task failed: {e}")))?;
+        });
+
+        let metadata_result = tokio::time::timeout(timeout, join)
+            .await
+            .map_err(|_| ShoveError::Connection(format!("kafka ping timed out after {timeout:?}")))?
+            .map_err(|e| ShoveError::Connection(format!("kafka ping task failed: {e}")))?;
 
         metadata_result
             .map(|_| ())

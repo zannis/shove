@@ -68,9 +68,12 @@ impl<B: Backend> Broker<B> {
     ///   (k8s `failureThreshold`, an HTTP middleware, etc.).
     /// - **No metrics emitted** — probes are called frequently; recording a
     ///   metric per call would drown out failure signal.
-    /// - **Post-`close()` is a permanent failure state** — every backend
-    ///   checks its shutdown token and returns `Err(ShoveError::Connection)`
-    ///   before any I/O.
+    /// - **Post-`close()` semantics are backend-specific.** Backends with a
+    ///   meaningful close (Kafka, RabbitMQ, NATS, SQS, InMemory) check a
+    ///   shutdown token and return `Err(ShoveError::Connection)` before any
+    ///   I/O. The Redis backend's `close` is a no-op — its connections drop
+    ///   on last `Arc` release — so ping continues to function until the
+    ///   broker itself becomes unreachable.
     /// - **Backends may transparently recover stale internal state.**
     ///   For example, the RabbitMQ backend dials a fresh AMQP connection if
     ///   the cached one died, librdkafka maintains its own broker connection

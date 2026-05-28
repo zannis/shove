@@ -16,7 +16,10 @@ async fn ping_succeeds_against_live_broker() {
 }
 
 #[tokio::test]
-async fn ping_with_timeout_succeeds_against_live_broker() {
+async fn ping_with_timeout_ignores_deadline_because_no_io() {
+    // InMemory has no transport, so ping_with_timeout does not actually
+    // enforce the deadline. This test documents that the API surface
+    // is accepted (the call compiles and succeeds against a live broker).
     let broker = Broker::<InMemory>::new(InMemoryConfig::default())
         .await
         .unwrap();

@@ -23,13 +23,13 @@ Wire this into your HTTP framework of choice. Retry policy, failure thresholds, 
 
 ## What happens on the wire
 
-Every backend issues a single real round-trip. There are no local-state shortcuts — a half-closed socket cannot lie its way to a green probe.
+Every production backend issues a real round-trip. There are no local-state shortcuts on the network path — a half-closed socket cannot lie its way to a green probe. The InMemory backend is the exception: it performs a shutdown-token check only, since it has no underlying transport.
 
 | Backend   | RPC                                                | Side effects             |
 |-----------|----------------------------------------------------|--------------------------|
 | Kafka     | `fetch_metadata(None, timeout)` on producer client | none                     |
 | Redis     | `PING` on the multiplexed connection               | none                     |
-| NATS      | subscribe + flush + publish + await echo on a unique inbox | none |
+| NATS      | subscribe + unsubscribe-after(1) + flush + publish + await echo on a unique inbox | none |
 | RabbitMQ  | transient channel open + close                     | none                     |
 | SQS       | `ListQueues` with `max_results=1`                  | one AWS API call billed  |
 | InMemory  | shutdown-token check (no I/O)                      | none                     |
@@ -44,7 +44,7 @@ The SQS call is the only one with a meaningful operational cost: each probe is o
 
 `ping` does not retry a failed probe. It does, however, allow backends to transparently recover stale internal state during the probe. The RabbitMQ backend dials a fresh AMQP connection if the cached one died, librdkafka maintains its own broker pool, and async-nats heartbeats keep the underlying connection alive. A probe that succeeds after such recovery is reported as `Ok(())`; the broker is reachable now, which is what liveness asks.
 
-After `Broker::close`, every backend's `ping` returns `Err(ShoveError::Connection)` immediately via a shutdown-token check. A closed broker stays closed.
+After `Broker::close`, most backends' `ping` returns `Err(ShoveError::Connection)` immediately via a shutdown-token check. Redis is the exception: its `close` is a no-op because connections drop on last `Arc` release, so `ping` continues to function against a closed broker until the underlying server becomes unreachable.
 
 ## What `ping` does not do
 

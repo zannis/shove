@@ -304,20 +304,28 @@ impl RedisClient {
     /// Liveness check. Sends a `PING` over the multiplexed connection,
     /// bounded by `timeout`. Returns `Err(ShoveError::Connection)` on
     /// timeout, transport error, or unexpected reply.
+    ///
+    /// The entire body — including connection establishment — runs inside the
+    /// `tokio::time::timeout` wrapper so that a slow `multiplexed_conn` call
+    /// (up to [`DEFAULT_CONNECTION_TIMEOUT`] by default) cannot escape the
+    /// caller's deadline.
     pub(super) async fn ping(&self, timeout: Duration) -> Result<()> {
-        let mut conn = self.multiplexed_conn().await?;
-        let reply: String = tokio::time::timeout(timeout, async {
-            conn.query::<String>(&mut redis::cmd("PING")).await
-        })
-        .await
-        .map_err(|_| ShoveError::Connection(format!("redis ping timed out after {timeout:?}")))?
-        .map_err(|e| ShoveError::Connection(format!("redis ping failed: {e}")))?;
-        if reply != "PONG" {
-            return Err(ShoveError::Connection(format!(
-                "redis ping returned {reply:?}, expected PONG"
-            )));
-        }
-        Ok(())
+        let fut = async {
+            let mut conn = self.multiplexed_conn().await?;
+            let reply: String = conn
+                .query::<String>(&mut redis::cmd("PING"))
+                .await
+                .map_err(|e| ShoveError::Connection(format!("redis ping failed: {e}")))?;
+            if reply != "PONG" {
+                return Err(ShoveError::Connection(format!(
+                    "redis ping returned {reply:?}, expected PONG"
+                )));
+            }
+            Ok::<(), ShoveError>(())
+        };
+        tokio::time::timeout(timeout, fut).await.map_err(|_| {
+            ShoveError::Connection(format!("redis ping timed out after {timeout:?}"))
+        })?
     }
 
     /// The consumer group name shared by all consumers on this client.
