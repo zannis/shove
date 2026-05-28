@@ -77,6 +77,12 @@ impl Backend for Nats {
     async fn close(client: &Self::Client) {
         client.shutdown().await;
     }
+
+    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
+        Err(crate::ShoveError::Connection(
+            "ping not yet implemented for NATS".into(),
+        ))
+    }
 }
 
 impl HasCoordinatedGroups for Nats {

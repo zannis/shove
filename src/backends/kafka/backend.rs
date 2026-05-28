@@ -80,6 +80,12 @@ impl Backend for Kafka {
     async fn close(client: &Self::Client) {
         client.shutdown().await;
     }
+
+    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
+        Err(crate::ShoveError::Connection(
+            "ping not yet implemented for Kafka".into(),
+        ))
+    }
 }
 
 impl HasCoordinatedGroups for Kafka {

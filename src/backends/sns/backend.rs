@@ -108,6 +108,12 @@ impl Backend for Sqs {
     async fn close(client: &Self::Client) {
         client.shutdown().await;
     }
+
+    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
+        Err(crate::ShoveError::Connection(
+            "ping not yet implemented for SQS".into(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

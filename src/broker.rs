@@ -1,5 +1,7 @@
 //! Public `Broker<B>` hub. See DESIGN_V2.md §6.1.
 
+use std::time::Duration;
+
 use crate::backend::Backend;
 use crate::backend::capability::HasCoordinatedGroups;
 use crate::consumer_group::ConsumerGroup;
@@ -7,6 +9,11 @@ use crate::consumer_supervisor::ConsumerSupervisor;
 use crate::error::Result;
 use crate::publisher::Publisher;
 use crate::topology_declarer::TopologyDeclarer;
+
+/// Default deadline for `Broker::ping`. Matches the rest of shove's 5 s
+/// timeout constants (kafka `PRODUCE_TIMEOUT`, autoscaler metadata fetch,
+/// `MESSAGE_TIMEOUT_MS`). Override via [`Broker::ping_with_timeout`].
+pub const DEFAULT_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Broker<B: Backend> {
     client: B::Client,
@@ -48,6 +55,23 @@ impl<B: Backend> Broker<B> {
 
     pub async fn close(&self) {
         B::close(&self.client).await
+    }
+
+    /// Verify the broker is reachable. Issues a single bounded RPC against
+    /// the cluster and returns `Ok(())` iff it completes within
+    /// [`DEFAULT_PING_TIMEOUT`].
+    ///
+    /// Designed for liveness / readiness probes. The method does not retry,
+    /// does not emit metrics, and does not attempt reconnect on failure —
+    /// probe policy belongs to the caller.
+    pub async fn ping(&self) -> Result<()> {
+        self.ping_with_timeout(DEFAULT_PING_TIMEOUT).await
+    }
+
+    /// Same as [`ping`](Self::ping), with a caller-supplied deadline. Exceeding
+    /// `timeout` returns `Err(ShoveError::Connection)`.
+    pub async fn ping_with_timeout(&self, timeout: Duration) -> Result<()> {
+        B::ping(&self.client, timeout).await
     }
 
     /// Return a [`QueueStatsImpl`](crate::backend::Backend::QueueStatsImpl) for

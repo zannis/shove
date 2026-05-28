@@ -159,6 +159,12 @@ impl Backend for RabbitMq {
     async fn close(client: &Self::Client) {
         client.shutdown().await;
     }
+
+    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
+        Err(ShoveError::Connection(
+            "ping not yet implemented for RabbitMQ".into(),
+        ))
+    }
 }
 
 impl HasCoordinatedGroups for RabbitMq {

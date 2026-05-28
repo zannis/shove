@@ -77,6 +77,12 @@ impl Backend for Redis {
         // Redis connections are closed when the last Arc<ClientInner> drops.
         // Nothing to do here.
     }
+
+    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
+        Err(crate::ShoveError::Connection(
+            "ping not yet implemented for Redis".into(),
+        ))
+    }
 }
 
 impl HasCoordinatedGroups for Redis {
