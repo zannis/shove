@@ -1134,7 +1134,11 @@ async fn route_outcome(
                         metrics::BackendErrorKind::Ack,
                     );
                 }
-            } else if let Some(level) = hold_level(new_retry, hold_queues) {
+            } else if let Some(level) = hold_level(retry_count, hold_queues) {
+                // Select the backoff tier from the *incoming* retry count
+                // (retry 0 -> tier 0), matching the documented contract in
+                // `topology.rs` and every other backend. `new_retry` is still
+                // what gets written into the held entry's retry-count header.
                 let hq = &hold_queues[level];
                 route_to_hold(
                     conn,
