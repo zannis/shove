@@ -232,42 +232,6 @@ name = "nats_raw_bytes"
 path = "examples/nats/raw_bytes.rs"
 required-features = ["nats"]
 
-[[test]]
-name = "rabbitmq_integration"
-required-features = ["rabbitmq"]
-
-[[test]]
-name = "rabbitmq_reconnect"
-required-features = ["rabbitmq"]
-
-[[test]]
-name = "sns_integration"
-required-features = ["aws-sns-sqs"]
-
-[[test]]
-name = "sns_sqs_integration"
-required-features = ["aws-sns-sqs"]
-
-[[test]]
-name = "nats_integration"
-required-features = ["nats"]
-
-[[test]]
-name = "kafka_integration"
-required-features = ["kafka"]
-
-[[test]]
-name = "kafka_ping"
-required-features = ["kafka"]
-
-[[test]]
-name = "kafka_msk_iam_unit"
-required-features = ["kafka-msk-iam"]
-
-[[test]]
-name = "kafka_msk_iam_integration"
-required-features = ["kafka-msk-iam"]
-
 [[example]]
 name = "kafka_basic"
 path = "examples/kafka/basic.rs"
@@ -298,22 +262,6 @@ name = "kafka_protobuf_pubsub"
 path = "examples/kafka/protobuf_pubsub.rs"
 required-features = ["kafka", "protobuf"]
 
-[[test]]
-name = "inmemory_integration"
-required-features = ["inmemory"]
-
-[[test]]
-name = "inmemory_ping"
-required-features = ["inmemory"]
-
-[[test]]
-name = "metrics_inmemory"
-required-features = ["inmemory", "metrics"]
-
-[[test]]
-name = "metrics_inmemory_group"
-required-features = ["inmemory", "metrics"]
-
 [[example]]
 name = "inmemory_basic"
 path = "examples/inmemory/basic.rs"
@@ -339,13 +287,6 @@ name = "inmemory_stress"
 path = "examples/inmemory/stress.rs"
 required-features = ["inmemory"]
 
-[[test]]
-name = "redis_integration"
-required-features = ["redis-streams"]
-
-[[test]]
-name = "redis_ping"
-required-features = ["redis-streams"]
 
 [[example]]
 name = "redis_basic"

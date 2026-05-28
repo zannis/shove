@@ -1,3 +1,5 @@
+#![cfg(feature = "aws-sns-sqs")]
+
 //! Integration tests for the SNS/SQS pub-sub backend.
 //!
 //! Uses `Broker<Sqs>` + `Publisher<Sqs>` + `TopologyDeclarer<Sqs>` +

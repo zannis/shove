@@ -1,3 +1,5 @@
+#![cfg(feature = "rabbitmq")]
+
 //! Integration test for `RabbitMqClient` reconnect after a broker disconnect.
 //!
 //! Stops the broker's Erlang application via `rabbitmqctl stop_app`, restarts

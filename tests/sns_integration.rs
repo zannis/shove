@@ -1,3 +1,5 @@
+#![cfg(feature = "aws-sns-sqs")]
+
 //! Integration tests for the SNS publisher backend.
 //!
 //! Uses `Broker<Sqs>` + `Publisher<Sqs>` + `TopologyDeclarer<Sqs>`. The broker
