@@ -1,0 +1,34 @@
+src/backends/rabbitmq/backend.rs
+  s_12c83afaad42aa::t_f593bb07cead97 162-167
+src/broker.rs
+  s_12c83afaad42aa::t_418a9d396f2eea 3-4,13-16
+  s_12c83afaad42aa::t_01a49c9067efc1 60-76
+src/backends/inmemory/backend.rs
+  s_12c83afaad42aa::t_02eb9115bd320b 96-101
+src/backends/sns/backend.rs
+  s_12c83afaad42aa::t_364fddbc081a35 111-116
+src/backends/kafka/backend.rs
+  s_12c83afaad42aa::t_90e1c14595df19 83-88
+src/backends/nats/backend.rs
+  s_12c83afaad42aa::t_5f8970638c89f6 80-85
+src/backends/redis/backend.rs
+  s_12c83afaad42aa::t_0826f9f1c89f30 80-85
+src/backend/mod.rs
+  s_12c83afaad42aa::t_851ac5e24bf4ae 64-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "c891fc42fd6db19d42f713704f2bdec592de817b",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
