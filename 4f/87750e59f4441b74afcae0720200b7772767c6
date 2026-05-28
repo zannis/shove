@@ -1,0 +1,19 @@
+src/broker.rs
+  s_12c83afaad42aa::t_2bc9a93ff92326 64-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4f87750e59f4441b74afcae0720200b7772767c6",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
