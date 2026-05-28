@@ -10,20 +10,18 @@ Type-safe async pub/sub for Rust. One API across RabbitMQ, AWS SNS+SQS, NATS Jet
 
 **Guides, examples, and the full walkthrough live at [shove.rs](https://shove.rs).** Rustdoc on [docs.rs/shove](https://docs.rs/shove).
 
-## Why shove
+## What you get
 
-- **Typed topics** — define a topic once as a Rust type; queue names, DLQs, and hold queues all derive from it.
-- **Retry topologies without glue code** — escalating backoff through hold queues, DLQ routing, retry budgets, handler timeouts.
-- **Strict per-key ordering** — `SequencedTopic` with pluggable failure policies (`Skip` or `FailAll`), enforced by the broker.
-- **Consumer groups + autoscaling** — min/max bounds driven by queue depth (or consumer lag on Kafka), with optional structured audit trails.
-- **Pluggable codecs** — JSON by default; opt into Protobuf (via the `protobuf` feature), raw bytes, or a custom `Codec<M>` per topic without touching backend code.
-- **One API across six backends** — swap the transport without changing topic definitions or handlers.
-
-If you have one queue, one consumer, and little retry logic, use `lapin`, the AWS SDK, `async-nats`, or `rdkafka` directly. `shove` is the layer for multi-service event flows that need operational discipline.
+- **Define a topic once, use it everywhere.** Queue names, DLQs, and retries all derive from a single Rust type.
+- **Retries and DLQs included.** Escalating backoff, dead-letter routing, retry budgets, handler timeouts — no glue code.
+- **Strict per-key ordering** when you need it, with pluggable failure policies.
+- **Autoscaling consumer groups** driven by queue depth or consumer lag.
+- **Switch backends without changing your code.** Same topic, same handler, six transports.
+- **Pluggable message codecs.** JSON by default; Protobuf, raw bytes, or your own.
 
 ## 30-second tour
 
-No Docker, no credentials, no config — this runs against the in-process backend:
+In-process, no Docker, no credentials:
 
 ```rust,no_run
 use serde::{Deserialize, Serialize};
@@ -77,66 +75,57 @@ async fn main() -> Result<(), shove::ShoveError> {
 }
 ```
 
-Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` — the topic and handler stay identical. Per-backend setup: [Getting Started](https://shove.rs/getting-started).
+Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` and the topic and handler stay identical. Per-backend setup: [Getting Started](https://shove.rs/getting-started).
 
 ## Backends
 
-| Backend              | Feature flag    | Marker     | Ordering primitive                    | Autoscale signal       |
-|----------------------|-----------------|------------|---------------------------------------|------------------------|
-| RabbitMQ             | `rabbitmq`      | `RabbitMq` | Consistent-hash exchange + SAC shards | Queue depth            |
-| AWS SNS+SQS          | `aws-sns-sqs`   | `Sqs`      | FIFO topic + `MessageGroupId`         | Queue depth            |
-| NATS JetStream       | `nats`          | `Nats`     | Subject shard + `max_ack_pending=1`   | Pending messages       |
-| Apache Kafka         | `kafka`         | `Kafka`    | Partition key                         | Consumer lag           |
-| Redis/Valkey Streams | `redis-streams` | `Redis`    | FNV-1a shard streams                  | XLEN + XPENDING        |
-| In-process           | `inmemory`      | `InMemory` | Per-key FIFO shards                   | Queue depth (in-proc)  |
+| Backend              | Feature flag    | Marker     |
+| -------------------- | --------------- | ---------- |
+| RabbitMQ             | `rabbitmq`      | `RabbitMq` |
+| AWS SNS+SQS          | `aws-sns-sqs`   | `Sqs`      |
+| NATS JetStream       | `nats`          | `Nats`     |
+| Apache Kafka         | `kafka`         | `Kafka`    |
+| Redis/Valkey Streams | `redis-streams` | `Redis`    |
+| In-process           | `inmemory`      | `InMemory` |
 
-> **Redis/Valkey requirement:** Redis 6.2+ (or an equivalent Valkey release) is required. shove uses `ZRANGE … BYSCORE` for hold-queue polling, which was introduced in Redis 6.2. The version is validated at connection time and an error is returned if the server is older.
+`cargo add shove --features <flag>`. Need help choosing? [Choosing a backend](https://shove.rs/backends/choosing).
 
-`cargo add shove --features <flag>`. No features are enabled by default. Decision guide: [Choosing a backend](https://shove.rs/backends/choosing).
-
-Optional add-ons: `audit` (built-in `ShoveAuditHandler` + `AuditLog` topic), `metrics` (Prometheus/StatsD/OTel via the [`metrics`](https://docs.rs/metrics) facade), `kafka-ssl` (TLS + SASL), `rabbitmq-transactional` (exactly-once routing), `protobuf` (`ProtobufCodec<M>` for `prost`-generated messages).
+Optional add-ons: `audit`, `metrics`, `kafka-ssl`, `rabbitmq-transactional`, `protobuf`.
 
 ## Delivery
 
-`shove` is at-least-once by default — handlers must be idempotent. A handler returns one of:
+At-least-once by default. Handlers return one of:
 
 - `Ack` — success
 - `Retry` — delayed retry through hold queues with escalating backoff
 - `Reject` — dead-letter immediately
 - `Defer` — delay without consuming a retry budget
 
-Handler timeouts convert to `Retry`. Full semantics: [Outcomes & Delivery](https://shove.rs/concepts/outcomes).
+Full semantics: [Outcomes & Delivery](https://shove.rs/concepts/outcomes).
 
 ## Performance
 
-MacBook Pro M4 Max, Docker, Rust 1.91. Reproducible via `cargo run -q --release --example <backend>_stress --features <backend>`.
+MacBook Pro M4 Max, using simulated tasks averaging ~175ms. Reproducible via `cargo run --release --example <backend>_stress --features <backend>`.
 
-Per-consumer scaling at the `high` tier with the `slow` handler (50–300 ms random sleep, ~175 ms avg), `--concurrent` enabled, `prefetch=32`. Each row is total throughput in msg/s across N parallel consumer tasks.
+- **56,000 msg/s** — Redis, 1,024 consumers
+- **7,996 msg/s** — Redis, 64 consumers
+- **7,585 msg/s** — RabbitMQ, 64 consumers
+- **2,245 msg/s** — Kafka, 64 consumers
 
-| Backend  |    8c |   16c |   32c |   64c |
-|----------|------:|------:|------:|------:|
-| Redis    | 1,371 | 2,761 | 5,462 | 7,996 |
-| RabbitMQ |   946 | 1,903 | 3,799 | 7,585 |
-| Kafka    |   347 |   694 | 1,406 | 2,245 |
-
-RabbitMQ scales linearly past 50 channels via the per-`ConsumerGroup` AMQP connection pool (auto-sized `ceil(max_consumers / 50)`). Redis ships shove-tuned defaults (30 s response, 10 s connect) that replace redis-rs's 500 ms / 1 s defaults — those misfire under heavy concurrent XREADGROUP load. Tune via `RedisConfig::with_response_timeout` / `with_connection_timeout` if needed.
-
-Redis consumer groups also run a single XAUTOCLAIM "reaper" sidecar per group instead of each consumer firing its own autoclaim — at 1 024 consumers this cuts broker-side autoclaim CPU from ~17 s / run to zero in the steady-state bench window. Headline impact on a single Redis node, 1 024 consumers, slow handler, `prefetch=20`: **56 000 msg/s** (was 5 900 before the reaper, ~10× speedup).
-
-`prefetch_count` is the primary throughput lever for I/O-bound handlers. Per-backend tuning notes, NATS/SQS comparisons, and `fast`/`heavy` profile breakdowns: [Performance](https://shove.rs/ops/performance).
+Tuning notes, NATS/SQS profiles, and the full benchmark matrix: [Performance](https://shove.rs/ops/performance).
 
 ## Learn more
 
-- [Getting Started](https://shove.rs/getting-started) — install, declare your first topic, publish and consume on every backend
-- [Core concepts](https://shove.rs/concepts/topics) — topics & topology, codecs, outcomes, handlers & context, the `Broker<B>` pattern
-- [Guides](https://shove.rs/guides/retries) — retries, sequenced delivery, consumer groups, audit, observability, exactly-once, shutdown
-- [Backends](https://shove.rs/backends/choosing) — per-backend overviews and runnable examples
-- [docs.rs/shove](https://docs.rs/shove) — full rustdoc
+- [Getting Started](https://shove.rs/getting-started)
+- [Core concepts](https://shove.rs/concepts/topics)
+- [Guides](https://shove.rs/guides/retries) — retries, sequenced delivery, consumer groups, audit, observability, exactly-once, shutdown, liveness
+- [Backends](https://shove.rs/backends/choosing)
+- [docs.rs/shove](https://docs.rs/shove)
 
 ## Requirements
 
-- Rust 1.85 or newer (edition 2024).
-- Redis 6.2+ or Valkey (any release) when using the `redis-streams` backend.
+- Rust 1.85+ (edition 2024)
+- Redis 6.2+ or Valkey (when using `redis-streams`)
 
 ## License
 
