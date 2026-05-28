@@ -81,10 +81,8 @@ impl Backend for Kafka {
         client.shutdown().await;
     }
 
-    async fn ping(_client: &Self::Client, _timeout: std::time::Duration) -> Result<()> {
-        Err(crate::ShoveError::Connection(
-            "ping not yet implemented for Kafka".into(),
-        ))
+    async fn ping(client: &Self::Client, timeout: std::time::Duration) -> Result<()> {
+        client.ping(timeout).await
     }
 }
 
