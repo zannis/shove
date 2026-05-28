@@ -61,9 +61,22 @@ impl<B: Backend> Broker<B> {
     /// the cluster and returns `Ok(())` iff it completes within
     /// [`DEFAULT_PING_TIMEOUT`].
     ///
-    /// Designed for liveness / readiness probes. The method does not retry,
-    /// does not emit metrics, and does not attempt reconnect on failure —
-    /// probe policy belongs to the caller.
+    /// Designed for liveness / readiness probes:
+    ///
+    /// - **No retries** — a failed probe is returned to the caller as-is.
+    ///   Probe policy (retry counts, failure thresholds) belongs to the caller
+    ///   (k8s `failureThreshold`, an HTTP middleware, etc.).
+    /// - **No metrics emitted** — probes are called frequently; recording a
+    ///   metric per call would drown out failure signal.
+    /// - **Post-`close()` is a permanent failure state** — every backend
+    ///   checks its shutdown token and returns `Err(ShoveError::Connection)`
+    ///   before any I/O.
+    /// - **Backends may transparently recover stale internal state.**
+    ///   For example, the RabbitMQ backend dials a fresh AMQP connection if
+    ///   the cached one died, librdkafka maintains its own broker connection
+    ///   pool, and async-nats heartbeats keep the underlying connection
+    ///   healthy. A probe that succeeds after such recovery is reported as
+    ///   `Ok(())` — the broker is reachable now, which is what liveness asks.
     pub async fn ping(&self) -> Result<()> {
         self.ping_with_timeout(DEFAULT_PING_TIMEOUT).await
     }
