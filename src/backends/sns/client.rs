@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "aws-sns-sqs")]
 use crate::backends::sns::topology::QueueRegistry;
 use crate::backends::sns::topology::TopicRegistry;
-use crate::error::Result;
+use crate::error::{Result, ShoveError};
 
 /// AWS SNS connection configuration.
 #[derive(Clone)]
@@ -147,7 +147,6 @@ impl SnsClient {
     /// endpoint is reachable without depending on a specific queue name.
     #[cfg(feature = "aws-sns-sqs")]
     pub(super) async fn ping(&self, timeout: std::time::Duration) -> Result<()> {
-        use crate::ShoveError;
         if self.shutdown_token.is_cancelled() {
             return Err(ShoveError::Connection("client is shut down".into()));
         }

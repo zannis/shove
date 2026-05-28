@@ -10,6 +10,33 @@ use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::localstack::LocalStack;
 
+/// Poll SNS and SQS against the LocalStack endpoint until both respond, or
+/// panic after 30s. Eliminates dispatch-failure flakes when the container is
+/// booted concurrently with other tests and the services aren't yet routable.
+async fn wait_for_localstack_ready(endpoint_url: &str) {
+    use std::time::Instant;
+    let aws_config = aws_config::from_env()
+        .region(aws_config::Region::new("us-east-1"))
+        .endpoint_url(endpoint_url)
+        .load()
+        .await;
+    let sns = aws_sdk_sns::Client::new(&aws_config);
+    let sqs = aws_sdk_sqs::Client::new(&aws_config);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let sns_ok = sns.list_topics().send().await.is_ok();
+        let sqs_ok = sqs.list_queues().send().await.is_ok();
+        if sns_ok && sqs_ok {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("LocalStack services not ready within 30s at {endpoint_url}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 struct TestBroker {
     #[allow(dead_code)]
     container: testcontainers::ContainerAsync<LocalStack>,
@@ -18,7 +45,8 @@ struct TestBroker {
 
 impl TestBroker {
     async fn start() -> Self {
-        // SAFETY: tests run single-threaded for env var manipulation.
+        // SAFETY: nextest runs each test binary in a separate process; no concurrent
+        // env mutation is possible here.
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", "test");
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
@@ -37,6 +65,8 @@ impl TestBroker {
             .await
             .expect("get LocalStack port");
         let endpoint_url = format!("http://localhost:{port}");
+
+        wait_for_localstack_ready(&endpoint_url).await;
 
         let sns_config = SnsConfig {
             region: Some("us-east-1".into()),
@@ -81,7 +111,8 @@ async fn ping_with_timeout_honors_deadline() {
         region: Some("us-east-1".into()),
         endpoint_url: Some("http://127.0.0.1:1".into()),
     };
-    // SAFETY: tests run single-threaded for env var manipulation.
+    // SAFETY: nextest runs each test binary in a separate process; no concurrent
+    // env mutation is possible here.
     unsafe {
         std::env::set_var("AWS_ACCESS_KEY_ID", "test");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
