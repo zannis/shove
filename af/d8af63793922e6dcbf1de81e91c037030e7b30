@@ -1,0 +1,23 @@
+src/backends/inmemory/client.rs
+  s_12c83afaad42aa::t_b19c9a116fb19d 122-130
+src/backends/inmemory/backend.rs
+  s_12c83afaad42aa::t_aa82ede0d467c7 97-98
+tests/inmemory_ping.rs
+  s_12c83afaad42aa::t_da529beaa8fec7 1-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "afd8af63793922e6dcbf1de81e91c037030e7b30",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
