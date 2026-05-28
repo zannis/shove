@@ -260,6 +260,21 @@ impl Topic for RetryTiersTopic {
     }
 }
 
+struct RetryCapTopic;
+impl Topic for RetryCapTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-retry-cap")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Event {
     account: String,
@@ -469,6 +484,66 @@ async fn first_retry_uses_first_hold_tier() {
         call_count.load(Ordering::Relaxed),
         2,
         "first retry must redeliver via the short tier-0 hold queue, not the 30s tier 1"
+    );
+}
+
+// `max_retries = N` must allow 1 initial attempt + N retries before the
+// message is dead-lettered (the documented contract). With max_retries=2 the
+// handler runs exactly 3 times.
+#[tokio::test]
+async fn max_retries_allows_initial_plus_n_retries() {
+    let broker = make_broker("redis-int-retry-cap-grp").await;
+    broker
+        .topology()
+        .declare::<RetryCapTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<RetryCapTopic>(&Order { id: 5 })
+        .await
+        .expect("publish");
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<RetryCapTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Retry
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<RetryCapTopic, _>(
+            H(call_count.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(2),
+        )
+        .expect("register");
+
+    let probe = call_count.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 3,
+            Duration::from_secs(15),
+        )
+        .await;
+        // Allow any erroneous 4th redelivery (~100ms hold + ~500ms poll) to surface.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        call_count.load(Ordering::Relaxed),
+        3,
+        "max_retries=2 must allow 1 initial + 2 retries = 3 attempts before DLQ"
     );
 }
 

@@ -371,7 +371,10 @@ async fn route_outcome(
         }
         Outcome::Retry => {
             let new_count = retry_count + 1;
-            if new_count >= max_retries {
+            // DLQ when the incoming retry count has reached the budget, so
+            // `max_retries = N` permits 1 initial attempt + N retries. Matches
+            // the documented contract and the other backends.
+            if retry_count >= max_retries {
                 // Emit before the DLQ publish so the metric fires regardless
                 // of DLQ outcome — silent loss on DLQ failure is what the
                 // counter has to surface to alerting.

@@ -1108,7 +1108,10 @@ async fn route_outcome(
         }
         Outcome::Retry => {
             let new_retry = retry_count + 1;
-            if new_retry >= max_retries {
+            // DLQ when the incoming retry count has reached the budget, so
+            // `max_retries = N` permits 1 initial attempt + N retries. Matches
+            // the documented contract and the other backends.
+            if retry_count >= max_retries {
                 route_to_dlq(
                     conn,
                     topology,
