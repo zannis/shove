@@ -1,0 +1,21 @@
+Cargo.toml
+  s_12c83afaad42aa::t_faf7dd217a0131 306-308
+  s_12c83afaad42aa::t_72e8226c66f93b 260-262
+  s_12c83afaad42aa::t_696fdd6089c004 346-349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6a231697ec1c57959bb17e00164b085d1bf09436",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
