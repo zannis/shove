@@ -1,0 +1,21 @@
+src/schema_registry/client.rs
+  s_78028e7db402f2::t_ba3a16e832e4ce 9-10
+  s_78028e7db402f2::t_d053270aacdf2e 148-150
+  s_78028e7db402f2::t_6c959bc31d57b7 107,151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "dc47c021f417f97bc996d6c338f64325f6185416",
+  "prompts": {},
+  "sessions": {
+    "s_78028e7db402f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5a2d892-7f72-4ef5-af98-690e967d2b90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
