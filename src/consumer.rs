@@ -506,9 +506,10 @@ impl ConsumerOptions<Kafka> {
 }
 
 #[cfg(test)]
-#[allow(clippy::absolute_paths, unused_imports)]
+#[allow(clippy::absolute_paths)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::markers::*;
 
     // Tests use the InMemory marker when available; otherwise fall back to
@@ -919,5 +920,50 @@ mod tests {
             HandlerTimeoutConfig::default(),
             HandlerTimeoutConfig::Inherit
         );
+    }
+
+    #[cfg(feature = "kafka-schema-registry")]
+    mod kafka_schema_registry_options {
+        use std::sync::Arc;
+
+        use crate::consumer::ConsumerOptions;
+        use crate::markers::Kafka;
+        use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+
+        #[test]
+        fn schema_enforcement_default_is_enforce() {
+            let inner = ConsumerOptions::<Kafka>::new().into_inner();
+            assert_eq!(inner.schema_enforcement, SchemaEnforcement::Enforce);
+            assert!(inner.schema_registry.is_none());
+            assert!(inner.schema_accepted_subjects.is_none());
+        }
+
+        #[test]
+        fn with_schema_enforcement_permissive_propagates() {
+            let inner = ConsumerOptions::<Kafka>::new()
+                .with_schema_enforcement(SchemaEnforcement::Permissive)
+                .into_inner();
+            assert_eq!(inner.schema_enforcement, SchemaEnforcement::Permissive);
+        }
+
+        #[test]
+        fn accept_schema_subjects_propagates() {
+            let inner = ConsumerOptions::<Kafka>::new()
+                .accept_schema_subjects(["orders-value", "orders-key"])
+                .into_inner();
+            assert_eq!(
+                inner.schema_accepted_subjects,
+                Some(vec![Arc::from("orders-value"), Arc::from("orders-key")])
+            );
+        }
+
+        #[test]
+        fn with_schema_registry_propagates() {
+            let registry = SchemaRegistry::builder("http://localhost:8081").build();
+            let inner = ConsumerOptions::<Kafka>::new()
+                .with_schema_registry(registry)
+                .into_inner();
+            assert!(inner.schema_registry.is_some());
+        }
     }
 }
