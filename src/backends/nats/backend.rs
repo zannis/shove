@@ -4,8 +4,6 @@
 //! types in this module via `impl Backend` and `impl HasCoordinatedGroups`,
 //! plus the six `pub(crate)` impl-trait bodies that carry the real work.
 //!
-//! See DESIGN_V2.md §4 and §4.1.
-//!
 //! The whole `crate::backends::nats` module is already gated on the
 //! `nats` feature at the parent (`crate::backends`); no per-file cfg
 //! is needed here.

@@ -1,8 +1,6 @@
 //! Sealed `Backend` trait layer. Binds a backend marker type to its concrete
 //! internal implementation types; the public generic wrappers (`Broker<B>`,
 //! `Publisher<B>`, etc.) delegate through this.
-//!
-//! See `DESIGN_V2.md` §4.
 
 use crate::error::Result;
 

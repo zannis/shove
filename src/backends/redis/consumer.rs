@@ -1018,47 +1018,55 @@ where
                         };
 
                         let elapsed = start.elapsed().as_secs_f64();
+
+                        if let Some(outcome) = outcome_opt {
+                            metrics::record_consumed(
+                                &task_topic,
+                                task_group_metric.as_deref(),
+                                &outcome,
+                            );
+                            metrics::record_processing_duration(
+                                &task_topic,
+                                task_group_metric.as_deref(),
+                                &outcome,
+                                elapsed,
+                            );
+
+                            // `task_conn` was cloned from the parent's hoisted
+                            // outcome connection — no per-message socket churn.
+                            if let Err(e) = route_outcome(
+                                &mut task_conn,
+                                topology,
+                                &task_stream,
+                                &task_group,
+                                &entry_id,
+                                &fields,
+                                outcome,
+                                retry_count,
+                                max_retries,
+                                hold_queues,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    entry_id,
+                                    "outcome routing failed; message left in PEL"
+                                );
+                            }
+                        }
+
+                        // Release the prefetch permit only AFTER outcome routing
+                        // (XACK / hold-enqueue / DLQ) has landed, so the shutdown
+                        // drain (`acquire_many(prefetch)`) waits for in-flight
+                        // routing to complete — mirroring the NATS consumer.
+                        // Releasing before routing let the drain return while a
+                        // detached task still owed an XACK/hold/DLQ write, which
+                        // could then be lost if the process exited.
                         drop(permit);
                         if task_semaphore.available_permits() == prefetch {
                             task_processing
                                 .store(false, std::sync::atomic::Ordering::Release);
-                        }
-
-                        let Some(outcome) = outcome_opt else { return };
-
-                        metrics::record_consumed(
-                            &task_topic,
-                            task_group_metric.as_deref(),
-                            &outcome,
-                        );
-                        metrics::record_processing_duration(
-                            &task_topic,
-                            task_group_metric.as_deref(),
-                            &outcome,
-                            elapsed,
-                        );
-
-                        // `task_conn` was cloned from the parent's hoisted
-                        // outcome connection — no per-message socket churn.
-                        if let Err(e) = route_outcome(
-                            &mut task_conn,
-                            topology,
-                            &task_stream,
-                            &task_group,
-                            &entry_id,
-                            &fields,
-                            outcome,
-                            retry_count,
-                            max_retries,
-                            hold_queues,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                error = %e,
-                                entry_id,
-                                "outcome routing failed; message left in PEL"
-                            );
                         }
                     });
                 }
@@ -1100,7 +1108,10 @@ async fn route_outcome(
         }
         Outcome::Retry => {
             let new_retry = retry_count + 1;
-            if new_retry >= max_retries {
+            // DLQ when the incoming retry count has reached the budget, so
+            // `max_retries = N` permits 1 initial attempt + N retries. Matches
+            // the documented contract and the other backends.
+            if retry_count >= max_retries {
                 route_to_dlq(
                     conn,
                     topology,
@@ -1126,7 +1137,11 @@ async fn route_outcome(
                         metrics::BackendErrorKind::Ack,
                     );
                 }
-            } else if let Some(level) = hold_level(new_retry, hold_queues) {
+            } else if let Some(level) = hold_level(retry_count, hold_queues) {
+                // Select the backoff tier from the *incoming* retry count
+                // (retry 0 -> tier 0), matching the documented contract in
+                // `topology.rs` and every other backend. `new_retry` is still
+                // what gets written into the held entry's retry-count header.
                 let hq = &hold_queues[level];
                 route_to_hold(
                     conn,

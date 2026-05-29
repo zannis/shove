@@ -1,5 +1,5 @@
 //! Backend marker types. One zero-sized struct per backend, each under
-//! the existing Cargo feature. See DESIGN_V2.md §7.
+//! the existing Cargo feature.
 
 #[cfg(feature = "kafka")]
 #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]

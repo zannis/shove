@@ -1,4 +1,4 @@
-//! Internal `TopologyImpl` trait. See DESIGN_V2.md §5.
+//! Internal `TopologyImpl` trait.
 
 use crate::error::Result;
 use crate::topic::Topic;

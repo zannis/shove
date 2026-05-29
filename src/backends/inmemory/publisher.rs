@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::Topic;
 use crate::backend::PublisherImpl;
 use crate::error::{Result, ShoveError};
-use crate::publisher_internal::validate_headers;
+use crate::publisher_internal::{shard_for_key, validate_headers};
 
 use super::client::{Envelope, InMemoryBroker};
 use super::constants::{X_MESSAGE_ID, X_SEQUENCE_KEY};
@@ -106,19 +106,7 @@ impl PublisherImpl for InMemoryPublisher {
 }
 
 fn shard_index(key: &str, shards: u16) -> u16 {
-    debug_assert!(shards > 0);
-    (fnv1a_hash(key) % shards as u64) as u16
-}
-
-fn fnv1a_hash(key: &str) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in key.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    shard_for_key(key, shards)
 }
 
 #[cfg(test)]

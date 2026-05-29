@@ -134,13 +134,31 @@ impl QueueTopology {
             .iter()
             .map(|hq| HoldQueue {
                 name: format!(
-                    "{}-seq-{shard_index}-hold-{}s",
+                    "{}-seq-{shard_index}-hold-{}",
                     self.queue,
-                    hq.delay.as_secs()
+                    hold_delay_suffix(hq.delay)
                 ),
                 delay: hq.delay,
             })
             .collect()
+    }
+}
+
+/// Renders a hold-queue delay into the suffix used in its queue name.
+///
+/// Whole-second delays keep the historical `{secs}s` form so existing deployed
+/// topologies are unchanged. Sub-second or fractional delays use `{ms}ms` so the
+/// name stays injective at millisecond granularity — the precision backends use
+/// for the queue TTL (e.g. RabbitMQ's `x-message-ttl`), so two delays sharing a
+/// name with different TTLs would fail re-declaration with PRECONDITION_FAILED.
+/// The two forms never overlap: `{secs}s` is only emitted for whole seconds, and
+/// `{ms}ms` only for non-whole-second values. (Delays differing only below 1ms
+/// still collide, but sub-millisecond backoff tiers are not a real use case.)
+fn hold_delay_suffix(delay: Duration) -> String {
+    if delay.subsec_millis() == 0 {
+        format!("{}s", delay.as_secs())
+    } else {
+        format!("{}ms", delay.as_millis())
     }
 }
 
@@ -313,7 +331,7 @@ impl TopologyBuilder {
             .hold_queues
             .into_iter()
             .map(|delay| HoldQueue {
-                name: format!("{}-hold-{}s", self.queue, delay.as_secs()),
+                name: format!("{}-hold-{}", self.queue, hold_delay_suffix(delay)),
                 delay,
             })
             .collect();
@@ -375,6 +393,37 @@ mod tests {
     fn builder_no_hold_queues() {
         let topology = TopologyBuilder::new("orders").build();
         assert!(topology.hold_queues().is_empty());
+    }
+
+    #[test]
+    fn builder_whole_second_hold_names_unchanged() {
+        // Whole-second delays keep the historical `{secs}s` suffix.
+        let topology = TopologyBuilder::new("orders")
+            .hold_queue(Duration::from_secs(5))
+            .hold_queue(Duration::from_secs(30))
+            .build();
+
+        let hqs = topology.hold_queues();
+        assert_eq!(hqs[0].name(), "orders-hold-5s");
+        assert_eq!(hqs[1].name(), "orders-hold-30s");
+    }
+
+    #[test]
+    fn builder_sub_second_hold_names_use_millis_and_stay_distinct() {
+        // Delays that share a whole second (or are sub-second) render as `{ms}ms`
+        // so their names — and the TTLs backends derive from them — stay distinct.
+        let topology = TopologyBuilder::new("orders")
+            .hold_queue(Duration::from_millis(200))
+            .hold_queue(Duration::from_millis(500))
+            .hold_queue(Duration::from_millis(1500))
+            .hold_queue(Duration::from_millis(1800))
+            .build();
+
+        let hqs = topology.hold_queues();
+        assert_eq!(hqs[0].name(), "orders-hold-200ms");
+        assert_eq!(hqs[1].name(), "orders-hold-500ms");
+        assert_eq!(hqs[2].name(), "orders-hold-1500ms");
+        assert_eq!(hqs[3].name(), "orders-hold-1800ms");
     }
 
     #[test]

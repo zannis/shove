@@ -1,6 +1,6 @@
 //! `HasCoordinatedGroups` capability trait — gates `ConsumerGroup<B>` and
 //! `consumer_group()` to backends with a real broker-level group
-//! primitive. See DESIGN_V2.md §4.1.
+//! primitive.
 
 use crate::backend::{Backend, RegistryImpl};
 

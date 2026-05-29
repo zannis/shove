@@ -244,6 +244,37 @@ impl Topic for RejectTopic {
     }
 }
 
+struct RetryTiersTopic;
+impl Topic for RetryTiersTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-retry-tiers")
+                .hold_queue(Duration::from_millis(100)) // tier 0 — used on first retry
+                .hold_queue(Duration::from_secs(30)) // tier 1 — must NOT be used on first retry
+                .dlq()
+                .build()
+        })
+    }
+}
+
+struct RetryCapTopic;
+impl Topic for RetryCapTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-retry-cap")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Event {
     account: String,
@@ -388,6 +419,131 @@ async fn retry_then_ack_on_redeliver() {
         call_count.load(Ordering::Relaxed),
         2,
         "handler must be called exactly twice (retry + ack)"
+    );
+}
+
+// Regression for the hold-tier off-by-one: the first retry must use hold
+// tier 0 (the short 100ms delay), not tier 1. With the bug (indexing by
+// retry_count + 1) the first retry went to the 30s tier and the redelivery
+// would not arrive within this 8s window.
+#[tokio::test]
+async fn first_retry_uses_first_hold_tier() {
+    let broker = make_broker("redis-int-retry-tiers").await;
+    broker
+        .topology()
+        .declare::<RetryTiersTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<RetryTiersTopic>(&Order { id: 7 })
+        .await
+        .expect("publish");
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<RetryTiersTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            if meta.retry_count == 0 {
+                Outcome::Retry
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<RetryTiersTopic, _>(
+            H(call_count.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(5),
+        )
+        .expect("register");
+
+    let probe = call_count.clone();
+    // tier 0 = 100ms + ~500ms requeuer poll => redelivery well under 8s;
+    // tier 1 = 30s would miss this window entirely (the off-by-one bug).
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 2,
+            Duration::from_secs(8),
+        )
+        .await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        call_count.load(Ordering::Relaxed),
+        2,
+        "first retry must redeliver via the short tier-0 hold queue, not the 30s tier 1"
+    );
+}
+
+// `max_retries = N` must allow 1 initial attempt + N retries before the
+// message is dead-lettered (the documented contract). With max_retries=2 the
+// handler runs exactly 3 times.
+#[tokio::test]
+async fn max_retries_allows_initial_plus_n_retries() {
+    let broker = make_broker("redis-int-retry-cap-grp").await;
+    broker
+        .topology()
+        .declare::<RetryCapTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<RetryCapTopic>(&Order { id: 5 })
+        .await
+        .expect("publish");
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<RetryCapTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Retry
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<RetryCapTopic, _>(
+            H(call_count.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(2),
+        )
+        .expect("register");
+
+    let probe = call_count.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 3,
+            Duration::from_secs(15),
+        )
+        .await;
+        // Allow any erroneous 4th redelivery (~100ms hold + ~500ms poll) to surface.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(
+        call_count.load(Ordering::Relaxed),
+        3,
+        "max_retries=2 must allow 1 initial + 2 retries = 3 attempts before DLQ"
     );
 }
 
@@ -740,6 +896,32 @@ async fn publish_with_headers_visible_in_metadata() {
         hdrs.get("x-tenant").map(String::as_str),
         Some("acme"),
         "x-tenant header must be preserved"
+    );
+}
+
+#[tokio::test]
+async fn publish_with_reserved_header_rejected() {
+    let broker = make_broker("redis-int-headers-reserved-grp").await;
+    broker
+        .topology()
+        .declare::<HeadersTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+
+    // A publisher must not be able to forge an internal routing field; the
+    // Redis consumer reads `x-retry-count` off the stream entry to drive
+    // retry/DLQ routing, so accepting it would let a publisher poison delivery.
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-retry-count".to_string(), "999".to_string());
+    let err = publisher
+        .publish_with_headers::<HeadersTopic>(&Order { id: 11 }, headers)
+        .await
+        .expect_err("reserved header must be rejected");
+    assert!(
+        matches!(err, shove::ShoveError::Validation(_)),
+        "expected Validation error, got: {err:?}"
     );
 }
 

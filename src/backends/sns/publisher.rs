@@ -1,3 +1,5 @@
+use aws_sdk_sns::config::http::HttpResponse;
+use aws_sdk_sns::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_sns::types::{MessageAttributeValue, PublishBatchRequestEntry};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,29 +11,12 @@ use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
 use crate::error::{Result, ShoveError};
 use crate::metrics;
-use crate::publisher_internal::validate_headers;
+use crate::publisher_internal::{fnv1a_64, shard_for_key, validate_headers};
 use crate::retry::Backoff;
 use crate::topic::Topic;
 
 /// Maximum number of messages in a single SNS PublishBatch call.
 const SNS_BATCH_LIMIT: usize = 10;
-
-/// FNV-1a 64-bit hash over arbitrary bytes (stable across versions).
-fn fnv1a_64(data: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
-    const FNV_PRIME: u64 = 1099511628211;
-    let mut hash = FNV_OFFSET;
-    for byte in data {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-/// Compute shard index using FNV-1a hash (stable across versions).
-fn compute_shard(key: &str, shards: u16) -> u16 {
-    (fnv1a_64(key.as_bytes()) % shards as u64) as u16
-}
 
 /// Derive a deterministic SNS `MessageDeduplicationId` from the serialised
 /// payload.  Using the same ID for every attempt of the same payload means
@@ -40,6 +25,56 @@ fn compute_shard(key: &str, shards: u16) -> u16 {
 /// already landed at the broker).
 fn content_dedup_id(payload: &str) -> String {
     format!("{:016x}", fnv1a_64(payload.as_bytes()))
+}
+
+/// Whether an SNS service-error code represents a transient failure worth
+/// retrying.
+///
+/// These are AWS *wire* codes as returned by [`ProvideErrorMetadata::code`],
+/// which for SNS's query protocol are the short forms — NOT the Rust variant
+/// names (`InternalErrorException`) and NOT the SQS/JSON-protocol codes
+/// (`RequestThrottled`, `OverLimit`, …). `InternalError` and `KMSThrottling`
+/// are modeled in the `Publish` error set (see the SDK's
+/// `protocol_serde::shape_publish` deserializer); `Throttling`/
+/// `ThrottlingException` cover generic request throttling that surfaces
+/// unmodeled. Everything else (authorization, invalid parameters, topic not
+/// found) is permanent.
+fn is_transient_sns_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("InternalError" | "KMSThrottling" | "Throttling" | "ThrottlingException")
+    )
+}
+
+/// Maps an SNS `SdkError` to the appropriate `ShoveError` variant.
+///
+/// Transport-level failures (timeout, dispatch, response parse) are transient →
+/// `Connection`; construction failures are code/config bugs → `Topology`;
+/// service errors are classified by their AWS wire code via
+/// [`is_transient_sns_code`] so the publish loop can stop retrying permanent
+/// failures early.
+fn map_sns_error<E>(context: &str, e: SdkError<E, HttpResponse>) -> ShoveError
+where
+    E: std::fmt::Debug + std::fmt::Display + ProvideErrorMetadata,
+{
+    match &e {
+        // Transient transport-level errors
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            ShoveError::Connection(format!("{context}: {e}"))
+        }
+        // Construction failures are config/code bugs — permanent
+        SdkError::ConstructionFailure(_) => ShoveError::Topology(format!("{context}: {e}")),
+        // Service errors — classify by AWS wire code
+        SdkError::ServiceError(se) => {
+            if is_transient_sns_code(ProvideErrorMetadata::code(se.err())) {
+                ShoveError::Connection(format!("{context}: {e}"))
+            } else {
+                ShoveError::Topology(format!("{context}: {e}"))
+            }
+        }
+        // SdkError is #[non_exhaustive]; all current variants are handled above.
+        _ => ShoveError::Unknown(format!("unrecognized AWS SDK error in {context}: {e}")),
+    }
 }
 
 /// Convert a `HashMap<String, String>` into SNS message attributes.
@@ -103,7 +138,7 @@ impl SnsPublisher {
                 .message_deduplication_id(content_dedup_id(payload));
 
             if let Some(shards) = routing_shards {
-                let shard = compute_shard(gid, shards);
+                let shard = shard_for_key(gid, shards);
                 let shard_attr = MessageAttributeValue::builder()
                     .data_type("String")
                     .string_value(shard.to_string())
@@ -124,7 +159,7 @@ impl SnsPublisher {
                 metrics::BackendLabel::SnsSqs,
                 metrics::BackendErrorKind::Publish,
             );
-            ShoveError::Connection(format!("SNS publish failed: {e}"))
+            map_sns_error("SNS publish failed", e)
         })?;
 
         Ok(())
@@ -178,6 +213,13 @@ impl SnsPublisher {
                     return Ok(());
                 }
                 Err(e) => {
+                    // Permanent failures (authorization, invalid parameters,
+                    // topic not found) cannot succeed on retry — surface
+                    // immediately instead of sleeping through the remaining
+                    // attempts.
+                    if !e.is_retryable() {
+                        return Err(e);
+                    }
                     warn!(queue_name, attempt, error = %e, "SNS publish failed, retrying");
                     last_err = Some(e);
                     if attempt < 2 {
@@ -261,7 +303,7 @@ impl SnsPublisher {
                         .message_deduplication_id(content_dedup_id(payload));
 
                     if let Some(seq) = topology.sequencing() {
-                        let shard = compute_shard(&keys[i], seq.routing_shards());
+                        let shard = shard_for_key(&keys[i], seq.routing_shards());
                         let shard_attr = MessageAttributeValue::builder()
                             .data_type("String")
                             .string_value(shard.to_string())
@@ -330,10 +372,16 @@ impl SnsPublisher {
                             metrics::BackendLabel::SnsSqs,
                             metrics::BackendErrorKind::Publish,
                         );
-                        let err = ShoveError::Connection(format!("SNS batch publish failed: {e}"));
+                        let err = map_sns_error("SNS batch publish failed", e);
+                        chunk_succeeded = 0;
+                        // Permanent failures (auth, invalid params, topic not
+                        // found) can't succeed on retry — stop early.
+                        if !err.is_retryable() {
+                            chunk_err = Some(err);
+                            break;
+                        }
                         warn!(queue_name, attempt, error = %err, "SNS batch chunk failed, retrying");
                         chunk_err = Some(err);
-                        chunk_succeeded = 0;
                         if attempt < 2 {
                             let delay = backoff.next().expect("backoff is infinite");
                             tokio::time::sleep(delay).await;
@@ -385,6 +433,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transient_sns_codes_are_retryable() {
+        for code in [
+            "InternalError",
+            "KMSThrottling",
+            "Throttling",
+            "ThrottlingException",
+        ] {
+            assert!(
+                is_transient_sns_code(Some(code)),
+                "{code} should be classified transient"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_sns_codes_are_not_retryable() {
+        for code in [
+            "AuthorizationError",
+            "InvalidParameter",
+            "ParameterValueInvalid",
+            "NotFound",
+            "EndpointDisabled",
+            "KMSAccessDenied",
+        ] {
+            assert!(
+                !is_transient_sns_code(Some(code)),
+                "{code} should be classified permanent"
+            );
+        }
+        assert!(!is_transient_sns_code(None));
+    }
+
+    // `ProvideErrorMetadata::code()` returns the AWS wire code, not the Rust
+    // variant name. Guard against regressing to the variant names (or to the
+    // SQS/JSON-protocol codes), which never match a real SNS Publish error and
+    // would silently make transient failures permanent.
+    #[test]
+    fn rust_variant_names_and_sqs_codes_do_not_match() {
+        for code in [
+            "InternalErrorException",  // Rust variant, not the wire code
+            "KMSThrottlingException",  // Rust variant, not the wire code
+            "ThrottledException",      // not in the Publish error set
+            "RequestThrottled",        // SQS code
+            "OverLimit",               // SQS code
+            "KMS.ThrottlingException", // SQS code
+        ] {
+            assert!(
+                !is_transient_sns_code(Some(code)),
+                "{code} is not a real SNS Publish wire code and must not match"
+            );
+        }
+    }
+
+    #[test]
     fn hashmap_to_message_attributes_empty() {
         let attrs = hashmap_to_message_attributes(HashMap::new()).unwrap();
         assert!(attrs.is_empty());
@@ -415,16 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn fnv1a_64_deterministic() {
-        assert_eq!(fnv1a_64(b"hello"), fnv1a_64(b"hello"));
-    }
-
-    #[test]
-    fn fnv1a_64_different_inputs_differ() {
-        assert_ne!(fnv1a_64(b"hello"), fnv1a_64(b"world"));
-    }
-
-    #[test]
     fn content_dedup_id_deterministic() {
         let a = content_dedup_id(r#"{"id":1}"#);
         let b = content_dedup_id(r#"{"id":1}"#);
@@ -443,36 +535,5 @@ mod tests {
         let id = content_dedup_id(r#"{"foo":"bar"}"#);
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn compute_shard_deterministic() {
-        let a = compute_shard("order-123", 8);
-        let b = compute_shard("order-123", 8);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn compute_shard_within_range() {
-        for i in 0..100 {
-            let key = format!("key-{i}");
-            let shard = compute_shard(&key, 4);
-            assert!(shard < 4, "shard {shard} out of range for 4 shards");
-        }
-    }
-
-    #[test]
-    fn compute_shard_distributes() {
-        let mut counts = [0u32; 8];
-        for i in 0..1000 {
-            let shard = compute_shard(&format!("key-{i}"), 8) as usize;
-            counts[shard] += 1;
-        }
-        for (i, count) in counts.iter().enumerate() {
-            assert!(
-                *count > 50,
-                "shard {i} only got {count} messages out of 1000"
-            );
-        }
     }
 }

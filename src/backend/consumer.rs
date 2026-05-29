@@ -1,6 +1,6 @@
 //! Internal `ConsumerImpl` trait. Backend-specific consumer structs
 //! implement this; public harnesses (`ConsumerSupervisor<B>`,
-//! `ConsumerGroup<B>`) delegate here. See DESIGN_V2.md §5.
+//! `ConsumerGroup<B>`) delegate here.
 //!
 //! The trait bound is `H: MessageHandler<T>` — the `ctx: H::Context`
 //! parameter is threaded to every spawned consumer task so handlers with

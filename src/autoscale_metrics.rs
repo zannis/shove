@@ -1,4 +1,4 @@
-//! Honest, partial-data metrics struct for autoscaler inputs. See DESIGN_V2.md §9.1.
+//! Honest, partial-data metrics struct for autoscaler inputs.
 
 use std::time::Duration;
 

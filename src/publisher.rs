@@ -1,4 +1,4 @@
-//! Public `Publisher<B>` wrapper. See DESIGN_V2.md §6.2.
+//! Public `Publisher<B>` wrapper.
 
 use std::collections::HashMap;
 use std::time::Instant;
