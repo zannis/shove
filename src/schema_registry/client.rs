@@ -35,8 +35,8 @@ pub struct SchemaRegistry {
     resolved: DashMap<SchemaId, Arc<CachedSchema>>,
     // Tier 2: in-flight single-flight futures.
     inflight: DashMap<SchemaId, SharedResolve>,
-    // Negative cache: id -> instant inserted.
-    negative: DashMap<SchemaId, std::time::Instant>,
+    // Negative cache: id -> (instant inserted, error that caused the miss).
+    negative: DashMap<SchemaId, (std::time::Instant, SchemaRegistryError)>,
 }
 
 impl SchemaRegistry {
@@ -59,10 +59,11 @@ impl SchemaRegistry {
             return Ok(hit.clone());
         }
         // Negative cache: suppress hammering on a known-bad id within the TTL.
-        if let Some(at) = self.negative.get(&id)
-            && at.elapsed() < self.negative_cache_ttl
-        {
-            return Err(SchemaRegistryError::NotFound(id.0));
+        if let Some(entry) = self.negative.get(&id) {
+            let (at, err) = entry.value();
+            if at.elapsed() < self.negative_cache_ttl {
+                return Err(err.clone());
+            }
         }
         // Tier 2: single-flight — collapse concurrent misses into one fetch.
         let shared = self.shared_fetch(id);
@@ -73,8 +74,11 @@ impl SchemaRegistry {
                 self.inflight.remove(&id);
                 self.negative.remove(&id);
             }
-            Err(_) => {
-                self.negative.insert(id, std::time::Instant::now());
+            Err(e) => {
+                if !e.is_retriable() {
+                    self.negative
+                        .insert(id, (std::time::Instant::now(), e.clone()));
+                }
                 self.inflight.remove(&id);
             }
         }

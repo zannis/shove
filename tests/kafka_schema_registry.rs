@@ -3,12 +3,45 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::{Json, Router, extract::Path, extract::State, routing::get};
+use axum::{Json, Router, extract::Path, extract::State, http::StatusCode, routing::get};
 use shove::schema_registry::{SchemaId, SchemaRegistry};
 
 #[derive(Clone)]
 struct MockState {
     calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct StatusMockState {
+    calls: Arc<AtomicUsize>,
+    status: u16,
+}
+
+async fn status_versions(State(s): State<StatusMockState>, Path(_id): Path<u32>) -> StatusCode {
+    s.calls.fetch_add(1, Ordering::SeqCst);
+    StatusCode::from_u16(s.status).unwrap()
+}
+
+async fn status_schema(State(s): State<StatusMockState>, Path(_id): Path<u32>) -> StatusCode {
+    s.calls.fetch_add(1, Ordering::SeqCst);
+    StatusCode::from_u16(s.status).unwrap()
+}
+
+/// Spawn a mock registry that always returns the given HTTP status, returning (base_url, calls-counter).
+async fn spawn_status_mock(status: u16) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = StatusMockState {
+        calls: calls.clone(),
+        status,
+    };
+    let app = Router::new()
+        .route("/schemas/ids/{id}/versions", get(status_versions))
+        .route("/schemas/ids/{id}", get(status_schema))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
 }
 
 async fn versions(State(s): State<MockState>, Path(_id): Path<u32>) -> Json<serde_json::Value> {
@@ -78,5 +111,41 @@ async fn concurrent_cold_misses_single_flight_to_one_fetch() {
         calls.load(Ordering::SeqCst),
         2,
         "single-flight must collapse to one fetch"
+    );
+}
+
+#[tokio::test]
+async fn not_found_is_negative_cached() {
+    let (url, calls) = spawn_status_mock(404).await;
+    let registry = SchemaRegistry::builder(url).build();
+    // First resolve hits the registry; /versions returns 404 -> NotFound immediately,
+    // without calling /schema. Exactly 1 HTTP call.
+    assert!(registry.resolve(SchemaId(1)).await.is_err());
+    let after_first = calls.load(Ordering::SeqCst);
+    assert_eq!(
+        after_first, 1,
+        "first resolve makes exactly one HTTP call (versions 404)"
+    );
+    // Second resolve within TTL is served from the negative cache: no new HTTP.
+    assert!(registry.resolve(SchemaId(1)).await.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        after_first,
+        "NotFound must be negative-cached"
+    );
+}
+
+#[tokio::test]
+async fn retriable_error_is_not_negative_cached() {
+    let (url, calls) = spawn_status_mock(503).await;
+    // max_retries(0) so a 503 returns immediately as Transport{retriable:true} with no backoff sleep.
+    let registry = SchemaRegistry::builder(url).max_retries(0).build();
+    assert!(registry.resolve(SchemaId(1)).await.is_err());
+    let after_first = calls.load(Ordering::SeqCst);
+    // Second resolve must RETRY (not be suppressed by the negative cache) -> more HTTP calls.
+    assert!(registry.resolve(SchemaId(1)).await.is_err());
+    assert!(
+        calls.load(Ordering::SeqCst) > after_first,
+        "retriable errors must not be negative-cached"
     );
 }
