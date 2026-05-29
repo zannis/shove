@@ -105,6 +105,8 @@ pub(crate) enum FailReason {
     Timeout,
     MaxRetriesExceeded,
     Rejected,
+    SchemaFrame,
+    SchemaValidation,
 }
 
 #[allow(dead_code)]
@@ -117,6 +119,8 @@ impl FailReason {
             FailReason::Timeout => "timeout",
             FailReason::MaxRetriesExceeded => "max_retries_exceeded",
             FailReason::Rejected => "rejected",
+            FailReason::SchemaFrame => "schema_frame",
+            FailReason::SchemaValidation => "schema_validation",
         }
     }
 }

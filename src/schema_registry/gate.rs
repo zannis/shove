@@ -15,7 +15,6 @@ pub enum SchemaEnforcement {
 }
 
 /// What the gate decided.
-#[allow(dead_code)] // Consumed by the decode stage (Task 7).
 #[derive(Debug, PartialEq)]
 pub enum GateOutcome {
     /// Subject accepted (or enforcement permissive) — proceed to decode.
@@ -25,7 +24,6 @@ pub enum GateOutcome {
 }
 
 /// Evaluate the gate for a resolved schema. Pure — no I/O.
-#[allow(dead_code)] // Consumed by the decode stage (Task 7).
 pub fn evaluate(
     schema: &CachedSchema,
     accepted: &[Arc<str>],
@@ -41,7 +39,6 @@ pub fn evaluate(
 }
 
 /// Derive the default accepted subject for a queue (TopicNameStrategy).
-#[allow(dead_code)] // Consumed by the decode stage (Task 7).
 pub fn default_subject(queue: &str) -> Arc<str> {
     Arc::from(format!("{queue}-value"))
 }

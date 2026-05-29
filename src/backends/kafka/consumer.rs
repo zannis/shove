@@ -29,6 +29,13 @@ use crate::{HoldQueue, Kafka, ShoveError};
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
 
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::WireFormat;
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::decode::{RegistryDecode, registry_decode};
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::default_subject;
+
 use super::client::KafkaClient;
 use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
@@ -910,6 +917,17 @@ impl KafkaConsumer {
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_registry = options.schema_registry.clone();
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_enforcement = options.schema_enforcement;
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_accepted: Arc<[Arc<str>]> = options
+            .schema_accepted_subjects
+            .clone()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+
         run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
             let handler = handler.clone();
             let ctx = ctx.clone();
@@ -920,6 +938,10 @@ impl KafkaConsumer {
             let semaphore = semaphore.clone();
             let topic = topic.clone();
             let group = group.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_registry = schema_registry.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_accepted = schema_accepted.clone();
             async move {
                 let consumer = create_stream_consumer(
                     client.base_config(),
@@ -1031,7 +1053,114 @@ impl KafkaConsumer {
                                 continue;
                             }
 
-                            // Deserialize payload; reject to DLQ on failure
+                            // Deserialize payload; reject to DLQ on failure.
+                            // With a schema registry configured, the registry decode
+                            // stage (frame-strip + subject gate + inner codec decode)
+                            // runs in place of the direct codec decode. Without one,
+                            // the direct decode path is byte-for-byte the same as before.
+                            #[cfg(feature = "kafka-schema-registry")]
+                            let payload: T::Message = if let Some(registry) = schema_registry.as_ref() {
+                                let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
+                                let registry_result = match WireFormat::from_codec_name(codec_name) {
+                                    Some(fmt) => registry_decode::<T::Message, T::Codec>(
+                                        registry,
+                                        fmt,
+                                        schema_enforcement,
+                                        &schema_accepted,
+                                        payload_slice,
+                                    ).await,
+                                    None => {
+                                        tracing::error!(
+                                            codec = codec_name,
+                                            queue,
+                                            "codec has no Confluent wire format; routing to DLQ"
+                                        );
+                                        Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+                                    }
+                                };
+                                match registry_result {
+                                    Ok(RegistryDecode::Decoded(m)) => m,
+                                    Ok(RegistryDecode::Dlq(reason)) => {
+                                        metrics::record_failed(
+                                            &topic,
+                                            group.as_deref(),
+                                            metrics::FailReason::SchemaValidation,
+                                        );
+                                        if let Err(dlq_err) = publish_to_dlq(
+                                            &client,
+                                            topology,
+                                            payload_slice,
+                                            key.as_deref(),
+                                            &headers,
+                                            reason,
+                                        ).await {
+                                            tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
+                                        }
+                                        if completion_tx.try_send((partition, offset)).is_err() {
+                                            tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                        }
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            queue,
+                                            "failed to deserialize message, sending to DLQ"
+                                        );
+                                        metrics::record_failed(
+                                            &topic,
+                                            group.as_deref(),
+                                            metrics::FailReason::Deserialize,
+                                        );
+                                        if let Err(dlq_err) = publish_to_dlq(
+                                            &client,
+                                            topology,
+                                            payload_slice,
+                                            key.as_deref(),
+                                            &headers,
+                                            "deserialization_error",
+                                        ).await {
+                                            tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
+                                        }
+                                        if completion_tx.try_send((partition, offset)).is_err() {
+                                            tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                        }
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            queue,
+                                            "failed to deserialize message, sending to DLQ"
+                                        );
+                                        metrics::record_failed(
+                                            &topic,
+                                            group.as_deref(),
+                                            metrics::FailReason::Deserialize,
+                                        );
+                                        if let Err(dlq_err) = publish_to_dlq(
+                                            &client,
+                                            topology,
+                                            payload_slice,
+                                            key.as_deref(),
+                                            &headers,
+                                            "deserialization_error",
+                                        ).await {
+                                            tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
+                                        }
+                                        if completion_tx.try_send((partition, offset)).is_err() {
+                                            tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                        }
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            #[cfg(not(feature = "kafka-schema-registry"))]
                             let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
                                 Ok(m) => m,
                                 Err(e) => {
@@ -1238,6 +1367,17 @@ impl KafkaConsumer {
         let topic: Arc<str> = Arc::from(queue.as_str());
         let group: Option<Arc<str>> = options.consumer_group.clone();
 
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_registry = options.schema_registry.clone();
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_enforcement = options.schema_enforcement;
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_accepted: Arc<[Arc<str>]> = options
+            .schema_accepted_subjects
+            .clone()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from(vec![default_subject(&queue)]));
+
         tracing::info!(queue, group_id, max_retries, "Kafka FIFO consumer started");
 
         let shard_task = tokio::spawn(async move {
@@ -1251,6 +1391,10 @@ impl KafkaConsumer {
                 let queue = queue.clone();
                 let topic = topic.clone();
                 let group = group.clone();
+                #[cfg(feature = "kafka-schema-registry")]
+                let schema_registry = schema_registry.clone();
+                #[cfg(feature = "kafka-schema-registry")]
+                let schema_accepted = schema_accepted.clone();
                 async move {
                     let consumer = create_stream_consumer(
                         client.base_config(),
@@ -1320,7 +1464,107 @@ impl KafkaConsumer {
                                     continue;
                                 }
 
-                                // Deserialize payload; reject to DLQ on failure
+                                // Deserialize payload; reject to DLQ on failure.
+                                // With a schema registry configured, the registry decode
+                                // stage runs in place of the direct codec decode; without
+                                // one the direct decode path is unchanged.
+                                #[cfg(feature = "kafka-schema-registry")]
+                                let payload: T::Message = if let Some(registry) = schema_registry.as_ref() {
+                                    let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
+                                    let registry_result = match WireFormat::from_codec_name(codec_name) {
+                                        Some(fmt) => registry_decode::<T::Message, T::Codec>(
+                                            registry,
+                                            fmt,
+                                            schema_enforcement,
+                                            &schema_accepted,
+                                            payload_bytes,
+                                        ).await,
+                                        None => {
+                                            tracing::error!(
+                                                codec = codec_name,
+                                                queue,
+                                                "codec has no Confluent wire format; routing to DLQ"
+                                            );
+                                            Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+                                        }
+                                    };
+                                    match registry_result {
+                                        Ok(RegistryDecode::Decoded(m)) => m,
+                                        Ok(RegistryDecode::Dlq(reason)) => {
+                                            metrics::record_failed(
+                                                &topic,
+                                                group.as_deref(),
+                                                metrics::FailReason::SchemaValidation,
+                                            );
+                                            if let Err(dlq_err) = publish_to_dlq(
+                                                &client,
+                                                topology,
+                                                payload_bytes,
+                                                key.as_deref(),
+                                                &headers,
+                                                reason,
+                                            ).await {
+                                                tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
+                                            }
+                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                error = %e,
+                                                queue,
+                                                "failed to deserialize FIFO message, sending to DLQ"
+                                            );
+                                            metrics::record_failed(
+                                                &topic,
+                                                group.as_deref(),
+                                                metrics::FailReason::Deserialize,
+                                            );
+                                            if let Err(dlq_err) = publish_to_dlq(
+                                                &client,
+                                                topology,
+                                                payload_bytes,
+                                                key.as_deref(),
+                                                &headers,
+                                                "deserialization_error",
+                                            ).await {
+                                                tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
+                                            }
+                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
+                                        Ok(m) => m,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                error = %e,
+                                                queue,
+                                                "failed to deserialize FIFO message, sending to DLQ"
+                                            );
+                                            metrics::record_failed(
+                                                &topic,
+                                                group.as_deref(),
+                                                metrics::FailReason::Deserialize,
+                                            );
+                                            if let Err(dlq_err) = publish_to_dlq(
+                                                &client,
+                                                topology,
+                                                payload_bytes,
+                                                key.as_deref(),
+                                                &headers,
+                                                "deserialization_error",
+                                            ).await {
+                                                tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
+                                            }
+                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                            continue;
+                                        }
+                                    }
+                                };
+
+                                #[cfg(not(feature = "kafka-schema-registry"))]
                                 let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
                                     Ok(m) => m,
                                     Err(e) => {
@@ -1517,6 +1761,17 @@ impl KafkaConsumer {
         // rather than the DEFAULT_MAX_MESSAGE_SIZE constant.
         let max_message_size = options.max_message_size;
 
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_registry = options.schema_registry.clone();
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_enforcement = options.schema_enforcement;
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_accepted: Arc<[Arc<str>]> = options
+            .schema_accepted_subjects
+            .clone()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from(vec![default_subject(dlq)]));
+
         tracing::info!(dlq, group_id = dlq_group_id, "Kafka DLQ consumer started");
 
         run_with_reconnect(&shutdown, dlq, None, || {
@@ -1525,6 +1780,10 @@ impl KafkaConsumer {
             let client_clone = client.clone();
             let shutdown = shutdown.clone();
             let dlq_group_id = dlq_group_id.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_registry = schema_registry.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_accepted = schema_accepted.clone();
             async move {
                 // DLQ consumers always drain from the earliest available
                 // offset — skipping dead messages on a tail-only join would
@@ -1582,7 +1841,69 @@ impl KafkaConsumer {
                                 continue;
                             }
 
-                            // Deserialize payload; on failure, log and ack anyway
+                            // Deserialize payload; on failure, log and ack anyway.
+                            // With a schema registry configured, the registry decode
+                            // stage runs in place of the direct codec decode. The DLQ
+                            // consumer never re-publishes — an undecodable dead message
+                            // is logged and acked, exactly as before. Without a registry
+                            // the direct decode path is unchanged.
+                            #[cfg(feature = "kafka-schema-registry")]
+                            let payload: T::Message = if let Some(registry) = schema_registry.as_ref() {
+                                let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
+                                let registry_result = match WireFormat::from_codec_name(codec_name) {
+                                    Some(fmt) => registry_decode::<T::Message, T::Codec>(
+                                        registry,
+                                        fmt,
+                                        schema_enforcement,
+                                        &schema_accepted,
+                                        payload_bytes,
+                                    ).await,
+                                    None => {
+                                        tracing::error!(
+                                            codec = codec_name,
+                                            dlq,
+                                            "codec has no Confluent wire format; acking dead message anyway"
+                                        );
+                                        Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+                                    }
+                                };
+                                match registry_result {
+                                    Ok(RegistryDecode::Decoded(m)) => m,
+                                    Ok(RegistryDecode::Dlq(reason)) => {
+                                        tracing::error!(
+                                            reason,
+                                            dlq,
+                                            "schema decode rejected dead message, acking anyway"
+                                        );
+                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            dlq,
+                                            "failed to deserialize DLQ message, acking anyway"
+                                        );
+                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            dlq,
+                                            "failed to deserialize DLQ message, acking anyway"
+                                        );
+                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            #[cfg(not(feature = "kafka-schema-registry"))]
                             let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(payload_bytes) {
                                 Ok(m) => m,
                                 Err(e) => {

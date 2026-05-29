@@ -10,6 +10,7 @@
 //! Enable with the `kafka-schema-registry` feature.
 
 mod client;
+pub(crate) mod decode;
 mod error;
 mod gate;
 mod schema;
@@ -18,5 +19,6 @@ mod wire;
 pub use client::{SchemaRegistry, SchemaRegistryAuth, SchemaRegistryBuilder};
 pub use error::SchemaRegistryError;
 pub use gate::SchemaEnforcement;
+pub(crate) use gate::default_subject;
 pub use schema::{CachedSchema, SchemaType};
 pub use wire::{FrameResult, SchemaId, WireFormat};
