@@ -1,7 +1,7 @@
 //! Structured errors for the schema registry client.
 
 /// Errors from resolving a schema against the registry.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SchemaRegistryError {
     /// The schema id is unknown to the registry (HTTP 404 / 40403).
     #[error("schema id {0} not found in registry")]

@@ -44,3 +44,39 @@ async fn resolve_returns_subject_and_type() {
     let resolved = registry.resolve(SchemaId(1)).await.unwrap();
     assert_eq!(resolved.primary_subject(), Some("orders-value"));
 }
+
+#[tokio::test]
+async fn second_resolve_is_served_from_cache() {
+    let (url, calls) = spawn_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+    registry.resolve(SchemaId(1)).await.unwrap();
+    let after_first = calls.load(Ordering::SeqCst);
+    registry.resolve(SchemaId(1)).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        after_first,
+        "cache hit must not call registry"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_cold_misses_single_flight_to_one_fetch() {
+    let (url, calls) = spawn_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let r = registry.clone();
+        handles.push(tokio::spawn(async move {
+            r.resolve(SchemaId(9)).await.unwrap()
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    // /versions + /schema = 2 HTTP calls for exactly one fetch.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "single-flight must collapse to one fetch"
+    );
+}

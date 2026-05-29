@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Shared};
 
 use crate::retry::Backoff;
@@ -29,16 +30,12 @@ pub struct SchemaRegistry {
     http: reqwest::Client,
     auth: SchemaRegistryAuth,
     max_retries: u32,
-    #[allow(dead_code)] // Used by the cache layer (Task 4).
     negative_cache_ttl: Duration,
     // Tier 1: resolved schemas, immutable by id.
-    #[allow(dead_code)] // Used by the cache layer (Task 4).
     resolved: DashMap<SchemaId, Arc<CachedSchema>>,
-    // Tier 2: in-flight single-flight futures (added in Task 4).
-    #[allow(dead_code)] // Used by the cache layer (Task 4).
+    // Tier 2: in-flight single-flight futures.
     inflight: DashMap<SchemaId, SharedResolve>,
-    // Negative cache: id -> instant inserted (Task 4).
-    #[allow(dead_code)] // Used by the cache layer (Task 4).
+    // Negative cache: id -> instant inserted.
     negative: DashMap<SchemaId, std::time::Instant>,
 }
 
@@ -54,13 +51,66 @@ impl SchemaRegistry {
         }
     }
 
-    /// Resolve a schema by id. Task 4 adds caching + single-flight; this base
-    /// version always performs the HTTP fetch.
+    /// Resolve a schema by id. Serves from cache on second call; collapses
+    /// concurrent cold misses into a single HTTP fetch via single-flight.
     pub async fn resolve(&self, id: SchemaId) -> Result<Arc<CachedSchema>> {
-        self.fetch(id).await
+        // Tier 1: resolved cache (lock-free read, no await).
+        if let Some(hit) = self.resolved.get(&id) {
+            return Ok(hit.clone());
+        }
+        // Negative cache: suppress hammering on a known-bad id within the TTL.
+        if let Some(at) = self.negative.get(&id)
+            && at.elapsed() < self.negative_cache_ttl
+        {
+            return Err(SchemaRegistryError::NotFound(id.0));
+        }
+        // Tier 2: single-flight — collapse concurrent misses into one fetch.
+        let shared = self.shared_fetch(id);
+        let result = shared.await;
+        match &result {
+            Ok(schema) => {
+                self.resolved.insert(id, schema.clone());
+                self.inflight.remove(&id);
+                self.negative.remove(&id);
+            }
+            Err(_) => {
+                self.negative.insert(id, std::time::Instant::now());
+                self.inflight.remove(&id);
+            }
+        }
+        result
     }
 
-    async fn fetch(&self, id: SchemaId) -> Result<Arc<CachedSchema>> {
+    fn shared_fetch(&self, id: SchemaId) -> SharedResolve {
+        use dashmap::mapref::entry::Entry;
+        match self.inflight.entry(id) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(e) => {
+                let ctx = FetchCtx {
+                    base_url: self.base_url.clone(),
+                    http: self.http.clone(),
+                    auth: self.auth.clone(),
+                    max_retries: self.max_retries,
+                };
+                let fut = async move { ctx.fetch(id).await };
+                let shared: SharedResolve = fut.boxed().shared();
+                e.insert(shared.clone());
+                shared
+            }
+        }
+    }
+}
+
+/// Owned context for a single boxed fetch future, ensuring `Send + 'static`.
+struct FetchCtx {
+    base_url: Arc<str>,
+    http: reqwest::Client,
+    auth: SchemaRegistryAuth,
+    max_retries: u32,
+}
+
+impl FetchCtx {
+    async fn fetch(self, id: SchemaId) -> Result<Arc<CachedSchema>> {
         let versions = self.get_versions(id).await?;
         let (raw, schema_type) = self.get_schema(id).await?;
         Ok(Arc::new(CachedSchema {
