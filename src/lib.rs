@@ -163,6 +163,9 @@ pub mod metrics;
 pub mod outcome;
 pub mod publisher;
 pub(crate) mod publisher_internal;
+#[cfg(feature = "kafka-schema-registry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
+pub mod schema_registry;
 pub mod topic;
 pub mod topology;
 pub mod topology_declarer;

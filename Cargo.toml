@@ -59,6 +59,11 @@ kafka-ssl = ["kafka", "rdkafka?/ssl", "rdkafka?/sasl"]
 # signed against `kafka-cluster:Connect`. Implies TLS.
 kafka-msk-iam = ["kafka-ssl", "dep:aws-config", "dep:aws-credential-types", "dep:aws-msk-iam-sasl-signer"]
 
+# Confluent Schema Registry decode for Kafka consumers. Adds an async, cached
+# registry client and an opt-in decode stage that strips the Confluent wire
+# frame and validates schema identity before delegating to the topic's codec.
+kafka-schema-registry = ["kafka", "dep:reqwest", "dep:dashmap", "dep:futures-util"]
+
 # In-process backend
 inmemory = ["dep:dashmap"]
 
