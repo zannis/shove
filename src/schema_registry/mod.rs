@@ -9,6 +9,10 @@
 //!
 //! Enable with the `kafka-schema-registry` feature.
 
+mod error;
+mod schema;
 mod wire;
 
+pub use error::SchemaRegistryError;
+pub use schema::{CachedSchema, SchemaType};
 pub use wire::{FrameResult, SchemaId, WireFormat};
