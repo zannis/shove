@@ -15,6 +15,8 @@ use crate::consumer::{
     validate_message_size,
 };
 use crate::error::Result;
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 
 #[derive(Clone)]
 #[allow(dead_code)] // Fields are read by backend consumers behind feature gates.
@@ -47,6 +49,19 @@ pub(crate) struct ConsumerOptionsInner {
     #[cfg(feature = "kafka")]
     pub kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
 
+    /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
+    /// messages. `None` disables registry-based decoding.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub schema_registry: Option<Arc<SchemaRegistry>>,
+    /// Kafka-only: how subject mismatches are handled. Default `Enforce`.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub schema_enforcement: SchemaEnforcement,
+    /// Kafka-only: accepted subject set. `None` derives `["{queue}-value"]` at
+    /// decode time.
+    // Read by the decode stage (Task 7).
+    #[cfg(feature = "kafka-schema-registry")]
+    pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
+
     #[cfg(feature = "rabbitmq-transactional")]
     pub exactly_once: bool,
     #[cfg(feature = "aws-sns-sqs")]
@@ -77,6 +92,12 @@ impl ConsumerOptionsInner {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted_subjects: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]

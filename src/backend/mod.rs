@@ -87,6 +87,9 @@ mod bounds_smoke {
     // backend feature enabled these imports go unused.
     #[allow(unused_imports)]
     use crate::markers::*;
+    #[cfg(feature = "kafka-schema-registry")]
+    #[allow(unused_imports)]
+    use crate::schema_registry::SchemaEnforcement;
     #[allow(unused_imports)]
     use crate::{MessageMetadata, QueueTopology, SupervisorOutcome};
     #[allow(unused_imports)]
@@ -211,6 +214,12 @@ mod bounds_smoke {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted_subjects: None,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: false,
             #[cfg(feature = "aws-sns-sqs")]
