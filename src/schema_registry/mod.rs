@@ -9,10 +9,12 @@
 //!
 //! Enable with the `kafka-schema-registry` feature.
 
+mod client;
 mod error;
 mod schema;
 mod wire;
 
+pub use client::{SchemaRegistry, SchemaRegistryAuth, SchemaRegistryBuilder};
 pub use error::SchemaRegistryError;
 pub use schema::{CachedSchema, SchemaType};
 pub use wire::{FrameResult, SchemaId, WireFormat};

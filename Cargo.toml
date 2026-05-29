@@ -124,6 +124,7 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 metrics-util = "0.20"
 libc = "0.2"
+axum = "0.8"
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 mach2 = "0.6"
 
