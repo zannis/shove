@@ -6,6 +6,8 @@ use std::time::Duration;
 use dashmap::DashMap;
 use futures_util::future::{BoxFuture, Shared};
 
+use crate::retry::Backoff;
+
 use super::error::SchemaRegistryError;
 use super::schema::{CachedSchema, SchemaType};
 use super::wire::SchemaId;
@@ -38,8 +40,6 @@ pub struct SchemaRegistry {
     // Negative cache: id -> instant inserted (Task 4).
     #[allow(dead_code)] // Used by the cache layer (Task 4).
     negative: DashMap<SchemaId, std::time::Instant>,
-    #[cfg(test)]
-    pub(crate) http_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SchemaRegistry {
@@ -61,10 +61,6 @@ impl SchemaRegistry {
     }
 
     async fn fetch(&self, id: SchemaId) -> Result<Arc<CachedSchema>> {
-        #[cfg(test)]
-        self.http_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
         let versions = self.get_versions(id).await?;
         let (raw, schema_type) = self.get_schema(id).await?;
         Ok(Arc::new(CachedSchema {
@@ -108,6 +104,7 @@ impl SchemaRegistry {
 
     async fn get_json(&self, url: &str, id: SchemaId) -> Result<serde_json::Value> {
         let mut attempt = 0;
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(5));
         loop {
             let mut req = self.http.get(url);
             req = match &self.auth {
@@ -148,6 +145,10 @@ impl SchemaRegistry {
                     }
                 }
             }
+            let delay = backoff
+                .next()
+                .expect("backoff iterator is infinite; this is a bug");
+            tokio::time::sleep(delay).await;
             attempt += 1;
         }
     }
@@ -193,8 +194,6 @@ impl SchemaRegistryBuilder {
             resolved: DashMap::new(),
             inflight: DashMap::new(),
             negative: DashMap::new(),
-            #[cfg(test)]
-            http_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 }
