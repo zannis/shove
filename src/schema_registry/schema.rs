@@ -80,4 +80,23 @@ mod tests {
             SchemaType::Protobuf
         );
     }
+
+    #[test]
+    fn schema_type_maps_json() {
+        assert_eq!(SchemaType::from_registry(Some("JSON")), SchemaType::Json);
+    }
+
+    #[test]
+    fn primary_subject_returns_first() {
+        let s = schema(&[("x", 1), ("y", 2)]);
+        assert_eq!(s.primary_subject(), Some("x"));
+
+        let empty = CachedSchema {
+            id: 2,
+            schema_type: SchemaType::Avro,
+            raw: Arc::from("{}"),
+            subjects: Vec::new().into(),
+        };
+        assert_eq!(empty.primary_subject(), None);
+    }
 }

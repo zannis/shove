@@ -50,4 +50,13 @@ mod tests {
     fn not_found_is_not_retriable() {
         assert!(!SchemaRegistryError::NotFound(7).is_retriable());
     }
+
+    #[test]
+    fn transport_non_retriable_is_not_retriable() {
+        let e = SchemaRegistryError::Transport {
+            retriable: false,
+            message: "400".into(),
+        };
+        assert!(!e.is_retriable());
+    }
 }
