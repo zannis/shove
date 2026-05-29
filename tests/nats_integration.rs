@@ -823,6 +823,71 @@ async fn max_retries_sends_to_dlq() {
     dlq_handle.await.unwrap().ok();
 }
 
+// `max_retries = N` must allow 1 initial attempt + N retries before the
+// message is dead-lettered (the documented contract). With max_retries=2 the
+// handler runs exactly 3 times.
+#[tokio::test]
+async fn max_retries_allows_initial_plus_n_retries() {
+    struct CountingRetry(WaitableCounter);
+    impl MessageHandler<WorkTopic> for CountingRetry {
+        type Context = ();
+        async fn handle(&self, _: SimpleMessage, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.increment();
+            Outcome::Retry
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "retry-cap".into(),
+            content: "exhaust retries".into(),
+        })
+        .await
+        .unwrap();
+
+    let counter = WaitableCounter::new();
+    let handler = CountingRetry(counter.clone());
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<WorkTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(2)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+
+    // 1 initial + 2 retries = 3 attempts, then DLQ.
+    assert!(
+        counter.wait_for(3, Duration::from_secs(30)).await,
+        "should reach 3 attempts"
+    );
+    // Allow any erroneous 4th redelivery to surface before asserting.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        counter.get(),
+        3,
+        "max_retries=2 must allow 1 initial + 2 retries = 3 attempts before DLQ"
+    );
+
+    shutdown.cancel();
+    broker.close().await;
+    handle.await.unwrap().ok();
+}
+
 // ===========================================================================
 // Defer mechanism
 // ===========================================================================
@@ -2090,8 +2155,9 @@ async fn run_fifo_until_timeout_observes_handler_panic() {
     }
 
     let consumer = NatsConsumer::new(client.clone());
-    // max_retries=1 so the message is dispatched once (retry_count 0 < 1),
-    // panics (Retry), then redelivered with retry_count=1 >= max_retries -> DLQ.
+    // max_retries=1: dispatched at retry_count 0 (0 < 1) where it panics
+    // (Retry) and is republished, then dispatched again at retry_count 1 where
+    // 1 >= max_retries routes it to the DLQ.
     let opts = ConsumerOptions::<Nats>::new().with_max_retries(1);
 
     // Generous signal — give the shard time to pull the message, panic, and DLQ it.
