@@ -17,6 +17,8 @@ use crate::consumer_supervisor::ShutdownTally;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
@@ -78,6 +80,18 @@ pub struct KafkaConsumerGroupConfig {
     /// of `Earliest` (replay history). Override to `Latest` for tail-only
     /// consumers or to `None` to refuse silent replay/skip on a fresh group.
     auto_offset_reset: Option<KafkaAutoOffsetReset>,
+
+    /// Schema Registry client shared across every consumer spawned by this
+    /// group. `None` disables registry-based decoding for the group.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) schema_registry: Option<Arc<SchemaRegistry>>,
+    /// How subject mismatches are handled for this group. Default `Enforce`.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) schema_enforcement: SchemaEnforcement,
+    /// Accepted subject set for this group. `None` derives `["{queue}-value"]`
+    /// at decode time.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) schema_accepted_subjects: Option<Vec<Arc<str>>>,
 }
 
 impl Default for KafkaConsumerGroupConfig {
@@ -113,6 +127,12 @@ impl KafkaConsumerGroupConfig {
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             group_id: None,
             auto_offset_reset: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted_subjects: None,
         }
     }
 
@@ -184,6 +204,44 @@ impl KafkaConsumerGroupConfig {
     /// should apply.
     pub fn auto_offset_reset(&self) -> Option<KafkaAutoOffsetReset> {
         self.auto_offset_reset
+    }
+
+    /// Set the Schema Registry client for this consumer group.
+    ///
+    /// Every consumer spawned by the group shares the same `Arc<SchemaRegistry>`,
+    /// so the in-memory schema cache is shared across the whole group rather than
+    /// duplicated per consumer.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn with_schema_registry(mut self, registry: Arc<SchemaRegistry>) -> Self {
+        self.schema_registry = Some(registry);
+        self
+    }
+
+    /// Override the schema-enforcement policy for this consumer group.
+    ///
+    /// Defaults to [`SchemaEnforcement::Enforce`] (subject mismatches route
+    /// messages to the DLQ). Set to [`SchemaEnforcement::Permissive`] to log
+    /// and count mismatches without rejecting.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn with_schema_enforcement(mut self, enforcement: SchemaEnforcement) -> Self {
+        self.schema_enforcement = enforcement;
+        self
+    }
+
+    /// Restrict accepted Confluent schema subjects for this consumer group.
+    ///
+    /// When set, only messages whose registered subject matches one of the
+    /// supplied values are accepted; mismatches are handled according to the
+    /// configured [`SchemaEnforcement`] policy. When unset (the default), the
+    /// subject `"{queue}-value"` is derived at decode time.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn accept_schema_subjects<I, S>(mut self, subjects: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Arc<str>>,
+    {
+        self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
     }
 
     pub fn prefetch_count(&self) -> u16 {
@@ -557,6 +615,12 @@ impl KafkaConsumerGroup {
             options.kafka_group_id = Some(Arc::from(gid.as_str()));
         }
         options.kafka_auto_offset_reset = self.config.auto_offset_reset;
+        #[cfg(feature = "kafka-schema-registry")]
+        {
+            options.schema_registry = self.config.schema_registry.clone();
+            options.schema_enforcement = self.config.schema_enforcement;
+            options.schema_accepted_subjects = self.config.schema_accepted_subjects.clone();
+        }
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
@@ -1187,5 +1251,38 @@ mod tests {
             fifo_group_id,
             super::super::constants::consumer_group_id("orders")
         );
+    }
+
+    // -- schema-registry group config (Task 8) --
+
+    #[cfg(feature = "kafka-schema-registry")]
+    mod schema_registry_group_config {
+        use super::*;
+        use crate::schema_registry::SchemaEnforcement;
+
+        #[test]
+        fn schema_enforcement_default_is_enforce() {
+            let cfg = KafkaConsumerGroupConfig::new(1..=1);
+            assert_eq!(cfg.schema_enforcement, SchemaEnforcement::Enforce);
+            assert!(cfg.schema_registry.is_none());
+            assert!(cfg.schema_accepted_subjects.is_none());
+        }
+
+        #[test]
+        fn with_schema_enforcement_permissive_stores_permissive() {
+            let cfg = KafkaConsumerGroupConfig::new(1..=1)
+                .with_schema_enforcement(SchemaEnforcement::Permissive);
+            assert_eq!(cfg.schema_enforcement, SchemaEnforcement::Permissive);
+        }
+
+        #[test]
+        fn accept_schema_subjects_stores_subjects() {
+            let cfg = KafkaConsumerGroupConfig::new(1..=1)
+                .accept_schema_subjects(["orders-value", "orders-dlq-value"]);
+            let subjects = cfg.schema_accepted_subjects.as_deref().unwrap();
+            assert_eq!(subjects.len(), 2);
+            assert!(subjects.iter().any(|s| s.as_ref() == "orders-value"));
+            assert!(subjects.iter().any(|s| s.as_ref() == "orders-dlq-value"));
+        }
     }
 }
