@@ -1,0 +1,101 @@
+# Kafka — Schema Registry
+
+Configure a Kafka consumer to decode [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/index.html)-framed messages. On each message the consumer strips the wire frame (magic byte `0x00` + big-endian schema id), resolves the schema from the registry (cached in memory), validates the schema subject against the accepted set, then delegates to the topic's `Codec` for the actual payload decode.
+
+Works with the Confluent Schema Registry and with **Redpanda's built-in Schema Registry** — both expose the same REST API and wire format.
+
+## Prerequisites
+
+- Cargo features: `kafka-schema-registry` (implies `kafka`)
+- A running Confluent-compatible Schema Registry (Confluent, Redpanda, or compatible)
+- Topics must use `JsonCodec` or `ProtobufCodec`; other codecs are not supported
+
+## Install
+
+```sh
+cargo add shove --features kafka-schema-registry
+```
+
+## Build the registry client
+
+```rust,no_run
+use std::time::Duration;
+use shove::schema_registry::{SchemaRegistry, SchemaRegistryAuth};
+
+let registry = SchemaRegistry::builder("http://schema-registry:8081")
+    .auth(SchemaRegistryAuth::Basic {
+        user: "sr-user".into(),
+        pass: "sr-pass".into(),
+    })
+    .timeout(Duration::from_secs(3))
+    .max_retries(2)
+    .negative_cache_ttl(Duration::from_secs(60))
+    .build();
+```
+
+`build()` returns `Arc<SchemaRegistry>`. Clone the `Arc` to share the same schema cache across consumers or a consumer group.
+
+Auth options:
+
+| Variant | Use |
+|---------|-----|
+| `SchemaRegistryAuth::None` | No authentication (default) |
+| `SchemaRegistryAuth::Bearer(token)` | `Authorization: Bearer <token>` |
+| `SchemaRegistryAuth::Basic { user, pass }` | HTTP Basic auth |
+
+## Per-consumer setup
+
+```rust,no_run
+use std::sync::Arc;
+use shove::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use shove::consumer::ConsumerOptions;
+use shove::markers::Kafka;
+
+let registry = SchemaRegistry::builder("http://schema-registry:8081").build();
+
+let opts = ConsumerOptions::<Kafka>::new()
+    .with_schema_registry(Arc::clone(&registry))
+    .with_schema_enforcement(SchemaEnforcement::Enforce)
+    .accept_schema_subjects(["orders-value"]);
+```
+
+## Per-consumer-group setup
+
+Attaching the registry on `KafkaConsumerGroupConfig` shares one `Arc` — and therefore one schema cache — across the whole autoscaling group:
+
+```rust,no_run
+use std::sync::Arc;
+use shove::kafka::KafkaConsumerGroupConfig;
+use shove::schema_registry::{SchemaEnforcement, SchemaRegistry};
+
+let registry = SchemaRegistry::builder("http://schema-registry:8081").build();
+
+let cfg = KafkaConsumerGroupConfig::new(1..=8)
+    .with_schema_registry(Arc::clone(&registry))
+    .with_schema_enforcement(SchemaEnforcement::Enforce)
+    .accept_schema_subjects(["orders-value"]);
+```
+
+## Enforcement modes
+
+`SchemaEnforcement` controls what happens when a message's registered subject is not in the accepted set:
+
+- **`Enforce`** (default) — the message is routed to the DLQ with death reason `schema_validation_failed`. Use this in production where a subject mismatch is a producer misconfiguration.
+- **`Permissive`** — the mismatch is logged and counted; the message is still decoded. Use this during migration windows or when producers share a topic with different subject conventions.
+
+## Accepted subjects
+
+`accept_schema_subjects([...])` pins the set of Confluent schema subjects the consumer will accept. When not set, the default follows the Confluent [TopicNameStrategy](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#subject-name-strategy): `"{queue}-value"`. For a topic named `orders` that resolves to `orders-value`.
+
+## DLQ consumer caveat
+
+:::warning
+If you enable registry decoding on the consumer that drains the DLQ (`handle_dead` path), any dead message that cannot be resolved or validated by the registry cannot be delivered to `handle_dead`. Such messages are acked-and-dropped, matching the existing behavior for undecodable dead messages. To avoid this, omit the registry on the DLQ consumer, or set `SchemaEnforcement::Permissive` so subject mismatches do not block delivery.
+:::
+
+## What to try next
+
+- Change `SchemaEnforcement::Enforce` to `SchemaEnforcement::Permissive` and verify that subject-mismatched messages reach your handler rather than the DLQ.
+- Share one `Arc<SchemaRegistry>` across two different `ConsumerGroupConfig` registrations to confirm they hit the same cache.
+- Point `SchemaRegistry::builder` at a Redpanda broker URL to confirm Redpanda Schema Registry compatibility.
+- See the [Kafka backend overview](/backends/kafka#schema-registry) for the full configuration reference.
