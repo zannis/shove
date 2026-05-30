@@ -1084,7 +1084,7 @@ impl KafkaConsumer {
                                         metrics::record_failed(
                                             &topic,
                                             group.as_deref(),
-                                            metrics::FailReason::SchemaValidation,
+                                            metrics::FailReason::for_schema_reason(reason),
                                         );
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &client,
@@ -1494,7 +1494,7 @@ impl KafkaConsumer {
                                             metrics::record_failed(
                                                 &topic,
                                                 group.as_deref(),
-                                                metrics::FailReason::SchemaValidation,
+                                                metrics::FailReason::for_schema_reason(reason),
                                             );
                                             if let Err(dlq_err) = publish_to_dlq(
                                                 &client,
