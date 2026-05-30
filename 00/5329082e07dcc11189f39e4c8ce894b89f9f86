@@ -1,0 +1,27 @@
+docs/pages/backends/kafka.mdx
+  s_78028e7db402f2::t_5989b863771084 287-288
+  s_78028e7db402f2::t_cfcd3a511773eb 308
+  s_78028e7db402f2::t_96aa91d188d677 183-277
+docs/pages/backends/kafka/examples/schema-registry.mdx
+  s_78028e7db402f2::t_ba31cf966ca538 1-101
+src/schema_registry/mod.rs
+  s_78028e7db402f2::t_f0ff2814958e7b 3,10-13,15-44
+Cargo.toml
+  s_78028e7db402f2::t_ddcfb8cfc22fb6 11-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "005329082e07dcc11189f39e4c8ce894b89f9f86",
+  "prompts": {},
+  "sessions": {
+    "s_78028e7db402f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5a2d892-7f72-4ef5-af98-690e967d2b90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
