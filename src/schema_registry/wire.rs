@@ -45,7 +45,6 @@ pub enum FrameResult<'a> {
 }
 
 /// Read a base-128 varint, returning (value, bytes_consumed). `None` if truncated.
-#[allow(dead_code)] // Consumed by the consumer decode stage (added in a later task); allow until then.
 fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift = 0u32;
@@ -67,7 +66,6 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 }
 
 /// Parse the Confluent frame for the given wire format.
-#[allow(dead_code)] // Consumed by the consumer decode stage (added in a later task); allow until then.
 pub fn parse_frame(format: WireFormat, bytes: &[u8]) -> FrameResult<'_> {
     if bytes.is_empty() {
         return FrameResult::Null;
@@ -93,7 +91,6 @@ pub fn parse_frame(format: WireFormat, bytes: &[u8]) -> FrameResult<'_> {
 }
 
 /// Skip the protobuf message-index array, returning the proto bytes after it.
-#[allow(dead_code)] // Consumed by the consumer decode stage (added in a later task); allow until then.
 fn skip_message_indexes(bytes: &[u8]) -> Option<&[u8]> {
     let (count, mut off) = read_varint(bytes)?;
     if count == 0 {
