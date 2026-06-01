@@ -248,6 +248,11 @@ path = "examples/kafka/stress.rs"
 required-features = ["kafka"]
 
 [[example]]
+name = "kafka_burst_autoscale"
+path = "examples/kafka/burst_autoscale.rs"
+required-features = ["kafka"]
+
+[[example]]
 name = "kafka_audited_consumer"
 path = "examples/kafka/audited_consumer.rs"
 required-features = ["kafka", "audit"]
