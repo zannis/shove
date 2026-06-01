@@ -1,0 +1,22 @@
+Cargo.toml
+  s_d6190716ba0fb6::t_7088150f621cb1 251-254
+examples/kafka/burst_autoscale.rs
+  s_d6190716ba0fb6::t_8a0796038ae848 1-299,301-983
+  s_d6190716ba0fb6::t_1fcab892dacfa8 300
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b97e5fd7b6bfe4ad37392e04427b436847dfb846",
+  "prompts": {},
+  "sessions": {
+    "s_d6190716ba0fb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999441ed-0690-4ce5-9ee8-ecbc8972197f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
