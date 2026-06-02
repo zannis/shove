@@ -7,12 +7,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerOptionsInner};
 use crate::error::{Result, ShoveError};
+#[cfg(feature = "kafka-schema-registry")]
+use crate::markers::Kafka;
 #[cfg(feature = "nats")]
 use crate::markers::Nats;
 #[cfg(feature = "rabbitmq")]
 use crate::markers::RabbitMq;
 #[cfg(feature = "aws-sns-sqs")]
 use crate::markers::Sqs;
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 
 /// Default maximum message payload size: 10 MiB.
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -189,6 +193,21 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
     pub max_ack_pending: Option<i64>,
 
+    /// Kafka-only: Schema Registry client for decoding Confluent wire-framed
+    /// messages. `None` disables registry-based decoding.
+    #[cfg(feature = "kafka-schema-registry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
+    pub schema_registry: Option<Arc<SchemaRegistry>>,
+    /// Kafka-only: how subject mismatches are handled. Default `Enforce`.
+    #[cfg(feature = "kafka-schema-registry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
+    pub schema_enforcement: SchemaEnforcement,
+    /// Kafka-only: accepted subject set. `None` derives `["{queue}-value"]` at
+    /// decode time.
+    #[cfg(feature = "kafka-schema-registry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
+    pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
+
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,
     pub(crate) processing: Arc<AtomicBool>,
@@ -216,6 +235,12 @@ impl<B: Backend> ConsumerOptions<B> {
             receive_batch_size: 0,
             #[cfg(feature = "nats")]
             max_ack_pending: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted_subjects: None,
             shutdown: None,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
@@ -348,6 +373,12 @@ impl<B: Backend> ConsumerOptions<B> {
             kafka_group_id: None,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: self.schema_registry,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: self.schema_enforcement,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted_subjects: self.schema_accepted_subjects,
             #[cfg(feature = "rabbitmq-transactional")]
             exactly_once: self.exactly_once,
             #[cfg(feature = "aws-sns-sqs")]
@@ -382,6 +413,12 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             receive_batch_size: self.receive_batch_size,
             #[cfg(feature = "nats")]
             max_ack_pending: self.max_ack_pending,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: self.schema_registry.clone(),
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: self.schema_enforcement,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted_subjects: self.schema_accepted_subjects.clone(),
             shutdown: self.shutdown.clone(),
             processing: self.processing.clone(),
             consumer_group: self.consumer_group.clone(),
@@ -441,10 +478,38 @@ impl ConsumerOptions<RabbitMq> {
     }
 }
 
+#[cfg(feature = "kafka-schema-registry")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
+impl ConsumerOptions<Kafka> {
+    /// Decode registry-framed messages via the given registry (shared cache).
+    pub fn with_schema_registry(mut self, registry: Arc<SchemaRegistry>) -> Self {
+        self.schema_registry = Some(registry);
+        self
+    }
+
+    /// Set how subject mismatches are handled. Default `Enforce`.
+    pub fn with_schema_enforcement(mut self, enforcement: SchemaEnforcement) -> Self {
+        self.schema_enforcement = enforcement;
+        self
+    }
+
+    /// Set the accepted subject set. Defaults to `["{queue}-value"]` at decode
+    /// time when not set.
+    pub fn accept_schema_subjects<I, S>(mut self, subjects: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Arc<str>>,
+    {
+        self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::absolute_paths)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::markers::*;
 
     // Tests use the InMemory marker when available; otherwise fall back to
@@ -855,5 +920,50 @@ mod tests {
             HandlerTimeoutConfig::default(),
             HandlerTimeoutConfig::Inherit
         );
+    }
+
+    #[cfg(feature = "kafka-schema-registry")]
+    mod kafka_schema_registry_options {
+        use std::sync::Arc;
+
+        use crate::consumer::ConsumerOptions;
+        use crate::markers::Kafka;
+        use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+
+        #[test]
+        fn schema_enforcement_default_is_enforce() {
+            let inner = ConsumerOptions::<Kafka>::new().into_inner();
+            assert_eq!(inner.schema_enforcement, SchemaEnforcement::Enforce);
+            assert!(inner.schema_registry.is_none());
+            assert!(inner.schema_accepted_subjects.is_none());
+        }
+
+        #[test]
+        fn with_schema_enforcement_permissive_propagates() {
+            let inner = ConsumerOptions::<Kafka>::new()
+                .with_schema_enforcement(SchemaEnforcement::Permissive)
+                .into_inner();
+            assert_eq!(inner.schema_enforcement, SchemaEnforcement::Permissive);
+        }
+
+        #[test]
+        fn accept_schema_subjects_propagates() {
+            let inner = ConsumerOptions::<Kafka>::new()
+                .accept_schema_subjects(["orders-value", "orders-key"])
+                .into_inner();
+            assert_eq!(
+                inner.schema_accepted_subjects,
+                Some(vec![Arc::from("orders-value"), Arc::from("orders-key")])
+            );
+        }
+
+        #[test]
+        fn with_schema_registry_propagates() {
+            let registry = SchemaRegistry::builder("http://localhost:8081").build();
+            let inner = ConsumerOptions::<Kafka>::new()
+                .with_schema_registry(registry)
+                .into_inner();
+            assert!(inner.schema_registry.is_some());
+        }
     }
 }

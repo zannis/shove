@@ -105,6 +105,8 @@ pub(crate) enum FailReason {
     Timeout,
     MaxRetriesExceeded,
     Rejected,
+    SchemaFrame,
+    SchemaValidation,
 }
 
 #[allow(dead_code)]
@@ -117,6 +119,22 @@ impl FailReason {
             FailReason::Timeout => "timeout",
             FailReason::MaxRetriesExceeded => "max_retries_exceeded",
             FailReason::Rejected => "rejected",
+            FailReason::SchemaFrame => "schema_frame",
+            FailReason::SchemaValidation => "schema_validation",
+        }
+    }
+
+    /// Classify a schema-registry DLQ death-reason into a metric reason.
+    ///
+    /// Frame-level failures (`schema_frame_invalid`, `schema_unsupported_codec`)
+    /// map to [`FailReason::SchemaFrame`]; subject-resolve and validation
+    /// failures (and any unrecognised reason) map to
+    /// [`FailReason::SchemaValidation`].
+    #[cfg(feature = "kafka-schema-registry")]
+    pub(crate) fn for_schema_reason(reason: &str) -> FailReason {
+        match reason {
+            "schema_frame_invalid" | "schema_unsupported_codec" => FailReason::SchemaFrame,
+            _ => FailReason::SchemaValidation,
         }
     }
 }
@@ -449,5 +467,31 @@ mod tests {
         assert_eq!(BackendErrorKind::Consume.as_label(), "consume");
         assert_eq!(BackendErrorKind::Topology.as_label(), "topology");
         assert_eq!(BackendErrorKind::Ack.as_label(), "ack");
+    }
+
+    #[cfg(feature = "kafka-schema-registry")]
+    #[test]
+    fn for_schema_reason_routes_frame_and_validation() {
+        assert_eq!(
+            FailReason::for_schema_reason("schema_frame_invalid").as_label(),
+            "schema_frame"
+        );
+        assert_eq!(
+            FailReason::for_schema_reason("schema_unsupported_codec").as_label(),
+            "schema_frame"
+        );
+        assert_eq!(
+            FailReason::for_schema_reason("schema_resolve_failed").as_label(),
+            "schema_validation"
+        );
+        assert_eq!(
+            FailReason::for_schema_reason("schema_validation_failed").as_label(),
+            "schema_validation"
+        );
+        // Any unknown reason falls back to schema_validation.
+        assert_eq!(
+            FailReason::for_schema_reason("unknown_reason").as_label(),
+            "schema_validation"
+        );
     }
 }

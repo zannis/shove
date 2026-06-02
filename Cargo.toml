@@ -8,6 +8,11 @@ license = "MIT"
 repository = "https://github.com/zannis/shove"
 keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
 categories = ["asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 exclude = [
     "docs/",
     "package.json",
@@ -58,6 +63,11 @@ kafka-ssl = ["kafka", "rdkafka?/ssl", "rdkafka?/sasl"]
 # which uses `SASL_SSL` + `OAUTHBEARER` with auto-refreshed presigned tokens
 # signed against `kafka-cluster:Connect`. Implies TLS.
 kafka-msk-iam = ["kafka-ssl", "dep:aws-config", "dep:aws-credential-types", "dep:aws-msk-iam-sasl-signer"]
+
+# Confluent Schema Registry decode for Kafka consumers. Adds an async, cached
+# registry client and an opt-in decode stage that strips the Confluent wire
+# frame and validates schema identity before delegating to the topic's codec.
+kafka-schema-registry = ["kafka", "dep:reqwest", "dep:dashmap", "dep:futures-util"]
 
 # In-process backend
 inmemory = ["dep:dashmap"]
@@ -119,6 +129,7 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.10"
 metrics-util = "0.20"
 libc = "0.2"
+axum = "0.8"
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 mach2 = "0.6"
 
