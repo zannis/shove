@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use redis::aio::MultiplexedConnection;
 use serde::{Deserialize, Serialize};
 use testcontainers::ImageExt;
 use testcontainers::core::ContainerPort;
@@ -301,6 +302,69 @@ impl SequencedTopic for LedgerTopic {
     fn sequence_key(msg: &Event) -> String {
         msg.account.clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Publisher connection reuse
+// ---------------------------------------------------------------------------
+
+/// Read `total_connections_received` from `INFO stats` — the cumulative count
+/// of connections the server has accepted since startup.
+async fn total_connections_received(conn: &mut MultiplexedConnection) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("stats")
+        .query_async(conn)
+        .await
+        .expect("INFO stats");
+    info.lines()
+        .find_map(|line| line.strip_prefix("total_connections_received:"))
+        .expect("total_connections_received present in INFO stats")
+        .trim()
+        .parse()
+        .expect("total_connections_received parses as u64")
+}
+
+#[tokio::test]
+async fn publisher_reuses_connection_across_publishes() {
+    let broker = make_broker("redis-int-conn-reuse").await;
+    broker
+        .topology()
+        .declare::<OrdersTopic>()
+        .await
+        .expect("declare");
+
+    // Dedicated probe connection for the INFO snapshots, created once up
+    // front so the probe itself contributes nothing to the measured delta.
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut probe = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("probe conn");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    // Warm-up publish so any lazily-established publisher connection exists
+    // before the baseline snapshot.
+    publisher
+        .publish::<OrdersTopic>(&Order { id: 0 })
+        .await
+        .expect("warm-up publish");
+
+    let before = total_connections_received(&mut probe).await;
+    for i in 1..=50u64 {
+        publisher
+            .publish::<OrdersTopic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+    let after = total_connections_received(&mut probe).await;
+
+    let delta = after - before;
+    assert!(
+        delta <= 5,
+        "50 publishes on one publisher must reuse a cached connection, \
+         but the server accepted {delta} new connections"
+    );
 }
 
 // ---------------------------------------------------------------------------

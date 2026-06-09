@@ -2,6 +2,9 @@
 //! the correct stream, with shove metadata as additional stream entry fields.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use crate::backend::publisher::PublisherImpl;
 use crate::error::{Result, ShoveError};
@@ -31,17 +34,44 @@ pub fn shard_for_key(key: &str, routing_shards: u16) -> u16 {
 
 /// Publishes messages to Redis Streams.
 ///
-/// Implements [`PublisherImpl`]. Obtains a multiplexed connection per call
-/// (cheap — the underlying connection is shared by the client).
+/// Implements [`PublisherImpl`]. Holds one cached multiplexed connection
+/// shared by every publish on this publisher and its clones — redis-rs dials
+/// a fresh TCP socket on every `get_multiplexed_async_connection` call, so
+/// acquiring per publish opened (and dropped) a connection per message.
+/// On a publish error the cached connection is invalidated and the next
+/// publish dials a fresh one; the error itself still propagates to the
+/// caller unchanged.
 #[derive(Clone)]
 pub struct RedisPublisher {
     client: RedisClient,
+    conn: Arc<Mutex<Option<RedisConnection>>>,
 }
 
 impl RedisPublisher {
     /// Create a new publisher backed by the given [`RedisClient`].
     pub fn new(client: RedisClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            conn: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Clone the cached connection, dialing and caching one if absent.
+    /// Clones share the underlying socket and multiplexer task, so the lock
+    /// is held only for the clone, never across a query.
+    async fn cached_conn(&self) -> Result<RedisConnection> {
+        let mut guard = self.conn.lock().await;
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+        let c = self.client.multiplexed_conn().await?;
+        *guard = Some(c.clone());
+        Ok(c)
+    }
+
+    /// Drop the cached connection so the next publish dials a fresh one.
+    async fn invalidate_conn(&self) {
+        *self.conn.lock().await = None;
     }
 
     /// Core XADD helper — resolves the stream name, serializes, and publishes.
@@ -70,15 +100,24 @@ impl RedisPublisher {
             (topology.queue().to_owned(), None)
         };
 
-        let mut owned;
-        let c: &mut RedisConnection = if let Some(c) = conn {
-            c
-        } else {
-            owned = self.client.multiplexed_conn().await?;
-            &mut owned
-        };
-
-        xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await
+        match conn {
+            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await,
+            None => {
+                let mut owned = self.cached_conn().await?;
+                let result = xadd_on_conn(
+                    &mut owned,
+                    &stream,
+                    &payload,
+                    &headers,
+                    sequence_key.as_deref(),
+                )
+                .await;
+                if result.is_err() {
+                    self.invalidate_conn().await;
+                }
+                result
+            }
+        }
     }
 }
 
@@ -114,7 +153,7 @@ impl RedisPublisher {
     /// contract — on `Ok(())` the caller may assume `succeeded == msgs.len()`;
     /// on `Err(_)` `succeeded` is the count accepted before the failure.
     pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> (u64, Result<()>) {
-        let mut conn = match self.client.multiplexed_conn().await {
+        let mut conn = match self.cached_conn().await {
             Ok(c) => c,
             Err(e) => return (0, Err(e)),
         };
@@ -125,7 +164,10 @@ impl RedisPublisher {
                 .await
             {
                 Ok(()) => succeeded += 1,
-                Err(e) => return (succeeded, Err(e)),
+                Err(e) => {
+                    self.invalidate_conn().await;
+                    return (succeeded, Err(e));
+                }
             }
         }
         (succeeded, Ok(()))
