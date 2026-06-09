@@ -1,0 +1,23 @@
+src/backends/redis/reaper.rs
+  s_b029cb0284d7f0::t_02c4d2d2522795 16-20,97-104,108,219-269
+  s_b029cb0284d7f0::t_c8bfeff7d62044 270-273
+tests/redis_integration.rs
+  s_b029cb0284d7f0::t_02c4d2d2522795 2528-2720
+  s_b029cb0284d7f0::t_b132e07097d03c 2721-2722
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "53c74da313d7a1120cda554a497dd3ccdf79e333",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
