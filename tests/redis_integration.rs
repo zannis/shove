@@ -2525,4 +2525,199 @@ mod reaper_tests {
             "reaper PEL must be empty after re-XADD + XACK (was {reaper_pel})"
         );
     }
+
+    /// XACK removes an entry from the PEL but not from the stream, so without
+    /// trimming every stream grows forever. The reaper must XTRIM entries the
+    /// group has fully acknowledged.
+    #[tokio::test]
+    async fn reaper_trims_fully_acked_entries() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-acked-stream";
+        let group = "reaper-trim-acked-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("$")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        // Publish 10, deliver all to a consumer, ack all — PEL empty.
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("trim-consumer")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let acked: i64 = xack.query_async(&mut raw).await.expect("XACK");
+        assert_eq!(acked, 10, "all 10 entries must be acked");
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        // Large min_idle so XAUTOCLAIM reclaims nothing — this test isolates
+        // the trim behaviour from redelivery.
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            60_000,
+            shutdown.clone(),
+        );
+
+        // Acked entries must be trimmed away. The last delivered entry may
+        // be kept (conservative MINID threshold), so expect XLEN <= 1.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut len: i64 = i64::MAX;
+        while std::time::Instant::now() < deadline {
+            len = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert!(
+            len <= 1,
+            "fully-acked entries must be trimmed from the stream, XLEN still {len}"
+        );
+    }
+
+    /// Trimming must never remove entries that are still pending (delivered
+    /// but not acknowledged) — those are the at-least-once redelivery source.
+    #[tokio::test]
+    async fn reaper_trim_preserves_pending_entries() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-pending-stream";
+        let group = "reaper-trim-pending-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("$")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        // Publish 5, deliver all, ack only the first 3 — entries 4 and 5
+        // stay in the PEL.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("trim-consumer")
+            .arg("COUNT")
+            .arg(5)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let acked: i64 = redis::cmd("XACK")
+            .arg(stream)
+            .arg(group)
+            .arg(&ids[0])
+            .arg(&ids[1])
+            .arg(&ids[2])
+            .query_async(&mut raw)
+            .await
+            .expect("XACK");
+        assert_eq!(acked, 3);
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        // Large min_idle so the pending entries are not autoclaim-redelivered
+        // during the test window.
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            60_000,
+            shutdown.clone(),
+        );
+
+        // Wait until the acked prefix is trimmed (XLEN drops to 2)…
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut len: i64 = i64::MAX;
+        while std::time::Instant::now() < deadline {
+            len = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(len, 2, "only the 3 acked entries may be trimmed");
+
+        // …and the two pending entries must still be readable in the stream.
+        let range: Vec<redis::Value> = redis::cmd("XRANGE")
+            .arg(stream)
+            .arg(&ids[3])
+            .arg(&ids[4])
+            .query_async(&mut raw)
+            .await
+            .expect("XRANGE");
+        assert_eq!(
+            range.len(),
+            2,
+            "pending (unacked) entries must survive the trim"
+        );
+    }
 }

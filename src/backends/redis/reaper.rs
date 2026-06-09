@@ -13,6 +13,11 @@
 //! consumer name (`shove-reaper-{group}`). Regular consumers no longer do
 //! any XAUTOCLAIM themselves.
 //!
+//! Each sweep also trims fully-acknowledged entries (`XTRIM MINID`, see
+//! [`trim_acked`]): XACK clears the PEL but leaves entries in the stream,
+//! so without trimming, stream memory grows without bound and `XLEN`-based
+//! backlog estimates drift ever upward.
+//!
 //! **At-least-once semantics**: if shove runs in multiple processes against
 //! the same Redis, each spawns its own reaper. They race on XAUTOCLAIM, which
 //! is safe — only one of them wins ownership of each reclaimed entry. Some
@@ -89,13 +94,18 @@ pub fn spawn_reaper(
                 if shutdown.is_cancelled() {
                     return;
                 }
-                if let Err(e) =
-                    autoclaim_all(&mut conn, stream, &group, &reaper, min_idle_ms, &shutdown).await
-                {
+                let result =
+                    match autoclaim_all(&mut conn, stream, &group, &reaper, min_idle_ms, &shutdown)
+                        .await
+                    {
+                        Ok(()) => trim_acked(&mut conn, stream, &group).await,
+                        err => err,
+                    };
+                if let Err(e) = result {
                     tracing::warn!(
                         stream,
                         error = %e,
-                        "reaper: XAUTOCLAIM failed, reconnecting",
+                        "reaper: sweep failed, reconnecting",
                     );
                     needs_reconnect = true;
                     break;
@@ -202,6 +212,61 @@ async fn autoclaim_all(
             break;
         }
         cursor = reply.next_stream_id;
+    }
+    Ok(())
+}
+
+/// Trim entries that every consumer in `group` has already acknowledged.
+///
+/// XACK removes an entry from the PEL but not from the stream, so without
+/// trimming every stream grows without bound. The safe `XTRIM MINID`
+/// threshold:
+///
+/// * PEL non-empty → the oldest pending entry id. Delivery is in id order,
+///   so every entry below the oldest pending one was delivered and is no
+///   longer pending — i.e. acknowledged.
+/// * PEL empty → the group's `last-delivered-id`. Everything at or below it
+///   is acked; using the id itself (MINID keeps entries `>=` threshold)
+///   retains the last delivered entry, trading one kept entry for not
+///   having to do stream-id arithmetic.
+///
+/// shove owns exactly one consumer group per stream, so the group's own
+/// progress is the stream's global progress — there is no other group whose
+/// unread entries could be trimmed away. DLQ streams are not in the
+/// reaper's stream list and are never trimmed.
+async fn trim_acked(conn: &mut RedisConnection, stream: &str, group: &str) -> Result<()> {
+    use redis::streams::{StreamInfoGroupsReply, StreamPendingReply};
+
+    let pending: StreamPendingReply = conn
+        .query(redis::cmd("XPENDING").arg(stream).arg(group))
+        .await?;
+
+    let threshold = match pending {
+        StreamPendingReply::Data(data) => data.start_id,
+        StreamPendingReply::Empty => {
+            let info: StreamInfoGroupsReply = conn
+                .query(redis::cmd("XINFO").arg("GROUPS").arg(stream))
+                .await?;
+            let Some(g) = info.groups.into_iter().find(|g| g.name == group) else {
+                // Group not declared on this stream (yet) — nothing to trim.
+                return Ok(());
+            };
+            if g.last_delivered_id == "0-0" {
+                // Nothing delivered yet — trimming would race fresh entries.
+                return Ok(());
+            }
+            g.last_delivered_id
+        }
+        // `StreamPendingReply` is non_exhaustive; an unknown variant gives
+        // no safe threshold, so skip the trim for this sweep.
+        _ => return Ok(()),
+    };
+
+    let trimmed: i64 = conn
+        .query(redis::cmd("XTRIM").arg(stream).arg("MINID").arg(&threshold))
+        .await?;
+    if trimmed > 0 {
+        tracing::debug!(stream, trimmed, threshold, "reaper: trimmed acked entries");
     }
     Ok(())
 }
