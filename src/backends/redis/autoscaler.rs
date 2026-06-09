@@ -70,7 +70,7 @@ impl XlenStatsProvider {
 
 impl RedisQueueStatsProvider for XlenStatsProvider {
     async fn get_queue_stats(&self, queue: &str) -> Result<RedisQueueStats> {
-        use redis::streams::StreamInfoGroupsReply;
+        use redis::streams::{StreamInfoGroupsReply, StreamInfoStreamReply};
 
         let group = self.client.group();
         let mut conn = self.client.multiplexed_conn().await?;
@@ -101,20 +101,35 @@ impl RedisQueueStatsProvider for XlenStatsProvider {
         let in_flight = g.pending as u64;
         let messages_ready = match g.lag {
             Some(lag) => lag as u64,
-            // `lag` is absent on Redis < 7.0 and nil when entry deletion
-            // made it indeterminate. Degrade to the XLEN-based estimate —
-            // an upper bound that over-counts acked-but-untrimmed history.
+            // `lag` is absent on Redis < 7.0 and nil when entry deletion made
+            // it indeterminate. XINFO STREAM's last-generated-id still
+            // answers the common case exactly: a group whose
+            // last-delivered-id has caught up to it has zero backlog.
             None => {
-                let len: u64 = conn
-                    .query(redis::cmd("XLEN").arg(queue))
+                let stream_info: StreamInfoStreamReply = conn
+                    .query(redis::cmd("XINFO").arg("STREAM").arg(queue))
                     .await
-                    .map_err(|e| ShoveError::Connection(format!("XLEN failed: {e}")))?;
-                tracing::debug!(
-                    queue,
-                    group,
-                    "XINFO GROUPS lag unavailable; falling back to XLEN-based backlog estimate"
-                );
-                len.saturating_sub(in_flight)
+                    .map_err(|e| ShoveError::Connection(format!("XINFO STREAM failed: {e}")))?;
+                let caught_up = match (
+                    super::stream_id::parse(&g.last_delivered_id),
+                    super::stream_id::parse(&stream_info.last_generated_id),
+                ) {
+                    (Some(delivered), Some(last)) => delivered >= last,
+                    _ => false,
+                };
+                if caught_up {
+                    0
+                } else {
+                    // Genuinely behind with no lag available: degrade to the
+                    // length-based estimate, an upper bound that over-counts
+                    // acked-but-untrimmed history.
+                    tracing::debug!(
+                        queue,
+                        group,
+                        "XINFO GROUPS lag unavailable; using length-based backlog estimate"
+                    );
+                    (stream_info.length as u64).saturating_sub(in_flight)
+                }
             }
         };
 

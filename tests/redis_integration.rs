@@ -1216,6 +1216,94 @@ async fn autoscaler_stats_zero_after_full_consumption() {
     );
 }
 
+/// Same contract as [`autoscaler_stats_zero_after_full_consumption`], but on
+/// Redis 6.2 — the minimum supported server — where `XINFO GROUPS` carries no
+/// `lag` field and the stats provider must derive the answer another way.
+#[tokio::test]
+async fn autoscaler_stats_zero_after_full_consumption_on_redis_62() {
+    struct Stats62Topic;
+    impl Topic for Stats62Topic {
+        type Message = Order;
+        type Codec = JsonCodec;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("redis-int-stats-62").build())
+        }
+    }
+
+    // Own 6.2 container — the shared one runs 7.0.
+    let host_port: u16 = find_free_port();
+    let container = ContainerOnDrop::new(
+        RedisContainer::default()
+            .with_tag("6.2")
+            .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
+            .start()
+            .await
+            .expect("start Redis 6.2 container"),
+    );
+    let host = container.get_host().await.expect("get host");
+    let url = format!("redis://{host}:{host_port}/");
+
+    let broker = connect_with_retry(&url, "redis-62-stats-grp", Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<Stats62Topic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..5u64 {
+        publisher
+            .publish::<Stats62Topic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<Stats62Topic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<Stats62Topic, _>(H(counter.clone()), ConsumerOptions::<Redis>::new())
+        .expect("register");
+
+    let probe = counter.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(counter.load(Ordering::Relaxed), 5, "all messages consumed");
+
+    let stats = broker
+        .queue_stats_provider()
+        .get_queue_stats(Stats62Topic::topology().queue())
+        .await
+        .expect("get_queue_stats");
+
+    assert_eq!(stats.messages_in_flight, 0, "all messages were acked");
+    assert_eq!(
+        stats.messages_ready, 0,
+        "a drained queue must report zero backlog on Redis 6.2 even though \
+         XINFO GROUPS has no lag field"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Helper for finding a free port
 // ---------------------------------------------------------------------------
