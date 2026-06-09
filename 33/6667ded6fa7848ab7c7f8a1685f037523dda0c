@@ -1,0 +1,21 @@
+tests/kafka_integration.rs
+  s_b029cb0284d7f0::t_02c4d2d2522795 1869-1956
+src/backends/kafka/consumer.rs
+  s_b029cb0284d7f0::t_02c4d2d2522795 996-1007
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "336667ded6fa7848ab7c7f8a1685f037523dda0c",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
