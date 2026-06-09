@@ -1,0 +1,25 @@
+docs/pages/backends/redis/examples/autoscaler.mdx
+  s_b029cb0284d7f0::t_e6e9e53fa675fa 3
+docs/pages/backends/redis.mdx
+  s_b029cb0284d7f0::t_fb5c28b8b4caa1 143
+  s_b029cb0284d7f0::t_8ee9782fe47eff 121-130
+  s_b029cb0284d7f0::t_a8a4efef9a9e4b 96
+docs/pages/ops/backends.mdx
+  s_b029cb0284d7f0::t_376dc6163ba14c 97-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "54d35050c423bd40f20287799bf6e939243167a4",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
