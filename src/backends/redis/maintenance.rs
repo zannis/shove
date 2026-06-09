@@ -66,21 +66,40 @@ impl Drop for MaintenanceGuard {
     }
 }
 
+/// Derive the sidecar's sweep interval and XAUTOCLAIM idle threshold from a
+/// consumer's handler timeout.
+///
+/// With a timeout, the idle threshold is the timeout itself (an entry must
+/// have been pending at least one handler-timeout before reclaim) and the
+/// sweep interval is that floored at 30 s — the same numbers the former
+/// consumer-group reaper factory used. Without one
+/// ([`ConsumerOptions::without_handler_timeout`]) there is no deadline after
+/// which an in-flight entry can be presumed dead, so reclaim is disabled
+/// (`None`) and the sidecar only trims, on the default 30 s cadence.
+///
+/// [`ConsumerOptions::without_handler_timeout`]: crate::ConsumerOptions::without_handler_timeout
+fn sidecar_timing(handler_timeout: Option<Duration>) -> (Duration, Option<u64>) {
+    match handler_timeout {
+        Some(timeout) => {
+            let min_idle_ms = timeout.as_millis() as u64;
+            let interval = Duration::from_millis(min_idle_ms.max(30_000));
+            (interval, Some(min_idle_ms))
+        }
+        None => (DEFAULT_HANDLER_TIMEOUT, None),
+    }
+}
+
 /// Ensure a maintenance sidecar runs for `(client, stream, group)` and
 /// return a guard expressing this consumer's interest in it.
 ///
-/// `handler_timeout` seeds the sidecar timing exactly like the former
-/// consumer-group reaper factory did: the XAUTOCLAIM idle threshold is the
-/// resolved handler timeout, and the sweep interval is that floored at 30 s.
-/// The first acquirer's timing wins for the lifetime of the entry.
+/// `handler_timeout` seeds the sidecar timing via [`sidecar_timing`]. The
+/// first acquirer's timing wins for the lifetime of the entry.
 pub(super) fn acquire(
     client: &RedisClient,
     stream: &str,
     handler_timeout: Option<Duration>,
 ) -> MaintenanceGuard {
-    let timeout = handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
-    let min_idle_ms = timeout.as_millis() as u64;
-    let interval = Duration::from_millis(min_idle_ms.max(30_000));
+    let (interval, min_idle_ms) = sidecar_timing(handler_timeout);
     let group = client.group().to_owned();
     let stream = stream.to_owned();
     acquire_with(
@@ -128,6 +147,32 @@ mod tests {
         // Distinct high client-ids so tests can't collide with each other or
         // with real acquisitions in the shared process-wide registry.
         (usize::MAX - n, format!("stream-{n}"), format!("group-{n}"))
+    }
+
+    #[test]
+    fn timing_with_timeout_floors_interval_and_sets_min_idle() {
+        assert_eq!(
+            sidecar_timing(Some(Duration::from_secs(5))),
+            (Duration::from_secs(30), Some(5_000)),
+            "short timeouts keep the 30s sweep floor but gate reclaim at the timeout"
+        );
+        assert_eq!(
+            sidecar_timing(Some(Duration::from_secs(45))),
+            (Duration::from_secs(45), Some(45_000)),
+            "long timeouts stretch the sweep interval to match"
+        );
+    }
+
+    #[test]
+    fn timing_without_timeout_disables_reclaim() {
+        // `without_handler_timeout()` is an explicit promise that handlers
+        // may run indefinitely — maintenance must never reclaim their
+        // in-flight entries on a made-up deadline. Trim still runs.
+        assert_eq!(
+            sidecar_timing(None),
+            (Duration::from_secs(30), None),
+            "no handler deadline means no XAUTOCLAIM deadline"
+        );
     }
 
     #[test]

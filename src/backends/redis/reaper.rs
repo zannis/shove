@@ -64,18 +64,22 @@ fn reaper_consumer_name(group: &str) -> String {
 /// reclaim, so the early pass cannot steal in-flight work.
 ///
 /// `min_idle_ms` is the XAUTOCLAIM idle threshold — entries whose PEL idle
-/// time is shorter than this are not reclaimed.
+/// time is shorter than this are not reclaimed. `None` disables XAUTOCLAIM
+/// entirely (the sidecar only trims): consumers that run without a handler
+/// timeout have no deadline after which in-flight work may be presumed dead,
+/// so reclaiming on a made-up one would redeliver messages that are still
+/// being processed.
 /// `pub` (with `#[doc(hidden)]`) rather than `pub(crate)` so integration
 /// tests in `tests/` — which are compiled as separate crates — can spawn the
 /// reaper directly with arbitrary timing. Production code should not call
-/// this; the consumer-group registry owns reaper lifecycle.
+/// this; the per-process maintenance registry owns reaper lifecycle.
 #[doc(hidden)]
 pub fn spawn_reaper(
     client: RedisClient,
     streams: Vec<String>,
     group: String,
     interval: Duration,
-    min_idle_ms: u64,
+    min_idle_ms: Option<u64>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let reaper = reaper_consumer_name(&group);
@@ -97,13 +101,18 @@ pub fn spawn_reaper(
                 if shutdown.is_cancelled() {
                     return;
                 }
-                let result =
-                    match autoclaim_all(&mut conn, stream, &group, &reaper, min_idle_ms, &shutdown)
-                        .await
-                    {
-                        Ok(()) => trim_acked(&mut conn, stream).await,
-                        err => err,
-                    };
+                let result = match min_idle_ms {
+                    Some(idle) => {
+                        match autoclaim_all(&mut conn, stream, &group, &reaper, idle, &shutdown)
+                            .await
+                        {
+                            Ok(()) => trim_acked(&mut conn, stream).await,
+                            err => err,
+                        }
+                    }
+                    // No handler deadline — trim-only sidecar.
+                    None => trim_acked(&mut conn, stream).await,
+                };
                 if let Err(e) = result {
                     tracing::warn!(
                         stream,

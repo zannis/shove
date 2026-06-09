@@ -122,12 +122,19 @@ impl RedisQueueStatsProvider for XlenStatsProvider {
                 } else {
                     // Genuinely behind with no lag available: degrade to the
                     // length-based estimate, an upper bound that over-counts
-                    // acked-but-untrimmed history.
-                    tracing::debug!(
-                        queue,
-                        group,
-                        "XINFO GROUPS lag unavailable; using length-based backlog estimate"
-                    );
+                    // acked-but-untrimmed history (bounded by the reaper's
+                    // trim cadence). Warned once per process so operators on
+                    // Redis < 7.0 know their scaling input is approximate.
+                    static LAG_FALLBACK_WARNED: std::sync::Once = std::sync::Once::new();
+                    LAG_FALLBACK_WARNED.call_once(|| {
+                        tracing::warn!(
+                            queue,
+                            group,
+                            "XINFO GROUPS exposes no lag (Redis < 7.0): backlog falls back to a \
+                             length-based upper bound that can over-count acked-but-untrimmed \
+                             history; autoscaling may overshoot until the next trim sweep"
+                        );
+                    });
                     (stream_info.length as u64).saturating_sub(in_flight)
                 }
             }

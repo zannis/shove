@@ -2623,7 +2623,7 @@ mod reaper_tests {
             vec!["reaper-exit-sleep-stream".to_string()],
             "reaper-exit-sleep".to_string(),
             Duration::from_secs(60),
-            30_000,
+            Some(30_000),
             shutdown.clone(),
         );
 
@@ -2660,7 +2660,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            0,
+            Some(0),
             shutdown.clone(),
         );
 
@@ -2734,7 +2734,7 @@ mod reaper_tests {
             streams.iter().map(|s| s.to_string()).collect(),
             group.to_string(),
             Duration::from_millis(100),
-            0,
+            Some(0),
             shutdown.clone(),
         );
 
@@ -2815,7 +2815,7 @@ mod reaper_tests {
             streams.clone(),
             group.to_string(),
             Duration::from_millis(200),
-            0,
+            Some(0),
             shutdown.clone(),
         );
 
@@ -2862,7 +2862,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            0,
+            Some(0),
             shutdown.clone(),
         );
 
@@ -2978,7 +2978,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3072,7 +3072,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3199,7 +3199,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group_a.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3309,7 +3309,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group_a.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3329,5 +3329,109 @@ mod reaper_tests {
             "a group with no consumption yet (last-delivered 0-0) expects \
              the full stream — trim must be skipped"
         );
+    }
+
+    /// `min_idle_ms = None` is the no-handler-deadline mode: the sidecar must
+    /// still trim fully-acked entries but must never XAUTOCLAIM pending ones
+    /// — a consumer without a timeout may legitimately hold an entry forever.
+    #[tokio::test]
+    async fn reaper_without_min_idle_trims_but_never_reclaims() {
+        let url = redis_url().await;
+        let stream = "reaper-noidle-stream";
+        let group = "reaper-noidle-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        // Five entries delivered to a consumer; the first three acked, the
+        // last two left in-flight (pending) indefinitely.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("slow-consumer")
+            .arg("COUNT")
+            .arg(5)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let acked: i64 = redis::cmd("XACK")
+            .arg(stream)
+            .arg(group)
+            .arg(&ids[0])
+            .arg(&ids[1])
+            .arg(&ids[2])
+            .query_async(&mut raw)
+            .await
+            .expect("XACK");
+        assert_eq!(acked, 3);
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            None,
+            shutdown.clone(),
+        );
+
+        // Wait for the trim of the acked prefix…
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let len: i64 = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 2 || std::time::Instant::now() > deadline {
+                assert_eq!(len, 2, "acked entries must still be trimmed");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // …then give further ticks a chance to (incorrectly) reclaim.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        // The two in-flight entries must still be pending for the original
+        // consumer — never claimed by the reaper, never re-added.
+        let pel = pending_count_for(&mut raw, stream, group, "slow-consumer").await;
+        assert_eq!(
+            pel, 2,
+            "entries owned by a no-deadline consumer must never be reclaimed"
+        );
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+        assert_eq!(len, 2, "no re-added duplicates may appear in the stream");
     }
 }
