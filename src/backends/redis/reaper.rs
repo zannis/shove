@@ -64,17 +64,48 @@ fn reaper_consumer_name(group: &str) -> String {
 /// reclaim, so the early pass cannot steal in-flight work.
 ///
 /// `min_idle_ms` is the XAUTOCLAIM idle threshold — entries whose PEL idle
-/// time is shorter than this are not reclaimed. `None` disables XAUTOCLAIM
-/// entirely (the sidecar only trims): consumers that run without a handler
-/// timeout have no deadline after which in-flight work may be presumed dead,
-/// so reclaiming on a made-up one would redeliver messages that are still
-/// being processed.
+/// time is shorter than this are not reclaimed.
 /// `pub` (with `#[doc(hidden)]`) rather than `pub(crate)` so integration
 /// tests in `tests/` — which are compiled as separate crates — can spawn the
 /// reaper directly with arbitrary timing. Production code should not call
 /// this; the per-process maintenance registry owns reaper lifecycle.
 #[doc(hidden)]
 pub fn spawn_reaper(
+    client: RedisClient,
+    streams: Vec<String>,
+    group: String,
+    interval: Duration,
+    min_idle_ms: u64,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_reaper_inner(
+        client,
+        streams,
+        group,
+        interval,
+        Some(min_idle_ms),
+        shutdown,
+    )
+}
+
+/// Trim-only variant of [`spawn_reaper`]: no XAUTOCLAIM. Used for keys whose
+/// consumers run without a handler timeout — with no deadline after which
+/// in-flight work may be presumed dead, reclaiming on a made-up one would
+/// redeliver messages that are still being processed. `#[doc(hidden)]` for
+/// the same integration-test reason as [`spawn_reaper`].
+#[doc(hidden)]
+pub fn spawn_trim_only_reaper(
+    client: RedisClient,
+    streams: Vec<String>,
+    group: String,
+    interval: Duration,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_reaper_inner(client, streams, group, interval, None, shutdown)
+}
+
+/// Shared core: `min_idle_ms: None` disables XAUTOCLAIM (trim-only).
+pub(crate) fn spawn_reaper_inner(
     client: RedisClient,
     streams: Vec<String>,
     group: String,

@@ -2498,7 +2498,7 @@ mod reaper_tests {
     use super::*;
     use redis::aio::MultiplexedConnection;
     use shove::Backend;
-    use shove::redis::{RedisClient, spawn_reaper};
+    use shove::redis::{RedisClient, spawn_reaper, spawn_trim_only_reaper};
     use tokio_util::sync::CancellationToken;
 
     /// Open a raw multiplexed connection to the shared Redis URL for issuing
@@ -2623,7 +2623,7 @@ mod reaper_tests {
             vec!["reaper-exit-sleep-stream".to_string()],
             "reaper-exit-sleep".to_string(),
             Duration::from_secs(60),
-            Some(30_000),
+            30_000,
             shutdown.clone(),
         );
 
@@ -2660,7 +2660,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            Some(0),
+            0,
             shutdown.clone(),
         );
 
@@ -2734,7 +2734,7 @@ mod reaper_tests {
             streams.iter().map(|s| s.to_string()).collect(),
             group.to_string(),
             Duration::from_millis(100),
-            Some(0),
+            0,
             shutdown.clone(),
         );
 
@@ -2815,7 +2815,7 @@ mod reaper_tests {
             streams.clone(),
             group.to_string(),
             Duration::from_millis(200),
-            Some(0),
+            0,
             shutdown.clone(),
         );
 
@@ -2862,7 +2862,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            Some(0),
+            0,
             shutdown.clone(),
         );
 
@@ -2978,7 +2978,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            Some(60_000),
+            60_000,
             shutdown.clone(),
         );
 
@@ -3072,7 +3072,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            Some(60_000),
+            60_000,
             shutdown.clone(),
         );
 
@@ -3199,7 +3199,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group_a.to_string(),
             Duration::from_millis(100),
-            Some(60_000),
+            60_000,
             shutdown.clone(),
         );
 
@@ -3309,7 +3309,7 @@ mod reaper_tests {
             vec![stream.to_string()],
             group_a.to_string(),
             Duration::from_millis(100),
-            Some(60_000),
+            60_000,
             shutdown.clone(),
         );
 
@@ -3390,12 +3390,11 @@ mod reaper_tests {
 
         let client = connect_client_with_retry(url, group).await;
         let shutdown = CancellationToken::new();
-        let handle = spawn_reaper(
+        let handle = spawn_trim_only_reaper(
             client,
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            None,
             shutdown.clone(),
         );
 
