@@ -93,7 +93,7 @@ group
 
 - **`.with_prefetch_count(N)`** — the `COUNT` argument to XREADGROUP. With concurrent processing on, also the in-flight cap per consumer task. Default: 10.
 - **`.with_concurrent_processing(true)`** — dispatch each fetched message to its own tokio task with a per-task multiplexed connection for outcome routing. A semaphore caps in-flight handlers at `prefetch_count`. Default: `false` (handlers serialize via prefetch clamped to 1).
-- **`.with_handler_timeout(Duration)`** — per-message handler deadline. Timed-out messages are left in the PEL for XAUTOCLAIM to reclaim. Default `30s`; the registry-level default can be set via `RedisConsumerGroupRegistry::with_default_handler_timeout(Duration)`.
+- **`.with_handler_timeout(Duration)`** — per-message handler deadline. Timed-out messages are left in the PEL for XAUTOCLAIM to reclaim. Default `30s`; the registry-level default can be set via `RedisConsumerGroupRegistry::with_default_handler_timeout(Duration)`. The timeout also sets the crash-recovery reclaim deadline for the whole consumer group, so use the same value for every consumer of a stream and group, including other processes (see [Stream maintenance](#stream-maintenance)).
 - **`.with_max_retries(u32)`** — retry budget before a message is dead-lettered. Default `10`.
 - **`.with_max_pending_per_key(usize)`** — caps the per-key pending buffer for sequenced topics. Default `100`.
 - **`.with_max_message_size(usize)`** — payload ceiling in bytes; oversize messages route to the DLQ without invoking the handler. Default `1 MiB`.
@@ -118,6 +118,16 @@ group
 
 `register_fifo` wires consumer tasks for sequenced delivery. `RedisConsumerGroupConfig::default()` spawns one consumer task per shard; pass `RedisConsumerGroupConfig::new(min..=max)` to run more replicas. `with_concurrent_processing(true)` is rejected with a `Topology` error on this path — it would break per-key ordering within a shard. See [Sequenced Topics](/guides/sequenced) for the full ordering model.
 
+## Stream maintenance
+
+While a consumer runs, a background sidecar keeps its stream healthy. Entries that every consumer group on the stream has acknowledged are trimmed away, so stream memory tracks outstanding work rather than lifetime throughput. Entries stuck pending past the handler timeout — for example after a consumer crash — are reclaimed and redelivered. One sidecar runs per stream and group per process, no matter how many consumers you scale to, and it applies to consumers started through the group registry and through `ConsumerSupervisor` alike.
+
+Three behaviours worth knowing:
+
+- **Trimming waits for the slowest reader.** If several consumer groups share a stream (fan-out via distinct `with_group` names), entries survive until every group has acknowledged them. A group that has not consumed anything yet blocks trimming entirely.
+- **DLQ streams are never trimmed or reclaimed.** Dead letters are an audit record and stay put until you handle them.
+- **Disabling the handler timeout also disables reclaim.** `ConsumerOptions::without_handler_timeout()` means in-flight work is never presumed dead; trimming still runs. Configure the same timeout for every consumer of a stream and group, including consumers in other processes — a process with a shorter timeout reclaims entries held by longer-running consumers elsewhere.
+
 ## Gotchas
 
 - **Redis 6.2+ is required.** Connecting to an older server returns an error at startup. Any Valkey release is compatible.
@@ -130,7 +140,7 @@ group
 - [Basic](/backends/redis/examples/basic) — publish/consume round trip with hold queues and DLQ
 - [Sequenced](/backends/redis/examples/sequenced) — FNV-1a shard routing for per-key ordering
 - [Consumer Groups](/backends/redis/examples/consumer-groups) — coordinated `min..=max` group with a burst-and-drain workload
-- [Autoscaler](/backends/redis/examples/autoscaler) — XLEN-driven scale up/down within a `min..=max` range
+- [Autoscaler](/backends/redis/examples/autoscaler) — consumer-lag-driven scale up/down within a `min..=max` range
 - [Audited Consumer](/backends/redis/examples/audited) — `MessageHandlerExt::audited` wrapping
 - [Stress](/backends/redis/examples/stress) — throughput benchmarking
 
