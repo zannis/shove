@@ -226,7 +226,16 @@ impl ConsumerImpl for RedisConsumer {
         async move {
             let topology = T::topology();
             let stream = topology.queue();
-            run_stream_loop::<T, H>(client, handler, ctx, options, topology, stream).await
+            run_stream_loop::<T, H>(
+                client,
+                handler,
+                ctx,
+                options,
+                topology,
+                stream,
+                Maintain::Stream,
+            )
+            .await
         }
     }
 
@@ -275,7 +284,19 @@ impl ConsumerImpl for RedisConsumer {
                     topology.queue()
                 ))
             })?;
-            run_stream_loop::<T, H>(client, handler, ctx, options, topology, dlq_name).await
+            // Maintain::None: DLQ streams are an operator audit record —
+            // they get neither autoclaim redelivery nor acked-entry
+            // trimming from the maintenance sidecar.
+            run_stream_loop::<T, H>(
+                client,
+                handler,
+                ctx,
+                options,
+                topology,
+                dlq_name,
+                Maintain::None,
+            )
+            .await
         }
     }
 
@@ -343,6 +364,7 @@ impl ConsumerImpl for RedisConsumer {
                         topology,
                         &stream_name,
                         &shard_hold_queues,
+                        Maintain::Stream,
                     )
                     .await;
 
@@ -423,6 +445,18 @@ where
 // Core loop
 // ---------------------------------------------------------------------------
 
+/// Whether a consumer loop enrols its stream in background maintenance
+/// (XAUTOCLAIM crash recovery + acked-entry trimming via the per-process
+/// registry in [`super::maintenance`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Maintain {
+    /// Regular work stream — acquire a maintenance interest.
+    Stream,
+    /// No maintenance. Used for DLQ streams, which are an operator audit
+    /// record: dead entries must never be reclaimed or trimmed.
+    None,
+}
+
 async fn run_stream_loop<T, H>(
     client: RedisClient,
     handler: H,
@@ -430,6 +464,7 @@ async fn run_stream_loop<T, H>(
     options: ConsumerOptionsInner,
     topology: &'static QueueTopology,
     stream: &str,
+    maintain: Maintain,
 ) -> Result<()>
 where
     T: Topic,
@@ -453,6 +488,7 @@ where
         topology,
         stream,
         hold_queues,
+        maintain,
     )
     .await;
 
@@ -464,6 +500,7 @@ where
 
 /// Core consumer loop that takes `Arc<H>` and `Arc<H::Context>` so it can be
 /// shared across shard tasks without requiring `H: Clone`.
+#[allow(clippy::too_many_arguments)]
 async fn run_stream_loop_arc<T, H>(
     client: RedisClient,
     handler: Arc<H>,
@@ -472,6 +509,7 @@ async fn run_stream_loop_arc<T, H>(
     topology: &'static QueueTopology,
     stream: &str,
     hold_queues: &[HoldQueue],
+    maintain: Maintain,
 ) -> Result<()>
 where
     T: Topic,
@@ -481,6 +519,12 @@ where
     let shutdown = options.shutdown.clone();
     let topic_name = topology.queue();
     let consumer_group = options.consumer_group.as_deref();
+
+    // Hold a maintenance interest (reaper: XAUTOCLAIM recovery + acked-entry
+    // trimming) for this stream while the consumer runs. The registry dedupes
+    // per (client, stream, group), so N consumers still share one sidecar.
+    let _maintenance = (maintain == Maintain::Stream)
+        .then(|| super::maintenance::acquire(&client, stream, options.handler_timeout));
 
     // Pre-compute metric label arcs once — reused cheaply for every message.
     let topic_arc: Arc<str> = Arc::from(topic_name);
@@ -777,6 +821,10 @@ where
     let shutdown = options.shutdown.clone();
     let topic_name = topology.queue();
     let consumer_group = options.consumer_group.as_deref();
+
+    // Same per-(client, stream, group) maintenance interest as the
+    // sequential loop — see run_stream_loop_arc.
+    let _maintenance = super::maintenance::acquire(&client, stream, options.handler_timeout);
 
     let topic_arc: Arc<str> = Arc::from(topic_name);
     let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);

@@ -332,6 +332,14 @@ impl RedisClient {
     pub(super) fn group(&self) -> &str {
         &self.group
     }
+
+    /// Identity of this client's shared inner connection state. Clones of one
+    /// client share it; independently-connected clients (possibly to other
+    /// servers) differ. Used by the maintenance registry to scope its
+    /// per-`(client, stream, group)` deduplication.
+    pub(super) fn instance_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
 }
 
 /// Build an [`AsyncConnectionConfig`](redis::AsyncConnectionConfig) from the

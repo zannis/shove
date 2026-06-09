@@ -59,7 +59,9 @@ fn reaper_consumer_name(group: &str) -> String {
 ///
 /// `interval` is the gap between XAUTOCLAIM passes. Defaults at the call
 /// site to `max(handler_timeout, 30s)` so the reaper never fires more
-/// frequently than entries can plausibly time out.
+/// frequently than entries can plausibly time out. The first sweep runs
+/// immediately at spawn; `min_idle_ms` still gates which entries it may
+/// reclaim, so the early pass cannot steal in-flight work.
 ///
 /// `min_idle_ms` is the XAUTOCLAIM idle threshold — entries whose PEL idle
 /// time is shorter than this are not reclaimed.
@@ -84,11 +86,12 @@ pub fn spawn_reaper(
         };
 
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(interval) => {}
-            }
-
+            // Sweep first, sleep after: the initial sweep at spawn means a
+            // freshly started consumer reclaims orphaned PEL entries (and
+            // trims acked history) immediately instead of one interval later
+            // — matching the pre-consolidation behaviour where every
+            // consumer ran autoclaim at startup. Errors still pace at
+            // `interval` because the reconnect falls through to the sleep.
             let mut needs_reconnect = false;
             for stream in &streams {
                 if shutdown.is_cancelled() {
@@ -117,6 +120,11 @@ pub fn spawn_reaper(
                     Some(c) => conn = c,
                     None => return,
                 }
+            }
+
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     })

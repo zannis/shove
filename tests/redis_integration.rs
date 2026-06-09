@@ -22,7 +22,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
 use shove::consumer_group::ConsumerGroupConfig;
-use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider};
+use shove::redis::{
+    RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider,
+};
 use shove::{
     Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
     SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
@@ -1301,6 +1303,223 @@ async fn autoscaler_stats_zero_after_full_consumption_on_redis_62() {
         stats.messages_ready, 0,
         "a drained queue must report zero backlog on Redis 6.2 even though \
          XINFO GROUPS has no lag field"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stream maintenance on the direct consumer path
+// ---------------------------------------------------------------------------
+
+struct DirectTrimTopic;
+impl Topic for DirectTrimTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-direct-trim").build())
+    }
+}
+
+#[derive(Clone)]
+struct DirectTrimHandler(Arc<AtomicUsize>);
+impl MessageHandler<DirectTrimTopic> for DirectTrimHandler {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Outcome::Ack
+    }
+}
+
+/// Consumers driven through the direct `ConsumerSupervisor` path (no
+/// `RedisConsumerGroupRegistry`) must also get stream maintenance: a stream
+/// whose entries were all consumed and acked must be trimmed while such a
+/// consumer is running.
+#[tokio::test]
+async fn direct_consumer_stream_is_trimmed() {
+    let broker = make_broker("redis-int-direct-trim-grp").await;
+    broker
+        .topology()
+        .declare::<DirectTrimTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..10u64 {
+        publisher
+            .publish::<DirectTrimTopic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+
+    // First consumer run: consume and ack everything, then stop.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<DirectTrimTopic, _>(
+            DirectTrimHandler(counter.clone()),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+    let probe = counter.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 10,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(counter.load(Ordering::Relaxed), 10, "all messages consumed");
+
+    // Second consumer run on the now fully-acked stream: its maintenance
+    // sweep must trim the acked entries.
+    let mut supervisor = broker.consumer_supervisor();
+    let token = supervisor.cancellation_token();
+    supervisor
+        .register::<DirectTrimTopic, _>(
+            DirectTrimHandler(Arc::new(AtomicUsize::new(0))),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut raw = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+
+    let trim_signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let len: i64 = redis::cmd("XLEN")
+                .arg("redis-int-direct-trim")
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 1 || std::time::Instant::now() > deadline {
+                token.cancel();
+                assert!(
+                    len <= 1,
+                    "a direct consumer's fully-acked stream must be trimmed, \
+                     XLEN still {len}"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let outcome = supervisor
+        .run_until_timeout(trim_signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+}
+
+struct DlqKeepTopic;
+impl Topic for DlqKeepTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-dlq-keep").dlq().build())
+    }
+}
+
+#[derive(Clone)]
+struct DlqKeepHandler;
+impl MessageHandler<DlqKeepTopic> for DlqKeepHandler {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+/// DLQ streams are an operator audit record: running a DLQ consumer must
+/// never enrol the DLQ stream in maintenance trimming, even after every dead
+/// message has been delivered and acknowledged.
+#[tokio::test]
+async fn dlq_stream_is_never_trimmed() {
+    let group = "redis-int-dlq-keep-grp";
+    let broker = make_broker(group).await;
+    broker
+        .topology()
+        .declare::<DlqKeepTopic>()
+        .await
+        .expect("declare");
+    let dlq = DlqKeepTopic::topology().dlq().expect("topic has a DLQ");
+
+    // Seed five dead messages and mark them delivered + acked, mirroring a
+    // DLQ that an operator's handler has already worked through.
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut raw = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let id: String = redis::cmd("XADD")
+            .arg(dlq)
+            .arg("*")
+            .arg("payload")
+            .arg(format!("{{\"id\":{i}}}"))
+            .query_async(&mut raw)
+            .await
+            .expect("XADD");
+        ids.push(id);
+    }
+    let _: redis::Value = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(group)
+        .arg("dlq-worker")
+        .arg("COUNT")
+        .arg(5)
+        .arg("STREAMS")
+        .arg(dlq)
+        .arg(">")
+        .query_async(&mut raw)
+        .await
+        .expect("XREADGROUP");
+    let mut xack = redis::cmd("XACK");
+    xack.arg(dlq).arg(group);
+    for id in &ids {
+        xack.arg(id);
+    }
+    let acked: i64 = xack.query_async(&mut raw).await.expect("XACK");
+    assert_eq!(acked, 5);
+
+    // Run a DLQ consumer over the fully-acked DLQ stream. If it (wrongly)
+    // enrols the stream in maintenance, the startup sweep trims it.
+    let cfg = RedisConfig::new(RedisMode::Standalone {
+        url: url.to_owned(),
+    })
+    .with_group(group);
+    let client = <Redis as shove::Backend>::connect(cfg)
+        .await
+        .expect("connect RedisClient");
+    let dlq_task = tokio::spawn(async move {
+        let consumer = RedisConsumer::new(client);
+        let _ = consumer
+            .run_dlq::<DlqKeepTopic, _>(DlqKeepHandler, ())
+            .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let len: i64 = redis::cmd("XLEN")
+        .arg(dlq)
+        .query_async(&mut raw)
+        .await
+        .expect("XLEN");
+
+    dlq_task.abort();
+    let _ = dlq_task.await;
+
+    assert_eq!(
+        len, 5,
+        "DLQ streams are an audit record and must never be trimmed"
     );
 }
 
