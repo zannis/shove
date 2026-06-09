@@ -1134,6 +1134,89 @@ async fn autoscaler_stats_reflect_published_messages() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 8b: autoscaler_stats_zero_after_full_consumption
+// ---------------------------------------------------------------------------
+
+struct ConsumedStatsTopic;
+impl Topic for ConsumedStatsTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-stats-consumed").build())
+    }
+}
+
+/// XACK leaves entries in the stream, so a backlog metric derived from XLEN
+/// reads a fully-drained queue as permanently backlogged — the autoscaler
+/// would pin every group at max consumers. After every message is consumed
+/// and acked, the stats provider must report zero ready and zero in-flight.
+#[tokio::test]
+async fn autoscaler_stats_zero_after_full_consumption() {
+    let broker = make_broker("redis-int-stats-consumed-grp").await;
+    broker
+        .topology()
+        .declare::<ConsumedStatsTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..20u64 {
+        publisher
+            .publish::<ConsumedStatsTopic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<ConsumedStatsTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<ConsumedStatsTopic, _>(H(counter.clone()), ConsumerOptions::<Redis>::new())
+        .expect("register");
+
+    let probe = counter.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 20,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(counter.load(Ordering::Relaxed), 20, "all messages consumed");
+
+    let stats = broker
+        .queue_stats_provider()
+        .get_queue_stats(ConsumedStatsTopic::topology().queue())
+        .await
+        .expect("get_queue_stats");
+
+    assert_eq!(
+        stats.messages_in_flight, 0,
+        "all messages were acked — nothing in flight"
+    );
+    assert_eq!(
+        stats.messages_ready, 0,
+        "all messages were consumed and acked — a drained queue must not \
+         report backlog (XLEN counts acked entries too)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Helper for finding a free port
 // ---------------------------------------------------------------------------
 
