@@ -126,6 +126,12 @@ impl RedisConsumerGroupConfig {
 
     /// Set the maximum time a handler may spend processing a single
     /// message. If exceeded, the message is left in the PEL for XAUTOCLAIM.
+    ///
+    /// The timeout also seeds the maintenance sidecar's reclaim deadline,
+    /// which applies to the whole consumer group: configure the same value
+    /// for every consumer of this stream and group, including consumers in
+    /// other processes. A process whose consumers use a shorter timeout will
+    /// reclaim entries held by longer-running consumers elsewhere.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = HandlerTimeoutConfig::Set(timeout);

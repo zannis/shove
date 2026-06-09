@@ -21,6 +21,12 @@
 //! leaving changes the effective policy, the sidecar is cancelled and
 //! respawned with the new one.
 //!
+//! This reconciliation is per process. A separate process (or an
+//! independently connected client) consuming the same stream and group runs
+//! its own sidecar on its own policy, so handler timeouts should be
+//! configured consistently across every consumer of a stream and group —
+//! see `ConsumerOptions::with_handler_timeout`.
+//!
 //! The key includes the client identity so two clients pointed at different
 //! Redis servers never share a maintenance task; two distinct clients on the
 //! same server merely run duplicate sweeps, which XAUTOCLAIM and the
