@@ -2498,7 +2498,7 @@ mod reaper_tests {
     use super::*;
     use redis::aio::MultiplexedConnection;
     use shove::Backend;
-    use shove::redis::{RedisClient, spawn_reaper, spawn_trim_only_reaper};
+    use shove::redis::{RedisClient, spawn_maintenance, spawn_reaper};
     use tokio_util::sync::CancellationToken;
 
     /// Open a raw multiplexed connection to the shared Redis URL for issuing
@@ -2973,12 +2973,12 @@ mod reaper_tests {
         let shutdown = CancellationToken::new();
         // Large min_idle so XAUTOCLAIM reclaims nothing — this test isolates
         // the trim behaviour from redelivery.
-        let handle = spawn_reaper(
+        let handle = spawn_maintenance(
             client,
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3067,12 +3067,12 @@ mod reaper_tests {
         let shutdown = CancellationToken::new();
         // Large min_idle so the pending entries are not autoclaim-redelivered
         // during the test window.
-        let handle = spawn_reaper(
+        let handle = spawn_maintenance(
             client,
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3194,12 +3194,12 @@ mod reaper_tests {
         // The reaper runs on behalf of group A.
         let client = connect_client_with_retry(url, group_a).await;
         let shutdown = CancellationToken::new();
-        let handle = spawn_reaper(
+        let handle = spawn_maintenance(
             client,
             vec![stream.to_string()],
             group_a.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3304,12 +3304,12 @@ mod reaper_tests {
 
         let client = connect_client_with_retry(url, group_a).await;
         let shutdown = CancellationToken::new();
-        let handle = spawn_reaper(
+        let handle = spawn_maintenance(
             client,
             vec![stream.to_string()],
             group_a.to_string(),
             Duration::from_millis(100),
-            60_000,
+            Some(60_000),
             shutdown.clone(),
         );
 
@@ -3328,6 +3328,88 @@ mod reaper_tests {
             len, 10,
             "a group with no consumption yet (last-delivered 0-0) expects \
              the full stream — trim must be skipped"
+        );
+    }
+
+    /// `spawn_reaper` is the long-standing doc-hidden escape hatch and has
+    /// always been autoclaim-only. Gaining a trimming side effect would let
+    /// existing callers (e.g. pointing it at a DLQ stream) silently delete
+    /// acknowledged entries — it must not trim.
+    #[tokio::test]
+    async fn spawn_reaper_does_not_trim() {
+        let url = redis_url().await;
+        let stream = "reaper-notrim-stream";
+        let group = "reaper-notrim-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("worker")
+            .arg("COUNT")
+            .arg(5)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let acked: i64 = xack.query_async(&mut raw).await.expect("XACK");
+        assert_eq!(acked, 5);
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            60_000,
+            shutdown.clone(),
+        );
+
+        // Several sweep ticks must pass without the acked entries vanishing.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            len, 5,
+            "spawn_reaper is autoclaim-only — trimming is the maintenance \
+             sidecar's job (spawn_maintenance)"
         );
     }
 
@@ -3390,11 +3472,12 @@ mod reaper_tests {
 
         let client = connect_client_with_retry(url, group).await;
         let shutdown = CancellationToken::new();
-        let handle = spawn_trim_only_reaper(
+        let handle = spawn_maintenance(
             client,
             vec![stream.to_string()],
             group.to_string(),
             Duration::from_millis(100),
+            None,
             shutdown.clone(),
         );
 

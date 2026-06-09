@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::client::RedisClient;
-use super::reaper::spawn_reaper_inner;
+use super::reaper::spawn_maintenance;
 use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
 type Key = (usize, String, String);
@@ -158,7 +158,7 @@ pub(super) fn acquire(
     let stream = stream.to_owned();
     let spawner: Spawner = Arc::new(move |shutdown, policy| {
         let (interval, min_idle_ms) = sidecar_timing(policy);
-        spawn_reaper_inner(
+        spawn_maintenance(
             client.clone(),
             vec![stream.clone()],
             client.group().to_owned(),

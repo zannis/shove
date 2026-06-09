@@ -325,7 +325,7 @@ pub mod redis {
     /// import them directly. Production code should not call these; the
     /// per-process maintenance registry owns reaper lifecycle.
     #[doc(hidden)]
-    pub use crate::backends::redis::{spawn_reaper, spawn_trim_only_reaper};
+    pub use crate::backends::redis::{spawn_maintenance, spawn_reaper};
 }
 
 /// In-process, non-durable broker backend.

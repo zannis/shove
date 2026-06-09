@@ -64,7 +64,9 @@ fn reaper_consumer_name(group: &str) -> String {
 /// reclaim, so the early pass cannot steal in-flight work.
 ///
 /// `min_idle_ms` is the XAUTOCLAIM idle threshold — entries whose PEL idle
-/// time is shorter than this are not reclaimed.
+/// time is shorter than this are not reclaimed. This entry point is
+/// autoclaim-only — it never trims, so it is safe to point at any stream
+/// (including a DLQ). Trimming lives in [`spawn_maintenance`].
 /// `pub` (with `#[doc(hidden)]`) rather than `pub(crate)` so integration
 /// tests in `tests/` — which are compiled as separate crates — can spawn the
 /// reaper directly with arbitrary timing. Production code should not call
@@ -78,39 +80,56 @@ pub fn spawn_reaper(
     min_idle_ms: u64,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
-    spawn_reaper_inner(
+    spawn_sidecar(
         client,
         streams,
         group,
         interval,
         Some(min_idle_ms),
+        false,
         shutdown,
     )
 }
 
-/// Trim-only variant of [`spawn_reaper`]: no XAUTOCLAIM. Used for keys whose
-/// consumers run without a handler timeout — with no deadline after which
-/// in-flight work may be presumed dead, reclaiming on a made-up one would
-/// redeliver messages that are still being processed. `#[doc(hidden)]` for
-/// the same integration-test reason as [`spawn_reaper`].
+/// Full maintenance sidecar: XAUTOCLAIM crash recovery (when `min_idle_ms`
+/// is `Some`) plus acked-entry trimming on every sweep. `min_idle_ms: None`
+/// is the no-handler-deadline mode — with no point after which in-flight
+/// work may be presumed dead, reclaiming on a made-up deadline would
+/// redeliver messages that are still being processed, so only the trim runs.
+///
+/// Never point this at a DLQ stream — trimming deletes acknowledged entries,
+/// and dead-letter streams are an operator audit record. `#[doc(hidden)]`
+/// for the same integration-test reason as [`spawn_reaper`].
 #[doc(hidden)]
-pub fn spawn_trim_only_reaper(
-    client: RedisClient,
-    streams: Vec<String>,
-    group: String,
-    interval: Duration,
-    shutdown: CancellationToken,
-) -> JoinHandle<()> {
-    spawn_reaper_inner(client, streams, group, interval, None, shutdown)
-}
-
-/// Shared core: `min_idle_ms: None` disables XAUTOCLAIM (trim-only).
-pub(crate) fn spawn_reaper_inner(
+pub fn spawn_maintenance(
     client: RedisClient,
     streams: Vec<String>,
     group: String,
     interval: Duration,
     min_idle_ms: Option<u64>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_sidecar(
+        client,
+        streams,
+        group,
+        interval,
+        min_idle_ms,
+        true,
+        shutdown,
+    )
+}
+
+/// Shared core: `min_idle_ms: None` disables XAUTOCLAIM; `trim` gates the
+/// acked-entry trim pass.
+#[allow(clippy::too_many_arguments)]
+fn spawn_sidecar(
+    client: RedisClient,
+    streams: Vec<String>,
+    group: String,
+    interval: Duration,
+    min_idle_ms: Option<u64>,
+    trim: bool,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let reaper = reaper_consumer_name(&group);
@@ -134,15 +153,14 @@ pub(crate) fn spawn_reaper_inner(
                 }
                 let result = match min_idle_ms {
                     Some(idle) => {
-                        match autoclaim_all(&mut conn, stream, &group, &reaper, idle, &shutdown)
-                            .await
-                        {
-                            Ok(()) => trim_acked(&mut conn, stream).await,
-                            err => err,
-                        }
+                        autoclaim_all(&mut conn, stream, &group, &reaper, idle, &shutdown).await
                     }
-                    // No handler deadline — trim-only sidecar.
-                    None => trim_acked(&mut conn, stream).await,
+                    // No handler deadline — nothing may be reclaimed.
+                    None => Ok(()),
+                };
+                let result = match result {
+                    Ok(()) if trim => trim_acked(&mut conn, stream).await,
+                    other => other,
                 };
                 if let Err(e) = result {
                     tracing::warn!(
@@ -308,7 +326,17 @@ async fn trim_acked(conn: &mut RedisConnection, stream: &str) -> Result<()> {
                 StreamPendingReply::Empty => g.last_delivered_id,
                 // `StreamPendingReply` is non_exhaustive; an unknown variant
                 // gives no safe threshold, so skip the trim for this sweep.
-                _ => return Ok(()),
+                // Warned because a persistent skip means the stream grows
+                // unbounded with no other operator-visible signal.
+                other => {
+                    tracing::warn!(
+                        stream,
+                        group = %g.name,
+                        reply = ?other,
+                        "trim skipped: unexpected XPENDING reply shape — stream will not shrink this sweep"
+                    );
+                    return Ok(());
+                }
             }
         } else {
             g.last_delivered_id
@@ -317,7 +345,13 @@ async fn trim_acked(conn: &mut RedisConnection, stream: &str) -> Result<()> {
             return Ok(());
         }
         let Some(parsed) = super::stream_id::parse(&checkpoint) else {
-            // Unparseable checkpoint — no safe threshold, skip this sweep.
+            // No safe threshold — same unbounded-growth concern as above.
+            tracing::warn!(
+                stream,
+                group = %g.name,
+                checkpoint,
+                "trim skipped: unparseable group checkpoint — stream will not shrink this sweep"
+            );
             return Ok(());
         };
         if threshold.is_none_or(|t| parsed < t) {
