@@ -12,6 +12,7 @@ mod consumer_group;
 mod publisher;
 mod reaper;
 mod requeue;
+mod stream_id;
 mod topology;
 
 pub use autoscaler::{

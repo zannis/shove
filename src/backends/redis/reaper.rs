@@ -98,7 +98,7 @@ pub fn spawn_reaper(
                     match autoclaim_all(&mut conn, stream, &group, &reaper, min_idle_ms, &shutdown)
                         .await
                     {
-                        Ok(()) => trim_acked(&mut conn, stream, &group).await,
+                        Ok(()) => trim_acked(&mut conn, stream).await,
                         err => err,
                     };
                 if let Err(e) = result {
@@ -216,57 +216,83 @@ async fn autoclaim_all(
     Ok(())
 }
 
-/// Trim entries that every consumer in `group` has already acknowledged.
+/// Trim entries that **every** consumer group on the stream has already
+/// acknowledged.
 ///
 /// XACK removes an entry from the PEL but not from the stream, so without
 /// trimming every stream grows without bound. The safe `XTRIM MINID`
-/// threshold:
+/// threshold is the minimum, across all groups on the stream, of each
+/// group's checkpoint:
 ///
-/// * PEL non-empty → the oldest pending entry id. Delivery is in id order,
-///   so every entry below the oldest pending one was delivered and is no
-///   longer pending — i.e. acknowledged.
+/// * PEL non-empty → the group's oldest pending entry id. Delivery is in id
+///   order, so every entry below the oldest pending one was delivered to
+///   that group and is no longer pending — i.e. acknowledged.
 /// * PEL empty → the group's `last-delivered-id`. Everything at or below it
 ///   is acked; using the id itself (MINID keeps entries `>=` threshold)
 ///   retains the last delivered entry, trading one kept entry for not
 ///   having to do stream-id arithmetic.
 ///
-/// shove owns exactly one consumer group per stream, so the group's own
-/// progress is the stream's global progress — there is no other group whose
-/// unread entries could be trimmed away. DLQ streams are not in the
-/// reaper's stream list and are never trimmed.
-async fn trim_acked(conn: &mut RedisConnection, stream: &str, group: &str) -> Result<()> {
+/// All groups are considered — not just the reaper's own — because a stream
+/// can carry several (fan-out via `RedisConfig::with_group`); trimming on
+/// one group's progress alone would delete entries a slower group has not
+/// consumed. A group whose checkpoint is `0-0` has consumed nothing and
+/// expects the full stream, so the trim is skipped entirely. DLQ streams
+/// are not in the reaper's stream list and are never trimmed.
+async fn trim_acked(conn: &mut RedisConnection, stream: &str) -> Result<()> {
     use redis::streams::{StreamInfoGroupsReply, StreamPendingReply};
 
-    let pending: StreamPendingReply = conn
-        .query(redis::cmd("XPENDING").arg(stream).arg(group))
+    let info: StreamInfoGroupsReply = conn
+        .query(redis::cmd("XINFO").arg("GROUPS").arg(stream))
         .await?;
+    if info.groups.is_empty() {
+        return Ok(());
+    }
 
-    let threshold = match pending {
-        StreamPendingReply::Data(data) => data.start_id,
-        StreamPendingReply::Empty => {
-            let info: StreamInfoGroupsReply = conn
-                .query(redis::cmd("XINFO").arg("GROUPS").arg(stream))
+    let mut threshold: Option<(u64, u64)> = None;
+    let mut threshold_raw = String::new();
+    for g in info.groups {
+        let checkpoint = if g.pending > 0 {
+            let pending: StreamPendingReply = conn
+                .query(redis::cmd("XPENDING").arg(stream).arg(&g.name))
                 .await?;
-            let Some(g) = info.groups.into_iter().find(|g| g.name == group) else {
-                // Group not declared on this stream (yet) — nothing to trim.
-                return Ok(());
-            };
-            if g.last_delivered_id == "0-0" {
-                // Nothing delivered yet — trimming would race fresh entries.
-                return Ok(());
+            match pending {
+                StreamPendingReply::Data(data) => data.start_id,
+                StreamPendingReply::Empty => g.last_delivered_id,
+                // `StreamPendingReply` is non_exhaustive; an unknown variant
+                // gives no safe threshold, so skip the trim for this sweep.
+                _ => return Ok(()),
             }
+        } else {
             g.last_delivered_id
+        };
+        if checkpoint == "0-0" {
+            return Ok(());
         }
-        // `StreamPendingReply` is non_exhaustive; an unknown variant gives
-        // no safe threshold, so skip the trim for this sweep.
-        _ => return Ok(()),
-    };
+        let Some(parsed) = super::stream_id::parse(&checkpoint) else {
+            // Unparseable checkpoint — no safe threshold, skip this sweep.
+            return Ok(());
+        };
+        if threshold.is_none_or(|t| parsed < t) {
+            threshold = Some(parsed);
+            threshold_raw = checkpoint;
+        }
+    }
 
     let trimmed: i64 = conn
-        .query(redis::cmd("XTRIM").arg(stream).arg("MINID").arg(&threshold))
+        .query(
+            redis::cmd("XTRIM")
+                .arg(stream)
+                .arg("MINID")
+                .arg(&threshold_raw),
+        )
         .await?;
     if trimmed > 0 {
-        tracing::debug!(stream, trimmed, threshold, "reaper: trimmed acked entries");
+        tracing::debug!(
+            stream,
+            trimmed,
+            threshold = threshold_raw,
+            "reaper: trimmed acked entries"
+        );
     }
     Ok(())
 }

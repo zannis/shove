@@ -2803,4 +2803,224 @@ mod reaper_tests {
             "pending (unacked) entries must survive the trim"
         );
     }
+
+    /// A stream can carry more than one consumer group (fan-out via
+    /// `RedisConfig::with_group`). Trimming driven by one group's progress
+    /// must never delete entries another, slower group has not consumed.
+    #[tokio::test]
+    async fn reaper_trim_respects_slower_second_group() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-multigroup-stream";
+        let group_a = "reaper-trim-multigrp-a";
+        let group_b = "reaper-trim-multigrp-b";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        for g in [group_a, group_b] {
+            let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(stream)
+                .arg(g)
+                .arg("0")
+                .arg("MKSTREAM")
+                .query_async(&mut raw)
+                .await;
+        }
+
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+
+        // Group A consumes and acks everything.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group_a)
+            .arg("ca")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP a");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group_a);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let _: i64 = xack.query_async(&mut raw).await.expect("XACK a");
+
+        // Group B has only consumed (and acked) the first 4.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group_b)
+            .arg("cb")
+            .arg("COUNT")
+            .arg(4)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP b");
+        let _: i64 = redis::cmd("XACK")
+            .arg(stream)
+            .arg(group_b)
+            .arg(&ids[0])
+            .arg(&ids[1])
+            .arg(&ids[2])
+            .arg(&ids[3])
+            .query_async(&mut raw)
+            .await
+            .expect("XACK b");
+
+        // The reaper runs on behalf of group A.
+        let client = connect_client_with_retry(url, group_a).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group_a.to_string(),
+            Duration::from_millis(100),
+            60_000,
+            shutdown.clone(),
+        );
+
+        // Wait for a trim to land, then check it stopped at B's checkpoint.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let len: i64 = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len < 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Give a subsequent tick the chance to (incorrectly) trim further.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            len, 7,
+            "trim must stop at the slowest group's checkpoint (B acked 4 of \
+             10, so the 3 entries below its last-delivered may go, keeping 7)"
+        );
+        // B's six undelivered entries must still be readable.
+        let range: Vec<redis::Value> = redis::cmd("XRANGE")
+            .arg(stream)
+            .arg(&ids[4])
+            .arg("+")
+            .query_async(&mut raw)
+            .await
+            .expect("XRANGE");
+        assert_eq!(
+            range.len(),
+            6,
+            "entries group B has not consumed must survive the trim"
+        );
+    }
+
+    /// A group that exists but has never consumed anything (created at `0`)
+    /// expects the full stream — trimming must be skipped entirely.
+    #[tokio::test]
+    async fn reaper_trim_skipped_when_a_group_has_not_consumed() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-freshgroup-stream";
+        let group_a = "reaper-trim-freshgrp-a";
+        let group_b = "reaper-trim-freshgrp-b";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        for g in [group_a, group_b] {
+            let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(stream)
+                .arg(g)
+                .arg("0")
+                .arg("MKSTREAM")
+                .query_async(&mut raw)
+                .await;
+        }
+
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+
+        // Group A consumes and acks everything; group B never reads.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group_a)
+            .arg("ca")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP a");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group_a);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let _: i64 = xack.query_async(&mut raw).await.expect("XACK a");
+
+        let client = connect_client_with_retry(url, group_a).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group_a.to_string(),
+            Duration::from_millis(100),
+            60_000,
+            shutdown.clone(),
+        );
+
+        // Let several reaper ticks pass, then verify nothing was trimmed.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            len, 10,
+            "a group with no consumption yet (last-delivered 0-0) expects \
+             the full stream — trim must be skipped"
+        );
+    }
 }
