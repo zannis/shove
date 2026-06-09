@@ -1,0 +1,27 @@
+src/backends/redis/stream_id.rs
+  s_b029cb0284d7f0::t_9caa13ea386b9d 1-42
+src/backends/redis/mod.rs
+  s_b029cb0284d7f0::t_72d80b545485e5 15
+src/backends/redis/reaper.rs
+  s_b029cb0284d7f0::t_1e087992406939 219-220,224-225,227-229,235-241,244-245,247-249,251-256,258-263,265,267-269,271-279,282-287,290-295
+  s_b029cb0284d7f0::t_58edf4d231aeda 101
+tests/redis_integration.rs
+  s_b029cb0284d7f0::t_26e33c01fb1bd5 2806-2901,2903-2913,2915-3025
+  s_b029cb0284d7f0::t_9ad95a13290b08 2902,2914
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "048bea276722fcb364bee2ddb047b52b497f0854",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
