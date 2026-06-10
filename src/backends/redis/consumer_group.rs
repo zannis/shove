@@ -29,7 +29,6 @@ use crate::backend::consumer::ConsumerImpl;
 
 use super::client::RedisClient;
 use super::consumer::RedisConsumer;
-use super::reaper::spawn_reaper;
 use super::topology::RedisTopologyDeclarer;
 
 // ---------------------------------------------------------------------------
@@ -127,6 +126,12 @@ impl RedisConsumerGroupConfig {
 
     /// Set the maximum time a handler may spend processing a single
     /// message. If exceeded, the message is left in the PEL for XAUTOCLAIM.
+    ///
+    /// The timeout also seeds the maintenance sidecar's reclaim deadline,
+    /// which applies to the whole consumer group: configure the same value
+    /// for every consumer of this stream and group, including consumers in
+    /// other processes. A process whose consumers use a shorter timeout will
+    /// reclaim entries held by longer-running consumers elsewhere.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
@@ -207,6 +212,11 @@ impl Default for RedisConsumerGroupConfig {
 /// `Spawner` closure (capturing the topic, handler factory, and client) plus
 /// the live consumer tasks. `scale_up`/`scale_down` invoke the spawner or
 /// cancel the chosen consumer's child token.
+///
+/// Stream maintenance (XAUTOCLAIM crash recovery + acked-entry trimming) is
+/// not owned here: every consumer loop acquires a per-`(client, stream,
+/// group)` interest in the process-wide [`super::maintenance`] registry, so
+/// registry-managed and direct consumers share the same single sidecar.
 pub struct RedisConsumerGroup {
     pub(crate) queue: String,
     pub(crate) config: RedisConsumerGroupConfig,
@@ -215,50 +225,6 @@ pub struct RedisConsumerGroup {
     pub(crate) group_token: CancellationToken,
     pub(crate) error_count: Arc<AtomicUsize>,
     pub(crate) panic_count: Arc<AtomicUsize>,
-    /// Factory for the per-group XAUTOCLAIM sidecar. Built once in `new` /
-    /// `new_fifo` so `start` can spawn the reaper without re-capturing
-    /// topology data.
-    pub(crate) reaper_factory: ReaperFactory,
-    /// Handle to the reaper task spawned on `start`. `None` until `start` is
-    /// called, taken back to `None` by `shutdown_with_tally`.
-    pub(crate) reaper_handle: Option<JoinHandle<()>>,
-}
-
-/// Type-erased "spawn me a reaper" closure. Captures the streams + group +
-/// timing knobs needed to call [`super::reaper::spawn_reaper`].
-pub(crate) type ReaperFactory = Arc<dyn Fn() -> JoinHandle<()> + Send + Sync>;
-
-/// Build a [`ReaperFactory`] for the given streams + group. Used by both
-/// `RedisConsumerGroup::new` (single stream) and `::new_fifo` (one stream
-/// per shard).
-///
-/// The reaper interval derives from the group's resolved `handler_timeout`,
-/// floored at 30 s — matches what the per-consumer autoclaim loop used to
-/// pick. `min_idle_ms` (the XAUTOCLAIM idle threshold) is set to the same
-/// value, so an entry must have been pending at least one handler-timeout
-/// before the reaper reclaims it.
-fn build_reaper_factory(
-    client: &RedisClient,
-    streams: Vec<String>,
-    config: &RedisConsumerGroupConfig,
-    group_token: &CancellationToken,
-) -> ReaperFactory {
-    let group = client.group().to_string();
-    let handler_timeout = resolve_handler_timeout(config.handler_timeout, None);
-    let min_idle_ms = handler_timeout.as_millis() as u64;
-    let interval = Duration::from_millis(min_idle_ms.max(30_000));
-    let client = client.clone();
-    let token = group_token.clone();
-    Arc::new(move || {
-        spawn_reaper(
-            client.clone(),
-            streams.clone(),
-            group.clone(),
-            interval,
-            min_idle_ms,
-            token.clone(),
-        )
-    })
 }
 
 impl RedisConsumerGroup {
@@ -313,13 +279,6 @@ impl RedisConsumerGroup {
             })
         });
 
-        let reaper_factory = build_reaper_factory(
-            &client,
-            vec![T::topology().queue().to_string()],
-            &config,
-            &group_token,
-        );
-
         Self {
             queue: queue.into(),
             consumers: Vec::with_capacity(config.max_consumers() as usize),
@@ -328,8 +287,6 @@ impl RedisConsumerGroup {
             group_token,
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
-            reaper_factory,
-            reaper_handle: None,
         }
     }
 
@@ -397,18 +354,6 @@ impl RedisConsumerGroup {
             })
         });
 
-        // FIFO topics own one stream per shard — pass all shard names so the
-        // reaper sweeps them as a group.
-        let topology = T::topology();
-        let n_shards = topology
-            .sequencing()
-            .expect("new_fifo requires sequencing config")
-            .routing_shards();
-        let reaper_streams: Vec<String> = (0..n_shards)
-            .map(|idx| RedisTopologyDeclarer::shard_stream_name(topology.queue(), idx))
-            .collect();
-        let reaper_factory = build_reaper_factory(&client, reaper_streams, &config, &group_token);
-
         Self {
             queue: queue.into(),
             consumers: Vec::with_capacity(1),
@@ -417,12 +362,12 @@ impl RedisConsumerGroup {
             group_token,
             error_count,
             panic_count,
-            reaper_factory,
-            reaper_handle: None,
         }
     }
 
-    /// Spawn `min_consumers` consumer tasks and the per-group reaper sidecar.
+    /// Spawn `min_consumers` consumer tasks. Each consumer loop acquires its
+    /// stream's maintenance sidecar through [`super::maintenance`], so no
+    /// per-group reaper is spawned here.
     pub fn start(&mut self) {
         let target = self.config.min_consumers() as usize;
         info!(
@@ -433,9 +378,6 @@ impl RedisConsumerGroup {
         );
         for _ in 0..target {
             self.spawn_one();
-        }
-        if self.reaper_handle.is_none() {
-            self.reaper_handle = Some((self.reaper_factory)());
         }
     }
 
@@ -541,26 +483,20 @@ impl RedisConsumerGroup {
                 }
             }
         }
-        // The reaper shares `group_token`, so the cancel above already signals
-        // it to exit. Await its JoinHandle so we don't return before the
-        // sidecar is gone.
-        if let Some(h) = self.reaper_handle.take() {
-            let _ = h.await;
-        }
+        // Maintenance sidecars are refcounted per (client, stream, group);
+        // each consumer task drops its guard as it exits above, and the last
+        // drop cancels the sidecar — nothing further to join here.
 
         tally.errors += self.error_count.swap(0, Ordering::Relaxed);
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
 
-    /// Abort surviving consumer handles (and the reaper) after a drain
-    /// timeout, accumulating any results into `tally`.
+    /// Abort surviving consumer handles after a drain timeout, accumulating
+    /// any results into `tally`.
     pub(crate) async fn abort_remaining_into(&mut self, tally: &mut ShutdownTally) {
         self.group_token.cancel();
         for (_token, _processing, handle) in &self.consumers {
             handle.abort();
-        }
-        if let Some(h) = &self.reaper_handle {
-            h.abort();
         }
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
@@ -575,9 +511,6 @@ impl RedisConsumerGroup {
                     tally.panics += 1;
                 }
             }
-        }
-        if let Some(h) = self.reaper_handle.take() {
-            let _ = h.await;
         }
         tally.errors += self.error_count.swap(0, Ordering::Relaxed);
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
@@ -1055,7 +988,6 @@ mod tests {
                     options.shutdown.cancelled().await;
                 })
             });
-            let reaper_factory: ReaperFactory = Arc::new(|| tokio::spawn(async {}));
             RedisConsumerGroup {
                 queue: "test-queue".into(),
                 consumers: Vec::with_capacity(config.max_consumers() as usize),
@@ -1064,8 +996,6 @@ mod tests {
                 group_token,
                 error_count: Arc::new(AtomicUsize::new(0)),
                 panic_count: Arc::new(AtomicUsize::new(0)),
-                reaper_factory,
-                reaper_handle: None,
             }
         }
 
@@ -1149,56 +1079,13 @@ mod tests {
             group.shutdown().await;
         }
 
-        #[tokio::test]
-        async fn reaper_is_spawned_exactly_once_per_group() {
-            // `start()` is idempotent re: the reaper — calling it multiple
-            // times (e.g. after a no-op scale event) must not double-spawn.
-            // Verified by counting factory invocations.
-            let spawn_count = Arc::new(AtomicUsize::new(0));
-            let counter = spawn_count.clone();
-            let reaper_factory: ReaperFactory = Arc::new(move || {
-                counter.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(async {})
-            });
-            let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
-            group.reaper_factory = reaper_factory;
-            assert_eq!(spawn_count.load(Ordering::Relaxed), 0);
-            group.start();
-            assert_eq!(spawn_count.load(Ordering::Relaxed), 1);
-            group.start();
-            assert_eq!(
-                spawn_count.load(Ordering::Relaxed),
-                1,
-                "second start() must not respawn the reaper"
-            );
-            group.shutdown().await;
-        }
-
-        #[tokio::test]
-        async fn shutdown_joins_the_reaper_handle() {
-            // After `shutdown`, the group's reaper_handle should be cleared
-            // — `shutdown_with_tally` takes() it and awaits.
-            let reaper_factory: ReaperFactory = Arc::new(|| tokio::spawn(async {}));
-            let mut group = test_group(RedisConsumerGroupConfig::new(1..=4));
-            group.reaper_factory = reaper_factory;
-            group.start();
-            assert!(group.reaper_handle.is_some());
-            group.shutdown().await;
-            assert!(
-                group.reaper_handle.is_none(),
-                "shutdown_with_tally must take() the reaper handle"
-            );
-        }
+        // Maintenance-sidecar lifecycle (one per (client, stream, group),
+        // refcounted, cancelled with the last consumer) is covered by the
+        // unit tests in `super::super::maintenance`.
 
         fn hanging_test_group(config: RedisConsumerGroupConfig) -> RedisConsumerGroup {
             let mut group = test_group(config);
             group.spawner = Arc::new(|_options: ConsumerOptionsInner| {
-                tokio::spawn(async {
-                    std::future::pending::<()>().await;
-                })
-            });
-            // Reaper that also never exits, exercising the abort-on-escalation path.
-            group.reaper_factory = Arc::new(|| {
                 tokio::spawn(async {
                     std::future::pending::<()>().await;
                 })
@@ -1225,10 +1112,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn abort_remaining_into_kills_hanging_consumers_and_reaper() {
+        async fn abort_remaining_into_kills_hanging_consumers() {
             let mut group = hanging_test_group(RedisConsumerGroupConfig::new(2..=2));
             group.start();
-            assert!(group.reaper_handle.is_some());
 
             group.error_count.store(5, Ordering::Relaxed);
             group.panic_count.store(1, Ordering::Relaxed);
@@ -1239,10 +1125,6 @@ mod tests {
             group.abort_remaining_into(&mut tally).await;
 
             assert_eq!(group.active_consumers(), 0);
-            assert!(
-                group.reaper_handle.is_none(),
-                "abort_remaining_into must take() the reaper handle"
-            );
             assert_eq!(tally.errors, 5);
             assert_eq!(tally.panics, 1);
         }

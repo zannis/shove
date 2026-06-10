@@ -1866,6 +1866,94 @@ async fn lag_stats_provider_reports_zero_after_consumption() {
     broker.close().await;
 }
 
+#[tokio::test]
+async fn committed_offsets_advance_while_consumer_is_idle() {
+    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+
+    shove::define_topic!(
+        IdleCommitTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-idle-commit").dlq().build()
+    );
+
+    impl MessageHandler<IdleCommitTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<IdleCommitTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..3 {
+        publisher
+            .publish::<IdleCommitTopic>(&SimpleMessage {
+                id: format!("idle-commit-{i}"),
+                content: "test".into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<IdleCommitTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
+            .await
+    });
+
+    assert!(
+        handler.counter.wait_for(3, TIMEOUT).await,
+        "should consume all 3 messages"
+    );
+
+    // The consumer stays running and no further messages arrive. Handler
+    // completions alone must drive the offset commits — a crash or rebalance
+    // in this state must not redeliver the already-processed batch.
+    let stats_provider = KafkaLagStatsProvider::new(client.clone());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let stats: KafkaQueueStats = stats_provider
+            .get_queue_stats("kafka-idle-commit", "kafka-idle-commit-consumer")
+            .await
+            .expect("get_queue_stats should succeed");
+        if stats.messages_pending == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "offsets must be committed while the consumer is idle (no new \
+             traffic, no shutdown), still got lag {}",
+            stats.messages_pending
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
 // ===========================================================================
 // Partition expansion
 // ===========================================================================

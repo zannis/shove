@@ -13,6 +13,11 @@
 //! consumer name (`shove-reaper-{group}`). Regular consumers no longer do
 //! any XAUTOCLAIM themselves.
 //!
+//! Each sweep also trims fully-acknowledged entries (`XTRIM MINID`, see
+//! [`trim_acked`]): XACK clears the PEL but leaves entries in the stream,
+//! so without trimming, stream memory grows without bound and `XLEN`-based
+//! backlog estimates drift ever upward.
+//!
 //! **At-least-once semantics**: if shove runs in multiple processes against
 //! the same Redis, each spawns its own reaper. They race on XAUTOCLAIM, which
 //! is safe — only one of them wins ownership of each reclaimed entry. Some
@@ -54,14 +59,18 @@ fn reaper_consumer_name(group: &str) -> String {
 ///
 /// `interval` is the gap between XAUTOCLAIM passes. Defaults at the call
 /// site to `max(handler_timeout, 30s)` so the reaper never fires more
-/// frequently than entries can plausibly time out.
+/// frequently than entries can plausibly time out. The first sweep runs
+/// immediately at spawn; `min_idle_ms` still gates which entries it may
+/// reclaim, so the early pass cannot steal in-flight work.
 ///
 /// `min_idle_ms` is the XAUTOCLAIM idle threshold — entries whose PEL idle
-/// time is shorter than this are not reclaimed.
+/// time is shorter than this are not reclaimed. This entry point is
+/// autoclaim-only — it never trims, so it is safe to point at any stream
+/// (including a DLQ). Trimming lives in [`spawn_maintenance`].
 /// `pub` (with `#[doc(hidden)]`) rather than `pub(crate)` so integration
 /// tests in `tests/` — which are compiled as separate crates — can spawn the
 /// reaper directly with arbitrary timing. Production code should not call
-/// this; the consumer-group registry owns reaper lifecycle.
+/// this; the per-process maintenance registry owns reaper lifecycle.
 #[doc(hidden)]
 pub fn spawn_reaper(
     client: RedisClient,
@@ -69,6 +78,58 @@ pub fn spawn_reaper(
     group: String,
     interval: Duration,
     min_idle_ms: u64,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_sidecar(
+        client,
+        streams,
+        group,
+        interval,
+        Some(min_idle_ms),
+        false,
+        shutdown,
+    )
+}
+
+/// Full maintenance sidecar: XAUTOCLAIM crash recovery (when `min_idle_ms`
+/// is `Some`) plus acked-entry trimming on every sweep. `min_idle_ms: None`
+/// is the no-handler-deadline mode — with no point after which in-flight
+/// work may be presumed dead, reclaiming on a made-up deadline would
+/// redeliver messages that are still being processed, so only the trim runs.
+///
+/// Never point this at a DLQ stream — trimming deletes acknowledged entries,
+/// and dead-letter streams are an operator audit record. `#[doc(hidden)]`
+/// for the same integration-test reason as [`spawn_reaper`].
+#[doc(hidden)]
+pub fn spawn_maintenance(
+    client: RedisClient,
+    streams: Vec<String>,
+    group: String,
+    interval: Duration,
+    min_idle_ms: Option<u64>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_sidecar(
+        client,
+        streams,
+        group,
+        interval,
+        min_idle_ms,
+        true,
+        shutdown,
+    )
+}
+
+/// Shared core: `min_idle_ms: None` disables XAUTOCLAIM; `trim` gates the
+/// acked-entry trim pass.
+#[allow(clippy::too_many_arguments)]
+fn spawn_sidecar(
+    client: RedisClient,
+    streams: Vec<String>,
+    group: String,
+    interval: Duration,
+    min_idle_ms: Option<u64>,
+    trim: bool,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let reaper = reaper_consumer_name(&group);
@@ -79,23 +140,33 @@ pub fn spawn_reaper(
         };
 
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(interval) => {}
-            }
-
+            // Sweep first, sleep after: the initial sweep at spawn means a
+            // freshly started consumer reclaims orphaned PEL entries (and
+            // trims acked history) immediately instead of one interval later
+            // — matching the pre-consolidation behaviour where every
+            // consumer ran autoclaim at startup. Errors still pace at
+            // `interval` because the reconnect falls through to the sleep.
             let mut needs_reconnect = false;
             for stream in &streams {
                 if shutdown.is_cancelled() {
                     return;
                 }
-                if let Err(e) =
-                    autoclaim_all(&mut conn, stream, &group, &reaper, min_idle_ms, &shutdown).await
-                {
+                let result = match min_idle_ms {
+                    Some(idle) => {
+                        autoclaim_all(&mut conn, stream, &group, &reaper, idle, &shutdown).await
+                    }
+                    // No handler deadline — nothing may be reclaimed.
+                    None => Ok(()),
+                };
+                let result = match result {
+                    Ok(()) if trim => trim_acked(&mut conn, stream).await,
+                    other => other,
+                };
+                if let Err(e) = result {
                     tracing::warn!(
                         stream,
                         error = %e,
-                        "reaper: XAUTOCLAIM failed, reconnecting",
+                        "reaper: sweep failed, reconnecting",
                     );
                     needs_reconnect = true;
                     break;
@@ -107,6 +178,11 @@ pub fn spawn_reaper(
                     Some(c) => conn = c,
                     None => return,
                 }
+            }
+
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     })
@@ -202,6 +278,103 @@ async fn autoclaim_all(
             break;
         }
         cursor = reply.next_stream_id;
+    }
+    Ok(())
+}
+
+/// Trim entries that **every** consumer group on the stream has already
+/// acknowledged.
+///
+/// XACK removes an entry from the PEL but not from the stream, so without
+/// trimming every stream grows without bound. The safe `XTRIM MINID`
+/// threshold is the minimum, across all groups on the stream, of each
+/// group's checkpoint:
+///
+/// * PEL non-empty → the group's oldest pending entry id. Delivery is in id
+///   order, so every entry below the oldest pending one was delivered to
+///   that group and is no longer pending — i.e. acknowledged.
+/// * PEL empty → the group's `last-delivered-id`. Everything at or below it
+///   is acked; using the id itself (MINID keeps entries `>=` threshold)
+///   retains the last delivered entry, trading one kept entry for not
+///   having to do stream-id arithmetic.
+///
+/// All groups are considered — not just the reaper's own — because a stream
+/// can carry several (fan-out via `RedisConfig::with_group`); trimming on
+/// one group's progress alone would delete entries a slower group has not
+/// consumed. A group whose checkpoint is `0-0` has consumed nothing and
+/// expects the full stream, so the trim is skipped entirely. DLQ streams
+/// are not in the reaper's stream list and are never trimmed.
+async fn trim_acked(conn: &mut RedisConnection, stream: &str) -> Result<()> {
+    use redis::streams::{StreamInfoGroupsReply, StreamPendingReply};
+
+    let info: StreamInfoGroupsReply = conn
+        .query(redis::cmd("XINFO").arg("GROUPS").arg(stream))
+        .await?;
+    if info.groups.is_empty() {
+        return Ok(());
+    }
+
+    let mut threshold: Option<(u64, u64)> = None;
+    let mut threshold_raw = String::new();
+    for g in info.groups {
+        let checkpoint = if g.pending > 0 {
+            let pending: StreamPendingReply = conn
+                .query(redis::cmd("XPENDING").arg(stream).arg(&g.name))
+                .await?;
+            match pending {
+                StreamPendingReply::Data(data) => data.start_id,
+                StreamPendingReply::Empty => g.last_delivered_id,
+                // `StreamPendingReply` is non_exhaustive; an unknown variant
+                // gives no safe threshold, so skip the trim for this sweep.
+                // Warned because a persistent skip means the stream grows
+                // unbounded with no other operator-visible signal.
+                other => {
+                    tracing::warn!(
+                        stream,
+                        group = %g.name,
+                        reply = ?other,
+                        "trim skipped: unexpected XPENDING reply shape — stream will not shrink this sweep"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            g.last_delivered_id
+        };
+        if checkpoint == "0-0" {
+            return Ok(());
+        }
+        let Some(parsed) = super::stream_id::parse(&checkpoint) else {
+            // No safe threshold — same unbounded-growth concern as above.
+            tracing::warn!(
+                stream,
+                group = %g.name,
+                checkpoint,
+                "trim skipped: unparseable group checkpoint — stream will not shrink this sweep"
+            );
+            return Ok(());
+        };
+        if threshold.is_none_or(|t| parsed < t) {
+            threshold = Some(parsed);
+            threshold_raw = checkpoint;
+        }
+    }
+
+    let trimmed: i64 = conn
+        .query(
+            redis::cmd("XTRIM")
+                .arg(stream)
+                .arg("MINID")
+                .arg(&threshold_raw),
+        )
+        .await?;
+    if trimmed > 0 {
+        tracing::debug!(
+            stream,
+            trimmed,
+            threshold = threshold_raw,
+            "reaper: trimmed acked entries"
+        );
     }
     Ok(())
 }

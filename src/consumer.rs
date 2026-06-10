@@ -276,6 +276,15 @@ impl<B: Backend> ConsumerOptions<B> {
 
     /// Set the handler timeout. If a handler exceeds this duration the message
     /// is retried automatically. Panics if `timeout` is zero.
+    ///
+    /// On the Redis backend the timeout also drives crash recovery: a
+    /// background sidecar reclaims entries that have been pending longer
+    /// than the timeout. Reclaim applies to the whole consumer group, so
+    /// configure the same timeout for every consumer of a given stream and
+    /// group, including consumers in other processes. Within one process,
+    /// mixed settings are reconciled conservatively (the longest timeout
+    /// wins; a disabled timeout disables reclaim); across processes each
+    /// process acts on its own setting.
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = Some(timeout);
@@ -283,6 +292,12 @@ impl<B: Backend> ConsumerOptions<B> {
     }
 
     /// Disable the handler timeout entirely (handlers may run indefinitely).
+    ///
+    /// On the Redis backend this also disables crash-recovery reclaim for
+    /// the stream's maintenance sidecar: with no deadline, in-flight work is
+    /// never presumed dead. See [`with_handler_timeout`](Self::with_handler_timeout)
+    /// for why the setting should be consistent across every consumer of a
+    /// stream and group, including other processes.
     pub fn without_handler_timeout(mut self) -> Self {
         self.handler_timeout = None;
         self

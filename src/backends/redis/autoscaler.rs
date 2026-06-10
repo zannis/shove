@@ -1,4 +1,4 @@
-//! Redis Streams autoscaler — XLEN + XPENDING stats and the
+//! Redis Streams autoscaler — XINFO GROUPS (lag + pending) stats and the
 //! `AutoscalerBackend` impl that drives `list_groups`/`fetch_metrics`/`scale`.
 
 use std::sync::Arc;
@@ -46,11 +46,16 @@ pub trait RedisQueueStatsProvider: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// XlenStatsProvider — default impl backed by XLEN + XPENDING
+// XlenStatsProvider — default impl backed by XINFO GROUPS
 // ---------------------------------------------------------------------------
 
-/// Reads queue depth from Redis using XLEN (total entries) and XPENDING
-/// (PEL / in-flight count).
+/// Reads queue depth from Redis via `XINFO GROUPS`: the group's `lag`
+/// (undelivered entries) as ready backlog and its `pending` (PEL size) as
+/// in-flight. Falls back to an XLEN-based estimate only when `lag` is
+/// unavailable (Redis < 7.0, or indeterminate after entry deletion).
+///
+/// The name is historical — the provider originally computed
+/// `XLEN - pending`, which counts acked-but-untrimmed history as backlog.
 #[derive(Clone)]
 pub struct XlenStatsProvider {
     client: RedisClient,
@@ -65,41 +70,75 @@ impl XlenStatsProvider {
 
 impl RedisQueueStatsProvider for XlenStatsProvider {
     async fn get_queue_stats(&self, queue: &str) -> Result<RedisQueueStats> {
-        let group = self.client.group().to_owned();
-        let client = self.client.clone();
-        let client2 = self.client.clone();
-        let group2 = group.clone();
-        let queue2 = queue.to_owned();
+        use redis::streams::{StreamInfoGroupsReply, StreamInfoStreamReply};
 
-        // Run XLEN and XPENDING concurrently — two independent reads, no causal dependency.
-        let (stream_len, pending_reply) = tokio::try_join!(
-            async move {
-                let mut conn = client.multiplexed_conn().await?;
-                conn.query::<u64>(redis::cmd("XLEN").arg(queue))
-                    .await
-                    .map_err(|e| ShoveError::Connection(format!("XLEN failed: {e}")))
-            },
-            async move {
-                let mut conn = client2.multiplexed_conn().await?;
-                conn.query::<redis::Value>(redis::cmd("XPENDING").arg(&queue2).arg(&group2))
-                    .await
-                    .map_err(|e| ShoveError::Connection(format!("XPENDING failed: {e}")))
-            }
-        )?;
+        let group = self.client.group();
+        let mut conn = self.client.multiplexed_conn().await?;
 
-        let in_flight: u64 = match &pending_reply {
-            redis::Value::Array(parts) => {
-                if let Some(redis::Value::Int(n)) = parts.first() {
-                    *n as u64
-                } else {
-                    0
-                }
-            }
-            // XPENDING on a non-existent group returns an error; treat as 0.
-            _ => 0,
+        // XACK removes an entry from the PEL but not from the stream, so
+        // `XLEN - pending` counts already-processed history as backlog and a
+        // long-lived queue reads as permanently backlogged. `XINFO GROUPS`
+        // exposes both the group's PEL size (`pending`) and its undelivered
+        // count (`lag`) in one round trip.
+        let info: StreamInfoGroupsReply = conn
+            .query(redis::cmd("XINFO").arg("GROUPS").arg(queue))
+            .await
+            .map_err(|e| ShoveError::Connection(format!("XINFO GROUPS failed: {e}")))?;
+
+        let Some(g) = info.groups.iter().find(|g| g.name == group) else {
+            // Group not declared yet — nothing has been delivered, so the
+            // whole stream is undelivered backlog.
+            let len: u64 = conn
+                .query(redis::cmd("XLEN").arg(queue))
+                .await
+                .map_err(|e| ShoveError::Connection(format!("XLEN failed: {e}")))?;
+            return Ok(RedisQueueStats {
+                messages_ready: len,
+                messages_in_flight: 0,
+            });
         };
 
-        let messages_ready = stream_len.saturating_sub(in_flight);
+        let in_flight = g.pending as u64;
+        let messages_ready = match g.lag {
+            Some(lag) => lag as u64,
+            // `lag` is absent on Redis < 7.0 and nil when entry deletion made
+            // it indeterminate. XINFO STREAM's last-generated-id still
+            // answers the common case exactly: a group whose
+            // last-delivered-id has caught up to it has zero backlog.
+            None => {
+                let stream_info: StreamInfoStreamReply = conn
+                    .query(redis::cmd("XINFO").arg("STREAM").arg(queue))
+                    .await
+                    .map_err(|e| ShoveError::Connection(format!("XINFO STREAM failed: {e}")))?;
+                let caught_up = match (
+                    super::stream_id::parse(&g.last_delivered_id),
+                    super::stream_id::parse(&stream_info.last_generated_id),
+                ) {
+                    (Some(delivered), Some(last)) => delivered >= last,
+                    _ => false,
+                };
+                if caught_up {
+                    0
+                } else {
+                    // Genuinely behind with no lag available: degrade to the
+                    // length-based estimate, an upper bound that over-counts
+                    // acked-but-untrimmed history (bounded by the reaper's
+                    // trim cadence). Warned once per process so operators on
+                    // Redis < 7.0 know their scaling input is approximate.
+                    static LAG_FALLBACK_WARNED: std::sync::Once = std::sync::Once::new();
+                    LAG_FALLBACK_WARNED.call_once(|| {
+                        tracing::warn!(
+                            queue,
+                            group,
+                            "XINFO GROUPS exposes no lag (Redis < 7.0): backlog falls back to a \
+                             length-based upper bound that can over-count acked-but-untrimmed \
+                             history; autoscaling may overshoot until the next trim sweep"
+                        );
+                    });
+                    (stream_info.length as u64).saturating_sub(in_flight)
+                }
+            }
+        };
 
         Ok(RedisQueueStats {
             messages_ready,
@@ -121,7 +160,7 @@ pub struct RedisAutoscalerBackend<S: RedisQueueStatsProvider = XlenStatsProvider
 }
 
 impl RedisAutoscalerBackend<XlenStatsProvider> {
-    /// Create a backend that reads queue depth from Redis via XLEN + XPENDING.
+    /// Create a backend that reads queue depth from Redis via XINFO GROUPS.
     pub fn new(client: RedisClient, registry: Arc<Mutex<RedisConsumerGroupRegistry>>) -> Self {
         Self {
             stats_provider: XlenStatsProvider::new(client),
@@ -344,8 +383,7 @@ mod tests {
         use crate::autoscaler::{AutoscalerBackend, ScalingDecision};
         use crate::backend::ConsumerOptionsInner;
         use crate::backends::redis::consumer_group::{
-            ReaperFactory, RedisConsumerGroup, RedisConsumerGroupConfig,
-            RedisConsumerGroupRegistry, Spawner,
+            RedisConsumerGroup, RedisConsumerGroupConfig, RedisConsumerGroupRegistry, Spawner,
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -377,7 +415,6 @@ mod tests {
                     options.shutdown.cancelled().await;
                 })
             });
-            let reaper_factory: ReaperFactory = Arc::new(|| tokio::spawn(async {}));
             let mut g = RedisConsumerGroup {
                 queue: queue.into(),
                 consumers: Vec::with_capacity(config.max_consumers() as usize),
@@ -386,8 +423,6 @@ mod tests {
                 group_token,
                 error_count: Arc::new(AtomicUsize::new(0)),
                 panic_count: Arc::new(AtomicUsize::new(0)),
-                reaper_factory,
-                reaper_handle: None,
             };
             if started {
                 g.start();

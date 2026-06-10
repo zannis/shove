@@ -94,6 +94,8 @@ On macOS, the dependency is typically satisfied via Homebrew. `librdkafka` is a 
 
 **Consumer groups are created automatically.** At topology declaration, shove creates an XGROUP on each shard stream if one does not already exist. The group name defaults to `"shove"` and can be overridden via `RedisConfig::group`. Do not reuse the same group name across unrelated applications that share a Redis instance.
 
+**Stream memory is bounded by outstanding work.** While consumers run, shove trims entries that every consumer group on the stream has acknowledged, so a stream's size tracks its backlog rather than its lifetime throughput — no external `XTRIM` policy is needed. Trimming waits for the slowest group, never touches pending (in-flight) entries, and never touches DLQ streams. The same background task reclaims entries left pending past the handler timeout (e.g. after a consumer crash) and redelivers them; keep the handler timeout consistent across every consumer of a stream and group, including other processes.
+
 ## In-process
 
 **No durability.** Messages live entirely in process memory. Process exit — whether clean or via a crash — means message loss. State this explicitly on every internal review of "should we use the in-process backend in production?" — the answer is almost always no for distributed or stateful workloads.

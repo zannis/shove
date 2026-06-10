@@ -993,6 +993,18 @@ impl KafkaConsumer {
                             }
                             return Ok(());
                         }
+                        // Handler completions must wake the loop even when no new
+                        // message arrives: with only the recv() arm, the offsets of
+                        // the last in-flight batch sat uncommitted until the *next*
+                        // message (or shutdown), so a crash or rebalance on an idle
+                        // topic redelivered an already-processed batch. The drain at
+                        // the top of the loop picks up any further completions and
+                        // commits in one pass.
+                        completion = completion_rx.recv() => {
+                            if let Some((partition, offset)) = completion {
+                                tracker.mark_complete(partition, offset);
+                            }
+                        }
                         msg_result = consumer.recv() => {
                             let msg = match msg_result {
                                 Ok(msg) => msg,

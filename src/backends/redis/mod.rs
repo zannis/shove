@@ -9,9 +9,11 @@ pub(super) mod client;
 pub(super) mod constants;
 mod consumer;
 mod consumer_group;
+mod maintenance;
 mod publisher;
 mod reaper;
 mod requeue;
+mod stream_id;
 mod topology;
 
 pub use autoscaler::{
@@ -24,6 +26,6 @@ pub use consumer_group::{
 };
 pub use publisher::{RedisPublisher, shard_for_key};
 #[doc(hidden)]
-pub use reaper::spawn_reaper;
+pub use reaper::{spawn_maintenance, spawn_reaper};
 pub(crate) use requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
 pub use topology::RedisTopologyDeclarer;

@@ -1,6 +1,6 @@
 # Redis — Autoscaler
 
-Wires the Redis backend into the autoscaler. A consumer group with `min=1, max=5` starts with a single worker; the autoscaler polls stream depth (`XLEN` minus the group's last-delivered ID) and spawns workers up to `max` while a burst of forty messages is pending, then drains back down to `min` as the backlog clears. The driver thread prints periodic stats so you can watch the scale decisions.
+Wires the Redis backend into the autoscaler. A consumer group with `min=1, max=5` starts with a single worker; the autoscaler polls the group's consumer lag (messages awaiting delivery, as reported by Redis — already-processed history does not count as backlog) and spawns workers up to `max` while a burst of forty messages is pending, then drains back down to `min` as the backlog clears. The driver thread prints periodic stats so you can watch the scale decisions.
 
 ## Prerequisites
 

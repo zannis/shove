@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use redis::aio::MultiplexedConnection;
 use serde::{Deserialize, Serialize};
 use testcontainers::ImageExt;
 use testcontainers::core::ContainerPort;
@@ -21,7 +22,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 
 use shove::consumer_group::ConsumerGroupConfig;
-use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider};
+use shove::redis::{
+    RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode, RedisQueueStatsProvider,
+};
 use shove::{
     Broker, ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, Redis,
     SequenceFailure, SequencedTopic, Topic, TopologyBuilder,
@@ -301,6 +304,69 @@ impl SequencedTopic for LedgerTopic {
     fn sequence_key(msg: &Event) -> String {
         msg.account.clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Publisher connection reuse
+// ---------------------------------------------------------------------------
+
+/// Read `total_connections_received` from `INFO stats` — the cumulative count
+/// of connections the server has accepted since startup.
+async fn total_connections_received(conn: &mut MultiplexedConnection) -> u64 {
+    let info: String = redis::cmd("INFO")
+        .arg("stats")
+        .query_async(conn)
+        .await
+        .expect("INFO stats");
+    info.lines()
+        .find_map(|line| line.strip_prefix("total_connections_received:"))
+        .expect("total_connections_received present in INFO stats")
+        .trim()
+        .parse()
+        .expect("total_connections_received parses as u64")
+}
+
+#[tokio::test]
+async fn publisher_reuses_connection_across_publishes() {
+    let broker = make_broker("redis-int-conn-reuse").await;
+    broker
+        .topology()
+        .declare::<OrdersTopic>()
+        .await
+        .expect("declare");
+
+    // Dedicated probe connection for the INFO snapshots, created once up
+    // front so the probe itself contributes nothing to the measured delta.
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut probe = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("probe conn");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    // Warm-up publish so any lazily-established publisher connection exists
+    // before the baseline snapshot.
+    publisher
+        .publish::<OrdersTopic>(&Order { id: 0 })
+        .await
+        .expect("warm-up publish");
+
+    let before = total_connections_received(&mut probe).await;
+    for i in 1..=50u64 {
+        publisher
+            .publish::<OrdersTopic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+    let after = total_connections_received(&mut probe).await;
+
+    let delta = after - before;
+    assert!(
+        delta <= 5,
+        "50 publishes on one publisher must reuse a cached connection, \
+         but the server accepted {delta} new connections"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1132,394 @@ async fn autoscaler_stats_reflect_published_messages() {
         stats.messages_ready >= 5,
         "expected at least 5 ready messages, got {}",
         stats.messages_ready
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8b: autoscaler_stats_zero_after_full_consumption
+// ---------------------------------------------------------------------------
+
+struct ConsumedStatsTopic;
+impl Topic for ConsumedStatsTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-stats-consumed").build())
+    }
+}
+
+/// XACK leaves entries in the stream, so a backlog metric derived from XLEN
+/// reads a fully-drained queue as permanently backlogged — the autoscaler
+/// would pin every group at max consumers. After every message is consumed
+/// and acked, the stats provider must report zero ready and zero in-flight.
+#[tokio::test]
+async fn autoscaler_stats_zero_after_full_consumption() {
+    let broker = make_broker("redis-int-stats-consumed-grp").await;
+    broker
+        .topology()
+        .declare::<ConsumedStatsTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..20u64 {
+        publisher
+            .publish::<ConsumedStatsTopic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<ConsumedStatsTopic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<ConsumedStatsTopic, _>(H(counter.clone()), ConsumerOptions::<Redis>::new())
+        .expect("register");
+
+    let probe = counter.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 20,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(counter.load(Ordering::Relaxed), 20, "all messages consumed");
+
+    let stats = broker
+        .queue_stats_provider()
+        .get_queue_stats(ConsumedStatsTopic::topology().queue())
+        .await
+        .expect("get_queue_stats");
+
+    assert_eq!(
+        stats.messages_in_flight, 0,
+        "all messages were acked — nothing in flight"
+    );
+    assert_eq!(
+        stats.messages_ready, 0,
+        "all messages were consumed and acked — a drained queue must not \
+         report backlog (XLEN counts acked entries too)"
+    );
+}
+
+/// Same contract as [`autoscaler_stats_zero_after_full_consumption`], but on
+/// Redis 6.2 — the minimum supported server — where `XINFO GROUPS` carries no
+/// `lag` field and the stats provider must derive the answer another way.
+#[tokio::test]
+async fn autoscaler_stats_zero_after_full_consumption_on_redis_62() {
+    struct Stats62Topic;
+    impl Topic for Stats62Topic {
+        type Message = Order;
+        type Codec = JsonCodec;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("redis-int-stats-62").build())
+        }
+    }
+
+    // Own 6.2 container — the shared one runs 7.0.
+    let host_port: u16 = find_free_port();
+    let container = ContainerOnDrop::new(
+        RedisContainer::default()
+            .with_tag("6.2")
+            .with_mapped_port(host_port, ContainerPort::Tcp(REDIS_PORT))
+            .start()
+            .await
+            .expect("start Redis 6.2 container"),
+    );
+    let host = container.get_host().await.expect("get host");
+    let url = format!("redis://{host}:{host_port}/");
+
+    let broker = connect_with_retry(&url, "redis-62-stats-grp", Duration::from_secs(30)).await;
+    broker
+        .topology()
+        .declare::<Stats62Topic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..5u64 {
+        publisher
+            .publish::<Stats62Topic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct H(Arc<AtomicUsize>);
+    impl MessageHandler<Stats62Topic> for H {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<Stats62Topic, _>(H(counter.clone()), ConsumerOptions::<Redis>::new())
+        .expect("register");
+
+    let probe = counter.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(counter.load(Ordering::Relaxed), 5, "all messages consumed");
+
+    let stats = broker
+        .queue_stats_provider()
+        .get_queue_stats(Stats62Topic::topology().queue())
+        .await
+        .expect("get_queue_stats");
+
+    assert_eq!(stats.messages_in_flight, 0, "all messages were acked");
+    assert_eq!(
+        stats.messages_ready, 0,
+        "a drained queue must report zero backlog on Redis 6.2 even though \
+         XINFO GROUPS has no lag field"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stream maintenance on the direct consumer path
+// ---------------------------------------------------------------------------
+
+struct DirectTrimTopic;
+impl Topic for DirectTrimTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-direct-trim").build())
+    }
+}
+
+#[derive(Clone)]
+struct DirectTrimHandler(Arc<AtomicUsize>);
+impl MessageHandler<DirectTrimTopic> for DirectTrimHandler {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Outcome::Ack
+    }
+}
+
+/// Consumers driven through the direct `ConsumerSupervisor` path (no
+/// `RedisConsumerGroupRegistry`) must also get stream maintenance: a stream
+/// whose entries were all consumed and acked must be trimmed while such a
+/// consumer is running.
+#[tokio::test]
+async fn direct_consumer_stream_is_trimmed() {
+    let broker = make_broker("redis-int-direct-trim-grp").await;
+    broker
+        .topology()
+        .declare::<DirectTrimTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for i in 0..10u64 {
+        publisher
+            .publish::<DirectTrimTopic>(&Order { id: i })
+            .await
+            .expect("publish");
+    }
+
+    // First consumer run: consume and ack everything, then stop.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<DirectTrimTopic, _>(
+            DirectTrimHandler(counter.clone()),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+    let probe = counter.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 10,
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert_eq!(counter.load(Ordering::Relaxed), 10, "all messages consumed");
+
+    // Second consumer run on the now fully-acked stream: its maintenance
+    // sweep must trim the acked entries.
+    let mut supervisor = broker.consumer_supervisor();
+    let token = supervisor.cancellation_token();
+    supervisor
+        .register::<DirectTrimTopic, _>(
+            DirectTrimHandler(Arc::new(AtomicUsize::new(0))),
+            ConsumerOptions::<Redis>::new(),
+        )
+        .expect("register");
+
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut raw = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+
+    let trim_signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let len: i64 = redis::cmd("XLEN")
+                .arg("redis-int-direct-trim")
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 1 || std::time::Instant::now() > deadline {
+                token.cancel();
+                assert!(
+                    len <= 1,
+                    "a direct consumer's fully-acked stream must be trimmed, \
+                     XLEN still {len}"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let outcome = supervisor
+        .run_until_timeout(trim_signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+}
+
+struct DlqKeepTopic;
+impl Topic for DlqKeepTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-dlq-keep").dlq().build())
+    }
+}
+
+#[derive(Clone)]
+struct DlqKeepHandler;
+impl MessageHandler<DlqKeepTopic> for DlqKeepHandler {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+}
+
+/// DLQ streams are an operator audit record: running a DLQ consumer must
+/// never enrol the DLQ stream in maintenance trimming, even after every dead
+/// message has been delivered and acknowledged.
+#[tokio::test]
+async fn dlq_stream_is_never_trimmed() {
+    let group = "redis-int-dlq-keep-grp";
+    let broker = make_broker(group).await;
+    broker
+        .topology()
+        .declare::<DlqKeepTopic>()
+        .await
+        .expect("declare");
+    let dlq = DlqKeepTopic::topology().dlq().expect("topic has a DLQ");
+
+    // Seed five dead messages and mark them delivered + acked, mirroring a
+    // DLQ that an operator's handler has already worked through.
+    let url = redis_url().await;
+    let probe_client = redis::Client::open(url).expect("raw client");
+    let mut raw = probe_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let id: String = redis::cmd("XADD")
+            .arg(dlq)
+            .arg("*")
+            .arg("payload")
+            .arg(format!("{{\"id\":{i}}}"))
+            .query_async(&mut raw)
+            .await
+            .expect("XADD");
+        ids.push(id);
+    }
+    let _: redis::Value = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(group)
+        .arg("dlq-worker")
+        .arg("COUNT")
+        .arg(5)
+        .arg("STREAMS")
+        .arg(dlq)
+        .arg(">")
+        .query_async(&mut raw)
+        .await
+        .expect("XREADGROUP");
+    let mut xack = redis::cmd("XACK");
+    xack.arg(dlq).arg(group);
+    for id in &ids {
+        xack.arg(id);
+    }
+    let acked: i64 = xack.query_async(&mut raw).await.expect("XACK");
+    assert_eq!(acked, 5);
+
+    // Run a DLQ consumer over the fully-acked DLQ stream. If it (wrongly)
+    // enrols the stream in maintenance, the startup sweep trims it.
+    let cfg = RedisConfig::new(RedisMode::Standalone {
+        url: url.to_owned(),
+    })
+    .with_group(group);
+    let client = <Redis as shove::Backend>::connect(cfg)
+        .await
+        .expect("connect RedisClient");
+    let dlq_task = tokio::spawn(async move {
+        let consumer = RedisConsumer::new(client);
+        let _ = consumer
+            .run_dlq::<DlqKeepTopic, _>(DlqKeepHandler, ())
+            .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let len: i64 = redis::cmd("XLEN")
+        .arg(dlq)
+        .query_async(&mut raw)
+        .await
+        .expect("XLEN");
+
+    dlq_task.abort();
+    let _ = dlq_task.await;
+
+    assert_eq!(
+        len, 5,
+        "DLQ streams are an audit record and must never be trimmed"
     );
 }
 
@@ -2044,7 +2498,7 @@ mod reaper_tests {
     use super::*;
     use redis::aio::MultiplexedConnection;
     use shove::Backend;
-    use shove::redis::{RedisClient, spawn_reaper};
+    use shove::redis::{RedisClient, spawn_maintenance, spawn_reaper};
     use tokio_util::sync::CancellationToken;
 
     /// Open a raw multiplexed connection to the shared Redis URL for issuing
@@ -2460,5 +2914,606 @@ mod reaper_tests {
             reaper_pel, 0,
             "reaper PEL must be empty after re-XADD + XACK (was {reaper_pel})"
         );
+    }
+
+    /// XACK removes an entry from the PEL but not from the stream, so without
+    /// trimming every stream grows forever. The reaper must XTRIM entries the
+    /// group has fully acknowledged.
+    #[tokio::test]
+    async fn reaper_trims_fully_acked_entries() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-acked-stream";
+        let group = "reaper-trim-acked-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("$")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        // Publish 10, deliver all to a consumer, ack all — PEL empty.
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("trim-consumer")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let acked: i64 = xack.query_async(&mut raw).await.expect("XACK");
+        assert_eq!(acked, 10, "all 10 entries must be acked");
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        // Large min_idle so XAUTOCLAIM reclaims nothing — this test isolates
+        // the trim behaviour from redelivery.
+        let handle = spawn_maintenance(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            Some(60_000),
+            shutdown.clone(),
+        );
+
+        // Acked entries must be trimmed away. The last delivered entry may
+        // be kept (conservative MINID threshold), so expect XLEN <= 1.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut len: i64 = i64::MAX;
+        while std::time::Instant::now() < deadline {
+            len = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert!(
+            len <= 1,
+            "fully-acked entries must be trimmed from the stream, XLEN still {len}"
+        );
+    }
+
+    /// Trimming must never remove entries that are still pending (delivered
+    /// but not acknowledged) — those are the at-least-once redelivery source.
+    #[tokio::test]
+    async fn reaper_trim_preserves_pending_entries() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-pending-stream";
+        let group = "reaper-trim-pending-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("$")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        // Publish 5, deliver all, ack only the first 3 — entries 4 and 5
+        // stay in the PEL.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("trim-consumer")
+            .arg("COUNT")
+            .arg(5)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let acked: i64 = redis::cmd("XACK")
+            .arg(stream)
+            .arg(group)
+            .arg(&ids[0])
+            .arg(&ids[1])
+            .arg(&ids[2])
+            .query_async(&mut raw)
+            .await
+            .expect("XACK");
+        assert_eq!(acked, 3);
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        // Large min_idle so the pending entries are not autoclaim-redelivered
+        // during the test window.
+        let handle = spawn_maintenance(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            Some(60_000),
+            shutdown.clone(),
+        );
+
+        // Wait until the acked prefix is trimmed (XLEN drops to 2)…
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut len: i64 = i64::MAX;
+        while std::time::Instant::now() < deadline {
+            len = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(len, 2, "only the 3 acked entries may be trimmed");
+
+        // …and the two pending entries must still be readable in the stream.
+        let range: Vec<redis::Value> = redis::cmd("XRANGE")
+            .arg(stream)
+            .arg(&ids[3])
+            .arg(&ids[4])
+            .query_async(&mut raw)
+            .await
+            .expect("XRANGE");
+        assert_eq!(
+            range.len(),
+            2,
+            "pending (unacked) entries must survive the trim"
+        );
+    }
+
+    /// A stream can carry more than one consumer group (fan-out via
+    /// `RedisConfig::with_group`). Trimming driven by one group's progress
+    /// must never delete entries another, slower group has not consumed.
+    #[tokio::test]
+    async fn reaper_trim_respects_slower_second_group() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-multigroup-stream";
+        let group_a = "reaper-trim-multigrp-a";
+        let group_b = "reaper-trim-multigrp-b";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        for g in [group_a, group_b] {
+            let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(stream)
+                .arg(g)
+                .arg("0")
+                .arg("MKSTREAM")
+                .query_async(&mut raw)
+                .await;
+        }
+
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+
+        // Group A consumes and acks everything.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group_a)
+            .arg("ca")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP a");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group_a);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let _: i64 = xack.query_async(&mut raw).await.expect("XACK a");
+
+        // Group B has only consumed (and acked) the first 4.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group_b)
+            .arg("cb")
+            .arg("COUNT")
+            .arg(4)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP b");
+        let _: i64 = redis::cmd("XACK")
+            .arg(stream)
+            .arg(group_b)
+            .arg(&ids[0])
+            .arg(&ids[1])
+            .arg(&ids[2])
+            .arg(&ids[3])
+            .query_async(&mut raw)
+            .await
+            .expect("XACK b");
+
+        // The reaper runs on behalf of group A.
+        let client = connect_client_with_retry(url, group_a).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_maintenance(
+            client,
+            vec![stream.to_string()],
+            group_a.to_string(),
+            Duration::from_millis(100),
+            Some(60_000),
+            shutdown.clone(),
+        );
+
+        // Wait for a trim to land, then check it stopped at B's checkpoint.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let len: i64 = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len < 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Give a subsequent tick the chance to (incorrectly) trim further.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            len, 7,
+            "trim must stop at the slowest group's checkpoint (B acked 4 of \
+             10, so the 3 entries below its last-delivered may go, keeping 7)"
+        );
+        // B's six undelivered entries must still be readable.
+        let range: Vec<redis::Value> = redis::cmd("XRANGE")
+            .arg(stream)
+            .arg(&ids[4])
+            .arg("+")
+            .query_async(&mut raw)
+            .await
+            .expect("XRANGE");
+        assert_eq!(
+            range.len(),
+            6,
+            "entries group B has not consumed must survive the trim"
+        );
+    }
+
+    /// A group that exists but has never consumed anything (created at `0`)
+    /// expects the full stream — trimming must be skipped entirely.
+    #[tokio::test]
+    async fn reaper_trim_skipped_when_a_group_has_not_consumed() {
+        let url = redis_url().await;
+        let stream = "reaper-trim-freshgroup-stream";
+        let group_a = "reaper-trim-freshgrp-a";
+        let group_b = "reaper-trim-freshgrp-b";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        for g in [group_a, group_b] {
+            let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(stream)
+                .arg(g)
+                .arg("0")
+                .arg("MKSTREAM")
+                .query_async(&mut raw)
+                .await;
+        }
+
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+
+        // Group A consumes and acks everything; group B never reads.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group_a)
+            .arg("ca")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP a");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group_a);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let _: i64 = xack.query_async(&mut raw).await.expect("XACK a");
+
+        let client = connect_client_with_retry(url, group_a).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_maintenance(
+            client,
+            vec![stream.to_string()],
+            group_a.to_string(),
+            Duration::from_millis(100),
+            Some(60_000),
+            shutdown.clone(),
+        );
+
+        // Let several reaper ticks pass, then verify nothing was trimmed.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            len, 10,
+            "a group with no consumption yet (last-delivered 0-0) expects \
+             the full stream — trim must be skipped"
+        );
+    }
+
+    /// `spawn_reaper` is the long-standing doc-hidden escape hatch and has
+    /// always been autoclaim-only. Gaining a trimming side effect would let
+    /// existing callers (e.g. pointing it at a DLQ stream) silently delete
+    /// acknowledged entries — it must not trim.
+    #[tokio::test]
+    async fn spawn_reaper_does_not_trim() {
+        let url = redis_url().await;
+        let stream = "reaper-notrim-stream";
+        let group = "reaper-notrim-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("worker")
+            .arg("COUNT")
+            .arg(5)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let mut xack = redis::cmd("XACK");
+        xack.arg(stream).arg(group);
+        for id in &ids {
+            xack.arg(id);
+        }
+        let acked: i64 = xack.query_async(&mut raw).await.expect("XACK");
+        assert_eq!(acked, 5);
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_reaper(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            60_000,
+            shutdown.clone(),
+        );
+
+        // Several sweep ticks must pass without the acked entries vanishing.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            len, 5,
+            "spawn_reaper is autoclaim-only — trimming is the maintenance \
+             sidecar's job (spawn_maintenance)"
+        );
+    }
+
+    /// `min_idle_ms = None` is the no-handler-deadline mode: the sidecar must
+    /// still trim fully-acked entries but must never XAUTOCLAIM pending ones
+    /// — a consumer without a timeout may legitimately hold an entry forever.
+    #[tokio::test]
+    async fn reaper_without_min_idle_trims_but_never_reclaims() {
+        let url = redis_url().await;
+        let stream = "reaper-noidle-stream";
+        let group = "reaper-noidle-grp";
+
+        let mut raw = raw_conn(url).await;
+        let _: redis::RedisResult<i64> = redis::cmd("DEL").arg(stream).query_async(&mut raw).await;
+        let _: redis::RedisResult<String> = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream)
+            .arg(group)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async(&mut raw)
+            .await;
+
+        // Five entries delivered to a consumer; the first three acked, the
+        // last two left in-flight (pending) indefinitely.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id: String = redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg(format!("v{i}"))
+                .query_async(&mut raw)
+                .await
+                .expect("XADD");
+            ids.push(id);
+        }
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(group)
+            .arg("slow-consumer")
+            .arg("COUNT")
+            .arg(5)
+            .arg("STREAMS")
+            .arg(stream)
+            .arg(">")
+            .query_async(&mut raw)
+            .await
+            .expect("XREADGROUP");
+        let acked: i64 = redis::cmd("XACK")
+            .arg(stream)
+            .arg(group)
+            .arg(&ids[0])
+            .arg(&ids[1])
+            .arg(&ids[2])
+            .query_async(&mut raw)
+            .await
+            .expect("XACK");
+        assert_eq!(acked, 3);
+
+        let client = connect_client_with_retry(url, group).await;
+        let shutdown = CancellationToken::new();
+        let handle = spawn_maintenance(
+            client,
+            vec![stream.to_string()],
+            group.to_string(),
+            Duration::from_millis(100),
+            None,
+            shutdown.clone(),
+        );
+
+        // Wait for the trim of the acked prefix…
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let len: i64 = redis::cmd("XLEN")
+                .arg(stream)
+                .query_async(&mut raw)
+                .await
+                .expect("XLEN");
+            if len <= 2 || std::time::Instant::now() > deadline {
+                assert_eq!(len, 2, "acked entries must still be trimmed");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // …then give further ticks a chance to (incorrectly) reclaim.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        shutdown.cancel();
+        let _ = handle.await;
+
+        // The two in-flight entries must still be pending for the original
+        // consumer — never claimed by the reaper, never re-added.
+        let pel = pending_count_for(&mut raw, stream, group, "slow-consumer").await;
+        assert_eq!(
+            pel, 2,
+            "entries owned by a no-deadline consumer must never be reclaimed"
+        );
+        let len: i64 = redis::cmd("XLEN")
+            .arg(stream)
+            .query_async(&mut raw)
+            .await
+            .expect("XLEN");
+        assert_eq!(len, 2, "no re-added duplicates may appear in the stream");
     }
 }
