@@ -6,6 +6,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Shared};
+use reqwest::header::HeaderMap;
 
 use crate::retry::Backoff;
 
@@ -29,6 +30,7 @@ pub struct SchemaRegistry {
     base_url: Arc<str>,
     http: reqwest::Client,
     auth: SchemaRegistryAuth,
+    headers: HeaderMap,
     max_retries: u32,
     negative_cache_ttl: Duration,
     // Tier 1: resolved schemas, immutable by id.
@@ -45,6 +47,7 @@ impl SchemaRegistry {
         SchemaRegistryBuilder {
             base_url: base_url.into(),
             auth: SchemaRegistryAuth::None,
+            headers: HeaderMap::new(),
             timeout: Duration::from_secs(5),
             max_retries: 3,
             negative_cache_ttl: Duration::from_secs(30),
@@ -94,6 +97,7 @@ impl SchemaRegistry {
                     base_url: self.base_url.clone(),
                     http: self.http.clone(),
                     auth: self.auth.clone(),
+                    headers: self.headers.clone(),
                     max_retries: self.max_retries,
                 };
                 let fut = async move { ctx.fetch(id).await };
@@ -110,6 +114,7 @@ struct FetchCtx {
     base_url: Arc<str>,
     http: reqwest::Client,
     auth: SchemaRegistryAuth,
+    headers: HeaderMap,
     max_retries: u32,
 }
 
@@ -161,6 +166,9 @@ impl FetchCtx {
         let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(5));
         loop {
             let mut req = self.http.get(url);
+            if !self.headers.is_empty() {
+                req = req.headers(self.headers.clone());
+            }
             req = match &self.auth {
                 SchemaRegistryAuth::None => req,
                 SchemaRegistryAuth::Bearer(t) => req.bearer_auth(t),
@@ -212,6 +220,7 @@ impl FetchCtx {
 pub struct SchemaRegistryBuilder {
     base_url: String,
     auth: SchemaRegistryAuth,
+    headers: HeaderMap,
     timeout: Duration,
     max_retries: u32,
     negative_cache_ttl: Duration,
@@ -220,6 +229,21 @@ pub struct SchemaRegistryBuilder {
 impl SchemaRegistryBuilder {
     pub fn auth(mut self, auth: SchemaRegistryAuth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Attach a static header sent on every registry request, layered with any
+    /// configured [`SchemaRegistryAuth`]. Call repeatedly to set multiple
+    /// headers (e.g. Cloudflare Access `CF-Access-Client-Id` and
+    /// `CF-Access-Client-Secret`). Panics if `name` or `value` is not a valid
+    /// HTTP header.
+    pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        use reqwest::header::{HeaderName, HeaderValue};
+        let name = HeaderName::from_bytes(name.as_ref().as_bytes())
+            .expect("schema registry header name is a valid HTTP header name");
+        let value = HeaderValue::from_str(value.as_ref())
+            .expect("schema registry header value is a valid HTTP header value");
+        self.headers.insert(name, value);
         self
     }
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -243,6 +267,7 @@ impl SchemaRegistryBuilder {
             base_url: Arc::from(self.base_url.trim_end_matches('/')),
             http,
             auth: self.auth,
+            headers: self.headers,
             max_retries: self.max_retries,
             negative_cache_ttl: self.negative_cache_ttl,
             resolved: DashMap::new(),
