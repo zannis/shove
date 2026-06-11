@@ -1,10 +1,13 @@
 #![cfg(feature = "kafka-schema-registry")]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::{Json, Router, extract::Path, extract::State, http::StatusCode, routing::get};
-use shove::schema_registry::{SchemaId, SchemaRegistry};
+use axum::{
+    Json, Router, extract::Path, extract::State, http::HeaderMap, http::StatusCode, routing::get,
+};
+use shove::schema_registry::{SchemaId, SchemaRegistry, SchemaRegistryAuth};
 
 #[derive(Clone)]
 struct MockState {
@@ -68,6 +71,114 @@ async fn spawn_mock() -> (String, Arc<AtomicUsize>) {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}"), calls)
+}
+
+/// Captures the inbound headers seen by each registry endpoint.
+#[derive(Clone)]
+struct HeaderMockState {
+    versions_headers: Arc<Mutex<Option<HeaderMap>>>,
+    schema_headers: Arc<Mutex<Option<HeaderMap>>>,
+}
+
+async fn header_versions(
+    State(s): State<HeaderMockState>,
+    headers: HeaderMap,
+    Path(_id): Path<u32>,
+) -> Json<serde_json::Value> {
+    *s.versions_headers.lock().unwrap() = Some(headers);
+    Json(serde_json::json!([{ "subject": "orders-value", "version": 3 }]))
+}
+
+async fn header_schema(
+    State(s): State<HeaderMockState>,
+    headers: HeaderMap,
+    Path(_id): Path<u32>,
+) -> Json<serde_json::Value> {
+    *s.schema_headers.lock().unwrap() = Some(headers);
+    Json(serde_json::json!({ "schema": "{}", "schemaType": "JSON" }))
+}
+
+/// Spawn a mock registry that records the headers each endpoint received.
+async fn spawn_header_mock() -> (String, HeaderMockState) {
+    let state = HeaderMockState {
+        versions_headers: Arc::new(Mutex::new(None)),
+        schema_headers: Arc::new(Mutex::new(None)),
+    };
+    let app = Router::new()
+        .route("/schemas/ids/{id}/versions", get(header_versions))
+        .route("/schemas/ids/{id}", get(header_schema))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), state)
+}
+
+#[tokio::test]
+async fn configured_headers_are_sent_on_registry_requests() {
+    let (url, state) = spawn_header_mock().await;
+    let registry = SchemaRegistry::builder(url)
+        .header("CF-Access-Client-Id", "client-id-123")
+        .header("CF-Access-Client-Secret", "client-secret-456")
+        .build();
+    registry.resolve(SchemaId(1)).await.unwrap();
+
+    for captured in [&state.versions_headers, &state.schema_headers] {
+        let headers = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("endpoint should have been called");
+        assert_eq!(
+            headers.get("cf-access-client-id").unwrap(),
+            "client-id-123",
+            "configured client-id header must reach the registry"
+        );
+        assert_eq!(
+            headers.get("cf-access-client-secret").unwrap(),
+            "client-secret-456",
+            "configured client-secret header must reach the registry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_headers_coexist_with_bearer_auth() {
+    let (url, state) = spawn_header_mock().await;
+    let registry = SchemaRegistry::builder(url)
+        .auth(SchemaRegistryAuth::Bearer("token-abc".into()))
+        .header("CF-Access-Client-Id", "client-id-123")
+        .build();
+    registry.resolve(SchemaId(1)).await.unwrap();
+
+    let headers = state
+        .versions_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("endpoint should have been called");
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer token-abc",
+        "bearer auth must still be applied alongside custom headers"
+    );
+    assert_eq!(
+        headers.get("cf-access-client-id").unwrap(),
+        "client-id-123",
+        "custom header must coexist with auth"
+    );
+}
+
+#[test]
+#[should_panic(expected = "valid HTTP header name")]
+fn invalid_header_name_is_rejected() {
+    let _ = SchemaRegistry::builder("http://localhost:8081").header("Bad Header Name", "value");
+}
+
+#[test]
+#[should_panic(expected = "valid HTTP header value")]
+fn invalid_header_value_is_rejected() {
+    let _ = SchemaRegistry::builder("http://localhost:8081").header("X-Custom", "bad\nvalue");
 }
 
 #[tokio::test]
