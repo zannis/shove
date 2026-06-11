@@ -1,0 +1,20 @@
+tests/kafka_schema_registry.rs
+  s_e2216681d777a1::t_3e261d8540133c 146-183
+  s_e2216681d777a1::t_cd35120c8a3ae1 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "feeb51640812cc2f7ff1189dd4c974e15ffb0029",
+  "prompts": {},
+  "sessions": {
+    "s_e2216681d777a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9975a6b6-040b-4da3-8d63-7b02be4ff0b8",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
