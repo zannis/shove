@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::{
     Json, Router, extract::Path, extract::State, http::HeaderMap, http::StatusCode, routing::get,
 };
-use shove::schema_registry::{SchemaId, SchemaRegistry};
+use shove::schema_registry::{SchemaId, SchemaRegistry, SchemaRegistryAuth};
 
 #[derive(Clone)]
 struct MockState {
@@ -140,6 +140,45 @@ async fn configured_headers_are_sent_on_registry_requests() {
             "configured client-secret header must reach the registry"
         );
     }
+}
+
+#[tokio::test]
+async fn custom_headers_coexist_with_bearer_auth() {
+    let (url, state) = spawn_header_mock().await;
+    let registry = SchemaRegistry::builder(url)
+        .auth(SchemaRegistryAuth::Bearer("token-abc".into()))
+        .header("CF-Access-Client-Id", "client-id-123")
+        .build();
+    registry.resolve(SchemaId(1)).await.unwrap();
+
+    let headers = state
+        .versions_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("endpoint should have been called");
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer token-abc",
+        "bearer auth must still be applied alongside custom headers"
+    );
+    assert_eq!(
+        headers.get("cf-access-client-id").unwrap(),
+        "client-id-123",
+        "custom header must coexist with auth"
+    );
+}
+
+#[test]
+#[should_panic(expected = "valid HTTP header name")]
+fn invalid_header_name_is_rejected() {
+    let _ = SchemaRegistry::builder("http://localhost:8081").header("Bad Header Name", "value");
+}
+
+#[test]
+#[should_panic(expected = "valid HTTP header value")]
+fn invalid_header_value_is_rejected() {
+    let _ = SchemaRegistry::builder("http://localhost:8081").header("X-Custom", "bad\nvalue");
 }
 
 #[tokio::test]
