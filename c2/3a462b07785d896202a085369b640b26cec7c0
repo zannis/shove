@@ -1,0 +1,27 @@
+src/schema_registry/client.rs
+  s_e2216681d777a1::t_614ca3886c320c 270
+  s_e2216681d777a1::t_97da035d40df4f 234-246
+  s_e2216681d777a1::t_a8761cc9640f72 9
+  s_e2216681d777a1::t_964ed237bc94b8 169-171
+  s_e2216681d777a1::t_52345df8212a47 33,50,117,223
+  s_e2216681d777a1::t_a132768e993ce1 100
+tests/kafka_schema_registry.rs
+  s_e2216681d777a1::t_b8bcce923da709 4,7-9
+  s_e2216681d777a1::t_8e0a54cf349633 76-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "c23a462b07785d896202a085369b640b26cec7c0",
+  "prompts": {},
+  "sessions": {
+    "s_e2216681d777a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9975a6b6-040b-4da3-8d63-7b02be4ff0b8",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
