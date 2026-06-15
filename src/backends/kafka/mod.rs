@@ -19,5 +19,5 @@ pub use consumer::KafkaConsumer;
 pub use consumer_group::{
     KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
 };
-pub use publisher::KafkaPublisher;
+pub use publisher::{KafkaPublisher, KafkaPublisherConfig};
 pub use topology::KafkaTopologyDeclarer;

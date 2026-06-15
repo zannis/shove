@@ -123,3 +123,25 @@ impl<B: HasCoordinatedGroups> Broker<B> {
         ConsumerGroup::new(B::make_registry(&self.client))
     }
 }
+
+#[cfg(feature = "kafka")]
+use crate::backends::kafka::{KafkaPublisher, KafkaPublisherConfig};
+#[cfg(feature = "kafka")]
+use crate::markers::Kafka;
+
+#[cfg(feature = "kafka")]
+impl Broker<Kafka> {
+    /// Build a [`Publisher`] from a [`KafkaPublisherConfig`].
+    ///
+    /// The Kafka-specific counterpart to [`publisher`](Self::publisher): the
+    /// config carries optional producer-side Schema Registry settings used to
+    /// Confluent-frame outgoing payloads, symmetric with how
+    /// [`KafkaConsumerGroupConfig`] carries SR settings on the consume side.
+    /// [`publisher`](Self::publisher) remains framing-free.
+    ///
+    /// [`KafkaConsumerGroupConfig`]: crate::backends::kafka::KafkaConsumerGroupConfig
+    pub async fn publisher_with(&self, config: KafkaPublisherConfig) -> Result<Publisher<Kafka>> {
+        let inner = KafkaPublisher::with_config(self.client.clone(), config).await?;
+        Ok(Publisher::new(inner))
+    }
+}

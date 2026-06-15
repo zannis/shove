@@ -18,6 +18,7 @@ Type-safe async pub/sub for Rust. One API across RabbitMQ, AWS SNS+SQS, NATS Jet
 - **Autoscaling consumer groups** driven by queue depth or consumer lag.
 - **Switch backends without changing your code.** Same topic, same handler, six transports.
 - **Pluggable message codecs.** JSON by default; Protobuf, raw bytes, or your own.
+- **Confluent Schema Registry** for Kafka — opt-in encode on publish and decode on consume (Confluent and Redpanda), with subject enforcement.
 
 ## 30-second tour
 
