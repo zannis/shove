@@ -1,0 +1,21 @@
+Cargo.toml
+  s_7aed588dfb2219::t_cceced527d197a 3
+Cargo.lock
+  s_7aed588dfb2219::t_5b1416c520b1fa 4235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "0bb127cd27a256a1d6c6b9eb2f924c21da437d62",
+  "prompts": {},
+  "sessions": {
+    "s_7aed588dfb2219": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "68af061e-d256-44e1-899b-7dbcf29c8434",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
