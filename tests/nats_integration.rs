@@ -109,6 +109,17 @@ shove::define_topic!(
     TopologyBuilder::new("nats-nodlq").build()
 );
 
+// Bridge-style topic: shove creates and owns a WorkQueue stream over an
+// externally-owned subject (not just the queue name).
+shove::define_topic!(
+    BridgeTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-bridge")
+        .nats_subjects(["bridge-feed.price.>"])
+        .dlq()
+        .build()
+);
+
 shove::define_topic!(
     DeferNoHoldTopic,
     SimpleMessage,
@@ -190,6 +201,14 @@ impl CountingHandler {
 }
 
 impl MessageHandler<WorkTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<BridgeTopic> for CountingHandler {
     type Context = ();
     async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.counter.increment();
@@ -1509,6 +1528,101 @@ async fn consumer_group_processes_messages() {
     assert!(outcome.is_clean());
 
     assert_eq!(handler.counter.get(), 5);
+    broker.close().await;
+}
+
+// ===========================================================================
+// Configurable NATS stream subject (bridge use case)
+// ===========================================================================
+
+#[tokio::test]
+async fn nats_subjects_creates_workqueue_stream_over_external_subject() {
+    use async_nats::jetstream::stream::RetentionPolicy;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<BridgeTopic>().await.unwrap();
+
+    // Stream NAME stays the queue; only its captured subjects change.
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-bridge")
+        .await
+        .expect("bridge stream should exist under the queue name");
+    let info = stream.info().await.expect("stream info");
+
+    assert_eq!(
+        info.config.subjects,
+        vec!["bridge-feed.price.>".to_string()],
+        "stream should be created over the configured external subject"
+    );
+    assert_eq!(
+        info.config.retention,
+        RetentionPolicy::WorkQueue,
+        "bridge stream keeps WorkQueue retention (delete-on-ack)"
+    );
+
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn nats_subjects_consumer_group_receives_messages_on_external_subject() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<BridgeTopic>().await.unwrap();
+
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+    let config = NatsConsumerGroupConfig::new(1..=1).with_prefetch_count(1);
+    let mut group = broker.consumer_group();
+    group
+        .register::<BridgeTopic, _>(ConsumerGroupConfig::new(config), move || {
+            handler_clone.clone()
+        })
+        .await
+        .unwrap();
+
+    // Upstream publishes a raw message to a CONCRETE subject under the wildcard
+    // — the shove-owned WorkQueue stream captures it and the durable consumer
+    // (filtered on the configured subject) delivers it to the handler.
+    let payload = serde_json::to_vec(&SimpleMessage {
+        id: "price-1".into(),
+        content: "tick".into(),
+    })
+    .unwrap();
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(NATS_MESSAGE_ID, "price-1");
+    client
+        .jetstream()
+        .publish_with_headers(
+            "bridge-feed.price.0xabc".to_string(),
+            headers,
+            bytes::Bytes::from(payload),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(1, Duration::from_secs(60)).await;
+        t.cancel();
+    });
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+    assert_eq!(
+        handler.counter.get(),
+        1,
+        "consumer group should receive the message published to the external subject"
+    );
+
     broker.close().await;
 }
 

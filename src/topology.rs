@@ -110,6 +110,8 @@ pub struct QueueTopology {
     pub(crate) dlq: Option<String>,
     pub(crate) hold_queues: Vec<HoldQueue>,
     pub(crate) sequencing: Option<SequenceConfig>,
+    #[cfg(feature = "nats")]
+    pub(crate) nats_stream_subjects: Option<Vec<String>>,
 }
 
 impl QueueTopology {
@@ -127,6 +129,18 @@ impl QueueTopology {
 
     pub fn sequencing(&self) -> Option<&SequenceConfig> {
         self.sequencing.as_ref()
+    }
+
+    /// NATS JetStream subjects this stream is created over, if overridden via
+    /// [`TopologyBuilder::nats_subjects`]. `None` keeps the default behavior
+    /// (the stream is created over a single subject equal to the queue name).
+    ///
+    /// Lets shove create and own a WorkQueue stream over an externally-owned
+    /// subject (e.g. `markets-feed.market.EVENT_TYPE_PRICE_CHANGE.>`) rather
+    /// than only the queue name. NATS-specific; ignored by other backends.
+    #[cfg(feature = "nats")]
+    pub fn nats_stream_subjects(&self) -> Option<&[String]> {
+        self.nats_stream_subjects.as_deref()
     }
 
     pub fn shard_hold_queue_names(&self, shard_index: u16) -> Vec<HoldQueue> {
@@ -172,6 +186,8 @@ pub struct TopologyBuilder {
     hold_queues: Vec<Duration>,
     sequencing: Option<SequenceConfig>,
     allow_message_loss: bool,
+    #[cfg(feature = "nats")]
+    nats_stream_subjects: Option<Vec<String>>,
 }
 
 impl TopologyBuilder {
@@ -182,7 +198,26 @@ impl TopologyBuilder {
             hold_queues: Vec::new(),
             sequencing: None,
             allow_message_loss: false,
+            #[cfg(feature = "nats")]
+            nats_stream_subjects: None,
         }
+    }
+
+    /// Create and own a NATS JetStream WorkQueue stream over the given
+    /// subjects, instead of the default single subject equal to the queue name.
+    ///
+    /// Use this to bridge an externally-owned subject (e.g.
+    /// `markets-feed.market.EVENT_TYPE_PRICE_CHANGE.>`): the stream **name**
+    /// stays the queue name; only the subjects it captures change, and the
+    /// durable pull consumer filters on the configured subject.
+    ///
+    /// NATS-specific — other backends ignore it. Cannot be combined with
+    /// [`sequenced`](Self::sequenced), which owns the subject space via its
+    /// per-shard subjects; `build()` panics if both are set.
+    #[cfg(feature = "nats")]
+    pub fn nats_subjects(mut self, subjects: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.nats_stream_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
     }
 
     /// Enables strict per-key ordered delivery for this topic.
@@ -292,6 +327,23 @@ impl TopologyBuilder {
     /// - Sequencing enabled without at least one hold queue (unless
     ///   [`allow_message_loss`](Self::allow_message_loss) is set).
     pub fn build(self) -> QueueTopology {
+        #[cfg(feature = "nats")]
+        {
+            assert!(
+                !(self.nats_stream_subjects.is_some() && self.sequencing.is_some()),
+                "nats_subjects() cannot be combined with sequenced() — sequencing owns the subject space via its per-shard subjects"
+            );
+            if let Some(ref subjects) = self.nats_stream_subjects {
+                assert!(
+                    !subjects.is_empty(),
+                    "nats_subjects() requires at least one subject"
+                );
+                assert!(
+                    subjects.iter().all(|s| !s.trim().is_empty()),
+                    "nats_subjects() subjects must be non-empty"
+                );
+            }
+        }
         if let Some(ref seq) = self.sequencing {
             assert!(
                 seq.routing_shards > 0,
@@ -341,6 +393,8 @@ impl TopologyBuilder {
             dlq,
             hold_queues,
             sequencing: self.sequencing,
+            #[cfg(feature = "nats")]
+            nats_stream_subjects: self.nats_stream_subjects,
         }
     }
 }
@@ -615,5 +669,66 @@ mod tests {
             .build();
         assert_eq!(topology.dlq(), Some("events-failed"));
         assert!(topology.sequencing().is_some());
+    }
+
+    // -- NATS stream subjects --
+
+    #[cfg(feature = "nats")]
+    mod nats_subjects {
+        use super::*;
+
+        #[test]
+        fn builder_no_nats_subjects_is_none() {
+            let topology = TopologyBuilder::new("orders").build();
+            assert!(topology.nats_stream_subjects().is_none());
+        }
+
+        #[test]
+        fn builder_nats_subjects_sets_stream_subjects() {
+            let topology = TopologyBuilder::new("price-bridge")
+                .nats_subjects(["markets-feed.market.EVENT_TYPE_PRICE_CHANGE.>"])
+                .build();
+            assert_eq!(
+                topology.nats_stream_subjects(),
+                Some(["markets-feed.market.EVENT_TYPE_PRICE_CHANGE.>".to_string()].as_slice())
+            );
+        }
+
+        #[test]
+        fn builder_nats_subjects_accepts_multiple() {
+            let topology = TopologyBuilder::new("q")
+                .nats_subjects(["a.b.>", "c.d"])
+                .build();
+            assert_eq!(
+                topology.nats_stream_subjects(),
+                Some(["a.b.>".to_string(), "c.d".to_string()].as_slice())
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "nats_subjects() requires at least one subject")]
+        fn builder_nats_subjects_empty_panics() {
+            let _ = TopologyBuilder::new("q")
+                .nats_subjects(Vec::<String>::new())
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "nats_subjects() subjects must be non-empty")]
+        fn builder_nats_subjects_blank_panics() {
+            let _ = TopologyBuilder::new("q").nats_subjects(["  "]).build();
+        }
+
+        #[test]
+        #[should_panic(expected = "nats_subjects() cannot be combined with sequenced()")]
+        fn builder_nats_subjects_with_sequenced_panics() {
+            let _ = TopologyBuilder::new("q")
+                .sequenced(SequenceFailure::Skip)
+                .routing_shards(4)
+                .hold_queue(Duration::from_secs(5))
+                .dlq()
+                .nats_subjects(["a.b.>"])
+                .build();
+        }
     }
 }

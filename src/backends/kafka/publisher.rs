@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(feature = "kafka-schema-registry")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use rdkafka::client::ClientContext;
@@ -13,6 +15,9 @@ use crate::publisher_internal::validate_headers;
 use crate::retry::Backoff;
 use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
+
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::SchemaRegistry;
 
 use super::client::KafkaClient;
 use super::constants::{
@@ -73,14 +78,130 @@ where
     unreachable!()
 }
 
+/// Publisher-side configuration for the Kafka backend.
+///
+/// The symmetric counterpart to [`KafkaConsumerGroupConfig`] on the consume
+/// side: it carries optional Schema Registry settings used to Confluent-frame
+/// outgoing payloads. The default (no schema registry) leaves payloads as the
+/// topic codec encodes them — identical to [`Broker::publisher`].
+///
+/// [`KafkaConsumerGroupConfig`]: super::consumer_group::KafkaConsumerGroupConfig
+/// [`Broker::publisher`]: crate::broker::Broker::publisher
+#[derive(Clone, Default)]
+pub struct KafkaPublisherConfig {
+    /// Schema Registry client used to resolve subject → latest id and frame
+    /// outgoing payloads. `None` disables producer-side framing.
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_registry: Option<Arc<SchemaRegistry>>,
+    /// Override the Confluent subject. Defaults to TopicNameStrategy
+    /// (`"{topic}-value"`) when unset.
+    #[cfg(feature = "kafka-schema-registry")]
+    subject_override: Option<Arc<str>>,
+}
+
+impl KafkaPublisherConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the Schema Registry client for producer-side Confluent framing.
+    ///
+    /// When set, payloads for protobuf/JSON codecs are wrapped in the Confluent
+    /// wire frame (magic byte + big-endian schema id [+ protobuf message-index])
+    /// using the latest registered id for the resolved subject. Symmetric with
+    /// [`KafkaConsumerGroupConfig::with_schema_registry`] on the consume side.
+    ///
+    /// [`KafkaConsumerGroupConfig::with_schema_registry`]: super::consumer_group::KafkaConsumerGroupConfig::with_schema_registry
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn with_schema_registry(mut self, registry: Arc<SchemaRegistry>) -> Self {
+        self.schema_registry = Some(registry);
+        self
+    }
+
+    /// Override the Confluent subject used for the schema-id lookup. Defaults to
+    /// `"{topic}-value"` (TopicNameStrategy).
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn with_subject(mut self, subject: impl Into<Arc<str>>) -> Self {
+        self.subject_override = Some(subject.into());
+        self
+    }
+}
+
+/// Resolved producer-side Schema Registry encoder held by the publisher.
+#[cfg(feature = "kafka-schema-registry")]
+#[derive(Clone)]
+struct PublisherSrEncoder {
+    registry: Arc<SchemaRegistry>,
+    subject_override: Option<Arc<str>>,
+}
+
 #[derive(Clone)]
 pub struct KafkaPublisher {
     client: KafkaClient,
+    #[cfg(feature = "kafka-schema-registry")]
+    sr: Option<PublisherSrEncoder>,
 }
 
 impl KafkaPublisher {
     pub async fn new(client: KafkaClient) -> Result<Self> {
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            #[cfg(feature = "kafka-schema-registry")]
+            sr: None,
+        })
+    }
+
+    /// Build a publisher from a [`KafkaPublisherConfig`]. The config's Schema
+    /// Registry settings (if any) enable producer-side Confluent framing.
+    #[cfg_attr(
+        not(feature = "kafka-schema-registry"),
+        allow(unused_variables, clippy::unused_async)
+    )]
+    pub async fn with_config(client: KafkaClient, config: KafkaPublisherConfig) -> Result<Self> {
+        Ok(Self {
+            client,
+            #[cfg(feature = "kafka-schema-registry")]
+            sr: config.schema_registry.map(|registry| PublisherSrEncoder {
+                registry,
+                subject_override: config.subject_override,
+            }),
+        })
+    }
+
+    /// Frame `payload` in the Confluent wire format when producer-side SR is
+    /// configured and the codec maps to a registry wire format; otherwise return
+    /// it unchanged.
+    #[cfg(feature = "kafka-schema-registry")]
+    async fn frame_payload(
+        enc: Option<&PublisherSrEncoder>,
+        codec_name: &str,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        use crate::schema_registry::{WireFormat, build_frame, default_subject};
+
+        let Some(enc) = enc else {
+            return Ok(payload);
+        };
+        let Some(fmt) = WireFormat::from_codec_name(codec_name) else {
+            return Ok(payload);
+        };
+        let subject = enc
+            .subject_override
+            .clone()
+            .unwrap_or_else(|| default_subject(topic));
+        let id = enc.registry.latest_id(&subject).await.map_err(|e| {
+            let msg = format!("schema registry latest_id({subject}) failed: {e}");
+            if e.is_retriable() {
+                ShoveError::Connection(msg)
+            } else {
+                ShoveError::Unknown(msg)
+            }
+        })?;
+        // The publisher always frames with message index [0] (the first message
+        // type) — the only index byte-identical across Confluent's zig-zag and
+        // shove's plain varint encoding, and all the bridge needs.
+        Ok(build_frame(fmt, id, &[0], &payload))
     }
 
     fn resolve_topic_and_key<T: Topic>(
@@ -125,6 +246,14 @@ impl KafkaPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
+        #[cfg(feature = "kafka-schema-registry")]
+        let payload = Self::frame_payload(
+            self.sr.as_ref(),
+            <T::Codec as crate::Codec<T::Message>>::NAME,
+            topic,
+            payload,
+        )
+        .await?;
         let headers = Self::build_headers(None);
         self.client
             .publish_with_retry(
@@ -147,6 +276,14 @@ impl KafkaPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
+        #[cfg(feature = "kafka-schema-registry")]
+        let payload = Self::frame_payload(
+            self.sr.as_ref(),
+            <T::Codec as crate::Codec<T::Message>>::NAME,
+            topic,
+            payload,
+        )
+        .await?;
         let headers = Self::build_headers(Some(&extra_headers));
         self.client
             .publish_with_retry(
@@ -188,10 +325,16 @@ impl KafkaPublisher {
         // doesn't cancel the others — that lets the wrapper attribute
         // accurate per-message success/failure counters even on partial
         // failure, and we still surface the first error to the caller.
+        #[cfg(feature = "kafka-schema-registry")]
+        let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
+        #[cfg(feature = "kafka-schema-registry")]
+        let sr = self.sr.as_ref();
         let results: Vec<Result<()>> =
             join_all(prepared.into_iter().map(|(topic, key, headers, payload)| {
                 let client = &self.client;
                 async move {
+                    #[cfg(feature = "kafka-schema-registry")]
+                    let payload = Self::frame_payload(sr, codec_name, topic, payload).await?;
                     client
                         .publish_with_retry(
                             topic,

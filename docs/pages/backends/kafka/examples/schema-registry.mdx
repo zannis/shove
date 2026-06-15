@@ -1,6 +1,6 @@
 # Kafka — Schema Registry
 
-Configure a Kafka consumer to decode [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/index.html)-framed messages. On each message the consumer strips the wire frame (magic byte `0x00` + big-endian schema id), resolves the schema from the registry (cached in memory), validates the schema subject against the accepted set, then delegates to the topic's `Codec` for the actual payload decode.
+Configure a Kafka consumer to decode [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/index.html)-framed messages, and a publisher to produce them. On each consumed message the consumer strips the wire frame (magic byte `0x00` + big-endian schema id), resolves the schema from the registry (cached in memory), validates the schema subject against the accepted set, then delegates to the topic's `Codec` for the actual payload decode. On the produce side, an opt-in publisher wraps each encoded payload in the same frame — see [Producing SR-framed messages](#producing-sr-framed-messages).
 
 Works with the Confluent Schema Registry and with **Redpanda's built-in Schema Registry** — both expose the same REST API and wire format.
 
@@ -75,6 +75,28 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
     .with_schema_enforcement(SchemaEnforcement::Enforce)
     .accept_schema_subjects(["orders-value"]);
 ```
+
+## Producing SR-framed messages
+
+The same registry client drives producer-side encoding. Attach it to a `KafkaPublisherConfig` and get the publisher via `Broker::publisher_with` — every publish then emits a Confluent-framed payload, wire-compatible with any standard Confluent consumer (including ClickPipes and shove's own decode path above).
+
+```rust,no_run
+use std::sync::Arc;
+use shove::kafka::KafkaPublisherConfig;
+use shove::schema_registry::SchemaRegistry;
+
+let registry = SchemaRegistry::builder("http://schema-registry:8081").build();
+
+// `broker` is a `Broker<Kafka>`.
+let publisher = broker
+    .publisher_with(KafkaPublisherConfig::new().with_schema_registry(Arc::clone(&registry)))
+    .await?;
+
+// Emits `0x00` + big-endian schema id + encoded payload.
+publisher.publish::<OrdersTopic>(&order).await?;
+```
+
+The publisher looks up the latest schema id for the subject (`GET /subjects/{subject}/versions/latest`, cached per subject) — it carries no schema text, so the subject must already be registered. The subject defaults to `"{topic}-value"`; override it with `KafkaPublisherConfig::with_subject("...")`. Framing applies only to `JsonCodec` / `ProtobufCodec` topics (Protobuf uses message index `[0]`); a plain `Broker::publisher()` does no framing.
 
 ## Enforcement modes
 

@@ -42,7 +42,14 @@ impl NatsTopologyDeclarer {
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
 
-        self.create_stream(queue, vec![queue.to_string()]).await?;
+        // The stream NAME stays the queue; only the subjects it captures change.
+        // When `nats_subjects` is set, shove creates and owns a WorkQueue stream
+        // over the externally-owned subject(s) rather than the queue name.
+        let subjects = match topology.nats_stream_subjects() {
+            Some(subjects) => subjects.to_vec(),
+            None => vec![queue.to_string()],
+        };
+        self.create_stream(queue, subjects).await?;
 
         if let Some(dlq) = topology.dlq() {
             self.create_stream(dlq, vec![dlq.to_string()]).await?;
@@ -95,6 +102,7 @@ impl NatsTopologyDeclarer {
         stream: &str,
         consumer_name: &str,
         max_ack_pending: i64,
+        filter_subjects: &[String],
     ) -> Result<()> {
         let stream = self
             .client
@@ -102,11 +110,22 @@ impl NatsTopologyDeclarer {
             .get_stream(stream)
             .await
             .map_err(|e| ShoveError::Topology(format!("get_stream({stream}) failed: {e}")))?;
+        // When the stream is created over external subject(s), filter the durable
+        // pull consumer to those subjects. A single subject uses `filter_subject`
+        // (the common case); multiple use `filter_subjects`. With no override the
+        // consumer reads the whole stream (unchanged default behavior).
+        let (filter_subject, filter_subjects) = match filter_subjects {
+            [] => (String::new(), Vec::new()),
+            [one] => (one.clone(), Vec::new()),
+            many => (String::new(), many.to_vec()),
+        };
         stream
             .create_consumer(PullConsumerConfig {
                 durable_name: Some(consumer_name.to_string()),
                 ack_policy: AckPolicy::Explicit,
                 max_ack_pending,
+                filter_subject,
+                filter_subjects,
                 ..Default::default()
             })
             .await

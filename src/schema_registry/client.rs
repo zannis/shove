@@ -39,6 +39,8 @@ pub struct SchemaRegistry {
     inflight: DashMap<SchemaId, SharedResolve>,
     // Negative cache: id -> (instant inserted, error that caused the miss).
     negative: DashMap<SchemaId, (std::time::Instant, SchemaRegistryError)>,
+    // Producer-side subject -> latest id cache (TopicNameStrategy lookups).
+    subject_ids: DashMap<Arc<str>, SchemaId>,
 }
 
 impl SchemaRegistry {
@@ -88,6 +90,35 @@ impl SchemaRegistry {
         result
     }
 
+    /// Resolve a subject to its latest schema id via
+    /// `GET /subjects/{subject}/versions/latest`. Cached subject→id so the
+    /// publisher hot path is a single lock-free map read after the first
+    /// lookup. Producer-side counterpart to [`resolve`](Self::resolve).
+    pub async fn latest_id(&self, subject: &str) -> Result<SchemaId> {
+        if let Some(hit) = self.subject_ids.get(subject) {
+            return Ok(*hit);
+        }
+        let ctx = FetchCtx {
+            base_url: self.base_url.clone(),
+            http: self.http.clone(),
+            auth: self.auth.clone(),
+            headers: self.headers.clone(),
+            max_retries: self.max_retries,
+        };
+        let url = format!("{}/subjects/{}/versions/latest", self.base_url, subject);
+        let not_found = SchemaRegistryError::Transport {
+            retriable: false,
+            message: format!("subject `{subject}` has no registered version (404)"),
+        };
+        let body = ctx.get_json(&url, not_found).await?;
+        let id = body.get("id").and_then(|v| v.as_u64()).ok_or_else(|| {
+            SchemaRegistryError::Decode("missing id in latest-version response".into())
+        })?;
+        let id = SchemaId(id as u32);
+        self.subject_ids.insert(Arc::from(subject), id);
+        Ok(id)
+    }
+
     fn shared_fetch(&self, id: SchemaId) -> SharedResolve {
         use dashmap::mapref::entry::Entry;
         match self.inflight.entry(id) {
@@ -132,7 +163,9 @@ impl FetchCtx {
 
     async fn get_versions(&self, id: SchemaId) -> Result<Vec<(Arc<str>, i32)>> {
         let url = format!("{}/schemas/ids/{}/versions", self.base_url, id.0);
-        let body: serde_json::Value = self.get_json(&url, id).await?;
+        let body: serde_json::Value = self
+            .get_json(&url, SchemaRegistryError::NotFound(id.0))
+            .await?;
         let arr = body
             .as_array()
             .ok_or_else(|| SchemaRegistryError::Decode("expected array from /versions".into()))?;
@@ -150,7 +183,9 @@ impl FetchCtx {
 
     async fn get_schema(&self, id: SchemaId) -> Result<(String, SchemaType)> {
         let url = format!("{}/schemas/ids/{}", self.base_url, id.0);
-        let body: serde_json::Value = self.get_json(&url, id).await?;
+        let body: serde_json::Value = self
+            .get_json(&url, SchemaRegistryError::NotFound(id.0))
+            .await?;
         let raw = body
             .get("schema")
             .and_then(|s| s.as_str())
@@ -161,7 +196,14 @@ impl FetchCtx {
         Ok((raw, schema_type))
     }
 
-    async fn get_json(&self, url: &str, id: SchemaId) -> Result<serde_json::Value> {
+    /// GET `url` as JSON with retry/auth/headers. `not_found` is returned on a
+    /// 404 so callers can attribute it to the right resource (a schema id or a
+    /// subject).
+    async fn get_json(
+        &self,
+        url: &str,
+        not_found: SchemaRegistryError,
+    ) -> Result<serde_json::Value> {
         let mut attempt = 0;
         let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(5));
         loop {
@@ -182,7 +224,7 @@ impl FetchCtx {
                         .map_err(|e| SchemaRegistryError::Decode(e.to_string()));
                 }
                 Ok(resp) if resp.status().as_u16() == 404 => {
-                    return Err(SchemaRegistryError::NotFound(id.0));
+                    return Err(not_found);
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     if attempt >= self.max_retries {
@@ -273,6 +315,7 @@ impl SchemaRegistryBuilder {
             resolved: DashMap::new(),
             inflight: DashMap::new(),
             negative: DashMap::new(),
+            subject_ids: DashMap::new(),
         })
     }
 }

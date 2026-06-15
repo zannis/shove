@@ -530,8 +530,14 @@ impl NatsConsumerGroupRegistry {
         // uses `get_consumer` (read-only) to attach.
         let max_ack_pending = aggregate_max_ack_pending(&config);
         let consumer_name = super::constants::consumer_name(topology.queue());
+        let filter_subjects = topology.nats_stream_subjects().unwrap_or(&[]);
         declarer
-            .declare_pull_consumer(topology.queue(), &consumer_name, max_ack_pending)
+            .declare_pull_consumer(
+                topology.queue(),
+                &consumer_name,
+                max_ack_pending,
+                filter_subjects,
+            )
             .await?;
 
         info!(group = %name, "registering consumer group");

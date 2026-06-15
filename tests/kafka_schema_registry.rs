@@ -260,3 +260,73 @@ async fn retriable_error_is_not_negative_cached() {
         "retriable errors must not be negative-cached"
     );
 }
+
+// ---------------------------------------------------------------------------
+// latest_id (producer-side subject -> id lookup)
+// ---------------------------------------------------------------------------
+
+async fn subject_latest(
+    State(s): State<MockState>,
+    Path(subject): Path<String>,
+) -> Json<serde_json::Value> {
+    s.calls.fetch_add(1, Ordering::SeqCst);
+    Json(serde_json::json!({
+        "subject": subject,
+        "version": 1,
+        "id": 42,
+        "schema": "{}",
+    }))
+}
+
+/// Spawn a mock serving `GET /subjects/{subject}/versions/latest`, returning
+/// (base_url, calls-counter).
+async fn spawn_subject_latest_mock() -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = MockState {
+        calls: calls.clone(),
+    };
+    let app = Router::new()
+        .route("/subjects/{subject}/versions/latest", get(subject_latest))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), calls)
+}
+
+#[tokio::test]
+async fn latest_id_returns_the_registered_id() {
+    let (url, _calls) = spawn_subject_latest_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+    let id = registry
+        .latest_id("orders-value")
+        .await
+        .expect("latest_id resolves the registered subject");
+    assert_eq!(id, SchemaId(42));
+}
+
+#[tokio::test]
+async fn second_latest_id_is_served_from_cache() {
+    let (url, calls) = spawn_subject_latest_mock().await;
+    let registry = SchemaRegistry::builder(url).build();
+
+    assert_eq!(
+        registry.latest_id("orders-value").await.unwrap(),
+        SchemaId(42)
+    );
+    let after_first = calls.load(Ordering::SeqCst);
+    assert_eq!(
+        after_first, 1,
+        "first latest_id makes exactly one HTTP call"
+    );
+
+    assert_eq!(
+        registry.latest_id("orders-value").await.unwrap(),
+        SchemaId(42)
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        after_first,
+        "subject -> id must be cached: no second HTTP call"
+    );
+}

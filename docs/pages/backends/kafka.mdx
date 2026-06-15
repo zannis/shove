@@ -182,7 +182,7 @@ On shutdown the consumer drains the in-flight republish queue before exiting the
 
 ## Schema Registry
 
-The `kafka-schema-registry` feature adds decode-only [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/index.html) support for Kafka consumers. When enabled, each incoming message is unwrapped from the Confluent wire frame (magic byte `0x00` + 4-byte big-endian schema id; for Protobuf, also the message-index array), the schema id is resolved against the registry (cached in memory, with single-flight deduplication of concurrent cold misses and a configurable negative-TTL for permanent failures), and the inner payload is decoded via the topic's existing `Codec` (`JsonCodec` or `ProtobufCodec`).
+The `kafka-schema-registry` feature adds [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/index.html) support for Kafka consumers (decode) and producers (encode). On the consume side, each incoming message is unwrapped from the Confluent wire frame (magic byte `0x00` + 4-byte big-endian schema id; for Protobuf, also the message-index array), the schema id is resolved against the registry (cached in memory, with single-flight deduplication of concurrent cold misses and a configurable negative-TTL for permanent failures), and the inner payload is decoded via the topic's existing `Codec` (`JsonCodec` or `ProtobufCodec`). On the produce side, an opt-in publisher wraps each encoded payload in the same wire frame — see [Producer-side encoding](#producer-side-encoding).
 
 The feature works with the Confluent Schema Registry and with **Redpanda's built-in Schema Registry**, which exposes the same Confluent-compatible REST API and wire format. The e2e test suite validates both paths.
 
@@ -260,6 +260,32 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 ### Accepted subjects
 
 `accept_schema_subjects([...])` pins the set of Confluent schema subjects that are accepted for a consumer. When not called, the default is derived from the queue name using the Confluent [TopicNameStrategy](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#subject-name-strategy): `"{queue}-value"`. For a topic named `orders`, that resolves to `orders-value`.
+
+### Producer-side encoding
+
+The same feature lets a publisher emit Confluent-framed messages, symmetric with how the consumer is configured. Attach a `SchemaRegistry` to a `KafkaPublisherConfig` and obtain the publisher with `Broker::publisher_with`; the publisher then wraps each codec-encoded payload in the Confluent wire frame using the latest registered schema id for the subject. Like the consumer side, framing is a publisher-layer concern — it is **not** baked into the topic's `Codec`.
+
+```rust,no_run
+use std::sync::Arc;
+use shove::kafka::KafkaPublisherConfig;
+use shove::schema_registry::SchemaRegistry;
+
+let registry = SchemaRegistry::builder("http://schema-registry:8081").build();
+
+// `broker` is a `Broker<Kafka>`.
+let publisher = broker
+    .publisher_with(KafkaPublisherConfig::new().with_schema_registry(Arc::clone(&registry)))
+    .await?;
+
+// `publisher.publish::<OrdersTopic>(&order).await?` now emits SR-framed bytes.
+```
+
+Details:
+
+- **Subject** — defaults to the Confluent TopicNameStrategy `"{topic}-value"`; override with `KafkaPublisherConfig::with_subject("...")`.
+- **Schema id** — resolved once per subject via `GET /subjects/{subject}/versions/latest` and cached. shove carries no schema text; the subject must already be registered.
+- **Codecs** — framing applies only to `JsonCodec` and `ProtobufCodec` topics; other codecs are published unframed. For Protobuf the message-index is `[0]` (the first message type).
+- **Opt-in** — a publisher built with the plain `Broker::publisher()` does no framing, so existing publishers are byte-for-byte unchanged.
 
 ### Codec requirement
 

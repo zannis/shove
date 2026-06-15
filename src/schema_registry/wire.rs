@@ -65,6 +65,45 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
+/// Append `value` to `out` as a base-128 varint. Inverse of [`read_varint`].
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Build a Confluent wire frame — the inverse of [`parse_frame`].
+///
+/// Layout: magic byte `0x00`, big-endian schema id, then for [`WireFormat::Protobuf`]
+/// the message-index array followed by the proto `payload`; for [`WireFormat::Json`]
+/// the `payload` directly (`msg_index` is ignored). The common protobuf index
+/// `[0]` is encoded as a single `0x00` byte, matching the count==0 fast path in
+/// [`skip_message_indexes`]; any other array is encoded as a count varint
+/// followed by each index varint.
+pub fn build_frame(format: WireFormat, id: SchemaId, msg_index: &[u32], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + payload.len());
+    out.push(0x00);
+    out.extend_from_slice(&id.0.to_be_bytes());
+    if format == WireFormat::Protobuf {
+        if msg_index == [0] {
+            out.push(0x00);
+        } else {
+            write_varint(&mut out, msg_index.len() as u64);
+            for &idx in msg_index {
+                write_varint(&mut out, u64::from(idx));
+            }
+        }
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
 /// Parse the Confluent frame for the given wire format.
 pub fn parse_frame(format: WireFormat, bytes: &[u8]) -> FrameResult<'_> {
     if bytes.is_empty() {
@@ -176,6 +215,77 @@ mod tests {
         assert_eq!(
             parse_frame(WireFormat::Json, &bytes),
             FrameResult::Unframed(&bytes)
+        );
+    }
+
+    #[test]
+    fn build_json_frame_exact_bytes_and_round_trip() {
+        let frame = build_frame(WireFormat::Json, SchemaId(1), &[], b"{}");
+        assert_eq!(frame, [0x00, 0x00, 0x00, 0x00, 0x01, b'{', b'}']);
+        assert_eq!(
+            parse_frame(WireFormat::Json, &frame),
+            FrameResult::Framed {
+                id: SchemaId(1),
+                payload: b"{}",
+            }
+        );
+    }
+
+    #[test]
+    fn build_protobuf_zero_index_uses_single_byte_optimization() {
+        // msg_index [0] must encode as a single 0x00 byte (matching
+        // skip_message_indexes' count==0 fast path), not [0x01, 0x00].
+        let frame = build_frame(WireFormat::Protobuf, SchemaId(5), &[0], &[0xDE, 0xAD]);
+        assert_eq!(frame, [0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0xDE, 0xAD]);
+        assert_eq!(
+            parse_frame(WireFormat::Protobuf, &frame),
+            FrameResult::Framed {
+                id: SchemaId(5),
+                payload: &[0xDE, 0xAD],
+            }
+        );
+    }
+
+    #[test]
+    fn build_protobuf_explicit_index_array_round_trips() {
+        // A non-[0] index array is encoded as count varint + each index varint.
+        let frame = build_frame(WireFormat::Protobuf, SchemaId(5), &[1, 3], &[0xBE, 0xEF]);
+        assert_eq!(
+            frame,
+            [0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x01, 0x03, 0xBE, 0xEF]
+        );
+        assert_eq!(
+            parse_frame(WireFormat::Protobuf, &frame),
+            FrameResult::Framed {
+                id: SchemaId(5),
+                payload: &[0xBE, 0xEF],
+            }
+        );
+    }
+
+    #[test]
+    fn build_frame_large_id_round_trips() {
+        let frame = build_frame(WireFormat::Json, SchemaId(100_000), &[], &[0xAB]);
+        assert_eq!(
+            parse_frame(WireFormat::Json, &frame),
+            FrameResult::Framed {
+                id: SchemaId(100_000),
+                payload: &[0xAB],
+            }
+        );
+    }
+
+    #[test]
+    fn build_protobuf_multibyte_index_varint_round_trips() {
+        // An index of 128 forces a 2-byte varint ([0x80, 0x01]) — exercises
+        // write_varint's continuation-bit path symmetrically with read_varint.
+        let frame = build_frame(WireFormat::Protobuf, SchemaId(7), &[128], &[0xAA]);
+        assert_eq!(
+            parse_frame(WireFormat::Protobuf, &frame),
+            FrameResult::Framed {
+                id: SchemaId(7),
+                payload: &[0xAA],
+            }
         );
     }
 

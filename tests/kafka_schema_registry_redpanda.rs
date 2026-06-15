@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
 use shove::handler::MessageHandler;
-use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer};
+use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer, KafkaPublisherConfig};
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
@@ -148,6 +148,12 @@ shove::define_topic!(
     TopologyBuilder::new("rp-sr-permissive").dlq().build()
 );
 
+shove::define_topic!(
+    ProducerTopic,
+    OrderEvent,
+    TopologyBuilder::new("rp-sr-producer").dlq().build()
+);
+
 // ---------------------------------------------------------------------------
 // Capturing handler (generic over the three topics)
 // ---------------------------------------------------------------------------
@@ -187,6 +193,7 @@ macro_rules! impl_capture_handler {
 impl_capture_handler!(HappyTopic);
 impl_capture_handler!(EnforceTopic);
 impl_capture_handler!(PermissiveTopic);
+impl_capture_handler!(ProducerTopic);
 
 // ---------------------------------------------------------------------------
 // Framing + produce helpers (mirror the hybrid test)
@@ -552,6 +559,85 @@ async fn redpanda_real_schema_registry_e2e() {
             handler.messages().await,
             vec![event],
             "permissive: should deliver the decoded payload, not DLQ it"
+        );
+    }
+
+    // =======================================================================
+    // Scenario 4 — producer-side SR encode round-trip: shove's publisher frames
+    // an SR-encoded message (subject `{queue}-value`, default Enforce-compatible)
+    // and shove's own SR-decode consumer reads it back. Proves the producer
+    // emits Confluent-compatible wire bytes (magic + BE id) AND that the full
+    // encode -> broker -> decode path reconstructs the original payload.
+    // =======================================================================
+    {
+        broker.topology().declare::<ProducerTopic>().await.unwrap();
+        let queue = ProducerTopic::topology().queue();
+        let subject = format!("{queue}-value");
+        let schema_id = register_json_schema(&sr_base, &subject).await;
+
+        let event = OrderEvent {
+            id: "order-4".into(),
+            qty: 99,
+        };
+
+        // Publish through shove's publisher with producer-side SR framing.
+        let registry = SchemaRegistry::builder(sr_base.clone()).build();
+        let publisher = broker
+            .publisher_with(KafkaPublisherConfig::new().with_schema_registry(registry.clone()))
+            .await
+            .expect("build SR publisher");
+        publisher
+            .publish::<ProducerTopic>(&event)
+            .await
+            .expect("SR-framed publish should succeed");
+
+        // Raw-read the produced bytes off the broker (independent group) and
+        // assert they carry the Confluent frame: magic 0x00 + the registered id.
+        let (raw, _reason) = read_dlq(&client, queue)
+            .await
+            .expect("produced message should be on the topic");
+        assert_eq!(
+            raw.first(),
+            Some(&0x00),
+            "producer: emitted payload must start with the Confluent magic byte"
+        );
+        assert_eq!(
+            u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]),
+            schema_id,
+            "producer: emitted frame must carry the latest registered schema id"
+        );
+
+        // Decode it back through shove's consumer SR path.
+        let handler = CaptureHandler::new();
+        let hc = handler.clone();
+        let shutdown = CancellationToken::new();
+        let sc = shutdown.clone();
+        let consumer = KafkaConsumer::new(client.clone());
+        let handle = tokio::spawn(async move {
+            consumer
+                .run::<ProducerTopic, _>(
+                    hc,
+                    (),
+                    ConsumerOptions::<Kafka>::new()
+                        .with_shutdown(sc)
+                        .with_prefetch_count(1)
+                        .with_schema_registry(registry)
+                        .accept_schema_subjects([subject.clone()]),
+                )
+                .await
+        });
+
+        assert!(
+            handler.counter.wait_for(1, TIMEOUT).await,
+            "producer round-trip: consumer should decode the self-published message"
+        );
+        shutdown.cancel();
+        handle.await.unwrap().ok();
+
+        assert_eq!(
+            handler.messages().await,
+            vec![event],
+            "producer round-trip: decoded payload must match what was published"
         );
     }
 
