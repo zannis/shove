@@ -1,0 +1,68 @@
+src/backends/nats/consumer_group.rs
+  s_7aed588dfb2219::t_54523bc32d0756 533,535-540
+src/schema_registry/client.rs
+  s_7aed588dfb2219::t_37fe1c5bdb5286 93-113,115,117-121
+  s_7aed588dfb2219::t_44431efb4b8205 166-168
+  s_7aed588dfb2219::t_cf56ece0ef73c4 199-206
+  s_7aed588dfb2219::t_ce3703a141022f 42-43
+  s_7aed588dfb2219::t_8de7f283d04025 186-188
+  s_7aed588dfb2219::t_b62d01f6b1eb12 318
+  s_7aed588dfb2219::t_185bf155f11a84 227
+src/schema_registry/wire.rs
+  s_7aed588dfb2219::t_a6e1991da57768 68-106
+  s_7aed588dfb2219::t_0abc3a061fbb72 222-291
+src/schema_registry/mod.rs
+  s_7aed588dfb2219::t_78aba154b98b96 58
+src/broker.rs
+  s_7aed588dfb2219::t_060ffa52e4daaa 126-127,134-142,145-147
+  s_7aed588dfb2219::t_0a2e766f0918ba 128-133,144
+tests/kafka_schema_registry.rs
+  s_7aed588dfb2219::t_b273b03707dd12 263-332
+src/backends/kafka/publisher.rs
+  s_7aed588dfb2219::t_9145b05ca829d2 168-171
+  s_7aed588dfb2219::t_f4e2acf7438c73 19-21
+  s_7aed588dfb2219::t_dd90110dd07bde 259-266
+  s_7aed588dfb2219::t_c93dc53da0bdd9 2-3
+  s_7aed588dfb2219::t_07e2b674f482b5 289-296
+  s_7aed588dfb2219::t_45d31af8af8660 81-149,153-154,159-167,172-214
+  s_7aed588dfb2219::t_47cd66417a39cf 338-341,346-347
+tests/kafka_schema_registry_redpanda.rs
+  s_7aed588dfb2219::t_f3842696afed6d 151-156
+  s_7aed588dfb2219::t_60c8f7fd59487e 50
+  s_7aed588dfb2219::t_1ef00ceb71d9e3 565-643
+  s_7aed588dfb2219::t_0a51b7ef57db2c 196
+src/lib.rs
+  s_7aed588dfb2219::t_927a223603f100 300-301
+src/topology.rs
+  s_7aed588dfb2219::t_f09f028cfc4c30 133-143
+  s_7aed588dfb2219::t_f7794e8cc460f6 325-328
+  s_7aed588dfb2219::t_752f56d8430f83 113
+  s_7aed588dfb2219::t_89052f12e8a221 378
+  s_7aed588dfb2219::t_2c02a1bdf57a97 187,198,202-215
+  s_7aed588dfb2219::t_48dc245c82f97c 654-695
+tests/nats_integration.rs
+  s_7aed588dfb2219::t_fb2284aad1b706 1535-1628
+  s_7aed588dfb2219::t_cb792ff6804733 112-122
+  s_7aed588dfb2219::t_4a84b5ead98596 211-218
+src/backends/kafka/mod.rs
+  s_7aed588dfb2219::t_9bfe62d97375b0 22
+src/backends/nats/topology.rs
+  s_7aed588dfb2219::t_02a9b6bc420de6 105,113-121,127-128
+  s_7aed588dfb2219::t_e15d13601c5c3d 45-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "449a18f746b0b50ac8ea5e282cb397fb7e44568c",
+  "prompts": {},
+  "sessions": {
+    "s_7aed588dfb2219": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "68af061e-d256-44e1-899b-7dbcf29c8434",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
