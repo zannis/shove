@@ -1,0 +1,36 @@
+src/lib.rs
+  s_addb436dbef6dd::t_c67517576d51d1 203-204
+tests/nats_integration.rs
+  s_addb436dbef6dd::t_6a05bdd32b5437 11
+  s_addb436dbef6dd::t_cadeed3154863a 489-533,535-536,538-591
+  s_addb436dbef6dd::t_91a422f45c1423 130-153
+  s_addb436dbef6dd::t_6e4d54612e6528 23
+src/topology.rs
+  s_addb436dbef6dd::t_dcd731c6de8692 272-275,288-291
+  s_addb436dbef6dd::t_5b35bc5eb1d01f 312-345
+  s_addb436dbef6dd::t_7553a250a4f6e3 2-58
+  s_addb436dbef6dd::t_5619741b4e4975 211-226
+  s_addb436dbef6dd::t_98a3d2e2296e8b 469-482
+  s_addb436dbef6dd::t_7408659b50a9e1 535-538
+  s_addb436dbef6dd::t_a32c7ffc264523 875-955
+  s_addb436dbef6dd::t_9cc798e025d1b9 172-179
+src/backends/nats/topology.rs
+  s_addb436dbef6dd::t_74589d1d506779 11,24-38,44,48-53,65-87,89-90,92
+  s_addb436dbef6dd::t_5c2ed717a96f49 107,110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "f1d979a085a5452ece5aa93aab070e96b982db9c",
+  "prompts": {},
+  "sessions": {
+    "s_addb436dbef6dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c2e26090-068e-46c0-af9a-4686f6e11855",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zannis.kalampoukis@polymarket.com>"
+    }
+  }
+}
