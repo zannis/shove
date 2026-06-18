@@ -52,7 +52,59 @@ All slots are `Option<…>` — set only the ones your deployment uses. The `Deb
 // [!include ~/examples/nats/basic.rs:declare]
 ```
 
-`topology().declare::<T>()` provisions JetStream streams for the topic: the main stream, plus a DLQ stream when `.dlq()` is configured. Sequenced topics declare a single main stream with subject shards (`{queue}.shard.{N}`). Durable consumers are not created here — the consumer runtime creates them on demand when you start consuming. The call is idempotent and safe to invoke on every startup.
+`topology().declare::<T>()` provisions JetStream streams for the topic: the main stream, plus a DLQ stream when `.dlq()` is configured. Sequenced topics declare a single main stream with subject shards (`{queue}.shard.{N}`). Durable consumers are not created here — the consumer runtime creates them on demand when you start consuming. The call is idempotent and safe to invoke on every startup: it reconciles an existing stream to the configured shape (via `create_or_update_stream`) rather than leaving a stale config in place.
+
+## Stream management
+
+By default `declare::<T>()` creates the main stream with shove's defaults — `WorkQueue` retention, file storage, a single replica, and **no size or age limit**. Two NATS-specific `TopologyBuilder` options change how the stream is bounded and who owns it.
+
+### Bounded / replicated managed stream
+
+Use `nats_stream_config` when shove should own the stream but you need it bounded — so a stalled consumer can't grow the file store without limit — or replicated for durability:
+
+```rust,no_run
+use shove::{NatsRetention, NatsStreamConfig, TopologyBuilder};
+use std::time::Duration;
+
+shove::define_topic!(
+    PriceChanges,
+    PriceChange,
+    TopologyBuilder::new("price-changes")
+        .nats_stream_config(NatsStreamConfig {
+            retention: NatsRetention::Limits,
+            max_age: Some(Duration::from_secs(600)),  // drop messages older than 10m
+            max_bytes: Some(1_000_000_000),            // cap the file store at ~1 GiB
+            max_messages: None,
+            num_replicas: 3,                           // R3 for production durability
+        })
+        .dlq()
+        .build()
+);
+```
+
+`NatsStreamConfig::default()` is WorkQueue / unbounded / single-replica, so set only the fields you need. On re-declare, **mutable** changes (`max_age`, `max_bytes`, `max_messages`, `num_replicas`) are applied to the existing stream; **immutable** ones (`retention`, storage) make `declare()` fail loudly rather than silently no-op — recreate the stream, or hand ownership to infra with `nats_external_stream()` if you need to change those.
+
+### Bind to an externally-provisioned stream
+
+When infra owns the stream — a Terraform module, a `nats` CLI bootstrap job, or an operator that sets retention, replication, or placement outside the app — use `nats_external_stream()`:
+
+```rust,no_run
+use shove::TopologyBuilder;
+
+shove::define_topic!(
+    PriceChanges,
+    PriceChange,
+    // The queue name must match the externally-provisioned stream name.
+    TopologyBuilder::new("CLOB_PRICE_CHANGES")
+        .nats_external_stream()
+        .dlq()
+        .build()
+);
+```
+
+In this mode `declare::<T>()` does **not** create the main stream — it verifies the stream (named after the queue) already exists and returns an error if it doesn't, so a missing or misnamed stream fails fast at startup instead of silently falling back to a default-configured one. shove still creates and owns its own DLQ stream and the durable consumer on the external stream. Provision the stream before the consumer starts (e.g. order a bootstrap job ahead of the deployment).
+
+`nats_external_stream()` and `nats_stream_config()` are mutually exclusive — and both are incompatible with `nats_subjects()` and `sequenced()`, which configure stream *creation* that external mode skips. `build()` panics if they are combined.
 
 ## Publish
 
@@ -101,13 +153,13 @@ See the [Basic example](/backends/nats/examples/basic) for a complete runnable w
 
 ## Gotchas
 
-- **Stream provisioning at declaration time.** `topology().declare::<T>()` creates JetStream streams with default storage limits. Ensure stream limits (max bytes, max messages, max message size) match your expected load — streams that hit their limits drop or reject new messages depending on the retention policy.
+- **Stream provisioning at declaration time.** `topology().declare::<T>()` creates JetStream streams with default storage limits unless you pass [`nats_stream_config`](#bounded--replicated-managed-stream). Ensure stream limits (max bytes, max messages, max message size) match your expected load — streams that hit their limits drop or reject new messages depending on the retention policy. When infra owns the stream, bind to it with [`nats_external_stream`](#bind-to-an-externally-provisioned-stream) instead.
 - **De-duplication via `Nats-Msg-Id`.** shove sets the `Nats-Msg-Id` header on every publish (a fresh UUID per call). JetStream de-duplicates within a configurable window (default 120 seconds) — if a publisher retries the same logical message inside that window, JetStream rejects the duplicate. Note that the header is generated per-publish-call, so deduplicating across application-level retries requires the caller to pass a stable id via `publish_with_headers`.
-- **Work-queue semantics assumed.** shove provisions JetStream streams with work-queue (interest-based delete-on-ack) semantics. Streams are not shared across consumer groups with different group names — each `consumer_group()` registration gets its own durable consumer on the shared stream.
+- **Work-queue semantics by default.** shove provisions JetStream streams with work-queue (delete-on-ack) semantics unless you override `retention` via [`nats_stream_config`](#bounded--replicated-managed-stream) or bind to an infra-owned stream with [`nats_external_stream`](#bind-to-an-externally-provisioned-stream). Work-queue streams allow a single logical consumer over a subject — each `consumer_group()` registration gets its own durable consumer on the stream.
 - **JetStream must be enabled on the server.** Connecting to a server without JetStream and calling `topology().declare::<T>()` will return an error. The `-js` flag is required on the NATS server.
 - **TLS scheme must match TLS options.** Setting any of `tls_ca_cert`, `tls_client_cert`, or `tls_client_key` on a plaintext `nats://` URL is rejected at connect time. Use `tls://` or `nats+tls://` to make the encrypted transport explicit — this guards against silent downgrade.
 - **Reconnect bounds.** `ConsumerOptions::<Nats>::new().with_max_reconnect_attempts(N)` caps reconnect attempts after a connection drop; default is unlimited. Set this when you want the consumer to surface `Connection` errors after `N` failed redials rather than retry forever.
-- **JetStream consumer tuning is fixed.** Streams are declared with `RetentionPolicy::WorkQueue`, `StorageType::File`, and `DiscardPolicy::New`; durable consumers use `AckPolicy::Explicit` with `max_ack_pending = prefetch × max_consumers` and a 120 s deduplication window. These are not yet user-configurable — open an issue if you need them surfaced as knobs.
+- **Stream config is tunable; durable-consumer tuning is fixed.** Stream retention, storage bounds (`max_age` / `max_bytes` / `max_messages`), and `num_replicas` are configurable via [`nats_stream_config`](#bounded--replicated-managed-stream) (or skipped entirely with [`nats_external_stream`](#bind-to-an-externally-provisioned-stream)); the defaults remain `WorkQueue` / `StorageType::File` / `DiscardPolicy::New` / single-replica / unbounded. The **durable consumers** are still declared with `AckPolicy::Explicit`, `max_ack_pending = prefetch × max_consumers`, and a 120 s deduplication window — these are not yet user-configurable, so open an issue if you need them surfaced as knobs.
 
 ## Examples
 
