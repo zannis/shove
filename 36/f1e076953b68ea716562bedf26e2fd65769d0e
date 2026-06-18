@@ -1,0 +1,53 @@
+src/consumer_supervisor.rs
+  5d2b32b4f1e0615a 49-52,59
+src/backends/nats/consumer.rs
+  5d2b32b4f1e0615a 419-422,465-470,472-477
+examples/kafka/stress.rs
+  5d2b32b4f1e0615a 12-14,22-24,37-57
+src/backend/options_inner.rs
+  5d2b32b4f1e0615a 60-63
+examples/rabbitmq/stress.rs
+  5d2b32b4f1e0615a 15-16,25-26,49-69
+src/backends/kafka/publisher.rs
+  5d2b32b4f1e0615a 143-144,157-181
+tests/broker_inmemory.rs
+  5d2b32b4f1e0615a 76-137
+src/backends/sns/consumer.rs
+  5d2b32b4f1e0615a 245-249,254
+examples/sqs/stress.rs
+  5d2b32b4f1e0615a 29-31,63-89,92-93
+src/backends/rabbitmq/backend.rs
+  5d2b32b4f1e0615a 257-282
+src/backends/inmemory/backend.rs
+  5d2b32b4f1e0615a 246-338
+src/backends/kafka/consumer.rs
+  5d2b32b4f1e0615a 449-453,457-462,467-472
+src/consumer.rs
+  5d2b32b4f1e0615a 540-646
+src/backends/nats/constants.rs
+  5d2b32b4f1e0615a 11-17
+examples/nats/stress.rs
+  5d2b32b4f1e0615a 20-21,36-52
+Cargo.toml
+  5d2b32b4f1e0615a 36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "36f1e076953b68ea716562bedf26e2fd65769d0e",
+  "prompts": {
+    "5d2b32b4f1e0615a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b2a9db5f-b3d0-4b64-8b68-87de816d5a78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 663,
+      "total_deletions": 217,
+      "accepted_lines": 487,
+      "overriden_lines": 6
+    }
+  }
+}

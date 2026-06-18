@@ -1,0 +1,24 @@
+tests/rabbitmq_reconnect.rs
+  ff905a1fdecdaf0b 1-107
+Cargo.toml
+  ff905a1fdecdaf0b 30,84,210-211,213-215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "33b7665575e7ae5a4855f2019109b5a32fb8ae08",
+  "prompts": {
+    "ff905a1fdecdaf0b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be7db84d-3162-4408-b4ab-ecc73f88bb5b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "total_additions": 111,
+      "total_deletions": 0,
+      "accepted_lines": 110,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,37 @@
+examples/nats/sequenced.rs
+  a7e66bb650d7c23d 90
+examples/sqs/sequenced_pubsub.rs
+  a7e66bb650d7c23d 219,221,240,242
+examples/kafka/sequenced.rs
+  a7e66bb650d7c23d 92
+examples/sqs/consumer_groups.rs
+  a7e66bb650d7c23d 136
+examples/rabbitmq/sequenced_pubsub.rs
+  a7e66bb650d7c23d 218,220,238,240
+examples/sqs/autoscaler.rs
+  a7e66bb650d7c23d 141
+examples/rabbitmq/consumer_groups.rs
+  a7e66bb650d7c23d 122
+examples/inmemory/sequenced.rs
+  a7e66bb650d7c23d 88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "36376f0a9b88fdd37ce0e7f64f107478ef94e96c",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 7,
+      "accepted_lines": 22642,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,38 @@
+src/backends/rabbitmq/consumer_group.rs
+  56c5fc5d7b5f1084 162,292
+src/backends/rabbitmq/consumer.rs
+  56c5fc5d7b5f1084 477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "3139363dfcbfcebc066188d98cee6ddb871f145f",
+  "prompts": {
+    "56c5fc5d7b5f1084": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a4e8138-595c-45a6-b406-7434810cf4a7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 3,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    },
+    "83e8be756fe9e414": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1f752485-725e-4685-93c0-0cbf43dcb0d1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 1168,
+      "total_deletions": 0,
+      "accepted_lines": 1168,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,35 @@
+docs/public/favicon.svg
+  54214397c9f7db40 1-7
+docs/public/shove-icon-dark.svg
+  54214397c9f7db40 1-7
+docs/public/shove-lockup-dark.svg
+  54214397c9f7db40 1-8
+docs/public/shove-icon.svg
+  54214397c9f7db40 1-7
+docs/public/shove-icon-mono.svg
+  54214397c9f7db40 1-7
+docs/public/shove-lockup.svg
+  54214397c9f7db40 1-8
+docs/public/shove-icon-white.svg
+  54214397c9f7db40 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "52544d666d102c792f6a961e3b1c7c1693b750f9",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 51,
+      "total_deletions": 0,
+      "accepted_lines": 132,
+      "overriden_lines": 0
+    }
+  }
+}

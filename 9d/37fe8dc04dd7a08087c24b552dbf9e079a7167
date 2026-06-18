@@ -1,0 +1,45 @@
+src/backends/kafka/topology.rs
+  a7e66bb650d7c23d 2,78-79
+src/backends/kafka/backend.rs
+  a7e66bb650d7c23d 142
+src/backends/sns/topology.rs
+  a7e66bb650d7c23d 9,417-418
+tests/kafka_integration.rs
+  a7e66bb650d7c23d 24
+src/backends/inmemory/topology.rs
+  a7e66bb650d7c23d 2,23-24
+src/backends/inmemory/backend.rs
+  a7e66bb650d7c23d 152
+src/lib.rs
+  a7e66bb650d7c23d 40,52
+src/backends/sns/backend.rs
+  a7e66bb650d7c23d 147
+src/backends/nats/backend.rs
+  a7e66bb650d7c23d 139
+src/backends/rabbitmq/topology.rs
+  a7e66bb650d7c23d 6,144-145
+src/backends/nats/topology.rs
+  a7e66bb650d7c23d 9,71-72
+src/backends/rabbitmq/backend.rs
+  a7e66bb650d7c23d 167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "9d37fe8dc04dd7a08087c24b552dbf9e079a7167",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 22674,
+      "total_deletions": 56,
+      "accepted_lines": 25049,
+      "overriden_lines": 0
+    }
+  }
+}

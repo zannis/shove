@@ -1,0 +1,23 @@
+src/consumer.rs
+  s_b029cb0284d7f0::t_025ba3b1bd17c7 279-287,295-300
+src/backends/redis/maintenance.rs
+  s_b029cb0284d7f0::t_fce70dd03c42b9 24-29
+src/backends/redis/consumer_group.rs
+  s_b029cb0284d7f0::t_a0a43d9e3d39bb 129-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7190f5d6efaf28766aa036f933c8e8517cf88fbb",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

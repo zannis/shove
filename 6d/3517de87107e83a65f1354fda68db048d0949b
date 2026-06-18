@@ -1,0 +1,25 @@
+src/backends/sns/publisher.rs
+  f24298483bede394 153
+src/backends/rabbitmq/client.rs
+  f24298483bede394 86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "6d3517de87107e83a65f1354fda68db048d0949b",
+  "prompts": {
+    "f24298483bede394": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48b0893f-38e6-4fb6-9ed5-448c1187a826",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 267,
+      "total_deletions": 13,
+      "accepted_lines": 267,
+      "overriden_lines": 0
+    }
+  }
+}

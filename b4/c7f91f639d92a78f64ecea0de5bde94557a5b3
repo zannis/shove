@@ -1,0 +1,36 @@
+Cargo.toml
+  b8b4ec99d7b3db3b 41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "b4c7f91f639d92a78f64ecea0de5bde94557a5b3",
+  "prompts": {
+    "83e8be756fe9e414": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1f752485-725e-4685-93c0-0cbf43dcb0d1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 1168,
+      "overriden_lines": 0
+    },
+    "b8b4ec99d7b3db3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5fe4367-d9eb-49b2-b5db-826306c75f5a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 0,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}

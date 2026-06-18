@@ -1,0 +1,23 @@
+src/backends/sns/consumer.rs
+  f24298483bede394 19,112,120-121,123,567,601-602,604
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "26cb14f90115ae60ee511c867bc263d4ad7c22a3",
+  "prompts": {
+    "f24298483bede394": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48b0893f-38e6-4fb6-9ed5-448c1187a826",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 9,
+      "total_deletions": 5,
+      "accepted_lines": 623,
+      "overriden_lines": 0
+    }
+  }
+}

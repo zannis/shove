@@ -1,0 +1,35 @@
+src/backends/nats/publisher.rs
+  a5ddff18f4ae305a 6,17,20-65,105-113,152-153,155-166
+src/lib.rs
+  a5ddff18f4ae305a 71
+src/backends/nats/constants.rs
+  a5ddff18f4ae305a 1-19
+src/backends/nats/autoscaler.rs
+  a5ddff18f4ae305a 48,263
+src/backends/nats/mod.rs
+  a5ddff18f4ae305a 3,9
+src/backends/nats/consumer_group.rs
+  a5ddff18f4ae305a 28-34,168,181,186,196,206,214,234,239,257
+src/backends/nats/consumer.rs
+  a5ddff18f4ae305a 25-29,170-178,382,402,404,410,710,721
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "734e63c1fb8ced80f7a330cee9c8da424cb1a4ae",
+  "prompts": {
+    "a5ddff18f4ae305a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98dbbc56-bcb7-4639-b01f-b79be609ec98",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 143,
+      "total_deletions": 172,
+      "accepted_lines": 134,
+      "overriden_lines": 0
+    }
+  }
+}

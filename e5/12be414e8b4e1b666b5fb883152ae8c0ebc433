@@ -1,0 +1,26 @@
+docs/pages/guides/liveness.mdx
+  s_12c83afaad42aa::t_da400376d2744d 10
+  s_12c83afaad42aa::t_d0a89bf51f6b9e 53
+  s_12c83afaad42aa::t_2ae877d6614aae 32
+  s_12c83afaad42aa::t_7e006bae2a86f2 41
+docs/pages/backends/sqs.mdx
+  s_12c83afaad42aa::t_5840750f9b3ac3 102
+docs/pages/backends/inmemory.mdx
+  s_12c83afaad42aa::t_87ea9d90d581b1 90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e512be414e8b4e1b666b5fb883152ae8c0ebc433",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

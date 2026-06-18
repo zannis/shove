@@ -1,0 +1,23 @@
+src/backends/sns/publisher.rs
+  f24298483bede394 153-161,166,169-181,184-185,266-270,272-311
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "33bf47792224022955887cd5171d3fe022175460",
+  "prompts": {
+    "f24298483bede394": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48b0893f-38e6-4fb6-9ed5-448c1187a826",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 70,
+      "total_deletions": 36,
+      "accepted_lines": 70,
+      "overriden_lines": 0
+    }
+  }
+}

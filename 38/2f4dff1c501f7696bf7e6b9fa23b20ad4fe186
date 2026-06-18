@@ -1,0 +1,100 @@
+src/topology.rs
+  6f1b6af5ed60659f 4
+benches/autoscaler.rs
+  6f1b6af5ed60659f 119-120,166-167,171,173,233-234,239-241,290,295-297,305,307
+src/error.rs
+  6f1b6af5ed60659f 17-19
+src/backends/rabbitmq/client.rs
+  6f1b6af5ed60659f 7,55,72
+Cargo.toml
+  6f1b6af5ed60659f 3,58-59
+src/backends/rabbitmq/mod.rs
+  6f1b6af5ed60659f 5,9
+.github/workflows/ci.yml
+  a9ed72533fe65cb4 22-24
+  5cf3eae4c6f92c2c 25-38
+src/backends/rabbitmq/router.rs
+  6f1b6af5ed60659f 1-132
+src/backends/rabbitmq/headers.rs
+  6f1b6af5ed60659f 1-272,274-341,343-344,346-366,368-382
+src/backends/rabbitmq/autoscaler.rs
+  6f1b6af5ed60659f 9,11,73,79-88,90,417-445,449
+  a9ed72533fe65cb4 356-357
+src/backends/rabbitmq/publisher.rs
+  6f1b6af5ed60659f 12
+tests/rabbitmq_integration.rs
+  5cf3eae4c6f92c2c 528,531-534,541-546,549
+  6f1b6af5ed60659f 1-9,11-527,529-530,535-540,547-548,550-632
+src/handler.rs
+  6f1b6af5ed60659f 59-156
+src/macros.rs
+  6f1b6af5ed60659f 69-195
+src/backends/rabbitmq/consumer_group.rs
+  6f1b6af5ed60659f 26-29,32,36-50,53-54,59-100,300,312,326,359,413,437,468,508-511,514-518,521-546,548-582
+src/publisher.rs
+  6f1b6af5ed60659f 3
+src/backends/rabbitmq/registry.rs
+  6f1b6af5ed60659f 7-8,11,33-35,38,42-43,47-54,66
+src/backends/rabbitmq/management.rs
+  6f1b6af5ed60659f 5
+src/audit.rs
+  6f1b6af5ed60659f 7,41,70-77,133,338-388
+src/backends/rabbitmq/consumer.rs
+  6f1b6af5ed60659f 2-3,12,16,18,33,35,39-43,47,69,71,77-80,85-86,112,114,121-124,179,199,203-213,215-217,221,224,235,238,247,249,253-257,309,313-329,333,336,339,342,352-382,384,387-393,395-404,406,408-419,421,423,455,489,518-535
+src/consumer.rs
+  6f1b6af5ed60659f 7
+README.md
+  5cf3eae4c6f92c2c 3-8
+examples/consumer_groups.rs
+  6f1b6af5ed60659f 92-94,97,113,148-149
+src/backends/rabbitmq/topology.rs
+  6f1b6af5ed60659f 5,25,40,81,170
+src/lib.rs
+  6f1b6af5ed60659f 47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "382f4dff1c501f7696bf7e6b9fa23b20ad4fe186",
+  "prompts": {
+    "5cf3eae4c6f92c2c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "872079c9-09bd-4f5b-a493-789209b9f5fe",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 39,
+      "total_deletions": 14,
+      "accepted_lines": 32,
+      "overriden_lines": 0
+    },
+    "6f1b6af5ed60659f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c9995912-720e-4a15-9a0a-d315a6e66903",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 3591,
+      "total_deletions": 421,
+      "accepted_lines": 3482,
+      "overriden_lines": 8
+    },
+    "a9ed72533fe65cb4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7c99195d-5663-48c4-a144-9e62ef70fc5c",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 5,
+      "total_deletions": 4,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    }
+  }
+}

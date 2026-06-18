@@ -1,0 +1,19 @@
+package.json
+  s_171ff086013c26::t_98ae33d4fca673 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7b39c674a27b66eb99d8382cf129428ea768dba2",
+  "prompts": {},
+  "sessions": {
+    "s_171ff086013c26": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a13c8926-c886-480d-922e-51b7433803ca",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

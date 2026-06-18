@@ -1,0 +1,30 @@
+src/lib.rs
+  s_78028e7db402f2::t_7aa787510702c0 166-168
+src/schema_registry/mod.rs
+  s_78028e7db402f2::t_3980974776fb5c 1-14
+Cargo.toml
+  s_78028e7db402f2::t_07f66ead202709 62-66
+src/schema_registry/wire.rs
+  s_78028e7db402f2::t_5938b77c92d5e7 64
+  s_78028e7db402f2::t_98b02aebfd122a 116-119,127-128,130,139-142,151-154,163-166,173-176,181-184
+  s_78028e7db402f2::t_c86c1fa2e0e69a 90
+  s_78028e7db402f2::t_5a9eaed2a20731 129
+  s_78028e7db402f2::t_efc7ef5368d9e8 1-45,47-63,65-89,91-115,120-126,131-138,143-150,155-162,167-172,177-180,185-188
+  s_78028e7db402f2::t_45acc7610fa571 46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5390ceb0f42501ae971f349b16d12d64ad05e93a",
+  "prompts": {},
+  "sessions": {
+    "s_78028e7db402f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5a2d892-7f72-4ef5-af98-690e967d2b90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

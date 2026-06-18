@@ -1,0 +1,23 @@
+src/schema_registry/wire.rs
+  s_78028e7db402f2::t_91fba99fffe9ab 96
+  s_78028e7db402f2::t_b1e0f632029538 48,56-57
+  s_78028e7db402f2::t_9f14317298e6ab 25-26
+  s_78028e7db402f2::t_6a31aee56d3be7 193-234
+  s_78028e7db402f2::t_d0ba3f723bc29e 70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "756d2d8e60ea710752b088b1d774c4fb2fc7312a",
+  "prompts": {},
+  "sessions": {
+    "s_78028e7db402f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5a2d892-7f72-4ef5-af98-690e967d2b90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+src/backends/nats/consumer.rs
+  98039bddec9cc648 1-504
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "1318926827d9971cced52459fb6d9c36f48d7aa1",
+  "prompts": {
+    "98039bddec9cc648": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15d3d33d-9ab0-4f69-a92d-8d6d157ea0b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 505,
+      "total_deletions": 2,
+      "accepted_lines": 504,
+      "overriden_lines": 0
+    }
+  }
+}

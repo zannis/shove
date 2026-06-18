@@ -1,0 +1,22 @@
+tests/redis_integration.rs
+  s_b029cb0284d7f0::t_02c4d2d2522795 17,308-370
+src/backends/redis/publisher.rs
+  s_b029cb0284d7f0::t_233fdd661268ac 6
+  s_b029cb0284d7f0::t_02c4d2d2522795 5,7,37-43,47,53-74,103-120,156,167-170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "1c2151ded588e6a0a42c7cd92c0a5564bf928a2d",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+tests/broker_inmemory.rs
+  a7e66bb650d7c23d 1-49,51,53-64
+src/consumer_supervisor.rs
+  a7e66bb650d7c23d 1-2,14,16-37,39-127,129-135,139-150,152-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "449f22c2d6c3596643011606d14306d8bc6eff18",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 2,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  }
+}

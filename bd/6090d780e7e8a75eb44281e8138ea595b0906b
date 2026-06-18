@@ -1,0 +1,36 @@
+docs/superpowers/specs/2026-04-09-nats-autoscaler-design.md
+  98039bddec9cc648 1-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "bd6090d780e7e8a75eb44281e8138ea595b0906b",
+  "prompts": {
+    "19e308383ce264d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d828ff25-e74c-42b0-8d2d-f6cd6db34844",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 87,
+      "total_deletions": 32,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    },
+    "98039bddec9cc648": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15d3d33d-9ab0-4f69-a92d-8d6d157ea0b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 200,
+      "total_deletions": 0,
+      "accepted_lines": 200,
+      "overriden_lines": 0
+    }
+  }
+}

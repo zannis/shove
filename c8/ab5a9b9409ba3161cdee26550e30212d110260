@@ -1,0 +1,9 @@
+src/autoscale_metrics.rs
+  a7e66bb650d7c23d 1-8,10-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "c8ab5a9b9409ba3161cdee26550e30212d110260",
+  "prompts": {}
+}

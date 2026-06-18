@@ -1,0 +1,9 @@
+src/consumer_supervisor.rs
+  a7e66bb650d7c23d 1-3,5-26,28-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "968ae246d22487b1eef92e7d80b4d44ccbba2462",
+  "prompts": {}
+}

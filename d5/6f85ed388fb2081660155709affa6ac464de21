@@ -1,0 +1,23 @@
+examples/rabbitmq/basic_pubsub.rs
+  54214397c9f7db40 175,177,180,186,190,231,239,261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d56f85ed388fb2081660155709affa6ac464de21",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24757,
+      "total_deletions": 1,
+      "accepted_lines": 25903,
+      "overriden_lines": 0
+    }
+  }
+}

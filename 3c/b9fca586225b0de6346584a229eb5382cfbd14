@@ -1,0 +1,23 @@
+.github/workflows/publish.yml
+  b7c5b60e56e2cb01 18,51-52,54-60,66-71,76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "3cb9fca586225b0de6346584a229eb5382cfbd14",
+  "prompts": {
+    "b7c5b60e56e2cb01": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "76b376ed-71df-4418-a836-ac24cd08fc23",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 18,
+      "total_deletions": 5,
+      "accepted_lines": 17,
+      "overriden_lines": 1
+    }
+  }
+}

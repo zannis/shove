@@ -1,0 +1,48 @@
+tests/redis_integration.rs
+  s_b029cb0284d7f0::t_efb284d0efe4cf 1310-1420
+  s_b029cb0284d7f0::t_87336da35003df 1496-1502
+  s_b029cb0284d7f0::t_c8cf400b213aa0 1504
+  s_b029cb0284d7f0::t_eb74b9cd10a0ff 25-27
+  s_b029cb0284d7f0::t_411c2e8ab2236a 1421-1495,1503,1505-1525
+src/backends/redis/reaper.rs
+  s_b029cb0284d7f0::t_6323d3bfc7cf5b 89-94,124-127
+  s_b029cb0284d7f0::t_0b96d85e249203 62-64
+src/backends/redis/maintenance.rs
+  s_b029cb0284d7f0::t_5a8223bf9ad2cf 1-184
+src/backends/redis/mod.rs
+  s_b029cb0284d7f0::t_dd8a360b9bba4c 12
+src/backends/redis/consumer.rs
+  s_b029cb0284d7f0::t_899c64e2ee56a4 367
+  s_b029cb0284d7f0::t_33802fb92da48c 448-459,467,491
+  s_b029cb0284d7f0::t_9f8663a4304ddf 523-525,528
+  s_b029cb0284d7f0::t_4564bfc33aa2b0 825-828
+  s_b029cb0284d7f0::t_0792d8928c2367 287-299
+  s_b029cb0284d7f0::t_f1898446520df6 503,512,526-527
+  s_b029cb0284d7f0::t_7dddc6b8fbc9b3 229-238
+src/backends/redis/autoscaler.rs
+  s_b029cb0284d7f0::t_d0ff33fb75bac3 379
+src/backends/redis/consumer_group.rs
+  s_b029cb0284d7f0::t_130602e828486c 209-213
+  s_b029cb0284d7f0::t_523cc889561064 1109
+  s_b029cb0284d7f0::t_ddce12db2fcc71 1076-1078
+  s_b029cb0284d7f0::t_e83477e7c38b3b 480-482,488-489
+  s_b029cb0284d7f0::t_116fc3008b9165 362-364
+src/backends/redis/client.rs
+  s_b029cb0284d7f0::t_28d7cf9a0ee349 335-342
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "2509e551a7039017912995923762bb628f97106d",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+src/consumer_supervisor.rs
+  a7e66bb650d7c23d 1-70
+src/lib.rs
+  a7e66bb650d7c23d 4,41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "47969d6c09ffcf98ef5a90221755d8a9f173e6c1",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 22700,
+      "total_deletions": 0,
+      "accepted_lines": 71,
+      "overriden_lines": 0
+    }
+  }
+}

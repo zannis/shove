@@ -1,0 +1,31 @@
+src/backends/nats/consumer_group.rs
+  ba7b939f0f840377 58
+src/backends/kafka/consumer_group.rs
+  ba7b939f0f840377 58
+src/backends/rabbitmq/consumer_group.rs
+  ba7b939f0f840377 66
+src/backends/sns/consumer_group.rs
+  ba7b939f0f840377 67
+src/lib.rs
+  ba7b939f0f840377 18-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "55b85e6691286169986967be0ca9656d9a44f29e",
+  "prompts": {
+    "ba7b939f0f840377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bba4a5b5-ec01-4adc-953b-46a9098831e1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 8,
+      "total_deletions": 5,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    }
+  }
+}

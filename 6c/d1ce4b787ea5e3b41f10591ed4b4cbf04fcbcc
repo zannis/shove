@@ -1,0 +1,76 @@
+tests/kafka_integration.rs
+  3176c11aecdeaad5 1362-1368,1372-1398,1439-1530,1534,1536,1553-1800
+  6154b5e1c70a472d 1369,1371,1399-1434,1531-1533,1535,1537-1552
+src/backends/kafka/autoscaler.rs
+  3176c11aecdeaad5 506-553,555-581
+  6154b5e1c70a472d 76-91,93-98,100-101,103-104
+src/backends/nats/autoscaler.rs
+  3176c11aecdeaad5 454-501,503-529
+  6154b5e1c70a472d 41,49,51-77
+src/backends/kafka/consumer.rs
+  6154b5e1c70a472d 669,678-681,684-687,813-824
+tests/nats_integration.rs
+  6154b5e1c70a472d 1606-1608,1610,1612-1627
+  3176c11aecdeaad5 1532-1605,1609,1611,1628-1768
+src/backends/nats/consumer.rs
+  6154b5e1c70a472d 525,534-537,540-543,698-709
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "6cd1ce4b787ea5e3b41f10591ed4b4cbf04fcbcc",
+  "prompts": {
+    "3176c11aecdeaad5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8394d518-4307-4169-9f8a-a90452f00cf8",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 1744,
+      "total_deletions": 4,
+      "accepted_lines": 1710,
+      "overriden_lines": 2
+    },
+    "6154b5e1c70a472d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d950557f-d709-4a4d-a5f0-ed9dc194178c",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 308,
+      "total_deletions": 210,
+      "accepted_lines": 190,
+      "overriden_lines": 1
+    },
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 1520,
+      "overriden_lines": 0
+    },
+    "bda21613c20607db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c382560-f7c7-4f14-bbca-370e6f256a6f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 202,
+      "overriden_lines": 1
+    }
+  }
+}

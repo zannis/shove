@@ -1,0 +1,23 @@
+benches/publish_throughput.rs
+  ff905a1fdecdaf0b 81-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1b511e6c3c02cce56323a3b2696bb68b55cd4876",
+  "prompts": {
+    "ff905a1fdecdaf0b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be7db84d-3162-4408-b4ab-ecc73f88bb5b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 5,
+      "total_deletions": 1,
+      "accepted_lines": 9,
+      "overriden_lines": 0
+    }
+  }
+}

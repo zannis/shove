@@ -1,0 +1,50 @@
+README.md
+  5181c77e70759d67 13-16,200-201,203
+  c40e65ff96c4e9ae 175,189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "bd71d38189288bd078b068a0eba6b3688700146d",
+  "prompts": {
+    "14fc33816887c4f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b9a58710-fb5c-4a4b-bb00-964c12e8b3ec",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 75,
+      "total_deletions": 3,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    },
+    "5181c77e70759d67": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "86f8f637-ba08-4627-a7ff-7475031e1a22",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 8,
+      "total_deletions": 0,
+      "accepted_lines": 21,
+      "overriden_lines": 0
+    },
+    "c40e65ff96c4e9ae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00116b51-db65-4de1-aed1-472432d0e78f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 0,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    }
+  }
+}

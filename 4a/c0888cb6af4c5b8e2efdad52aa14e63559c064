@@ -1,0 +1,51 @@
+src/backends/nats/backend.rs
+  a7e66bb650d7c23d 18-19
+src/backends/sns/publisher.rs
+  a7e66bb650d7c23d 6,10,187
+src/broker.rs
+  a7e66bb650d7c23d 8
+src/backends/kafka/backend.rs
+  a7e66bb650d7c23d 18-19
+src/lib.rs
+  a7e66bb650d7c23d 17,53
+src/backends/rabbitmq/publisher.rs
+  a7e66bb650d7c23d 14,19,244
+src/backends/kafka/publisher.rs
+  a7e66bb650d7c23d 9,11,102
+src/backends/inmemory/publisher.rs
+  a7e66bb650d7c23d 6,8,61
+src/backends/inmemory/backend.rs
+  a7e66bb650d7c23d 18-19
+src/backends/sns/backend.rs
+  a7e66bb650d7c23d 27-28
+src/publisher_internal.rs
+  a7e66bb650d7c23d 1-62
+tests/sns_sqs_integration.rs
+  a7e66bb650d7c23d 27
+src/backends/nats/publisher.rs
+  a7e66bb650d7c23d 11,13,118
+src/backends/rabbitmq/backend.rs
+  a7e66bb650d7c23d 18-19
+src/audit.rs
+  a7e66bb650d7c23d 176,190-192,195-196,199-205,208,212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "4ac0888cb6af4c5b8e2efdad52aa14e63559c064",
+  "prompts": {
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 113,
+      "total_deletions": 200,
+      "accepted_lines": 25133,
+      "overriden_lines": 0
+    }
+  }
+}

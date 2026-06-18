@@ -1,0 +1,35 @@
+src/backends/kafka/autoscaler.rs
+  7ecdbe1682826f5d 44,48-49
+Cargo.toml
+  7ecdbe1682826f5d 41-45
+src/backends/kafka/mod.rs
+  7ecdbe1682826f5d 12-13
+src/backends/kafka/consumer.rs
+  7ecdbe1682826f5d 450,456,602,839,984,988
+src/backends/kafka/client.rs
+  7ecdbe1682826f5d 3-4,18-116,119-122,129-132,140-151,163-170,179-182,191-241,250,290-296,302-304,358,362-363,430-477
+README.md
+  7ecdbe1682826f5d 138-140,156
+src/lib.rs
+  7ecdbe1682826f5d 267-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "34d7747dbf4bdff199eecdbdb3384747f1aa0265",
+  "prompts": {
+    "7ecdbe1682826f5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "64ed513c-e5b4-4bb9-b74d-2a15962f6a8e",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 273,
+      "total_deletions": 26,
+      "accepted_lines": 269,
+      "overriden_lines": 0
+    }
+  }
+}

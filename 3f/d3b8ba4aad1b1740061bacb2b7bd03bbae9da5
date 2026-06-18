@@ -1,0 +1,23 @@
+docs/pages/index.mdx
+  54214397c9f7db40 19-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "3fd3b8ba4aad1b1740061bacb2b7bd03bbae9da5",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24808,
+      "total_deletions": 51,
+      "accepted_lines": 33035,
+      "overriden_lines": 0
+    }
+  }
+}

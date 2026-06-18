@@ -1,0 +1,24 @@
+tests/sns_ping.rs
+  s_12c83afaad42aa::t_a5799436769774 1-8,11-110
+  s_12c83afaad42aa::t_d283e1435f6d53 9
+src/backends/sns/client.rs
+  s_12c83afaad42aa::t_10b88c7c4829f6 145-161
+src/backends/sns/backend.rs
+  s_12c83afaad42aa::t_bbb3ff7d606b9d 112-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "55ce92e540f9cd66c0319fd6c00718b6968f990d",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

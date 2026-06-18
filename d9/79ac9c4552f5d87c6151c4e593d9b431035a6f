@@ -1,0 +1,23 @@
+src/backends/rabbitmq/client.rs
+  s_12c83afaad42aa::t_f8e03843c944f2 350-369
+src/backends/rabbitmq/backend.rs
+  s_12c83afaad42aa::t_fc9978c1fbc6d8 163-164
+tests/rabbitmq_ping.rs
+  s_12c83afaad42aa::t_dc528b366f406a 1-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d979ac9c4552f5d87c6151c4e593d9b431035a6f",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

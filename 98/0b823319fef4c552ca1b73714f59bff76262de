@@ -1,0 +1,29 @@
+src/backends/nats/consumer.rs
+  ba7b939f0f840377 487-501,503,506-507,693-707,709,712-713
+src/consumer.rs
+  ba7b939f0f840377 20-32,205
+src/publisher.rs
+  ba7b939f0f840377 13-16
+src/backends/kafka/consumer.rs
+  ba7b939f0f840377 629-645,648-649,808-824,827-828
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "980b823319fef4c552ca1b73714f59bff76262de",
+  "prompts": {
+    "ba7b939f0f840377": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bba4a5b5-ec01-4adc-953b-46a9098831e1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 92,
+      "total_deletions": 97,
+      "accepted_lines": 92,
+      "overriden_lines": 0
+    }
+  }
+}

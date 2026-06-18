@@ -1,0 +1,35 @@
+src/backends/nats/backend.rs
+  cee101a3fc7af78f 129-141
+src/backend/consumer.rs
+  cee101a3fc7af78f 10-11,48-57
+src/backends/kafka/backend.rs
+  cee101a3fc7af78f 132-144
+src/backends/rabbitmq/backend.rs
+  cee101a3fc7af78f 155-167
+src/backends/sns/backend.rs
+  cee101a3fc7af78f 132-144
+src/backends/inmemory/consumer.rs
+  cee101a3fc7af78f 66-89,321-329,334,364-365,372,377-378,381-399,405-422
+src/backends/inmemory/backend.rs
+  cee101a3fc7af78f 146-158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "9f052d6a6a932770f9e1b2c14ad4fca0305ee9f5",
+  "prompts": {
+    "cee101a3fc7af78f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73191ef5-b372-44ac-bd22-e7e3b931c45a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 222,
+      "total_deletions": 11,
+      "accepted_lines": 86,
+      "overriden_lines": 0
+    }
+  }
+}

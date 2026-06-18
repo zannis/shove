@@ -1,0 +1,20 @@
+src/backends/redis/publisher.rs
+  s_80d93bdfda1e22::t_19fec6275da4fb 8
+  s_80d93bdfda1e22::t_48098560482159 102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d09fcc459671a7401478c6d49efad8ddeb8fcde1",
+  "prompts": {},
+  "sessions": {
+    "s_80d93bdfda1e22": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b22502-baee-4e5a-9e07-4b245fea3dd6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

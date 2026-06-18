@@ -1,0 +1,25 @@
+.github/workflows/ci.yml
+  93192bbecc86a1f9 6-13,15-22
+.github/workflows/docs-build.yml
+  93192bbecc86a1f9 10,13-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "818e2bea7f6ebb33e85697f89a8a767b933a5917",
+  "prompts": {
+    "93192bbecc86a1f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b682a258-314d-4c22-9790-4ae7e7675792",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 24,
+      "total_deletions": 0,
+      "accepted_lines": 24,
+      "overriden_lines": 0
+    }
+  }
+}

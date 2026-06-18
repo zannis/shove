@@ -1,0 +1,35 @@
+src/backends/sns/topology.rs
+  21278ad40e2206c9 1-4
+Cargo.toml
+  21278ad40e2206c9 15,31,37-38
+src/backends/mod.rs
+  21278ad40e2206c9 3-5
+src/backends/sns/publisher.rs
+  21278ad40e2206c9 1-3
+src/lib.rs
+  21278ad40e2206c9 40-48
+src/backends/sns/client.rs
+  21278ad40e2206c9 1-4,6-114
+src/backends/sns/mod.rs
+  21278ad40e2206c9 1-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.3",
+  "base_commit_sha": "9b725de79dcbb0d309ac806c03b6e87fb168e965",
+  "prompts": {
+    "21278ad40e2206c9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdaea724-d258-41ba-83f7-a0d6d8d79c1a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 1865,
+      "total_deletions": 22,
+      "accepted_lines": 1841,
+      "overriden_lines": 1
+    }
+  }
+}

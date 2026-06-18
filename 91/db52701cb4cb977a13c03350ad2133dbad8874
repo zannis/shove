@@ -1,0 +1,11 @@
+tests/broker_inmemory.rs
+  a7e66bb650d7c23d 1-49,51,53-64
+src/consumer_supervisor.rs
+  a7e66bb650d7c23d 1-2,14,16-37,39-127,129-135,139-150,152-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "91db52701cb4cb977a13c03350ad2133dbad8874",
+  "prompts": {}
+}

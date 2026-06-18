@@ -1,0 +1,30 @@
+src/backends/kafka/client.rs
+  s_12c83afaad42aa::t_c0f040c4716668 584,588-593
+docs/pages/guides/liveness.mdx
+  s_12c83afaad42aa::t_a63836da987c1e 32
+  s_12c83afaad42aa::t_98124e58b00b25 26
+  s_12c83afaad42aa::t_7d978f05d5658c 47
+tests/inmemory_ping.rs
+  s_12c83afaad42aa::t_2f40b3ebc2258d 19-22
+src/backends/redis/client.rs
+  s_12c83afaad42aa::t_1da89bbbb7d0b5 307-311,313-325
+  s_12c83afaad42aa::t_bc4fece112fb36 326-328
+src/broker.rs
+  s_12c83afaad42aa::t_9c28f0e7da8b54 71-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "9059d2fe7b7d43e03b67a93181d1f11e4804d02a",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

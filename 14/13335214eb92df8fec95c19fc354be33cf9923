@@ -1,0 +1,9 @@
+src/backends/inmemory/consumer_group.rs
+  cee101a3fc7af78f 18,151-154,192-258,362,449-458,460,462,464-465,467-472,474-483,561,632
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "1413335214eb92df8fec95c19fc354be33cf9923",
+  "prompts": {}
+}

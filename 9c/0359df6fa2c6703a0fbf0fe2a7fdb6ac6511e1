@@ -1,0 +1,23 @@
+README.md
+  2951b802eaddff7a 70-92,200-202,206-208,235-236,267-268,298-299,329-330,367,369,376-410,435-436,439-441,478-479,509,529-532
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "9c0359df6fa2c6703a0fbf0fe2a7fdb6ac6511e1",
+  "prompts": {
+    "2951b802eaddff7a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06201576-b6a7-402b-8f7e-a12551f16172",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 97,
+      "total_deletions": 173,
+      "accepted_lines": 86,
+      "overriden_lines": 0
+    }
+  }
+}

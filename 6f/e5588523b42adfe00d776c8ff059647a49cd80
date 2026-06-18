@@ -1,0 +1,70 @@
+tests/kafka_integration.rs
+  s_80d93bdfda1e22::t_ca3c455f8c8533 1498-1499
+src/backend/registry.rs
+  s_80d93bdfda1e22::t_8228a5d3a98292 84-89,99
+src/broker.rs
+  s_80d93bdfda1e22::t_37723dee33f9fc 67-77
+  s_80d93bdfda1e22::t_d93de2cf04fc01 94
+src/backends/inmemory/backend.rs
+  s_80d93bdfda1e22::t_fdf3e39f854c68 252-256
+  s_80d93bdfda1e22::t_5dfaa202b5ef45 105-111
+  s_80d93bdfda1e22::t_f4f7f76b9ab5f9 79-80,86
+tests/nats_integration.rs
+  s_80d93bdfda1e22::t_05acf711bab6e1 1188-1189
+src/backends/nats/backend.rs
+  s_80d93bdfda1e22::t_e7d2c99a19e9ae 232-236
+  s_80d93bdfda1e22::t_0fba46e3462144 70
+  s_80d93bdfda1e22::t_4685383024f53b 89-95
+src/backends/redis/backend.rs
+  s_80d93bdfda1e22::t_854bca9712ed5c 69
+  s_80d93bdfda1e22::t_f6bb0cd59ae054 89-95
+  s_80d93bdfda1e22::t_9dfd2e92dc6abb 149-153
+src/backend/mod.rs
+  s_80d93bdfda1e22::t_1c0fa62a878d97 286,289,293
+src/consumer_group.rs
+  s_80d93bdfda1e22::t_51be19469c149c 134-135
+  s_80d93bdfda1e22::t_d876e86b5da860 4,7,18-19,38,40-42,44-45,54
+  s_80d93bdfda1e22::t_c94c5ef2340308 165
+  s_80d93bdfda1e22::t_6bc3439aff52da 39,43,55
+  s_80d93bdfda1e22::t_19d9bdd2d76346 333-372
+  s_80d93bdfda1e22::t_45076b7f2f8e8a 20-23
+  s_80d93bdfda1e22::t_b9e46e2712bb65 155,160
+  s_80d93bdfda1e22::t_54fa3c249d0bf5 94-95
+  s_80d93bdfda1e22::t_fe59e62d8a93ab 168-177,184-189
+  s_80d93bdfda1e22::t_a9bdfb2f4074f6 306-307,330-331
+tests/redis_integration.rs
+  s_80d93bdfda1e22::t_03332844b4421b 1526-1527
+src/backend/capability.rs
+  s_80d93bdfda1e22::t_a0ae3f301b479e 5-7,27-36
+src/backends/redis/consumer_group.rs
+  s_80d93bdfda1e22::t_20829e04da0896 834
+tests/inmemory_integration.rs
+  s_80d93bdfda1e22::t_c621b8bbb27186 1619-1620
+  s_80d93bdfda1e22::t_31f66a20590890 1805-1806
+tests/rabbitmq_integration.rs
+  s_80d93bdfda1e22::t_dadaf349b98888 3129-3130
+src/backends/rabbitmq/backend.rs
+  s_80d93bdfda1e22::t_e9cf2a857603e7 319-323
+  s_80d93bdfda1e22::t_f19c8f61561381 151
+  s_80d93bdfda1e22::t_44120491e314cb 170-177
+src/backends/kafka/backend.rs
+  s_80d93bdfda1e22::t_cfb10486d6dd67 239-243
+  s_80d93bdfda1e22::t_ea1513d213794e 73
+  s_80d93bdfda1e22::t_4fccb1784b1a52 92-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6fe5588523b42adfe00d776c8ff059647a49cd80",
+  "prompts": {},
+  "sessions": {
+    "s_80d93bdfda1e22": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f3b22502-baee-4e5a-9e07-4b245fea3dd6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

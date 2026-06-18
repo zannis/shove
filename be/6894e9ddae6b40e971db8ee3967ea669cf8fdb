@@ -1,0 +1,38 @@
+README.md
+  83e8be756fe9e414 260,277-289,291-303,305-323
+examples/stress.rs
+  83e8be756fe9e414 112-150,165-169,172-188,208,374-417,457-462,464-466,471,473-474,494-496,502,508-513,515,563-564,583-584,636,640,682,684-685,698,760-761,763,766,777
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "be6894e9ddae6b40e971db8ee3967ea669cf8fdb",
+  "prompts": {
+    "83e8be756fe9e414": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1f752485-725e-4685-93c0-0cbf43dcb0d1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 201,
+      "total_deletions": 82,
+      "accepted_lines": 1360,
+      "overriden_lines": 2
+    },
+    "b8b4ec99d7b3db3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5fe4367-d9eb-49b2-b5db-826306c75f5a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 23,
+      "total_deletions": 0,
+      "accepted_lines": 23,
+      "overriden_lines": 0
+    }
+  }
+}

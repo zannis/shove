@@ -1,0 +1,23 @@
+src/autoscaler.rs
+  df153fcedd6bc2c2 196-277,281-413
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "8db5f6d944cd8298bfb97e4cbf485fcedff21ceb",
+  "prompts": {
+    "df153fcedd6bc2c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d620fbe-4b3e-4ea0-826d-3111b347d957",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 215,
+      "total_deletions": 0,
+      "accepted_lines": 215,
+      "overriden_lines": 0
+    }
+  }
+}

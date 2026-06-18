@@ -1,0 +1,21 @@
+tests/kafka_schema_registry_integration.rs
+  s_78028e7db402f2::t_135d27821f8ad0 183,186-193,195-200,202-209,211,214-215,223-317
+  s_78028e7db402f2::t_990aacf3a3244c 605-609
+  s_78028e7db402f2::t_120a66bf80beba 593-604,610-666
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "6c038ea86dc7b77800c8ae330b6f3b6df08c11d8",
+  "prompts": {},
+  "sessions": {
+    "s_78028e7db402f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5a2d892-7f72-4ef5-af98-690e967d2b90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

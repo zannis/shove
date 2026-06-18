@@ -1,0 +1,23 @@
+wrangler.toml
+  b53cb677a9d06ea2 3,6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "03ceb08cbaadb5e6f759a37b79eff702cd0c2908",
+  "prompts": {
+    "b53cb677a9d06ea2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "61846c1c-9ebf-42a3-bf3d-21da1bad5444",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,27 @@
+docs/public/shove-hero-dark.svg
+  54214397c9f7db40 1-8
+docs/public/shove-hero.svg
+  54214397c9f7db40 1-8
+docs/pages/index.mdx
+  54214397c9f7db40 8-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "eedeb00fd15e8630a3748b6dd6fcbb9efe26f5e1",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 20,
+      "total_deletions": 1,
+      "accepted_lines": 33021,
+      "overriden_lines": 51
+    }
+  }
+}

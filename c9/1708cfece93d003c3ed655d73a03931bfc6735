@@ -1,0 +1,9 @@
+src/backend/mod.rs
+  a7e66bb650d7c23d 1-44,46-88,90-269
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "c91708cfece93d003c3ed655d73a03931bfc6735",
+  "prompts": {}
+}

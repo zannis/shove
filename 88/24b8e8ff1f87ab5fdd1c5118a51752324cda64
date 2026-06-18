@@ -1,0 +1,23 @@
+src/backends/rabbitmq/consumer.rs
+  f24298483bede394 21,104,112-113,115,172,202-203,205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "8824b8e8ff1f87ab5fdd1c5118a51752324cda64",
+  "prompts": {
+    "f24298483bede394": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48b0893f-38e6-4fb6-9ed5-448c1187a826",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 10,
+      "total_deletions": 5,
+      "accepted_lines": 623,
+      "overriden_lines": 0
+    }
+  }
+}

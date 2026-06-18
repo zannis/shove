@@ -1,0 +1,39 @@
+src/backends/nats/consumer.rs
+  98039bddec9cc648 1
+src/backends/mod.rs
+  98039bddec9cc648 6-8
+src/backends/nats/consumer_group.rs
+  98039bddec9cc648 1-2
+src/lib.rs
+  98039bddec9cc648 64-71
+src/backends/nats/client.rs
+  98039bddec9cc648 1-2
+src/backends/nats/topology.rs
+  98039bddec9cc648 1
+Cargo.toml
+  98039bddec9cc648 27,45-47
+src/backends/nats/mod.rs
+  98039bddec9cc648 1-11
+src/backends/nats/publisher.rs
+  98039bddec9cc648 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "d0aad10578c529b4823b7e21b35dfa5c8dd34cff",
+  "prompts": {
+    "98039bddec9cc648": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15d3d33d-9ab0-4f69-a92d-8d6d157ea0b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 1906,
+      "total_deletions": 13,
+      "accepted_lines": 1893,
+      "overriden_lines": 0
+    }
+  }
+}

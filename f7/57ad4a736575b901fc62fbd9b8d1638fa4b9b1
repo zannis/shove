@@ -1,0 +1,19 @@
+README.md
+  s_12c83afaad42aa::t_e015acf2477483 13,15-20,24,78,82-89,91,93,97,104,108,110-113,115,119-123,127-128,132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f757ad4a736575b901fc62fbd9b8d1638fa4b9b1",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

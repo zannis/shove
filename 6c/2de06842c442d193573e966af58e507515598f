@@ -1,0 +1,23 @@
+tests/sns_sqs_integration.rs
+  df153fcedd6bc2c2 2352-2563
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "6c2de06842c442d193573e966af58e507515598f",
+  "prompts": {
+    "df153fcedd6bc2c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1d620fbe-4b3e-4ea0-826d-3111b347d957",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 212,
+      "total_deletions": 0,
+      "accepted_lines": 212,
+      "overriden_lines": 0
+    }
+  }
+}

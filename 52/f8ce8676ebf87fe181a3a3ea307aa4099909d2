@@ -1,0 +1,81 @@
+src/audit.rs
+  2735a868547238af 186,266-293,417-434
+src/backends/rabbitmq/consumer_group.rs
+  b8b4ec99d7b3db3b 33-34,106-122,166,172-177,609-645
+src/backends/rabbitmq/publisher.rs
+  2735a868547238af 321-379
+examples/audited_consumer.rs
+  b8b4ec99d7b3db3b 74-86,89
+examples/basic_pubsub.rs
+  b8b4ec99d7b3db3b 156-168,171
+Cargo.toml
+  b8b4ec99d7b3db3b 66-68
+examples/consumer_groups.rs
+  b8b4ec99d7b3db3b 61-73,76
+examples/concurrent_pubsub.rs
+  b8b4ec99d7b3db3b 1-250
+src/backends/rabbitmq/router.rs
+  2735a868547238af 133-206
+README.md
+  83e8be756fe9e414 295
+  b8b4ec99d7b3db3b 17,39,125-144,279,340
+examples/stress.rs
+  b8b4ec99d7b3db3b 43-47,115,157,192,611-612,673,685
+  2735a868547238af 10,767,779-780,794,796,812,814
+examples/sequenced_pubsub.rs
+  b8b4ec99d7b3db3b 131-143,146
+tests/rabbitmq_integration.rs
+  b8b4ec99d7b3db3b 11,177-196,307-443,1768-2100
+  83e8be756fe9e414 167-176,444-495,2101-2149
+src/backends/rabbitmq/consumer.rs
+  b8b4ec99d7b3db3b 1,12,283-440,568-583,614-629
+  2735a868547238af 727-760
+src/consumer.rs
+  b8b4ec99d7b3db3b 79-81,88-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "52f8ce8676ebf87fe181a3a3ea307aa4099909d2",
+  "prompts": {
+    "2735a868547238af": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "858a75f0-417a-45ec-8353-0c2358f22ea9",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 224,
+      "total_deletions": 16,
+      "accepted_lines": 222,
+      "overriden_lines": 0
+    },
+    "83e8be756fe9e414": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1f752485-725e-4685-93c0-0cbf43dcb0d1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 112,
+      "total_deletions": 0,
+      "accepted_lines": 1280,
+      "overriden_lines": 0
+    },
+    "b8b4ec99d7b3db3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5fe4367-d9eb-49b2-b5db-826306c75f5a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 1118,
+      "total_deletions": 38,
+      "accepted_lines": 1113,
+      "overriden_lines": 2
+    }
+  }
+}

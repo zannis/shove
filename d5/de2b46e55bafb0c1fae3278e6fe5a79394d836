@@ -1,0 +1,86 @@
+src/backends/kafka/publisher.rs
+  s_7aed588dfb2219::t_c93dc53da0bdd9 2-3
+  s_7aed588dfb2219::t_45d31af8af8660 81-137,141-142,147-155,160-200
+  s_7aed588dfb2219::t_dd90110dd07bde 249-256
+  s_7aed588dfb2219::t_47cd66417a39cf 328-331,336-337
+  s_7aed588dfb2219::t_63b57a6e93d1ea 201-204
+  s_7aed588dfb2219::t_f4e2acf7438c73 19-21
+  s_7aed588dfb2219::t_9145b05ca829d2 156-159
+  s_7aed588dfb2219::t_07e2b674f482b5 279-286
+src/schema_registry/wire.rs
+  s_7aed588dfb2219::t_a6e1991da57768 68-106
+  s_7aed588dfb2219::t_0abc3a061fbb72 222-291
+tests/kafka_schema_registry_redpanda.rs
+  s_7aed588dfb2219::t_60c8f7fd59487e 50
+  s_7aed588dfb2219::t_1ef00ceb71d9e3 565-643
+  s_7aed588dfb2219::t_f3842696afed6d 151-156
+  s_7aed588dfb2219::t_0a51b7ef57db2c 196
+src/schema_registry/client.rs
+  s_7aed588dfb2219::t_37fe1c5bdb5286 93-121
+  s_7aed588dfb2219::t_ce3703a141022f 42-43
+  s_7aed588dfb2219::t_cf56ece0ef73c4 199-206
+  s_7aed588dfb2219::t_44431efb4b8205 166-168
+  s_7aed588dfb2219::t_8de7f283d04025 186-188
+  s_7aed588dfb2219::t_185bf155f11a84 227
+  s_7aed588dfb2219::t_b62d01f6b1eb12 318
+README.md
+  s_7aed588dfb2219::t_becfaa7665d0ae 21
+src/topology.rs
+  s_7aed588dfb2219::t_7c2e136391122f 396
+  s_7aed588dfb2219::t_e83bc1c5c52001 676
+  s_7aed588dfb2219::t_2c02a1bdf57a97 190,202,206-216,218-220
+  s_7aed588dfb2219::t_8f8ae68184eea5 330-331,333-334,336-345
+  s_7aed588dfb2219::t_f09f028cfc4c30 134-140,142-145
+  s_7aed588dfb2219::t_bee87fba93b8c6 217
+  s_7aed588dfb2219::t_48dc245c82f97c 673-675,685,696,733
+  s_7aed588dfb2219::t_448f53eae93557 189,201
+  s_7aed588dfb2219::t_752f56d8430f83 114
+  s_7aed588dfb2219::t_1be26641792b3d 141
+  s_7aed588dfb2219::t_89052f12e8a221 397
+  s_7aed588dfb2219::t_9534a67f3cac64 113
+  s_7aed588dfb2219::t_cdd5fa9b76d5cf 332,335,346
+  s_7aed588dfb2219::t_3273a49fc700ae 707,715
+  s_7aed588dfb2219::t_be861cab1ffd3f 677-684,686-695,697-706,708-714,716-732
+src/backends/kafka/mod.rs
+  s_7aed588dfb2219::t_9bfe62d97375b0 22
+src/schema_registry/mod.rs
+  s_7aed588dfb2219::t_78aba154b98b96 58
+src/lib.rs
+  s_7aed588dfb2219::t_927a223603f100 300-301
+tests/nats_integration.rs
+  s_7aed588dfb2219::t_fb2284aad1b706 1535-1628
+  s_7aed588dfb2219::t_cb792ff6804733 112-122
+  s_7aed588dfb2219::t_4a84b5ead98596 211-218
+src/backends/nats/topology.rs
+  s_7aed588dfb2219::t_02a9b6bc420de6 105,113-121,127-128
+  s_7aed588dfb2219::t_e15d13601c5c3d 45-52
+docs/pages/backends/kafka/examples/schema-registry.mdx
+  s_7aed588dfb2219::t_0cbfc8079bc334 3
+  s_7aed588dfb2219::t_08ca53affff104 79-100
+tests/kafka_schema_registry.rs
+  s_7aed588dfb2219::t_b273b03707dd12 263-332
+src/broker.rs
+  s_7aed588dfb2219::t_0a2e766f0918ba 128-133,144
+  s_7aed588dfb2219::t_060ffa52e4daaa 126-127,134-142,145-147
+src/backends/nats/consumer_group.rs
+  s_7aed588dfb2219::t_54523bc32d0756 533,535-540
+docs/pages/backends/kafka.mdx
+  s_7aed588dfb2219::t_2bf9383361e773 264-289
+  s_7aed588dfb2219::t_f1160db1d939df 185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "d5de2b46e55bafb0c1fae3278e6fe5a79394d836",
+  "prompts": {},
+  "sessions": {
+    "s_7aed588dfb2219": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "68af061e-d256-44e1-899b-7dbcf29c8434",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

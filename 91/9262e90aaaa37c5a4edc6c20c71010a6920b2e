@@ -1,0 +1,22 @@
+src/backends/rabbitmq/client.rs
+  ff905a1fdecdaf0b 68-80,149-150,223,341-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "919262e90aaaa37c5a4edc6c20c71010a6920b2e",
+  "prompts": {
+    "ff905a1fdecdaf0b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "be7db84d-3162-4408-b4ab-ecc73f88bb5b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "total_additions": 88,
+      "total_deletions": 63,
+      "accepted_lines": 83,
+      "overriden_lines": 0
+    }
+  }
+}

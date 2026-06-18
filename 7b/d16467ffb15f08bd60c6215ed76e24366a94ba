@@ -1,0 +1,39 @@
+src/backend/mod.rs
+  s_78028e7db402f2::t_0cc5417b25fb85 90-92
+  s_78028e7db402f2::t_00fc62b4515a23 220
+  s_78028e7db402f2::t_c46f0f744b9a0d 217-219,221-222
+src/backend/options_inner.rs
+  s_78028e7db402f2::t_402a0d781a44e9 52-54,56-57,59-62,64
+  s_78028e7db402f2::t_500ae3a03a719a 18-19
+  s_78028e7db402f2::t_c0bb0f3a2ea4d2 98
+  s_78028e7db402f2::t_a00697202d98b2 95-97,99-100
+  s_78028e7db402f2::t_b0d491d68b5da4 55,58,63
+src/consumer.rs
+  s_78028e7db402f2::t_dbf7bb893cde76 196-199,201-203,205-208,210
+  s_78028e7db402f2::t_98e7cae30f7d06 238-240,242-243
+  s_78028e7db402f2::t_4ea85934baa98d 416-421
+  s_78028e7db402f2::t_5f13f04bdb3459 483,485,491,501
+  s_78028e7db402f2::t_721350b9e11c1b 10-11
+  s_78028e7db402f2::t_3dedc2d9d956ed 200,204,209
+  s_78028e7db402f2::t_b9cf26835b5c78 241
+  s_78028e7db402f2::t_889801869d0546 376-381
+  s_78028e7db402f2::t_df6b0b8d8e546c 481-482,484,486-490,492-500,502-507
+  s_78028e7db402f2::t_8da5ef6888f84d 509
+  s_78028e7db402f2::t_e8c40d701432c6 18-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "7bd16467ffb15f08bd60c6215ed76e24366a94ba",
+  "prompts": {},
+  "sessions": {
+    "s_78028e7db402f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5a2d892-7f72-4ef5-af98-690e967d2b90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

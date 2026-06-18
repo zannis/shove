@@ -1,0 +1,183 @@
+src/backends/inmemory/consumer.rs
+  f2872b24c39d92c2 4,82-87,111,113,115-117,119,133,135-149,153-171,181-194,257-261,267,270,284,293,326-332,404-408,414-417,421,433,605-617,665,671-672,674,677-682,684-686,689,701-711,730-732
+  ea80b5729e3ac7a1 276-280,352-353,356-374,409-413,733-736,738,742-744,756,761-769,775-780,782-784,786-789
+  ff64744fd3f7c0b3 1-3,5-81,88-110,112,114,118,120-132,134,150-152,172-180,195-256,262-266,268-269,271-275,281-283,285-292,294-325,333-351,354-355,375-403,418-420,422-432,434-604,618-664,666,737,739-741,745-747,758-760,770-773,790-828
+  a7e66bb650d7c23d 667-670,673,675-676,683,687-688,690-700,712-729,748-755,757,781,785
+examples/common/stress_test.rs
+  a7e66bb650d7c23d 251-261
+  ea80b5729e3ac7a1 1-250,262-843
+examples/inmemory/consumer_groups.rs
+  ff64744fd3f7c0b3 1-79
+src/lib.rs
+  ff64744fd3f7c0b3 96-105
+  ea80b5729e3ac7a1 90-95
+Cargo.toml
+  ea80b5729e3ac7a1 240-244
+tests/inmemory_integration.rs
+  ff64744fd3f7c0b3 1-14,17-18,21-493,1036-1081
+  f2872b24c39d92c2 15-16,19-20,495-1035
+examples/inmemory/stress.rs
+  ea80b5729e3ac7a1 1-89
+src/backends/inmemory/constants.rs
+  ff64744fd3f7c0b3 1-8
+src/backends/inmemory/topology.rs
+  ff64744fd3f7c0b3 1-107
+examples/sqs/stress.rs
+  ea80b5729e3ac7a1 1,3,5-10,13,16,21-22,35-36,40-46,91,93,116,119,127,130,136-144,146-156,158-161,164-165,169-171,178
+  a7e66bb650d7c23d 23,26,39,177
+examples/inmemory/audited_consumer.rs
+  ff64744fd3f7c0b3 1-92
+src/backends/mod.rs
+  ff64744fd3f7c0b3 12-14
+src/backends/inmemory/autoscaler.rs
+  ff64744fd3f7c0b3 1-298
+src/backends/inmemory/client.rs
+  f2872b24c39d92c2 2,63-67,79-80
+  ff64744fd3f7c0b3 1,3-62,68-78,81-282
+src/backends/inmemory/mod.rs
+  ea80b5729e3ac7a1 1-5,7-10,22
+  ff64744fd3f7c0b3 6,11-21
+src/backends/inmemory/publisher.rs
+  ff64744fd3f7c0b3 1-83,96-264
+  f2872b24c39d92c2 84-95
+examples/inmemory/basic.rs
+  ff64744fd3f7c0b3 1-83
+examples/nats/stress.rs
+  ea80b5729e3ac7a1 1,7-10,12,15-16,27-29,32-33,36-37,39,41-42,55-58,71,73,83,86,92-100,102-108,110-113,116-117,121-123,129-130
+  a7e66bb650d7c23d 21-23
+examples/rabbitmq/stress.rs
+  ea80b5729e3ac7a1 1,7-10,12,15-16,33-43,69,87,92,102,105,111-119,121-127,129-132,135-136,140-142,148-149
+  a7e66bb650d7c23d 21-23
+src/backends/inmemory/consumer_group.rs
+  f2872b24c39d92c2 86-100
+  ff64744fd3f7c0b3 1-85,101-440
+examples/inmemory/sequenced.rs
+  ff64744fd3f7c0b3 1-103
+examples/kafka/stress.rs
+  ea80b5729e3ac7a1 1,7,9-10,13-14,24-26,29-30,33-34,36,38-39,52-55,68,71,77-85,87-93,95-98,101-102,106-108,114-115
+  a7e66bb650d7c23d 18-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "28b0dd6d272b1caa6ddb6d5b4bf6475012729bf0",
+  "prompts": {
+    "06baf356a0471559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "40e90cea-6d94-441c-88d1-f58d0c35d0ce",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 31,
+      "total_deletions": 3,
+      "accepted_lines": 77,
+      "overriden_lines": 0
+    },
+    "44f052adefc049ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "367c1176-1ac5-4e9f-9e07-18ac93d0082f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    },
+    "9b877aae7a454eb9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c224ab2-d9c0-4986-971f-6a6ad2f86937",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 373,
+      "total_deletions": 42,
+      "accepted_lines": 11,
+      "overriden_lines": 0
+    },
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 97,
+      "overriden_lines": 0
+    },
+    "a5ddff18f4ae305a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98dbbc56-bcb7-4639-b01f-b79be609ec98",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 2,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    },
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 78,
+      "total_deletions": 68,
+      "accepted_lines": 77,
+      "overriden_lines": 0
+    },
+    "ea80b5729e3ac7a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91fb8f39-20e6-4a53-978a-54fb8b5c07a5",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 2190,
+      "total_deletions": 3446,
+      "accepted_lines": 1206,
+      "overriden_lines": 0
+    },
+    "f2872b24c39d92c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "beeddc9a-7804-4c0b-af35-0b068f9c0495",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 746,
+      "total_deletions": 71,
+      "accepted_lines": 710,
+      "overriden_lines": 0
+    },
+    "ff64744fd3f7c0b3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "abaa41b5-b787-4658-aa80-527554858c28",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 3588,
+      "total_deletions": 252,
+      "accepted_lines": 6604,
+      "overriden_lines": 0
+    }
+  }
+}

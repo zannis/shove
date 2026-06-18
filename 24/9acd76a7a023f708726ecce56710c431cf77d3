@@ -1,0 +1,31 @@
+docs/pages/backends/inmemory/examples/consumer-groups.mdx
+  54214397c9f7db40 3-59
+docs/pages/backends/inmemory/examples/basic.mdx
+  54214397c9f7db40 3-60
+docs/pages/backends/inmemory/examples/sequenced.mdx
+  54214397c9f7db40 3-59
+docs/pages/backends/inmemory/examples/audited.mdx
+  54214397c9f7db40 3-59
+docs/pages/backends/inmemory/examples/stress.mdx
+  54214397c9f7db40 3-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "249acd76a7a023f708726ecce56710c431cf77d3",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 260,
+      "total_deletions": 8,
+      "accepted_lines": 27870,
+      "overriden_lines": 72
+    }
+  }
+}

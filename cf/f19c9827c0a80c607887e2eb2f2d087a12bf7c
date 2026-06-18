@@ -1,0 +1,136 @@
+src/backends/inmemory/consumer.rs
+  f2872b24c39d92c2 4,83-88,112,114,116-118,120,134,136-150,154-172,182-195,258-262,268,271,281,290,323-329,388-406,410,422,594-606,654,657-703
+  ff64744fd3f7c0b3 1-3,5-82,89-111,113,115,119,121-133,135,151-153,173-181,196-257,263-267,269-270,272-280,282-289,291-322,330-387,407-409,411-421,423-593,607-653,655,704-797
+src/backends/inmemory/mod.rs
+  ff64744fd3f7c0b3 1-19
+examples/inmemory/check_seq_retry.rs
+  ff64744fd3f7c0b3 1-68
+examples/inmemory/sequenced.rs
+  ff64744fd3f7c0b3 1-103
+src/backends/inmemory/publisher.rs
+  ff64744fd3f7c0b3 1-83,96-264
+  f2872b24c39d92c2 84-95
+examples/inmemory/basic.rs
+  ff64744fd3f7c0b3 1-83
+examples/inmemory/audited_consumer.rs
+  ff64744fd3f7c0b3 1-92
+src/backends/mod.rs
+  ff64744fd3f7c0b3 12-14
+src/backends/inmemory/autoscaler.rs
+  ff64744fd3f7c0b3 1-298
+src/backends/inmemory/topology.rs
+  ff64744fd3f7c0b3 1-107
+examples/inmemory/consumer_groups.rs
+  ff64744fd3f7c0b3 1-79
+src/backends/inmemory/constants.rs
+  ff64744fd3f7c0b3 1-8
+src/lib.rs
+  ff64744fd3f7c0b3 90-99
+src/backends/inmemory/consumer_group.rs
+  f2872b24c39d92c2 86-100
+  ff64744fd3f7c0b3 1-85,101-440
+src/backends/inmemory/client.rs
+  f2872b24c39d92c2 2,63-67,79-80
+  ff64744fd3f7c0b3 1,3-62,68-78,81-282
+tests/inmemory_integration.rs
+  f2872b24c39d92c2 15-16,19-20,495-1035
+  ff64744fd3f7c0b3 1-14,17-18,21-493,1036-1081
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "cff19c9827c0a80c607887e2eb2f2d087a12bf7c",
+  "prompts": {
+    "06baf356a0471559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "40e90cea-6d94-441c-88d1-f58d0c35d0ce",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 31,
+      "total_deletions": 3,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    },
+    "44f052adefc049ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "367c1176-1ac5-4e9f-9e07-18ac93d0082f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    },
+    "9b877aae7a454eb9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c224ab2-d9c0-4986-971f-6a6ad2f86937",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 373,
+      "total_deletions": 42,
+      "accepted_lines": 11,
+      "overriden_lines": 0
+    },
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 36,
+      "overriden_lines": 0
+    },
+    "a5ddff18f4ae305a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98dbbc56-bcb7-4639-b01f-b79be609ec98",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 14,
+      "total_deletions": 2,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    },
+    "f2872b24c39d92c2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "beeddc9a-7804-4c0b-af35-0b068f9c0495",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 746,
+      "total_deletions": 71,
+      "accepted_lines": 740,
+      "overriden_lines": 0
+    },
+    "ff64744fd3f7c0b3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "abaa41b5-b787-4658-aa80-527554858c28",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 3588,
+      "total_deletions": 252,
+      "accepted_lines": 6731,
+      "overriden_lines": 0
+    }
+  }
+}

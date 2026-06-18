@@ -1,0 +1,29 @@
+docs/pages/concepts/outcomes.mdx
+  54214397c9f7db40 7,9,11,13,70,72
+docs/pages/concepts/topics.mdx
+  54214397c9f7db40 3,95,97,103-105,117
+docs/pages/concepts/handlers.mdx
+  54214397c9f7db40 3,35-37,95,124,135
+docs/pages/concepts/broker.mdx
+  54214397c9f7db40 3,5,21,24,26,28,30,32-36,68,72,92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "cfcea5d75590416d4ff62eaac6ed55976b76695b",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 35,
+      "total_deletions": 27,
+      "accepted_lines": 1555,
+      "overriden_lines": 0
+    }
+  }
+}

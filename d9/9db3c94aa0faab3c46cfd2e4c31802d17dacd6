@@ -1,0 +1,29 @@
+src/backends/kafka/publisher.rs
+  s_b28db0bfbe744d::t_930b18e33f1c47 18-20
+src/backends/kafka/constants.rs
+  s_b28db0bfbe744d::t_930b18e33f1c47 1-13,20-23,41-112
+src/backends/kafka/topology.rs
+  s_b28db0bfbe744d::t_f1e5c043c01c9d 5
+src/backends/kafka/client.rs
+  s_b28db0bfbe744d::t_930b18e33f1c47 15,429,441,456
+src/backends/kafka/consumer.rs
+  s_b28db0bfbe744d::t_15d40bb229dccc 34-36
+  s_b28db0bfbe744d::t_5d3406129a176e 297-304
+  s_b28db0bfbe744d::t_92b7b5fe7bc344 596-597,599-600,602-603
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d99db3c94aa0faab3c46cfd2e4c31802d17dacd6",
+  "prompts": {},
+  "sessions": {
+    "s_b28db0bfbe744d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "47e2965f-d03b-4dd0-87e9-910108b30dbe",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

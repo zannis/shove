@@ -1,0 +1,27 @@
+src/backends/inmemory/consumer_group.rs
+  cee101a3fc7af78f 18,151-154,192-258,362,449-458,460,462,464-471,473-478,480-483,561,632
+src/backends/inmemory/autoscaler.rs
+  cee101a3fc7af78f 221
+src/backends/inmemory/backend.rs
+  cee101a3fc7af78f 146-158,218-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "8429149d0f1457cb34acd9f4875dfec5661dcb8c",
+  "prompts": {
+    "cee101a3fc7af78f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "73191ef5-b372-44ac-bd22-e7e3b931c45a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 118,
+      "overriden_lines": 0
+    }
+  }
+}

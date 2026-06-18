@@ -1,0 +1,25 @@
+tests/sns_integration.rs
+  s_12c83afaad42aa::t_907d08d4ac1a24 1-2
+tests/sns_sqs_integration.rs
+  s_12c83afaad42aa::t_7934bc855e7a51 1-2
+tests/rabbitmq_integration.rs
+  s_12c83afaad42aa::t_ee0b18dc7fe7b8 1-2
+tests/rabbitmq_reconnect.rs
+  s_12c83afaad42aa::t_088e39bcef8dbc 1-2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0f5aefaf8100d0eca383042013b3365bc2f4197f",
+  "prompts": {},
+  "sessions": {
+    "s_12c83afaad42aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83fb21b7-5a45-494a-8291-9439f75f78c3",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

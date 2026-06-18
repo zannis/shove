@@ -1,0 +1,23 @@
+src/consumer.rs
+  0f7c5921db6d3cba 84,86-88,93-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.3",
+  "base_commit_sha": "77dfa95aacad266bf29d13e92fab212971bbb7ce",
+  "prompts": {
+    "0f7c5921db6d3cba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0aab4311-ef06-414a-87fd-bf975dbb17c8",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 136,
+      "total_deletions": 266,
+      "accepted_lines": 156,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,29 @@
+docs/pages/backends/kafka/examples/sequenced.mdx
+  54214397c9f7db40 1-59
+docs/pages/backends/kafka/examples/stress.mdx
+  54214397c9f7db40 1-82
+docs/pages/backends/kafka/examples/audited.mdx
+  54214397c9f7db40 1-71
+docs/pages/backends/kafka/examples/basic.mdx
+  54214397c9f7db40 1-57
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "09e6efe4e9ad633666ead38d6f9324f4b8d26f49",
+  "prompts": {
+    "54214397c9f7db40": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc72a983-7d81-4d97-b43f-cb1ebc6863dd",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 25010,
+      "total_deletions": 4,
+      "accepted_lines": 261,
+      "overriden_lines": 0
+    }
+  }
+}

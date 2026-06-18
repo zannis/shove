@@ -1,0 +1,22 @@
+tests/redis_integration.rs
+  s_b029cb0284d7f0::t_53199181b7f19b 1219-1306
+src/backends/redis/autoscaler.rs
+  s_b029cb0284d7f0::t_c6ee076e26a8b7 73
+  s_b029cb0284d7f0::t_f81b0f513568d9 104-107,109-110,112-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "030f28db4d6819ec6ad934193e35a555e28962c5",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

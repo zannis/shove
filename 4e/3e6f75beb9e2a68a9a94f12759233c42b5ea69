@@ -1,0 +1,25 @@
+src/schema_registry/mod.rs
+  s_78028e7db402f2::t_42069cd7479a9f 14,20
+src/schema_registry/gate.rs
+  s_78028e7db402f2::t_c0d84df91cf099 67-70,77-80,87-90
+  s_78028e7db402f2::t_00518a182808c0 1-7,9-10,12-17,19-27,29-43,45-66,71-76,81-86,91-102
+  s_78028e7db402f2::t_38642c0377c577 8,11
+  s_78028e7db402f2::t_07213c03e6dc79 44
+  s_78028e7db402f2::t_4e6f3a9803c3b6 18,28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4e3e6f75beb9e2a68a9a94f12759233c42b5ea69",
+  "prompts": {},
+  "sessions": {
+    "s_78028e7db402f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5a2d892-7f72-4ef5-af98-690e967d2b90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

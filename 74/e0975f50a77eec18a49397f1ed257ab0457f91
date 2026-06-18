@@ -1,0 +1,38 @@
+tests/sns_sqs_integration.rs
+  5d2b32b4f1e0615a 40,92-117,149
+tests/sns_integration.rs
+  5d2b32b4f1e0615a 35-60,92-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.0",
+  "base_commit_sha": "74e0975f50a77eec18a49397f1ed257ab0457f91",
+  "prompts": {
+    "5d2b32b4f1e0615a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b2a9db5f-b3d0-4b64-8b68-87de816d5a78",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 56,
+      "total_deletions": 3,
+      "accepted_lines": 56,
+      "overriden_lines": 0
+    },
+    "a7e66bb650d7c23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63fe2a1e-5a3f-4a3c-8cd5-f1b2c59cc5ca",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 22628,
+      "overriden_lines": 0
+    }
+  }
+}

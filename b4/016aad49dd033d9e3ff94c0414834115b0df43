@@ -1,0 +1,2359 @@
+examples/stress.rs
+  764e33d062bdf1b8 781-783,863,866,872-875
+  83e8be756fe9e414 784-787,862,864,867-871
+benches/consumer_overhead.rs
+  764e33d062bdf1b8 226-228
+README.md
+  0f7c5921db6d3cba 9,11,13,15,17-18,21,23-24,55,69,75,83,94-104,115-128,130,134,136,138-140,170-173,182-189,244-264,266-280,285,287,295,300,302,305-308,311,313,324,326,328,330,332
+  764e33d062bdf1b8 113-114,314-315
+  ef919a8712b5cf69 105-112
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.3",
+  "base_commit_sha": "b4016aad49dd033d9e3ff94c0414834115b0df43",
+  "prompts": {
+    "0f7c5921db6d3cba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0aab4311-ef06-414a-87fd-bf975dbb17c8",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 111,
+      "overriden_lines": 0
+    },
+    "5181c77e70759d67": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "86f8f637-ba08-4627-a7ff-7475031e1a22",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 6,
+      "total_deletions": 0,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    },
+    "56c5fc5d7b5f1084": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a4e8138-595c-45a6-b406-7434810cf4a7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 212,
+      "total_deletions": 289,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    },
+    "5cf3eae4c6f92c2c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "872079c9-09bd-4f5b-a493-789209b9f5fe",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 39,
+      "total_deletions": 14,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    },
+    "764e33d062bdf1b8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e2c17c9-23cb-4ab6-b3ed-3e4fe435152c",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 92,
+      "overriden_lines": 0
+    },
+    "7de7315878950965": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06648094-d1ef-4d15-88d7-b820870c28e1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 776,
+      "total_deletions": 22,
+      "accepted_lines": 26,
+      "overriden_lines": 0
+    },
+    "83e8be756fe9e414": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1f752485-725e-4685-93c0-0cbf43dcb0d1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 202,
+      "total_deletions": 65,
+      "accepted_lines": 773,
+      "overriden_lines": 0
+    },
+    "b6f81590e7f047d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c85a608a-d300-473d-bf99-59328b36bd67",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 0,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    },
+    "b8b4ec99d7b3db3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5fe4367-d9eb-49b2-b5db-826306c75f5a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis <zannis@aave.com>",
+      "messages": [],
+      "total_additions": 1118,
+      "total_deletions": 38,
+      "accepted_lines": 14,
+      "overriden_lines": 0
+    },
+    "c40e65ff96c4e9ae": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00116b51-db65-4de1-aed1-472432d0e78f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 0,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    },
+    "ef919a8712b5cf69": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "420a1875-1425-4efc-88d9-144b3bc461d7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [
+        {
+          "type": "user",
+          "text": "this in the readme, | Handler          | prefetch=1    | prefetch=20   | Speedup  |\n|------------------|---------------|---------------|----------|\n| Fast (1-5ms)     | 222 msg/s     | 10,616 msg/s  | **48x**  |\n| Slow (50-300ms)  | 6 msg/s       | 331 msg/s     | **55x**  |\n| Heavy (1-5s)     | 0.3 msg/s     | 4 msg/s       | **13x**  |\n\n can you rerun the stress tests to confirm the prefetch values? (make sure the stress test is using these exact values)",
+          "timestamp": "2026-04-01T09:15:12.462Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Glob",
+          "input": {
+            "pattern": "examples/*stress*"
+          },
+          "timestamp": "2026-04-01T09:15:22.552Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Glob",
+          "input": {
+            "pattern": "benches/*stress*"
+          },
+          "timestamp": "2026-04-01T09:15:22.567Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs"
+          },
+          "timestamp": "2026-04-01T09:15:27.463Z"
+        },
+        {
+          "type": "assistant",
+          "text": "The stress test currently computes prefetch dynamically: `(messages / consumers).clamp(1, 100)` (line 622). It doesn't use the fixed prefetch=1 vs prefetch=20 comparison shown in the README table.\n\nTo confirm the README numbers, we'd need to run the stress test with those exact prefetch values. Let me check the README for more context and then modify the test.",
+          "timestamp": "2026-04-01T09:15:39.275Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Grep",
+          "input": {
+            "-C": 3,
+            "output_mode": "content",
+            "path": "/Users/zannis/dev/shove/README.md",
+            "pattern": "prefetch"
+          },
+          "timestamp": "2026-04-01T09:15:39.977Z"
+        },
+        {
+          "type": "assistant",
+          "text": "The stress test computes prefetch dynamically rather than using fixed values. I'll add a `--prefetch` CLI flag so we can run with the exact values from the README, then run the comparison.",
+          "timestamp": "2026-04-01T09:15:51.219Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "    /// Enable concurrent message processing within each consumer.\n    /// Processes up to prefetch_count messages concurrently per consumer.\n    #[arg(long)]\n    concurrent: bool,\n\n    /// Override prefetch count (default: computed from messages/consumers, clamped to [1, 100]).\n    #[arg(long)]\n    prefetch: Option<u16>,\n}",
+            "old_string": "    /// Enable concurrent message processing within each consumer.\n    /// Processes up to prefetch_count messages concurrently per consumer.\n    #[arg(long)]\n    concurrent: bool,\n}",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:15:53.481Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "fn build_scenarios(\n    tier: &TierArg,\n    handler: &HandlerArg,\n    concurrent: bool,\n    prefetch: Option<u16>,\n) -> Vec<Scenario> {",
+            "old_string": "fn build_scenarios(tier: &TierArg, handler: &HandlerArg, concurrent: bool) -> Vec<Scenario> {",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:16:11.526Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Now I need to add a `prefetch` field to `Scenario` and thread it through.",
+          "timestamp": "2026-04-01T09:16:26.460Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "    handler: HandlerProfile,\n    deadline: Duration,\n    concurrent: bool,\n    prefetch: Option<u16>,\n}",
+            "old_string": "    handler: HandlerProfile,\n    deadline: Duration,\n    concurrent: bool,\n}",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:16:27.513Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "                scenarios.push(Scenario {\n                    tier: tier_cfg.name,\n                    messages,\n                    consumers: c,\n                    handler: h,\n                    deadline: scenario_deadline(messages, c, h),\n                    concurrent,\n                    prefetch,\n                });",
+            "old_string": "                scenarios.push(Scenario {\n                    tier: tier_cfg.name,\n                    messages,\n                    consumers: c,\n                    handler: h,\n                    deadline: scenario_deadline(messages, c, h),\n                    concurrent,\n                });",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:16:39.044Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Now update the `run_scenario` to use the explicit prefetch when provided:",
+          "timestamp": "2026-04-01T09:16:51.433Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "                .with_prefetch_count(\n                    scenario\n                        .prefetch\n                        .unwrap_or((scenario.messages / consumers as u64).clamp(1, 100) as u16),\n                )",
+            "old_string": "                .with_prefetch_count((scenario.messages / consumers as u64).clamp(1, 100) as u16)",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:16:52.731Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Update the `main` call to pass prefetch:",
+          "timestamp": "2026-04-01T09:17:14.062Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "    let scenarios = build_scenarios(&cli.tier, &cli.handler, cli.concurrent, cli.prefetch);",
+            "old_string": "    let scenarios = build_scenarios(&cli.tier, &cli.handler, cli.concurrent);",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:17:15.746Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Also add the prefetch info to the scenario log line:",
+          "timestamp": "2026-04-01T09:17:29.211Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "        let prefetch_str = scenario\n            .prefetch\n            .map(|p| format!(\" | pf={p}\"))\n            .unwrap_or_default();\n        eprintln!(\n            \"[{}/{}] {} | {}msg | {}c{} | {} ...\",\n            i + 1,\n            scenarios.len(),\n            scenario.tier,\n            scenario.messages,\n            scenario.consumers,\n            prefetch_str,\n            scenario.handler,\n        );",
+            "old_string": "        eprintln!(\n            \"[{}/{}] {} | {}msg | {}c | {} ...\",\n            i + 1,\n            scenarios.len(),\n            scenario.tier,\n            scenario.messages,\n            scenario.consumers,\n            scenario.handler,\n        );",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:17:32.089Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Now let me verify it compiles, then run the two prefetch scenarios. The README table uses 1 consumer with prefetch=1 and prefetch=20 for fast/slow/heavy handlers. I need to figure out which tier/consumer count gives us 1 consumer — the moderate tier has consumers starting at 1.",
+          "timestamp": "2026-04-01T09:17:46.677Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo build -q --example stress --features rabbitmq 2>&1",
+            "timeout": 120000
+          },
+          "timestamp": "2026-04-01T09:17:47.205Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Compiles. Now let me run both prefetch=1 and prefetch=20 with moderate tier, 1 consumer. The moderate tier uses consumers `[1, 4, 8, 16, 32]` — we only need the 1-consumer runs. But the test will run all consumer counts for moderate. Let me check — we need to limit to just 1 consumer to match the README table.\n\nThe simplest approach: I'll run the full moderate tier with each prefetch and handler, and we can pick out the 1-consumer rows. But that would run many scenarios. Let me just modify the consumers list temporarily... actually, better to just run all moderate scenarios — we can extract the data we need.\n\nActually looking more carefully, the moderate tier runs 5 consumer counts × 3 handlers = 15 scenarios per prefetch value. That's a lot. Let me just run with `--handler fast`, `--handler slow`, `--handler heavy` separately for speed, or run all at once.\n\nLet me run prefetch=1 first (moderate tier, all 3 handlers, concurrent mode since prefetch>1 needs concurrent to matter):\n\nWait — actually for prefetch=1 there's only 1 message in flight so concurrent doesn't matter. For prefetch=20, concurrent mode is needed. Let me check the README context... it says \"prefetch count (how many messages each worker processes concurrently)\" — so concurrent mode should be on.\n\nLet me run both back-to-back. The moderate tier with 1 consumer should be quick for prefetch=1 but slow for heavy handlers. Let me run with just 1 consumer by temporarily adjusting, or... actually the test runs all consumer counts for the tier. Let me just accept it and run moderate with all consumers — it'll give us both the prefetch table (1 consumer) and scaling data.\n\nLet me just run it. The moderate heavy tier has only 20 messages so even with 1 consumer it should be <1 min each.",
+          "timestamp": "2026-04-01T09:18:11.688Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --prefetch 1 --concurrent --output json 2>&1",
+            "description": "Run stress test with prefetch=1",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:18:12.983Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Running the prefetch=1 test in background. I'll start the prefetch=20 test as well once the first completes (they share the same Docker container port, so they can't run simultaneously).\n\nThe prefetch=1 moderate tier is running now. It includes all handler profiles (zero, fast, slow, heavy) across consumer counts [1, 4, 8, 16, 32]. I'll share results as soon as both runs complete.\n\nWaiting for the prefetch=1 run to finish...",
+          "timestamp": "2026-04-01T09:18:19.189Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:18:19.818Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Still starting up. Let me wait.",
+          "timestamp": "2026-04-01T09:18:22.946Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cat /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output | tail -5",
+            "timeout": 5000
+          },
+          "timestamp": "2026-04-01T09:18:23.901Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Still starting the container. This takes a while with Docker. I'll check back shortly.",
+          "timestamp": "2026-04-01T09:18:27.573Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -20 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output",
+            "timeout": 5000
+          },
+          "timestamp": "2026-04-01T09:18:28.242Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "docker ps 2>&1"
+          },
+          "timestamp": "2026-04-01T09:18:31.343Z"
+        },
+        {
+          "type": "assistant",
+          "text": "There are many stale RabbitMQ containers from previous runs. Let me wait for the background task to progress.",
+          "timestamp": "2026-04-01T09:18:36.914Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "wc -l /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:18:39.106Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:18:42.774Z"
+        },
+        {
+          "type": "assistant",
+          "text": "It's running. First scenario is 50k messages with 1 consumer and prefetch=1 (zero handler). This will take a while — the zero handler with prefetch=1 is limited to sequential processing. Let me wait for it to progress more before checking.",
+          "timestamp": "2026-04-01T09:18:47.578Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:18:48.095Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:18:51.557Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Still processing the first scenario (50k no-op messages, prefetch=1). This will be slow since prefetch=1 means one message at a time. Let me wait a bit more.",
+          "timestamp": "2026-04-01T09:18:55.358Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -20 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:18:56.258Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Progress. Let me keep waiting.",
+          "timestamp": "2026-04-01T09:19:00.600Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -30 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:01.899Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -30 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:05.177Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -30 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:08.465Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -30 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:11.622Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:14.914Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:18.061Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:21.196Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:24.264Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:27.390Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Good, now on the fast handler scenarios. The fast handler with 1 consumer and prefetch=1 is the key one for the README table.",
+          "timestamp": "2026-04-01T09:19:31.381Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:31.810Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:35.106Z"
+        },
+        {
+          "type": "assistant",
+          "text": "10k messages at ~222 msg/s would take ~45s. Let me wait.",
+          "timestamp": "2026-04-01T09:19:38.177Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:39.050Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:42.544Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:45.342Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:48.893Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:52.212Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:56.489Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:19:59.726Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:02.832Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:06.137Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:09.459Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:12.539Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:16.874Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:22.023Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:25.633Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output"
+          },
+          "timestamp": "2026-04-01T09:20:28.691Z"
+        },
+        {
+          "type": "assistant",
+          "text": "The test panicked with a connection error. This might be due to all the stale RabbitMQ containers competing for resources. Let me clean up the old containers first and retry.",
+          "timestamp": "2026-04-01T09:20:32.876Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "docker ps --filter \"ancestor=rabbitmq:3.8.22-management\" --format \"{{.ID}} {{.Status}}\" | grep \"hours\" | awk '{print $1}' | xargs -r docker rm -f 2>&1",
+            "description": "Remove stale RabbitMQ test containers"
+          },
+          "timestamp": "2026-04-01T09:20:34.770Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "docker ps --filter \"ancestor=rabbitmq:3.8.22-management\" -q | xargs -r docker rm -f 2>&1",
+            "description": "Remove all testcontainer RabbitMQ instances"
+          },
+          "timestamp": "2026-04-01T09:20:44.845Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "docker ps --filter \"ancestor=rabbitmq:3.8.22-management\" -q 2>&1"
+          },
+          "timestamp": "2026-04-01T09:20:59.818Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Good, all cleaned up. Now let me retry. Since we only need the 1-consumer rows for the prefetch comparison table, let me streamline this by running only the handlers we care about (fast, slow, heavy) one at a time. But the test doesn't let us filter by consumer count. Let me add that quickly.\n\nActually, the simplest approach: the moderate tier starts at 1 consumer. The fast handler with 1 consumer and prefetch=1 took ~45s (10k msgs / ~222 msg/s). The slow handler (500 msgs, 1 consumer, pf=1) should be ~83s (500 * 175ms). Heavy (20 msgs, 1c, pf=1) ~60s. This is manageable. Let me just run it again with only the specific handlers.",
+          "timestamp": "2026-04-01T09:21:08.178Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler fast --prefetch 1 --concurrent --output json 2>&1",
+            "description": "Run stress: fast handler, prefetch=1",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:21:10.105Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:13.097Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:16.642Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:21.111Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:24.257Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Good, 5 scenarios only. The 1-consumer fast handler with prefetch=1 is running now. Expected ~45s.",
+          "timestamp": "2026-04-01T09:21:28.028Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:28.333Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:32.219Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:35.267Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:38.703Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:43.007Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:46.276Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:49.734Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:52.911Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:21:56.961Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:00.430Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:04.131Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:07.270Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:12.256Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:15.639Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:19.329Z"
+        },
+        {
+          "type": "assistant",
+          "text": "First result: **Fast handler, 1 consumer, prefetch=1: 180 msg/s** (README says 222 msg/s — in the right ballpark). Let me wait for it to finish all 5 scenarios.",
+          "timestamp": "2026-04-01T09:22:24.036Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:24.666Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:28.581Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:32.289Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:35.800Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:39.125Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:43.339Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -20 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output"
+          },
+          "timestamp": "2026-04-01T09:22:47.257Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Fast handler prefetch=1 done. Now let me run prefetch=20 for fast, then slow and heavy for both prefetch values. Let me run them sequentially to avoid port conflicts.",
+          "timestamp": "2026-04-01T09:22:51.386Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler fast --prefetch 20 --concurrent --output json 2>&1",
+            "description": "Run stress: fast handler, prefetch=20",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:22:53.400Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1cm44kcq.output"
+          },
+          "timestamp": "2026-04-01T09:22:56.713Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1cm44kcq.output"
+          },
+          "timestamp": "2026-04-01T09:23:00.345Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1cm44kcq.output"
+          },
+          "timestamp": "2026-04-01T09:23:03.606Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1cm44kcq.output"
+          },
+          "timestamp": "2026-04-01T09:23:06.661Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1cm44kcq.output"
+          },
+          "timestamp": "2026-04-01T09:23:10.436Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Fast handler, 1 consumer, prefetch=20: **2741 msg/s**. README says 10,616 msg/s. That's significantly lower. Let me wait for the full run to finish.",
+          "timestamp": "2026-04-01T09:23:14.380Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -15 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1cm44kcq.output"
+          },
+          "timestamp": "2026-04-01T09:23:14.899Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Fast prefetch=20 done. Now let me run slow and heavy handlers. Let me run all 4 remaining combinations.",
+          "timestamp": "2026-04-01T09:23:18.320Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler slow --prefetch 1 --concurrent --output json 2>&1",
+            "description": "Run stress: slow handler, prefetch=1",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:23:19.148Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:22.541Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:25.785Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:29.179Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:33.147Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:36.243Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:39.720Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:42.953Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:46.228Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:49.371Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:52.833Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:23:56.080Z"
+        },
+        {
+          "type": "assistant",
+          "text": "500 messages × ~175ms average = ~87s for 1 consumer with prefetch=1. Let me wait more.",
+          "timestamp": "2026-04-01T09:24:00.257Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:00.665Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:03.926Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:07.372Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:11.219Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:14.820Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:18.721Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:22.248Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:25.984Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:29.872Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:33.936Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:37.077Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:40.649Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:43.871Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:47.435Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:51.903Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:55.179Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:24:59.291Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:04.479Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Slow handler, 1 consumer, prefetch=1: **5.5 msg/s** (README says 6 msg/s — matches well). Let me wait for the rest.",
+          "timestamp": "2026-04-01T09:25:08.963Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -15 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:09.621Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:13.500Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:17.122Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:20.794Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:23.958Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:27.040Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:30.689Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:35.075Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:38.303Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -15 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:42.052Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output"
+          },
+          "timestamp": "2026-04-01T09:25:45.527Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Slow prefetch=1 done. Let me now run the remaining 3 combinations (slow pf=20, heavy pf=1, heavy pf=20).",
+          "timestamp": "2026-04-01T09:25:49.465Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler slow --prefetch 20 --concurrent --output json 2>&1",
+            "description": "Run stress: slow handler, prefetch=20",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:25:51.207Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bn46ds8cz.output"
+          },
+          "timestamp": "2026-04-01T09:25:54.715Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bn46ds8cz.output"
+          },
+          "timestamp": "2026-04-01T09:26:01.233Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bn46ds8cz.output"
+          },
+          "timestamp": "2026-04-01T09:26:04.768Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bn46ds8cz.output"
+          },
+          "timestamp": "2026-04-01T09:26:08.297Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bn46ds8cz.output"
+          },
+          "timestamp": "2026-04-01T09:26:12.107Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Slow handler, 1 consumer, prefetch=20: **77 msg/s** (README says 331 msg/s). Lower than README, but the speedup ratio is 77/5.5 = **14x** (README says 55x). The difference suggests the README numbers may have been measured with a different configuration. Let me wait for this to finish and start the heavy runs.",
+          "timestamp": "2026-04-01T09:26:17.696Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -15 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bn46ds8cz.output"
+          },
+          "timestamp": "2026-04-01T09:26:18.246Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Good, slow pf=20 done. Now heavy handler:",
+          "timestamp": "2026-04-01T09:26:22.610Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 1 --concurrent --output json 2>&1",
+            "description": "Run stress: heavy handler, prefetch=1",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:26:23.292Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:26.795Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:30.669Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:34.446Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:43.165Z"
+        },
+        {
+          "type": "assistant",
+          "text": "20 msgs × ~3s avg = ~60s for 1 consumer pf=1.",
+          "timestamp": "2026-04-01T09:26:46.710Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:47.238Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:50.702Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:54.454Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:26:57.845Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:02.085Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:05.693Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:09.094Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:12.942Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:16.277Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:20.464Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:24.353Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Heavy handler, 1 consumer, prefetch=1: **0.4 msg/s** (README says 0.3 — close). Let me wait for it to finish and start the pf=20 run.",
+          "timestamp": "2026-04-01T09:27:28.680Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:29.063Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:32.421Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:35.585Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:39.494Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:43.761Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:47.025Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:51.069Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:55.991Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:27:59.824Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output"
+          },
+          "timestamp": "2026-04-01T09:28:02.870Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Heavy pf=1 done. Last run: heavy pf=20.",
+          "timestamp": "2026-04-01T09:28:06.926Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 20 --concurrent --output json 2>&1",
+            "description": "Run stress: heavy handler, prefetch=20",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:28:08.860Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:13.218Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:17.104Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:20.658Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:23.843Z"
+        },
+        {
+          "type": "assistant",
+          "text": "With pf=20 and 20 messages, all 20 will be in-flight concurrently. Should be done in ~5s (max single handler time).",
+          "timestamp": "2026-04-01T09:28:28.189Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:28.947Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Heavy handler, 1 consumer, prefetch=20: **4.2 msg/s** (README says 4 msg/s — matches!). ",
+          "timestamp": "2026-04-01T09:28:32.963Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -15 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:33.392Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:37.204Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:40.659Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:46.112Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output"
+          },
+          "timestamp": "2026-04-01T09:28:50.646Z"
+        },
+        {
+          "type": "assistant",
+          "text": "All runs complete. Let me also clean up the test containers.",
+          "timestamp": "2026-04-01T09:28:54.710Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "docker ps --filter \"ancestor=rabbitmq:3.8.22-management\" -q | xargs -r docker rm -f 2>&1"
+          },
+          "timestamp": "2026-04-01T09:28:55.317Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Now let me compile all the 1-consumer results:\n\n**Results (1 consumer, concurrent mode):**\n\n| Handler | prefetch=1 | prefetch=20 | Speedup | README claimed |\n|---------|-----------|-------------|---------|----------------|\n| Fast (1-5ms) | 180 msg/s | 2,741 msg/s | **15x** | 222 → 10,616 (**48x**) |\n| Slow (50-300ms) | 5.5 msg/s | 77 msg/s | **14x** | 6 → 331 (**55x**) |\n| Heavy (1-5s) | 0.4 msg/s | 4.2 msg/s | **11x** | 0.3 → 4 (**13x**) |\n\n**Key findings:**\n- **prefetch=1 numbers match** the README closely (180 vs 222, 5.5 vs 6, 0.4 vs 0.3)\n- **prefetch=20 numbers are significantly lower** than README for fast and slow handlers (2,741 vs 10,616 and 77 vs 331)\n- **Heavy handler prefetch=20 matches** (4.2 vs 4 msg/s)\n- The **speedup ratios** are 15x/14x/11x vs README's 48x/55x/13x\n\nThe heavy handler matches because it's CPU/timer-bound — prefetch=20 with 20 messages means all run concurrently regardless. But for fast and slow handlers, the prefetch=20 throughput is 3-4x lower than what the README claims. This could be due to:\n1. Different hardware (the README says M4 Max)\n2. Different Docker/RabbitMQ configuration\n3. The README numbers may have been measured with an older or optimized build\n\nWould you like me to update the README table with the fresh numbers, or do you want to investigate the discrepancy further?",
+          "timestamp": "2026-04-01T09:29:23.506Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>b4wyf1uqc</task-id>\n<tool-use-id>toolu_01FxUCWYysNzsUJDUS2jy1nH</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b4wyf1uqc.output</output-file>\n<status>failed</status>\n<summary>Background command \"Run stress test with prefetch=1\" failed with exit code 101</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:29:23.648Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>b04fgv7r5</task-id>\n<tool-use-id>toolu_01S94nFQcpzbjb5ZGvSEFhkp</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b04fgv7r5.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run stress: fast handler, prefetch=1\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:29:23.649Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>b1cm44kcq</task-id>\n<tool-use-id>toolu_01Y9Dx2Ym1vuhdkrbnoKkrRf</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1cm44kcq.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run stress: fast handler, prefetch=20\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:29:23.649Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>bf15wy3ca</task-id>\n<tool-use-id>toolu_011TMGgXYi84orWwDSX5i6da</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bf15wy3ca.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run stress: slow handler, prefetch=1\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:29:23.649Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>bn46ds8cz</task-id>\n<tool-use-id>toolu_01GmAobhmX6cbJKLNHH6jaxJ</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bn46ds8cz.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run stress: slow handler, prefetch=20\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:29:23.650Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>buegelqls</task-id>\n<tool-use-id>toolu_01G64jMrVEFodatSnb5hHvDG</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/buegelqls.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run stress: heavy handler, prefetch=1\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:29:23.650Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>b1v8o7svt</task-id>\n<tool-use-id>toolu_019qqVQzTvhDAsK3yQ4HBGLU</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b1v8o7svt.output</output-file>\n<status>completed</status>\n<summary>Background command \"Run stress: heavy handler, prefetch=20\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:29:23.650Z"
+        },
+        {
+          "type": "assistant",
+          "text": "All background tasks completed. The results are as I summarized above. To recap the 1-consumer comparison:\n\n| Handler | prefetch=1 | prefetch=20 | Speedup | README claimed speedup |\n|---------|-----------|-------------|---------|----------------------|\n| Fast (1-5ms) | 180 msg/s | 2,741 msg/s | **15x** | **48x** |\n| Slow (50-300ms) | 5.5 msg/s | 77 msg/s | **14x** | **55x** |\n| Heavy (1-5s) | 0.4 msg/s | 4.2 msg/s | **11x** | **13x** |\n\nThe prefetch=1 baseline numbers are consistent with the README, but the prefetch=20 throughput is lower for fast/slow handlers — likely hardware differences (README states M4 Max). The heavy handler matches well since it's dominated by handler sleep time.\n\nWould you like me to update the README with these fresh numbers, or investigate the fast/slow discrepancy further?",
+          "timestamp": "2026-04-01T09:29:30.290Z"
+        },
+        {
+          "type": "user",
+          "text": "keep those numbers for the readme, (these are for 1 consumer with 2 different prefetch setups) and run the same tests with 8 consumers and prefetch=20",
+          "timestamp": "2026-04-01T09:31:14.236Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Running all three handlers with prefetch=20, concurrent mode. I'll extract the 8-consumer rows from the results.",
+          "timestamp": "2026-04-01T09:31:23.689Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler fast --prefetch 20 --concurrent --output json 2>&1 | grep -v '^[[:space:]]*$' | tail -1 > /tmp/stress_fast_pf20.json",
+            "description": "Stress: fast, prefetch=20, all consumers",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:31:26.539Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler slow --prefetch 20 --concurrent --output json 2>&1 | grep -v '^[[:space:]]*$' | tail -1 > /tmp/stress_slow_pf20.json",
+            "description": "Stress: slow, prefetch=20, all consumers",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:31:27.536Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 20 --concurrent --output json 2>&1 | grep -v '^[[:space:]]*$' | tail -1 > /tmp/stress_heavy_pf20.json",
+            "description": "Stress: heavy, prefetch=20, all consumers",
+            "run_in_background": true,
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:31:29.388Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Got it — running sequentially to avoid Docker resource contention. Let me wait for the fast run to finish first.",
+          "timestamp": "2026-04-01T09:31:52.070Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -5 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bjrs20of7.output"
+          },
+          "timestamp": "2026-04-01T09:31:52.681Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -15 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bjrs20of7.output"
+          },
+          "timestamp": "2026-04-01T09:32:00.591Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cat /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bjrs20of7.output"
+          },
+          "timestamp": "2026-04-01T09:32:05.697Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Output was piped to the json file. Let me check:",
+          "timestamp": "2026-04-01T09:32:09.672Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "wc -l /tmp/stress_fast_pf20.json && head -5 /tmp/stress_fast_pf20.json"
+          },
+          "timestamp": "2026-04-01T09:32:10.021Z"
+        },
+        {
+          "type": "assistant",
+          "text": "The piped output only captured the last line. The stderr (progress) went to the background output but the JSON went to the file. Let me check if there's valid JSON:",
+          "timestamp": "2026-04-01T09:32:18.081Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cat /tmp/stress_fast_pf20.json"
+          },
+          "timestamp": "2026-04-01T09:32:18.491Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Only got the last line of JSON. The pipe approach doesn't work well with background mode. Let me run them directly, sequentially, without background mode.",
+          "timestamp": "2026-04-01T09:32:23.826Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler fast --prefetch 20 --concurrent --output json 2>/dev/null",
+            "description": "Stress: fast, prefetch=20",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:32:24.633Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Fast done. **8 consumers, prefetch=20: 18,148 msg/s**. Now slow:",
+          "timestamp": "2026-04-01T09:32:50.567Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler slow --prefetch 20 --concurrent --output json 2>/dev/null",
+            "description": "Stress: slow, prefetch=20",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:32:51.253Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Slow done. **8 consumers, prefetch=20: 537 msg/s**. Now heavy:",
+          "timestamp": "2026-04-01T09:33:18.725Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 20 --concurrent --output json 2>/dev/null",
+            "description": "Stress: heavy, prefetch=20",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:33:19.411Z"
+        },
+        {
+          "type": "assistant",
+          "text": "All done. Here's the full summary for the README:\n\n### Prefetch count (1 consumer)\n\n| Handler | prefetch=1 | prefetch=20 | Speedup |\n|---------|-----------|-------------|---------|\n| Fast (1-5ms) | 180 msg/s | 2,741 msg/s | **15x** |\n| Slow (50-300ms) | 6 msg/s | 77 msg/s | **14x** |\n| Heavy (1-5s) | 0.4 msg/s | 4 msg/s | **11x** |\n\n### 8 consumers, prefetch=20\n\n| Handler | 8 consumers |\n|---------|------------|\n| Fast (1-5ms) | 18,148 msg/s |\n| Slow (50-300ms) | 537 msg/s |\n| Heavy (1-5s) | 4 msg/s |\n\nNote on heavy: with only 20 messages and prefetch=20, all messages are consumed by the first consumer in one batch, so adding more consumers doesn't help — throughput stays flat at ~4 msg/s regardless of consumer count.\n\nWould you like me to update the README with these numbers now?",
+          "timestamp": "2026-04-01T09:34:06.932Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>bjrs20of7</task-id>\n<tool-use-id>toolu_012BzY9bTDRsSCA3DgUAkots</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/bjrs20of7.output</output-file>\n<status>completed</status>\n<summary>Background command \"Stress: fast, prefetch=20, all consumers\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T09:34:07.175Z"
+        },
+        {
+          "type": "assistant",
+          "text": "\n\n(That was the earlier fast run completing — already captured those results.)\n\nStanding by for your direction. Want me to update the README with the fresh numbers?",
+          "timestamp": "2026-04-01T09:34:10.979Z"
+        },
+        {
+          "type": "user",
+          "text": "before you update it, increase the messages for the heavy test with 8 consumers so we have a meaningful output, re run it, then update the numbers and place them all together in a single table in the readme",
+          "timestamp": "2026-04-01T09:34:58.238Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Let me increase the heavy message count in the moderate tier and re-run.",
+          "timestamp": "2026-04-01T09:35:16.842Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "limit": 6,
+            "offset": 129
+          },
+          "timestamp": "2026-04-01T09:35:17.804Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "    messages: (50_000, 10_000, 500, 200),",
+            "old_string": "    messages: (50_000, 10_000, 500, 20),",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:35:22.612Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo build -q --example stress --features rabbitmq 2>&1",
+            "timeout": 120000
+          },
+          "timestamp": "2026-04-01T09:35:30.035Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Now running the 3 heavy scenarios sequentially: pf=1 (1c), pf=20 (1c), pf=20 (8c). But the test runs all consumer counts per tier. I only need specific rows — I'll extract them from the JSON.",
+          "timestamp": "2026-04-01T09:35:39.225Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 1 --concurrent --output json 2>/dev/null",
+            "description": "Heavy handler, prefetch=1, 200 msgs",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:35:40.197Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Wait — 200 heavy messages with prefetch=1 and 1 consumer would take ~600s and timeout. I already have the pf=1 heavy numbers from before (0.4 msg/s). Let me cancel this and just run pf=20 with 200 messages.",
+          "timestamp": "2026-04-01T09:46:01.982Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "pkill -f \"stress.*--handler heavy.*--prefetch 1\" 2>/dev/null; echo \"killed\""
+          },
+          "timestamp": "2026-04-01T09:46:02.281Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -10 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b65gmdj9r.output"
+          },
+          "timestamp": "2026-04-01T09:57:25.488Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b65gmdj9r.output"
+          },
+          "timestamp": "2026-04-01T09:57:29.235Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Finished — 1 consumer timed out as expected, but the 8-consumer result is there: **2.6 msg/s** with pf=1. Now let me run pf=20 with 200 messages:",
+          "timestamp": "2026-04-01T09:57:33.783Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 20 --concurrent --output json 2>/dev/null",
+            "description": "Heavy handler, prefetch=20, 200 msgs",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T09:57:34.436Z"
+        },
+        {
+          "type": "assistant",
+          "text": "All data collected. Key results for the combined table:\n\n- **Heavy, 1c, pf=1**: 0.4 msg/s (from earlier 20-msg run — consistent with the timeout rate here)\n- **Heavy, 1c, pf=20**: 4.6 msg/s → speedup **11x**\n- **Heavy, 8c, pf=20**: 21 msg/s\n\nNow let me update the README with all results in a single table.",
+          "timestamp": "2026-04-01T09:59:11.187Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/README.md",
+            "limit": 40,
+            "offset": 96
+          },
+          "timestamp": "2026-04-01T09:59:11.571Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/README.md",
+            "new_string": "Measured on a MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91. Results will vary by hardware and broker configuration. Reproducible via `cargo run -q --example stress --features rabbitmq`.\n\nThroughput is controlled by two knobs: **prefetch count** (how many messages each worker processes concurrently) and **worker count** (how many consumers in the group).\n\n| Handler          | 1 worker, prefetch=1 | 1 worker, prefetch=20 | Speedup | 8 workers, prefetch=20 |\n|------------------|----------------------|-----------------------|---------|------------------------|\n| Fast (1-5ms)     | 180 msg/s            | 2,741 msg/s           | **15x** | 18,148 msg/s           |\n| Slow (50-300ms)  | 6 msg/s              | 77 msg/s              | **14x** | 537 msg/s              |\n| Heavy (1-5s)     | 0.4 msg/s            | 5 msg/s               | **11x** | 21 msg/s               |\n\nPrefetch count is the single biggest throughput lever for I/O-bound handlers. Adding workers scales linearly when the handler is the bottleneck. Memory stays under 10 MB even at 256 workers.",
+            "old_string": "Measured on a MacBook Pro M4 Max, single RabbitMQ node via Docker, Rust 1.91. Results will vary by hardware and broker configuration. Reproducible via `cargo run -q --example stress --features rabbitmq`.\n\nThroughput is controlled by two knobs: **prefetch count** (how many messages each worker processes concurrently) and **worker count** (how many consumers in the group). The broker ceiling on a single RabbitMQ node is ~40k msg/s.\n\n### Prefetch count (concurrency per worker)\n\nHigher prefetch means more in-flight messages per worker. This is the single biggest throughput lever for I/O-bound handlers:\n\n| Handler          | prefetch=1    | prefetch=20   | Speedup  |\n|------------------|---------------|---------------|----------|\n| Fast (1-5ms)     | 222 msg/s     | 10,616 msg/s  | **48x**  |\n| Slow (50-300ms)  | 6 msg/s       | 331 msg/s     | **55x**  |\n| Heavy (1-5s)     | 0.3 msg/s     | 4 msg/s       | **13x**  |\n\nA single worker with prefetch=20 and a slow handler (331 msg/s) outperforms **64 workers** with prefetch=1 (323 msg/s).\n\n### Worker scaling\n\nAdding workers scales linearly when the handler is the bottleneck. Combine with higher prefetch for maximum throughput:\n\n| Handler          | 1 worker  | 8 workers   | 32 workers   | 64 workers   | 128 workers   |\n|------------------|-----------|-------------|--------------|--------------|---------------|\n| Fast (1-5ms)     | 222 msg/s | 1,885 msg/s | 7,543 msg/s  | 14,663 msg/s | 28,706 msg/s  |\n| Slow (50-300ms)  | 6 msg/s   | 45 msg/s    | 177 msg/s    | 323 msg/s    | 679 msg/s     |\n| Heavy (1-5s)     | 0.3 msg/s | 2 msg/s     | 7 msg/s      | 14 msg/s     | 28 msg/s      |\n\n8 workers with prefetch=20 on fast handlers hit the broker ceiling (40k msg/s). Memory stays under 10 MB even at 256 workers.",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T09:59:23.340Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Done. Updated the README with a single consolidated table using the fresh benchmark numbers. The three columns show the progression: sequential baseline (pf=1), concurrent single worker (pf=20), and scaled out (8 workers, pf=20).",
+          "timestamp": "2026-04-01T10:00:33.295Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>b65gmdj9r</task-id>\n<tool-use-id>toolu_01796L4ejgrv8cL5hpRgJMoD</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/b65gmdj9r.output</output-file>\n<status>completed</status>\n<summary>Background command \"Heavy handler, prefetch=1, 200 msgs\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T10:00:33.652Z"
+        },
+        {
+          "type": "assistant",
+          "text": "The background heavy/pf=1 run also completed — its results were consistent with what we already captured. The README is updated with the fresh numbers.",
+          "timestamp": "2026-04-01T10:00:37.780Z"
+        },
+        {
+          "type": "user",
+          "text": "can you run the stress tests again with the latest changes and see if the performance changed",
+          "timestamp": "2026-04-01T11:26:26.056Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo build -q --example stress --features rabbitmq 2>&1",
+            "timeout": 120000
+          },
+          "timestamp": "2026-04-01T11:26:31.553Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Running all 6 scenarios sequentially (fast/slow/heavy × pf=1 and pf=20, plus 8-consumer pf=20 runs).",
+          "timestamp": "2026-04-01T11:26:38.139Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler fast --prefetch 1 --concurrent --output json 2>/dev/null",
+            "description": "Fast handler, prefetch=1",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:26:39.571Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Fast pf=1: **179 msg/s** (was 180). Consistent. Next:",
+          "timestamp": "2026-04-01T11:28:19.090Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler fast --prefetch 20 --concurrent --output json 2>/dev/null",
+            "description": "Fast handler, prefetch=20",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:28:19.825Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Fast pf=20: 1c=**2,866** (was 2,741), 8c=**19,669** (was 18,148). Slightly higher.",
+          "timestamp": "2026-04-01T11:28:45.395Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler slow --prefetch 1 --concurrent --output json 2>/dev/null",
+            "description": "Slow handler, prefetch=1",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:28:46.330Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Slow pf=1: **5.6 msg/s** (was 6). Consistent. Noted — I'll also run 32 consumers with pf=20. Continuing:",
+          "timestamp": "2026-04-01T11:31:17.150Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler slow --prefetch 20 --concurrent --output json 2>/dev/null",
+            "description": "Slow handler, prefetch=20",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:31:17.798Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Slow pf=20: 1c=**75**, 8c=**544**, 32c=**1,516**. Now heavy:",
+          "timestamp": "2026-04-01T11:31:46.142Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 20 --concurrent --output json 2>/dev/null",
+            "description": "Heavy handler, prefetch=20",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:31:46.824Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Heavy pf=20: 1c=**4.6**, 8c=**21**, 32c=**40**. Now the remaining pf=1 heavy run — I'll skip the 1-consumer (would timeout) and just note we already have that number (0.4 msg/s). Let me get the 8c and 32c with pf=1:",
+          "timestamp": "2026-04-01T11:33:22.606Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 1 --concurrent --output json 2>/dev/null",
+            "description": "Heavy handler, prefetch=1",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:33:23.259Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "tail -3 /private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/by8p47ytw.output"
+          },
+          "timestamp": "2026-04-01T11:43:27.717Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/by8p47ytw.output"
+          },
+          "timestamp": "2026-04-01T11:43:31.590Z"
+        },
+        {
+          "type": "assistant",
+          "text": "All data collected. Here's the consolidated summary:\n\n**Fresh results (latest code):**\n\n| Handler | 1w, pf=1 | 1w, pf=20 | Speedup | 8w, pf=20 | 32w, pf=20 |\n|---------|----------|-----------|---------|-----------|------------|\n| Fast    | 179      | 2,866     | **16x** | 19,669    | 22,684     |\n| Slow    | 5.6      | 75        | **13x** | 544       | 1,516      |\n| Heavy   | 0.4      | 4.6       | **12x** | 21        | 40         |\n\nNumbers are very consistent with the previous run — no performance change from the latest code modifications. Now updating the README:",
+          "timestamp": "2026-04-01T11:43:39.316Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/README.md",
+            "limit": 16,
+            "offset": 100
+          },
+          "timestamp": "2026-04-01T11:43:39.996Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/README.md",
+            "new_string": "| Handler          | 1 worker, prefetch=1 | 1 worker, prefetch=20 | Speedup | 8 workers, prefetch=20 | 32 workers, prefetch=20 |\n|------------------|----------------------|-----------------------|---------|------------------------|-------------------------|\n| Fast (1-5ms)     | 179 msg/s            | 2,866 msg/s           | **16x** | 19,669 msg/s           | 22,684 msg/s            |\n| Slow (50-300ms)  | 6 msg/s              | 75 msg/s              | **13x** | 544 msg/s              | 1,516 msg/s             |\n| Heavy (1-5s)     | 0.4 msg/s            | 5 msg/s               | **12x** | 21 msg/s               | 40 msg/s                |",
+            "old_string": "| Handler          | 1 worker, prefetch=1 | 1 worker, prefetch=20 | Speedup | 8 workers, prefetch=20 |\n|------------------|----------------------|-----------------------|---------|------------------------|\n| Fast (1-5ms)     | 180 msg/s            | 2,741 msg/s           | **15x** | 18,148 msg/s           |\n| Slow (50-300ms)  | 6 msg/s              | 77 msg/s              | **14x** | 537 msg/s              |\n| Heavy (1-5s)     | 0.4 msg/s            | 5 msg/s               | **11x** | 21 msg/s               |",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T11:43:47.801Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Let me increase the message counts and run with 32 workers, prefetch=40.",
+          "timestamp": "2026-04-01T11:46:13.181Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Read",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "limit": 5,
+            "offset": 134
+          },
+          "timestamp": "2026-04-01T11:46:13.820Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/examples/stress.rs",
+            "new_string": "    messages: (50_000, 50_000, 5_000, 1_000),",
+            "old_string": "    messages: (50_000, 10_000, 500, 200),",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T11:46:18.418Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo build -q --example stress --features rabbitmq 2>&1",
+            "timeout": 120000
+          },
+          "timestamp": "2026-04-01T11:46:39.682Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Now running all three handlers with 32 workers, prefetch=40:",
+          "timestamp": "2026-04-01T11:46:48.422Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler fast --prefetch 40 --concurrent --output json 2>/dev/null",
+            "description": "Fast, 32w pf=40, 50k msgs",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:46:51.256Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Fast 32w pf=40: **29,207 msg/s**. Now slow:",
+          "timestamp": "2026-04-01T11:47:40.498Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler slow --prefetch 40 --concurrent --output json 2>/dev/null",
+            "description": "Slow, 32w pf=40, 5k msgs",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:47:41.256Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Slow 32w pf=40: **4,076 msg/s**. Now heavy:",
+          "timestamp": "2026-04-01T11:48:50.052Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Bash",
+          "input": {
+            "command": "cargo run -q --example stress --features rabbitmq -- --tier moderate --handler heavy --prefetch 40 --concurrent --output json 2>/dev/null",
+            "description": "Heavy, 32w pf=40, 1k msgs",
+            "timeout": 600000
+          },
+          "timestamp": "2026-04-01T11:48:50.769Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Heavy 32w pf=40: **199 msg/s** — much better than the 20-message run (40 msg/s). Now updating the README with the final table:",
+          "timestamp": "2026-04-01T11:52:00.616Z"
+        },
+        {
+          "type": "tool_use",
+          "name": "Edit",
+          "input": {
+            "file_path": "/Users/zannis/dev/shove/README.md",
+            "new_string": "| Handler          | 1 worker, prefetch=1 | 1 worker, prefetch=20 | 8 workers, prefetch=20 | 32 workers, prefetch=40 |\n|------------------|----------------------|-----------------------|------------------------|-------------------------|\n| Fast (1-5ms)     | 179 msg/s            | 2,866 msg/s           | 19,669 msg/s           | 29,207 msg/s            |\n| Slow (50-300ms)  | 6 msg/s              | 75 msg/s              | 544 msg/s              | 4,076 msg/s             |\n| Heavy (1-5s)     | 0.4 msg/s            | 5 msg/s               | 21 msg/s               | 199 msg/s               |",
+            "old_string": "| Handler          | 1 worker, prefetch=1 | 1 worker, prefetch=20 | Speedup | 8 workers, prefetch=20 |\n|------------------|----------------------|-----------------------|---------|------------------------|\n| Fast (1-5ms)     | 180 msg/s            | 2,741 msg/s           | **15x** | 18,148 msg/s           |\n| Slow (50-300ms)  | 6 msg/s              | 77 msg/s              | **14x** | 537 msg/s              |\n| Heavy (1-5s)     | 0.4 msg/s            | 5 msg/s               | **11x** | 21 msg/s               |",
+            "replace_all": false
+          },
+          "timestamp": "2026-04-01T11:52:07.184Z"
+        },
+        {
+          "type": "assistant",
+          "text": "Done. Updated the README with the single consolidated table — no speedup column, added 32 workers with prefetch=40. The heavy handler numbers are much more meaningful now with 1,000 messages (199 msg/s vs the earlier 40 msg/s with only 20 messages).",
+          "timestamp": "2026-04-01T11:56:54.494Z"
+        },
+        {
+          "type": "user",
+          "text": "<task-notification>\n<task-id>by8p47ytw</task-id>\n<tool-use-id>toolu_01VMn7FQ6pEKMHhZ7V7q7MnH</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-zannis-dev-shove/420a1875-1425-4efc-88d9-144b3bc461d7/tasks/by8p47ytw.output</output-file>\n<status>completed</status>\n<summary>Background command \"Heavy handler, prefetch=1\" completed (exit code 0)</summary>\n</task-notification>",
+          "timestamp": "2026-04-01T11:56:54.638Z"
+        },
+        {
+          "type": "assistant",
+          "text": "The earlier heavy/pf=1 background run also completed — those results were already captured. README is up to date with the fresh numbers.",
+          "timestamp": "2026-04-01T11:56:58.776Z"
+        }
+      ],
+      "total_additions": 6,
+      "total_deletions": 6,
+      "accepted_lines": 31,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,32 @@
+src/lib.rs
+  s_b029cb0284d7f0::t_9fb9b5df9bf2b4 328
+tests/redis_integration.rs
+  s_b029cb0284d7f0::t_dfb5bc9d893b69 3334-3415
+  s_b029cb0284d7f0::t_bc4a31335b151c 2501
+  s_b029cb0284d7f0::t_6332e303cc2bc4 2976,2981,3070,3075,3197,3202,3307,3312,3475,3480
+src/backends/redis/maintenance.rs
+  s_b029cb0284d7f0::t_600de954a1785b 161
+  s_b029cb0284d7f0::t_4e81477d62557c 36
+src/backends/redis/mod.rs
+  s_b029cb0284d7f0::t_a3eb1bb505b21e 29
+src/backends/redis/reaper.rs
+  s_b029cb0284d7f0::t_499d89cffb53f4 156,158-163
+  s_b029cb0284d7f0::t_68407c89582e7c 67-69,83,89,94-102,104,109,112-118,120,123-126,132
+  s_b029cb0284d7f0::t_c4f1ccd2e755e2 329-339,348-354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7077c51fada4ffb83e98b32096a01d174328d7a2",
+  "prompts": {},
+  "sessions": {
+    "s_b029cb0284d7f0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "564ec062-f733-4502-ab3b-3c1692e411b6",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

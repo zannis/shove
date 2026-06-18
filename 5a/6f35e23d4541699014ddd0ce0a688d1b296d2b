@@ -1,0 +1,72 @@
+src/backends/rabbitmq/mod.rs
+  bda21613c20607db 11-26
+src/backends/nats/consumer_group.rs
+  bda21613c20607db 316
+src/backends/kafka/client.rs
+  bda21613c20607db 55,106,167,182
+src/backends/kafka/consumer.rs
+  bda21613c20607db 8,425-446,459,483-485,566,583,610-612,747,761-763,857-859,872-874
+src/error.rs
+  bda21613c20607db 17-25
+src/backends/kafka/autoscaler.rs
+  bda21613c20607db 54,67,114,182,214,270
+src/backends/sns/stats.rs
+  bda21613c20607db 41-44
+src/backends/rabbitmq/consumer.rs
+  bda21613c20607db 33,60,72,83-86,108-110
+src/backends/kafka/consumer_group.rs
+  bda21613c20607db 306
+src/backends/rabbitmq/publisher.rs
+  bda21613c20607db 16,157,159,222,230,395,434,436
+src/backends/nats/consumer.rs
+  bda21613c20607db 10,315-329,351-353,438,584,747-751
+src/backends/nats/autoscaler.rs
+  bda21613c20607db 46,53,133,225
+src/backends/rabbitmq/client.rs
+  bda21613c20607db 10,74,127,145,150,177,182
+src/backends/sns/consumer.rs
+  bda21613c20607db 1-2,24-59,154-156,497,927-930,1276
+src/backends/rabbitmq/management.rs
+  bda21613c20607db 101,116
+src/backends/rabbitmq/autoscaler.rs
+  bda21613c20607db 6,80-83,116-119
+src/backends/sns/autoscaler.rs
+  bda21613c20607db 78,169
+Cargo.toml
+  bda21613c20607db 3
+src/autoscaler.rs
+  bda21613c20607db 303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "5a6f35e23d4541699014ddd0ce0a688d1b296d2b",
+  "prompts": {
+    "a54986d0f8c3a872": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "999c6e43-155f-4b28-857d-91aa8fba4d9e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 1520,
+      "overriden_lines": 0
+    },
+    "bda21613c20607db": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c382560-f7c7-4f14-bbca-370e6f256a6f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "zannis",
+      "messages": [],
+      "total_additions": 443,
+      "total_deletions": 123,
+      "accepted_lines": 407,
+      "overriden_lines": 0
+    }
+  }
+}
