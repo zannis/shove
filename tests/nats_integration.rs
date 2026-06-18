@@ -151,6 +151,35 @@ shove::define_topic!(
         .dlq()
         .build()
 );
+// Two topics over the SAME stream name with different (mutable) bounds, to prove
+// re-declaring reconciles an existing stream rather than silently ignoring the
+// new config. Same retention so the JetStream UPDATE is permitted.
+shove::define_topic!(
+    ReconcileUnboundedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-reconcile")
+        .nats_stream_config(NatsStreamConfig {
+            retention: NatsRetention::Limits,
+            max_age: None,
+            max_bytes: None,
+            max_messages: None,
+            num_replicas: 1,
+        })
+        .build()
+);
+shove::define_topic!(
+    ReconcileBoundedTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-reconcile")
+        .nats_stream_config(NatsStreamConfig {
+            retention: NatsRetention::Limits,
+            max_age: None,
+            max_bytes: Some(2_000_000),
+            max_messages: None,
+            num_replicas: 1,
+        })
+        .build()
+);
 
 shove::define_sequenced_topic!(
     SeqSkipTopic,
@@ -584,6 +613,50 @@ async fn topology_external_fails_fast_when_stream_absent() {
     assert!(
         result.is_err(),
         "external mode must fail fast when the stream is not provisioned"
+    );
+
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_managed_config_reconciles_existing_stream() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    // First declare creates the stream unbounded.
+    broker
+        .topology()
+        .declare::<ReconcileUnboundedTopic>()
+        .await
+        .unwrap();
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-reconcile")
+        .await
+        .expect("stream created on first declare");
+    assert_eq!(
+        stream.info().await.unwrap().config.max_bytes,
+        -1,
+        "stream starts unbounded"
+    );
+
+    // Re-declaring the same stream with a max_bytes bound must RECONCILE it, not
+    // silently leave the old config in place (the P2 fix: create_or_update_stream).
+    broker
+        .topology()
+        .declare::<ReconcileBoundedTopic>()
+        .await
+        .unwrap();
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-reconcile")
+        .await
+        .expect("stream still exists");
+    assert_eq!(
+        stream.info().await.unwrap().config.max_bytes,
+        2_000_000,
+        "re-declare with a changed config must update the existing stream"
     );
 
     broker.close().await;

@@ -21,9 +21,19 @@ impl NatsTopologyDeclarer {
         Self { client }
     }
 
-    /// Create (or upsert) a shove-managed stream. `config` is the caller's
+    /// Create or **reconcile** a shove-managed stream. `config` is the caller's
     /// explicit [`NatsStreamConfig`] (retention/bounds/replicas); `None` keeps
     /// shove's historical defaults (WorkQueue / unbounded / single-replica).
+    ///
+    /// Uses `create_or_update_stream` rather than `get_or_create_stream` so that
+    /// a config change actually takes effect on an already-existing stream:
+    /// `get_or_create` returns the existing stream verbatim and would silently
+    /// ignore the supplied config. Mutable changes (`max_age`/`max_bytes`/
+    /// `max_messages`/`num_replicas`) are applied; immutable ones (`retention`,
+    /// `storage`) make the JetStream UPDATE fail loud rather than no-op silently —
+    /// the operator must recreate the stream (or use
+    /// [`nats_external_stream`](crate::TopologyBuilder::nats_external_stream) to
+    /// let infra own it).
     async fn create_stream(
         &self,
         name: &str,
@@ -38,7 +48,7 @@ impl NatsTopologyDeclarer {
         };
         self.client
             .jetstream()
-            .get_or_create_stream(StreamConfig {
+            .create_or_update_stream(StreamConfig {
                 name: name.to_string(),
                 subjects,
                 retention,
@@ -54,7 +64,11 @@ impl NatsTopologyDeclarer {
                 ..Default::default()
             })
             .await
-            .map_err(|e| ShoveError::Topology(e.to_string()))?;
+            .map_err(|e| {
+                ShoveError::Topology(format!(
+                    "create_or_update_stream({name}) failed (retention/storage are immutable on an existing stream): {e}"
+                ))
+            })?;
 
         Ok(())
     }
