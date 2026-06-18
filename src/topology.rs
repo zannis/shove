@@ -1,4 +1,61 @@
 use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// NATS stream config
+// ---------------------------------------------------------------------------
+
+/// JetStream retention policy for a shove-managed stream. Mirrors
+/// `async_nats::jetstream::stream::RetentionPolicy` without coupling shove's
+/// public API to the async-nats version. NATS-specific.
+#[cfg(feature = "nats")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatsRetention {
+    /// Messages are removed once acknowledged by a consumer. Implies a single
+    /// logical consumer over a given subject. shove's historical default.
+    WorkQueue,
+    /// Messages are retained until a limit (age/bytes/count) is hit, regardless
+    /// of acknowledgement. Allows multiple consumers and replay within the window.
+    Limits,
+    /// Messages are retained while any consumer has interest.
+    Interest,
+}
+
+/// Explicit JetStream stream configuration for a shove-*managed* stream, set via
+/// [`TopologyBuilder::nats_stream_config`]. Lets shove create a stream with the
+/// retention, size/age bounds, and replication that the defaults don't express
+/// (the defaults are WorkQueue / unbounded / single-replica). NATS-specific.
+///
+/// Use this when shove should own the stream but you need it bounded (so a stalled
+/// consumer can't grow the file store without limit) or replicated (R3). Use
+/// [`TopologyBuilder::nats_external_stream`] instead when infra owns the stream.
+#[cfg(feature = "nats")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatsStreamConfig {
+    /// Retention policy. Default [`NatsRetention::WorkQueue`].
+    pub retention: NatsRetention,
+    /// Maximum age of a message before it is discarded. `None` ⇒ unlimited.
+    pub max_age: Option<Duration>,
+    /// Maximum total stream size in bytes. `None` ⇒ unlimited.
+    pub max_bytes: Option<i64>,
+    /// Maximum number of messages retained. `None` ⇒ unlimited.
+    pub max_messages: Option<i64>,
+    /// Replica count (e.g. 3 for prod durability). Default 1.
+    pub num_replicas: usize,
+}
+
+#[cfg(feature = "nats")]
+impl Default for NatsStreamConfig {
+    fn default() -> Self {
+        Self {
+            retention: NatsRetention::WorkQueue,
+            max_age: None,
+            max_bytes: None,
+            max_messages: None,
+            num_replicas: 1,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HoldQueue
 // ---------------------------------------------------------------------------
@@ -112,6 +169,14 @@ pub struct QueueTopology {
     pub(crate) sequencing: Option<SequenceConfig>,
     #[cfg(feature = "nats")]
     pub(crate) nats_stream_subjects: Option<Vec<String>>,
+    /// When true, shove binds to an externally-provisioned stream instead of
+    /// creating it (see [`TopologyBuilder::nats_external_stream`]).
+    #[cfg(feature = "nats")]
+    pub(crate) nats_external_stream: bool,
+    /// Explicit config for a shove-managed stream (see
+    /// [`TopologyBuilder::nats_stream_config`]); `None` keeps the defaults.
+    #[cfg(feature = "nats")]
+    pub(crate) nats_stream_config: Option<NatsStreamConfig>,
 }
 
 impl QueueTopology {
@@ -141,6 +206,22 @@ impl QueueTopology {
     #[cfg(feature = "nats")]
     pub fn nats_stream_subjects(&self) -> Option<&[String]> {
         self.nats_stream_subjects.as_deref()
+    }
+
+    /// Whether shove binds to an externally-provisioned JetStream stream rather
+    /// than creating it. When true, `declare()` verifies the stream exists and
+    /// fails fast if it doesn't (no silent fallback). NATS-specific.
+    #[cfg(feature = "nats")]
+    pub fn nats_external_stream(&self) -> bool {
+        self.nats_external_stream
+    }
+
+    /// Explicit config for a shove-managed stream, if set via
+    /// [`TopologyBuilder::nats_stream_config`]. `None` keeps shove's defaults
+    /// (WorkQueue / unbounded / single-replica). NATS-specific.
+    #[cfg(feature = "nats")]
+    pub fn nats_stream_config(&self) -> Option<&NatsStreamConfig> {
+        self.nats_stream_config.as_ref()
     }
 
     pub fn shard_hold_queue_names(&self, shard_index: u16) -> Vec<HoldQueue> {
@@ -188,6 +269,10 @@ pub struct TopologyBuilder {
     allow_message_loss: bool,
     #[cfg(feature = "nats")]
     nats_stream_subjects: Option<Vec<String>>,
+    #[cfg(feature = "nats")]
+    nats_external_stream: bool,
+    #[cfg(feature = "nats")]
+    nats_stream_config: Option<NatsStreamConfig>,
 }
 
 impl TopologyBuilder {
@@ -200,6 +285,10 @@ impl TopologyBuilder {
             allow_message_loss: false,
             #[cfg(feature = "nats")]
             nats_stream_subjects: None,
+            #[cfg(feature = "nats")]
+            nats_external_stream: false,
+            #[cfg(feature = "nats")]
+            nats_stream_config: None,
         }
     }
 
@@ -217,6 +306,40 @@ impl TopologyBuilder {
     #[cfg(feature = "nats")]
     pub fn nats_subjects(mut self, subjects: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.nats_stream_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Bind to an externally-provisioned JetStream stream instead of creating it.
+    ///
+    /// `declare()` will verify the stream (named after the queue) already exists
+    /// and **fail fast** if it doesn't — it never falls back to creating one. Use
+    /// this when infra owns the stream config (retention bounds, replication)
+    /// that shove can't express; shove then only manages the durable consumer and
+    /// its own DLQ/hold queues.
+    ///
+    /// NATS-specific. Mutually exclusive with [`nats_subjects`](Self::nats_subjects)
+    /// and [`nats_stream_config`](Self::nats_stream_config) (both configure stream
+    /// *creation*, which external mode skips) and with [`sequenced`](Self::sequenced);
+    /// `build()` panics if combined.
+    #[cfg(feature = "nats")]
+    pub fn nats_external_stream(mut self) -> Self {
+        self.nats_external_stream = true;
+        self
+    }
+
+    /// Create the shove-managed stream with explicit config (retention, size/age
+    /// bounds, replicas) instead of the defaults (WorkQueue / unbounded / R1).
+    ///
+    /// Use this when shove should own the stream but you need it bounded (so a
+    /// stalled consumer can't grow the file store without limit) or replicated.
+    /// For an infra-owned stream use [`nats_external_stream`](Self::nats_external_stream)
+    /// instead.
+    ///
+    /// NATS-specific. Mutually exclusive with
+    /// [`nats_external_stream`](Self::nats_external_stream); `build()` panics if both are set.
+    #[cfg(feature = "nats")]
+    pub fn nats_stream_config(mut self, config: NatsStreamConfig) -> Self {
+        self.nats_stream_config = Some(config);
         self
     }
 
@@ -343,6 +466,20 @@ impl TopologyBuilder {
                     "nats_subjects() subjects must be non-empty"
                 );
             }
+            // External mode skips stream creation, so it can't be combined with
+            // options that configure how the stream is created.
+            assert!(
+                !(self.nats_external_stream && self.nats_stream_config.is_some()),
+                "nats_external_stream() cannot be combined with nats_stream_config() — an external stream's config is owned by whoever provisions it"
+            );
+            assert!(
+                !(self.nats_external_stream && self.nats_stream_subjects.is_some()),
+                "nats_external_stream() cannot be combined with nats_subjects() — an external stream's subjects are owned by whoever provisions it"
+            );
+            assert!(
+                !(self.nats_external_stream && self.sequencing.is_some()),
+                "nats_external_stream() cannot be combined with sequenced() — sequencing requires shove to own the stream/subject space"
+            );
         }
         if let Some(ref seq) = self.sequencing {
             assert!(
@@ -395,6 +532,10 @@ impl TopologyBuilder {
             sequencing: self.sequencing,
             #[cfg(feature = "nats")]
             nats_stream_subjects: self.nats_stream_subjects,
+            #[cfg(feature = "nats")]
+            nats_external_stream: self.nats_external_stream,
+            #[cfg(feature = "nats")]
+            nats_stream_config: self.nats_stream_config,
         }
     }
 }
@@ -728,6 +869,87 @@ mod tests {
                 .hold_queue(Duration::from_secs(5))
                 .dlq()
                 .nats_subjects(["a.b.>"])
+                .build();
+        }
+    }
+
+    // -- NATS stream management (external bind / managed-with-config) --
+
+    #[cfg(feature = "nats")]
+    mod nats_stream_management {
+        use super::*;
+
+        #[test]
+        fn builder_defaults_are_managed_unbounded() {
+            let topology = TopologyBuilder::new("orders").build();
+            assert!(!topology.nats_external_stream());
+            assert!(topology.nats_stream_config().is_none());
+        }
+
+        #[test]
+        fn builder_external_stream_sets_flag() {
+            let topology = TopologyBuilder::new("CLOB_PRICE_CHANGES")
+                .nats_external_stream()
+                .build();
+            assert!(topology.nats_external_stream());
+            assert!(topology.nats_stream_config().is_none());
+        }
+
+        #[test]
+        fn builder_stream_config_is_stored() {
+            let cfg = NatsStreamConfig {
+                retention: NatsRetention::Limits,
+                max_age: Some(Duration::from_secs(600)),
+                max_bytes: Some(1_000_000),
+                max_messages: None,
+                num_replicas: 3,
+            };
+            let topology = TopologyBuilder::new("orders")
+                .nats_stream_config(cfg.clone())
+                .build();
+            assert_eq!(topology.nats_stream_config(), Some(&cfg));
+            assert!(!topology.nats_external_stream());
+        }
+
+        #[test]
+        fn stream_config_default_matches_historical_behavior() {
+            let cfg = NatsStreamConfig::default();
+            assert_eq!(cfg.retention, NatsRetention::WorkQueue);
+            assert_eq!(cfg.num_replicas, 1);
+            assert!(cfg.max_age.is_none());
+            assert!(cfg.max_bytes.is_none());
+            assert!(cfg.max_messages.is_none());
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "nats_external_stream() cannot be combined with nats_stream_config()"
+        )]
+        fn external_with_stream_config_panics() {
+            let _ = TopologyBuilder::new("q")
+                .nats_external_stream()
+                .nats_stream_config(NatsStreamConfig::default())
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "nats_external_stream() cannot be combined with nats_subjects()")]
+        fn external_with_subjects_panics() {
+            let _ = TopologyBuilder::new("q")
+                .nats_external_stream()
+                .nats_subjects(["a.b.>"])
+                .build();
+        }
+
+        #[test]
+        #[should_panic(expected = "nats_external_stream() cannot be combined with sequenced()")]
+        fn external_with_sequenced_panics() {
+            let _ = TopologyBuilder::new("q")
+                .sequenced(SequenceFailure::Skip)
+                .routing_shards(4)
+                .hold_queue(Duration::from_secs(5))
+                .dlq()
+                .nats_external_stream()
                 .build();
         }
     }

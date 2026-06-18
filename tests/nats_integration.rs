@@ -8,6 +8,7 @@
 #![cfg(feature = "nats")]
 
 use async_nats::header::NATS_MESSAGE_ID;
+use async_nats::jetstream::stream::{Config as JsStreamConfig, RetentionPolicy};
 use serde::{Deserialize, Serialize};
 use shove::SequencedTopic as _;
 use shove::broker::Broker;
@@ -19,6 +20,7 @@ use shove::metadata::{DeadMessageMetadata, MessageMetadata};
 use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
 use shove::outcome::Outcome;
 use shove::topology::{SequenceFailure, TopologyBuilder};
+use shove::{NatsRetention, NatsStreamConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -124,6 +126,30 @@ shove::define_topic!(
     DeferNoHoldTopic,
     SimpleMessage,
     TopologyBuilder::new("nats-defer-nohold").dlq().build()
+);
+shove::define_topic!(
+    ManagedConfigTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-managed-cfg")
+        .nats_stream_config(NatsStreamConfig {
+            retention: NatsRetention::Limits,
+            max_age: Some(Duration::from_secs(600)),
+            max_bytes: Some(1_000_000),
+            max_messages: None,
+            // 1 replica: the single-node test container can't satisfy R3 (the
+            // num_replicas mapping is covered by the topology unit test).
+            num_replicas: 1,
+        })
+        .dlq()
+        .build()
+);
+shove::define_topic!(
+    ExternalTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-external")
+        .nats_external_stream()
+        .dlq()
+        .build()
 );
 
 shove::define_sequenced_topic!(
@@ -455,6 +481,109 @@ async fn topology_idempotent() {
     assert!(
         stream.is_ok(),
         "stream should still exist after double declare"
+    );
+
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_managed_with_config_applies_retention_and_bounds() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<ManagedConfigTopic>()
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-managed-cfg")
+        .await
+        .expect("managed stream should exist");
+    let info = stream.info().await.expect("should get stream info");
+    assert_eq!(
+        info.config.retention,
+        RetentionPolicy::Limits,
+        "explicit retention policy should be applied"
+    );
+    assert_eq!(
+        info.config.max_age,
+        Duration::from_secs(600),
+        "explicit max_age should be applied"
+    );
+    assert_eq!(
+        info.config.max_bytes, 1_000_000,
+        "explicit max_bytes should be applied"
+    );
+
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_external_binds_to_preprovisioned_stream() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    // Simulate infra provisioning the stream with its own config (Limits +
+    // max_age) BEFORE the consumer starts.
+    client
+        .jetstream()
+        .create_stream(JsStreamConfig {
+            name: "nats-external".to_string(),
+            subjects: vec!["nats-external".to_string()],
+            retention: RetentionPolicy::Limits,
+            max_age: Duration::from_secs(300),
+            ..Default::default()
+        })
+        .await
+        .expect("infra pre-provisions the stream");
+
+    // External mode binds to it without recreating.
+    broker.topology().declare::<ExternalTopic>().await.unwrap();
+
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-external")
+        .await
+        .expect("external stream should still exist");
+    let info = stream.info().await.expect("should get stream info");
+    assert_eq!(
+        info.config.retention,
+        RetentionPolicy::Limits,
+        "shove must bind to the infra stream, not recreate it as WorkQueue"
+    );
+    assert_eq!(
+        info.config.max_age,
+        Duration::from_secs(300),
+        "infra-provisioned config must be left untouched"
+    );
+
+    // shove still owns its own DLQ stream in external mode.
+    assert!(
+        client
+            .jetstream()
+            .get_stream("nats-external-dlq")
+            .await
+            .is_ok(),
+        "shove should create its own DLQ even when the source stream is external"
+    );
+
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_external_fails_fast_when_stream_absent() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    // No stream provisioned → external declare must error, not silently create one.
+    let result = broker.topology().declare::<ExternalTopic>().await;
+    assert!(
+        result.is_err(),
+        "external mode must fail fast when the stream is not provisioned"
     );
 
     broker.close().await;

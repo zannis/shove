@@ -200,6 +200,8 @@ pub use outcome::Outcome;
 use std::time::Duration;
 pub use topic::{SequencedTopic, Topic};
 pub use topology::{HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder};
+#[cfg(feature = "nats")]
+pub use topology::{NatsRetention, NatsStreamConfig};
 
 pub use autoscaler::{
     Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics,
