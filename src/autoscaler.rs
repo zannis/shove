@@ -276,6 +276,13 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
                 }
             };
 
+            metrics::record_autoscaler_backlog(
+                &group.to_string(),
+                metrics.messages_ready,
+                metrics.messages_in_flight,
+                metrics.active_consumers,
+            );
+
             let group_str = group.to_string();
             let decision = self.strategy.evaluate(&group_str, &metrics);
 
@@ -718,5 +725,26 @@ mod tests {
         assert_eq!(s.evaluate("g", &test_metrics()), ScalingDecision::Hold);
         assert!(s.state["g"].scale_down_since.is_none());
         assert!(s.state["g"].scale_up_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn poll_records_backlog_for_each_group_without_panic() {
+        let mut metrics = HashMap::new();
+        metrics.insert("group-a".into(), ScalingMetrics::new(100, 5, 1, 10));
+        let scale_log = Arc::new(Mutex::new(vec![]));
+        let backend = MockBackend {
+            groups: vec!["group-a".into()],
+            metrics,
+            scale_log: scale_log.clone(),
+        };
+        let strategy = Stabilized::new(
+            ThresholdStrategy::default(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(60));
+        // Must not panic when the metrics feature is off or on.
+        autoscaler.poll_and_scale().await;
+        assert_eq!(scale_log.lock().await.len(), 1);
     }
 }
