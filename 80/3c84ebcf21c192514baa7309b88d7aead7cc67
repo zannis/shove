@@ -1,0 +1,22 @@
+tests/kafka_integration.rs
+  s_81848fc1a25b55::t_c3038c8cca184e 2582-2586
+  s_81848fc1a25b55::t_02dcb1abe6d91e 2495
+src/backends/kafka/consumer_group.rs
+  s_81848fc1a25b55::t_ec51fd3f4268ff 556-561
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "803c84ebcf21c192514baa7309b88d7aead7cc67",
+  "prompts": {},
+  "sessions": {
+    "s_81848fc1a25b55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8dcf6712-b42d-4682-949b-9c7595f579da",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
