@@ -1,0 +1,35 @@
+src/backends/nats/consumer_group.rs
+  s_81848fc1a25b55::t_c4ba40767ddb1e 16
+  s_81848fc1a25b55::t_aacdcc40aa2e0c 378
+src/backends/rabbitmq/consumer_group.rs
+  s_81848fc1a25b55::t_15670bbaf8720a 493
+  s_81848fc1a25b55::t_81b2e588ceb689 17
+.superpowers/sdd/f1-fix-report.md
+  s_81848fc1a25b55::t_82018e7183f431 1-110
+src/backends/kafka/consumer_group.rs
+  s_81848fc1a25b55::t_e3daf2d4b9f09e 562
+  s_81848fc1a25b55::t_6deb9148d54dcd 16
+src/backends/inmemory/consumer_group.rs
+  s_81848fc1a25b55::t_62ffdd3e447113 851-918
+  s_81848fc1a25b55::t_c42893ecce9a01 16
+  s_81848fc1a25b55::t_119d0a8fc75df3 381
+src/backends/redis/consumer_group.rs
+  s_81848fc1a25b55::t_6234cb0aa5aa0d 23
+  s_81848fc1a25b55::t_c95f756626f8b5 477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "1b79a2a511a56c6fc91beb7daced123772c6c60c",
+  "prompts": {},
+  "sessions": {
+    "s_81848fc1a25b55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8dcf6712-b42d-4682-949b-9c7595f579da",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
