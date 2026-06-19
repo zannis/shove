@@ -1,0 +1,19 @@
+examples/redis/autoscaler.rs
+  s_81848fc1a25b55::t_70b295df5c3a0c 3-9,19,21-22,58-65,82,85-89,91,97-98,103,105,114-120,122-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "e4b782d4460f909082607c5e49fa4d5134c9a502",
+  "prompts": {},
+  "sessions": {
+    "s_81848fc1a25b55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8dcf6712-b42d-4682-949b-9c7595f579da",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
