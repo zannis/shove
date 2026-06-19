@@ -1,0 +1,30 @@
+src/backends/inmemory/autoscaler.rs
+  s_81848fc1a25b55::t_fed2b7a0a78a8f 222
+src/backends/inmemory/consumer_group.rs
+  s_81848fc1a25b55::t_a9d9d6b2791117 403-413
+  s_81848fc1a25b55::t_b8f46f4b07e28a 889-909
+  s_81848fc1a25b55::t_223f6b9bf92b5d 338-342
+  s_81848fc1a25b55::t_db86e4b67b98ac 271
+  s_81848fc1a25b55::t_c4e2b87403d52f 322,324
+  s_81848fc1a25b55::t_708751f76b02c0 744
+  s_81848fc1a25b55::t_e205bc0d65bed4 816
+  s_81848fc1a25b55::t_73dd2fb3a1c067 158-161
+  s_81848fc1a25b55::t_88912e24240332 425-427,442-447
+  s_81848fc1a25b55::t_b28e9b55bf97a5 200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "efe501f19789752876e9bd14267e56176a2c9536",
+  "prompts": {},
+  "sessions": {
+    "s_81848fc1a25b55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8dcf6712-b42d-4682-949b-9c7595f579da",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
