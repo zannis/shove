@@ -8,7 +8,15 @@
 //! `kafka` feature at the parent (`crate::backends`); no per-file cfg
 //! is needed here.
 
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
 use crate::autoscale_metrics::AutoscaleMetrics;
+use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
     RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
@@ -18,9 +26,6 @@ use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::markers::Kafka;
 use crate::topic::{SequencedTopic, Topic};
-use std::future::Future;
-use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 use super::autoscaler::{KafkaAutoscalerBackend, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 use super::client::{KafkaClient, KafkaConfig};
@@ -90,6 +95,15 @@ impl HasCoordinatedGroups for Kafka {
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl {
         KafkaConsumerGroupRegistry::new(client.clone())
+    }
+
+    fn spawn_autoscaler(
+        _client: &Self::Client,
+        _registry: Arc<Mutex<Self::RegistryImpl>>,
+        _config: AutoscalerConfig,
+        _shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        todo!("implemented in task-8")
     }
 }
 
@@ -229,6 +243,33 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
 
     fn set_default_handler_timeout(&mut self, timeout: std::time::Duration) {
         self.default_handler_timeout = Some(timeout);
+    }
+
+    fn start_all(&mut self) {
+        KafkaConsumerGroupRegistry::start_all(self);
+    }
+
+    async fn drain_until_timeout(mut self, drain_timeout: Duration) -> SupervisorOutcome {
+        let mut tally = ShutdownTally::default();
+        match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
+            Ok(()) => SupervisorOutcome {
+                errors: tally.errors,
+                panics: tally.panics,
+                timed_out: false,
+            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving consumer tasks"
+                );
+                self.abort_all_remaining_into(&mut tally).await;
+                SupervisorOutcome {
+                    errors: tally.errors,
+                    panics: tally.panics,
+                    timed_out: true,
+                }
+            }
+        }
     }
 
     async fn run_until_timeout<S>(mut self, signal: S, drain_timeout: Duration) -> SupervisorOutcome

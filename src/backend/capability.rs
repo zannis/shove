@@ -2,6 +2,12 @@
 //! `consumer_group()` to backends with a real broker-level group
 //! primitive.
 
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{Backend, RegistryImpl};
 
 /// Capability: this backend has a broker-level coordinated-group primitive
@@ -21,4 +27,15 @@ pub trait HasCoordinatedGroups: Backend {
     type RegistryImpl: RegistryImpl<GroupConfig = Self::ConsumerGroupConfig> + Send + 'static;
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl;
+
+    /// Spawn the autoscaler loop against this group's own registry, bound to
+    /// `shutdown`. The autoscaler uses `Stabilized<ThresholdStrategy>` derived
+    /// from `config`. Infallible: backends whose stats client may fail (e.g.
+    /// RabbitMQ management) defer that error to the first metrics poll.
+    fn spawn_autoscaler(
+        client: &Self::Client,
+        registry: Arc<Mutex<Self::RegistryImpl>>,
+        config: AutoscalerConfig,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()>;
 }

@@ -8,7 +8,12 @@
 //! `inmemory` feature at the parent (`crate::backends`); no per-file cfg
 //! is needed here.
 
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
+
 use crate::autoscale_metrics::AutoscaleMetrics;
+use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
     RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
@@ -76,8 +81,6 @@ impl Backend for InMemory {
         // `Broker::consumer_group()` are not visible to this autoscaler;
         // wire them via `InMemoryAutoscalerBackend::new` with the shared
         // registry if cross-visibility is required.
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
         let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
             client.clone(),
         )));
@@ -103,6 +106,17 @@ impl HasCoordinatedGroups for InMemory {
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl {
         InMemoryConsumerGroupRegistry::new(client.clone())
+    }
+
+    fn spawn_autoscaler(
+        client: &Self::Client,
+        registry: Arc<Mutex<Self::RegistryImpl>>,
+        config: AutoscalerConfig,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut autoscaler =
+            InMemoryAutoscalerBackend::autoscaler(client.clone(), registry, config);
+        tokio::spawn(async move { autoscaler.run(shutdown).await })
     }
 }
 
@@ -399,5 +413,31 @@ mod tests {
         RegistryImpl::start_all(&mut registry);
         let outcome = RegistryImpl::drain_until_timeout(registry, Duration::from_millis(100)).await;
         assert!(outcome.is_clean(), "unexpected: {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn spawn_autoscaler_runs_and_stops_on_cancel() {
+        use crate::autoscaler::AutoscalerConfig;
+        use crate::backend::capability::HasCoordinatedGroups;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        let broker = InMemoryBroker::new();
+        let registry = Arc::new(Mutex::new(InMemoryConsumerGroupRegistry::new(
+            broker.clone(),
+        )));
+        let token = CancellationToken::new();
+        let handle = <InMemory as HasCoordinatedGroups>::spawn_autoscaler(
+            &broker,
+            registry,
+            AutoscalerConfig::default(),
+            token.clone(),
+        );
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("autoscaler must stop promptly after cancel")
+            .expect("autoscaler task should not panic");
     }
 }
