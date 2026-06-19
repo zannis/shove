@@ -225,6 +225,15 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
             .unwrap_or_else(|_| unreachable!("autoscaler joined; registry Arc must be sole-owned"))
             .into_inner();
 
+        // Broadcast shutdown to every registered group at once before draining,
+        // matching the non-autoscaling lifecycle: the non-autoscaling path calls
+        // broker_token.cancel() up-front so all group tokens are cancelled
+        // concurrently before any sequential per-group drain begins.
+        // Without this, drain_all_into cancels groups one at a time as it
+        // iterates, so groups 2..N keep consuming until the sequential drain
+        // reaches them.
+        consumer_token.cancel();
+
         let mut outcome = inner.drain_until_timeout(drain_timeout).await;
         outcome.panics += autoscaler_panics;
         outcome
@@ -239,6 +248,7 @@ mod tests {
 
     use crate::autoscaler::AutoscalerConfig;
     use crate::define_sequenced_topic;
+    use crate::define_topic;
     use crate::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
     use crate::topic::SequencedTopic;
     use crate::topology::{SequenceFailure, TopologyBuilder};
@@ -369,6 +379,100 @@ mod tests {
         let _ = broker
             .consumer_group()
             .with_default_handler_timeout(Duration::ZERO);
+    }
+
+    // Two unsequenced topics used by the two-group autoscaling shutdown test.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct AlphaEvent {
+        id: u32,
+    }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BetaEvent {
+        id: u32,
+    }
+
+    define_topic!(
+        AlphaTopic,
+        AlphaEvent,
+        TopologyBuilder::new("alpha-autoscale-test").build()
+    );
+    define_topic!(
+        BetaTopic,
+        BetaEvent,
+        TopologyBuilder::new("beta-autoscale-test").build()
+    );
+
+    struct AlphaHandler;
+    impl MessageHandler<AlphaTopic> for AlphaHandler {
+        type Context = ();
+        async fn handle(&self, _: AlphaEvent, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    struct BetaHandler;
+    impl MessageHandler<BetaTopic> for BetaHandler {
+        type Context = ();
+        async fn handle(&self, _: BetaEvent, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    /// Regression test for the autoscaling broadcast-cancel fix.
+    ///
+    /// Two groups are registered, autoscaling is enabled, and an immediate
+    /// shutdown signal is sent. With the fix, `consumer_token.cancel()` is
+    /// called before `drain_until_timeout`, broadcasting shutdown to BOTH
+    /// group tokens at once. Without the fix, groups are cancelled sequentially
+    /// inside `drain_all_into`, which means group 2's token is not cancelled
+    /// until after group 1 fully drains.
+    ///
+    /// This test verifies a clean outcome (exit_code 0, not timed out) within
+    /// a drain_timeout that is sufficient for concurrent cancellation but would
+    /// be tight for sequential cancellation if consumers were doing slow work.
+    /// With an empty queue the consumers are idle, so the timing difference is
+    /// not observable here; what the test guarantees is that the two-group
+    /// autoscaling shutdown path completes correctly and reports a clean outcome.
+    #[tokio::test]
+    async fn autoscaling_two_groups_broadcast_cancel_before_drain() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+
+        let mut group = broker.consumer_group();
+        group
+            .register::<AlphaTopic, _>(
+                ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=2)),
+                || AlphaHandler,
+            )
+            .await
+            .expect("register AlphaTopic");
+        group
+            .register::<BetaTopic, _>(
+                ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::new(1..=2)),
+                || BetaHandler,
+            )
+            .await
+            .expect("register BetaTopic");
+
+        // Immediate signal: shutdown fires before any polling cycle.
+        let outcome = group
+            .enable_autoscaling(AutoscalerConfig {
+                poll_interval: Duration::from_millis(50),
+                ..AutoscalerConfig::default()
+            })
+            .run_until_timeout(std::future::ready(()), Duration::from_millis(500))
+            .await;
+
+        assert_eq!(
+            outcome.exit_code(),
+            0,
+            "two-group autoscaling shutdown must be clean: {outcome:?}"
+        );
+        assert!(
+            !outcome.timed_out,
+            "drain must not time out with broadcast cancel: {outcome:?}"
+        );
     }
 
     #[tokio::test]
