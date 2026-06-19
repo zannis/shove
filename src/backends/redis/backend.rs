@@ -182,10 +182,22 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
         }
     }
 
-    async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
+    async fn run_until_timeout<S>(mut self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        RedisConsumerGroupRegistry::run_until_timeout(self, signal, drain_timeout).await
+        self.start_all();
+
+        let shutdown = self.broker_shutdown_token();
+        let signal_handle = tokio::spawn(signal);
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            res = signal_handle => {
+                let _ = res;
+                shutdown.cancel();
+            }
+        }
+
+        self.drain_until_timeout(drain_timeout).await
     }
 }
