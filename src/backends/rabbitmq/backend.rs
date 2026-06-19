@@ -175,12 +175,27 @@ impl HasCoordinatedGroups for RabbitMq {
     }
 
     fn spawn_autoscaler(
-        _client: &Self::Client,
-        _registry: Arc<Mutex<Self::RegistryImpl>>,
-        _config: AutoscalerConfig,
-        _shutdown: CancellationToken,
+        client: &Self::Client,
+        registry: Arc<Mutex<Self::RegistryImpl>>,
+        config: AutoscalerConfig,
+        shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        todo!("implemented in task-6")
+        use crate::autoscaler::{Autoscaler, Stabilized, ThresholdStrategy};
+        // Mirror make_autoscaler (backend.rs:151): build the stats bridge
+        // infallibly. A missing or broken management client defers its error to
+        // the first metrics poll — no panic at construction time.
+        let stats = RabbitMqStatsBridge::from_config(client.management_config());
+        let backend = RabbitMqAutoscalerBackend::with_stats_provider(stats, registry);
+        let strategy = Stabilized::new(
+            ThresholdStrategy {
+                scale_up_multiplier: config.scale_up_multiplier,
+                scale_down_multiplier: config.scale_down_multiplier,
+            },
+            config.hysteresis_duration,
+            config.cooldown_duration,
+        );
+        let mut autoscaler = Autoscaler::new(backend, strategy, config.poll_interval);
+        tokio::spawn(async move { autoscaler.run(shutdown).await })
     }
 }
 

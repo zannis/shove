@@ -185,6 +185,10 @@ pub struct RabbitMqConsumerGroup {
     /// AMQP connection pool shared across all consumers in this group.
     /// Sized at construction time from `ceil(max_consumers / 50)`.
     pool: Arc<Vec<RabbitMqClient>>,
+    /// Handles of consumers removed by `scale_down`. Their tokens are already
+    /// cancelled; retained here so the final drain awaits/aborts and tallies
+    /// them instead of detaching the task.
+    pub(crate) retiring: Vec<JoinHandle<()>>,
 }
 
 impl RabbitMqConsumerGroup {
@@ -269,6 +273,7 @@ impl RabbitMqConsumerGroup {
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
             pool,
+            retiring: Vec::new(),
         })
     }
 
@@ -355,6 +360,7 @@ impl RabbitMqConsumerGroup {
             error_count,
             panic_count,
             pool,
+            retiring: Vec::new(),
         })
     }
 
@@ -410,8 +416,9 @@ impl RabbitMqConsumerGroup {
             return false;
         };
 
-        let (token, _, _handle) = self.consumers.swap_remove(index);
+        let (token, _, handle) = self.consumers.swap_remove(index);
         token.cancel();
+        self.retiring.push(handle);
 
         info!(
             group = %self.name,
@@ -424,6 +431,11 @@ impl RabbitMqConsumerGroup {
     /// Number of currently active (spawned) consumers.
     pub fn active_consumers(&self) -> usize {
         self.consumers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retiring_is_empty(&self) -> bool {
+        self.retiring.is_empty()
     }
 
     /// The queue name this group reads from.
@@ -500,6 +512,17 @@ impl RabbitMqConsumerGroup {
             }
         }
 
+        while let Some(handle) = self.retiring.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.name, "retired consumer task panicked");
+                    tally.panics += 1;
+                }
+            }
+        }
+
         tally.errors += self.error_count.swap(0, Ordering::Relaxed);
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
     }
@@ -516,6 +539,9 @@ impl RabbitMqConsumerGroup {
         for (_token, _processing, handle) in &self.consumers {
             handle.abort();
         }
+        for handle in &self.retiring {
+            handle.abort();
+        }
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
                 Ok(()) => {}
@@ -526,6 +552,16 @@ impl RabbitMqConsumerGroup {
                         group = %self.name,
                         "consumer task panicked during abort escalation"
                     );
+                    tally.panics += 1;
+                }
+            }
+        }
+        while let Some(handle) = self.retiring.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.name, "retired consumer task panicked");
                     tally.panics += 1;
                 }
             }
@@ -578,6 +614,7 @@ mod tests {
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
             pool: Arc::new(Vec::new()),
+            retiring: Vec::new(),
         }
     }
 
@@ -762,6 +799,29 @@ mod tests {
             assert!(doomed_token.is_cancelled());
             group.shutdown().await;
         });
+    }
+
+    #[tokio::test]
+    async fn scale_down_handle_is_drained_not_detached() {
+        // A scaled-down consumer that hangs must still be aborted and counted,
+        // not silently detached. Use a hanging spawner so the retiring handle
+        // would leak under the old drop-the-handle behaviour.
+        let mut group = hanging_test_group(RabbitMqConsumerGroupConfig::new(1..=3));
+        group.start();
+        group.scale_up();
+        group.scale_up();
+        assert_eq!(group.active_consumers(), 3);
+        // Force scale_down of an idle (hanging-but-not-processing) consumer.
+        assert!(group.scale_down());
+        assert_eq!(group.active_consumers(), 2);
+
+        let mut tally = ShutdownTally::default();
+        let _ = tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+        group.abort_remaining_into(&mut tally).await;
+        // All handles, including the retired one, are now resolved.
+        assert_eq!(group.active_consumers(), 0);
+        assert!(group.retiring_is_empty());
+        assert_eq!(tally.panics, 0);
     }
 
     // -- shutdown --
