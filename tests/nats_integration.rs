@@ -2625,3 +2625,106 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
 
     broker.close().await;
 }
+
+// ===========================================================================
+// Autoscaling
+// ===========================================================================
+
+shove::define_topic!(
+    AutoscalingTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-autoscaling").build()
+);
+
+/// Autoscaling lifecycle: slow handlers + burst → `enable_autoscaling` →
+/// clean drain. Mirrors `autoscaling_scales_up_and_drains_clean` from
+/// `kafka_integration.rs` but exercises the NATS backend's `spawn_autoscaler`
+/// and `NatsConsumerGroup::retiring` drain path.
+#[tokio::test]
+async fn autoscaling_scales_up_and_drains_clean() {
+    use shove::AutoscalerConfig;
+    use std::sync::atomic::AtomicUsize;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<AutoscalingTopic>()
+        .await
+        .unwrap();
+
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    let mut group = broker.consumer_group();
+    {
+        let processed = processed.clone();
+        group
+            .register::<AutoscalingTopic, _>(
+                ConsumerGroupConfig::new(
+                    NatsConsumerGroupConfig::new(1..=4).with_prefetch_count(1),
+                ),
+                move || {
+                    #[derive(Clone)]
+                    struct SlowHandler(Arc<AtomicUsize>);
+                    impl MessageHandler<AutoscalingTopic> for SlowHandler {
+                        type Context = ();
+                        async fn handle(
+                            &self,
+                            _: SimpleMessage,
+                            _: MessageMetadata,
+                            _: &(),
+                        ) -> Outcome {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            self.0.fetch_add(1, Ordering::Relaxed);
+                            Outcome::Ack
+                        }
+                    }
+                    SlowHandler(processed.clone())
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Publish a burst large enough to build a sustained backlog.
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..20u32 {
+        publisher
+            .publish::<AutoscalingTopic>(&SimpleMessage {
+                id: format!("as-{i}"),
+                content: format!("burst {i}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Fast autoscaler config: short poll + hysteresis so scale-up fires
+    // within the first second of the test window.
+    let cfg = AutoscalerConfig {
+        poll_interval: Duration::from_millis(200),
+        scale_up_multiplier: 1.5,
+        scale_down_multiplier: 0.3,
+        hysteresis_duration: Duration::from_millis(200),
+        cooldown_duration: Duration::from_millis(400),
+    };
+
+    // Run for 8 s — enough time for autoscaler to scale up and drain the
+    // 20-message backlog through 4 max consumers at 200 ms each.
+    let signal = tokio::time::sleep(Duration::from_millis(8000));
+    let outcome = group
+        .enable_autoscaling(cfg)
+        .run_until_timeout(signal, Duration::from_secs(15))
+        .await;
+
+    assert!(
+        outcome.is_clean(),
+        "autoscaling group must drain cleanly; outcome: {outcome:?}"
+    );
+    assert_eq!(
+        processed.load(Ordering::Relaxed),
+        20,
+        "all 20 published messages must be handled before the group drains"
+    );
+
+    broker.close().await;
+}

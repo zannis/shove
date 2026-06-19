@@ -95,12 +95,13 @@ impl HasCoordinatedGroups for Nats {
     }
 
     fn spawn_autoscaler(
-        _client: &Self::Client,
-        _registry: Arc<Mutex<Self::RegistryImpl>>,
-        _config: AutoscalerConfig,
-        _shutdown: CancellationToken,
+        client: &Self::Client,
+        registry: Arc<Mutex<Self::RegistryImpl>>,
+        config: AutoscalerConfig,
+        shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        todo!("implemented in task-7")
+        let mut autoscaler = NatsAutoscalerBackend::autoscaler(client.clone(), registry, config);
+        tokio::spawn(async move { autoscaler.run(shutdown).await })
     }
 }
 
