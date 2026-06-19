@@ -5896,9 +5896,7 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
 
     // Connect with management config so spawn_autoscaler can poll queue stats.
     let config = ctx.rmq_config().with_management(ctx.mgmt_config());
-    let broker = shove::broker::Broker::<RabbitMqMarker>::new(config)
-        .await
-        .unwrap();
+    let broker = Broker::<RabbitMqMarker>::new(config).await.unwrap();
 
     broker
         .topology()
@@ -5913,8 +5911,7 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
         let processed = processed.clone();
         group
             .register::<ConsumerGroupAutoscalingTopic, _>(
-                #[allow(clippy::absolute_paths)]
-                shove::consumer_group::ConsumerGroupConfig::new(
+                ConsumerGroupConfig::new(
                     RabbitMqConsumerGroupConfig::new(1..=4).with_prefetch_count(1),
                 ),
                 move || {
@@ -5925,12 +5922,12 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
                         async fn handle(
                             &self,
                             _: SimpleMessage,
-                            _: shove::metadata::MessageMetadata,
+                            _: MessageMetadata,
                             _: &(),
-                        ) -> shove::outcome::Outcome {
+                        ) -> Outcome {
                             tokio::time::sleep(Duration::from_millis(200)).await;
                             self.0.fetch_add(1, Ordering::Relaxed);
-                            shove::outcome::Outcome::Ack
+                            Outcome::Ack
                         }
                     }
                     SlowHandler(processed.clone())
