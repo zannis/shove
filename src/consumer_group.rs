@@ -192,10 +192,10 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
             B::spawn_autoscaler(&self.client, registry.clone(), config, auto_token.clone());
 
         // Wait for the external signal or an externally-triggered cancel.
-        let signal_task = tokio::spawn(signal);
+        let mut signal_task = tokio::spawn(signal);
         tokio::select! {
-            _ = consumer_token.cancelled() => {}
-            res = signal_task => { let _ = res; }
+            _ = consumer_token.cancelled() => { signal_task.abort(); }
+            res = &mut signal_task => { let _ = res; }
         }
 
         // Stop the autoscaler first; bounded-join so a stuck metrics poll can't
@@ -237,6 +237,7 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
 
+    use crate::autoscaler::AutoscalerConfig;
     use crate::define_sequenced_topic;
     use crate::inmemory::{InMemoryConfig, InMemoryConsumerGroupConfig};
     use crate::topic::SequencedTopic;
@@ -391,8 +392,14 @@ mod tests {
             .expect("register_fifo");
 
         let outcome = group
-            .enable_autoscaling(crate::AutoscalerConfig::default())
-            .run_until_timeout(std::future::ready(()), Duration::from_millis(500))
+            .enable_autoscaling(AutoscalerConfig {
+                poll_interval: Duration::from_millis(50),
+                ..AutoscalerConfig::default()
+            })
+            .run_until_timeout(
+                async { tokio::time::sleep(Duration::from_millis(150)).await },
+                Duration::from_millis(500),
+            )
             .await;
         assert_eq!(outcome.exit_code(), 0);
     }
