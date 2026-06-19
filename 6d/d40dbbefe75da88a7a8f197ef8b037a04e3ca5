@@ -1,0 +1,20 @@
+src/autoscaler.rs
+  s_81848fc1a25b55::t_58177707e58013 729-749
+  s_81848fc1a25b55::t_7e0a558d20c653 279-285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "6dd40dbbefe75da88a7a8f197ef8b037a04e3ca5",
+  "prompts": {},
+  "sessions": {
+    "s_81848fc1a25b55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8dcf6712-b42d-4682-949b-9c7595f579da",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
