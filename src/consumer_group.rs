@@ -1,10 +1,13 @@
 //! Public `ConsumerGroup<B, Ctx>` -- specialist harness for coordinated
 //! consumer groups. Gated on `B: HasCoordinatedGroups`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::autoscaler::AutoscalerConfig;
 use crate::backend::RegistryImpl;
 use crate::backend::capability::HasCoordinatedGroups;
 use crate::consumer_supervisor::SupervisorOutcome;
@@ -14,6 +17,8 @@ use crate::topic::{SequencedTopic, Topic};
 
 pub struct ConsumerGroup<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static = ()> {
     pub(crate) inner: B::RegistryImpl,
+    client: B::Client,
+    autoscaler: Option<AutoscalerConfig>,
     ctx: Ctx,
 }
 
@@ -28,8 +33,13 @@ impl<B: HasCoordinatedGroups> ConsumerGroupConfig<B> {
 }
 
 impl<B: HasCoordinatedGroups> ConsumerGroup<B, ()> {
-    pub(crate) fn new(inner: B::RegistryImpl) -> Self {
-        Self { inner, ctx: () }
+    pub(crate) fn new(inner: B::RegistryImpl, client: B::Client) -> Self {
+        Self {
+            inner,
+            client,
+            autoscaler: None,
+            ctx: (),
+        }
     }
 
     pub fn with_context<Ctx: Clone + Send + Sync + 'static>(
@@ -38,6 +48,8 @@ impl<B: HasCoordinatedGroups> ConsumerGroup<B, ()> {
     ) -> ConsumerGroup<B, Ctx> {
         ConsumerGroup {
             inner: self.inner,
+            client: self.client,
+            autoscaler: self.autoscaler,
             ctx,
         }
     }
@@ -146,11 +158,76 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         self.inner.cancellation_token()
     }
 
+    /// Enable autoscaling for this group. The autoscaler polls queue depth on
+    /// `config.poll_interval` and scales consumers within the per-group
+    /// `ConsumerGroupConfig` min/max range using `Stabilized<ThresholdStrategy>`.
+    /// Its lifecycle is owned by [`run_until_timeout`](Self::run_until_timeout):
+    /// it is stopped and joined before consumers drain. A panic in the
+    /// autoscaler task (observed before the stop deadline) surfaces in the
+    /// returned [`SupervisorOutcome`] as a panic.
+    pub fn enable_autoscaling(mut self, config: AutoscalerConfig) -> Self {
+        self.autoscaler = Some(config);
+        self
+    }
+
     pub async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        self.inner.run_until_timeout(signal, drain_timeout).await
+        let Some(config) = self.autoscaler else {
+            return self.inner.run_until_timeout(signal, drain_timeout).await;
+        };
+
+        let mut inner = self.inner;
+        // Token we race the external signal against; cancelling it cascades to
+        // consumers exactly as the non-autoscaling path's broker token does.
+        let consumer_token = inner.cancellation_token();
+        inner.start_all();
+
+        let registry = Arc::new(Mutex::new(inner));
+        // Dedicated token so we can stop the autoscaler *before* draining
+        // consumers (ordering required by the shutdown contract).
+        let auto_token = CancellationToken::new();
+        let handle =
+            B::spawn_autoscaler(&self.client, registry.clone(), config, auto_token.clone());
+
+        // Wait for the external signal or an externally-triggered cancel.
+        let signal_task = tokio::spawn(signal);
+        tokio::select! {
+            _ = consumer_token.cancelled() => {}
+            res = signal_task => { let _ = res; }
+        }
+
+        // Stop the autoscaler first; bounded-join so a stuck metrics poll can't
+        // consume the drain budget. Count a panic observed before the deadline.
+        auto_token.cancel();
+        let mut autoscaler_panics = 0usize;
+        let grace = Duration::from_secs(1);
+        let mut handle = handle;
+        tokio::select! {
+            res = &mut handle => {
+                if matches!(&res, Err(e) if e.is_panic()) {
+                    autoscaler_panics += 1;
+                }
+            }
+            _ = tokio::time::sleep(grace) => {
+                handle.abort();
+                if let Err(e) = handle.await
+                    && e.is_panic()
+                {
+                    autoscaler_panics += 1;
+                }
+            }
+        }
+
+        // Autoscaler task (and its registry Arc clone) is now gone: sole owner.
+        let inner = Arc::try_unwrap(registry)
+            .unwrap_or_else(|_| unreachable!("autoscaler joined; registry Arc must be sole-owned"))
+            .into_inner();
+
+        let mut outcome = inner.drain_until_timeout(drain_timeout).await;
+        outcome.panics += autoscaler_panics;
+        outcome
     }
 }
 
@@ -291,5 +368,32 @@ mod tests {
         let _ = broker
             .consumer_group()
             .with_default_handler_timeout(Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn enable_autoscaling_runs_and_drains_clean() {
+        let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+            .await
+            .expect("broker");
+        broker
+            .topology()
+            .declare::<Ledger>()
+            .await
+            .expect("declare");
+
+        let mut group = broker.consumer_group();
+        group
+            .register_fifo::<Ledger, _>(
+                ConsumerGroupConfig::new(InMemoryConsumerGroupConfig::default()),
+                || NoopHandler,
+            )
+            .await
+            .expect("register_fifo");
+
+        let outcome = group
+            .enable_autoscaling(crate::AutoscalerConfig::default())
+            .run_until_timeout(std::future::ready(()), Duration::from_millis(500))
+            .await;
+        assert_eq!(outcome.exit_code(), 0);
     }
 }
