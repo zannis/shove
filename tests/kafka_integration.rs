@@ -2492,7 +2492,7 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
 shove::define_topic!(
     AutoscalingTopic,
     SimpleMessage,
-    TopologyBuilder::new("kafka-autoscaling").dlq().build()
+    TopologyBuilder::new("kafka-autoscaling").build()
 );
 
 /// Autoscaling lifecycle: slow handlers + burst → `enable_autoscaling` →
@@ -2578,6 +2578,11 @@ async fn autoscaling_scales_up_and_drains_clean() {
     assert!(
         outcome.is_clean(),
         "autoscaling group must drain cleanly; outcome: {outcome:?}"
+    );
+    assert_eq!(
+        processed.load(Ordering::Relaxed),
+        20,
+        "all 20 published messages must be handled before the group drains"
     );
 
     broker.close().await;

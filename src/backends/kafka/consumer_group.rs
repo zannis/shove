@@ -553,12 +553,12 @@ impl KafkaConsumerGroup {
     /// Cancel the group token and await every consumer handle, accumulating
     /// errors and panics into the caller-owned `tally`.
     ///
-    /// Atomic counts are swapped into `tally` **before** any handle is
-    /// awaited, so a caller that races this against a timeout (see
-    /// `RegistryImpl::run_until_timeout`) preserves pre-cancel state even if
-    /// the future is dropped mid-await. The consumer list is drained via
-    /// `pop()` so dropped futures leave unawaited handles in place for a
-    /// subsequent escalation via [`Self::abort_remaining_into`].
+    /// Error and panic counts are snapshotted at the start and again after all
+    /// awaits complete. Both the active-consumer and retiring drain loops sit
+    /// between the two snapshots, preserving cancel-safety across both. The
+    /// consumer list is drained via `pop()` so dropped futures leave unawaited
+    /// handles in place for a subsequent escalation via
+    /// [`Self::abort_remaining_into`].
     pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             group = %self.queue,
