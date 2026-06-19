@@ -13,7 +13,7 @@ use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
-use crate::consumer_supervisor::ShutdownTally;
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -571,6 +571,7 @@ impl KafkaConsumerGroup {
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -582,6 +583,7 @@ impl KafkaConsumerGroup {
         }
 
         while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}

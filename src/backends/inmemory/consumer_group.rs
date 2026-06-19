@@ -13,7 +13,7 @@ use crate::consumer::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
     resolve_handler_timeout,
 };
-use crate::consumer_supervisor::ShutdownTally;
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -390,6 +390,7 @@ impl InMemoryConsumerGroup {
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -401,6 +402,7 @@ impl InMemoryConsumerGroup {
         }
 
         while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -919,5 +921,50 @@ mod tests {
         let tally = registry.shutdown_all_with_tally().await;
         // 2 groups × 2 panicking consumers = 4 panics.
         assert_eq!(tally.panics, 4);
+    }
+
+    /// Verify that a handle popped from `consumers` but not yet awaited is
+    /// ABORTED (not detached) when the outer drain timeout fires.
+    ///
+    /// The sentinel's `Drop` fires only when the task future is dropped, which
+    /// happens on abort. If the handle is detached instead the sentinel never
+    /// drops within the test window and the assertion fails.
+    #[tokio::test]
+    async fn drain_into_aborts_inflight_handle_on_timeout() {
+        use std::sync::atomic::AtomicBool;
+
+        struct AbortSentinel(Arc<AtomicBool>);
+        impl Drop for AbortSentinel {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let aborted_clone = Arc::clone(&aborted);
+
+        let mut group = test_group(InMemoryConsumerGroupConfig::new(1..=1));
+        // Replace spawner with one that holds a sentinel and then hangs.
+        group.spawner = Arc::new(move |_options: ConsumerOptionsInner| {
+            let flag = Arc::clone(&aborted_clone);
+            tokio::spawn(async move {
+                let _sentinel = AbortSentinel(flag);
+                std::future::pending::<()>().await;
+            })
+        });
+        group.start();
+
+        let mut tally = ShutdownTally::default();
+        // Mirror how drain_until_timeout drives drain_into.
+        let _ = tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+
+        // Give the runtime a tick to deliver the abort signal and drop the future.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            aborted.load(Ordering::Acquire),
+            "AbortSentinel must have been dropped: the in-flight handle was detached, not aborted"
+        );
     }
 }

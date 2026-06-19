@@ -14,7 +14,7 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::consumer::RabbitMqConsumer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
-use crate::consumer_supervisor::ShutdownTally;
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
@@ -502,6 +502,7 @@ impl RabbitMqConsumerGroup {
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -513,6 +514,7 @@ impl RabbitMqConsumerGroup {
         }
 
         while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}

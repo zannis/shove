@@ -13,7 +13,7 @@ use crate::backends::nats::client::NatsClient;
 use crate::backends::nats::consumer::NatsConsumer;
 use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
-use crate::consumer_supervisor::ShutdownTally;
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -387,6 +387,7 @@ impl NatsConsumerGroup {
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -398,6 +399,7 @@ impl NatsConsumerGroup {
         }
 
         while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}

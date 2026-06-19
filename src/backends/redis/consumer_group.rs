@@ -20,7 +20,7 @@ use crate::consumer::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
     resolve_handler_timeout,
 };
-use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::topic::{SequencedTopic, Topic};
@@ -486,6 +486,7 @@ impl RedisConsumerGroup {
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
@@ -497,6 +498,7 @@ impl RedisConsumerGroup {
         }
 
         while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
