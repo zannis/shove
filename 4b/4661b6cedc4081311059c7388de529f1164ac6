@@ -1,0 +1,22 @@
+src/consumer_group.rs
+  s_81848fc1a25b55::t_308703142921af 251
+  s_81848fc1a25b55::t_b821aa65b838ff 473
+  s_81848fc1a25b55::t_4dcb42973333b5 228-236
+  s_81848fc1a25b55::t_2300e057bf44b9 384-472,474-477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "4b4661b6cedc4081311059c7388de529f1164ac6",
+  "prompts": {},
+  "sessions": {
+    "s_81848fc1a25b55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8dcf6712-b42d-4682-949b-9c7595f579da",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
