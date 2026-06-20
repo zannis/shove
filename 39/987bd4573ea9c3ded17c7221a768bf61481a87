@@ -1,0 +1,26 @@
+src/backends/rabbitmq/consumer.rs
+  s_3efee2bbade155::t_b0bce0c4215a55 829
+  s_3efee2bbade155::t_fc9419f523a81b 30
+  s_3efee2bbade155::t_7abc82e6898631 1047
+  s_3efee2bbade155::t_3121b9555e8f36 1179
+  s_3efee2bbade155::t_1d6ae67506ae29 627
+src/routing.rs
+  s_3efee2bbade155::t_7d12a2daa37412 71-76
+  s_3efee2bbade155::t_70d05cea7816b4 31-37,46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "39987bd4573ea9c3ded17c7221a768bf61481a87",
+  "prompts": {},
+  "sessions": {
+    "s_3efee2bbade155": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8ca34d5-db28-4a80-938e-fe6afee1f006",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
