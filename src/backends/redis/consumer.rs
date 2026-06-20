@@ -19,7 +19,7 @@ use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::hold_index;
+use crate::routing::{RetryDecision, decide_retry, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, QueueTopology};
 
@@ -1145,8 +1145,8 @@ async fn route_outcome(
     max_retries: u32,
     hold_queues: &[HoldQueue],
 ) -> Result<()> {
-    match outcome {
-        Outcome::Ack => {
+    match decide_retry(&outcome, retry_count, max_retries) {
+        RetryDecision::Ack => {
             if let Err(e) = xack(conn, stream, group, entry_id).await {
                 tracing::warn!(stream, entry_id, error = %e, "XACK failed on Ack");
                 metrics::record_backend_error(
@@ -1155,24 +1155,29 @@ async fn route_outcome(
                 );
             }
         }
-        Outcome::Retry => {
+        RetryDecision::Dlq { reason } => {
+            // Preserve the pre-refactor death counts: max-retries recorded
+            // `retry_count + 1`, reject recorded `retry_count`.
+            let death_count = if reason == "rejected" {
+                retry_count
+            } else {
+                retry_count + 1
+            };
+            route_to_dlq(
+                conn,
+                topology,
+                stream,
+                group,
+                entry_id,
+                fields,
+                reason,
+                death_count,
+            )
+            .await?;
+        }
+        RetryDecision::Hold { increment: true } => {
             let new_retry = retry_count + 1;
-            // DLQ when the incoming retry count has reached the budget, so
-            // `max_retries = N` permits 1 initial attempt + N retries. Matches
-            // the documented contract and the other backends.
-            if retry_count >= max_retries {
-                route_to_dlq(
-                    conn,
-                    topology,
-                    stream,
-                    group,
-                    entry_id,
-                    fields,
-                    "max-retries",
-                    new_retry,
-                )
-                .await?;
-            } else if hold_queues.is_empty() {
+            if hold_queues.is_empty() {
                 tracing::warn!(
                     stream,
                     entry_id,
@@ -1205,20 +1210,7 @@ async fn route_outcome(
                 .await;
             }
         }
-        Outcome::Reject => {
-            route_to_dlq(
-                conn,
-                topology,
-                stream,
-                group,
-                entry_id,
-                fields,
-                "rejected",
-                retry_count,
-            )
-            .await?;
-        }
-        Outcome::Defer => {
+        RetryDecision::Hold { increment: false } => {
             if hold_queues.is_empty() {
                 tracing::warn!(
                     stream,
@@ -1665,7 +1657,10 @@ mod tests {
             (X_RETRY_COUNT.to_string(), "2".to_string()),
             (X_SEQUENCE_KEY.to_string(), "acct-1".to_string()),
             (X_MESSAGE_ID.to_string(), "msg-abc".to_string()),
-            (X_DEATH_REASON.to_string(), "max-retries".to_string()),
+            (
+                X_DEATH_REASON.to_string(),
+                "max_retries_exceeded".to_string(),
+            ),
             (X_DEATH_COUNT.to_string(), "5".to_string()),
             (X_ORIGINAL_QUEUE.to_string(), "orders".to_string()),
             ("x-custom".to_string(), "val".to_string()),
