@@ -1,0 +1,36 @@
+src/backends/redis/consumer.rs
+  s_3efee2bbade155::t_8c8798887ee8f0 1511
+src/lib.rs
+  s_3efee2bbade155::t_dd0649d3feab2f 183-190
+src/routing.rs
+  s_3efee2bbade155::t_836f7d2c201a97 1-129
+src/backends/kafka/consumer.rs
+  s_3efee2bbade155::t_b5c16ad9dea195 417
+src/backends/rabbitmq/router.rs
+  s_3efee2bbade155::t_89aefc1e9a8504 11
+  s_3efee2bbade155::t_6092c25f57a5e5 37
+src/backends/inmemory/consumer.rs
+  s_3efee2bbade155::t_e8c5c689341704 23
+  s_3efee2bbade155::t_4d7b0901062d5a 709-711,716
+  s_3efee2bbade155::t_28f375fbb44046 739
+  s_3efee2bbade155::t_d10633b1ab1ff5 553
+  s_3efee2bbade155::t_1bafcf41a69950 708,712-713,717
+src/backends/nats/consumer.rs
+  s_3efee2bbade155::t_d29177131cb787 327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "910192c4d02ac9255c5182ccc45059d74dd71fb0",
+  "prompts": {},
+  "sessions": {
+    "s_3efee2bbade155": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8ca34d5-db28-4a80-938e-fe6afee1f006",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
