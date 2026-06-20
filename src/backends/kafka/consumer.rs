@@ -22,7 +22,7 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::hold_index;
+use crate::routing::{RetryDecision, decide_retry, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{HoldQueue, Kafka, ShoveError};
@@ -372,45 +372,38 @@ async fn route_outcome(
     // permit-holder finishes naturally.
     shutdown: CancellationToken,
 ) -> bool {
-    match outcome {
-        Outcome::Ack => {
+    match decide_retry(&outcome, retry_count, max_retries) {
+        RetryDecision::Ack => {
             signal_completion(completion, topic);
             true
         }
-        Outcome::Retry => {
-            let new_count = retry_count + 1;
-            // DLQ when the incoming retry count has reached the budget, so
-            // `max_retries = N` permits 1 initial attempt + N retries. Matches
-            // the documented contract and the other backends.
-            if retry_count >= max_retries {
-                // Emit before the DLQ publish so the metric fires regardless
-                // of DLQ outcome — silent loss on DLQ failure is what the
-                // counter has to surface to alerting.
-                metrics::record_failed(topic, group, metrics::FailReason::MaxRetriesExceeded);
-                let dlq_ok = publish_to_dlq(
-                    client,
-                    topology,
-                    payload,
-                    key.as_deref(),
-                    headers,
-                    "max_retries_exceeded",
-                )
-                .await;
-                // Commit even if the DLQ publish failed: the message has
-                // exhausted retries and looping it forever produces a poison
-                // hot-spot. The error trace + metric give operators what they
-                // need to investigate. Matches the existing pre-refactor
-                // semantic (the outer task committed regardless).
-                signal_completion(completion, topic);
-                return match dlq_ok {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::error!(error = %e, "failed to publish to DLQ after exhausting retries");
-                        false
-                    }
-                };
+        RetryDecision::Dlq { reason } => {
+            // Emit before the DLQ publish so the metric fires regardless
+            // of DLQ outcome — silent loss on DLQ failure is what the
+            // counter has to surface to alerting.
+            let fail_reason = match reason {
+                "rejected" => metrics::FailReason::Rejected,
+                _ => metrics::FailReason::MaxRetriesExceeded,
+            };
+            metrics::record_failed(topic, group, fail_reason);
+            let dlq_ok =
+                publish_to_dlq(client, topology, payload, key.as_deref(), headers, reason).await;
+            // Commit even if the DLQ publish failed: the message has
+            // exhausted retries (or was rejected) and looping it forever
+            // produces a poison hot-spot. The error trace + metric give
+            // operators what they need to investigate. Matches the existing
+            // pre-refactor semantic (the outer task committed regardless).
+            signal_completion(completion, topic);
+            match dlq_ok {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to publish to DLQ");
+                    false
+                }
             }
-
+        }
+        RetryDecision::Hold { increment: true } => {
+            let new_count = retry_count + 1;
             let delay = if hold_queues.is_empty() {
                 Duration::from_secs(1)
             } else {
@@ -435,31 +428,7 @@ async fn route_outcome(
             )
             .await
         }
-        Outcome::Reject => {
-            // Emit before the DLQ publish — see the symmetric note in the
-            // max_retries_exceeded arm above.
-            metrics::record_failed(topic, group, metrics::FailReason::Rejected);
-            let dlq_ok = publish_to_dlq(
-                client,
-                topology,
-                payload,
-                key.as_deref(),
-                headers,
-                "rejected",
-            )
-            .await;
-            // Same rationale as max_retries_exceeded: commit regardless of
-            // DLQ outcome to prevent a Reject from looping forever.
-            signal_completion(completion, topic);
-            match dlq_ok {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to publish rejected message to DLQ");
-                    false
-                }
-            }
-        }
-        Outcome::Defer => {
+        RetryDecision::Hold { increment: false } => {
             let delay = if hold_queues.is_empty() {
                 Duration::from_secs(1)
             } else {
