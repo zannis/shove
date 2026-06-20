@@ -1,0 +1,19 @@
+pnpm-workspace.yaml
+  s_2559c271837ef4::t_26de6b9466a54b 1-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "52ceb8ea5b3752677594e19a1b755fdb735b2c97",
+  "prompts": {},
+  "sessions": {
+    "s_2559c271837ef4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "21accac9-5ae8-496f-b2dd-993ebb2f3e10",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
