@@ -5,6 +5,7 @@
 [![Docs](https://docs.rs/shove/badge.svg)](https://docs.rs/shove)
 [![License:MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Coverage](https://codecov.io/gh/zannis/shove/branch/main/graph/badge.svg)](https://codecov.io/gh/zannis/shove)
+[![Dependencies](https://deps.rs/repo/github/zannis/shove/status.svg)](https://deps.rs/repo/github/zannis/shove)
 
 Type-safe async pub/sub for Rust. One API across RabbitMQ, AWS SNS+SQS, NATS JetStream, Apache Kafka, Redis/Valkey Streams, and an in-process backend.
 
