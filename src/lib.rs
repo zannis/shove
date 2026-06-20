@@ -180,6 +180,14 @@ mod backends;
     feature = "redis-streams"
 ))]
 pub(crate) mod retry;
+#[cfg(any(
+    feature = "inmemory",
+    feature = "rabbitmq",
+    feature = "nats",
+    feature = "kafka",
+    feature = "redis-streams"
+))]
+pub(crate) mod routing;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;

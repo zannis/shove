@@ -19,6 +19,7 @@ use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
+use crate::routing::hold_index;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, QueueTopology};
 
@@ -1507,7 +1508,7 @@ pub(super) fn hold_level<T>(retry_count: u32, hold_queues: &[T]) -> Option<usize
     if hold_queues.is_empty() {
         None
     } else {
-        Some((retry_count as usize).min(hold_queues.len() - 1))
+        Some(hold_index(retry_count, hold_queues.len()))
     }
 }
 

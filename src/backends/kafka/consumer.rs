@@ -22,6 +22,7 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
+use crate::routing::hold_index;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{HoldQueue, Kafka, ShoveError};
@@ -413,7 +414,7 @@ async fn route_outcome(
             let delay = if hold_queues.is_empty() {
                 Duration::from_secs(1)
             } else {
-                let idx = (retry_count as usize).min(hold_queues.len() - 1);
+                let idx = hold_index(retry_count, hold_queues.len());
                 hold_queues[idx].delay()
             };
 
