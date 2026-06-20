@@ -1,0 +1,21 @@
+package.json
+  s_2559c271837ef4::t_9a5b2c79b32167 22-24
+.github/workflows/ci.yml
+  s_2559c271837ef4::t_49a734cc1f2073 53-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "b706d0803c5a0bd1288a2f06a61ef388dcc3c543",
+  "prompts": {},
+  "sessions": {
+    "s_2559c271837ef4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "21accac9-5ae8-496f-b2dd-993ebb2f3e10",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
