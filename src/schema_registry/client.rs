@@ -1,5 +1,6 @@
 //! Async, cached Confluent Schema Registry client.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,22 @@ pub enum SchemaRegistryAuth {
     None,
     Bearer(String),
     Basic { user: String, pass: String },
+}
+
+// Hand-written so the bearer token / basic-auth password never print. Do NOT
+// switch to `#[derive(Debug)]` — derive would leak the secrets.
+impl fmt::Debug for SchemaRegistryAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Bearer(_) => f.debug_tuple("Bearer").field(&"<redacted>").finish(),
+            Self::Basic { user, .. } => f
+                .debug_struct("Basic")
+                .field("user", user)
+                .field("pass", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, SchemaRegistryError>;
@@ -317,5 +334,39 @@ impl SchemaRegistryBuilder {
             negative: DashMap::new(),
             subject_ids: DashMap::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SchemaRegistryAuth;
+
+    #[test]
+    fn bearer_token_is_redacted_in_debug() {
+        let auth = SchemaRegistryAuth::Bearer("super-secret-token".to_string());
+        let dbg = format!("{auth:?}");
+        assert!(!dbg.contains("super-secret-token"), "token leaked: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "missing redaction marker: {dbg}"
+        );
+    }
+
+    #[test]
+    fn basic_password_is_redacted_but_user_shown() {
+        let auth = SchemaRegistryAuth::Basic {
+            user: "alice".to_string(),
+            pass: "super-secret-token".to_string(),
+        };
+        let dbg = format!("{auth:?}");
+        assert!(
+            !dbg.contains("super-secret-token"),
+            "password leaked: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted>"),
+            "missing redaction marker: {dbg}"
+        );
+        assert!(dbg.contains("alice"), "user should be visible: {dbg}");
     }
 }
