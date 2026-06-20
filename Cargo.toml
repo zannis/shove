@@ -14,15 +14,15 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 exclude = [
-    "docs/",
-    "package.json",
-    "package-lock.json",
-    "tsconfig.json",
-    "vocs.config.ts",
-    "wrangler.toml",
-    ".github/workflows/docs-build.yml",
-    ".github/workflows/docs-preview.yml",
-    "node_modules/",
+  "docs/",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "vocs.config.ts",
+  "wrangler.toml",
+  ".github/workflows/docs-build.yml",
+  ".github/workflows/docs-preview.yml",
+  "node_modules/",
 ]
 
 [lints.clippy]
@@ -32,7 +32,13 @@ absolute-paths = "deny"
 default = []
 
 # RabbitMQ Pubsub
-rabbitmq = ["dep:lapin", "dep:futures-lite", "dep:reqwest", "dep:arc-swap", "dep:url"]
+rabbitmq = [
+  "dep:lapin",
+  "dep:futures-lite",
+  "dep:reqwest",
+  "dep:arc-swap",
+  "dep:url",
+]
 
 # Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.
 # Makes publish-to-hold-queue + ack atomic (tx_select/tx_commit), eliminating
@@ -62,12 +68,22 @@ kafka-ssl = ["kafka", "rdkafka?/ssl", "rdkafka?/sasl"]
 # AWS MSK IAM authentication. Adds the `MskIam` variant to `KafkaSasl`,
 # which uses `SASL_SSL` + `OAUTHBEARER` with auto-refreshed presigned tokens
 # signed against `kafka-cluster:Connect`. Implies TLS.
-kafka-msk-iam = ["kafka-ssl", "dep:aws-config", "dep:aws-credential-types", "dep:aws-msk-iam-sasl-signer"]
+kafka-msk-iam = [
+  "kafka-ssl",
+  "dep:aws-config",
+  "dep:aws-credential-types",
+  "dep:aws-msk-iam-sasl-signer",
+]
 
 # Confluent Schema Registry decode for Kafka consumers. Adds an async, cached
 # registry client and an opt-in decode stage that strips the Confluent wire
 # frame and validates schema identity before delegating to the topic's codec.
-kafka-schema-registry = ["kafka", "dep:reqwest", "dep:dashmap", "dep:futures-util"]
+kafka-schema-registry = [
+  "kafka",
+  "dep:reqwest",
+  "dep:dashmap",
+  "dep:futures-util",
+]
 
 # In-process backend
 inmemory = ["dep:dashmap"]
@@ -96,30 +112,56 @@ chrono = { version = "0.4", features = ["serde"] }
 lapin = { version = "4", features = ["rustls--ring"], optional = true }
 futures-lite = { version = "2", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
-aws-config = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
+aws-config = { version = "1", features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+], default-features = false, optional = true }
 aws-credential-types = { version = "1", optional = true }
 aws-msk-iam-sasl-signer = { version = "1", optional = true }
-aws-sdk-sns = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
-aws-sdk-sqs = { version = "1", features = ["behavior-version-latest", "default-https-client", "rt-tokio"], default-features = false, optional = true }
+aws-sdk-sns = { version = "1", features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+], default-features = false, optional = true }
+aws-sdk-sqs = { version = "1", features = [
+  "behavior-version-latest",
+  "default-https-client",
+  "rt-tokio",
+], default-features = false, optional = true }
 rand = "0.10"
 arc-swap = { version = "1", optional = true }
-async-nats = { version = "0.47", optional = true }
+async-nats = { version = "0.49", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
 rdkafka = { version = "0.39", features = ["tokio"], optional = true }
 dashmap = { version = "6", optional = true }
-redis = { version = "1", features = ["tokio-comp", "streams", "tokio-rustls-comp", "cluster-async"], optional = true }
+redis = { version = "1", features = [
+  "tokio-comp",
+  "streams",
+  "tokio-rustls-comp",
+  "cluster-async",
+], optional = true }
 metrics = { version = "0.24", optional = true }
 url = { version = "2", optional = true }
-prost = { version = "0.13", optional = true }
+prost = { version = "0.14", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-rdkafka = { version = "0.39", features = ["tokio", "cmake-build"], optional = true }
+rdkafka = { version = "0.39", features = [
+  "tokio",
+  "cmake-build",
+], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["rabbitmq", "localstack", "nats", "kafka", "redis"] }
+testcontainers-modules = { version = "0.15", features = [
+  "rabbitmq",
+  "localstack",
+  "nats",
+  "kafka",
+  "redis",
+] }
 # RUSTSEC-2026-0145: testcontainers 0.27.3 pulls in astral-tokio-tar 0.6.1 which
 # has a known vulnerability. Pin to 0.6.2 until testcontainers ships a fix.
 astral-tokio-tar = "0.6.2"
