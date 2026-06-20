@@ -5,7 +5,7 @@ crate locally so your change passes CI on the first try.
 
 ## Prerequisites
 
-- **Rust 1.85+** (edition 2024). The repo pins a toolchain via
+- **Rust 1.91+** (edition 2024). The repo pins a toolchain via
   `rust-toolchain.toml`; matching the pinned floor guarantees your build matches
   the documented MSRV.
 - **Docker**, running — the integration tests spin up real brokers

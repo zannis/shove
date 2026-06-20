@@ -441,15 +441,13 @@ impl RabbitMqConsumer {
                                             );
                                             publisher.rollback_if_tx().await;
                                             router::nack_requeue(&delivery, &publisher).await.ok();
+                                        } else if let Err(e) = publisher.commit_if_tx().await {
+                                            error!("tx_commit failed for shard defer: {e}");
                                         } else {
-                                            if let Err(e) = publisher.commit_if_tx().await {
-                                                error!("tx_commit failed for shard defer: {e}");
-                                            } else {
-                                                debug!(
-                                                    "deferring message to shard hold queue {}",
-                                                    hold_queue.name()
-                                                );
-                                            }
+                                            debug!(
+                                                "deferring message to shard hold queue {}",
+                                                hold_queue.name()
+                                            );
                                         }
                                     }
                                     Err(e) => {

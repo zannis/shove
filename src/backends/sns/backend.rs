@@ -33,8 +33,6 @@
 //! SQS-specific types (`SqsConsumer`, `SqsAutoscalerBackend`, …) are
 //! available.
 
-#![cfg(feature = "aws-sns-sqs")]
-
 use std::sync::Arc;
 
 use tokio::sync::Mutex;

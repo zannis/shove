@@ -345,11 +345,7 @@ fn current_rss_bytes() -> u64 {
                 &mut count,
             )
         };
-        if kr == 0 {
-            info.resident_size as u64
-        } else {
-            0
-        }
+        if kr == 0 { info.resident_size } else { 0 }
     }
     #[cfg(target_os = "linux")]
     {

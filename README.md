@@ -126,7 +126,7 @@ Tuning notes, NATS/SQS profiles, and the full benchmark matrix: [Performance](ht
 
 ## Requirements
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.91+ (edition 2024)
 - Redis 6.2+ or Valkey (when using `redis-streams`)
 
 ## License
