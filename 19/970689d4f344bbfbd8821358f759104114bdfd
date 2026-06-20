@@ -1,0 +1,25 @@
+.env.example
+  s_3efee2bbade155::t_39aa26d19b7282 1-11
+CONTRIBUTING.md
+  s_3efee2bbade155::t_8904bf2937e4d4 1-79
+CLAUDE.md
+  s_3efee2bbade155::t_d53a28ceae0746 1-84
+AGENTS.md
+  s_3efee2bbade155::t_bcd9b508fd2115 1-8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "19970689d4f344bbfbd8821358f759104114bdfd",
+  "prompts": {},
+  "sessions": {
+    "s_3efee2bbade155": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8ca34d5-db28-4a80-938e-fe6afee1f006",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
