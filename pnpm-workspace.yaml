@@ -1,0 +1,4 @@
+# Supply-chain guard: refuse to install any package version published less
+# than a week ago (10080 minutes), giving time for compromised releases to be
+# yanked before they can reach us. Applies to transitive deps too.
+minimumReleaseAge: 10080
