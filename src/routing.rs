@@ -28,6 +28,13 @@ pub(crate) enum RetryDecision {
     Hold { increment: bool },
 }
 
+/// Whether the retry budget is exhausted. `max_retries = N` permits N retries,
+/// so a message is terminal once `retry_count >= max_retries`. Single source of
+/// truth for the boundary shared by `decide_retry` and pre-handler gates.
+pub(crate) fn retries_exhausted(retry_count: u32, max_retries: u32) -> bool {
+    retry_count >= max_retries
+}
+
 /// Decide the routing for `outcome`. The retry-budget boundary lives here:
 /// `max_retries = N` permits 1 initial attempt + N retries, so the message
 /// goes to the DLQ once `retry_count >= max_retries`.
@@ -36,7 +43,7 @@ pub(crate) fn decide_retry(outcome: &Outcome, retry_count: u32, max_retries: u32
         Outcome::Ack => RetryDecision::Ack,
         Outcome::Reject => RetryDecision::Dlq { reason: "rejected" },
         Outcome::Retry => {
-            if retry_count >= max_retries {
+            if retries_exhausted(retry_count, max_retries) {
                 RetryDecision::Dlq {
                     reason: "max_retries_exceeded",
                 }
@@ -58,6 +65,13 @@ mod tests {
         assert_eq!(hold_index(1, 2), 1);
         assert_eq!(hold_index(5, 2), 1); // clamped
         assert_eq!(hold_index(0, 1), 0);
+    }
+
+    #[test]
+    fn retries_exhausted_at_boundary() {
+        assert!(!retries_exhausted(2, 3));
+        assert!(retries_exhausted(3, 3));
+        assert!(retries_exhausted(0, 0));
     }
 
     #[test]
