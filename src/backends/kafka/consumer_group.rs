@@ -13,7 +13,7 @@ use crate::backends::kafka::client::KafkaClient;
 use crate::backends::kafka::consumer::KafkaConsumer;
 use crate::backends::kafka::topology::KafkaTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
-use crate::consumer_supervisor::ShutdownTally;
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -300,6 +300,10 @@ pub struct KafkaConsumerGroup {
     /// exits with a `JoinError` that is not a cancellation. Drained by
     /// [`KafkaConsumerGroup::shutdown_with_tally`].
     pub(crate) panic_count: Arc<AtomicUsize>,
+    /// Handles of consumers removed by `scale_down`. Their tokens are already
+    /// cancelled; retained here so the final drain awaits/aborts and tallies
+    /// them instead of detaching the task.
+    pub(crate) retiring: Vec<JoinHandle<()>>,
 }
 
 impl KafkaConsumerGroup {
@@ -368,6 +372,7 @@ impl KafkaConsumerGroup {
             group_token,
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
+            retiring: Vec::new(),
         }
     }
 
@@ -440,6 +445,7 @@ impl KafkaConsumerGroup {
             group_token,
             error_count,
             panic_count,
+            retiring: Vec::new(),
         }
     }
 
@@ -489,8 +495,9 @@ impl KafkaConsumerGroup {
             return false;
         };
 
-        let (token, _, _handle) = self.consumers.swap_remove(index);
+        let (token, _, handle) = self.consumers.swap_remove(index);
         token.cancel();
+        self.retiring.push(handle);
 
         info!(
             group = %self.queue,
@@ -502,6 +509,11 @@ impl KafkaConsumerGroup {
 
     pub fn active_consumers(&self) -> usize {
         self.consumers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retiring_is_empty(&self) -> bool {
+        self.retiring.is_empty()
     }
 
     pub fn queue(&self) -> &str {
@@ -541,12 +553,12 @@ impl KafkaConsumerGroup {
     /// Cancel the group token and await every consumer handle, accumulating
     /// errors and panics into the caller-owned `tally`.
     ///
-    /// Atomic counts are swapped into `tally` **before** any handle is
-    /// awaited, so a caller that races this against a timeout (see
-    /// `RegistryImpl::run_until_timeout`) preserves pre-cancel state even if
-    /// the future is dropped mid-await. The consumer list is drained via
-    /// `pop()` so dropped futures leave unawaited handles in place for a
-    /// subsequent escalation via [`Self::abort_remaining_into`].
+    /// Error and panic counts are snapshotted at the start and again after all
+    /// awaits complete. Both the active-consumer and retiring drain loops sit
+    /// between the two snapshots, preserving cancel-safety across both. The
+    /// consumer list is drained via `pop()` so dropped futures leave unawaited
+    /// handles in place for a subsequent escalation via
+    /// [`Self::abort_remaining_into`].
     pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             group = %self.queue,
@@ -559,11 +571,24 @@ impl KafkaConsumerGroup {
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
+                    tally.panics += 1;
+                }
+            }
+        }
+
+        while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
                     tally.panics += 1;
                 }
             }
@@ -580,6 +605,9 @@ impl KafkaConsumerGroup {
         for (_token, _processing, handle) in &self.consumers {
             handle.abort();
         }
+        for handle in &self.retiring {
+            handle.abort();
+        }
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
                 Ok(()) => {}
@@ -590,6 +618,16 @@ impl KafkaConsumerGroup {
                         group = %self.queue,
                         "consumer task panicked during abort escalation"
                     );
+                    tally.panics += 1;
+                }
+            }
+        }
+        while let Some(handle) = self.retiring.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
                     tally.panics += 1;
                 }
             }
@@ -889,6 +927,7 @@ mod tests {
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
+            retiring: Vec::new(),
         }
     }
 
@@ -1058,6 +1097,29 @@ mod tests {
             })
         });
         group
+    }
+
+    #[tokio::test]
+    async fn scale_down_handle_is_drained_not_detached() {
+        // A scaled-down consumer that hangs must still be aborted and counted,
+        // not silently detached. Use a hanging spawner so the retiring handle
+        // would leak under the old drop-the-handle behaviour.
+        let mut group = hanging_test_group(KafkaConsumerGroupConfig::new(1..=3));
+        group.start();
+        group.scale_up();
+        group.scale_up();
+        assert_eq!(group.active_consumers(), 3);
+        // Force scale_down of an idle (hanging-but-not-processing) consumer.
+        assert!(group.scale_down());
+        assert_eq!(group.active_consumers(), 2);
+
+        let mut tally = ShutdownTally::default();
+        let _ = tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+        group.abort_remaining_into(&mut tally).await;
+        // All handles, including the retired one, are now resolved.
+        assert_eq!(group.active_consumers(), 0);
+        assert!(group.retiring_is_empty());
+        assert_eq!(tally.panics, 0, "no spurious panics from cancelled handles");
     }
 
     #[tokio::test]

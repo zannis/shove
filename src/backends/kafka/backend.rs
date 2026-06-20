@@ -8,7 +8,15 @@
 //! `kafka` feature at the parent (`crate::backends`); no per-file cfg
 //! is needed here.
 
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
 use crate::autoscale_metrics::AutoscaleMetrics;
+use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
     RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
@@ -18,9 +26,6 @@ use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::markers::Kafka;
 use crate::topic::{SequencedTopic, Topic};
-use std::future::Future;
-use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 use super::autoscaler::{KafkaAutoscalerBackend, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 use super::client::{KafkaClient, KafkaConfig};
@@ -90,6 +95,16 @@ impl HasCoordinatedGroups for Kafka {
 
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl {
         KafkaConsumerGroupRegistry::new(client.clone())
+    }
+
+    fn spawn_autoscaler(
+        client: &Self::Client,
+        registry: Arc<Mutex<Self::RegistryImpl>>,
+        config: AutoscalerConfig,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut autoscaler = KafkaAutoscalerBackend::autoscaler(client.clone(), registry, config);
+        tokio::spawn(async move { autoscaler.run(shutdown).await })
     }
 }
 
@@ -231,26 +246,11 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
         self.default_handler_timeout = Some(timeout);
     }
 
-    async fn run_until_timeout<S>(mut self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
-    where
-        S: Future<Output = ()> + Send + 'static,
-    {
-        self.start_all();
+    fn start_all(&mut self) {
+        KafkaConsumerGroupRegistry::start_all(self);
+    }
 
-        let broker_token = self.client_shutdown_token();
-        let signal_handle = tokio::spawn(signal);
-        tokio::select! {
-            _ = broker_token.cancelled() => {}
-            res = signal_handle => {
-                let _ = res;
-                broker_token.cancel();
-            }
-        }
-
-        // Mirror the supervisor pattern in `ConsumerSupervisor::run_until_timeout`:
-        // accumulate the tally outside the timeout so a drain-timeout
-        // escalation can abort survivors and finish tallying instead of
-        // discarding what was already counted.
+    async fn drain_until_timeout(mut self, drain_timeout: Duration) -> SupervisorOutcome {
         let mut tally = ShutdownTally::default();
         match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
             Ok(()) => SupervisorOutcome {
@@ -271,5 +271,24 @@ impl RegistryImpl for KafkaConsumerGroupRegistry {
                 }
             }
         }
+    }
+
+    async fn run_until_timeout<S>(mut self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
+        self.start_all();
+
+        let broker_token = self.client_shutdown_token();
+        let signal_handle = tokio::spawn(signal);
+        tokio::select! {
+            _ = broker_token.cancelled() => {}
+            res = signal_handle => {
+                let _ = res;
+                broker_token.cancel();
+            }
+        }
+
+        self.drain_until_timeout(drain_timeout).await
     }
 }

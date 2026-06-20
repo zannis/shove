@@ -13,7 +13,7 @@ use crate::consumer::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY, HandlerTimeoutConfig,
     resolve_handler_timeout,
 };
-use crate::consumer_supervisor::ShutdownTally;
+use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metrics;
@@ -155,6 +155,10 @@ pub struct InMemoryConsumerGroup {
     /// task exits with a `JoinError` that is not a cancellation. Drained by
     /// [`InMemoryConsumerGroup::shutdown_with_tally`].
     pub(crate) panic_count: Arc<AtomicUsize>,
+    /// Handles of consumers removed by `scale_down`. Their tokens are already
+    /// cancelled; retained here so the final drain awaits/aborts and tallies
+    /// them instead of detaching the task.
+    pub(crate) retiring: Vec<JoinHandle<()>>,
 }
 
 impl InMemoryConsumerGroup {
@@ -193,6 +197,7 @@ impl InMemoryConsumerGroup {
             group_token,
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
+            retiring: Vec::new(),
         }
     }
 
@@ -263,6 +268,7 @@ impl InMemoryConsumerGroup {
             group_token,
             error_count,
             panic_count,
+            retiring: Vec::new(),
         }
     }
 
@@ -313,8 +319,9 @@ impl InMemoryConsumerGroup {
             return false;
         };
 
-        let (token, _, _handle) = self.consumers.swap_remove(index);
+        let (token, _, handle) = self.consumers.swap_remove(index);
         token.cancel();
+        self.retiring.push(handle);
 
         info!(
             group = %self.queue,
@@ -326,6 +333,11 @@ impl InMemoryConsumerGroup {
 
     pub fn active_consumers(&self) -> usize {
         self.consumers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retiring_is_empty(&self) -> bool {
+        self.retiring.is_empty()
     }
 
     pub fn queue(&self) -> &str {
@@ -378,11 +390,24 @@ impl InMemoryConsumerGroup {
         tally.panics += self.panic_count.swap(0, Ordering::Relaxed);
 
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_cancelled() => {}
                 Err(e) => {
                     tracing::error!(error = %e, group = %self.queue, "consumer task panicked");
+                    tally.panics += 1;
+                }
+            }
+        }
+
+        while let Some(handle) = self.retiring.pop() {
+            let _abort_guard = AbortOnDrop(handle.abort_handle());
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
                     tally.panics += 1;
                 }
             }
@@ -399,6 +424,9 @@ impl InMemoryConsumerGroup {
         for (_token, _processing, handle) in &self.consumers {
             handle.abort();
         }
+        for handle in &self.retiring {
+            handle.abort();
+        }
         while let Some((_token, _processing, handle)) = self.consumers.pop() {
             match handle.await {
                 Ok(()) => {}
@@ -409,6 +437,16 @@ impl InMemoryConsumerGroup {
                         group = %self.queue,
                         "consumer task panicked during abort escalation"
                     );
+                    tally.panics += 1;
+                }
+            }
+        }
+        while let Some(handle) = self.retiring.pop() {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => {
+                    tracing::error!(error = %e, group = %self.queue, "retired consumer task panicked");
                     tally.panics += 1;
                 }
             }
@@ -705,6 +743,7 @@ mod tests {
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
+            retiring: Vec::new(),
         }
     }
 
@@ -776,6 +815,7 @@ mod tests {
             group_token,
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
+            retiring: Vec::new(),
         }
     }
 
@@ -848,6 +888,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scale_down_handle_is_drained_not_detached() {
+        // A scaled-down consumer that hangs must still be aborted and counted,
+        // not silently detached. Use a hanging spawner so the retiring handle
+        // would leak under the old drop-the-handle behaviour.
+        let mut group = hanging_test_group(InMemoryConsumerGroupConfig::new(1..=3));
+        group.start();
+        group.scale_up();
+        group.scale_up();
+        assert_eq!(group.active_consumers(), 3);
+        // Force scale_down of an idle (hanging-but-not-processing) consumer.
+        assert!(group.scale_down());
+        assert_eq!(group.active_consumers(), 2);
+
+        let mut tally = ShutdownTally::default();
+        let _ = tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+        group.abort_remaining_into(&mut tally).await;
+        // All handles, including the retired one, are now resolved.
+        assert_eq!(group.active_consumers(), 0);
+        assert!(group.retiring_is_empty());
+    }
+
+    #[tokio::test]
     async fn registry_shutdown_all_with_tally_aggregates() {
         let mut registry = InMemoryConsumerGroupRegistry::from_groups(HashMap::new());
         registry.groups.insert("a".into(), panicking_group());
@@ -859,5 +921,50 @@ mod tests {
         let tally = registry.shutdown_all_with_tally().await;
         // 2 groups × 2 panicking consumers = 4 panics.
         assert_eq!(tally.panics, 4);
+    }
+
+    /// Verify that a handle popped from `consumers` but not yet awaited is
+    /// ABORTED (not detached) when the outer drain timeout fires.
+    ///
+    /// The sentinel's `Drop` fires only when the task future is dropped, which
+    /// happens on abort. If the handle is detached instead the sentinel never
+    /// drops within the test window and the assertion fails.
+    #[tokio::test]
+    async fn drain_into_aborts_inflight_handle_on_timeout() {
+        use std::sync::atomic::AtomicBool;
+
+        struct AbortSentinel(Arc<AtomicBool>);
+        impl Drop for AbortSentinel {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let aborted_clone = Arc::clone(&aborted);
+
+        let mut group = test_group(InMemoryConsumerGroupConfig::new(1..=1));
+        // Replace spawner with one that holds a sentinel and then hangs.
+        group.spawner = Arc::new(move |_options: ConsumerOptionsInner| {
+            let flag = Arc::clone(&aborted_clone);
+            tokio::spawn(async move {
+                let _sentinel = AbortSentinel(flag);
+                std::future::pending::<()>().await;
+            })
+        });
+        group.start();
+
+        let mut tally = ShutdownTally::default();
+        // Mirror how drain_until_timeout drives drain_into.
+        let _ = tokio::time::timeout(Duration::from_millis(50), group.drain_into(&mut tally)).await;
+
+        // Give the runtime a tick to deliver the abort signal and drop the future.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert!(
+            aborted.load(Ordering::Acquire),
+            "AbortSentinel must have been dropped: the in-flight handle was detached, not aborted"
+        );
     }
 }

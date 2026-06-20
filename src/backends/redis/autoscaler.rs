@@ -423,6 +423,7 @@ mod tests {
                 group_token,
                 error_count: Arc::new(AtomicUsize::new(0)),
                 panic_count: Arc::new(AtomicUsize::new(0)),
+                retiring: Vec::new(),
             };
             if started {
                 g.start();

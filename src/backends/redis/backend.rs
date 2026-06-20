@@ -8,16 +8,19 @@
 //! re-implemented here.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
+use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
     AutoscalerBackendImpl, Backend, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
     capability::HasCoordinatedGroups, sealed,
 };
-use crate::consumer_supervisor::SupervisorOutcome;
+use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
 use crate::handler::MessageHandler;
 use crate::markers::Redis;
@@ -90,6 +93,16 @@ impl HasCoordinatedGroups for Redis {
     fn make_registry(client: &Self::Client) -> Self::RegistryImpl {
         RedisConsumerGroupRegistry::new(client.clone())
     }
+
+    fn spawn_autoscaler(
+        client: &Self::Client,
+        registry: Arc<Mutex<Self::RegistryImpl>>,
+        config: AutoscalerConfig,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut autoscaler = RedisAutoscalerBackend::autoscaler(client.clone(), registry, config);
+        tokio::spawn(async move { autoscaler.run(shutdown).await })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,10 +156,49 @@ impl RegistryImpl for RedisConsumerGroupRegistry {
         self.default_handler_timeout = Some(timeout);
     }
 
-    async fn run_until_timeout<S>(self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
+    fn start_all(&mut self) {
+        RedisConsumerGroupRegistry::start_all(self);
+    }
+
+    async fn drain_until_timeout(mut self, drain_timeout: Duration) -> SupervisorOutcome {
+        let mut tally = ShutdownTally::default();
+        match tokio::time::timeout(drain_timeout, self.drain_all_into(&mut tally)).await {
+            Ok(()) => SupervisorOutcome {
+                errors: tally.errors,
+                panics: tally.panics,
+                timed_out: false,
+            },
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = drain_timeout.as_millis() as u64,
+                    "drain timeout elapsed; aborting surviving consumer tasks"
+                );
+                self.abort_all_remaining_into(&mut tally).await;
+                SupervisorOutcome {
+                    errors: tally.errors,
+                    panics: tally.panics,
+                    timed_out: true,
+                }
+            }
+        }
+    }
+
+    async fn run_until_timeout<S>(mut self, signal: S, drain_timeout: Duration) -> SupervisorOutcome
     where
         S: Future<Output = ()> + Send + 'static,
     {
-        RedisConsumerGroupRegistry::run_until_timeout(self, signal, drain_timeout).await
+        self.start_all();
+
+        let shutdown = self.broker_shutdown_token();
+        let signal_handle = tokio::spawn(signal);
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            res = signal_handle => {
+                let _ = res;
+                shutdown.cancel();
+            }
+        }
+
+        self.drain_until_timeout(drain_timeout).await
     }
 }

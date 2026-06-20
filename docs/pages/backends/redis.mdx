@@ -89,7 +89,7 @@ group
     .await?;
 ```
 
-`RedisConsumerGroupConfig::new(min..=max)` mirrors the other coordinated-group backends. The registry spawns `min_consumers` tasks at start; `max_consumers` is the ceiling reserved for a future autoscaler. Each task polls its assigned shard stream with `XREADGROUP BLOCK COUNT prefetch_count`.
+`RedisConsumerGroupConfig::new(min..=max)` mirrors the other coordinated-group backends. The registry starts `min_consumers` tasks; `max_consumers` is the ceiling the autoscaler scales up to based on stream backlog (enable it with [`enable_autoscaling`](/guides/groups#enabling-autoscaling)). Each task polls its assigned shard stream with `XREADGROUP BLOCK COUNT prefetch_count`.
 
 - **`.with_prefetch_count(N)`** — the `COUNT` argument to XREADGROUP. With concurrent processing on, also the in-flight cap per consumer task. Default: 10.
 - **`.with_concurrent_processing(true)`** — dispatch each fetched message to its own tokio task with a per-task multiplexed connection for outcome routing. A semaphore caps in-flight handlers at `prefetch_count`. Default: `false` (handlers serialize via prefetch clamped to 1).

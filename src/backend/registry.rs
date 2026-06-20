@@ -75,6 +75,19 @@ pub(crate) trait RegistryImpl: Send {
     /// backend exposes it).
     fn set_default_handler_timeout(&mut self, timeout: Duration);
 
+    /// Spawn each registered group's `min_consumers` consumer tasks. Idempotent
+    /// per group is NOT guaranteed — call exactly once before draining.
+    fn start_all(&mut self);
+
+    /// Drain already-started consumers: fire shutdown, await up to
+    /// `drain_timeout`, abort survivors, return the tally. Does NOT call
+    /// `start_all`. Used by both `run_until_timeout` and the autoscaling path
+    /// so the drain machinery is shared and never double-starts consumers.
+    fn drain_until_timeout(
+        self,
+        drain_timeout: Duration,
+    ) -> impl Future<Output = SupervisorOutcome> + Send;
+
     /// Run the registered consumer-group loops until `signal` resolves or
     /// the group's cancellation token fires, then drain in-flight work
     /// with a bounded grace window and return a `SupervisorOutcome`.

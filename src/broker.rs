@@ -120,7 +120,7 @@ impl<B: Backend> Broker<B> {
 
 impl<B: HasCoordinatedGroups> Broker<B> {
     pub fn consumer_group(&self) -> ConsumerGroup<B> {
-        ConsumerGroup::new(B::make_registry(&self.client))
+        ConsumerGroup::new(B::make_registry(&self.client), self.client.clone())
     }
 }
 

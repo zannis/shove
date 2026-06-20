@@ -255,6 +255,14 @@ define_topic!(
         .build()
 );
 
+// Topic for consumer-group autoscaling via enable_autoscaling — no DLQ so
+// dropped messages surface immediately in the processed count assertion.
+define_topic!(
+    ConsumerGroupAutoscalingTopic,
+    SimpleMessage,
+    TopologyBuilder::new("test-cg-autoscaling").build()
+);
+
 // Topic for retry tests
 define_topic!(
     RetryWork,
@@ -5867,5 +5875,109 @@ async fn publisher_single_channel_pool_does_not_serialize_concurrent_publishes()
          if durations are similar the Mutex<Channel> is still held during the confirm await"
     );
 
+    ctx.cleanup().await;
+}
+
+// ===========================================================================
+// Consumer-group autoscaling via `enable_autoscaling` + `spawn_autoscaler`
+// ===========================================================================
+
+/// Autoscaling lifecycle via the generic `ConsumerGroup::enable_autoscaling` API.
+///
+/// Exercises:
+/// - `HasCoordinatedGroups::spawn_autoscaler` for RabbitMQ (infallible bridge path)
+/// - `RabbitMqConsumerGroup::retiring` drain path after scale-down
+/// - Clean drain: all published messages processed, no DLQ messages
+#[tokio::test]
+async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
+    use std::sync::atomic::AtomicUsize;
+
+    let ctx = TestContext::new().await;
+
+    // Connect with management config so spawn_autoscaler can poll queue stats.
+    let config = ctx.rmq_config().with_management(ctx.mgmt_config());
+    let broker = Broker::<RabbitMqMarker>::new(config).await.unwrap();
+
+    broker
+        .topology()
+        .declare::<ConsumerGroupAutoscalingTopic>()
+        .await
+        .unwrap();
+
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    let mut group = broker.consumer_group();
+    {
+        let processed = processed.clone();
+        group
+            .register::<ConsumerGroupAutoscalingTopic, _>(
+                ConsumerGroupConfig::new(
+                    RabbitMqConsumerGroupConfig::new(1..=4).with_prefetch_count(1),
+                ),
+                move || {
+                    #[derive(Clone)]
+                    struct SlowHandler(Arc<AtomicUsize>);
+                    impl MessageHandler<ConsumerGroupAutoscalingTopic> for SlowHandler {
+                        type Context = ();
+                        async fn handle(
+                            &self,
+                            _: SimpleMessage,
+                            _: MessageMetadata,
+                            _: &(),
+                        ) -> Outcome {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            self.0.fetch_add(1, Ordering::Relaxed);
+                            Outcome::Ack
+                        }
+                    }
+                    SlowHandler(processed.clone())
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Publish a burst large enough to build a sustained backlog.
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..20u32 {
+        publisher
+            .publish::<ConsumerGroupAutoscalingTopic>(&SimpleMessage {
+                body: format!("cg-as-{i}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Give management API time to reflect the queued messages before the
+    // autoscaler's first poll fires.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let cfg = AutoscalerConfig {
+        poll_interval: Duration::from_millis(300),
+        scale_up_multiplier: 1.5,
+        scale_down_multiplier: 0.3,
+        hysteresis_duration: Duration::from_millis(300),
+        cooldown_duration: Duration::from_millis(500),
+    };
+
+    // Run for 12 s — enough time for autoscaler to scale up and drain the
+    // 20-message backlog (20 * 200 ms / 4 consumers = ~1 s when at max).
+    let signal = tokio::time::sleep(Duration::from_millis(12_000));
+    let outcome = group
+        .enable_autoscaling(cfg)
+        .run_until_timeout(signal, Duration::from_secs(20))
+        .await;
+
+    assert!(
+        outcome.is_clean(),
+        "autoscaling group must drain cleanly; outcome: {outcome:?}"
+    );
+    assert_eq!(
+        processed.load(Ordering::Relaxed),
+        20,
+        "all 20 published messages must be handled before the group drains"
+    );
+
+    broker.close().await;
     ctx.cleanup().await;
 }

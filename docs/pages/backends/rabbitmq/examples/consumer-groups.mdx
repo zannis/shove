@@ -1,6 +1,6 @@
 # RabbitMQ — Consumer Groups
 
-Use this when you want to see the RabbitMQ autoscaler in action: start at one consumer, watch the count climb as queue depth rises, and watch it fall once the queue drains. The example exercises the full autoscaler stack — registry, config, management client, and scale signals — showing how `shove` adapts consumer count to actual load.
+Use this when you want to see the RabbitMQ autoscaler in action: start at one consumer, watch the count climb as queue depth rises, and watch it fall once the queue drains. The example uses the one-line `enable_autoscaling` API, showing how `shove` adapts consumer count to actual load with the autoscaler lifecycle folded into `run_until_timeout`.
 
 ## Prerequisites
 
@@ -15,24 +15,18 @@ cargo run --example rabbitmq_consumer_groups --features rabbitmq
 
 ## Expected output
 
-Consumer count will climb from 1 toward 5 as the queue fills, then fall back after the queue drains. The monitor loop prints active consumer count every 3 seconds:
+Consumer count climbs from 1 toward 5 as the queue fills, then falls back after the queue drains. With `RUST_LOG=shove=info` the autoscaler's scale decisions are logged as `scaled up: spawned new consumer` / `scaled down: cancelled an idle consumer`:
 
 ```text
-published 100 tasks
+published 100 tasks; starting group with autoscaling (min=1, max=5)
 
-consumer group started (min_consumers=1)
-
-autoscaler running — watch consumer count change
-
-[monitor] active_consumers=1 queue=ex-work-queue
-[monitor] active_consumers=3 queue=ex-work-queue
-[monitor] active_consumers=5 queue=ex-work-queue
-[monitor] active_consumers=5 queue=ex-work-queue
-[monitor] active_consumers=2 queue=ex-work-queue
-[monitor] active_consumers=1 queue=ex-work-queue
+[worker] task=TASK-000 attempt=1
+INFO shove: scaled up: spawned new consumer group=ex-work-queue consumers=2
+INFO shove: scaled up: spawned new consumer group=ex-work-queue consumers=5
 ...
-shutting down...
-done
+INFO shove: scaled down: cancelled an idle consumer group=ex-work-queue consumers=1
+
+shutdown complete: SupervisorOutcome { errors: 0, panics: 0, timed_out: false }
 ```
 
 Exact counts and timing depend on system load and the autoscaler's poll interval.
@@ -45,25 +39,25 @@ Exact counts and timing depend on system load and the autoscaler's poll interval
 
 ## Walkthrough
 
-### `ConsumerGroupRegistry` and `ConsumerGroupConfig`
+### Group and `ConsumerGroupConfig`
 
-`ConsumerGroupRegistry::new(client)` manages named groups of identical consumers. `registry.register::<WorkQueue, TaskHandler>(config, factory, ctx)` wires `TaskHandler` to `WorkQueue` with `ConsumerGroupConfig::new(1..=5)` — a range from one minimum to five maximum consumers. `.with_prefetch_count(10)` lets each consumer hold up to 10 messages at a time, giving a capacity of `consumers × 10` at any given scale. `registry.start_all()` spawns the minimum number of consumers immediately.
+`broker.consumer_group()` returns a coordinated group registry. `group.register::<WorkQueue, TaskHandler>(config, factory)` wires `TaskHandler` to `WorkQueue` with `RabbitMqConsumerGroupConfig::new(1..=5)` — a range from one minimum to five maximum consumers. `.with_prefetch_count(10)` lets each consumer hold up to 10 messages at a time, giving a capacity of `consumers × 10` at any given scale.
 
-### Autoscaler wiring
+### Enabling autoscaling
 
-`RabbitMqAutoscalerBackend::autoscaler(&mgmt_config, registry, autoscaler_config)` creates an autoscaler that polls the RabbitMQ Management HTTP API every `poll_interval` (2 s). The scaling logic is pure arithmetic: scale up when `messages_ready > capacity × scale_up_multiplier` (1.5), scale down when `messages_ready < capacity × scale_down_multiplier` (0.3). `hysteresis_duration` (4 s) prevents flapping by requiring the condition to hold before acting; `cooldown_duration` (8 s) prevents consecutive scale events from interfering.
+`group.enable_autoscaling(auto)` switches the autoscaler on. It polls the RabbitMQ Management HTTP API every `poll_interval` (2 s). The scaling logic is pure arithmetic: scale up when `messages_ready > capacity × scale_up_multiplier` (1.5), scale down when `messages_ready < capacity × scale_down_multiplier` (0.3). `hysteresis_duration` (4 s) prevents flapping by requiring the condition to hold before acting; `cooldown_duration` (8 s) prevents consecutive scale events from interfering.
 
 ### Management API configuration
 
-`ManagementConfig::new(url, username, password)` points the autoscaler at the RabbitMQ Management API running on port 15672. The management plugin is enabled by default in the `testcontainers-modules` RabbitMQ image. In production this URL and credentials would come from environment variables.
+The autoscaler reads its management credentials from the client, so the `RabbitMqConfig` is built with `.with_management(ManagementConfig::new(url, username, password))`, pointing at the RabbitMQ Management API on port 15672. The management plugin is enabled by default in the `testcontainers-modules` RabbitMQ image. In production this URL and credentials would come from environment variables.
 
-### Monitor loop and shutdown
+### Lifecycle and shutdown
 
-The main task loops 20 times at 3-second intervals, locking the registry and calling `group.active_consumers()` to print the current scale. After the loop `registry.shutdown_all()` gracefully stops every consumer group (draining in-flight messages), then `client.shutdown()` closes the AMQP connection. The autoscaler task is joined last to ensure it does not attempt to poll after the connection closes.
+`run_until_timeout(shutdown_signal(), drain_timeout)` owns the whole lifecycle: it starts the consumers, spawns the autoscaler against the group's own registry, and — when `shutdown_signal` fires — stops and joins the autoscaler before draining the consumers. The returned `SupervisorOutcome` carries the error/panic/timeout tally; `std::process::exit(outcome.exit_code())` maps it to a process exit code.
 
 ## What to try next
 
-- Lower `handler_delay` to 50 ms — the queue drains faster and the autoscaler may not have time to scale up before it triggers scale-down.
+- Lower the handler delay to 50 ms — the queue drains faster and the autoscaler may not have time to scale up before it triggers scale-down.
 - Raise `scale_up_multiplier` to 5.0 — the autoscaler requires a much deeper backlog before adding consumers.
-- Set `min..=max` to `3..=3` — disables autoscaling and processes with a fixed pool of 3 workers.
+- Set `min..=max` to `3..=3` — pins the pool at 3 workers; with min == max the autoscaler has no room to move.
 - See [Guides: Groups](/guides/groups) for an explanation of how consumer groups distribute load across workers.

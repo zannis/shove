@@ -56,6 +56,9 @@ pub(crate) struct MetricNames {
     pub message_size_bytes: String,
     pub messages_inflight: String,
     pub autoscaler_decisions_total: String,
+    pub autoscaler_messages_ready: String,
+    pub autoscaler_messages_in_flight: String,
+    pub autoscaler_active_consumers: String,
     pub backend_errors_total: String,
 }
 
@@ -72,6 +75,9 @@ pub(crate) fn names() -> &'static MetricNames {
             message_size_bytes: format!("{p}_message_size_bytes"),
             messages_inflight: format!("{p}_messages_inflight"),
             autoscaler_decisions_total: format!("{p}_autoscaler_decisions_total"),
+            autoscaler_messages_ready: format!("{p}_autoscaler_messages_ready"),
+            autoscaler_messages_in_flight: format!("{p}_autoscaler_messages_in_flight"),
+            autoscaler_active_consumers: format!("{p}_autoscaler_active_consumers"),
             backend_errors_total: format!("{p}_backend_errors_total"),
         }
     })
@@ -382,6 +388,34 @@ pub(crate) fn record_autoscaler_decision(group: &str, direction: &'static str) {
 pub(crate) fn record_autoscaler_decision(_: &str, _: &'static str) {}
 
 #[cfg(feature = "metrics")]
+pub(crate) fn record_autoscaler_backlog(
+    group: &str,
+    messages_ready: u64,
+    messages_in_flight: u64,
+    active_consumers: u16,
+) {
+    ::metrics::gauge!(
+        names().autoscaler_messages_ready.as_str(),
+        "consumer_group" => group.to_string(),
+    )
+    .set(messages_ready as f64);
+    ::metrics::gauge!(
+        names().autoscaler_messages_in_flight.as_str(),
+        "consumer_group" => group.to_string(),
+    )
+    .set(messages_in_flight as f64);
+    ::metrics::gauge!(
+        names().autoscaler_active_consumers.as_str(),
+        "consumer_group" => group.to_string(),
+    )
+    .set(active_consumers as f64);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_autoscaler_backlog(_: &str, _: u64, _: u64, _: u16) {}
+
+#[cfg(feature = "metrics")]
 pub(crate) fn record_backend_error(backend: BackendLabel, kind: BackendErrorKind) {
     ::metrics::counter!(
         names().backend_errors_total.as_str(),
@@ -467,6 +501,23 @@ mod tests {
         assert_eq!(BackendErrorKind::Consume.as_label(), "consume");
         assert_eq!(BackendErrorKind::Topology.as_label(), "topology");
         assert_eq!(BackendErrorKind::Ack.as_label(), "ack");
+    }
+
+    #[test]
+    fn autoscaler_backlog_gauge_names_use_default_prefix() {
+        let n = names();
+        assert_eq!(
+            n.autoscaler_messages_ready.as_str(),
+            "shove_autoscaler_messages_ready"
+        );
+        assert_eq!(
+            n.autoscaler_messages_in_flight.as_str(),
+            "shove_autoscaler_messages_in_flight"
+        );
+        assert_eq!(
+            n.autoscaler_active_consumers.as_str(),
+            "shove_autoscaler_active_consumers"
+        );
     }
 
     #[cfg(feature = "kafka-schema-registry")]

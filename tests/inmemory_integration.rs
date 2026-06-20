@@ -1908,3 +1908,110 @@ async fn consumer_group_register_fifo_auto_declares_topology() {
     assert!(outcome.is_clean(), "outcome: {outcome:?}");
     assert_eq!(consumed.load(Ordering::Relaxed), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Autoscaling vertical slice — backlog triggers scale-up, then drains clean
+// ---------------------------------------------------------------------------
+
+/// A dedicated topic for the autoscaling integration test so it does not share
+/// the "group-int" queue with other tests running in the same process.
+struct AutoscalingTopic;
+impl Topic for AutoscalingTopic {
+    type Message = Ping;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("autoscaling-int").dlq().build())
+    }
+}
+
+#[tokio::test]
+async fn autoscaling_scales_up_under_backlog_then_drains_clean() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
+    broker
+        .topology()
+        .declare::<AutoscalingTopic>()
+        .await
+        .unwrap();
+
+    let processed = Arc::new(AtomicUsize::new(0));
+
+    let mut group = broker.consumer_group();
+    {
+        let processed = processed.clone();
+        group
+            .register::<AutoscalingTopic, _>(
+                ConsumerGroupConfig::new(
+                    InMemoryConsumerGroupConfig::new(1..=4).with_prefetch_count(1),
+                ),
+                move || {
+                    #[derive(Clone)]
+                    struct SlowHandler(Arc<AtomicUsize>);
+                    impl MessageHandler<AutoscalingTopic> for SlowHandler {
+                        type Context = ();
+                        async fn handle(&self, _: Ping, _: MessageMetadata, _: &()) -> Outcome {
+                            // Slow enough that a burst of 40 messages accumulates
+                            // a backlog and pushes messages_ready above
+                            // capacity × scale_up_multiplier (1 × 1 × 1.5 = 1.5).
+                            tokio::time::sleep(Duration::from_millis(75)).await;
+                            self.0.fetch_add(1, Ordering::Relaxed);
+                            Outcome::Ack
+                        }
+                    }
+                    SlowHandler(processed.clone())
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // Publish a burst large enough to build a sustained backlog.
+    let publisher = broker.publisher().await.unwrap();
+    for i in 0..40u32 {
+        publisher
+            .publish::<AutoscalingTopic>(&Ping(i))
+            .await
+            .unwrap();
+    }
+
+    // AutoscalerConfig tuned for a fast test:
+    //   poll_interval 100ms — several polls happen within the 2-3 s window.
+    //   scale_up_multiplier 1.5 — with prefetch=1, even 2 ready messages triggers
+    //   scale-up once hysteresis elapses.
+    //   hysteresis_duration 100ms — condition must persist 100ms before action.
+    //   cooldown_duration 200ms — allows multiple scale-up steps during the run.
+    let cfg = AutoscalerConfig {
+        poll_interval: Duration::from_millis(100),
+        scale_up_multiplier: 1.5,
+        scale_down_multiplier: 0.3,
+        hysteresis_duration: Duration::from_millis(100),
+        cooldown_duration: Duration::from_millis(200),
+    };
+
+    // Signal fires after 2.5 s — enough for several autoscaler poll cycles and
+    // for the 40-message backlog to drain across scaled-up consumers.
+    let signal = tokio::time::sleep(Duration::from_millis(2500));
+    let outcome = group
+        .enable_autoscaling(cfg)
+        .run_until_timeout(signal, Duration::from_secs(5))
+        .await;
+
+    assert_eq!(
+        outcome.exit_code(),
+        0,
+        "autoscaling group must drain cleanly; outcome: {outcome:?}"
+    );
+
+    // NOTE: The InMemory ConsumerGroup<B> wrapper does not expose a public
+    // API to observe the peak active consumer count from outside the group
+    // (no pub method on the generic wrapper for registry introspection).
+    // Scaling behaviour — that the autoscaler fires ScaleUp decisions and
+    // actually spawns additional consumers — is covered by the unit tests in
+    // src/autoscaler.rs and the lower-level integration test
+    // `autoscaler_scales_up_under_backlog` which uses the raw
+    // InMemoryConsumerGroupRegistry. This test verifies the full integrated
+    // lifecycle: broker setup → topic declaration → consumer group registration
+    // → autoscaling enabled → backlog published → signal → clean drain.
+}
