@@ -1,0 +1,19 @@
+README.md
+  s_2559c271837ef4::t_945061f22aa6be 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "252fc6a362f567159ec431ba2e7c77e45d461962",
+  "prompts": {},
+  "sessions": {
+    "s_2559c271837ef4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "21accac9-5ae8-496f-b2dd-993ebb2f3e10",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
