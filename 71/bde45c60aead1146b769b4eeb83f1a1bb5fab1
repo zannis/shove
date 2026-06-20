@@ -1,0 +1,24 @@
+src/backends/nats/client.rs
+  s_3efee2bbade155::t_8dfe0b48b83815 82,85
+  s_3efee2bbade155::t_dfe5d4300c6464 337,344,347-349
+src/schema_registry/client.rs
+  s_3efee2bbade155::t_442b1aab6d9832 339-363
+  s_3efee2bbade155::t_dd7796b0986626 26-41
+  s_3efee2bbade155::t_bff25f02190f4e 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "71bde45c60aead1146b769b4eeb83f1a1bb5fab1",
+  "prompts": {},
+  "sessions": {
+    "s_3efee2bbade155": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8ca34d5-db28-4a80-938e-fe6afee1f006",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
