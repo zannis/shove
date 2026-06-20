@@ -244,15 +244,21 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
     pub async fn run(&mut self, shutdown: CancellationToken) {
         tracing::info!("autoscaler started");
         loop {
+            // Race the whole sleep+poll cycle against shutdown so a cancel that
+            // arrives mid-poll drops the in-flight `poll_and_scale` future
+            // before it can issue any further `scale` command. Without this,
+            // a poll already past the `sleep` arm would run to completion and
+            // could scale the group after shutdown has begun.
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => {
                     tracing::info!("autoscaler shutting down");
                     return;
                 }
-                _ = tokio::time::sleep(self.poll_interval) => {
+                _ = async {
+                    tokio::time::sleep(self.poll_interval).await;
                     self.poll_and_scale().await;
-                }
+                } => {}
             }
         }
     }
@@ -448,6 +454,72 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), autoscaler.run(token))
             .await
             .expect("run() should return promptly after shutdown token is cancelled");
+    }
+
+    #[tokio::test]
+    async fn autoscaler_does_not_scale_after_shutdown_mid_poll() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        // A backend that parks forever in `fetch_metrics`, signalling once it
+        // has entered the poll. Cancelling shutdown while the poll is parked
+        // must drop the poll before `scale` is ever reached.
+        struct BlockingBackend {
+            in_fetch: Arc<Notify>,
+            scaled: Arc<AtomicBool>,
+        }
+
+        impl AutoscalerBackend for BlockingBackend {
+            type GroupId = String;
+
+            async fn list_groups(&self) -> Result<Vec<Self::GroupId>> {
+                Ok(vec!["group-a".into()])
+            }
+
+            async fn fetch_metrics(&self, _group: &Self::GroupId) -> Result<ScalingMetrics> {
+                self.in_fetch.notify_one();
+                std::future::pending().await
+            }
+
+            async fn scale(
+                &self,
+                _group: &Self::GroupId,
+                _decision: ScalingDecision,
+            ) -> Result<()> {
+                self.scaled.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let in_fetch = Arc::new(Notify::new());
+        let scaled = Arc::new(AtomicBool::new(false));
+        let backend = BlockingBackend {
+            in_fetch: in_fetch.clone(),
+            scaled: scaled.clone(),
+        };
+        let strategy = Stabilized::new(
+            ThresholdStrategy::default(),
+            Duration::from_secs(0),
+            Duration::from_secs(0),
+        );
+        // poll_interval 0 so the poll starts immediately.
+        let mut autoscaler = Autoscaler::new(backend, strategy, Duration::from_secs(0));
+        let token = CancellationToken::new();
+        let run_token = token.clone();
+        let run = tokio::spawn(async move { autoscaler.run(run_token).await });
+
+        // Wait until the poll is parked inside fetch_metrics, then cancel.
+        in_fetch.notified().await;
+        token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("run() must return promptly even with a poll in flight")
+            .expect("run task panicked");
+        assert!(
+            !scaled.load(Ordering::SeqCst),
+            "scale must not be issued once shutdown has begun"
+        );
     }
 
     #[test]
