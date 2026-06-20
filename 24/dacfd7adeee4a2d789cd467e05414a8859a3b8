@@ -1,0 +1,29 @@
+CONTRIBUTING.md
+  s_3efee2bbade155::t_eefea4cb508487 8
+.github/workflows/ci.yml
+  s_3efee2bbade155::t_edb01f696a8a62 53-62
+rust-toolchain.toml
+  s_3efee2bbade155::t_f6fb272a64d581 1-3
+README.md
+  s_3efee2bbade155::t_0f265b53e3cbe4 129
+Cargo.toml
+  s_3efee2bbade155::t_4f7e212f0b3da3 6
+src/backends/rabbitmq/consumer.rs
+  s_3efee2bbade155::t_7d33363eef1ad2 444-445,447-450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "24dacfd7adeee4a2d789cd467e05414a8859a3b8",
+  "prompts": {},
+  "sessions": {
+    "s_3efee2bbade155": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d8ca34d5-db28-4a80-938e-fe6afee1f006",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
