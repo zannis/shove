@@ -50,6 +50,25 @@ jobs:
       - run: cargo test --no-default-features
       - run: cargo publish --dry-run --all-features
 
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install --locked --quiet cargo-audit
+      # cargo-audit re-clones the advisory DB on every run by default; caching
+      # it keyed by run id keeps a fresh DB but skips the ~30s git clone.
+      - name: Cache RustSec advisory DB
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/advisory-db
+          key: cargo-audit-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-audit-db-${{ runner.os }}-
+      - name: RustSec audit
+        run: cargo audit --deny warnings
+
   coverage:
     runs-on: ubuntu-latest
     permissions:
