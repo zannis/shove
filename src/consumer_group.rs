@@ -13,6 +13,8 @@ use crate::backend::capability::HasCoordinatedGroups;
 use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
+#[cfg(feature = "kafka")]
+use crate::markers::Kafka;
 use crate::topic::{SequencedTopic, Topic};
 
 pub struct ConsumerGroup<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static = ()> {
@@ -237,6 +239,25 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         let mut outcome = inner.drain_until_timeout(drain_timeout).await;
         outcome.panics += autoscaler_panics;
         outcome
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+impl<Ctx: Clone + Send + Sync + 'static> ConsumerGroup<Kafka, Ctx> {
+    /// Replication factor applied to every topic auto-declared when a group is
+    /// registered via [`register`](Self::register) / [`register_fifo`](Self::register_fifo).
+    /// Defaults to `1` (single-broker dev) when unset; production clusters
+    /// should set `>= 3`. Mirrors [`with_default_handler_timeout`](Self::with_default_handler_timeout):
+    /// a registry-level default reached directly from `broker.consumer_group()`
+    /// instead of only via the low-level `KafkaConsumerGroupRegistry`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 1`.
+    pub fn with_default_replication_factor(mut self, n: i32) -> Self {
+        self.inner = self.inner.with_default_replication_factor(n);
+        self
     }
 }
 

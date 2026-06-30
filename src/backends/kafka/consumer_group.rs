@@ -166,7 +166,9 @@ impl KafkaConsumerGroupConfig {
     /// partitions.
     ///
     /// This overrides only the rdkafka `group.id`; the group is still
-    /// identified within the registry by the topic name.
+    /// identified within the registry by the topic name. A FIFO group rebases
+    /// onto the override as `"{group}-fifo"` so a custom group does not
+    /// re-collide on the default `"{queue}-fifo"`.
     pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
         self.group_id = Some(group_id.into());
         self
@@ -189,6 +191,23 @@ impl KafkaConsumerGroupConfig {
         self.group_id
             .clone()
             .unwrap_or_else(|| super::constants::consumer_group_id(queue))
+    }
+
+    /// Resolves the broker-side FIFO consumer group ID for `queue`. When an
+    /// override is set via [`with_group_id`] the FIFO group is rebased onto it
+    /// as `"{group}-fifo"`, so a custom group does not re-collide on the
+    /// default `"{queue}-fifo"`. Otherwise falls back to that default.
+    ///
+    /// Like [`resolved_group_id`], this is the single source the FIFO consumer
+    /// and the autoscaler both resolve through.
+    ///
+    /// [`with_group_id`]: Self::with_group_id
+    /// [`resolved_group_id`]: Self::resolved_group_id
+    pub(crate) fn resolved_fifo_group_id(&self, queue: &str) -> String {
+        match self.group_id.as_deref() {
+            Some(base) => super::constants::fifo_group_id_from_base(base),
+            None => super::constants::consumer_group_id_fifo(queue),
+        }
     }
 
     /// Override the rdkafka `auto.offset.reset` policy for this consumer
@@ -288,8 +307,11 @@ pub struct KafkaConsumerGroup {
     pub(crate) queue: String,
     /// The Kafka consumer group ID actually used by broker-side consumers.
     /// Standard consumers: `"{queue}-consumer"`. FIFO consumers: `"{queue}-fifo"`.
-    /// Stored here so the autoscaler can query committed offsets under the
-    /// correct group without re-deriving it.
+    /// A [`with_group_id`] override rebases these to the override and
+    /// `"{group}-fifo"` respectively. Stored here so the autoscaler can query
+    /// committed offsets under the correct group without re-deriving it.
+    ///
+    /// [`with_group_id`]: KafkaConsumerGroupConfig::with_group_id
     pub(crate) group_id: String,
     pub(crate) config: KafkaConsumerGroupConfig,
     pub(crate) spawner: Spawner,
@@ -435,7 +457,11 @@ impl KafkaConsumerGroup {
         });
 
         let queue_str: String = queue.into();
-        let group_id = super::constants::consumer_group_id_fifo(&queue_str);
+        // Honor the per-group `with_group_id` override on the FIFO path too, so
+        // the autoscaler queries committed offsets under the same `{group}-fifo`
+        // the broker-side FIFO consumer joins. Both resolve through
+        // `fifo_group_id_from_base` — same arch-K-1 guard as the standard path.
+        let group_id = config.resolved_fifo_group_id(&queue_str);
         Self {
             queue: queue_str,
             group_id,
@@ -524,8 +550,9 @@ impl KafkaConsumerGroup {
     ///
     /// Standard consumers return `"{queue}-consumer"` (or the override supplied
     /// via [`KafkaConsumerGroupConfig::with_group_id`]); FIFO consumers return
-    /// `"{queue}-fifo"`. The autoscaler uses this to query committed offsets
-    /// under the correct group — never re-derive it from the queue name.
+    /// `"{queue}-fifo"` (or `"{group}-fifo"` under an override). The autoscaler
+    /// uses this to query committed offsets under the correct group — never
+    /// re-derive it from the queue name.
     pub fn group_id(&self) -> &str {
         &self.group_id
     }
@@ -1264,6 +1291,23 @@ mod tests {
     fn resolved_group_id_falls_back_to_default_derivation() {
         let cfg = KafkaConsumerGroupConfig::new(1..=1);
         assert_eq!(cfg.resolved_group_id("orders"), "orders-consumer");
+    }
+
+    // The override must also rebase the FIFO group so a custom group does not
+    // re-collide on `{queue}-fifo`. Both `new_fifo` (the value the autoscaler
+    // queries) and `spawn_fifo_shards` (the value the broker-side consumer
+    // joins) resolve through this single method — same arch-K-1 guard as the
+    // standard path.
+    #[test]
+    fn resolved_fifo_group_id_returns_suffixed_override_when_set() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
+        assert_eq!(cfg.resolved_fifo_group_id("orders"), "my-service-fifo");
+    }
+
+    #[test]
+    fn resolved_fifo_group_id_falls_back_to_default_derivation() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(cfg.resolved_fifo_group_id("orders"), "orders-fifo");
     }
 
     // -- auto.offset.reset --

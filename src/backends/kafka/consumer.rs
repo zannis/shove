@@ -1372,7 +1372,15 @@ impl KafkaConsumer {
         // Kafka naturally provides per-partition ordering. A single consumer
         // processing one message at a time guarantees FIFO per key (all
         // messages for the same key land in the same partition).
-        let group_id = format!("{queue}-fifo");
+        //
+        // Honor the `group.id` override (registry: set by `spawn_one` from
+        // `KafkaConsumerGroupConfig::with_group_id`; direct: set by
+        // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing onto it as
+        // `{group}-fifo`. `None` keeps the default `{queue}-fifo`.
+        let group_id = match options.kafka_group_id.as_deref() {
+            Some(base) => super::constants::fifo_group_id_from_base(base),
+            None => super::constants::consumer_group_id_fifo(&queue),
+        };
         let auto_offset_reset = options
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
@@ -1736,17 +1744,38 @@ impl KafkaConsumer {
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
-    /// Public DLQ entrypoint with default options (no max_message_size cap).
-    /// Equivalent to `run_dlq_with_inner` with `ConsumerOptions::default()`
-    /// inner; kept for backward compatibility with users who don't need to
-    /// thread per-consumer options into the DLQ loop.
+    /// Public DLQ entrypoint with default options. Equivalent to
+    /// [`run_dlq_with_options`](Self::run_dlq_with_options) with
+    /// `ConsumerOptions::new()`; kept for callers who don't need to thread
+    /// per-consumer options into the DLQ loop.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
         H: MessageHandler<T>,
     {
-        let options = crate::ConsumerOptions::<Kafka>::new().into_inner();
-        self.run_dlq_with_inner::<T, H>(handler, ctx, options).await
+        self.run_dlq_with_options::<T, H>(handler, ctx, crate::ConsumerOptions::<Kafka>::new())
+            .await
+    }
+
+    /// Public DLQ entrypoint that threads [`ConsumerOptions`] into the DLQ
+    /// loop. Use [`ConsumerOptions::<Kafka>::with_group_id`] here to drain the
+    /// DLQ under a custom group (`{group}-dlq`) so two independent services
+    /// draining the same DLQ topic do not compete for its partitions.
+    ///
+    /// [`ConsumerOptions`]: crate::ConsumerOptions
+    /// [`ConsumerOptions::<Kafka>::with_group_id`]: crate::ConsumerOptions::with_group_id
+    pub async fn run_dlq_with_options<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: crate::ConsumerOptions<Kafka>,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        self.run_dlq_with_inner::<T, H>(handler, ctx, options.into_inner())
+            .await
     }
 
     pub(crate) async fn run_dlq_with_inner<T, H>(
@@ -1764,7 +1793,14 @@ impl KafkaConsumer {
             ShoveError::Topology("run_dlq requires a DLQ to be configured".into())
         })?;
 
-        let dlq_group_id = super::constants::dlq_consumer_group_id(dlq);
+        // Honor the `group.id` override (set via
+        // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing the DLQ group
+        // onto it as `{group}-dlq`, so a custom group does not re-collide on
+        // the default `{dlq}-consumer`. `None` keeps that default.
+        let dlq_group_id = match options.kafka_group_id.as_deref() {
+            Some(base) => super::constants::dlq_group_id_from_base(base),
+            None => super::constants::dlq_consumer_group_id(dlq),
+        };
         let shutdown = self.client.shutdown_token();
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);

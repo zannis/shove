@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerOptionsInner};
 use crate::error::{Result, ShoveError};
-#[cfg(feature = "kafka-schema-registry")]
+#[cfg(feature = "kafka")]
 use crate::markers::Kafka;
 #[cfg(feature = "nats")]
 use crate::markers::Nats;
@@ -208,6 +208,13 @@ pub struct ConsumerOptions<B: Backend> {
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
     pub schema_accepted_subjects: Option<Vec<Arc<str>>>,
 
+    /// Kafka-only: base consumer `group.id` override. `None` (the default)
+    /// keeps the topic-derived ids. Set via
+    /// [`ConsumerOptions::<Kafka>::with_group_id`].
+    #[cfg(feature = "kafka")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+    pub kafka_group_id: Option<Arc<str>>,
+
     // Runtime coordination — crate-private.
     pub(crate) shutdown: Option<CancellationToken>,
     pub(crate) processing: Arc<AtomicBool>,
@@ -241,6 +248,8 @@ impl<B: Backend> ConsumerOptions<B> {
             schema_enforcement: SchemaEnforcement::Enforce,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: None,
+            #[cfg(feature = "kafka")]
+            kafka_group_id: None,
             shutdown: None,
             processing: Arc::new(AtomicBool::new(false)),
             consumer_group: None,
@@ -385,7 +394,7 @@ impl<B: Backend> ConsumerOptions<B> {
             processing: self.processing,
             consumer_group: self.consumer_group,
             #[cfg(feature = "kafka")]
-            kafka_group_id: None,
+            kafka_group_id: self.kafka_group_id,
             #[cfg(feature = "kafka")]
             kafka_auto_offset_reset: None,
             #[cfg(feature = "kafka-schema-registry")]
@@ -434,6 +443,8 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             schema_enforcement: self.schema_enforcement,
             #[cfg(feature = "kafka-schema-registry")]
             schema_accepted_subjects: self.schema_accepted_subjects.clone(),
+            #[cfg(feature = "kafka")]
+            kafka_group_id: self.kafka_group_id.clone(),
             shutdown: self.shutdown.clone(),
             processing: self.processing.clone(),
             consumer_group: self.consumer_group.clone(),
@@ -489,6 +500,27 @@ impl ConsumerOptions<RabbitMq> {
     pub fn with_hold_queue_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "hold_queue_timeout must be positive");
         self.hold_queue_timeout = Some(timeout);
+        self
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+impl ConsumerOptions<Kafka> {
+    /// Override the base Kafka consumer `group.id` for this consumer.
+    ///
+    /// The standard consumer joins this value verbatim; a DLQ drain joins
+    /// `"{group}-dlq"`; a FIFO consumer joins `"{group}-fifo"`. `None` (the
+    /// default) keeps the topic-derived ids: `"{queue}-consumer"`,
+    /// `"{dlq}-consumer"`, and `"{queue}-fifo"`.
+    ///
+    /// Use this when two independent services consume the same topic and each
+    /// must receive every message (fan-out): without distinct group IDs they
+    /// share one consumer group and compete for partitions. For the coordinated
+    /// registry path the equivalent is
+    /// [`KafkaConsumerGroupConfig::with_group_id`](crate::kafka::KafkaConsumerGroupConfig::with_group_id).
+    pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
+        self.kafka_group_id = Some(group_id.into());
         self
     }
 }
@@ -816,6 +848,24 @@ mod tests {
         let opts = ConsumerOptions::<TestBackend>::new().with_consumer_group("orders-worker");
         let inner = opts.into_inner();
         assert_eq!(inner.consumer_group.as_deref(), Some("orders-worker"));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_with_group_id_propagates_through_into_inner() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new()
+            .with_group_id("price-latest-sink")
+            .into_inner();
+        assert_eq!(inner.kafka_group_id.as_deref(), Some("price-latest-sink"));
+    }
+
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn kafka_group_id_defaults_to_none() {
+        use crate::markers::Kafka;
+        let inner = ConsumerOptions::<Kafka>::new().into_inner();
+        assert_eq!(inner.kafka_group_id, None);
     }
 
     #[cfg(any(
