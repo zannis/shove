@@ -1,0 +1,52 @@
+src/backends/kafka/consumer_group.rs
+  s_ca639aaaa568e8::t_abe749819e7e3d 460-464
+  s_ca639aaaa568e8::t_87e4d6362d3f09 1296-1312
+  s_ca639aaaa568e8::t_445cd2a396cee3 208
+  s_ca639aaaa568e8::t_8eee5b717b78b0 196-207,209-212
+  s_ca639aaaa568e8::t_0f51d9cbb2a4a6 553-555
+  s_ca639aaaa568e8::t_e3791d134c9aee 310-314
+  s_ca639aaaa568e8::t_793ebb08eb21cd 169-171
+src/consumer.rs
+  s_ca639aaaa568e8::t_fd00ec8ae6c50e 397
+  s_ca639aaaa568e8::t_1ae024c76d5463 853-870
+  s_ca639aaaa568e8::t_f24cf9d523327a 251-252
+  s_ca639aaaa568e8::t_a337d950f40d32 211-217
+  s_ca639aaaa568e8::t_aed13d2001ad7f 10
+  s_ca639aaaa568e8::t_f42904373bafd8 507-527
+  s_ca639aaaa568e8::t_b56598d173a413 446-447
+src/topology_declarer.rs
+  s_ca639aaaa568e8::t_a69cf0dbf40c3b 5-6
+  s_ca639aaaa568e8::t_8e5e98580da267 27-28,30-53
+  s_ca639aaaa568e8::t_a65f1a70347402 29
+src/backends/kafka/consumer.rs
+  s_ca639aaaa568e8::t_03830380cc874c 1796-1803
+  s_ca639aaaa568e8::t_802cc4d9276c68 1375-1383
+  s_ca639aaaa568e8::t_087529a9798c03 1747-1750,1756-1778
+src/consumer_group.rs
+  s_ca639aaaa568e8::t_7a9ab58a3c6dcc 245-246,248-263
+  s_ca639aaaa568e8::t_a140b4dfbe53df 16-17
+  s_ca639aaaa568e8::t_b5d801da234bd0 247
+src/backends/kafka/constants.rs
+  s_ca639aaaa568e8::t_d610aa14c1d869 127-146
+  s_ca639aaaa568e8::t_1ae2b44c2afccf 42-55
+tests/kafka_integration.rs
+  s_ca639aaaa568e8::t_d2ed1cc41041e3 2590-2778,2785-2796,2798-2800,2806-2809,2811-2812,2814
+  s_ca639aaaa568e8::t_755790de892c37 2779-2784,2797,2801-2805,2810,2813
+  s_ca639aaaa568e8::t_134fc73f885c87 2815-2929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.4",
+  "base_commit_sha": "f231c188e0ce52a478a7335b4b1ba3363814f194",
+  "prompts": {},
+  "sessions": {
+    "s_ca639aaaa568e8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "610d4e65-94e8-4453-9142-654d834c2515",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
