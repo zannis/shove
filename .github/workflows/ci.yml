@@ -50,6 +50,16 @@ jobs:
       - run: cargo test --no-default-features
       - run: cargo publish --dry-run --all-features
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features
+      - run: cargo build --no-default-features
+
   audit:
     runs-on: ubuntu-latest
     steps:

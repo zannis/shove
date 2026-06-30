@@ -1,5 +1,3 @@
-#![cfg(feature = "aws-sns-sqs")]
-
 use std::collections::HashMap;
 use std::time::Duration;
 

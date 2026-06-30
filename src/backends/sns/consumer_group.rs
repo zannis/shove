@@ -1,5 +1,3 @@
-#![cfg(feature = "aws-sns-sqs")]
-
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

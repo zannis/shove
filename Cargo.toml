@@ -3,6 +3,7 @@ name = "shove"
 version = "0.11.9"
 description = "Async tasks via pubsub on steroids. Comes with built-in support for complex queue configurations, audit logs, autoscaling consumer groups and more."
 edition = "2024"
+rust-version = "1.91"
 authors = ["Zannis Kalampoukis <zkalampoukis@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/zannis/shove"

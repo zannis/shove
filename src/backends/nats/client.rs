@@ -79,8 +79,10 @@ impl fmt::Debug for NatsConfig {
             .field("url", &redacted)
             .field("tls_ca_cert", &self.tls_ca_cert)
             .field("tls_client_cert", &self.tls_client_cert)
+            .field("tls_client_key", &self.tls_client_key)
             .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("nkey_seed", &self.nkey_seed.as_ref().map(|_| "<redacted>"))
             .field("creds_file", &self.creds_file)
             .finish()
@@ -332,15 +334,19 @@ mod tests {
     fn debug_redacts_username() {
         let mut cfg = NatsConfig::new("nats://localhost:4222");
         cfg.username = Some("alice".into());
-        cfg.password = Some("hunter2".into());
+        cfg.password = Some("sentinel-pw".into());
         let debug = format!("{cfg:?}");
         assert!(
             !debug.contains("alice"),
             "username must not appear in debug output"
         );
         assert!(
-            !debug.contains("hunter2"),
+            !debug.contains("sentinel-pw"),
             "password must not appear in debug output"
+        );
+        assert!(
+            debug.contains("password: Some(\"<redacted>\")"),
+            "password field must appear as <redacted>: {debug}"
         );
         assert!(
             debug.contains("<redacted>"),

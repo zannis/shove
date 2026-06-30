@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY};
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::error::{Result, ShoveError};
+use crate::routing::hold_index;
 use crate::topology::QueueTopology;
 
 pub(crate) async fn route_ack(delivery: &Delivery, publisher: &ChannelPublisher) -> Result<()> {
@@ -33,7 +34,7 @@ pub(crate) async fn route_retry(
     let hold_queues = topology.hold_queues();
 
     if !hold_queues.is_empty() {
-        let index = (retry_count as usize).min(hold_queues.len() - 1);
+        let index = hold_index(retry_count, hold_queues.len());
         let hold_queue = &hold_queues[index];
         let headers = clone_headers_with_retry(delivery, new_retry_count);
 

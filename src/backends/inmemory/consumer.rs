@@ -20,6 +20,7 @@ use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
+use crate::routing::{RetryDecision, decide_retry, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
@@ -549,7 +550,7 @@ async fn run_fifo_shard<T, H>(
                         let delay = if hold_queues.is_empty() {
                             Duration::ZERO
                         } else {
-                            hold_queues[(retry_count as usize).min(hold_queues.len() - 1)].delay()
+                            hold_queues[hold_index(retry_count, hold_queues.len())].delay()
                         };
 
                         let mut new_env = env;
@@ -704,21 +705,16 @@ async fn route_outcome(
     outcome: Outcome,
     options: &ConsumerOptionsInner,
 ) {
-    match outcome {
-        Outcome::Ack => {}
-        Outcome::Retry => {
-            let retry_count = get_retry_count(&env.headers);
-            if retry_count >= options.max_retries {
-                route_reject(broker, topology, env).await;
-            } else {
-                schedule_redelivery(broker, topology, env, true);
-            }
-        }
-        Outcome::Defer => {
-            schedule_redelivery(broker, topology, env, false);
-        }
-        Outcome::Reject => {
+    let retry_count = get_retry_count(&env.headers);
+    match decide_retry(&outcome, retry_count, options.max_retries) {
+        RetryDecision::Ack => {}
+        RetryDecision::Dlq { .. } => {
+            // In-memory's DLQ path is `route_reject` for both `Reject` and
+            // `max_retries_exceeded`; it does not differentiate the reason.
             route_reject(broker, topology, env).await;
+        }
+        RetryDecision::Hold { increment } => {
+            schedule_redelivery(broker, topology, env, increment);
         }
     }
 }
@@ -740,7 +736,7 @@ fn schedule_redelivery(
         }
         Duration::ZERO
     } else if increment {
-        hold_queues[(retry_count as usize).min(hold_queues.len() - 1)].delay()
+        hold_queues[hold_index(retry_count, hold_queues.len())].delay()
     } else {
         hold_queues[0].delay()
     };

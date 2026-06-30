@@ -26,6 +26,7 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
+use crate::routing::{RetryDecision, decide_retry, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
@@ -296,55 +297,41 @@ async fn route_outcome(
     ack_wait: Duration,
     shutdown: &CancellationToken,
 ) {
-    let result: Result<()> = match outcome {
-        Outcome::Ack => {
+    let result: Result<()> = match decide_retry(&outcome, retry_count, max_retries) {
+        RetryDecision::Ack => {
             if let Err(e) = msg.ack().await {
                 tracing::error!(error = %e, "failed to ack message");
             }
             return;
         }
-        Outcome::Retry => {
-            let new_count = retry_count + 1;
-            // DLQ when the incoming retry count has reached the budget, so
-            // `max_retries = N` permits 1 initial attempt + N retries. Matches
-            // the documented contract and the other backends.
-            if retry_count >= max_retries {
-                // Exhausted retries — send to DLQ
-                match publish_to_dlq(client, topology, msg, "max_retries_exceeded").await {
-                    Ok(()) => {
-                        if let Err(e) = msg.ack().await {
-                            tracing::error!(error = %e, "failed to ack after DLQ publish");
-                        }
-                        return;
+        RetryDecision::Dlq { reason } => {
+            match publish_to_dlq(client, topology, msg, reason).await {
+                Ok(()) => {
+                    if let Err(e) = msg.ack().await {
+                        tracing::error!(error = %e, "failed to ack after DLQ publish");
                     }
-                    Err(e) => Err(e),
+                    return;
                 }
-            } else {
-                let delay = if hold_queues.is_empty() {
-                    Duration::from_secs(1)
-                } else {
-                    let idx = (retry_count as usize).min(hold_queues.len() - 1);
-                    hold_queues[idx].delay()
-                };
-
-                // Hold the original un-acked through the backoff, then durably
-                // republish an incremented copy and ack — see
-                // `hold_then_republish`. Keeps at-least-once across crashes and
-                // republish failures while leaving the retry count header-based.
-                hold_then_republish(client, msg, delay, new_count, ack_wait, shutdown).await;
-                return;
+                Err(e) => Err(e),
             }
         }
-        Outcome::Reject => match publish_to_dlq(client, topology, msg, "rejected").await {
-            Ok(()) => {
-                if let Err(e) = msg.ack().await {
-                    tracing::error!(error = %e, "failed to ack after reject DLQ publish");
-                }
-                return;
-            }
-            Err(e) => Err(e),
-        },
-        Outcome::Defer => {
+        RetryDecision::Hold { increment: true } => {
+            let new_count = retry_count + 1;
+            let delay = if hold_queues.is_empty() {
+                Duration::from_secs(1)
+            } else {
+                let idx = hold_index(retry_count, hold_queues.len());
+                hold_queues[idx].delay()
+            };
+
+            // Hold the original un-acked through the backoff, then durably
+            // republish an incremented copy and ack — see
+            // `hold_then_republish`. Keeps at-least-once across crashes and
+            // republish failures while leaving the retry count header-based.
+            hold_then_republish(client, msg, delay, new_count, ack_wait, shutdown).await;
+            return;
+        }
+        RetryDecision::Hold { increment: false } => {
             let delay = if hold_queues.is_empty() {
                 Duration::from_secs(1)
             } else {

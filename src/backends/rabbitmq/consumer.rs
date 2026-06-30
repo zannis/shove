@@ -27,6 +27,7 @@ use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
+use crate::routing::{hold_index, retries_exhausted};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
 use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
@@ -440,15 +441,13 @@ impl RabbitMqConsumer {
                                             );
                                             publisher.rollback_if_tx().await;
                                             router::nack_requeue(&delivery, &publisher).await.ok();
+                                        } else if let Err(e) = publisher.commit_if_tx().await {
+                                            error!("tx_commit failed for shard defer: {e}");
                                         } else {
-                                            if let Err(e) = publisher.commit_if_tx().await {
-                                                error!("tx_commit failed for shard defer: {e}");
-                                            } else {
-                                                debug!(
-                                                    "deferring message to shard hold queue {}",
-                                                    hold_queue.name()
-                                                );
-                                            }
+                                            debug!(
+                                                "deferring message to shard hold queue {}",
+                                                hold_queue.name()
+                                            );
                                         }
                                     }
                                     Err(e) => {
@@ -623,7 +622,7 @@ impl RabbitMqConsumer {
                     }
 
                     // ── Max retries check ──
-                    if retry_count >= options.max_retries {
+                    if retries_exhausted(retry_count, options.max_retries) {
                         warn!(
                             queue = %queue,
                             retry_count,
@@ -825,7 +824,7 @@ impl RabbitMqConsumer {
             let retry_count = get_retry_count(&delivery);
 
             // Max retries check on buffered delivery.
-            if retry_count >= options.max_retries {
+            if retries_exhausted(retry_count, options.max_retries) {
                 warn!(
                     queue = %queue,
                     sequence_key = %key,
@@ -1043,7 +1042,7 @@ impl RabbitMqConsumer {
                     let delivery = unwrap_delivery(item, queue)?;
                     let retry_count = get_retry_count(&delivery);
 
-                    if retry_count >= options.max_retries {
+                    if retries_exhausted(retry_count, options.max_retries) {
                         warn!(
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
@@ -1175,7 +1174,7 @@ async fn route_shard_retry(
 ) {
     if !shard_hold_queues.is_empty() {
         let new_retry_count = retry_count + 1;
-        let index = (retry_count as usize).min(shard_hold_queues.len() - 1);
+        let index = hold_index(retry_count, shard_hold_queues.len());
         let hold_queue = &shard_hold_queues[index];
         let headers = router::clone_headers_with_retry(delivery, new_retry_count);
 
