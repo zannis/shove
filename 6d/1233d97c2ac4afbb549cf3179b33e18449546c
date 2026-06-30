@@ -1,0 +1,19 @@
+Cargo.lock
+  s_ca639aaaa568e8::t_8b784f1e59229c 151,153,3355,3357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.4",
+  "base_commit_sha": "6d1233d97c2ac4afbb549cf3179b33e18449546c",
+  "prompts": {},
+  "sessions": {
+    "s_ca639aaaa568e8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "610d4e65-94e8-4453-9142-654d834c2515",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
