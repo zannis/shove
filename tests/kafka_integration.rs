@@ -2587,3 +2587,343 @@ async fn autoscaling_scales_up_and_drains_clean() {
 
     broker.close().await;
 }
+
+// ===========================================================================
+// Configurable consumer group_id — independent (fan-out) consumption
+//
+// Two independent services consuming the same topic must each receive every
+// message. Each test drains once on the default group (committing offsets via
+// `enable.auto.commit=false` manual commits), then drains again under an
+// overridden group id which must rejoin a *fresh* group and re-receive all N
+// — proving the override produces a distinct broker-side group rather than
+// re-joining the committed default group.
+// ===========================================================================
+
+#[tokio::test]
+async fn standard_group_id_override_consumes_independently() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    const N: u32 = 5;
+    for i in 0..N {
+        publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("msg-{i}"),
+                content: "x".into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Consumer 1: default group `{queue}-consumer`, drain + commit.
+    let h1 = CountingHandler::new();
+    let h1c = h1.clone();
+    let sd1 = CancellationToken::new();
+    let sd1c = sd1.clone();
+    let c1 = KafkaConsumer::new(client.clone());
+    let j1 = tokio::spawn(async move {
+        c1.run::<WorkTopic, _>(
+            h1c,
+            (),
+            ConsumerOptions::<Kafka>::new()
+                .with_shutdown(sd1c)
+                .with_prefetch_count(1),
+        )
+        .await
+    });
+    assert!(
+        h1.counter.wait_for(N, TIMEOUT).await,
+        "default consumer should receive all {N}"
+    );
+    // Let manual offset commits flush before tearing the consumer down.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sd1.cancel();
+    j1.await.unwrap().ok();
+
+    // Consumer 2: overridden group id → independent, must also receive all N.
+    let h2 = CountingHandler::new();
+    let h2c = h2.clone();
+    let sd2 = CancellationToken::new();
+    let sd2c = sd2.clone();
+    let c2 = KafkaConsumer::new(client.clone());
+    let j2 = tokio::spawn(async move {
+        c2.run::<WorkTopic, _>(
+            h2c,
+            (),
+            ConsumerOptions::<Kafka>::new()
+                .with_shutdown(sd2c)
+                .with_prefetch_count(1)
+                .with_group_id("independent-sink"),
+        )
+        .await
+    });
+    assert!(
+        h2.counter.wait_for(N, TIMEOUT).await,
+        "consumer with overridden group_id must independently receive all {N}"
+    );
+    sd2.cancel();
+    j2.await.unwrap().ok();
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn fifo_group_id_override_consumes_independently() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<SeqSkipTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    const N: u32 = 5;
+    for i in 0..N {
+        publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "key-A".into(),
+                amount: i as u64,
+            })
+            .await
+            .unwrap();
+    }
+
+    // Consumer 1: default FIFO group `{queue}-fifo`, drain + commit.
+    let h1 = OrderRecordingHandler::new();
+    let h1c = h1.clone();
+    let sd1 = CancellationToken::new();
+    let sd1c = sd1.clone();
+    let c1 = KafkaConsumer::new(client.clone());
+    let j1 = tokio::spawn(async move {
+        c1.run_fifo::<SeqSkipTopic, _>(
+            h1c,
+            (),
+            ConsumerOptions::<Kafka>::new()
+                .with_shutdown(sd1c)
+                .with_max_retries(5),
+        )
+        .await
+    });
+    assert!(
+        h1.counter.wait_for(N, Duration::from_secs(60)).await,
+        "default FIFO consumer should receive all {N}"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sd1.cancel();
+    j1.await.unwrap().ok();
+
+    // Consumer 2: overridden group id → must rejoin a fresh `{group}-fifo`.
+    let h2 = OrderRecordingHandler::new();
+    let h2c = h2.clone();
+    let sd2 = CancellationToken::new();
+    let sd2c = sd2.clone();
+    let c2 = KafkaConsumer::new(client.clone());
+    let j2 = tokio::spawn(async move {
+        c2.run_fifo::<SeqSkipTopic, _>(
+            h2c,
+            (),
+            ConsumerOptions::<Kafka>::new()
+                .with_shutdown(sd2c)
+                .with_max_retries(5)
+                .with_group_id("independent-fifo-sink"),
+        )
+        .await
+    });
+    assert!(
+        h2.counter.wait_for(N, Duration::from_secs(60)).await,
+        "FIFO consumer with overridden group_id must independently receive all {N}"
+    );
+    sd2.cancel();
+    j2.await.unwrap().ok();
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn dlq_group_id_override_consumes_independently() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    const N: u32 = 3;
+    for i in 0..N {
+        publisher
+            .publish::<WorkTopic>(&SimpleMessage {
+                id: format!("dead-{i}"),
+                content: "dead".into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Push all N messages to the DLQ by rejecting them.
+    let sd_reject = CancellationToken::new();
+    let sdr = sd_reject.clone();
+    let reject = KafkaConsumer::new(client.clone());
+    let jr = tokio::spawn(async move {
+        reject
+            .run::<WorkTopic, _>(
+                FixedOutcomeHandler(Outcome::Reject),
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sdr)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    sd_reject.cancel();
+    jr.await.unwrap().ok();
+
+    // Two DLQ drains run concurrently on the same DLQ topic. Drain 1 joins the
+    // default group `{dlq}-consumer`; drain 2 overrides to `{group}-dlq`. With
+    // independent groups both receive every dead message; if the override were
+    // ignored they would share one group and compete, so one drain would see
+    // fewer than N. Both stop on `broker.close()` (run_dlq tracks the client
+    // shutdown token), so neither handle is awaited before the broker closes.
+    let d1 = DlqRecordingHandler::new();
+    let d1c = d1.clone();
+    let cd1 = KafkaConsumer::new(client.clone());
+    let jd1 = tokio::spawn(async move { cd1.run_dlq::<WorkTopic, _>(d1c, ()).await });
+
+    let d2 = DlqRecordingHandler::new();
+    let d2c = d2.clone();
+    let cd2 = KafkaConsumer::new(client.clone());
+    let jd2 = tokio::spawn(async move {
+        cd2.run_dlq_with_options::<WorkTopic, _>(
+            d2c,
+            (),
+            ConsumerOptions::<Kafka>::new().with_group_id("independent-dlq-sink"),
+        )
+        .await
+    });
+
+    assert!(
+        d1.counter.wait_for(N, TIMEOUT).await,
+        "default DLQ drain should receive all {N} dead messages"
+    );
+    assert!(
+        d2.counter.wait_for(N, TIMEOUT).await,
+        "DLQ drain with overridden group_id must independently receive all {N}"
+    );
+
+    broker.close().await;
+    jd1.await.unwrap().ok();
+    jd2.await.unwrap().ok();
+}
+
+// ===========================================================================
+// broker.topology() / broker.consumer_group() ergonomic knobs
+//
+// The replication-factor and partition-floor knobs are reachable directly on
+// the broker hub rather than only on the low-level KafkaTopologyDeclarer /
+// KafkaConsumerGroupRegistry. These are smoke tests that the new builder paths
+// chain and produce a working topology end-to-end (RF=1 on a single-broker
+// test container).
+// ===========================================================================
+
+#[tokio::test]
+async fn broker_topology_exposes_replication_and_partition_knobs() {
+    shove::define_topic!(
+        TopoKnobsTopic,
+        SimpleMessage,
+        TopologyBuilder::new("kafka-topo-knobs").build()
+    );
+    impl MessageHandler<TopoKnobsTopic> for CountingHandler {
+        type Context = ();
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.counter.increment();
+            Outcome::Ack
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    broker
+        .topology()
+        .with_replication_factor(1)
+        .with_min_partitions(8)
+        .declare::<TopoKnobsTopic>()
+        .await
+        .expect("declare via broker.topology() knobs should succeed");
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<TopoKnobsTopic>(&SimpleMessage {
+            id: "topo-1".into(),
+            content: "x".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let hc = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(client.clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run::<TopoKnobsTopic, _>(
+                hc,
+                (),
+                ConsumerOptions::<Kafka>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(1),
+            )
+            .await
+    });
+    assert!(
+        handler.counter.wait_for(1, TIMEOUT).await,
+        "should consume from a topic declared through broker.topology() knobs"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn broker_consumer_group_exposes_default_replication_factor() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<WorkTopic>(&SimpleMessage {
+            id: "cg-rf-1".into(),
+            content: "x".into(),
+        })
+        .await
+        .unwrap();
+
+    let handler = CountingHandler::new();
+    let handler_clone = handler.clone();
+
+    // with_default_replication_factor is reachable on broker.consumer_group()
+    // and applies to the topology auto-declared by register().
+    let mut group = broker.consumer_group().with_default_replication_factor(1);
+    group
+        .register::<WorkTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || handler_clone.clone(),
+        )
+        .await
+        .expect("register with a default replication factor should succeed");
+
+    let token = group.cancellation_token();
+    let counter = handler.counter.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        counter.wait_for(1, TIMEOUT).await;
+        t.cancel();
+    });
+
+    let outcome = group
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+    assert_eq!(handler.counter.get(), 1);
+    broker.close().await;
+}

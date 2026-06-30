@@ -2,6 +2,8 @@
 
 use crate::backend::{Backend, TopologyImpl};
 use crate::error::Result;
+#[cfg(feature = "kafka")]
+use crate::markers::Kafka;
 use crate::topic::Topic;
 
 pub struct TopologyDeclarer<B: Backend> {
@@ -19,6 +21,33 @@ impl<B: Backend> TopologyDeclarer<B> {
 
     pub async fn declare_all<Ts: Topics>(&self) -> Result<()> {
         Ts::declare_all(self).await
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
+impl TopologyDeclarer<Kafka> {
+    /// Replication factor applied to every topic this declarer creates (main +
+    /// DLQ). Defaults to `1` (single-broker dev) when unset; production
+    /// clusters should set `>= 3` (or whatever the cluster's quorum demands).
+    /// `declare` is idempotent and will not alter the replication of an
+    /// already-existing topic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 1`.
+    pub fn with_replication_factor(mut self, n: i32) -> Self {
+        self.inner = self.inner.with_replication_factor(n);
+        self
+    }
+
+    /// Partition floor for the topics this declarer creates: each topic gets
+    /// `max(topology_default, n)` partitions so Kafka can spread load across at
+    /// least `n` consumers. `declare` only ever expands partition counts,
+    /// never shrinks them.
+    pub fn with_min_partitions(mut self, n: i32) -> Self {
+        self.inner = self.inner.with_min_partitions(n);
+        self
     }
 }
 

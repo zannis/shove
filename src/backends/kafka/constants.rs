@@ -39,6 +39,20 @@ pub(super) fn dlq_consumer_group_id(dlq: &str) -> String {
     format!("{dlq}-consumer")
 }
 
+/// Rebases the FIFO group ID onto an explicit `group.id` override `base`.
+/// Single source for the `{base}-fifo` rule so the autoscaler-stored group
+/// (via `KafkaConsumerGroupConfig::resolved_fifo_group_id`) and the broker-side
+/// FIFO consumer (via `spawn_fifo_shards`) cannot drift apart.
+pub(super) fn fifo_group_id_from_base(base: &str) -> String {
+    format!("{base}-fifo")
+}
+
+/// Rebases the DLQ group ID onto an explicit `group.id` override `base`, so a
+/// custom group does not re-collide on the default `{dlq}-consumer` group.
+pub(super) fn dlq_group_id_from_base(base: &str) -> String {
+    format!("{base}-dlq")
+}
+
 // ---------------------------------------------------------------------------
 // Publisher tuning
 // ---------------------------------------------------------------------------
@@ -110,3 +124,23 @@ pub(super) const FETCH_MIN_BYTES: u32 = 1;
 /// waiting for `fetch.min.bytes` to accumulate. Set to `50` so that
 /// low-volume topics don't pay librdkafka's default 500 ms dwell.
 pub(super) const FETCH_WAIT_MAX_MS: u32 = 50;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_id_derivations_are_canonical() {
+        assert_eq!(consumer_group_id("orders"), "orders-consumer");
+        assert_eq!(consumer_group_id_fifo("orders"), "orders-fifo");
+        assert_eq!(dlq_consumer_group_id("orders-dlq"), "orders-dlq-consumer");
+    }
+
+    #[test]
+    fn override_rebasing_appends_role_suffix() {
+        // A `with_group_id` override is the base; FIFO/DLQ append their role
+        // suffix so a custom group cannot re-collide on the auxiliary groups.
+        assert_eq!(fifo_group_id_from_base("price-sink"), "price-sink-fifo");
+        assert_eq!(dlq_group_id_from_base("price-sink"), "price-sink-dlq");
+    }
+}
