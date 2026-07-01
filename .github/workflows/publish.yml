@@ -36,7 +36,7 @@ jobs:
 
       - name: Install cargo-edit
         if: inputs.bump != 'none'
-        run: cargo install -q cargo-edit
+        run: cargo install -q cargo-edit --version 0.13.10
 
       - name: Bump version
         if: inputs.bump != 'none'
