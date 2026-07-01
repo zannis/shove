@@ -18,6 +18,14 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::{MskIamContext, MskIamTokenProvider};
+#[cfg(feature = "kafka-msk-iam")]
+use rdkafka::bindings::{
+    rd_kafka_oauthbearer_set_token, rd_kafka_oauthbearer_set_token_failure, rd_kafka_t,
+};
+#[cfg(feature = "kafka-msk-iam")]
+use rdkafka::client::OAuthToken;
+#[cfg(feature = "kafka-msk-iam")]
+use rdkafka::types::RDKafkaRespErr;
 
 use crate::ShoveError;
 use crate::error::Result;
@@ -614,10 +622,15 @@ impl KafkaClient {
         let admin: AdminClient<MskIamContext> = self
             .base_config
             .clone()
-            .create_with_context(ctx)
-            .map_err(|e| {
-            ShoveError::Topology(format!("failed to create MSK admin client: {e}"))
-        })?;
+            .create_with_context(ctx.clone())
+            .map_err(|e| ShoveError::Topology(format!("failed to create MSK admin client: {e}")))?;
+        // Unlike the producer and stream/base consumers, rdkafka's admin client
+        // never polls its main queue, so it never services the OAUTHBEARER
+        // token-refresh event and would fail authentication under MSK IAM. Admin
+        // operations are short-lived (well under a token lifetime), so we set the
+        // token once here and return a ready-to-use client — no refresh thread,
+        // and thus nothing that could outlive `admin`.
+        prime_admin_oauth_token(&admin, ctx).await?;
         Ok(admin)
     }
 
@@ -840,6 +853,97 @@ fn fetch_topic_partition_count_blocking(
         .first()
         .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {topic_name}")))?;
     Ok(topic.partitions().len() as i32)
+}
+
+/// Generate an OAUTHBEARER token from `ctx` and set it on the admin client's
+/// native handle.
+///
+/// rdkafka services the OAUTHBEARER refresh event by polling the client's main
+/// queue; the admin client never polls it, so we generate and set the token
+/// ourselves. `generate_oauth_token` drives an async signer via
+/// `Handle::block_on`, which panics on a Tokio worker thread, so it runs on a
+/// blocking thread (the same contract librdkafka's own C callback thread has).
+#[cfg(feature = "kafka-msk-iam")]
+async fn prime_admin_oauth_token<C>(admin: &AdminClient<C>, ctx: C) -> Result<()>
+where
+    C: ClientContext + Send + 'static,
+{
+    let token = tokio::task::spawn_blocking(move || {
+        // The `Box<dyn Error>` from generate_oauth_token is not `Send`; stringify
+        // it inside the blocking thread so only a `String` crosses the boundary.
+        ctx.generate_oauth_token(None).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| ShoveError::Topology(format!("oauth token task join failed: {e}")))?
+    .map_err(|e| {
+        ShoveError::Connection(format!(
+            "failed to generate OAUTHBEARER token for admin client: {e}"
+        ))
+    })?;
+
+    set_admin_oauth_token(admin.inner().native_ptr(), &token)
+}
+
+/// Test-only seam: run the exact admin OAUTHBEARER priming path
+/// ([`prime_admin_oauth_token`]) against a caller-supplied admin client and
+/// context. Exists because MSK IAM's presigned-URL tokens cannot be validated
+/// without real AWS, so the integration test substitutes an unsecured-JWT
+/// context to exercise this code path against a local OAUTHBEARER broker.
+#[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
+pub async fn prime_admin_oauth_token_for_test<C>(admin: &AdminClient<C>, ctx: C) -> Result<()>
+where
+    C: ClientContext + Send + 'static,
+{
+    prime_admin_oauth_token(admin, ctx).await
+}
+
+/// Hand a generated token to librdkafka via `rd_kafka_oauthbearer_set_token`.
+///
+/// `rk` must be a live `rd_kafka_t` (it is: `admin` outlives this call, and we
+/// set the token synchronously — no thread captures the pointer). On failure we
+/// call `rd_kafka_oauthbearer_set_token_failure` so librdkafka stops waiting on
+/// a token that will never arrive.
+#[cfg(feature = "kafka-msk-iam")]
+fn set_admin_oauth_token(rk: *mut rd_kafka_t, token: &OAuthToken) -> Result<()> {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::c_char;
+
+    let token_c = CString::new(token.token.as_str())
+        .map_err(|_| ShoveError::Connection("OAuth token contains an interior NUL".into()))?;
+    let principal_c = CString::new(token.principal_name.as_str())
+        .map_err(|_| ShoveError::Connection("OAuth principal contains an interior NUL".into()))?;
+    let mut errbuf = [0 as c_char; 512];
+
+    // SAFETY: `rk` is a valid rd_kafka_t for the duration of the call; the
+    // CString pointers outlive it; `errbuf` matches the errstr_size argument.
+    let code = unsafe {
+        rd_kafka_oauthbearer_set_token(
+            rk,
+            token_c.as_ptr(),
+            token.lifetime_ms,
+            principal_c.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            errbuf.as_mut_ptr(),
+            errbuf.len(),
+        )
+    };
+
+    if code == RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR {
+        Ok(())
+    } else {
+        // SAFETY: same validity contract on `rk`; `errbuf` is a NUL-terminated
+        // C string populated by the failed call above.
+        let msg = unsafe {
+            rd_kafka_oauthbearer_set_token_failure(rk, errbuf.as_ptr());
+            CStr::from_ptr(errbuf.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        Err(ShoveError::Connection(format!(
+            "rd_kafka_oauthbearer_set_token failed: {msg}"
+        )))
+    }
 }
 
 #[cfg(test)]

@@ -101,6 +101,12 @@ metrics = ["dep:metrics"]
 # `M: prost::Message + Default`.
 protobuf = ["dep:prost"]
 
+# Test-only seams for integration tests (not part of the public API for normal
+# builds). Currently exposes the Kafka admin OAUTHBEARER priming path so the
+# OAUTHBEARER integration test can drive it against a local broker with an
+# unsecured JWT (MSK's presigned-URL tokens can't be validated without AWS).
+test-support = []
+
 [dependencies]
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

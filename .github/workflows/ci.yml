@@ -101,7 +101,10 @@ jobs:
           - name: nats
             features: nats,audit
           - name: kafka
-            features: kafka,kafka-ssl,audit
+            # kafka-msk-iam + test-support compile and run the MSK IAM tests,
+            # including the OAUTHBEARER admin integration test (local Kafka
+            # container + unsecured JWT; no AWS/LocalStack needed).
+            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit
           - name: redis-streams
             features: redis-streams
     steps:

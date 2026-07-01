@@ -12,6 +12,8 @@ mod topology;
 pub use autoscaler::{
     KafkaAutoscalerBackend, KafkaLagStatsProvider, KafkaQueueStats, KafkaQueueStatsProvider,
 };
+#[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
+pub use client::prime_admin_oauth_token_for_test;
 pub use client::{KafkaClient, KafkaConfig};
 #[cfg(feature = "kafka-ssl")]
 pub use client::{KafkaSasl, KafkaTls};

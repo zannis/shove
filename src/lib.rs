@@ -313,6 +313,13 @@ pub mod kafka {
     #[cfg(feature = "kafka-ssl")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]
     pub use crate::backends::kafka::{KafkaSasl, KafkaTls};
+
+    /// Test-only seam (see the `test-support` feature): runs the admin
+    /// OAUTHBEARER token-priming path against a caller-supplied admin client so
+    /// integration tests can exercise it against a local broker.
+    #[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-support")))]
+    pub use crate::backends::kafka::prime_admin_oauth_token_for_test;
 }
 
 /// Redis Streams backend.
