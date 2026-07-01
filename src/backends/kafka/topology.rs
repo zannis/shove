@@ -1,8 +1,30 @@
+use std::collections::BTreeMap;
+
 use crate::error::Result;
 use crate::topology::QueueTopology;
 
 use super::client::KafkaClient;
 use super::constants::{DEFAULT_PARTITIONS, DEFAULT_REPLICATION};
+
+/// Merge declarer-level and per-topic config entries into one map: per-topic
+/// wins key-by-key; within a layer, the later entry wins. BTreeMap keeps the
+/// result deterministically ordered.
+fn merge_topic_config(
+    declarer: &[(String, String)],
+    topic: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged: BTreeMap<&str, &str> = BTreeMap::new();
+    for (k, v) in declarer {
+        merged.insert(k, v);
+    }
+    for (k, v) in topic {
+        merged.insert(k, v);
+    }
+    merged
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
 
 pub struct KafkaTopologyDeclarer {
     client: KafkaClient,
@@ -15,6 +37,11 @@ pub struct KafkaTopologyDeclarer {
     /// `None` keeps the default of `1` (single-broker dev). Production
     /// clusters should set `3` (or whatever quorum the cluster sizes for).
     replication_factor: Option<i32>,
+    /// Declarer-level topic config entries (e.g. `retention.ms`) applied to
+    /// every **main** topic this declarer creates. Per-topic entries from
+    /// `TopologyBuilder::kafka_topic_config` override these key-by-key.
+    /// DLQ topics are never touched.
+    topic_config: Vec<(String, String)>,
 }
 
 impl KafkaTopologyDeclarer {
@@ -23,6 +50,7 @@ impl KafkaTopologyDeclarer {
             client,
             min_partitions: None,
             replication_factor: None,
+            topic_config: Vec::new(),
         }
     }
 
@@ -47,6 +75,16 @@ impl KafkaTopologyDeclarer {
         self
     }
 
+    /// Sets a Kafka topic-level config entry (e.g. `retention.ms`) applied to
+    /// every **main** topic this declarer creates or reconciles. Repeatable;
+    /// later calls for the same key win. Per-topic entries set via
+    /// `TopologyBuilder::kafka_topic_config` override these key-by-key.
+    /// DLQ topics keep cluster defaults.
+    pub fn with_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.topic_config.push((key.into(), value.into()));
+        self
+    }
+
     fn effective_partitions(&self, base: i32) -> i32 {
         match self.min_partitions {
             Some(min) => base.max(min),
@@ -62,8 +100,9 @@ impl KafkaTopologyDeclarer {
         let queue = topology.queue();
         let partitions = self.effective_partitions(DEFAULT_PARTITIONS);
         let replication = self.effective_replication();
+        let config = merge_topic_config(&self.topic_config, topology.kafka_topic_config());
         self.client
-            .create_topic(queue, partitions, replication, &[])
+            .create_topic(queue, partitions, replication, &config)
             .await?;
 
         if let Some(dlq) = topology.dlq() {
@@ -90,8 +129,9 @@ impl KafkaTopologyDeclarer {
 
         let num_partitions = self.effective_partitions(seq.routing_shards() as i32);
         let replication = self.effective_replication();
+        let config = merge_topic_config(&self.topic_config, topology.kafka_topic_config());
         self.client
-            .create_topic(queue, num_partitions, replication, &[])
+            .create_topic(queue, num_partitions, replication, &config)
             .await?;
 
         if let Some(dlq) = topology.dlq() {
@@ -124,5 +164,40 @@ impl KafkaTopologyDeclarer {
         } else {
             self.declare_standard(topology).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_topic_config;
+
+    fn cfg(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn topic_entries_override_declarer_entries_per_key() {
+        let declarer = cfg(&[("retention.ms", "604800000"), ("cleanup.policy", "delete")]);
+        let topic = cfg(&[("retention.ms", "3600000")]);
+        let merged = merge_topic_config(&declarer, &topic);
+        assert_eq!(
+            merged,
+            cfg(&[("cleanup.policy", "delete"), ("retention.ms", "3600000")])
+        );
+    }
+
+    #[test]
+    fn last_write_wins_within_a_layer() {
+        let declarer = cfg(&[("retention.ms", "1000"), ("retention.ms", "2000")]);
+        let merged = merge_topic_config(&declarer, &[]);
+        assert_eq!(merged, cfg(&[("retention.ms", "2000")]));
+    }
+
+    #[test]
+    fn empty_layers_merge_to_empty() {
+        assert!(merge_topic_config(&[], &[]).is_empty());
     }
 }
