@@ -1,0 +1,29 @@
+src/backends/kafka/autoscaler.rs
+  s_c243d6dd3e1723::t_1b3c636c1b10a4 296,302-305,309,315-318
+src/backends/rabbitmq/autoscaler.rs
+  s_c243d6dd3e1723::t_861d393e161d0f 125,131-134,138,144-147
+src/backends/redis/autoscaler.rs
+  s_c243d6dd3e1723::t_c8ebd16a383420 257,263-266,270,276-279
+src/backends/inmemory/autoscaler.rs
+  s_c243d6dd3e1723::t_7951a59bc74669 155,161-164,168,174-177
+src/backends/nats/autoscaler.rs
+  s_c243d6dd3e1723::t_7eb3d186b3fe6b 179,185-188,192,198-201
+src/backends/sns/autoscaler.rs
+  s_c243d6dd3e1723::t_04dd4772597039 117,123-126,130,136-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "7557a96ec8552909d4f5805337a1a72f79553833",
+  "prompts": {},
+  "sessions": {
+    "s_c243d6dd3e1723": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ba0173ec-c63c-42c1-b9eb-bc1922c35b38",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
