@@ -57,6 +57,36 @@ impl Default for NatsStreamConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Kafka topic config
+// ---------------------------------------------------------------------------
+
+/// Kafka `cleanup.policy` for a shove-managed topic, set via
+/// [`TopologyBuilder::kafka_cleanup_policy`]. Kafka-specific.
+#[cfg(feature = "kafka")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaCleanupPolicy {
+    /// Discard segments past the retention limits (`delete`, Kafka's default).
+    Delete,
+    /// Retain the latest value per message key (`compact`).
+    Compact,
+    /// Compact, and also discard segments past the retention limits
+    /// (`compact,delete`).
+    CompactDelete,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaCleanupPolicy {
+    /// The `cleanup.policy` value string Kafka expects.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Compact => "compact",
+            Self::CompactDelete => "compact,delete",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HoldQueue
 // ---------------------------------------------------------------------------
 
@@ -384,6 +414,45 @@ impl TopologyBuilder {
     pub fn kafka_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.kafka_topic_config.push((key.into(), value.into()));
         self
+    }
+
+    /// Sets `retention.ms` from a [`Duration`]. Sugar for
+    /// [`kafka_topic_config`](Self::kafka_topic_config); the same scope and
+    /// reconcile semantics apply. Sub-millisecond precision is truncated.
+    #[cfg(feature = "kafka")]
+    pub fn kafka_retention(self, retention: Duration) -> Self {
+        self.kafka_topic_config("retention.ms", retention.as_millis().to_string())
+    }
+
+    /// Sets `retention.ms = -1`, retaining messages forever (typically paired
+    /// with [`kafka_cleanup_policy`](Self::kafka_cleanup_policy) and
+    /// [`KafkaCleanupPolicy::Compact`]). Sugar for
+    /// [`kafka_topic_config`](Self::kafka_topic_config).
+    #[cfg(feature = "kafka")]
+    pub fn kafka_retention_forever(self) -> Self {
+        self.kafka_topic_config("retention.ms", "-1")
+    }
+
+    /// Sets `retention.bytes`, the maximum partition size before old segments
+    /// are discarded. Sugar for
+    /// [`kafka_topic_config`](Self::kafka_topic_config).
+    #[cfg(feature = "kafka")]
+    pub fn kafka_retention_bytes(self, bytes: u64) -> Self {
+        self.kafka_topic_config("retention.bytes", bytes.to_string())
+    }
+
+    /// Sets `cleanup.policy`. Sugar for
+    /// [`kafka_topic_config`](Self::kafka_topic_config).
+    #[cfg(feature = "kafka")]
+    pub fn kafka_cleanup_policy(self, policy: KafkaCleanupPolicy) -> Self {
+        self.kafka_topic_config("cleanup.policy", policy.as_str())
+    }
+
+    /// Sets `max.message.bytes`, the largest record batch the topic accepts.
+    /// Sugar for [`kafka_topic_config`](Self::kafka_topic_config).
+    #[cfg(feature = "kafka")]
+    pub fn kafka_max_message_bytes(self, bytes: u32) -> Self {
+        self.kafka_topic_config("max.message.bytes", bytes.to_string())
     }
 
     /// Enables strict per-key ordered delivery for this topic.
@@ -1062,6 +1131,57 @@ mod tests {
                 .kafka_topic_config("retention.ms", "3600000")
                 .build();
             assert_eq!(topology.kafka_topic_config().len(), 1);
+        }
+
+        #[test]
+        fn builder_named_helpers_map_to_config_entries() {
+            let topology = TopologyBuilder::new("orders")
+                .kafka_retention(Duration::from_secs(3600))
+                .kafka_retention_bytes(1_073_741_824)
+                .kafka_cleanup_policy(KafkaCleanupPolicy::CompactDelete)
+                .kafka_max_message_bytes(1_048_576)
+                .build();
+            assert_eq!(
+                topology.kafka_topic_config(),
+                [
+                    ("retention.ms".to_string(), "3600000".to_string()),
+                    ("retention.bytes".to_string(), "1073741824".to_string()),
+                    ("cleanup.policy".to_string(), "compact,delete".to_string()),
+                    ("max.message.bytes".to_string(), "1048576".to_string()),
+                ]
+                .as_slice()
+            );
+        }
+
+        #[test]
+        fn builder_kafka_retention_forever_is_minus_one() {
+            let topology = TopologyBuilder::new("orders")
+                .kafka_retention_forever()
+                .build();
+            assert_eq!(
+                topology.kafka_topic_config(),
+                [("retention.ms".to_string(), "-1".to_string())].as_slice()
+            );
+        }
+
+        #[test]
+        fn builder_named_helper_overrides_via_last_write_wins() {
+            // Named helpers go through the same generic entry list, so the
+            // declarer-side merge resolves repeated keys to the last call.
+            let topology = TopologyBuilder::new("orders")
+                .kafka_topic_config("retention.ms", "1000")
+                .kafka_retention(Duration::from_secs(2))
+                .build();
+            let entries = topology.kafka_topic_config();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[1], ("retention.ms".to_string(), "2000".to_string()));
+        }
+
+        #[test]
+        fn cleanup_policy_value_strings() {
+            assert_eq!(KafkaCleanupPolicy::Delete.as_str(), "delete");
+            assert_eq!(KafkaCleanupPolicy::Compact.as_str(), "compact");
+            assert_eq!(KafkaCleanupPolicy::CompactDelete.as_str(), "compact,delete");
         }
     }
 }

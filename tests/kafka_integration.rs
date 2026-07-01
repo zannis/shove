@@ -469,11 +469,12 @@ async fn topology_reconciles_config_on_existing_topic() {
     // First declare WITHOUT any config (declarer-level knob only, so the
     // same Topic type can be re-declared with a different desired value).
     broker.topology().declare::<WorkTopic>().await.unwrap();
-    // Redeclare with a declarer-level retention — topic already exists, so
-    // this exercises the describe → drift → alter path.
+    // Redeclare with a declarer-level retention (via the named helper) —
+    // topic already exists, so this exercises the describe → drift → alter
+    // path.
     broker
         .topology()
-        .with_topic_config("retention.ms", "7200000")
+        .with_retention(Duration::from_secs(7200))
         .declare::<WorkTopic>()
         .await
         .unwrap();
