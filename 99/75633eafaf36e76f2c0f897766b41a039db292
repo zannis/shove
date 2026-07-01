@@ -1,0 +1,27 @@
+Cargo.toml
+  s_00b9bc1384fab2::t_3fc7e82cddc6cf 153
+  s_00b9bc1384fab2::t_ddfb0794b77faf 138
+src/backends/kafka/autoscaler.rs
+  s_00b9bc1384fab2::t_c265daffabe633 113,121-139
+  s_00b9bc1384fab2::t_a579e9a96a3547 7-8,21-22
+  s_00b9bc1384fab2::t_2cf51209bb62c8 47-93,96,102
+  s_00b9bc1384fab2::t_f5a18b45fb7154 140
+Cargo.lock
+  s_00b9bc1384fab2::t_03bb4de811e294 3568
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "9975633eafaf36e76f2c0f897766b41a039db292",
+  "prompts": {},
+  "sessions": {
+    "s_00b9bc1384fab2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f9b9db7-1acc-4f4f-96f2-5560f366de17",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
