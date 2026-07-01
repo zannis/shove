@@ -1,0 +1,26 @@
+src/topology_declarer.rs
+  s_680dfd5a8a5463::t_8d1e1e91cd3a3a 81-88,95-101
+src/backends/kafka/topology.rs
+  s_680dfd5a8a5463::t_843988708d530b 94-124
+  s_680dfd5a8a5463::t_ab1b1d373e41cd 45-48,58-59
+src/topology.rs
+  s_680dfd5a8a5463::t_a8c42e03bb2b87 1213-1243
+  s_680dfd5a8a5463::t_cc1dea7d78ecff 430-434,436-441,449-452,454-459
+  s_680dfd5a8a5463::t_9edaf37da4c28c 323-326,345-348
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "519a7754749a8dd7eb3e8b3bc119a4c917787ec4",
+  "prompts": {},
+  "sessions": {
+    "s_680dfd5a8a5463": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4b0fd8a-5212-4c39-b0d0-e506073825a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
