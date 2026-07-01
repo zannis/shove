@@ -293,22 +293,30 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
 
         match decision {
             ScalingDecision::ScaleUp(n) => {
+                let mut changed = false;
                 for _ in 0..n {
                     if !g.scale_up() {
                         warn!(group = %group, "scale-up requested but already at max consumers");
                         break;
                     }
+                    changed = true;
                 }
-                info!(group = %group, consumers = g.active_consumers(), "Kafka scaled up");
+                if changed {
+                    info!(group = %group, consumers = g.active_consumers(), "Kafka scaled up");
+                }
             }
             ScalingDecision::ScaleDown(n) => {
+                let mut changed = false;
                 for _ in 0..n {
                     if !g.scale_down() {
                         debug!(group = %group, "scale-down requested but already at min consumers");
                         break;
                     }
+                    changed = true;
                 }
-                info!(group = %group, consumers = g.active_consumers(), "Kafka scaled down");
+                if changed {
+                    info!(group = %group, consumers = g.active_consumers(), "Kafka scaled down");
+                }
             }
             ScalingDecision::Hold => {}
         }
