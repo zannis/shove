@@ -134,7 +134,7 @@ shove::define_topic!(
     RetentionTopic,
     SimpleMessage,
     TopologyBuilder::new("kafka-retention")
-        .kafka_topic_config("retention.ms", "3600000")
+        .with_topic_config("retention.ms", "3600000")
         .build()
 );
 
@@ -142,7 +142,7 @@ shove::define_topic!(
     RetentionOverrideTopic,
     SimpleMessage,
     TopologyBuilder::new("kafka-retention-override")
-        .kafka_topic_config("retention.ms", "1800000")
+        .with_topic_config("retention.ms", "1800000")
         .build()
 );
 

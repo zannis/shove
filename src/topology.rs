@@ -61,7 +61,7 @@ impl Default for NatsStreamConfig {
 // ---------------------------------------------------------------------------
 
 /// Kafka `cleanup.policy` for a shove-managed topic, set via
-/// [`TopologyBuilder::kafka_cleanup_policy`]. Kafka-specific.
+/// [`TopologyBuilder::with_cleanup_policy`]. Kafka-specific.
 #[cfg(feature = "kafka")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KafkaCleanupPolicy {
@@ -209,7 +209,7 @@ pub struct QueueTopology {
     pub(crate) nats_stream_config: Option<NatsStreamConfig>,
     /// Kafka topic-level config entries (e.g. `retention.ms`) applied to the
     /// main topic when shove creates or reconciles it (see
-    /// [`TopologyBuilder::kafka_topic_config`]). Kafka-specific.
+    /// [`TopologyBuilder::with_topic_config`]). Kafka-specific.
     #[cfg(feature = "kafka")]
     pub(crate) kafka_topic_config: Vec<(String, String)>,
 }
@@ -260,7 +260,7 @@ impl QueueTopology {
     }
 
     /// Kafka topic-level config entries set via
-    /// [`TopologyBuilder::kafka_topic_config`], in call order (repeated keys
+    /// [`TopologyBuilder::with_topic_config`], in call order (repeated keys
     /// are kept; the declarer resolves last-write-wins at merge time).
     /// Applied to the **main topic only**; the DLQ keeps cluster defaults.
     /// Kafka-specific; ignored by other backends.
@@ -411,48 +411,48 @@ impl TopologyBuilder {
     ///
     /// `build()` panics if a key is empty or blank.
     #[cfg(feature = "kafka")]
-    pub fn kafka_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn with_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.kafka_topic_config.push((key.into(), value.into()));
         self
     }
 
     /// Sets `retention.ms` from a [`Duration`]. Sugar for
-    /// [`kafka_topic_config`](Self::kafka_topic_config); the same scope and
+    /// [`with_topic_config`](Self::with_topic_config); the same scope and
     /// reconcile semantics apply. Sub-millisecond precision is truncated.
     #[cfg(feature = "kafka")]
-    pub fn kafka_retention(self, retention: Duration) -> Self {
-        self.kafka_topic_config("retention.ms", retention.as_millis().to_string())
+    pub fn with_retention(self, retention: Duration) -> Self {
+        self.with_topic_config("retention.ms", retention.as_millis().to_string())
     }
 
     /// Sets `retention.ms = -1`, retaining messages forever (typically paired
-    /// with [`kafka_cleanup_policy`](Self::kafka_cleanup_policy) and
+    /// with [`with_cleanup_policy`](Self::with_cleanup_policy) and
     /// [`KafkaCleanupPolicy::Compact`]). Sugar for
-    /// [`kafka_topic_config`](Self::kafka_topic_config).
+    /// [`with_topic_config`](Self::with_topic_config).
     #[cfg(feature = "kafka")]
-    pub fn kafka_retention_forever(self) -> Self {
-        self.kafka_topic_config("retention.ms", "-1")
+    pub fn with_retention_forever(self) -> Self {
+        self.with_topic_config("retention.ms", "-1")
     }
 
     /// Sets `retention.bytes`, the maximum partition size before old segments
     /// are discarded. Sugar for
-    /// [`kafka_topic_config`](Self::kafka_topic_config).
+    /// [`with_topic_config`](Self::with_topic_config).
     #[cfg(feature = "kafka")]
-    pub fn kafka_retention_bytes(self, bytes: u64) -> Self {
-        self.kafka_topic_config("retention.bytes", bytes.to_string())
+    pub fn with_retention_bytes(self, bytes: u64) -> Self {
+        self.with_topic_config("retention.bytes", bytes.to_string())
     }
 
     /// Sets `cleanup.policy`. Sugar for
-    /// [`kafka_topic_config`](Self::kafka_topic_config).
+    /// [`with_topic_config`](Self::with_topic_config).
     #[cfg(feature = "kafka")]
-    pub fn kafka_cleanup_policy(self, policy: KafkaCleanupPolicy) -> Self {
-        self.kafka_topic_config("cleanup.policy", policy.as_str())
+    pub fn with_cleanup_policy(self, policy: KafkaCleanupPolicy) -> Self {
+        self.with_topic_config("cleanup.policy", policy.as_str())
     }
 
     /// Sets `max.message.bytes`, the largest record batch the topic accepts.
-    /// Sugar for [`kafka_topic_config`](Self::kafka_topic_config).
+    /// Sugar for [`with_topic_config`](Self::with_topic_config).
     #[cfg(feature = "kafka")]
-    pub fn kafka_max_message_bytes(self, bytes: u32) -> Self {
-        self.kafka_topic_config("max.message.bytes", bytes.to_string())
+    pub fn with_max_message_bytes(self, bytes: u32) -> Self {
+        self.with_topic_config("max.message.bytes", bytes.to_string())
     }
 
     /// Enables strict per-key ordered delivery for this topic.
@@ -598,7 +598,7 @@ impl TopologyBuilder {
             self.kafka_topic_config
                 .iter()
                 .all(|(k, _)| !k.trim().is_empty()),
-            "kafka_topic_config() keys must be non-empty"
+            "with_topic_config() keys must be non-empty"
         );
         if let Some(ref seq) = self.sequencing {
             assert!(
@@ -1090,8 +1090,8 @@ mod tests {
         #[test]
         fn builder_kafka_config_is_stored_in_order() {
             let topology = TopologyBuilder::new("orders")
-                .kafka_topic_config("retention.ms", "3600000")
-                .kafka_topic_config("cleanup.policy", "delete")
+                .with_topic_config("retention.ms", "3600000")
+                .with_topic_config("cleanup.policy", "delete")
                 .build();
             assert_eq!(
                 topology.kafka_topic_config(),
@@ -1108,17 +1108,17 @@ mod tests {
             // Last-write-wins is resolved at merge time in the declarer;
             // the builder stores entries verbatim, in call order.
             let topology = TopologyBuilder::new("orders")
-                .kafka_topic_config("retention.ms", "1000")
-                .kafka_topic_config("retention.ms", "2000")
+                .with_topic_config("retention.ms", "1000")
+                .with_topic_config("retention.ms", "2000")
                 .build();
             assert_eq!(topology.kafka_topic_config().len(), 2);
         }
 
         #[test]
-        #[should_panic(expected = "kafka_topic_config() keys must be non-empty")]
+        #[should_panic(expected = "with_topic_config() keys must be non-empty")]
         fn builder_kafka_config_blank_key_panics() {
             let _ = TopologyBuilder::new("orders")
-                .kafka_topic_config("  ", "3600000")
+                .with_topic_config("  ", "3600000")
                 .build();
         }
 
@@ -1128,7 +1128,7 @@ mod tests {
                 .sequenced(SequenceFailure::Skip)
                 .hold_queue(Duration::from_secs(5))
                 .dlq()
-                .kafka_topic_config("retention.ms", "3600000")
+                .with_topic_config("retention.ms", "3600000")
                 .build();
             assert_eq!(topology.kafka_topic_config().len(), 1);
         }
@@ -1136,10 +1136,10 @@ mod tests {
         #[test]
         fn builder_named_helpers_map_to_config_entries() {
             let topology = TopologyBuilder::new("orders")
-                .kafka_retention(Duration::from_secs(3600))
-                .kafka_retention_bytes(1_073_741_824)
-                .kafka_cleanup_policy(KafkaCleanupPolicy::CompactDelete)
-                .kafka_max_message_bytes(1_048_576)
+                .with_retention(Duration::from_secs(3600))
+                .with_retention_bytes(1_073_741_824)
+                .with_cleanup_policy(KafkaCleanupPolicy::CompactDelete)
+                .with_max_message_bytes(1_048_576)
                 .build();
             assert_eq!(
                 topology.kafka_topic_config(),
@@ -1154,9 +1154,9 @@ mod tests {
         }
 
         #[test]
-        fn builder_kafka_retention_forever_is_minus_one() {
+        fn builder_with_retention_forever_is_minus_one() {
             let topology = TopologyBuilder::new("orders")
-                .kafka_retention_forever()
+                .with_retention_forever()
                 .build();
             assert_eq!(
                 topology.kafka_topic_config(),
@@ -1169,8 +1169,8 @@ mod tests {
             // Named helpers go through the same generic entry list, so the
             // declarer-side merge resolves repeated keys to the last call.
             let topology = TopologyBuilder::new("orders")
-                .kafka_topic_config("retention.ms", "1000")
-                .kafka_retention(Duration::from_secs(2))
+                .with_topic_config("retention.ms", "1000")
+                .with_retention(Duration::from_secs(2))
                 .build();
             let entries = topology.kafka_topic_config();
             assert_eq!(entries.len(), 2);

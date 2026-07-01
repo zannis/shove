@@ -57,7 +57,7 @@ impl TopologyDeclarer<Kafka> {
     /// Kafka topic-level config entry (e.g. `retention.ms`) applied to every
     /// **main** topic this declarer creates or reconciles. Repeatable; later
     /// calls for the same key win. Per-topic entries set via
-    /// [`TopologyBuilder::kafka_topic_config`](crate::topology::TopologyBuilder::kafka_topic_config)
+    /// [`TopologyBuilder::with_topic_config`](crate::topology::TopologyBuilder::with_topic_config)
     /// override these key-by-key. DLQ topics keep cluster defaults.
     ///
     /// On an already-existing topic, `declare` compares the declared keys

@@ -39,7 +39,7 @@ pub struct KafkaTopologyDeclarer {
     replication_factor: Option<i32>,
     /// Declarer-level topic config entries (e.g. `retention.ms`) applied to
     /// every **main** topic this declarer creates. Per-topic entries from
-    /// `TopologyBuilder::kafka_topic_config` override these key-by-key.
+    /// `TopologyBuilder::with_topic_config` override these key-by-key.
     /// DLQ topics are never touched.
     topic_config: Vec<(String, String)>,
 }
@@ -78,7 +78,7 @@ impl KafkaTopologyDeclarer {
     /// Sets a Kafka topic-level config entry (e.g. `retention.ms`) applied to
     /// every **main** topic this declarer creates or reconciles. Repeatable;
     /// later calls for the same key win. Per-topic entries set via
-    /// `TopologyBuilder::kafka_topic_config` override these key-by-key.
+    /// `TopologyBuilder::with_topic_config` override these key-by-key.
     /// DLQ topics keep cluster defaults.
     pub fn with_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.topic_config.push((key.into(), value.into()));
