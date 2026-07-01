@@ -63,12 +63,12 @@ impl KafkaTopologyDeclarer {
         let partitions = self.effective_partitions(DEFAULT_PARTITIONS);
         let replication = self.effective_replication();
         self.client
-            .create_topic(queue, partitions, replication)
+            .create_topic(queue, partitions, replication, &[])
             .await?;
 
         if let Some(dlq) = topology.dlq() {
             self.client
-                .create_topic(dlq, DEFAULT_PARTITIONS, replication)
+                .create_topic(dlq, DEFAULT_PARTITIONS, replication, &[])
                 .await?;
         }
 
@@ -91,12 +91,12 @@ impl KafkaTopologyDeclarer {
         let num_partitions = self.effective_partitions(seq.routing_shards() as i32);
         let replication = self.effective_replication();
         self.client
-            .create_topic(queue, num_partitions, replication)
+            .create_topic(queue, num_partitions, replication, &[])
             .await?;
 
         if let Some(dlq) = topology.dlq() {
             self.client
-                .create_topic(dlq, DEFAULT_PARTITIONS, replication)
+                .create_topic(dlq, DEFAULT_PARTITIONS, replication, &[])
                 .await?;
         }
 
