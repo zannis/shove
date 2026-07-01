@@ -1,0 +1,19 @@
+src/topology_declarer.rs
+  s_680dfd5a8a5463::t_92f1df62a37768 52-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "2ec692f520c25b98f96af8e1cd83810f5897d16d",
+  "prompts": {},
+  "sessions": {
+    "s_680dfd5a8a5463": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4b0fd8a-5212-4c39-b0d0-e506073825a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
