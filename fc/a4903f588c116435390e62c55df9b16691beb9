@@ -1,0 +1,47 @@
+src/backends/kafka/client.rs
+  s_00b9bc1384fab2::t_3738159237ba8a 801-804,810-813
+  s_00b9bc1384fab2::t_63951f88bcfc1a 305
+  s_00b9bc1384fab2::t_30770977c77d9a 10
+  s_00b9bc1384fab2::t_3904eb6fe5d695 16
+  s_00b9bc1384fab2::t_d9a4a44c92db67 439,445,454,460
+  s_00b9bc1384fab2::t_291fc1c7bdf8c1 601-602,605
+src/backends/kafka/context.rs
+  s_00b9bc1384fab2::t_1ad097eba6abcc 88
+  s_00b9bc1384fab2::t_007b3019403902 1-61
+  s_00b9bc1384fab2::t_bbd1ccb687715a 62-87,89-127
+src/backends/kafka/autoscaler.rs
+  s_00b9bc1384fab2::t_13ad29f8a2dbbb 52
+  s_00b9bc1384fab2::t_70c9407b309e9c 19
+  s_00b9bc1384fab2::t_e23b00aca784cf 74,78
+  s_00b9bc1384fab2::t_31a245c7bd44b3 63-66
+src/backends/kafka/msk_iam.rs
+  s_00b9bc1384fab2::t_28bea0c787636c 7
+  s_00b9bc1384fab2::t_badf5c94cc2343 82-85
+src/backends/kafka/mod.rs
+  s_00b9bc1384fab2::t_83bc6e3222abb0 7
+Cargo.toml
+  s_00b9bc1384fab2::t_ddfb0794b77faf 138
+  s_00b9bc1384fab2::t_3fc7e82cddc6cf 153
+src/backends/kafka/consumer.rs
+  s_00b9bc1384fab2::t_bc9043a750fe5c 669
+  s_00b9bc1384fab2::t_83bc6e3222abb0 752-754
+  s_00b9bc1384fab2::t_21983e23d72ea2 47
+Cargo.lock
+  s_00b9bc1384fab2::t_03bb4de811e294 3568
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "fca4903f588c116435390e62c55df9b16691beb9",
+  "prompts": {},
+  "sessions": {
+    "s_00b9bc1384fab2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f9b9db7-1acc-4f4f-96f2-5560f366de17",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
