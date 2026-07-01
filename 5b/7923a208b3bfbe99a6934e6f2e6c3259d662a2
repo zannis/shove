@@ -1,0 +1,25 @@
+src/topology.rs
+  s_680dfd5a8a5463::t_f7f76a82bc5531 1008-1066
+  s_680dfd5a8a5463::t_4df4ec6a13996c 291-292,309-310
+  s_680dfd5a8a5463::t_f726f209fc0c32 527-533
+  s_680dfd5a8a5463::t_d255af4676d669 365-388
+  s_680dfd5a8a5463::t_2ff35bd6c561a0 589-590
+  s_680dfd5a8a5463::t_d4395b096bab95 180-184
+  s_680dfd5a8a5463::t_80a460beb04853 232-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "5b7923a208b3bfbe99a6934e6f2e6c3259d662a2",
+  "prompts": {},
+  "sessions": {
+    "s_680dfd5a8a5463": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4b0fd8a-5212-4c39-b0d0-e506073825a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
