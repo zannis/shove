@@ -1,0 +1,35 @@
+src/backends/kafka/autoscaler.rs
+  s_00b9bc1384fab2::t_a579e9a96a3547 7-8,21-22
+  s_00b9bc1384fab2::t_1d28da7720a9ad 23-24
+  s_00b9bc1384fab2::t_a3bb740f1ed276 94-107
+  s_00b9bc1384fab2::t_345358b1a85e3f 191-194,197,199-214
+  s_00b9bc1384fab2::t_2cf51209bb62c8 49-93,108-109,112,118
+  s_00b9bc1384fab2::t_a6b1ae8fe695fa 119-126,131-132,134-137
+  s_00b9bc1384fab2::t_c265daffabe633 143,151-154,170,172,174-176
+  s_00b9bc1384fab2::t_4448e19b806cd6 163-168
+  s_00b9bc1384fab2::t_f5a18b45fb7154 180
+  s_00b9bc1384fab2::t_2cbde2a897fa20 155-162,169,171,173,177-179,184-190,195-196,198
+src/backends/kafka/client.rs
+  s_00b9bc1384fab2::t_f1ee58399830dc 798-814
+Cargo.toml
+  s_00b9bc1384fab2::t_3fc7e82cddc6cf 153
+  s_00b9bc1384fab2::t_ddfb0794b77faf 138
+Cargo.lock
+  s_00b9bc1384fab2::t_03bb4de811e294 3568
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "a98352e1e387e6e8a69e92052953dc88281135e3",
+  "prompts": {},
+  "sessions": {
+    "s_00b9bc1384fab2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8f9b9db7-1acc-4f4f-96f2-5560f366de17",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
