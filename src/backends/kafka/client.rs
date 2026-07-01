@@ -864,10 +864,10 @@ fn fetch_topic_partition_count_blocking(
 /// `Handle::block_on`, which panics on a Tokio worker thread, so it runs on a
 /// blocking thread (the same contract librdkafka's own C callback thread has).
 #[cfg(feature = "kafka-msk-iam")]
-async fn prime_admin_oauth_token(
-    admin: &AdminClient<MskIamContext>,
-    ctx: MskIamContext,
-) -> Result<()> {
+async fn prime_admin_oauth_token<C>(admin: &AdminClient<C>, ctx: C) -> Result<()>
+where
+    C: ClientContext + Send + 'static,
+{
     let token = tokio::task::spawn_blocking(move || {
         // The `Box<dyn Error>` from generate_oauth_token is not `Send`; stringify
         // it inside the blocking thread so only a `String` crosses the boundary.
@@ -877,11 +877,24 @@ async fn prime_admin_oauth_token(
     .map_err(|e| ShoveError::Topology(format!("oauth token task join failed: {e}")))?
     .map_err(|e| {
         ShoveError::Connection(format!(
-            "failed to generate MSK IAM token for admin client: {e}"
+            "failed to generate OAUTHBEARER token for admin client: {e}"
         ))
     })?;
 
     set_admin_oauth_token(admin.inner().native_ptr(), &token)
+}
+
+/// Test-only seam: run the exact admin OAUTHBEARER priming path
+/// ([`prime_admin_oauth_token`]) against a caller-supplied admin client and
+/// context. Exists because MSK IAM's presigned-URL tokens cannot be validated
+/// without real AWS, so the integration test substitutes an unsecured-JWT
+/// context to exercise this code path against a local OAUTHBEARER broker.
+#[cfg(all(feature = "kafka-msk-iam", feature = "test-support"))]
+pub async fn prime_admin_oauth_token_for_test<C>(admin: &AdminClient<C>, ctx: C) -> Result<()>
+where
+    C: ClientContext + Send + 'static,
+{
+    prime_admin_oauth_token(admin, ctx).await
 }
 
 /// Hand a generated token to librdkafka via `rd_kafka_oauthbearer_set_token`.
