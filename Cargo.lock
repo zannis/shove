@@ -4173,7 +4173,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shove"
-version = "0.11.9"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "astral-tokio-tar",
