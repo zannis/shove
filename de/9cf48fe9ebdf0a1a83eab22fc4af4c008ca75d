@@ -1,0 +1,36 @@
+src/topology.rs
+  s_680dfd5a8a5463::t_4ed8f67966403c 59-88
+  s_680dfd5a8a5463::t_9f52a0296f7684 419-457
+  s_680dfd5a8a5463::t_ae16d15beb541f 1135-1185
+src/topology_declarer.rs
+  s_680dfd5a8a5463::t_4a8a12315dbca6 77-110
+  s_680dfd5a8a5463::t_abe744859cd860 8-11
+tests/kafka_integration.rs
+  s_680dfd5a8a5463::t_70569034d2e778 472-474,477
+src/lib.rs
+  s_5b6464a098e6aa::t_b5bb908a7de281 210-211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "de9cf48fe9ebdf0a1a83eab22fc4af4c008ca75d",
+  "prompts": {},
+  "sessions": {
+    "s_5b6464a098e6aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09a5da37-7afc-4497-b5f3-8b11592d1b74",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_680dfd5a8a5463": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4b0fd8a-5212-4c39-b0d0-e506073825a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
