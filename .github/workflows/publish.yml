@@ -34,9 +34,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: cargo-bins/cargo-binstall@v1.20.1
+
       - name: Install cargo-edit
         if: inputs.bump != 'none'
-        run: cargo install -q cargo-edit
+        run: cargo binstall -y --version 0.13.10 cargo-edit
 
       - name: Bump version
         if: inputs.bump != 'none'
