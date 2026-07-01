@@ -320,6 +320,10 @@ pub struct TopologyBuilder {
     nats_stream_config: Option<NatsStreamConfig>,
     #[cfg(feature = "kafka")]
     kafka_topic_config: Vec<(String, String)>,
+    #[cfg(feature = "kafka")]
+    kafka_retention_finite: bool,
+    #[cfg(feature = "kafka")]
+    kafka_retention_forever: bool,
 }
 
 impl TopologyBuilder {
@@ -338,6 +342,10 @@ impl TopologyBuilder {
             nats_stream_config: None,
             #[cfg(feature = "kafka")]
             kafka_topic_config: Vec::new(),
+            #[cfg(feature = "kafka")]
+            kafka_retention_finite: false,
+            #[cfg(feature = "kafka")]
+            kafka_retention_forever: false,
         }
     }
 
@@ -419,8 +427,18 @@ impl TopologyBuilder {
     /// Sets `retention.ms` from a [`Duration`]. Sugar for
     /// [`with_topic_config`](Self::with_topic_config); the same scope and
     /// reconcile semantics apply. Sub-millisecond precision is truncated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with
+    /// [`with_retention_forever`](Self::with_retention_forever).
     #[cfg(feature = "kafka")]
-    pub fn with_retention(self, retention: Duration) -> Self {
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        assert!(
+            !self.kafka_retention_forever,
+            "with_retention() cannot be combined with with_retention_forever() — both set retention.ms"
+        );
+        self.kafka_retention_finite = true;
         self.with_topic_config("retention.ms", retention.as_millis().to_string())
     }
 
@@ -428,8 +446,17 @@ impl TopologyBuilder {
     /// with [`with_cleanup_policy`](Self::with_cleanup_policy) and
     /// [`KafkaCleanupPolicy::Compact`]). Sugar for
     /// [`with_topic_config`](Self::with_topic_config).
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with [`with_retention`](Self::with_retention).
     #[cfg(feature = "kafka")]
-    pub fn with_retention_forever(self) -> Self {
+    pub fn with_retention_forever(mut self) -> Self {
+        assert!(
+            !self.kafka_retention_finite,
+            "with_retention() cannot be combined with with_retention_forever() — both set retention.ms"
+        );
+        self.kafka_retention_forever = true;
         self.with_topic_config("retention.ms", "-1")
     }
 
@@ -1182,6 +1209,37 @@ mod tests {
             assert_eq!(KafkaCleanupPolicy::Delete.as_str(), "delete");
             assert_eq!(KafkaCleanupPolicy::Compact.as_str(), "compact");
             assert_eq!(KafkaCleanupPolicy::CompactDelete.as_str(), "compact,delete");
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "with_retention() cannot be combined with with_retention_forever()"
+        )]
+        fn builder_retention_then_forever_panics() {
+            let _ = TopologyBuilder::new("orders")
+                .with_retention(Duration::from_secs(1))
+                .with_retention_forever();
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "with_retention() cannot be combined with with_retention_forever()"
+        )]
+        fn builder_forever_then_retention_panics() {
+            let _ = TopologyBuilder::new("orders")
+                .with_retention_forever()
+                .with_retention(Duration::from_secs(1));
+        }
+
+        #[test]
+        fn builder_retention_combines_with_retention_bytes() {
+            // retention.bytes is a complementary size bound, kept combinable
+            // with either retention.ms form.
+            let topology = TopologyBuilder::new("orders")
+                .with_retention_forever()
+                .with_retention_bytes(1_000_000)
+                .build();
+            assert_eq!(topology.kafka_topic_config().len(), 2);
         }
     }
 }

@@ -78,16 +78,27 @@ impl TopologyDeclarer<Kafka> {
     /// Sets `retention.ms` from a [`Duration`]. Sugar for
     /// [`with_topic_config`](Self::with_topic_config); the same scope and
     /// reconcile semantics apply. Sub-millisecond precision is truncated.
-    pub fn with_retention(self, retention: Duration) -> Self {
-        self.with_topic_config("retention.ms", retention.as_millis().to_string())
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with
+    /// [`with_retention_forever`](Self::with_retention_forever).
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.inner = self.inner.with_retention(retention);
+        self
     }
 
     /// Sets `retention.ms = -1`, retaining messages forever (typically paired
     /// with [`with_cleanup_policy`](Self::with_cleanup_policy) and
     /// [`KafkaCleanupPolicy::Compact`]). Sugar for
     /// [`with_topic_config`](Self::with_topic_config).
-    pub fn with_retention_forever(self) -> Self {
-        self.with_topic_config("retention.ms", "-1")
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with [`with_retention`](Self::with_retention).
+    pub fn with_retention_forever(mut self) -> Self {
+        self.inner = self.inner.with_retention_forever();
+        self
     }
 
     /// Sets `retention.bytes`, the maximum partition size before old segments

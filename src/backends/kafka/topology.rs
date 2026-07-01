@@ -42,6 +42,10 @@ pub struct KafkaTopologyDeclarer {
     /// `TopologyBuilder::with_topic_config` override these key-by-key.
     /// DLQ topics are never touched.
     topic_config: Vec<(String, String)>,
+    /// Guards for the mutually exclusive named retention helpers:
+    /// `with_retention` sets the first, `with_retention_forever` the second.
+    retention_finite: bool,
+    retention_forever: bool,
 }
 
 impl KafkaTopologyDeclarer {
@@ -51,6 +55,8 @@ impl KafkaTopologyDeclarer {
             min_partitions: None,
             replication_factor: None,
             topic_config: Vec::new(),
+            retention_finite: false,
+            retention_forever: false,
         }
     }
 
@@ -83,6 +89,37 @@ impl KafkaTopologyDeclarer {
     pub fn with_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.topic_config.push((key.into(), value.into()));
         self
+    }
+
+    /// Sets `retention.ms` from a [`Duration`]. Sugar for
+    /// [`with_topic_config`](Self::with_topic_config).
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with
+    /// [`with_retention_forever`](Self::with_retention_forever).
+    pub fn with_retention(mut self, retention: std::time::Duration) -> Self {
+        assert!(
+            !self.retention_forever,
+            "with_retention() cannot be combined with with_retention_forever() — both set retention.ms"
+        );
+        self.retention_finite = true;
+        self.with_topic_config("retention.ms", retention.as_millis().to_string())
+    }
+
+    /// Sets `retention.ms = -1`, retaining messages forever. Sugar for
+    /// [`with_topic_config`](Self::with_topic_config).
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with [`with_retention`](Self::with_retention).
+    pub fn with_retention_forever(mut self) -> Self {
+        assert!(
+            !self.retention_finite,
+            "with_retention() cannot be combined with with_retention_forever() — both set retention.ms"
+        );
+        self.retention_forever = true;
+        self.with_topic_config("retention.ms", "-1")
     }
 
     fn effective_partitions(&self, base: i32) -> i32 {
