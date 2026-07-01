@@ -49,6 +49,27 @@ impl TopologyDeclarer<Kafka> {
         self.inner = self.inner.with_min_partitions(n);
         self
     }
+
+    /// Kafka topic-level config entry (e.g. `retention.ms`) applied to every
+    /// **main** topic this declarer creates or reconciles. Repeatable; later
+    /// calls for the same key win. Per-topic entries set via
+    /// [`TopologyBuilder::kafka_topic_config`](crate::topology::TopologyBuilder::kafka_topic_config)
+    /// override these key-by-key. DLQ topics keep cluster defaults.
+    ///
+    /// On an already-existing topic, `declare` compares the declared keys
+    /// against the live values and issues an alter when they drift, preserving
+    /// the topic's other dynamic config entries.
+    ///
+    /// ```ignore
+    /// broker.topology()
+    ///     .with_topic_config("retention.ms", "604800000")
+    ///     .declare::<IngestionTopic>()
+    ///     .await?;
+    /// ```
+    pub fn with_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.inner = self.inner.with_topic_config(key, value);
+        self
+    }
 }
 
 /// Multi-topic declaration via tuples. Arities 1 through 16.
