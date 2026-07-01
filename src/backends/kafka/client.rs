@@ -703,12 +703,16 @@ impl KafkaClient {
         let topic_name = name.to_string();
         #[cfg(feature = "kafka-msk-iam")]
         let msk_ctx = self.msk_context();
+        #[cfg(feature = "kafka-msk-iam")]
+        let shutdown = self.shutdown_token();
         let current = tokio::task::spawn_blocking(move || {
             fetch_topic_partition_count_blocking(
                 base,
                 &topic_name,
                 #[cfg(feature = "kafka-msk-iam")]
                 msk_ctx,
+                #[cfg(feature = "kafka-msk-iam")]
+                shutdown,
             )
         })
         .await
@@ -778,6 +782,7 @@ fn fetch_topic_partition_count_blocking(
     base: ClientConfig,
     topic_name: &str,
     #[cfg(feature = "kafka-msk-iam")] msk_ctx: Option<MskIamContext>,
+    #[cfg(feature = "kafka-msk-iam")] shutdown: CancellationToken,
 ) -> Result<i32> {
     use rdkafka::consumer::{BaseConsumer, Consumer as _};
 
@@ -795,7 +800,23 @@ fn fetch_topic_partition_count_blocking(
         let consumer: BaseConsumer<MskIamContext> = cfg.create_with_context(ctx).map_err(|e| {
             ShoveError::Topology(format!("failed to create MSK metadata consumer: {e}"))
         })?;
-        consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10))
+        // A one-shot metadata consumer never polls, so nothing would deliver
+        // the initial OAUTHBEARER token (rdkafka services it via the event
+        // queue, which fetch_metadata does not pump). Pump it on a scoped
+        // thread for the duration of the blocking fetch; the thread is joined
+        // before this block returns.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) && !shutdown.is_cancelled() {
+                    let _ = consumer.poll(Duration::from_millis(100));
+                }
+            });
+            let md = consumer.fetch_metadata(Some(topic_name), Duration::from_secs(10));
+            done.store(true, Ordering::Relaxed);
+            md
+        })
     } else {
         let consumer: BaseConsumer = cfg.create().map_err(|e| {
             ShoveError::Topology(format!("failed to create metadata consumer: {e}"))

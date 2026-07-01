@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use rdkafka::TopicPartitionList;
 use rdkafka::consumer::{BaseConsumer, Consumer as RdkafkaConsumer};
+use rdkafka::error::KafkaResult;
+use rdkafka::metadata::Metadata;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -16,6 +18,10 @@ use crate::error::Result;
 
 use super::client::KafkaClient;
 use super::consumer_group::KafkaConsumerGroupRegistry;
+#[cfg(feature = "kafka-msk-iam")]
+use super::msk_iam::MskIamContext;
+#[cfg(feature = "kafka-msk-iam")]
+use tokio_util::sync::CancellationToken;
 
 /// Queue statistics fetched from Kafka consumer lag.
 #[derive(Debug, Clone, Default)]
@@ -40,26 +46,101 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
     ) -> impl Future<Output = Result<KafkaQueueStats>> + Send;
 }
 
+/// Stats-only `BaseConsumer` that carries whichever `ClientContext` matches the
+/// broker's auth mode. Under MSK IAM the consumer must hold an
+/// [`MskIamContext`] so librdkafka's OAUTHBEARER refresh callback can mint
+/// tokens; without it the metadata/committed-offset RPCs below fail
+/// authentication. Mirrors the context selection used by the producer, stream
+/// consumer, admin client, and metadata consumer.
+enum StatsConsumer {
+    Default(BaseConsumer),
+    #[cfg(feature = "kafka-msk-iam")]
+    MskIam(BaseConsumer<MskIamContext>),
+}
+
+impl StatsConsumer {
+    fn fetch_metadata(&self, topic: Option<&str>, timeout: Duration) -> KafkaResult<Metadata> {
+        match self {
+            Self::Default(c) => c.fetch_metadata(topic, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.fetch_metadata(topic, timeout),
+        }
+    }
+
+    fn committed_offsets(
+        &self,
+        tpl: TopicPartitionList,
+        timeout: Duration,
+    ) -> KafkaResult<TopicPartitionList> {
+        match self {
+            Self::Default(c) => c.committed_offsets(tpl, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.committed_offsets(tpl, timeout),
+        }
+    }
+
+    fn fetch_watermarks(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Duration,
+    ) -> KafkaResult<(i64, i64)> {
+        match self {
+            Self::Default(c) => c.fetch_watermarks(topic, partition, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.fetch_watermarks(topic, partition, timeout),
+        }
+    }
+
+    /// Service the client's event queue once. This is what fires librdkafka's
+    /// OAUTHBEARER token-refresh callback: the blocking metadata/offset RPCs
+    /// above never poll the queue themselves, so an MSK IAM consumer that is
+    /// only ever used for stats would otherwise never acquire or refresh a
+    /// token. The returned message (always `None` here — this consumer never
+    /// subscribes) is dropped immediately.
+    #[cfg(feature = "kafka-msk-iam")]
+    fn serve_events(&self, timeout: Duration) {
+        match self {
+            Self::Default(c) => drop(c.poll(timeout)),
+            Self::MskIam(c) => drop(c.poll(timeout)),
+        }
+    }
+}
+
 /// Default stats provider that queries Kafka consumer lag.
 ///
-/// perf-K-10: caches one BaseConsumer per group_id so each autoscaler poll
+/// perf-K-10: caches one consumer per group_id so each autoscaler poll
 /// reuses the connection + metadata cache instead of doing a fresh broker
 /// handshake. Typical deployments have one or two distinct group_ids
 /// (`{queue}-consumer` for standard groups, `{queue}-fifo` for FIFO).
 pub struct KafkaLagStatsProvider {
     client: KafkaClient,
-    consumers: StdMutex<HashMap<String, Arc<BaseConsumer>>>,
+    consumers: StdMutex<HashMap<String, Arc<StatsConsumer>>>,
+    /// Child of the client shutdown token: cancelled when the client shuts
+    /// down *or* when this provider is dropped, whichever comes first. Bounds
+    /// the OAUTHBEARER refresh threads (below) to the provider's lifetime so
+    /// none outlive it.
+    #[cfg(feature = "kafka-msk-iam")]
+    refresh_shutdown: CancellationToken,
+    #[cfg(feature = "kafka-msk-iam")]
+    refresh_threads: StdMutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl KafkaLagStatsProvider {
     pub fn new(client: KafkaClient) -> Self {
+        #[cfg(feature = "kafka-msk-iam")]
+        let refresh_shutdown = client.shutdown_token().child_token();
         Self {
+            #[cfg(feature = "kafka-msk-iam")]
+            refresh_shutdown,
+            #[cfg(feature = "kafka-msk-iam")]
+            refresh_threads: StdMutex::new(Vec::new()),
             client,
             consumers: StdMutex::new(HashMap::new()),
         }
     }
 
-    fn get_or_create_consumer(&self, group_id: &str) -> Result<Arc<BaseConsumer>> {
+    fn get_or_create_consumer(&self, group_id: &str) -> Result<Arc<StatsConsumer>> {
         let mut guard = self
             .consumers
             .lock()
@@ -67,15 +148,69 @@ impl KafkaLagStatsProvider {
         if let Some(c) = guard.get(group_id) {
             return Ok(Arc::clone(c));
         }
-        let consumer: BaseConsumer = self
-            .client
-            .base_config()
-            .set("group.id", group_id)
-            .create()
-            .map_err(|e| ShoveError::Topology(format!("failed to create stats consumer: {e}")))?;
-        let arc = Arc::new(consumer);
+        let mut cfg = self.client.base_config();
+        cfg.set("group.id", group_id);
+
+        #[cfg(feature = "kafka-msk-iam")]
+        let arc = if let Some(ctx) = self.client.msk_context() {
+            let consumer: BaseConsumer<MskIamContext> =
+                cfg.create_with_context(ctx).map_err(|e| {
+                    ShoveError::Topology(format!("failed to create MSK stats consumer: {e}"))
+                })?;
+            let arc = Arc::new(StatsConsumer::MskIam(consumer));
+            // A stats-only consumer never polls, so nothing would service the
+            // OAUTHBEARER token-refresh event. Pump its event queue on a
+            // dedicated thread, scoped to this provider via refresh_shutdown.
+            let handle =
+                Self::spawn_token_refresh_loop(Arc::clone(&arc), self.refresh_shutdown.clone());
+            if let Ok(mut threads) = self.refresh_threads.lock() {
+                threads.push(handle);
+            }
+            arc
+        } else {
+            Arc::new(StatsConsumer::Default(cfg.create().map_err(|e| {
+                ShoveError::Topology(format!("failed to create stats consumer: {e}"))
+            })?))
+        };
+
+        #[cfg(not(feature = "kafka-msk-iam"))]
+        let arc = Arc::new(StatsConsumer::Default(cfg.create().map_err(|e| {
+            ShoveError::Topology(format!("failed to create stats consumer: {e}"))
+        })?));
+
         guard.insert(group_id.to_string(), Arc::clone(&arc));
         Ok(arc)
+    }
+
+    /// Continuously serve the MSK IAM stats consumer's event queue so
+    /// librdkafka can deliver the initial OAUTHBEARER token and the periodic
+    /// (~every few minutes) refreshes. Runs on its own OS thread because
+    /// `serve_events` blocks inside librdkafka; exits promptly once the client
+    /// shutdown token is cancelled.
+    #[cfg(feature = "kafka-msk-iam")]
+    fn spawn_token_refresh_loop(
+        consumer: Arc<StatsConsumer>,
+        shutdown: CancellationToken,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while !shutdown.is_cancelled() {
+                consumer.serve_events(Duration::from_millis(250));
+            }
+        })
+    }
+}
+
+#[cfg(feature = "kafka-msk-iam")]
+impl Drop for KafkaLagStatsProvider {
+    fn drop(&mut self) {
+        // Stop the OAUTHBEARER refresh threads and wait for them so no
+        // background work outlives the provider.
+        self.refresh_shutdown.cancel();
+        if let Ok(mut threads) = self.refresh_threads.lock() {
+            for handle in threads.drain(..) {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
