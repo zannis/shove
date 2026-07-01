@@ -1,0 +1,27 @@
+src/backends/kafka/topology.rs
+  s_680dfd5a8a5463::t_f8463afe0494cb 94,99
+  s_680dfd5a8a5463::t_f8e8795d84127c 66,71
+src/backends/kafka/client.rs
+  s_680dfd5a8a5463::t_1b331569aae02c 1,10-13
+  s_680dfd5a8a5463::t_ec5d90dba64528 888-891
+  s_680dfd5a8a5463::t_697ec3aacd92cd 872-887,892-899
+  s_680dfd5a8a5463::t_82d9ea2bd96522 1131-1212
+  s_680dfd5a8a5463::t_7ab92ffebf57a9 641-643,649,655,659,669,674,679-681,694
+  s_680dfd5a8a5463::t_c4b1de070eac9a 779-850
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.6",
+  "base_commit_sha": "5a42ecaf3eeb0db4f828d6d677f049c258857484",
+  "prompts": {},
+  "sessions": {
+    "s_680dfd5a8a5463": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e4b0fd8a-5212-4c39-b0d0-e506073825a1",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
