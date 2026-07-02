@@ -1,0 +1,22 @@
+docs/pages/backends/kafka/examples/basic.mdx
+  s_7458278028faf2::t_759f4c88de2503 42
+  s_7458278028faf2::t_660003f37337f4 56
+docs/pages/backends/kafka.mdx
+  s_7458278028faf2::t_eac930704b7328 322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "3f79f34cf53d16c9ab2cd42da83654f2adc89bee",
+  "prompts": {},
+  "sessions": {
+    "s_7458278028faf2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29b24b3b-593c-4f99-906c-c433027d04f7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}

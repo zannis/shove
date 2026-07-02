@@ -1,0 +1,31 @@
+tests/kafka_rebalance.rs
+  s_7458278028faf2::t_1042c5ebbcb257 191
+  s_7458278028faf2::t_cdd3de3df4fb7b 156,159-160
+  s_7458278028faf2::t_49bdcf8a82da3c 212-213,215
+  s_7458278028faf2::t_612f201d253bc9 153-155
+  s_7458278028faf2::t_1015b6638ce2b8 278
+  s_7458278028faf2::t_2abdbe2ab824ea 157-158,161-186
+  s_7458278028faf2::t_35464f95727b08 141
+  s_7458278028faf2::t_dcd4dc7d0e6a97 129
+  s_7458278028faf2::t_a6ec8163022462 37
+  s_7458278028faf2::t_05c35e9a1c84dd 140,142-148
+  s_7458278028faf2::t_134c8573b98394 245-250,292-297
+  s_7458278028faf2::t_e9c3eaebfb078e 214,216
+  s_7458278028faf2::t_d70b975c49aa52 1-36,38-128,130-139,149-152,187-190,192-211,217-244,251-277,279-291,298-302
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "6523978e9216ead66be7fb10294004e00d43f0fe",
+  "prompts": {},
+  "sessions": {
+    "s_7458278028faf2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29b24b3b-593c-4f99-906c-c433027d04f7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
