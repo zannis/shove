@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(feature = "kafka-ssl")]
 use std::path::PathBuf;
@@ -6,7 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
-use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::admin::{
+    AdminClient, AdminOptions, AlterConfig, ConfigEntry, ConfigSource, NewTopic, ResourceSpecifier,
+    TopicReplication,
+};
 use rdkafka::client::{ClientContext, DefaultClientContext};
 use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::OwnedHeaders;
@@ -634,23 +638,25 @@ impl KafkaClient {
         Ok(admin)
     }
 
-    /// Create a topic, or expand its partition count if it already exists
-    /// with fewer partitions than requested.
+    /// Create a topic, or bring an existing one up to spec: expand its
+    /// partition count if lower than requested, and reconcile the given
+    /// topic-level config entries if they drift from the live values.
     pub(super) async fn create_topic(
         &self,
         name: &str,
         num_partitions: i32,
         replication_factor: i32,
+        config: &[(String, String)],
     ) -> Result<()> {
         #[cfg(feature = "kafka-msk-iam")]
         if let Some(ctx) = self.msk_context() {
             let admin = self.create_admin_msk(ctx).await?;
             return self
-                .create_topic_with_admin(&admin, name, num_partitions, replication_factor)
+                .create_topic_with_admin(&admin, name, num_partitions, replication_factor, config)
                 .await;
         }
         let admin = self.create_admin_default().await?;
-        self.create_topic_with_admin(&admin, name, num_partitions, replication_factor)
+        self.create_topic_with_admin(&admin, name, num_partitions, replication_factor, config)
             .await
     }
 
@@ -660,15 +666,19 @@ impl KafkaClient {
         name: &str,
         num_partitions: i32,
         replication_factor: i32,
+        config: &[(String, String)],
     ) -> Result<()>
     where
         C: ClientContext + 'static,
     {
-        let new_topic = NewTopic::new(
+        let mut new_topic = NewTopic::new(
             name,
             num_partitions,
             TopicReplication::Fixed(replication_factor),
         );
+        for (key, value) in config {
+            new_topic = new_topic.set(key, value);
+        }
         let results = admin
             .create_topics(&[new_topic], &AdminOptions::new())
             .await
@@ -681,6 +691,7 @@ impl KafkaClient {
                     if code == RDKafkaErrorCode::TopicAlreadyExists {
                         tracing::debug!(topic, "topic already exists, checking partition count");
                         self.ensure_partitions(admin, name, num_partitions).await?;
+                        self.ensure_topic_configs(admin, name, config).await?;
                     } else {
                         metrics::record_backend_error(
                             metrics::BackendLabel::Kafka,
@@ -765,6 +776,78 @@ impl KafkaClient {
         Ok(())
     }
 
+    /// If any declared config entry differs from the topic's live value,
+    /// realign the topic via AlterConfigs. No drift ⇒ no alter call, so
+    /// idempotent redeclares stay quiet.
+    async fn ensure_topic_configs<C>(
+        &self,
+        admin: &AdminClient<C>,
+        name: &str,
+        desired: &[(String, String)],
+    ) -> Result<()>
+    where
+        C: ClientContext + 'static,
+    {
+        if desired.is_empty() {
+            return Ok(());
+        }
+
+        let specifier = ResourceSpecifier::Topic(name);
+        let described = admin
+            .describe_configs([&specifier], &AdminOptions::new())
+            .await
+            .map_err(|e| {
+                ShoveError::Topology(format!("failed to describe configs for {name}: {e}"))
+            })?;
+        let resource = described
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ShoveError::Topology(format!("no config resource returned for topic {name}"))
+            })?
+            .map_err(|code| {
+                ShoveError::Topology(format!("failed to describe configs for {name}: {code:?}"))
+            })?;
+
+        let live = resource.entry_map();
+        let drift: Vec<&str> = desired
+            .iter()
+            .filter(|(k, v)| {
+                live.get(k.as_str()).and_then(|e| e.value.as_deref()) != Some(v.as_str())
+            })
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if drift.is_empty() {
+            tracing::debug!(topic = name, "topic configs already match declared values");
+            return Ok(());
+        }
+
+        tracing::info!(topic = name, keys = ?drift, "reconciling topic configs");
+        let merged = overlay_dynamic_entries(&resource.entries, desired);
+        let mut alter = AlterConfig::new(ResourceSpecifier::Topic(name));
+        for (key, value) in &merged {
+            alter = alter.set(key, value);
+        }
+        let results = admin
+            .alter_configs([&alter], &AdminOptions::new())
+            .await
+            .map_err(|e| {
+                ShoveError::Topology(format!("failed to alter configs for {name}: {e}"))
+            })?;
+        for result in results {
+            if let Err((spec, code)) = result {
+                metrics::record_backend_error(
+                    metrics::BackendLabel::Kafka,
+                    metrics::BackendErrorKind::Topology,
+                );
+                return Err(ShoveError::Topology(format!(
+                    "failed to alter configs for {spec:?}: {code:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
         tokio::time::sleep(SHUTDOWN_GRACE).await;
@@ -784,6 +867,34 @@ impl KafkaClient {
     pub(super) fn msk_context(&self) -> Option<MskIamContext> {
         self.msk_context.clone()
     }
+}
+
+/// Merge set for a legacy `AlterConfigs` call: the topic's current
+/// dynamic-topic entries overlaid with the declared `desired` keys.
+///
+/// Legacy AlterConfigs (the only variant rdkafka 0.39 wraps) **replaces** the
+/// topic's entire dynamic config set — submitting only the declared keys would
+/// silently reset every other dynamic entry to cluster defaults. Only entries
+/// with `source == DynamicTopic` are carried over: default/broker-sourced
+/// values are not part of the topic's dynamic set and must not be pinned onto
+/// it. Valueless entries (sensitive) are skipped — they cannot be read back,
+/// so they cannot be preserved.
+fn overlay_dynamic_entries<'a>(
+    entries: &'a [ConfigEntry],
+    desired: &'a [(String, String)],
+) -> BTreeMap<&'a str, &'a str> {
+    let mut merged: BTreeMap<&str, &str> = BTreeMap::new();
+    for e in entries {
+        if e.source == ConfigSource::DynamicTopic
+            && let Some(v) = e.value.as_deref()
+        {
+            merged.insert(e.name.as_str(), v);
+        }
+    }
+    for (k, v) in desired {
+        merged.insert(k.as_str(), v.as_str());
+    }
+    merged
 }
 
 /// Build a metadata `BaseConsumer` against `base`, fetch the topic's metadata
@@ -1015,6 +1126,88 @@ mod tests {
         assert!(!rendered.contains("NESTED-PASSWORD"));
         assert!(rendered.contains("broker:9093"));
         assert!(rendered.contains("bob"));
+    }
+
+    // -- overlay_dynamic_entries: legacy AlterConfigs merge correctness --
+
+    mod overlay {
+        use super::super::overlay_dynamic_entries;
+        use rdkafka::admin::{ConfigEntry, ConfigSource};
+
+        fn entry(name: &str, value: &str, source: ConfigSource) -> ConfigEntry {
+            ConfigEntry {
+                name: name.to_string(),
+                value: Some(value.to_string()),
+                source,
+                is_read_only: false,
+                is_default: false,
+                is_sensitive: false,
+            }
+        }
+
+        #[test]
+        fn preserves_dynamic_topic_entries_not_being_overridden() {
+            let entries = vec![
+                entry("segment.bytes", "123456789", ConfigSource::DynamicTopic),
+                entry("retention.ms", "604800000", ConfigSource::Default),
+            ];
+            let desired = vec![("retention.ms".to_string(), "3600000".to_string())];
+            let merged = overlay_dynamic_entries(&entries, &desired);
+            assert_eq!(merged.get("segment.bytes"), Some(&"123456789"));
+            assert_eq!(merged.get("retention.ms"), Some(&"3600000"));
+            assert_eq!(merged.len(), 2);
+        }
+
+        #[test]
+        fn excludes_non_dynamic_topic_sources() {
+            // Broker-level / default entries must NOT be echoed into a topic
+            // alter — only dynamic *topic* config belongs to the topic's set.
+            let entries = vec![
+                entry("retention.ms", "604800000", ConfigSource::Default),
+                entry("compression.type", "producer", ConfigSource::DynamicBroker),
+                entry("min.insync.replicas", "2", ConfigSource::StaticBroker),
+            ];
+            let desired = vec![("retention.ms".to_string(), "1000".to_string())];
+            let merged = overlay_dynamic_entries(&entries, &desired);
+            assert_eq!(merged.get("retention.ms"), Some(&"1000"));
+            assert_eq!(merged.len(), 1);
+        }
+
+        #[test]
+        fn desired_overrides_dynamic_topic_entry() {
+            let entries = vec![entry("retention.ms", "1000", ConfigSource::DynamicTopic)];
+            let desired = vec![("retention.ms".to_string(), "2000".to_string())];
+            let merged = overlay_dynamic_entries(&entries, &desired);
+            assert_eq!(merged.get("retention.ms"), Some(&"2000"));
+            assert_eq!(merged.len(), 1);
+        }
+
+        #[test]
+        fn later_desired_entry_wins_for_repeated_key() {
+            let entries: Vec<ConfigEntry> = vec![];
+            let desired = vec![
+                ("retention.ms".to_string(), "1000".to_string()),
+                ("retention.ms".to_string(), "2000".to_string()),
+            ];
+            let merged = overlay_dynamic_entries(&entries, &desired);
+            assert_eq!(merged.get("retention.ms"), Some(&"2000"));
+        }
+
+        #[test]
+        fn skips_valueless_dynamic_entries() {
+            let entries = vec![ConfigEntry {
+                name: "some.sensitive".to_string(),
+                value: None,
+                source: ConfigSource::DynamicTopic,
+                is_read_only: false,
+                is_default: false,
+                is_sensitive: true,
+            }];
+            let desired = vec![("retention.ms".to_string(), "1000".to_string())];
+            let merged = overlay_dynamic_entries(&entries, &desired);
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged.get("retention.ms"), Some(&"1000"));
+        }
     }
 
     // -- sec-K-2: SASL over plaintext must be refused, not warned --

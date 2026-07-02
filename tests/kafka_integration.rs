@@ -130,6 +130,22 @@ shove::define_sequenced_topic!(
         .build()
 );
 
+shove::define_topic!(
+    RetentionTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-retention")
+        .with_topic_config("retention.ms", "3600000")
+        .build()
+);
+
+shove::define_topic!(
+    RetentionOverrideTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-retention-override")
+        .with_topic_config("retention.ms", "1800000")
+        .build()
+);
+
 // ---------------------------------------------------------------------------
 // Test harness: shared setup
 // ---------------------------------------------------------------------------
@@ -171,6 +187,51 @@ impl TestBroker {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read a live topic config value straight from the broker via a raw admin
+/// client, bypassing shove.
+async fn live_topic_config(brokers: &str, topic: &str, key: &str) -> Option<String> {
+    use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
+    use rdkafka::client::DefaultClientContext;
+
+    let admin: AdminClient<DefaultClientContext> = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create admin client");
+    let specifier = ResourceSpecifier::Topic(topic);
+    let resources = admin
+        .describe_configs([&specifier], &AdminOptions::new())
+        .await
+        .expect("describe_configs failed");
+    let resource = resources
+        .into_iter()
+        .next()
+        .expect("no resource returned")
+        .expect("describe_configs returned an error for the topic");
+    resource.entry_map().get(key).and_then(|e| e.value.clone())
+}
+
+/// Poll [`live_topic_config`] until the key reads back as `expected` or the
+/// timeout elapses, returning the last observed value. Config changes commit
+/// on the controller before brokers apply them to their local metadata
+/// snapshot, so a describe issued immediately after a create/alter can be
+/// stale.
+async fn wait_for_topic_config(
+    brokers: &str,
+    topic: &str,
+    key: &str,
+    expected: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let value = live_topic_config(brokers, topic, key).await;
+        if value.as_deref() == Some(expected) || Instant::now() >= deadline {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Reusable handlers
@@ -379,6 +440,159 @@ async fn topology_declares_standard_topic_and_dlq() {
     let broker = tb.broker();
     broker.topology().declare::<WorkTopic>().await.unwrap();
     // If we got here without error, topology was declared successfully.
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_sets_topic_config_on_create() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<RetentionTopic>().await.unwrap();
+
+    let value = wait_for_topic_config(
+        tb.client().brokers(),
+        "kafka-retention",
+        "retention.ms",
+        "3600000",
+        TIMEOUT,
+    )
+    .await;
+    assert_eq!(value.as_deref(), Some("3600000"));
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_reconciles_config_on_existing_topic() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+
+    // First declare WITHOUT any config (declarer-level knob only, so the
+    // same Topic type can be re-declared with a different desired value).
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+    // Redeclare with a declarer-level retention (via the named helper) —
+    // topic already exists, so this exercises the describe → drift → alter
+    // path.
+    broker
+        .topology()
+        .with_retention(Duration::from_secs(7200))
+        .declare::<WorkTopic>()
+        .await
+        .unwrap();
+
+    let value = wait_for_topic_config(
+        tb.client().brokers(),
+        "kafka-work",
+        "retention.ms",
+        "7200000",
+        TIMEOUT,
+    )
+    .await;
+    assert_eq!(value.as_deref(), Some("7200000"));
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_reconcile_preserves_unrelated_dynamic_config() {
+    use rdkafka::admin::{AdminClient, AdminOptions, AlterConfig, ResourceSpecifier};
+    use rdkafka::client::DefaultClientContext;
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    // Out-of-band: set an unrelated dynamic topic config, as infra might.
+    let admin: AdminClient<DefaultClientContext> = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", tb.client().brokers())
+        .create()
+        .expect("failed to create admin client");
+    let alter =
+        AlterConfig::new(ResourceSpecifier::Topic("kafka-work")).set("segment.bytes", "123456789");
+    for r in admin
+        .alter_configs([&alter], &AdminOptions::new())
+        .await
+        .expect("alter_configs failed")
+    {
+        r.expect("alter_configs returned an error");
+    }
+    // Wait for the out-of-band change to propagate to describe_configs —
+    // shove's reconcile reads the live config, so it can only preserve
+    // entries that are visible when it runs.
+    let visible = wait_for_topic_config(
+        tb.client().brokers(),
+        "kafka-work",
+        "segment.bytes",
+        "123456789",
+        TIMEOUT,
+    )
+    .await;
+    assert_eq!(visible.as_deref(), Some("123456789"));
+
+    // Reconcile retention via shove — segment.bytes must survive the
+    // legacy-AlterConfigs merge.
+    broker
+        .topology()
+        .with_topic_config("retention.ms", "7200000")
+        .declare::<WorkTopic>()
+        .await
+        .unwrap();
+
+    let brokers = tb.client().brokers().to_string();
+    let retention =
+        wait_for_topic_config(&brokers, "kafka-work", "retention.ms", "7200000", TIMEOUT).await;
+    let segment = wait_for_topic_config(
+        &brokers,
+        "kafka-work",
+        "segment.bytes",
+        "123456789",
+        TIMEOUT,
+    )
+    .await;
+    assert_eq!(retention.as_deref(), Some("7200000"));
+    assert_eq!(segment.as_deref(), Some("123456789"));
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_config_redeclare_is_idempotent() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<RetentionTopic>().await.unwrap();
+    // Second declare with identical config: no drift, must succeed quietly.
+    broker.topology().declare::<RetentionTopic>().await.unwrap();
+
+    let value = wait_for_topic_config(
+        tb.client().brokers(),
+        "kafka-retention",
+        "retention.ms",
+        "3600000",
+        TIMEOUT,
+    )
+    .await;
+    assert_eq!(value.as_deref(), Some("3600000"));
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn topology_per_topic_config_overrides_declarer_default() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    // Declarer says 9999999, the topic's builder says 1800000 — builder wins.
+    broker
+        .topology()
+        .with_topic_config("retention.ms", "9999999")
+        .declare::<RetentionOverrideTopic>()
+        .await
+        .unwrap();
+
+    let value = wait_for_topic_config(
+        tb.client().brokers(),
+        "kafka-retention-override",
+        "retention.ms",
+        "1800000",
+        TIMEOUT,
+    )
+    .await;
+    assert_eq!(value.as_deref(), Some("1800000"));
     broker.close().await;
 }
 

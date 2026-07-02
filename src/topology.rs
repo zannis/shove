@@ -57,6 +57,36 @@ impl Default for NatsStreamConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Kafka topic config
+// ---------------------------------------------------------------------------
+
+/// Kafka `cleanup.policy` for a shove-managed topic, set via
+/// [`TopologyBuilder::with_cleanup_policy`]. Kafka-specific.
+#[cfg(feature = "kafka")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaCleanupPolicy {
+    /// Discard segments past the retention limits (`delete`, Kafka's default).
+    Delete,
+    /// Retain the latest value per message key (`compact`).
+    Compact,
+    /// Compact, and also discard segments past the retention limits
+    /// (`compact,delete`).
+    CompactDelete,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaCleanupPolicy {
+    /// The `cleanup.policy` value string Kafka expects.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Compact => "compact",
+            Self::CompactDelete => "compact,delete",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HoldQueue
 // ---------------------------------------------------------------------------
 
@@ -177,6 +207,11 @@ pub struct QueueTopology {
     /// [`TopologyBuilder::nats_stream_config`]); `None` keeps the defaults.
     #[cfg(feature = "nats")]
     pub(crate) nats_stream_config: Option<NatsStreamConfig>,
+    /// Kafka topic-level config entries (e.g. `retention.ms`) applied to the
+    /// main topic when shove creates or reconciles it (see
+    /// [`TopologyBuilder::with_topic_config`]). Kafka-specific.
+    #[cfg(feature = "kafka")]
+    pub(crate) kafka_topic_config: Vec<(String, String)>,
 }
 
 impl QueueTopology {
@@ -222,6 +257,16 @@ impl QueueTopology {
     #[cfg(feature = "nats")]
     pub fn nats_stream_config(&self) -> Option<&NatsStreamConfig> {
         self.nats_stream_config.as_ref()
+    }
+
+    /// Kafka topic-level config entries set via
+    /// [`TopologyBuilder::with_topic_config`], in call order (repeated keys
+    /// are kept; the declarer resolves last-write-wins at merge time).
+    /// Applied to the **main topic only**; the DLQ keeps cluster defaults.
+    /// Kafka-specific; ignored by other backends.
+    #[cfg(feature = "kafka")]
+    pub fn kafka_topic_config(&self) -> &[(String, String)] {
+        &self.kafka_topic_config
     }
 
     pub fn shard_hold_queue_names(&self, shard_index: u16) -> Vec<HoldQueue> {
@@ -273,6 +318,12 @@ pub struct TopologyBuilder {
     nats_external_stream: bool,
     #[cfg(feature = "nats")]
     nats_stream_config: Option<NatsStreamConfig>,
+    #[cfg(feature = "kafka")]
+    kafka_topic_config: Vec<(String, String)>,
+    #[cfg(feature = "kafka")]
+    kafka_retention_finite: bool,
+    #[cfg(feature = "kafka")]
+    kafka_retention_forever: bool,
 }
 
 impl TopologyBuilder {
@@ -289,6 +340,12 @@ impl TopologyBuilder {
             nats_external_stream: false,
             #[cfg(feature = "nats")]
             nats_stream_config: None,
+            #[cfg(feature = "kafka")]
+            kafka_topic_config: Vec::new(),
+            #[cfg(feature = "kafka")]
+            kafka_retention_finite: false,
+            #[cfg(feature = "kafka")]
+            kafka_retention_forever: false,
         }
     }
 
@@ -341,6 +398,88 @@ impl TopologyBuilder {
     pub fn nats_stream_config(mut self, config: NatsStreamConfig) -> Self {
         self.nats_stream_config = Some(config);
         self
+    }
+
+    /// Sets a Kafka topic-level config entry (e.g. `retention.ms`,
+    /// `retention.bytes`, `cleanup.policy`) on the **main topic**. Repeatable;
+    /// later calls for the same key win. The DLQ topic is never touched.
+    ///
+    /// Entries apply when shove creates the topic, and are **reconciled** on
+    /// already-existing topics: `declare()` compares the declared keys against
+    /// the live values and issues an alter when they drift (preserving the
+    /// topic's other dynamic config entries).
+    ///
+    /// Values pass through to the broker verbatim; an invalid key or value
+    /// surfaces as a `ShoveError::Topology` from `declare()`.
+    ///
+    /// Kafka-specific; other backends ignore it. For a declarer-wide default
+    /// see `TopologyDeclarer::<Kafka>::with_topic_config`.
+    ///
+    /// # Panics
+    ///
+    /// `build()` panics if a key is empty or blank.
+    #[cfg(feature = "kafka")]
+    pub fn with_topic_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.kafka_topic_config.push((key.into(), value.into()));
+        self
+    }
+
+    /// Sets `retention.ms` from a [`Duration`]. Sugar for
+    /// [`with_topic_config`](Self::with_topic_config); the same scope and
+    /// reconcile semantics apply. Sub-millisecond precision is truncated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with
+    /// [`with_retention_forever`](Self::with_retention_forever).
+    #[cfg(feature = "kafka")]
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        assert!(
+            !self.kafka_retention_forever,
+            "with_retention() cannot be combined with with_retention_forever() — both set retention.ms"
+        );
+        self.kafka_retention_finite = true;
+        self.with_topic_config("retention.ms", retention.as_millis().to_string())
+    }
+
+    /// Sets `retention.ms = -1`, retaining messages forever (typically paired
+    /// with [`with_cleanup_policy`](Self::with_cleanup_policy) and
+    /// [`KafkaCleanupPolicy::Compact`]). Sugar for
+    /// [`with_topic_config`](Self::with_topic_config).
+    ///
+    /// # Panics
+    ///
+    /// Panics if combined with [`with_retention`](Self::with_retention).
+    #[cfg(feature = "kafka")]
+    pub fn with_retention_forever(mut self) -> Self {
+        assert!(
+            !self.kafka_retention_finite,
+            "with_retention() cannot be combined with with_retention_forever() — both set retention.ms"
+        );
+        self.kafka_retention_forever = true;
+        self.with_topic_config("retention.ms", "-1")
+    }
+
+    /// Sets `retention.bytes`, the maximum partition size before old segments
+    /// are discarded. Sugar for
+    /// [`with_topic_config`](Self::with_topic_config).
+    #[cfg(feature = "kafka")]
+    pub fn with_retention_bytes(self, bytes: u64) -> Self {
+        self.with_topic_config("retention.bytes", bytes.to_string())
+    }
+
+    /// Sets `cleanup.policy`. Sugar for
+    /// [`with_topic_config`](Self::with_topic_config).
+    #[cfg(feature = "kafka")]
+    pub fn with_cleanup_policy(self, policy: KafkaCleanupPolicy) -> Self {
+        self.with_topic_config("cleanup.policy", policy.as_str())
+    }
+
+    /// Sets `max.message.bytes`, the largest record batch the topic accepts.
+    /// Sugar for [`with_topic_config`](Self::with_topic_config).
+    #[cfg(feature = "kafka")]
+    pub fn with_max_message_bytes(self, bytes: u32) -> Self {
+        self.with_topic_config("max.message.bytes", bytes.to_string())
     }
 
     /// Enables strict per-key ordered delivery for this topic.
@@ -481,6 +620,13 @@ impl TopologyBuilder {
                 "nats_external_stream() cannot be combined with sequenced() — sequencing requires shove to own the stream/subject space"
             );
         }
+        #[cfg(feature = "kafka")]
+        assert!(
+            self.kafka_topic_config
+                .iter()
+                .all(|(k, _)| !k.trim().is_empty()),
+            "with_topic_config() keys must be non-empty"
+        );
         if let Some(ref seq) = self.sequencing {
             assert!(
                 seq.routing_shards > 0,
@@ -536,6 +682,8 @@ impl TopologyBuilder {
             nats_external_stream: self.nats_external_stream,
             #[cfg(feature = "nats")]
             nats_stream_config: self.nats_stream_config,
+            #[cfg(feature = "kafka")]
+            kafka_topic_config: self.kafka_topic_config,
         }
     }
 }
@@ -951,6 +1099,147 @@ mod tests {
                 .dlq()
                 .nats_external_stream()
                 .build();
+        }
+    }
+
+    // -- Kafka topic config --
+
+    #[cfg(feature = "kafka")]
+    mod kafka_topic_config {
+        use super::*;
+
+        #[test]
+        fn builder_no_kafka_config_is_empty() {
+            let topology = TopologyBuilder::new("orders").build();
+            assert!(topology.kafka_topic_config().is_empty());
+        }
+
+        #[test]
+        fn builder_kafka_config_is_stored_in_order() {
+            let topology = TopologyBuilder::new("orders")
+                .with_topic_config("retention.ms", "3600000")
+                .with_topic_config("cleanup.policy", "delete")
+                .build();
+            assert_eq!(
+                topology.kafka_topic_config(),
+                [
+                    ("retention.ms".to_string(), "3600000".to_string()),
+                    ("cleanup.policy".to_string(), "delete".to_string()),
+                ]
+                .as_slice()
+            );
+        }
+
+        #[test]
+        fn builder_kafka_config_keeps_repeated_keys() {
+            // Last-write-wins is resolved at merge time in the declarer;
+            // the builder stores entries verbatim, in call order.
+            let topology = TopologyBuilder::new("orders")
+                .with_topic_config("retention.ms", "1000")
+                .with_topic_config("retention.ms", "2000")
+                .build();
+            assert_eq!(topology.kafka_topic_config().len(), 2);
+        }
+
+        #[test]
+        #[should_panic(expected = "with_topic_config() keys must be non-empty")]
+        fn builder_kafka_config_blank_key_panics() {
+            let _ = TopologyBuilder::new("orders")
+                .with_topic_config("  ", "3600000")
+                .build();
+        }
+
+        #[test]
+        fn builder_kafka_config_with_sequenced() {
+            let topology = TopologyBuilder::new("orders")
+                .sequenced(SequenceFailure::Skip)
+                .hold_queue(Duration::from_secs(5))
+                .dlq()
+                .with_topic_config("retention.ms", "3600000")
+                .build();
+            assert_eq!(topology.kafka_topic_config().len(), 1);
+        }
+
+        #[test]
+        fn builder_named_helpers_map_to_config_entries() {
+            let topology = TopologyBuilder::new("orders")
+                .with_retention(Duration::from_secs(3600))
+                .with_retention_bytes(1_073_741_824)
+                .with_cleanup_policy(KafkaCleanupPolicy::CompactDelete)
+                .with_max_message_bytes(1_048_576)
+                .build();
+            assert_eq!(
+                topology.kafka_topic_config(),
+                [
+                    ("retention.ms".to_string(), "3600000".to_string()),
+                    ("retention.bytes".to_string(), "1073741824".to_string()),
+                    ("cleanup.policy".to_string(), "compact,delete".to_string()),
+                    ("max.message.bytes".to_string(), "1048576".to_string()),
+                ]
+                .as_slice()
+            );
+        }
+
+        #[test]
+        fn builder_with_retention_forever_is_minus_one() {
+            let topology = TopologyBuilder::new("orders")
+                .with_retention_forever()
+                .build();
+            assert_eq!(
+                topology.kafka_topic_config(),
+                [("retention.ms".to_string(), "-1".to_string())].as_slice()
+            );
+        }
+
+        #[test]
+        fn builder_named_helper_overrides_via_last_write_wins() {
+            // Named helpers go through the same generic entry list, so the
+            // declarer-side merge resolves repeated keys to the last call.
+            let topology = TopologyBuilder::new("orders")
+                .with_topic_config("retention.ms", "1000")
+                .with_retention(Duration::from_secs(2))
+                .build();
+            let entries = topology.kafka_topic_config();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[1], ("retention.ms".to_string(), "2000".to_string()));
+        }
+
+        #[test]
+        fn cleanup_policy_value_strings() {
+            assert_eq!(KafkaCleanupPolicy::Delete.as_str(), "delete");
+            assert_eq!(KafkaCleanupPolicy::Compact.as_str(), "compact");
+            assert_eq!(KafkaCleanupPolicy::CompactDelete.as_str(), "compact,delete");
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "with_retention() cannot be combined with with_retention_forever()"
+        )]
+        fn builder_retention_then_forever_panics() {
+            let _ = TopologyBuilder::new("orders")
+                .with_retention(Duration::from_secs(1))
+                .with_retention_forever();
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "with_retention() cannot be combined with with_retention_forever()"
+        )]
+        fn builder_forever_then_retention_panics() {
+            let _ = TopologyBuilder::new("orders")
+                .with_retention_forever()
+                .with_retention(Duration::from_secs(1));
+        }
+
+        #[test]
+        fn builder_retention_combines_with_retention_bytes() {
+            // retention.bytes is a complementary size bound, kept combinable
+            // with either retention.ms form.
+            let topology = TopologyBuilder::new("orders")
+                .with_retention_forever()
+                .with_retention_bytes(1_000_000)
+                .build();
+            assert_eq!(topology.kafka_topic_config().len(), 2);
         }
     }
 }
