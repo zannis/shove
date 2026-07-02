@@ -2,14 +2,19 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use rdkafka::ClientConfig;
-use rdkafka::consumer::{CommitMode, Consumer as RdkafkaConsumer, StreamConsumer};
+use rdkafka::client::{DefaultClientContext, OAuthToken};
+use rdkafka::config::RDKafkaLogLevel;
+use rdkafka::consumer::{
+    BaseConsumer, CommitMode, Consumer as RdkafkaConsumer, ConsumerContext, Rebalance,
+    StreamConsumer,
+};
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
-use rdkafka::{Offset, TopicPartitionList};
+use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionList};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -55,6 +60,11 @@ struct PartitionTracker {
     /// Offsets that have been processed but not yet committable
     /// (because earlier offsets are still in-flight).
     completed: BTreeSet<i64>,
+    /// Set when an async commit that included this partition was rejected
+    /// (e.g. during a rebalance). Makes the next `drain_committable` re-offer
+    /// the current `next_to_commit` even without new completions, so the
+    /// failed commit is retried instead of silently lost.
+    dirty: bool,
 }
 
 impl PartitionTracker {
@@ -62,21 +72,36 @@ impl PartitionTracker {
         Self {
             next_to_commit: first_offset,
             completed: BTreeSet::new(),
+            dirty: false,
         }
     }
 
     fn mark_complete(&mut self, offset: i64) {
+        // Completions below the seed are stale: after a partition is removed
+        // on rebalance and re-seeded by the next delivery, completions of
+        // messages in flight from the previous assignment epoch would
+        // otherwise pile up in `completed` forever (never contiguous with
+        // `next_to_commit`).
+        if offset < self.next_to_commit {
+            return;
+        }
         self.completed.insert(offset);
     }
 
-    /// Returns the new commit offset if progress was made, or None.
+    /// Returns the offset to commit if progress was made (or a failed commit
+    /// needs to be retried — see `dirty`), or None.
     fn drain_committable(&mut self) -> Option<i64> {
         let mut next = self.next_to_commit;
         while self.completed.remove(&next) {
             next += 1;
         }
-        if next > self.next_to_commit {
+        let progressed = next > self.next_to_commit;
+        let retry = self.dirty;
+        self.dirty = false;
+        if progressed {
             self.next_to_commit = next;
+        }
+        if progressed || retry {
             Some(next)
         } else {
             None
@@ -106,6 +131,64 @@ impl OffsetTracker {
     fn mark_complete(&mut self, partition: i32, offset: i64) {
         if let Some(tracker) = self.partitions.get_mut(&partition) {
             tracker.mark_complete(offset);
+        }
+    }
+
+    /// Drops per-partition state when the partition's ownership changes.
+    ///
+    /// Called for BOTH revoke and assign events: on revoke so this member
+    /// stops committing offsets for a partition it no longer owns; on assign
+    /// so a reassigned partition re-seeds `next_to_commit` from the first
+    /// offset actually delivered under the new assignment. The broker's
+    /// committed offset decides where delivery resumes, so seeding from
+    /// delivery is correct — while a stale seed (left from before the
+    /// partition moved away and another member committed on it) would make
+    /// `drain_committable` wait for a contiguous run that never arrives,
+    /// stalling commits on the partition forever.
+    fn remove(&mut self, partition: i32) {
+        self.partitions.remove(&partition);
+    }
+
+    /// Flags a partition to re-offer its current commit position on the next
+    /// drain, because an async commit that covered it was rejected. No-ops if
+    /// the partition's tracker is gone (revoked meanwhile) — a commit must
+    /// never be retried for a partition this member no longer owns.
+    fn mark_dirty(&mut self, partition: i32) {
+        if let Some(tracker) = self.partitions.get_mut(&partition) {
+            tracker.dirty = true;
+        }
+    }
+
+    /// Applies all queued rebalance/commit-failure events from librdkafka's
+    /// callbacks. Cheap when the channel is empty (a single failed
+    /// `try_recv`), so callers run it every loop iteration.
+    fn apply_rebalance_events(&mut self, rx: &std_mpsc::Receiver<RebalanceEvent>) {
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions) => {
+                    for partition in partitions {
+                        self.remove(partition);
+                    }
+                    // Async commits in flight while the group rebalances can
+                    // be dropped by librdkafka without surfacing an error
+                    // (observed against a real broker: commits submitted
+                    // between the revoke and assign phases of a cooperative
+                    // rebalance vanish — no commit_callback ever fires).
+                    // Re-offer every retained partition's position once the
+                    // dust settles; re-committing an already-committed offset
+                    // is a broker-side no-op. The rebalance always ends with
+                    // an assign round, so the last re-offer lands after the
+                    // group is stable again.
+                    for tracker in self.partitions.values_mut() {
+                        tracker.dirty = true;
+                    }
+                }
+                RebalanceEvent::CommitFailed(partitions) => {
+                    for partition in partitions {
+                        self.mark_dirty(partition);
+                    }
+                }
+            }
         }
     }
 
@@ -661,13 +744,161 @@ fn map_kafka_error(context: &str, e: KafkaError) -> ShoveError {
 }
 
 // ---------------------------------------------------------------------------
+// Rebalance plumbing
+// ---------------------------------------------------------------------------
+
+/// Consumer-group event forwarded from librdkafka's callbacks to the receive
+/// loop that owns the `OffsetTracker`.
+enum RebalanceEvent {
+    Assign(Vec<i32>),
+    Revoke(Vec<i32>),
+    /// An async offset commit was rejected — typically
+    /// `REBALANCE_IN_PROGRESS` or a stale generation while the group was
+    /// re-forming. `drain_committable` only yields on *new* completions, so
+    /// without an explicit retry the failed commit would never be resubmitted
+    /// and the partition's committed offset would stay stale until (if ever)
+    /// new traffic arrived. The listed partitions re-offer their current
+    /// commit position on the next drain.
+    CommitFailed(Vec<i32>),
+}
+
+/// `ConsumerContext` that forwards partition assign/revoke deltas to the
+/// receive loop over a channel, wrapping whichever inner `ClientContext`
+/// matches the broker's auth mode (default or MSK IAM).
+///
+/// The callback is synchronous (librdkafka invokes it during a poll inside
+/// `StreamConsumer::recv`), so a `std::sync::mpsc` channel is used and the
+/// loop drains it non-blocking with `try_recv`. Unbounded is safe: rebalances
+/// are rare and each event is a small partition list.
+pub(super) struct RebalanceContext<C: ClientContext> {
+    inner: C,
+    /// Topic this consumer subscribes to; TPL entries for other topics are
+    /// filtered out (each shove consumer subscribes to exactly one topic).
+    topic: String,
+    /// The consumer's unique `client.id` — identifies which group member an
+    /// assignment change happened on in the logs.
+    client_id: String,
+    tx: std_mpsc::Sender<RebalanceEvent>,
+}
+
+impl<C: ClientContext> RebalanceContext<C> {
+    fn partitions_for_topic(&self, tpl: &TopicPartitionList) -> Vec<i32> {
+        tpl.elements()
+            .iter()
+            .filter(|e| e.topic() == self.topic)
+            .map(|e| e.partition())
+            .collect()
+    }
+}
+
+/// Load-bearing delegation: every method and associated const the inner
+/// context overrides MUST be forwarded here, or the override silently stops
+/// working once the context is wrapped. `MskIamContext` overrides
+/// `ENABLE_REFRESH_OAUTH_TOKEN` and `generate_oauth_token` (OAUTHBEARER token
+/// refresh — MSK auth breaks without them); `log`/`stats`/`stats_raw`/`error`
+/// are forwarded too so any future inner override keeps working.
+impl<C: ClientContext> ClientContext for RebalanceContext<C> {
+    const ENABLE_REFRESH_OAUTH_TOKEN: bool = C::ENABLE_REFRESH_OAUTH_TOKEN;
+
+    fn log(&self, level: RDKafkaLogLevel, fac: &str, log_message: &str) {
+        self.inner.log(level, fac, log_message);
+    }
+
+    fn stats(&self, statistics: Statistics) {
+        self.inner.stats(statistics);
+    }
+
+    fn stats_raw(&self, statistics: &[u8]) {
+        self.inner.stats_raw(statistics);
+    }
+
+    fn error(&self, error: KafkaError, reason: &str) {
+        self.inner.error(error, reason);
+    }
+
+    fn generate_oauth_token(
+        &self,
+        oauthbearer_config: Option<&str>,
+    ) -> std::result::Result<OAuthToken, Box<dyn std::error::Error>> {
+        self.inner.generate_oauth_token(oauthbearer_config)
+    }
+}
+
+impl<C: ClientContext> ConsumerContext for RebalanceContext<C> {
+    /// `pre_rebalance` (not `post_`) for both directions: pre and post
+    /// receive the identical TPL delta (rdkafka's default `rebalance` builds
+    /// the `Rebalance` value once and passes it to both), and pre runs
+    /// *before* librdkafka applies the incremental (un)assignment — so an
+    /// Assign event is guaranteed to be queued before any message from the
+    /// new assignment can be delivered, which is the ordering the tracker
+    /// reset relies on.
+    ///
+    /// The inner context's own `ConsumerContext` methods cannot be delegated
+    /// (they take `&BaseConsumer<C>`, not `&BaseConsumer<Self>`); both
+    /// wrapped contexts use the empty defaults, so nothing is lost.
+    fn pre_rebalance(&self, _base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        let event = match rebalance {
+            Rebalance::Assign(tpl) => {
+                let partitions = self.partitions_for_topic(tpl);
+                tracing::debug!(
+                    topic = %self.topic,
+                    client_id = %self.client_id,
+                    ?partitions,
+                    "rebalance: partitions assigned"
+                );
+                RebalanceEvent::Assign(partitions)
+            }
+            Rebalance::Revoke(tpl) => {
+                let partitions = self.partitions_for_topic(tpl);
+                tracing::debug!(
+                    topic = %self.topic,
+                    client_id = %self.client_id,
+                    ?partitions,
+                    "rebalance: partitions revoked"
+                );
+                RebalanceEvent::Revoke(partitions)
+            }
+            Rebalance::Error(e) => {
+                tracing::warn!(topic = %self.topic, error = %e, "rebalance error");
+                return;
+            }
+        };
+        // A closed channel means the receive loop is gone (shutdown or
+        // reconnect teardown, or a consumer that keeps no tracker) — nothing
+        // to notify.
+        let _ = self.tx.send(event);
+    }
+
+    /// Async commit results surface here (the default impl is silent). A
+    /// commit rejected during a rebalance (stale generation,
+    /// `REBALANCE_IN_PROGRESS`) would otherwise be lost for good: the
+    /// tracker's `next_to_commit` has already advanced past the offsets in
+    /// the failed request, so no future drain re-offers them. Report the
+    /// failure to the loop so the affected partitions re-offer their current
+    /// position.
+    fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {
+        if let Err(e) = result {
+            let partitions = self.partitions_for_topic(offsets);
+            tracing::warn!(
+                topic = %self.topic,
+                client_id = %self.client_id,
+                error = %e,
+                ?partitions,
+                "async offset commit failed; scheduling re-commit"
+            );
+            let _ = self.tx.send(RebalanceEvent::CommitFailed(partitions));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KafkaStreamConsumer — context-agnostic wrapper
 // ---------------------------------------------------------------------------
 
 pub(super) enum KafkaStreamConsumer {
-    Default(StreamConsumer),
+    Default(StreamConsumer<RebalanceContext<DefaultClientContext>>),
     #[cfg(feature = "kafka-msk-iam")]
-    MskIam(StreamConsumer<MskIamContext>),
+    MskIam(StreamConsumer<RebalanceContext<MskIamContext>>),
 }
 
 impl KafkaStreamConsumer {
@@ -715,6 +946,8 @@ fn create_stream_consumer(
     mut base: ClientConfig,
     group_id: &str,
     auto_offset_reset: KafkaAutoOffsetReset,
+    topic: &str,
+    rebalance_tx: std_mpsc::Sender<RebalanceEvent>,
     #[cfg(feature = "kafka-msk-iam")] msk_context: Option<MskIamContext>,
 ) -> Result<KafkaStreamConsumer> {
     // Each consumer task within a group gets a distinct `client.id` so
@@ -723,7 +956,7 @@ fn create_stream_consumer(
     // "group generation id is not valid" commit errors.
     let client_id = format!("shove-{}", uuid::Uuid::new_v4().simple());
     base.set("group.id", group_id)
-        .set("client.id", client_id)
+        .set("client.id", &client_id)
         // Cooperative-sticky assignment performs incremental rebalance so that
         // adding/removing a consumer only reassigns the delta — without this,
         // every join triggers an eager (stop-the-world) rebalance that
@@ -742,14 +975,26 @@ fn create_stream_consumer(
 
     #[cfg(feature = "kafka-msk-iam")]
     if let Some(ctx) = msk_context {
-        let consumer: StreamConsumer<MskIamContext> = base
+        let ctx = RebalanceContext {
+            inner: ctx,
+            topic: topic.to_string(),
+            client_id,
+            tx: rebalance_tx,
+        };
+        let consumer: StreamConsumer<RebalanceContext<MskIamContext>> = base
             .create_with_context(ctx)
             .map_err(|e| map_kafka_error("failed to create MSK consumer", e))?;
         return Ok(KafkaStreamConsumer::MskIam(consumer));
     }
 
-    let consumer: StreamConsumer = base
-        .create()
+    let ctx = RebalanceContext {
+        inner: DefaultClientContext,
+        topic: topic.to_string(),
+        client_id,
+        tx: rebalance_tx,
+    };
+    let consumer: StreamConsumer<RebalanceContext<DefaultClientContext>> = base
+        .create_with_context(ctx)
         .map_err(|e| map_kafka_error("failed to create consumer", e))?;
     Ok(KafkaStreamConsumer::Default(consumer))
 }
@@ -762,6 +1007,10 @@ fn create_stream_consumer(
 /// to have had a healthy connection: the reconnect budget and backoff reset,
 /// so `max_reconnect_attempts` bounds *consecutive* failures, not lifetime.
 const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(60);
+
+/// How often the concurrent receive loop wakes to drain rebalance events and
+/// retry commits when no messages or completions arrive to wake it.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
@@ -923,10 +1172,16 @@ impl KafkaConsumer {
             #[cfg(feature = "kafka-schema-registry")]
             let schema_accepted = schema_accepted.clone();
             async move {
+                // Fresh channel per (re)connect, matching the fresh
+                // OffsetTracker below: rebalance events from a torn-down
+                // consumer must not leak into the next connection's tracker.
+                let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 let consumer = create_stream_consumer(
                     client.base_config(),
                     &group_id,
                     auto_offset_reset,
+                    queue,
+                    rebalance_tx,
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
                 )?;
@@ -949,11 +1204,23 @@ impl KafkaConsumer {
                 let (completion_tx, mut completion_rx) =
                     mpsc::channel::<(i32, i64)>(prefetch_count as usize);
 
+                // Periodic wake so rebalance events and commit retries are
+                // drained even when no messages or completions arrive: the
+                // callbacks push onto a channel that only the loop body
+                // reads, and the loop body only runs when a select arm
+                // completes. A no-op when nothing is pending.
+                let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+
                 loop {
-                    // Drain completed offsets and commit
+                    // Drain completed offsets, then apply any partition
+                    // assignment changes BEFORE committing: a revoked
+                    // partition's tracker (and any completions queued for it)
+                    // is dropped so this member never commits offsets for a
+                    // partition it no longer owns.
                     while let Ok((partition, offset)) = completion_rx.try_recv() {
                         tracker.mark_complete(partition, offset);
                     }
+                    tracker.apply_rebalance_events(&rebalance_rx);
                     if let Some(tpl) = tracker.drain_committable() {
                         consumer
                             .commit(&tpl, CommitMode::Async)
@@ -968,6 +1235,7 @@ impl KafkaConsumer {
                             while let Ok((partition, offset)) = completion_rx.try_recv() {
                                 tracker.mark_complete(partition, offset);
                             }
+                            tracker.apply_rebalance_events(&rebalance_rx);
                             if let Some(tpl) = tracker.drain_committable()
                                 && let Err(e) = consumer.commit(&tpl, CommitMode::Sync)
                             {
@@ -975,6 +1243,9 @@ impl KafkaConsumer {
                             }
                             return Ok(());
                         }
+                        // Falls through to the top-of-loop drain — see the
+                        // comment on `housekeeping` above.
+                        _ = housekeeping.tick() => {}
                         // Handler completions must wake the loop even when no new
                         // message arrives: with only the recv() arm, the offsets of
                         // the last in-flight batch sat uncommitted until the *next*
@@ -1012,6 +1283,14 @@ impl KafkaConsumer {
                             // delay tasks becomes a refcount bump instead of a memcpy.
                             let key = msg.key().map(Bytes::copy_from_slice);
 
+                            // The rebalance callback runs inside consumer.recv()'s
+                            // poll, so an Assign event for this partition may
+                            // already be queued when its first post-reassignment
+                            // message arrives from the same poll. Apply pending
+                            // events BEFORE tracking — otherwise the next
+                            // iteration's drain would wipe the tracker entry this
+                            // message is about to seed.
+                            tracker.apply_rebalance_events(&rebalance_rx);
                             tracker.track_received(partition, offset);
 
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
@@ -1398,10 +1677,16 @@ impl KafkaConsumer {
                 #[cfg(feature = "kafka-schema-registry")]
                 let schema_accepted = schema_accepted.clone();
                 async move {
+                    // FIFO commits per message via commit_message and keeps no
+                    // offset tracker, so rebalance events are irrelevant — the
+                    // receiver is dropped deliberately.
+                    let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
                     let consumer = create_stream_consumer(
                         client.base_config(),
                         &group_id,
                         auto_offset_reset,
+                        queue.as_str(),
+                        rebalance_tx,
                         #[cfg(feature = "kafka-msk-iam")]
                         client.msk_context(),
                     )?;
@@ -1820,10 +2105,17 @@ impl KafkaConsumer {
                 // silently lose audit data the operator explicitly opted in
                 // to. Keep the policy fixed regardless of the user's main
                 // consumer `auto_offset_reset` override.
+                //
+                // The DLQ loop commits per message via commit_message and
+                // keeps no offset tracker, so rebalance events are irrelevant
+                // — the receiver is dropped deliberately.
+                let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
                 let consumer = create_stream_consumer(
                     client_clone.base_config(),
                     &dlq_group_id,
                     KafkaAutoOffsetReset::Earliest,
+                    dlq,
+                    rebalance_tx,
                     #[cfg(feature = "kafka-msk-iam")]
                     client_clone.msk_context(),
                 )?;
@@ -1959,6 +2251,195 @@ impl KafkaConsumer {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod offset_tracker_tests {
+    use super::*;
+
+    fn committed_offset(tpl: &TopicPartitionList, partition: i32) -> Option<i64> {
+        tpl.elements()
+            .iter()
+            .find(|e| e.partition() == partition)
+            .and_then(|e| match e.offset() {
+                Offset::Offset(o) => Some(o),
+                _ => None,
+            })
+    }
+
+    /// Regression: the normal contiguous drain still works — out-of-order
+    /// completions commit only up to the first gap, then advance once the
+    /// gap fills.
+    #[test]
+    fn contiguous_drain_advances_past_gaps_only_when_filled() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.mark_complete(0, 2);
+        tracker.mark_complete(0, 0);
+
+        let tpl = tracker
+            .drain_committable()
+            .expect("offset 0 is committable");
+        assert_eq!(committed_offset(&tpl, 0), Some(1), "gap at 1 blocks 2");
+
+        tracker.mark_complete(0, 1);
+        let tpl = tracker.drain_committable().expect("gap filled");
+        assert_eq!(committed_offset(&tpl, 0), Some(3));
+    }
+
+    /// After remove + re-track (a partition revoked and reassigned), the
+    /// tracker re-seeds `next_to_commit` from the newly delivered offset
+    /// instead of stalling on the stale pre-revocation seed.
+    #[test]
+    fn remove_then_track_reseeds_next_to_commit() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 5);
+        tracker.mark_complete(0, 5);
+        let tpl = tracker.drain_committable().expect("initial commit");
+        assert_eq!(committed_offset(&tpl, 0), Some(6));
+
+        // Partition moves away (another member commits 6..99), then returns.
+        tracker.remove(0);
+        tracker.track_received(0, 100);
+        tracker.mark_complete(0, 100);
+        let tpl = tracker
+            .drain_committable()
+            .expect("re-seeded partition must commit without waiting for 6..100");
+        assert_eq!(committed_offset(&tpl, 0), Some(101));
+    }
+
+    /// Completions that arrive after the partition's tracker was removed
+    /// (late completions from the previous assignment epoch) are dropped and
+    /// never produce a commit.
+    #[test]
+    fn completions_after_remove_are_dropped() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 5);
+        tracker.remove(0);
+        tracker.mark_complete(0, 5);
+        assert!(
+            tracker.drain_committable().is_none(),
+            "removed partition must not commit"
+        );
+    }
+
+    /// A completion below the seed (stale offset from before reassignment)
+    /// is ignored — it must neither commit nor linger in `completed`.
+    #[test]
+    fn mark_complete_below_seed_is_ignored() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 10);
+        tracker.mark_complete(0, 5);
+        assert!(
+            tracker.drain_committable().is_none(),
+            "stale completion must not commit"
+        );
+
+        tracker.mark_complete(0, 10);
+        let tpl = tracker.drain_committable().expect("seed offset completes");
+        assert_eq!(
+            committed_offset(&tpl, 0),
+            Some(11),
+            "stale offset 5 must not have corrupted the contiguous run"
+        );
+    }
+
+    /// A failed async commit (CommitFailed event) makes the partition
+    /// re-offer its current commit position on the next drain even though no
+    /// new completions arrived — and only once (the flag clears).
+    #[test]
+    fn commit_failed_re_offers_current_position_once() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.mark_complete(0, 0);
+        let tpl = tracker.drain_committable().expect("initial commit");
+        assert_eq!(committed_offset(&tpl, 0), Some(1));
+
+        // The async commit of offset 1 was rejected mid-rebalance.
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx);
+        let tpl = tracker
+            .drain_committable()
+            .expect("failed commit must be re-offered without new completions");
+        assert_eq!(committed_offset(&tpl, 0), Some(1));
+
+        assert!(
+            tracker.drain_committable().is_none(),
+            "retry flag must clear after one re-offer"
+        );
+    }
+
+    /// Any rebalance event re-offers every retained partition's current
+    /// position: async commits in flight during the rebalance can be dropped
+    /// by librdkafka without an error, so positions are re-asserted once the
+    /// group settles.
+    #[test]
+    fn rebalance_event_re_offers_retained_partition_positions() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(4, 0);
+        tracker.mark_complete(4, 0);
+        let tpl = tracker.drain_committable().expect("initial commit");
+        assert_eq!(committed_offset(&tpl, 4), Some(1));
+
+        // Another member joins: partitions 0-3 move away; the commit of
+        // (4, 1) submitted during the rebalance may have been dropped.
+        tx.send(RebalanceEvent::Revoke(vec![0, 1, 2, 3])).unwrap();
+        tracker.apply_rebalance_events(&rx);
+        let tpl = tracker
+            .drain_committable()
+            .expect("retained partition must re-offer its position");
+        assert_eq!(committed_offset(&tpl, 4), Some(1));
+
+        assert!(
+            tracker.drain_committable().is_none(),
+            "re-offer happens once per rebalance event"
+        );
+    }
+
+    /// A commit failure for a partition whose tracker was removed (revoked
+    /// meanwhile) must NOT resurrect a commit — this member no longer owns
+    /// the partition.
+    #[test]
+    fn commit_failed_after_revoke_is_dropped() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.mark_complete(0, 0);
+        let _ = tracker.drain_committable().expect("initial commit");
+
+        tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx);
+        assert!(
+            tracker.drain_committable().is_none(),
+            "no retry for a revoked partition"
+        );
+    }
+
+    /// Assign and Revoke events drained from the channel both remove the
+    /// affected partitions' state; other partitions are untouched.
+    #[test]
+    fn apply_rebalance_events_removes_only_listed_partitions() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 5);
+        tracker.track_received(1, 7);
+        tracker.track_received(2, 9);
+
+        tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
+        tx.send(RebalanceEvent::Assign(vec![1])).unwrap();
+        tracker.apply_rebalance_events(&rx);
+
+        tracker.mark_complete(0, 5);
+        tracker.mark_complete(1, 7);
+        tracker.mark_complete(2, 9);
+        let tpl = tracker.drain_committable().expect("partition 2 commits");
+        assert_eq!(committed_offset(&tpl, 0), None, "revoked: removed");
+        assert_eq!(committed_offset(&tpl, 1), None, "reassigned: removed");
+        assert_eq!(committed_offset(&tpl, 2), Some(10), "untouched partition");
     }
 }
 
