@@ -307,10 +307,10 @@ pub mod kafka {
     pub use crate::markers::Kafka;
 
     pub use crate::backends::kafka::{
-        KafkaAutoscalerBackend, KafkaClient, KafkaConsumer, KafkaConsumerGroup,
-        KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry, KafkaLagStatsProvider,
-        KafkaPublisher, KafkaPublisherConfig, KafkaQueueStats, KafkaQueueStatsProvider,
-        KafkaTopologyDeclarer,
+        KafkaAutoOffsetReset, KafkaAutoscalerBackend, KafkaClient, KafkaConsumer,
+        KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
+        KafkaLagStatsProvider, KafkaPublisher, KafkaPublisherConfig, KafkaQueueStats,
+        KafkaQueueStatsProvider, KafkaTopologyDeclarer,
     };
     #[cfg(feature = "kafka-ssl")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]
