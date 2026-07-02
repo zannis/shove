@@ -1,0 +1,43 @@
+src/backends/kafka/consumer_group.rs
+  s_7458278028faf2::t_b1aa10f7fa6399 643-644
+  s_7458278028faf2::t_e5054547f6ec88 744
+  s_7458278028faf2::t_2033cb6737c132 31-53
+  s_7458278028faf2::t_4b59a3e9a79cdc 518-534,537,553,581-583,585-588
+  s_7458278028faf2::t_e39c864df1839a 2,4,7
+  s_7458278028faf2::t_718681fcfd7bf6 1000-1001,1003-1006,1013,1020-1042
+  s_7458278028faf2::t_7e94c3de2cd7b7 1043,1188-1266
+  s_7458278028faf2::t_645e8de6409c40 1044
+src/backends/nats/consumer_group.rs
+  s_7458278028faf2::t_d8a3c39b6632db 29-51
+  s_7458278028faf2::t_81b2cf7266bab5 316-332,335,351,379-381,383-386
+  s_7458278028faf2::t_5c1362c53d6822 525
+  s_7458278028faf2::t_c76d19b6e12f05 432-433
+  s_7458278028faf2::t_e9826166acba54 795-796,798-801,807,814-836
+  s_7458278028faf2::t_e16bb4b4957f27 837,1005-1083
+  s_7458278028faf2::t_dc32c59c587caa 2,4,7
+  s_f8c35582fd31f3::t_c7cca8d61c946a 838
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "d32ae7fc55ecbe3e63f67d8bb7aba2b839daa17c",
+  "prompts": {},
+  "sessions": {
+    "s_7458278028faf2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29b24b3b-593c-4f99-906c-c433027d04f7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_f8c35582fd31f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "395d22b5-cd27-4c68-8321-5bbb01f4511d",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
