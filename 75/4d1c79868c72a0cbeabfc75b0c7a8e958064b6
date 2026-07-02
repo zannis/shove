@@ -1,0 +1,48 @@
+src/lib.rs
+  s_7458278028faf2::t_edeac5b5409d56 308-311
+src/backends/kafka/backend.rs
+  s_7458278028faf2::t_18b8a5fef1e6d3 194-200
+  s_7458278028faf2::t_e979f50b28b737 33-35
+src/backends/kafka/autoscaler.rs
+  s_7458278028faf2::t_ec2b600abb3e2e 532-566
+  s_7458278028faf2::t_09a6afba64b93b 519-524
+  s_7458278028faf2::t_9c68207778a6fe 20
+  s_7458278028faf2::t_b30314c08840fa 414,425-427,433
+  s_7458278028faf2::t_42a41a8375009f 37-45,50,54-69
+  s_7458278028faf2::t_1e6de569f02110 325,332-342
+  s_7458278028faf2::t_612faf952f5f38 241-246
+  s_7458278028faf2::t_fb5636672a36fb 70-71
+  s_7458278028faf2::t_2ef3c83989e0f5 567-569
+  s_37b0ef52e1850a::t_43155e0c685824 913,974
+tests/kafka_integration.rs
+  s_7458278028faf2::t_82453fba4a0d06 1792
+  s_7458278028faf2::t_90f26335b2327b 1945-1949
+  s_7458278028faf2::t_5f3314a5187f0e 1753
+  s_7458278028faf2::t_6c57a6e2ed99dd 1879
+  s_7458278028faf2::t_9c3c0ce0675293 1856-1860
+  s_7458278028faf2::t_5c750ec209d7e6 1773-1777
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "754d1c79868c72a0cbeabfc75b0c7a8e958064b6",
+  "prompts": {},
+  "sessions": {
+    "s_37b0ef52e1850a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a602b78d9382b5894",
+        "model": "unknown"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    },
+    "s_7458278028faf2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29b24b3b-593c-4f99-906c-c433027d04f7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
