@@ -186,20 +186,23 @@ impl NatsPublisher {
             }
         }
 
+        // Drain every already-submitted ack even if submission broke early:
+        // those messages were accepted by NATS and must be counted, not
+        // abandoned. A submission error takes precedence in `first_err`; an
+        // ack error only replaces it when nothing has failed yet.
         let mut succeeded: u64 = 0;
-        if first_err.is_none() {
-            for ack in ack_futures {
-                match ack.await {
-                    Ok(_) => succeeded += 1,
-                    Err(e) => {
-                        metrics::record_backend_error(
-                            metrics::BackendLabel::Nats,
-                            metrics::BackendErrorKind::Publish,
-                        );
+        for ack in ack_futures {
+            match ack.await {
+                Ok(_) => succeeded += 1,
+                Err(e) => {
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Nats,
+                        metrics::BackendErrorKind::Publish,
+                    );
+                    if first_err.is_none() {
                         first_err = Some(ShoveError::Connection(format!(
                             "batch publish ack failed: {e}"
                         )));
-                        break;
                     }
                 }
             }

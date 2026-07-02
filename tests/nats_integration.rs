@@ -17,7 +17,7 @@ use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::markers::Nats;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
-use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
+use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroupConfig, NatsPublisher};
 use shove::outcome::Outcome;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 use shove::{NatsRetention, NatsStreamConfig};
@@ -190,6 +190,21 @@ shove::define_sequenced_topic!(
         .routing_shards(2)
         .hold_queue(Duration::from_millis(200))
         .dlq()
+        .build()
+);
+
+// Sharded topic used to fault-inject a partial `publish_batch` failure: the
+// stream backing this topic is created manually (see
+// `publish_batch_drains_acks_after_partial_stream_failure`) with only shard 0
+// in its subject list, so shard-1 messages have no stream to ack against.
+shove::define_sequenced_topic!(
+    SeqPartialTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-partial-fail")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(2)
+        .allow_message_loss()
         .build()
 );
 
@@ -833,6 +848,83 @@ async fn publish_and_consume_batch() {
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 5);
     broker.close().await;
+}
+
+#[tokio::test]
+async fn publish_batch_happy_path_reports_accurate_count() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let publisher = NatsPublisher::new(client).await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage {
+            id: format!("count-{i}"),
+            content: format!("message {i}"),
+        })
+        .collect();
+
+    let (succeeded, result) = publisher.publish_batch::<WorkTopic>(&messages).await;
+    assert!(result.is_ok(), "expected success, got {result:?}");
+    assert_eq!(succeeded, 5, "all 5 messages should be reported as stored");
+
+    broker.close().await;
+}
+
+/// Regression test for the `publish_batch` bug where a mid-batch failure
+/// (either at submission or at ack time) abandoned every already-submitted
+/// ack, always reporting `succeeded == 0` even though some messages were
+/// genuinely stored. The stream backing `SeqPartialTopic` is created here
+/// with only shard 0 in its subject list, so messages that hash to shard 1
+/// have no stream to ack against and fail at ack time while shard-0 messages
+/// succeed — a real partial failure, not a simulated one.
+#[tokio::test]
+async fn publish_batch_drains_acks_after_partial_stream_failure() {
+    let tb = TestBroker::start().await;
+    let client = tb.client();
+
+    client
+        .jetstream()
+        .create_stream(JsStreamConfig {
+            name: "nats-partial-fail".to_string(),
+            subjects: vec!["nats-partial-fail.shard.0".to_string()],
+            retention: RetentionPolicy::Limits,
+            ..Default::default()
+        })
+        .await
+        .expect("should create partial-coverage stream");
+
+    let publisher = NatsPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<OrderMessage> = (1..=20)
+        .map(|i| OrderMessage {
+            order_id: format!("order-{i}"),
+            amount: i,
+        })
+        .collect();
+
+    let (succeeded, result) = publisher.publish_batch::<SeqPartialTopic>(&messages).await;
+
+    assert!(
+        result.is_err(),
+        "expected a partial failure from the shard-1 messages with no stream"
+    );
+    assert!(succeeded > 0, "shard-0 acks must not be abandoned");
+    assert!(
+        succeeded < messages.len() as u64,
+        "shard-1 messages have no stream and must not be counted as stored"
+    );
+
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-partial-fail")
+        .await
+        .expect("stream should exist");
+    let info = stream.info().await.expect("should get stream info");
+    assert_eq!(
+        info.state.messages, succeeded,
+        "reported success count must match what NATS actually stored"
+    );
 }
 
 // ===========================================================================
