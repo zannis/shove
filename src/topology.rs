@@ -306,6 +306,7 @@ fn hold_delay_suffix(delay: Duration) -> String {
 // TopologyBuilder
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub struct TopologyBuilder {
     queue: String,
     dlq: Option<String>,
