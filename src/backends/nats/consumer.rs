@@ -18,7 +18,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
-use crate::consumer::validate_message_size;
+use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, validate_message_size};
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -36,6 +36,21 @@ use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER, RETRY_COUNT_HEADER,
 };
 use super::publisher::publish_with_retry;
+
+// ---------------------------------------------------------------------------
+// ack_wait derivation
+// ---------------------------------------------------------------------------
+
+/// JetStream redelivers any message not acked within `ack_wait`. Derive it
+/// from the handler timeout with a 3x margin so a handler running to its
+/// limit — plus queue-wait behind a full prefetch buffer (the `ack_wait`
+/// clock ticks from delivery, and delivered messages wait on the prefetch
+/// semaphore before their handler starts) — never has its message
+/// redelivered mid-flight. Floor at the JetStream default (30s) so short
+/// handler timeouts don't tighten redelivery below the server default.
+pub(super) fn derive_ack_wait(handler_timeout: Duration) -> Duration {
+    (handler_timeout * 3).max(Duration::from_secs(30))
+}
 
 // ---------------------------------------------------------------------------
 // Metadata extraction functions
@@ -547,6 +562,7 @@ impl NatsConsumer {
 
         let max_message_size = options.max_message_size;
         let max_ack_pending = options.max_ack_pending.unwrap_or(prefetch_count as i64);
+        let derived_ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
 
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
@@ -619,6 +635,7 @@ impl NatsConsumer {
                                 durable_name: Some(consumer_name.clone()),
                                 ack_policy: AckPolicy::Explicit,
                                 max_ack_pending,
+                                ack_wait: derived_ack_wait,
                                 ..Default::default()
                             })
                             .await
@@ -915,6 +932,7 @@ impl NatsConsumer {
         let hold_queues = topology.hold_queues();
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = options.consumer_group.clone();
+        let derived_ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
 
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
@@ -961,6 +979,10 @@ impl NatsConsumer {
                             .await
                             .map_err(|e| map_get_stream_error(queue, e))?;
 
+                        // Note: `get_or_create_consumer` returns an existing
+                        // durable verbatim — only newly created shard
+                        // consumers get the derived ack_wait; pre-existing
+                        // ones keep their stored value until recreated.
                         let pull_consumer = stream
                             .get_or_create_consumer(
                                 &consumer_name,
@@ -969,6 +991,7 @@ impl NatsConsumer {
                                     filter_subject: filter_subject.clone(),
                                     ack_policy: AckPolicy::Explicit,
                                     max_ack_pending: 1,
+                                    ack_wait: derived_ack_wait,
                                     ..Default::default()
                                 },
                             )
@@ -1179,6 +1202,10 @@ impl NatsConsumer {
                         PullConsumerConfig {
                             durable_name: Some(dlq_consumer_name.clone()),
                             ack_policy: AckPolicy::Explicit,
+                            // run_dlq has no handler-timeout knob; give the
+                            // DLQ durable the same margin a default-timeout
+                            // consumer gets.
+                            ack_wait: derive_ack_wait(DEFAULT_HANDLER_TIMEOUT),
                             ..Default::default()
                         },
                     )
@@ -1264,6 +1291,35 @@ impl NatsConsumer {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod ack_wait_tests {
+    use super::*;
+
+    #[test]
+    fn default_handler_timeout_gets_triple_margin() {
+        assert_eq!(
+            derive_ack_wait(Duration::from_secs(30)),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn short_handler_timeout_floors_at_server_default() {
+        assert_eq!(
+            derive_ack_wait(Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn long_handler_timeout_scales_linearly() {
+        assert_eq!(
+            derive_ack_wait(Duration::from_secs(120)),
+            Duration::from_secs(360)
+        );
     }
 }
 

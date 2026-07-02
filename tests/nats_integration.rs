@@ -2719,6 +2719,201 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
 }
 
 // ===========================================================================
+// ack_wait derivation
+//
+// JetStream redelivers any message not acked within ack_wait; shove derives
+// it as max(3 x handler timeout, 30s) at every consumer-creation site so a
+// handler running to its limit never has its message redelivered mid-flight.
+// ===========================================================================
+
+shove::define_topic!(
+    AckWaitExplicitTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-ackwait-explicit").build()
+);
+
+shove::define_topic!(
+    AckWaitDefaultTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-ackwait-default").build()
+);
+
+shove::define_sequenced_topic!(
+    AckWaitFifoTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-ackwait-fifo")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(2)
+        .allow_message_loss()
+        .build()
+);
+
+impl MessageHandler<AckWaitExplicitTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<AckWaitDefaultTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<AckWaitFifoTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+async fn durable_ack_wait(client: &NatsClient, stream: &str, consumer: &str) -> Duration {
+    client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("stream should exist")
+        .consumer_info(consumer)
+        .await
+        .expect("durable should exist")
+        .config
+        .ack_wait
+}
+
+#[tokio::test]
+async fn group_durable_ack_wait_derived_from_explicit_handler_timeout() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register::<AckWaitExplicitTopic, _>(
+            ConsumerGroupConfig::new(
+                NatsConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(20)),
+            ),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        durable_ack_wait(
+            &client,
+            "nats-ackwait-explicit",
+            "nats-ackwait-explicit-consumer"
+        )
+        .await,
+        Duration::from_secs(60),
+        "ack_wait must be 3x the explicit 20s handler timeout"
+    );
+
+    // Upgrade path: a fresh registry re-registering the same topic (as a
+    // restarted deployment would) upserts the EXISTING durable — the changed
+    // ack_wait must be applied, not rejected by the consumer update.
+    let handler2 = CountingHandler::new();
+    let mut group2 = broker.consumer_group();
+    group2
+        .register::<AckWaitExplicitTopic, _>(
+            ConsumerGroupConfig::new(
+                NatsConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(40)),
+            ),
+            move || handler2.clone(),
+        )
+        .await
+        .expect("upserting the existing durable with a changed ack_wait must succeed");
+
+    assert_eq!(
+        durable_ack_wait(
+            &client,
+            "nats-ackwait-explicit",
+            "nats-ackwait-explicit-consumer"
+        )
+        .await,
+        Duration::from_secs(120),
+        "the upsert must update ack_wait on the existing durable"
+    );
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn group_durable_ack_wait_has_margin_over_default_handler_timeout() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register::<AckWaitDefaultTopic, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        durable_ack_wait(
+            &client,
+            "nats-ackwait-default",
+            "nats-ackwait-default-consumer"
+        )
+        .await,
+        Duration::from_secs(90),
+        "ack_wait must be 3x the 30s default handler timeout, not the 30s server default"
+    );
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn fifo_shard_durable_gets_derived_ack_wait() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<AckWaitFifoTopic, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Shard durables are created lazily when the shard tasks start — run the
+    // group briefly so they exist.
+    let signal = tokio::time::sleep(Duration::from_secs(3));
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome was {outcome:?}");
+
+    assert_eq!(
+        durable_ack_wait(&client, "nats-ackwait-fifo", "nats-ackwait-fifo-shard-0").await,
+        Duration::from_secs(90),
+        "shard durables must get the derived ack_wait, not the 30s server default"
+    );
+    broker.close().await;
+}
+
+// ===========================================================================
 // Autoscaling
 // ===========================================================================
 

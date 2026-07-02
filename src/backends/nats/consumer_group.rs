@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backends::nats::client::NatsClient;
-use crate::backends::nats::consumer::NatsConsumer;
+use crate::backends::nats::consumer::{NatsConsumer, derive_ack_wait};
 use crate::backends::nats::topology::NatsTopologyDeclarer;
 use crate::consumer::{HandlerTimeoutConfig, resolve_handler_timeout};
 use crate::consumer_supervisor::{AbortOnDrop, ShutdownTally};
@@ -620,7 +620,12 @@ impl NatsConsumerGroupRegistry {
         // ack budget — eliminates N-way `CONSUMER.CREATE` storms on
         // reconnect (one per consumer task). Per-consumer code now
         // uses `get_consumer` (read-only) to attach.
+        //
+        // `config.handler_timeout` was folded to `Set(resolved)` above, so
+        // this resolves to exactly the effective timeout the group's
+        // consumers will enforce.
         let max_ack_pending = aggregate_max_ack_pending(&config);
+        let ack_wait = derive_ack_wait(resolve_handler_timeout(config.handler_timeout, None));
         let consumer_name = super::constants::consumer_name(topology.queue());
         let filter_subjects = topology.nats_stream_subjects().unwrap_or(&[]);
         declarer
@@ -628,6 +633,7 @@ impl NatsConsumerGroupRegistry {
                 topology.queue(),
                 &consumer_name,
                 max_ack_pending,
+                ack_wait,
                 filter_subjects,
             )
             .await?;
