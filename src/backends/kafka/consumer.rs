@@ -758,6 +758,11 @@ fn create_stream_consumer(
 // Reconnect loop
 // ---------------------------------------------------------------------------
 
+/// A consumer that stayed up at least this long before erroring is considered
+/// to have had a healthy connection: the reconnect budget and backoff reset,
+/// so `max_reconnect_attempts` bounds *consecutive* failures, not lifetime.
+const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(60);
+
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
@@ -771,9 +776,14 @@ where
     let mut backoff = Backoff::default();
     let mut attempts = 0u32;
     loop {
+        let started = tokio::time::Instant::now();
         match f().await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if started.elapsed() >= RECONNECT_RESET_AFTER {
+                    attempts = 0;
+                    backoff = Backoff::default();
+                }
                 if !e.is_retryable() {
                     return Err(e);
                 }
@@ -1949,5 +1959,53 @@ impl KafkaConsumer {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    use super::*;
+
+    /// A closure that keeps a connection "up" for at least
+    /// `RECONNECT_RESET_AFTER` before failing must have its reconnect budget
+    /// reset each time, so `max_reconnect_attempts` never trips even though
+    /// the closure fails more times than the configured max.
+    #[tokio::test(start_paused = true)]
+    async fn resets_budget_after_healthy_run() {
+        let shutdown = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let result = run_with_reconnect(&shutdown, "test", Some(2), || {
+            let n = calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            async move {
+                if n <= 5 {
+                    tokio::time::advance(RECONNECT_RESET_AFTER + Duration::from_secs(1)).await;
+                    Err(ShoveError::Connection("boom".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 6);
+    }
+
+    /// Without an intervening healthy period, consecutive fast failures must
+    /// still exhaust the configured reconnect budget.
+    #[tokio::test(start_paused = true)]
+    async fn exhausts_budget_on_consecutive_fast_failures() {
+        let shutdown = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let result = run_with_reconnect(&shutdown, "test", Some(2), || {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            async move { Err(ShoveError::Connection("boom".to_string())) }
+        })
+        .await;
+
+        assert!(result.is_err(), "expected exhaustion error, got {result:?}");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
     }
 }
