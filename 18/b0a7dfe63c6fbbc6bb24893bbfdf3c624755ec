@@ -1,0 +1,24 @@
+src/backends/nats/publisher.rs
+  s_7458278028faf2::t_5ca7889aa40d2e 189-192,194-202
+tests/nats_integration.rs
+  s_7458278028faf2::t_fceaa25d6ea49a 20
+  s_7458278028faf2::t_343fae1bf9a230 196-206,208-210
+  s_7458278028faf2::t_88b56d9c100e3b 207
+  s_7458278028faf2::t_26985da7b4d377 853-929
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "18b0a7dfe63c6fbbc6bb24893bbfdf3c624755ec",
+  "prompts": {},
+  "sessions": {
+    "s_7458278028faf2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29b24b3b-593c-4f99-906c-c433027d04f7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
