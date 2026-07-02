@@ -39,7 +39,7 @@ Done.
 
 ### `KafkaConfig` and bootstrap servers
 
-`Broker::<Kafka>::new(KafkaConfig::new(&bootstrap))` initialises the rdkafka producer and consumer configuration pointing at the single-broker testcontainer. In production `bootstrap` would be a comma-separated list of broker addresses. `KafkaConfig` exposes additional methods for TLS (`with_ssl`) and SASL authentication (`with_sasl`) — see the [Kafka backend overview](/backends/kafka) for the `kafka-ssl` feature.
+`Broker::<Kafka>::new(KafkaConfig::new(&bootstrap))` initialises the rdkafka producer and consumer configuration pointing at the single-broker testcontainer. In production `bootstrap` would be a comma-separated list of broker addresses. `KafkaConfig` exposes additional methods for TLS (`with_tls`) and SASL authentication (`with_sasl`) — see the [Kafka backend overview](/backends/kafka) for the `kafka-ssl` feature.
 
 ### Consumer group with coordinated partition assignment
 
@@ -53,5 +53,5 @@ Unlike RabbitMQ (which uses AMQP dead-letter routing) or NATS (which uses JetStr
 
 - Change `new(1..=1)` to `new(1..=4)` and publish 20 messages — the consumer group assigns partitions dynamically; observe rebalance log lines during the 3-second run window.
 - Return `Outcome::Retry` from `OrderHandler` and verify the 1-second hold queue fires and redelivers before the 3-second window closes.
-- Add TLS by enabling the `kafka-ssl` feature and configuring `KafkaConfig::with_ssl` — no handler code changes needed.
+- Add TLS by enabling the `kafka-ssl` feature and configuring `KafkaConfig::with_tls` — no handler code changes needed.
 - See [Guides: Retries](/guides/retries) for how hold queues and retry limits interact on Kafka.

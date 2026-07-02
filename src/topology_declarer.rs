@@ -10,6 +10,7 @@ use crate::topology::KafkaCleanupPolicy;
 #[cfg(feature = "kafka")]
 use std::time::Duration;
 
+#[must_use]
 pub struct TopologyDeclarer<B: Backend> {
     pub(crate) inner: B::TopologyImpl,
 }

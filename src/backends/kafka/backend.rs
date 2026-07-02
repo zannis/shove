@@ -30,7 +30,9 @@ use crate::topic::{SequencedTopic, Topic};
 use super::autoscaler::{KafkaAutoscalerBackend, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 use super::client::{KafkaClient, KafkaConfig};
 use super::consumer::KafkaConsumer;
-use super::consumer_group::{KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry};
+use super::consumer_group::{
+    KafkaAutoOffsetReset, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
+};
 use super::publisher::KafkaPublisher;
 use super::topology::KafkaTopologyDeclarer;
 
@@ -189,7 +191,13 @@ impl AutoscalerBackendImpl for KafkaAutoscalerBackend<KafkaLagStatsProvider> {}
 impl QueueStatsProviderImpl for KafkaLagStatsProvider {
     async fn snapshot(&self, queue: &str) -> Result<AutoscaleMetrics> {
         let group_id = super::constants::consumer_group_id(queue);
-        let stats = self.get_queue_stats(queue, &group_id).await?;
+        // The snapshot path addresses the default group, whose reset policy
+        // defaults to Earliest (mirrors the consumer's resolution); a
+        // custom-config group is only reachable through `fetch_metrics`,
+        // which passes the real policy.
+        let stats = self
+            .get_queue_stats(queue, &group_id, KafkaAutoOffsetReset::Earliest)
+            .await?;
         Ok(AutoscaleMetrics {
             backlog: Some(stats.messages_pending),
             inflight: Some(stats.messages_in_flight),

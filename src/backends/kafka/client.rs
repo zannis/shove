@@ -47,6 +47,7 @@ use crate::retry::Backoff;
 /// (AWS MSK + ACM, Confluent Cloud); set `ca_location`/`ca_pem` for private CAs.
 #[cfg(feature = "kafka-ssl")]
 #[derive(Clone, Default)]
+#[must_use]
 pub struct KafkaTls {
     /// Path to CA certificate (PEM). Maps to `ssl.ca.location`.
     pub ca_location: Option<PathBuf>,
@@ -96,6 +97,7 @@ impl fmt::Debug for KafkaTls {
 /// [`KafkaConfig`] to get `SASL_SSL`; without TLS this is `SASL_PLAINTEXT`.
 #[cfg(feature = "kafka-ssl")]
 #[derive(Clone)]
+#[must_use]
 pub enum KafkaSasl {
     Plain {
         username: String,
@@ -219,6 +221,7 @@ impl fmt::Debug for KafkaSasl {
     }
 }
 
+#[must_use]
 pub struct KafkaConfig {
     pub brokers: String,
     #[cfg(feature = "kafka-ssl")]

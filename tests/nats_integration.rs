@@ -17,7 +17,7 @@ use shove::consumer_group::ConsumerGroupConfig;
 use shove::handler::MessageHandler;
 use shove::markers::Nats;
 use shove::metadata::{DeadMessageMetadata, MessageMetadata};
-use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
+use shove::nats::{NatsClient, NatsConfig, NatsConsumer, NatsConsumerGroupConfig, NatsPublisher};
 use shove::outcome::Outcome;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 use shove::{NatsRetention, NatsStreamConfig};
@@ -190,6 +190,21 @@ shove::define_sequenced_topic!(
         .routing_shards(2)
         .hold_queue(Duration::from_millis(200))
         .dlq()
+        .build()
+);
+
+// Sharded topic used to fault-inject a partial `publish_batch` failure: the
+// stream backing this topic is created manually (see
+// `publish_batch_drains_acks_after_partial_stream_failure`) with only shard 0
+// in its subject list, so shard-1 messages have no stream to ack against.
+shove::define_sequenced_topic!(
+    SeqPartialTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-partial-fail")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(2)
+        .allow_message_loss()
         .build()
 );
 
@@ -833,6 +848,83 @@ async fn publish_and_consume_batch() {
     handle.await.unwrap().ok();
     assert_eq!(handler.counter.get(), 5);
     broker.close().await;
+}
+
+#[tokio::test]
+async fn publish_batch_happy_path_reports_accurate_count() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker.topology().declare::<WorkTopic>().await.unwrap();
+
+    let publisher = NatsPublisher::new(client).await.unwrap();
+    let messages: Vec<SimpleMessage> = (1..=5)
+        .map(|i| SimpleMessage {
+            id: format!("count-{i}"),
+            content: format!("message {i}"),
+        })
+        .collect();
+
+    let (succeeded, result) = publisher.publish_batch::<WorkTopic>(&messages).await;
+    assert!(result.is_ok(), "expected success, got {result:?}");
+    assert_eq!(succeeded, 5, "all 5 messages should be reported as stored");
+
+    broker.close().await;
+}
+
+/// Regression test for the `publish_batch` bug where a mid-batch failure
+/// (either at submission or at ack time) abandoned every already-submitted
+/// ack, always reporting `succeeded == 0` even though some messages were
+/// genuinely stored. The stream backing `SeqPartialTopic` is created here
+/// with only shard 0 in its subject list, so messages that hash to shard 1
+/// have no stream to ack against and fail at ack time while shard-0 messages
+/// succeed — a real partial failure, not a simulated one.
+#[tokio::test]
+async fn publish_batch_drains_acks_after_partial_stream_failure() {
+    let tb = TestBroker::start().await;
+    let client = tb.client();
+
+    client
+        .jetstream()
+        .create_stream(JsStreamConfig {
+            name: "nats-partial-fail".to_string(),
+            subjects: vec!["nats-partial-fail.shard.0".to_string()],
+            retention: RetentionPolicy::Limits,
+            ..Default::default()
+        })
+        .await
+        .expect("should create partial-coverage stream");
+
+    let publisher = NatsPublisher::new(client.clone()).await.unwrap();
+    let messages: Vec<OrderMessage> = (1..=20)
+        .map(|i| OrderMessage {
+            order_id: format!("order-{i}"),
+            amount: i,
+        })
+        .collect();
+
+    let (succeeded, result) = publisher.publish_batch::<SeqPartialTopic>(&messages).await;
+
+    assert!(
+        result.is_err(),
+        "expected a partial failure from the shard-1 messages with no stream"
+    );
+    assert!(succeeded > 0, "shard-0 acks must not be abandoned");
+    assert!(
+        succeeded < messages.len() as u64,
+        "shard-1 messages have no stream and must not be counted as stored"
+    );
+
+    let mut stream = client
+        .jetstream()
+        .get_stream("nats-partial-fail")
+        .await
+        .expect("stream should exist");
+    let info = stream.info().await.expect("should get stream info");
+    assert_eq!(
+        info.state.messages, succeeded,
+        "reported success count must match what NATS actually stored"
+    );
 }
 
 // ===========================================================================
@@ -2623,6 +2715,201 @@ async fn consumer_group_register_fifo_drains_via_run_until_timeout() {
     assert!(outcome.is_clean(), "outcome was {outcome:?}");
     assert_eq!(handler.counter.get(), 5);
 
+    broker.close().await;
+}
+
+// ===========================================================================
+// ack_wait derivation
+//
+// JetStream redelivers any message not acked within ack_wait; shove derives
+// it as max(3 x handler timeout, 30s) at every consumer-creation site so a
+// handler running to its limit never has its message redelivered mid-flight.
+// ===========================================================================
+
+shove::define_topic!(
+    AckWaitExplicitTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-ackwait-explicit").build()
+);
+
+shove::define_topic!(
+    AckWaitDefaultTopic,
+    SimpleMessage,
+    TopologyBuilder::new("nats-ackwait-default").build()
+);
+
+shove::define_sequenced_topic!(
+    AckWaitFifoTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-ackwait-fifo")
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(2)
+        .allow_message_loss()
+        .build()
+);
+
+impl MessageHandler<AckWaitExplicitTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<AckWaitDefaultTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+impl MessageHandler<AckWaitFifoTopic> for CountingHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.counter.increment();
+        Outcome::Ack
+    }
+}
+
+async fn durable_ack_wait(client: &NatsClient, stream: &str, consumer: &str) -> Duration {
+    client
+        .jetstream()
+        .get_stream(stream)
+        .await
+        .expect("stream should exist")
+        .consumer_info(consumer)
+        .await
+        .expect("durable should exist")
+        .config
+        .ack_wait
+}
+
+#[tokio::test]
+async fn group_durable_ack_wait_derived_from_explicit_handler_timeout() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register::<AckWaitExplicitTopic, _>(
+            ConsumerGroupConfig::new(
+                NatsConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(20)),
+            ),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        durable_ack_wait(
+            &client,
+            "nats-ackwait-explicit",
+            "nats-ackwait-explicit-consumer"
+        )
+        .await,
+        Duration::from_secs(60),
+        "ack_wait must be 3x the explicit 20s handler timeout"
+    );
+
+    // Upgrade path: a fresh registry re-registering the same topic (as a
+    // restarted deployment would) upserts the EXISTING durable — the changed
+    // ack_wait must be applied, not rejected by the consumer update.
+    let handler2 = CountingHandler::new();
+    let mut group2 = broker.consumer_group();
+    group2
+        .register::<AckWaitExplicitTopic, _>(
+            ConsumerGroupConfig::new(
+                NatsConsumerGroupConfig::new(1..=1).with_handler_timeout(Duration::from_secs(40)),
+            ),
+            move || handler2.clone(),
+        )
+        .await
+        .expect("upserting the existing durable with a changed ack_wait must succeed");
+
+    assert_eq!(
+        durable_ack_wait(
+            &client,
+            "nats-ackwait-explicit",
+            "nats-ackwait-explicit-consumer"
+        )
+        .await,
+        Duration::from_secs(120),
+        "the upsert must update ack_wait on the existing durable"
+    );
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn group_durable_ack_wait_has_margin_over_default_handler_timeout() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register::<AckWaitDefaultTopic, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        durable_ack_wait(
+            &client,
+            "nats-ackwait-default",
+            "nats-ackwait-default-consumer"
+        )
+        .await,
+        Duration::from_secs(90),
+        "ack_wait must be 3x the 30s default handler timeout, not the 30s server default"
+    );
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn fifo_shard_durable_gets_derived_ack_wait() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+
+    let handler = CountingHandler::new();
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<AckWaitFifoTopic, _>(
+            ConsumerGroupConfig::new(NatsConsumerGroupConfig::default()),
+            {
+                let h = handler.clone();
+                move || h.clone()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Shard durables are created lazily when the shard tasks start — run the
+    // group briefly so they exist.
+    let signal = tokio::time::sleep(Duration::from_secs(3));
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean(), "outcome was {outcome:?}");
+
+    assert_eq!(
+        durable_ack_wait(&client, "nats-ackwait-fifo", "nats-ackwait-fifo-shard-0").await,
+        Duration::from_secs(90),
+        "shard durables must get the derived ack_wait, not the 30s server default"
+    );
     broker.close().await;
 }
 

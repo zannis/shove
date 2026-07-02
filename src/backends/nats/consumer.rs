@@ -18,7 +18,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
-use crate::consumer::validate_message_size;
+use crate::consumer::{DEFAULT_HANDLER_TIMEOUT, validate_message_size};
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
 use crate::handler::MessageHandler;
@@ -36,6 +36,21 @@ use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER, RETRY_COUNT_HEADER,
 };
 use super::publisher::publish_with_retry;
+
+// ---------------------------------------------------------------------------
+// ack_wait derivation
+// ---------------------------------------------------------------------------
+
+/// JetStream redelivers any message not acked within `ack_wait`. Derive it
+/// from the handler timeout with a 3x margin so a handler running to its
+/// limit — plus queue-wait behind a full prefetch buffer (the `ack_wait`
+/// clock ticks from delivery, and delivered messages wait on the prefetch
+/// semaphore before their handler starts) — never has its message
+/// redelivered mid-flight. Floor at the JetStream default (30s) so short
+/// handler timeouts don't tighten redelivery below the server default.
+pub(super) fn derive_ack_wait(handler_timeout: Duration) -> Duration {
+    (handler_timeout * 3).max(Duration::from_secs(30))
+}
 
 // ---------------------------------------------------------------------------
 // Metadata extraction functions
@@ -424,6 +439,11 @@ fn map_get_stream_error(queue: &str, e: GetStreamError) -> ShoveError {
 // Reconnect loop
 // ---------------------------------------------------------------------------
 
+/// A consumer that stayed up at least this long before erroring is considered
+/// to have had a healthy connection: the reconnect budget and backoff reset,
+/// so `max_reconnect_attempts` bounds *consecutive* failures, not lifetime.
+const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(60);
+
 /// Runs `f` in a reconnect loop, retrying on transient errors until shutdown
 /// or `max_retries` consecutive failures.
 async fn run_with_reconnect<F, Fut>(
@@ -439,9 +459,14 @@ where
     let mut backoff = Backoff::default();
     let mut attempts = 0u32;
     loop {
+        let started = tokio::time::Instant::now();
         match f().await {
             Ok(()) => return Ok(()),
             Err(e) => {
+                if started.elapsed() >= RECONNECT_RESET_AFTER {
+                    attempts = 0;
+                    backoff = Backoff::default();
+                }
                 if !e.is_retryable() {
                     return Err(e);
                 }
@@ -537,6 +562,7 @@ impl NatsConsumer {
 
         let max_message_size = options.max_message_size;
         let max_ack_pending = options.max_ack_pending.unwrap_or(prefetch_count as i64);
+        let derived_ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
 
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
@@ -609,6 +635,7 @@ impl NatsConsumer {
                                 durable_name: Some(consumer_name.clone()),
                                 ack_policy: AckPolicy::Explicit,
                                 max_ack_pending,
+                                ack_wait: derived_ack_wait,
                                 ..Default::default()
                             })
                             .await
@@ -905,6 +932,7 @@ impl NatsConsumer {
         let hold_queues = topology.hold_queues();
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = options.consumer_group.clone();
+        let derived_ack_wait = derive_ack_wait(handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT));
 
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
@@ -951,6 +979,10 @@ impl NatsConsumer {
                             .await
                             .map_err(|e| map_get_stream_error(queue, e))?;
 
+                        // Note: `get_or_create_consumer` returns an existing
+                        // durable verbatim — only newly created shard
+                        // consumers get the derived ack_wait; pre-existing
+                        // ones keep their stored value until recreated.
                         let pull_consumer = stream
                             .get_or_create_consumer(
                                 &consumer_name,
@@ -959,6 +991,7 @@ impl NatsConsumer {
                                     filter_subject: filter_subject.clone(),
                                     ack_policy: AckPolicy::Explicit,
                                     max_ack_pending: 1,
+                                    ack_wait: derived_ack_wait,
                                     ..Default::default()
                                 },
                             )
@@ -1169,6 +1202,10 @@ impl NatsConsumer {
                         PullConsumerConfig {
                             durable_name: Some(dlq_consumer_name.clone()),
                             ack_policy: AckPolicy::Explicit,
+                            // run_dlq has no handler-timeout knob; give the
+                            // DLQ durable the same margin a default-timeout
+                            // consumer gets.
+                            ack_wait: derive_ack_wait(DEFAULT_HANDLER_TIMEOUT),
                             ..Default::default()
                         },
                     )
@@ -1254,5 +1291,82 @@ impl NatsConsumer {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod ack_wait_tests {
+    use super::*;
+
+    #[test]
+    fn default_handler_timeout_gets_triple_margin() {
+        assert_eq!(
+            derive_ack_wait(Duration::from_secs(30)),
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn short_handler_timeout_floors_at_server_default() {
+        assert_eq!(
+            derive_ack_wait(Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn long_handler_timeout_scales_linearly() {
+        assert_eq!(
+            derive_ack_wait(Duration::from_secs(120)),
+            Duration::from_secs(360)
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    use super::*;
+
+    /// A closure that keeps a connection "up" for at least
+    /// `RECONNECT_RESET_AFTER` before failing must have its reconnect budget
+    /// reset each time, so `max_reconnect_attempts` never trips even though
+    /// the closure fails more times than the configured max.
+    #[tokio::test(start_paused = true)]
+    async fn resets_budget_after_healthy_run() {
+        let shutdown = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let result = run_with_reconnect(&shutdown, "test", Some(2), || {
+            let n = calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            async move {
+                if n <= 5 {
+                    tokio::time::advance(RECONNECT_RESET_AFTER + Duration::from_secs(1)).await;
+                    Err(ShoveError::Connection("boom".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 6);
+    }
+
+    /// Without an intervening healthy period, consecutive fast failures must
+    /// still exhaust the configured reconnect budget.
+    #[tokio::test(start_paused = true)]
+    async fn exhausts_budget_on_consecutive_fast_failures() {
+        let shutdown = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let result = run_with_reconnect(&shutdown, "test", Some(2), || {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            async move { Err(ShoveError::Connection("boom".to_string())) }
+        })
+        .await;
+
+        assert!(result.is_err(), "expected exhaustion error, got {result:?}");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
     }
 }

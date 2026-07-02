@@ -148,11 +148,17 @@ impl NatsTopologyDeclarer {
     ///
     /// `max_ack_pending` must reflect the **aggregate** in-flight budget
     /// for the whole group (typically `prefetch_count × max_consumers`).
+    ///
+    /// `ack_wait` must leave headroom above the group's handler timeout so a
+    /// handler running to its limit never has its message redelivered
+    /// mid-flight — derive it with
+    /// [`derive_ack_wait`](super::consumer::derive_ack_wait).
     pub(crate) async fn declare_pull_consumer(
         &self,
         stream: &str,
         consumer_name: &str,
         max_ack_pending: i64,
+        ack_wait: Duration,
         filter_subjects: &[String],
     ) -> Result<()> {
         let stream = self
@@ -175,6 +181,7 @@ impl NatsTopologyDeclarer {
                 durable_name: Some(consumer_name.to_string()),
                 ack_policy: AckPolicy::Explicit,
                 max_ack_pending,
+                ack_wait,
                 filter_subject,
                 filter_subjects,
                 ..Default::default()

@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::RangeInclusive;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -24,6 +27,29 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
 /// Type-erased factory that spawns a single consumer task.
 pub(crate) type Spawner = Arc<dyn Fn(ConsumerOptions) -> JoinHandle<()> + Send + Sync>;
+
+/// Returns `true` if the handle is finished, harvesting its result first: a
+/// panic (non-cancelled `JoinError`) is counted into `panic_count` so it
+/// still reaches the shutdown tally even though the pruned handle will never
+/// be awaited by the final drain. Polling a finished `JoinHandle` with a
+/// no-op waker completes immediately — this never blocks.
+fn harvest_if_finished(
+    handle: &mut JoinHandle<()>,
+    panic_count: &AtomicUsize,
+    queue: &str,
+) -> bool {
+    if !handle.is_finished() {
+        return false;
+    }
+    let mut cx = Context::from_waker(Waker::noop());
+    if let Poll::Ready(Err(e)) = Pin::new(handle).poll(&mut cx)
+        && !e.is_cancelled()
+    {
+        tracing::error!(error = %e, group = %queue, "finished consumer task had panicked");
+        panic_count.fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
 
 /// `auto.offset.reset` policy applied when a consumer group joins a topic
 /// for the first time (no committed offsets yet) or after offsets have
@@ -489,8 +515,26 @@ impl KafkaConsumerGroup {
         }
     }
 
+    /// Removes finished handles from the active and retiring lists so
+    /// capacity gates and the idle-pick operate on live members only. A
+    /// consumer that exited with a non-retryable error (or exhausted its
+    /// reconnect budget) would otherwise occupy a slot forever: `scale_up`
+    /// would refuse at "max capacity" with zero consumers running, and
+    /// `scale_down` could "cancel" an already-dead member while live ones
+    /// keep working. Panics of pruned handles are harvested into
+    /// `panic_count` so the shutdown tally stays accurate.
+    fn prune_finished(&mut self) {
+        let panic_count = &self.panic_count;
+        let queue = &self.queue;
+        self.consumers
+            .retain_mut(|(_, _, handle)| !harvest_if_finished(handle, panic_count, queue));
+        self.retiring
+            .retain_mut(|handle| !harvest_if_finished(handle, panic_count, queue));
+    }
+
     /// Spawn one additional consumer. Returns false at max capacity.
     pub fn scale_up(&mut self) -> bool {
+        self.prune_finished();
         if self.consumers.len() >= self.config.max_consumers as usize {
             debug!(group = %self.queue, max = self.config.max_consumers, "scale_up rejected: at max capacity");
             return false;
@@ -506,6 +550,7 @@ impl KafkaConsumerGroup {
 
     /// Cancel an idle consumer. Returns false at min capacity or all busy.
     pub fn scale_down(&mut self) -> bool {
+        self.prune_finished();
         if self.consumers.len() <= self.config.min_consumers as usize {
             debug!(group = %self.queue, min = self.config.min_consumers, "scale_down rejected: at min capacity");
             return false;
@@ -533,8 +578,14 @@ impl KafkaConsumerGroup {
         true
     }
 
+    /// Number of consumer tasks that are actually alive. Counts (rather than
+    /// relying on prior pruning) because the autoscaler reads this through
+    /// immutable registry access — it must be truthful with `&self`.
     pub fn active_consumers(&self) -> usize {
-        self.consumers.len()
+        self.consumers
+            .iter()
+            .filter(|(_, _, handle)| !handle.is_finished())
+            .count()
     }
 
     #[cfg(test)]
@@ -589,6 +640,8 @@ impl KafkaConsumerGroup {
     pub(crate) async fn drain_into(&mut self, tally: &mut ShutdownTally) {
         info!(
             group = %self.queue,
+            // Deliberately the raw slot count (not active_consumers): this is
+            // how many handles the drain below will await, live or not.
             consumers = self.consumers.len(),
             "shutting down consumer group"
         );
@@ -688,6 +741,7 @@ impl KafkaConsumerGroup {
         }
         let handle = (self.spawner)(options);
         self.consumers.push((child_token, processing, handle));
+        // Raw vec position of the new entry, not a liveness count.
         debug!(group = %self.queue, consumer_index = self.consumers.len() - 1, "spawned consumer");
     }
 }
@@ -938,24 +992,54 @@ mod tests {
     use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
 
     fn test_group(config: KafkaConsumerGroupConfig) -> KafkaConsumerGroup {
-        let group_token = CancellationToken::new();
         let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
             tokio::spawn(async move {
                 options.shutdown.cancelled().await;
             })
         });
+        test_group_with_spawner(config, spawner)
+    }
 
+    fn test_group_with_spawner(
+        config: KafkaConsumerGroupConfig,
+        spawner: Spawner,
+    ) -> KafkaConsumerGroup {
         KafkaConsumerGroup {
             queue: "test-queue".into(),
             group_id: "test-queue-consumer".into(),
             consumers: Vec::with_capacity(config.max_consumers as usize),
             config,
             spawner,
-            group_token,
+            group_token: CancellationToken::new(),
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
             retiring: Vec::new(),
         }
+    }
+
+    /// Spawner whose first task exits immediately (a "dead" consumer) and
+    /// whose subsequent tasks stay alive until their shutdown token fires.
+    fn first_dies_spawner() -> Spawner {
+        let calls = Arc::new(AtomicUsize::new(0));
+        Arc::new(move |options: ConsumerOptions| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if n > 0 {
+                    options.shutdown.cancelled().await;
+                }
+            })
+        })
+    }
+
+    /// Polls until the group's consumer at `index` has finished (bounded).
+    async fn wait_finished(group: &KafkaConsumerGroup, index: usize) {
+        for _ in 0..200 {
+            if group.consumers[index].2.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("consumer task {index} did not finish within the wait budget");
     }
 
     fn default_config() -> KafkaConsumerGroupConfig {
@@ -1099,6 +1183,85 @@ mod tests {
             assert!(doomed_token.is_cancelled());
             group.shutdown().await;
         });
+    }
+
+    // -- liveness accounting --
+
+    #[tokio::test]
+    async fn dead_consumer_is_not_counted_as_active() {
+        let spawner: Spawner = Arc::new(|_options: ConsumerOptions| tokio::spawn(async {}));
+        let mut group = test_group_with_spawner(KafkaConsumerGroupConfig::new(1..=4), spawner);
+        group.start();
+        wait_finished(&group, 0).await;
+        assert_eq!(
+            group.active_consumers(),
+            0,
+            "a finished consumer task must not be reported as active"
+        );
+        group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scale_up_replaces_dead_consumer_at_max_capacity() {
+        let mut group =
+            test_group_with_spawner(KafkaConsumerGroupConfig::new(0..=1), first_dies_spawner());
+        assert!(group.scale_up());
+        wait_finished(&group, 0).await;
+        assert_eq!(group.active_consumers(), 0);
+
+        // len == max, but the only member is dead: pruning must free the slot.
+        assert!(
+            group.scale_up(),
+            "scale_up must not refuse at max capacity when the slot holder is dead"
+        );
+        assert_eq!(group.active_consumers(), 1);
+        group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scale_down_prunes_dead_member_instead_of_cancelling_live_one() {
+        let mut group =
+            test_group_with_spawner(KafkaConsumerGroupConfig::new(1..=2), first_dies_spawner());
+        assert!(group.scale_up()); // dies immediately
+        assert!(group.scale_up()); // stays alive
+        wait_finished(&group, 0).await;
+
+        let live_token = group.consumers[1].0.clone();
+        // min+1 slots, one dead: pruning brings the live count to min, so the
+        // scale-down is rejected and no live member is cancelled.
+        assert!(!group.scale_down());
+        assert!(
+            !live_token.is_cancelled(),
+            "the live member must not be cancelled while a dead one occupied a slot"
+        );
+        assert_eq!(group.active_consumers(), 1);
+        assert!(group.retiring_is_empty());
+        group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pruned_panicked_consumer_still_lands_in_shutdown_tally() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if n == 0 {
+                    panic!("consumer blew up");
+                }
+                options.shutdown.cancelled().await;
+            })
+        });
+        let mut group = test_group_with_spawner(KafkaConsumerGroupConfig::new(0..=2), spawner);
+        assert!(group.scale_up()); // panics immediately
+        wait_finished(&group, 0).await;
+        assert!(group.scale_up()); // prunes (and harvests) the panicked handle
+
+        let tally = group.shutdown_with_tally().await;
+        assert_eq!(
+            tally.panics, 1,
+            "a panic harvested at prune time must still reach the shutdown tally"
+        );
     }
 
     // -- shutdown --

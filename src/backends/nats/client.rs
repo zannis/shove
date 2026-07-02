@@ -11,6 +11,7 @@ use crate::ShoveError;
 use crate::error::Result;
 use crate::retry::Backoff;
 
+#[must_use]
 pub struct NatsConfig {
     pub url: String,
     /// Path to a PEM-encoded CA certificate for verifying the server's TLS certificate.

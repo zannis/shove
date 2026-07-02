@@ -17,7 +17,7 @@ use crate::autoscaler::{
 use crate::error::Result;
 
 use super::client::KafkaClient;
-use super::consumer_group::KafkaConsumerGroupRegistry;
+use super::consumer_group::{KafkaAutoOffsetReset, KafkaConsumerGroupRegistry};
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
 #[cfg(feature = "kafka-msk-iam")]
@@ -34,16 +34,39 @@ pub struct KafkaQueueStats {
 pub trait KafkaQueueStatsProvider: Send + Sync {
     /// Fetch lag statistics for `queue` under the given `group_id`.
     ///
-    /// Both parameters are required: `queue` names the topic, `group_id` is the
-    /// Kafka consumer group whose committed offsets are queried. Callers must pass
-    /// the actual group ID (e.g. `"{queue}-fifo"` for FIFO groups) rather than
-    /// re-deriving it from the queue name — re-derivation is what caused the bug
-    /// fixed by arch-K-1.
+    /// `queue` names the topic, `group_id` is the Kafka consumer group whose
+    /// committed offsets are queried. Callers must pass the actual group ID
+    /// (e.g. `"{queue}-fifo"` for FIFO groups) rather than re-deriving it from
+    /// the queue name — re-derivation is what caused the bug fixed by arch-K-1.
+    ///
+    /// `reset` is the group's `auto.offset.reset` policy. It determines the
+    /// effective start position — and therefore the lag — for partitions the
+    /// group has never committed: `earliest` starts at the low watermark,
+    /// `latest` at the high watermark (zero lag).
     fn get_queue_stats(
         &self,
         queue: &str,
         group_id: &str,
+        reset: KafkaAutoOffsetReset,
     ) -> impl Future<Output = Result<KafkaQueueStats>> + Send;
+}
+
+/// Lag for one partition given the group's committed offset and the
+/// partition watermarks. When the group has never committed, the effective
+/// start position depends on `auto.offset.reset`: `earliest` starts at the
+/// low watermark, `latest` at the high watermark (zero lag).
+fn partition_lag(committed: Option<i64>, low: i64, high: i64, reset: KafkaAutoOffsetReset) -> u64 {
+    match committed {
+        Some(offset) => (high - offset).max(0) as u64,
+        None => match reset {
+            KafkaAutoOffsetReset::Latest => 0,
+            // `None` refuses to start without a committed offset; report the
+            // same backlog as `earliest` so the pathology is visible.
+            KafkaAutoOffsetReset::Earliest | KafkaAutoOffsetReset::None => {
+                (high - low).max(0) as u64
+            }
+        },
+    }
 }
 
 /// Stats-only `BaseConsumer` that carries whichever `ClientContext` matches the
@@ -215,7 +238,12 @@ impl Drop for KafkaLagStatsProvider {
 }
 
 impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
-    async fn get_queue_stats(&self, queue: &str, group_id: &str) -> Result<KafkaQueueStats> {
+    async fn get_queue_stats(
+        &self,
+        queue: &str,
+        group_id: &str,
+        reset: KafkaAutoOffsetReset,
+    ) -> Result<KafkaQueueStats> {
         // perf-K-10: reuse a cached BaseConsumer keyed by group_id.
         let consumer = self.get_or_create_consumer(group_id)?;
         let queue = queue.to_string();
@@ -294,24 +322,24 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             tokio::task::spawn_blocking(move || -> Result<u64> {
                 let mut total: u64 = 0;
                 for pid in partitions {
-                    let (_low, high) = c
+                    let (low, high) = c
                         .fetch_watermarks(&q, pid, Duration::from_secs(5))
                         .map_err(|e| {
                             ShoveError::Connection(format!(
                                 "failed to fetch watermarks for {q}/{pid}: {e}"
                             ))
                         })?;
-                    if let Some(elem) = committed.find_partition(&q, pid) {
-                        let committed_offset = match elem.offset() {
-                            rdkafka::Offset::Offset(o) => o,
-                            _ => 0,
-                        };
-                        if high > committed_offset {
-                            total += (high - committed_offset) as u64;
-                        }
-                    } else {
-                        total += high as u64;
-                    }
+                    // Both a partition absent from the committed TPL and an
+                    // `Offset::Invalid` entry mean "the group has never
+                    // committed here" — map both to `None`.
+                    let committed_offset =
+                        committed
+                            .find_partition(&q, pid)
+                            .and_then(|elem| match elem.offset() {
+                                rdkafka::Offset::Offset(o) => Some(o),
+                                _ => None,
+                            });
+                    total += partition_lag(committed_offset, low, high, reset);
                 }
                 Ok(total)
             })
@@ -383,7 +411,7 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
     }
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
-        let (queue, group_id, prefetch, active) = {
+        let (queue, group_id, prefetch, active, reset) = {
             let reg = self.registry.lock().await;
             let g = reg
                 .groups()
@@ -394,12 +422,15 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
                 g.group_id().to_owned(),
                 g.config().prefetch_count(),
                 g.active_consumers(),
+                g.config()
+                    .auto_offset_reset()
+                    .unwrap_or(KafkaAutoOffsetReset::Earliest),
             )
         };
 
         let stats = self
             .stats_provider
-            .get_queue_stats(&queue, &group_id)
+            .get_queue_stats(&queue, &group_id, reset)
             .await?;
 
         debug!(
@@ -485,12 +516,55 @@ mod tests {
     }
 
     impl KafkaQueueStatsProvider for MockKafkaStatsProvider {
-        async fn get_queue_stats(&self, queue: &str, _group_id: &str) -> Result<KafkaQueueStats> {
+        async fn get_queue_stats(
+            &self,
+            queue: &str,
+            _group_id: &str,
+            _reset: KafkaAutoOffsetReset,
+        ) -> Result<KafkaQueueStats> {
             self.stats
                 .get(queue)
                 .cloned()
                 .ok_or_else(|| ShoveError::Topology(format!("not found: {queue}")))
         }
+    }
+
+    #[test]
+    fn partition_lag_committed_normal_case() {
+        assert_eq!(
+            partition_lag(Some(40), 0, 100, KafkaAutoOffsetReset::Earliest),
+            60
+        );
+        assert_eq!(
+            partition_lag(Some(40), 0, 100, KafkaAutoOffsetReset::Latest),
+            60
+        );
+    }
+
+    #[test]
+    fn partition_lag_committed_beyond_high_is_zero() {
+        assert_eq!(
+            partition_lag(Some(120), 0, 100, KafkaAutoOffsetReset::Earliest),
+            0
+        );
+    }
+
+    #[test]
+    fn partition_lag_never_committed_earliest_uses_low_watermark() {
+        // Retention has truncated the log: low > 0. Lag is high - low, not
+        // the full high watermark.
+        assert_eq!(
+            partition_lag(None, 30, 100, KafkaAutoOffsetReset::Earliest),
+            70
+        );
+    }
+
+    #[test]
+    fn partition_lag_never_committed_latest_is_zero() {
+        assert_eq!(
+            partition_lag(None, 30, 100, KafkaAutoOffsetReset::Latest),
+            0
+        );
     }
 
     type TestSpawner = Arc<dyn Fn(ConsumerOptions) -> tokio::task::JoinHandle<()> + Send + Sync>;
@@ -836,6 +910,7 @@ mod tests {
                 &self,
                 _queue: &str,
                 group_id: &str,
+                _reset: KafkaAutoOffsetReset,
             ) -> Result<KafkaQueueStats> {
                 assert_eq!(
                     group_id, self.expected_group_id,
@@ -896,6 +971,7 @@ mod tests {
                 &self,
                 _queue: &str,
                 group_id: &str,
+                _reset: KafkaAutoOffsetReset,
             ) -> Result<KafkaQueueStats> {
                 assert_eq!(
                     group_id, self.expected_group_id,

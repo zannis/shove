@@ -1964,7 +1964,7 @@ async fn deserialization_failure_rejects_to_dlq() {
 
 #[tokio::test]
 async fn lag_stats_provider_reports_pending_messages() {
-    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -1984,7 +1984,11 @@ async fn lag_stats_provider_reports_pending_messages() {
 
     let stats_provider = KafkaLagStatsProvider::new(client.clone());
     let stats: KafkaQueueStats = stats_provider
-        .get_queue_stats("kafka-work", "kafka-work-consumer")
+        .get_queue_stats(
+            "kafka-work",
+            "kafka-work-consumer",
+            KafkaAutoOffsetReset::Earliest,
+        )
         .await
         .expect("get_queue_stats should succeed");
 
@@ -1999,7 +2003,7 @@ async fn lag_stats_provider_reports_pending_messages() {
 
 #[tokio::test]
 async fn lag_stats_provider_reports_zero_after_consumption() {
-    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 
     shove::define_topic!(
         LagTestTopic,
@@ -2063,7 +2067,11 @@ async fn lag_stats_provider_reports_zero_after_consumption() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stats: KafkaQueueStats = stats_provider
-            .get_queue_stats("kafka-lag-test", "kafka-lag-test-consumer")
+            .get_queue_stats(
+                "kafka-lag-test",
+                "kafka-lag-test-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
             .await
             .expect("get_queue_stats should succeed");
         if stats.messages_pending == 0 {
@@ -2082,7 +2090,7 @@ async fn lag_stats_provider_reports_zero_after_consumption() {
 
 #[tokio::test]
 async fn committed_offsets_advance_while_consumer_is_idle() {
-    use shove::kafka::{KafkaLagStatsProvider, KafkaQueueStatsProvider};
+    use shove::kafka::{KafkaAutoOffsetReset, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 
     shove::define_topic!(
         IdleCommitTopic,
@@ -2148,7 +2156,11 @@ async fn committed_offsets_advance_while_consumer_is_idle() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stats: KafkaQueueStats = stats_provider
-            .get_queue_stats("kafka-idle-commit", "kafka-idle-commit-consumer")
+            .get_queue_stats(
+                "kafka-idle-commit",
+                "kafka-idle-commit-consumer",
+                KafkaAutoOffsetReset::Earliest,
+            )
             .await
             .expect("get_queue_stats should succeed");
         if stats.messages_pending == 0 {
