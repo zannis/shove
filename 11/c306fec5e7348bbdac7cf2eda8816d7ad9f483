@@ -1,0 +1,23 @@
+src/backends/nats/consumer.rs
+  s_7458278028faf2::t_3b98e36afc6995 427-431,447,451-454
+  s_7458278028faf2::t_cee7f6f2314a45 1269-1316
+src/backends/kafka/consumer.rs
+  s_7458278028faf2::t_d69a39b1d8ea57 761-765,779,783-786
+  s_7458278028faf2::t_079eb52c56b316 1964-2011
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.8",
+  "base_commit_sha": "11c306fec5e7348bbdac7cf2eda8816d7ad9f483",
+  "prompts": {},
+  "sessions": {
+    "s_7458278028faf2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "29b24b3b-593c-4f99-906c-c433027d04f7",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
