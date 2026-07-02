@@ -958,8 +958,10 @@ impl KafkaConsumer {
                             while let Ok((partition, offset)) = completion_rx.try_recv() {
                                 tracker.mark_complete(partition, offset);
                             }
-                            if let Some(tpl) = tracker.drain_committable() {
-                                consumer.commit(&tpl, CommitMode::Async).ok();
+                            if let Some(tpl) = tracker.drain_committable()
+                                && let Err(e) = consumer.commit(&tpl, CommitMode::Sync)
+                            {
+                                tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
                             }
                             return Ok(());
                         }
