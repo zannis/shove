@@ -1,0 +1,45 @@
+tests/redis_integration.rs
+  s_fab751bd59435c::t_dc9aa7fcb91445 3616-3675
+docs/pages/reference.mdx
+  s_fab751bd59435c::t_4c529b8dcda98b 22-23
+docs/pages/concepts/codecs.mdx
+  s_fab751bd59435c::t_48bc5b3ff9a5fb 173
+tests/sns_sqs_integration.rs
+  s_fab751bd59435c::t_dc9aa7fcb91445 3141-3197
+src/codecs/sbe.rs
+  s_fab751bd59435c::t_cbd3e4c3db7856 517-518
+  s_fab751bd59435c::t_9c60cb9c793fb5 230-236
+  s_fab751bd59435c::t_e1f8b3be4eaf64 541-546,549-555,559-592
+  s_fab751bd59435c::t_516da25f6cec69 170-184
+  s_fab751bd59435c::t_172be611c1cb43 325-330
+  s_fab751bd59435c::t_f3c74d8ae8d15c 306-307
+tests/nats_integration.rs
+  s_fab751bd59435c::t_02dc2ed60765f4 3137
+  s_fab751bd59435c::t_2ed2427d8a908a 3018-3136,3138-3140
+README.md
+  s_fab751bd59435c::t_180a0a7ac09117 95
+tests/rabbitmq_integration.rs
+  s_fab751bd59435c::t_02dc2ed60765f4 6096
+  s_fab751bd59435c::t_ba669e4b5f9334 5984-6095,6097-6100
+.github/workflows/ci.yml
+  s_fab751bd59435c::t_6e5e1e6b2952cf 96,98,100,102,107,109
+tests/kafka_integration.rs
+  s_fab751bd59435c::t_ba669e4b5f9334 3156-3274,3276-3278
+  s_fab751bd59435c::t_02dc2ed60765f4 3275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3238e5ee910f97f94edd84134c9810a87d49e7f",
+  "prompts": {},
+  "sessions": {
+    "s_fab751bd59435c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "198d04ed-7edb-4726-8ef9-e6af1c121e8b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
