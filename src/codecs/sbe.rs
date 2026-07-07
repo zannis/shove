@@ -167,6 +167,21 @@ pub enum SbeCodecError {
         /// Template id found on the wire.
         actual: u16,
     },
+
+    /// The buffer ends before the root block promised by the header's
+    /// `blockLength`, so flyweight field reads would run past the buffer.
+    #[error("SBE root block truncated: frame is {len} bytes, header promises {needed}")]
+    RootBlockTruncated {
+        /// Header length plus the acting `blockLength`.
+        needed: usize,
+        /// Length of the rejected buffer.
+        len: usize,
+    },
+
+    /// SBE frames are binary and refuse string-based transports (SNS/SQS,
+    /// Redis Streams) outright, even when a frame happens to be valid UTF-8.
+    #[error("SBE frames cannot ride string-based transports")]
+    StringTransportUnsupported,
 }
 
 impl SbeCodecError {
@@ -210,6 +225,13 @@ impl<T: SbeMessage> SbeFrame<T> {
             return Err(SbeCodecError::TemplateIdMismatch {
                 expected: T::TEMPLATE_ID,
                 actual: header.template_id,
+            });
+        }
+        let needed = SbeHeader::ENCODED_LENGTH + usize::from(header.block_length);
+        if bytes.len() < needed {
+            return Err(SbeCodecError::RootBlockTruncated {
+                needed,
+                len: bytes.len(),
             });
         }
         Ok(Self {
@@ -281,8 +303,8 @@ impl<T: SbeMessage> AsRef<[u8]> for SbeFrame<T> {
 /// clone and `decode_owned` revalidates the header and keeps the received
 /// buffer. The borrowed fallbacks (`encode`, `decode`) cost exactly one
 /// buffer copy and are only hit on backends that cannot hand over ownership.
-/// String-API backends (SNS/SQS, Redis Streams) reject binary SBE frames at
-/// publish time through the default `encode_to_string` UTF-8 check.
+/// String-API backends (SNS/SQS, Redis Streams) are refused unconditionally
+/// at publish time via `encode_to_string`.
 pub struct SbeCodec;
 
 impl<T: SbeMessage> Codec<SbeFrame<T>> for SbeCodec {
@@ -298,6 +320,12 @@ impl<T: SbeMessage> Codec<SbeFrame<T>> for SbeCodec {
 
     fn encode_bytes(value: &SbeFrame<T>) -> Result<Bytes> {
         Ok(value.bytes.clone())
+    }
+
+    // Unconditional: the default UTF-8 check would let frames that happen to
+    // be UTF-8-valid ride string transports, making failures data-dependent.
+    fn encode_to_string(_value: &SbeFrame<T>) -> Result<String> {
+        Err(SbeCodecError::StringTransportUnsupported.into_shove())
     }
 
     fn decode_owned(bytes: Bytes) -> Result<SbeFrame<T>> {
@@ -486,7 +514,8 @@ mod tests {
             schema_id: 42,
             version: 1,
         };
-        let frame = header.to_bytes(SbeByteOrder::BigEndian).to_vec();
+        let mut frame = header.to_bytes(SbeByteOrder::BigEndian).to_vec();
+        frame.extend_from_slice(&[0u8; 16]);
         let decoded = SbeFrame::<BigEndianOrder>::new(frame.clone()).unwrap();
         assert_eq!(decoded.header().schema_id, 42);
 
@@ -509,14 +538,56 @@ mod tests {
     }
 
     #[test]
-    fn encode_to_string_rejects_non_utf8_frame() {
-        let mut encoded = encode_order(u64::MAX, u64::MAX);
-        encoded.extend_from_slice(&[0xFF, 0xFE]);
-        let frame = SbeFrame::<Order>::new(encoded).unwrap();
+    fn encode_to_string_rejects_even_utf8_valid_frames() {
+        // Every byte of this frame is < 0x80, so it passes UTF-8 validation;
+        // the codec must still refuse string-based transports outright.
+        let frame = SbeFrame::<Order>::new(encode_order(65, 66)).unwrap();
+        assert!(String::from_utf8(frame.as_bytes().to_vec()).is_ok());
+
         let err = <SbeCodec as Codec<SbeFrame<Order>>>::encode_to_string(&frame).unwrap_err();
         match err {
-            ShoveError::Codec { codec, .. } => assert_eq!(codec, "sbe"),
+            ShoveError::Codec { codec, source } => {
+                assert_eq!(codec, "sbe");
+                assert!(matches!(
+                    source.downcast_ref::<SbeCodecError>(),
+                    Some(SbeCodecError::StringTransportUnsupported)
+                ));
+            }
             other => panic!("expected Codec variant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn frame_rejects_root_block_shorter_than_block_length() {
+        let header = SbeHeader {
+            block_length: 16,
+            template_id: 7,
+            schema_id: 42,
+            version: 1,
+        };
+        let mut frame = header.to_bytes(SbeByteOrder::LittleEndian).to_vec();
+        frame.extend_from_slice(&[0u8; 15]);
+
+        let err = SbeFrame::<Order>::new(frame).unwrap_err();
+        match err {
+            SbeCodecError::RootBlockTruncated { needed, len } => {
+                assert_eq!(needed, 24);
+                assert_eq!(len, 23);
+            }
+            other => panic!("expected RootBlockTruncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_accepts_root_block_exactly_block_length() {
+        let header = SbeHeader {
+            block_length: 16,
+            template_id: 7,
+            schema_id: 42,
+            version: 1,
+        };
+        let mut frame = header.to_bytes(SbeByteOrder::LittleEndian).to_vec();
+        frame.extend_from_slice(&[0u8; 16]);
+        assert!(SbeFrame::<Order>::new(frame).is_ok());
     }
 }

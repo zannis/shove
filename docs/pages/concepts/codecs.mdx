@@ -170,7 +170,7 @@ Per-backend copy behavior:
 | RabbitMQ | zero-copy into the client | one copy (the delivery buffer is retained for retry/DLQ routing) |
 | SNS/SQS, Redis Streams | rejected at publish time | — |
 
-SNS/SQS and Redis Streams speak string payloads, so binary SBE frames fail the UTF-8 check in `encode_to_string` at publish time — the same behavior as Protobuf on those backends.
+SNS/SQS and Redis Streams speak string payloads, so `SbeCodec` refuses them unconditionally at publish time with `ShoveError::Codec { codec: "sbe", .. }`. The rejection does not depend on the frame's bytes: even a frame that happens to be valid UTF-8 is refused, so failures are deterministic instead of data-dependent.
 
 ## RawBytesCodec — the escape hatch
 
