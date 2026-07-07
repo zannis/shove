@@ -1,0 +1,49 @@
+src/backends/rabbitmq/router.rs
+  s_fab751bd59435c::t_d8bd3cd545ae6f 89,100
+  s_fab751bd59435c::t_6fe3419d217ad8 29,43
+docs/pages/concepts/codecs.mdx
+  s_fab751bd59435c::t_370e7f1a42fecd 169
+src/backends/rabbitmq/consumer.rs
+  s_fab751bd59435c::t_30b2d0c2c1de0a 1050,1052
+  s_fab751bd59435c::t_567ccc4c168116 738,750,758,760
+  s_fab751bd59435c::t_e736a8ad014f3d 188
+  s_fab751bd59435c::t_bc77e3df82c813 394,404
+  s_fab751bd59435c::t_79f39981e59641 793
+  s_fab751bd59435c::t_c45fa8e3e94384 358,378,386-387
+  s_fab751bd59435c::t_bcf7e9ce171ab1 1070-1071,1078,1082,1085,1108
+  s_fab751bd59435c::t_a0d82df15face8 1144-1145,1147,1149,1156
+  s_fab751bd59435c::t_49b6d5c1d21b53 39-55
+  s_fab751bd59435c::t_bf231d75cfbfbd 507,515-516,525,529,538,549,553,564,571,575
+  s_fab751bd59435c::t_91cd86a57077dc 432,449,451,462
+  s_fab751bd59435c::t_7136d2ac7d15c6 1421,1430,1432,1440,1445,1455
+  s_fab751bd59435c::t_e03aaff7b3c32d 7
+  s_fab751bd59435c::t_d291c8df596557 663-664,668
+  s_fab751bd59435c::t_09cee85699fc90 620,627-628,630
+  s_fab751bd59435c::t_00c970a48dbc5a 641
+  s_fab751bd59435c::t_c069b5c81dc6ff 1210,1216,1224
+  s_fab751bd59435c::t_2ea400af4f5578 1182,1188,1191-1196,1198-1200,1202-1204
+  s_fab751bd59435c::t_2f5fc7b122efe3 1769,1773,1776-1780
+  s_fab751bd59435c::t_5fa6153a0b5394 997,1011,1013,1020,1023
+  s_fab751bd59435c::t_29c10468dad336 477,481
+  s_fab751bd59435c::t_aaa689258f2505 834-836,847-848,861,865-867,872,878,880,896-898,921
+  s_fab751bd59435c::t_1c0bc5ed1b31f2 1272,1277-1278
+  s_fab751bd59435c::t_68dbe002e2fecf 692,704
+  s_fab751bd59435c::t_75e67541c51b1f 231,305,820,1268,1792
+  s_fab751bd59435c::t_cff41e4240c590 1197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2411be5180cd5695d2703d516d9b1953e9c5184a",
+  "prompts": {},
+  "sessions": {
+    "s_fab751bd59435c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "198d04ed-7edb-4726-8ef9-e6af1c121e8b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
