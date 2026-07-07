@@ -1,0 +1,19 @@
+Cargo.lock
+  s_99b5a5b738ece3::t_badce3b68bbc39 1361,1363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1992530b7010c9d9babdbb08e51703841ef57a5c",
+  "prompts": {},
+  "sessions": {
+    "s_99b5a5b738ece3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "06507f49-477c-4fca-85b8-2e5ad3365522",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
