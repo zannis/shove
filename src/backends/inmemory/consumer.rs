@@ -678,8 +678,9 @@ where
             continue;
         }
 
-        let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&env.payload)
-        {
+        let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode_owned(
+            env.payload.clone(),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, queue = dlq_name, "failed to deserialize DLQ message, discarding");
@@ -845,14 +846,15 @@ fn prepare_message<T: Topic>(
         return Err(Outcome::Reject);
     }
 
-    let message: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&env.payload) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to deserialize message — rejecting");
-            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
-            return Err(Outcome::Reject);
-        }
-    };
+    let message: T::Message =
+        match <T::Codec as crate::Codec<T::Message>>::decode_owned(env.payload.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to deserialize message — rejecting");
+                metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
+                return Err(Outcome::Reject);
+            }
+        };
 
     Ok((message, metadata_from(env)))
 }

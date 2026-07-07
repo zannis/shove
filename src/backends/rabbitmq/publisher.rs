@@ -182,7 +182,7 @@ impl RabbitMqPublisher {
     async fn publish_batch_raw(
         &self,
         exchange: &str,
-        items: &[(&str, Vec<u8>)],
+        items: &[(&str, bytes::Bytes)],
     ) -> (u64, Result<()>) {
         let slot = self.pool.get();
 
@@ -233,7 +233,7 @@ impl RabbitMqPublisher {
     async fn do_publish_batch(
         channel: &Channel,
         exchange: &str,
-        items: &[(&str, Vec<u8>)],
+        items: &[(&str, bytes::Bytes)],
     ) -> (u64, Result<()>) {
         let mut confirms = Vec::with_capacity(items.len());
         let props = base_properties();
@@ -281,7 +281,7 @@ impl RabbitMqPublisher {
 
 impl RabbitMqPublisher {
     pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
 
         match (topology.sequencing(), T::SEQUENCE_KEY_FN) {
@@ -303,7 +303,7 @@ impl RabbitMqPublisher {
         headers: HashMap<String, String>,
     ) -> Result<()> {
         validate_headers(&headers)?;
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let field_table = hashmap_to_field_table(headers);
         let topology = T::topology();
 
@@ -329,9 +329,9 @@ impl RabbitMqPublisher {
         let sequencing = topology.sequencing();
         let key_fn = T::SEQUENCE_KEY_FN;
 
-        let payloads: Result<Vec<Vec<u8>>> = messages
+        let payloads: Result<Vec<bytes::Bytes>> = messages
             .iter()
-            .map(<T::Codec as crate::Codec<T::Message>>::encode)
+            .map(<T::Codec as crate::Codec<T::Message>>::encode_bytes)
             .collect();
         let payloads = match payloads {
             Ok(v) => v,
@@ -342,7 +342,7 @@ impl RabbitMqPublisher {
 
         match (sequencing, routing_keys) {
             (Some(seq), Some(keys)) => {
-                let items: Vec<(&str, Vec<u8>)> = keys
+                let items: Vec<(&str, bytes::Bytes)> = keys
                     .iter()
                     .zip(payloads)
                     .map(|(k, p)| (k.as_str(), p))
@@ -356,7 +356,7 @@ impl RabbitMqPublisher {
                 )),
             ),
             (None, _) => {
-                let items: Vec<(&str, Vec<u8>)> =
+                let items: Vec<(&str, bytes::Bytes)> =
                     payloads.into_iter().map(|p| (queue, p)).collect();
                 self.publish_batch_raw("", &items).await
             }

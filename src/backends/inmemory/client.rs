@@ -12,10 +12,11 @@ use crate::metrics;
 
 use super::constants::DEFAULT_QUEUE_CAPACITY;
 
-/// Internal wire format between publisher and consumer.
+/// Internal wire format between publisher and consumer. The payload is a
+/// reference-counted [`bytes::Bytes`], so envelope clones share one buffer.
 #[derive(Debug, Clone)]
 pub(super) struct Envelope {
-    pub payload: Vec<u8>,
+    pub payload: bytes::Bytes,
     pub headers: HashMap<String, String>,
 }
 
@@ -202,12 +203,12 @@ mod tests {
         let broker = InMemoryBroker::new();
         let queue = broker.declare("t");
         let env = Envelope {
-            payload: b"hello".to_vec(),
+            payload: bytes::Bytes::from_static(b"hello"),
             headers: HashMap::new(),
         };
         broker.enqueue(&queue, env).await.unwrap();
         let popped = queue.buffer.lock().await.pop_front().unwrap();
-        assert_eq!(popped.payload, b"hello");
+        assert_eq!(&popped.payload[..], b"hello");
     }
 
     #[tokio::test]
@@ -222,7 +223,7 @@ mod tests {
             .enqueue(
                 &queue,
                 Envelope {
-                    payload: b"first".to_vec(),
+                    payload: bytes::Bytes::from_static(b"first"),
                     headers: HashMap::new(),
                 },
             )
@@ -237,7 +238,7 @@ mod tests {
                 .enqueue(
                     &queue2,
                     Envelope {
-                        payload: b"second".to_vec(),
+                        payload: bytes::Bytes::from_static(b"second"),
                         headers: HashMap::new(),
                     },
                 )
@@ -267,7 +268,7 @@ mod tests {
             .enqueue(
                 &queue,
                 Envelope {
-                    payload: vec![],
+                    payload: bytes::Bytes::new(),
                     headers: HashMap::new(),
                 },
             )
@@ -281,7 +282,7 @@ mod tests {
                 .enqueue(
                     &queue2,
                     Envelope {
-                        payload: vec![],
+                        payload: bytes::Bytes::new(),
                         headers: HashMap::new(),
                     },
                 )

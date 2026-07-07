@@ -9,6 +9,7 @@ The codec slot is per-topic, not per-broker. Two topics on the same backend may 
 Three situations come up in practice:
 
 - **Protobuf**, when you need a compact, schema-evolution-aware wire format, or when you share message contracts with services written in other languages.
+- **SBE**, when latency dominates: Simple Binary Encoding frames publish and decode with zero copies, and handlers read fields in place through generated flyweight decoders.
 - **Raw bytes**, when the payload is already encoded by an upstream component (Confluent Schema Registry's framed Avro, opaque blobs from a legacy system, a third-party format with its own framing).
 - **A custom codec**, when none of the above fit — for example, CBOR or a domain-specific framing.
 
@@ -23,10 +24,16 @@ pub trait Codec<M>: Send + Sync + 'static {
     const NAME: &'static str;
     fn encode(value: &M) -> Result<Vec<u8>>;
     fn decode(bytes: &[u8]) -> Result<M>;
+
+    // Provided: override only for zero-copy codecs.
+    fn encode_bytes(value: &M) -> Result<Bytes> { /* wraps encode */ }
+    fn decode_owned(bytes: Bytes) -> Result<M> { /* borrows and delegates */ }
 }
 ```
 
 `encode` and `decode` are associated functions, not methods on a value. The codec carries no state; the macros plug the type in directly. `NAME` is a stable label used in logs.
+
+`encode_bytes` and `decode_owned` are the owned-buffer variants the backends actually call where their clients allow it. The provided implementations delegate to `encode`/`decode`, so a custom codec only needs the two required functions; codecs whose message type already holds encoded bytes (SBE below) override them to pass the buffer through without copying.
 
 ## JsonCodec — the default
 
@@ -114,6 +121,56 @@ define_topic!(
 For gRPC services, swap `prost-build` for [`tonic-build`](https://docs.rs/tonic-build) — the generated message types still implement `prost::Message`, so `ProtobufCodec` works on them unchanged. If you already depend on a separate crate that publishes generated protobuf types, depend on it as a normal dependency and skip the `build.rs` step.
 
 shove deliberately does not bundle a `.proto` compiler — `prost-build` and `tonic-build` are the standard tools and would only duplicate them. The `protobuf` feature in shove is the runtime codec only.
+
+## SbeCodec — zero-copy
+
+Enable the `sbe` cargo feature (it adds no dependencies). [Simple Binary Encoding](https://github.com/aeron-io/simple-binary-encoding) is a fixed-layout binary format from the low-latency trading world: instead of deserializing into an owned struct, generated *flyweight* codecs read and write fields directly on a byte buffer. shove preserves that model end to end.
+
+An SBE topic carries `SbeFrame<T>`: an owned, header-validated wire frame. `T` is a zero-sized type tag that binds the topic to one SBE message type via the constants `sbe-tool` generates:
+
+```rust,no_run
+use shove::{define_topic, SbeCodec, SbeFrame, SbeMessage, TopologyBuilder};
+
+struct Order;
+impl SbeMessage for Order {
+    const SCHEMA_ID: u16 = order_codec::SBE_SCHEMA_ID;
+    const TEMPLATE_ID: u16 = order_codec::SBE_TEMPLATE_ID;
+    // BYTE_ORDER defaults to little-endian, the SBE default.
+}
+
+define_topic!(
+    Orders,
+    SbeFrame<Order>,
+    TopologyBuilder::new("orders").dlq().build(),
+    codec = SbeCodec
+);
+```
+
+On the publish side, encode once with the generated encoder (message header included) and hand the buffer to `SbeFrame::new`, which validates the header and takes ownership without copying:
+
+```rust,no_run
+let frame = SbeFrame::<Order>::new(encoded)?;
+publisher.publish::<Orders>(&frame).await?;
+```
+
+On the consume side the handler receives the `SbeFrame` and wraps the generated decoder straight over `frame.as_bytes()`. There is no intermediate struct and, on backends that own the delivery buffer, no copy: the handler reads the same allocation the client received.
+
+What the codec validates and what it deliberately does not:
+
+- `schemaId` and `templateId` are checked against `T` on every decode (and at `SbeFrame::new`), so a frame from the wrong topic or message type surfaces as `ShoveError::Codec { codec: "sbe", .. }` instead of being misread.
+- The wire `version` and `blockLength` are accepted as-is, following SBE extension semantics. The acting values are exposed through `frame.header()` so the generated decoder can handle frames from older or newer schema versions.
+
+Per-backend copy behavior:
+
+| Backend | Publish | Consume |
+|---|---|---|
+| NATS | zero-copy | zero-copy |
+| In-memory | zero-copy | zero-copy |
+| Kafka | zero-copy into the client | one copy out of the client's borrowed buffer |
+| RabbitMQ | zero-copy into the client | one copy (the delivery buffer is retained for retry/DLQ routing) |
+| SNS/SQS, Redis Streams | rejected at publish time | — |
+
+SNS/SQS and Redis Streams speak string payloads, so binary SBE frames fail the UTF-8 check in `encode_to_string` at publish time — the same behavior as Protobuf on those backends.
 
 ## RawBytesCodec — the escape hatch
 

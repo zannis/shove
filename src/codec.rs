@@ -8,6 +8,7 @@
 
 use crate::error::{Result, ShoveError};
 
+use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Encodes and decodes the byte representation of a topic message.
@@ -46,6 +47,23 @@ pub trait Codec<M>: Send + Sync + 'static {
             codec: Self::NAME,
             source: Box::new(e),
         })
+    }
+
+    /// Encode `value` to a [`Bytes`] buffer. Backends whose clients accept
+    /// owned buffers call this instead of [`Self::encode`]. The default
+    /// implementation wraps the `Vec<u8>` from `encode` without copying;
+    /// codecs holding an already-encoded frame (e.g. SBE) override it to
+    /// return a reference-counted clone and skip re-encoding entirely.
+    fn encode_bytes(value: &M) -> Result<Bytes> {
+        Ok(Bytes::from(Self::encode(value)?))
+    }
+
+    /// Decode from an owned [`Bytes`] buffer. Backends that own the received
+    /// payload call this instead of [`Self::decode`] so codecs can keep the
+    /// buffer instead of copying it. The default implementation borrows and
+    /// delegates to `decode`.
+    fn decode_owned(bytes: Bytes) -> Result<M> {
+        Self::decode(&bytes)
     }
 }
 
@@ -137,6 +155,28 @@ mod tests {
         assert!(s.contains("\"abc\""));
         let decoded: Sample = <JsonCodec as Codec<Sample>>::decode(s.as_bytes()).unwrap();
         assert_eq!(decoded, sample);
+    }
+
+    #[test]
+    fn encode_bytes_default_round_trips_through_decode_owned() {
+        let sample = Sample {
+            id: "abc".into(),
+            n: 42,
+        };
+        let bytes = <JsonCodec as Codec<Sample>>::encode_bytes(&sample).unwrap();
+        let decoded = <JsonCodec as Codec<Sample>>::decode_owned(bytes).unwrap();
+        assert_eq!(decoded, sample);
+    }
+
+    #[test]
+    fn encode_bytes_default_matches_encode_output() {
+        let sample = Sample {
+            id: "abc".into(),
+            n: 42,
+        };
+        let vec = <JsonCodec as Codec<Sample>>::encode(&sample).unwrap();
+        let bytes = <JsonCodec as Codec<Sample>>::encode_bytes(&sample).unwrap();
+        assert_eq!(&bytes[..], &vec[..]);
     }
 
     #[test]
