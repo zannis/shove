@@ -1,0 +1,80 @@
+src/lib.rs
+  s_fab751bd59435c::t_34d9195d40450f 199-201
+src/backends/nats/consumer.rs
+  s_fab751bd59435c::t_d77ff6ce92a148 726,1080,1267
+src/backends/nats/publisher.rs
+  s_fab751bd59435c::t_1fb5496a92c799 139,143
+  s_fab751bd59435c::t_e526717b706eb9 126,130
+  s_fab751bd59435c::t_280ee070ed5dac 151,154
+src/codecs/sbe.rs
+  s_fab751bd59435c::t_8eea895240be99 211,216-217,219
+  s_fab751bd59435c::t_c1e8f5bf3bdc1b 185
+  s_fab751bd59435c::t_a6496de32cc014 1-184,186-210,212-215,218,220-242,244-516
+  s_fab751bd59435c::t_cda37fad23d62e 243
+  s_fab751bd59435c::t_faa6484f548ef7 517-519
+  s_fab751bd59435c::t_68b2ff46d6759d 520-522
+src/backends/inmemory/client.rs
+  s_fab751bd59435c::t_eb61822281af99 15-16,19
+  s_fab751bd59435c::t_998c7d9d453fbd 206,226,241,271,285
+  s_fab751bd59435c::t_f1f11773e157b8 211
+src/backends/kafka/publisher.rs
+  s_fab751bd59435c::t_d920a139422fe8 247
+  s_fab751bd59435c::t_bea4663bc48f6f 6
+  s_fab751bd59435c::t_533ef011aa5041 205
+  s_fab751bd59435c::t_f865cfb1917a96 180-181
+  s_fab751bd59435c::t_5211dabb027d9b 306-314
+  s_fab751bd59435c::t_91d95940249b8a 277
+src/backends/inmemory/consumer.rs
+  s_fab751bd59435c::t_e625aef044ce79 681
+  s_fab751bd59435c::t_ae95c8de278a8d 682-683
+  s_fab751bd59435c::t_9e11f84e3d7627 849-857
+README.md
+  s_fab751bd59435c::t_77c17a395d5f2c 21
+  s_fab751bd59435c::t_f1ee25f6b2e474 95
+docs/pages/concepts/codecs.mdx
+  s_fab751bd59435c::t_2136f5118dbd73 27-30,36
+  s_fab751bd59435c::t_8b253496edc41b 125-174
+  s_fab751bd59435c::t_b6ad7e5e831951 12
+  s_fab751bd59435c::t_6c035281c7e5a9 37
+tests/sbe_codec_inmemory.rs
+  s_fab751bd59435c::t_3384fffce25099 76-92
+  s_fab751bd59435c::t_329ff642d6f877 202-212,214-219
+  s_fab751bd59435c::t_814fc1cd37a481 1-75,93-142,147,150,159-201,213,220-225
+  s_fab751bd59435c::t_f6116fc5483850 143-146,148-149,151-158
+src/backends/rabbitmq/publisher.rs
+  s_fab751bd59435c::t_57ba1ce9c7af59 284
+  s_fab751bd59435c::t_8307ab07455f2d 306
+  s_fab751bd59435c::t_959c938c376aed 185,236
+  s_fab751bd59435c::t_29490ba78c7497 332,334
+  s_fab751bd59435c::t_1796594b26d534 345
+  s_fab751bd59435c::t_e3d80fd759f4ee 359
+src/backends/inmemory/publisher.rs
+  s_fab751bd59435c::t_71ad7377e859d7 31
+Cargo.toml
+  s_fab751bd59435c::t_ce815d931f5004 148
+  s_fab751bd59435c::t_03fc1b2a0ede1f 62
+  s_fab751bd59435c::t_06bd810ad40d35 59
+  s_fab751bd59435c::t_0394d123cb0b66 104-109
+src/codec.rs
+  s_fab751bd59435c::t_9c6dce4ac3d78f 11
+  s_fab751bd59435c::t_0df546ee89e6b4 51-67
+  s_fab751bd59435c::t_34a7670180b068 160-181
+src/codecs/mod.rs
+  s_fab751bd59435c::t_c9d7b383f70d98 11-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a389ba79084c2836b1f8875c6bf734f9cfe40c87",
+  "prompts": {},
+  "sessions": {
+    "s_fab751bd59435c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "198d04ed-7edb-4726-8ef9-e6af1c121e8b",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
