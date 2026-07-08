@@ -28,7 +28,7 @@ impl InMemoryPublisher {
         mut headers: HashMap<String, String>,
     ) -> Result<()> {
         let topology = T::topology();
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
 
         let queue_name = if let Some(seq) = topology.sequencing() {
             let key_fn = T::SEQUENCE_KEY_FN.ok_or_else(|| {

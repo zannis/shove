@@ -723,7 +723,7 @@ impl NatsConsumer {
                             }
 
                             // Deserialize payload; reject to DLQ on failure
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&msg.payload) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(
@@ -1077,7 +1077,7 @@ impl NatsConsumer {
                                     }
 
                                     // Deserialize payload; reject to DLQ on failure
-                                    let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&msg.payload) {
+                                    let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
                                         Ok(m) => m,
                                         Err(e) => {
                                             tracing::error!(
@@ -1264,7 +1264,7 @@ impl NatsConsumer {
                             }
 
                             // Deserialize payload; on failure, log and ack anyway
-                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode(&msg.payload) {
+                            let payload: T::Message = match <T::Codec as crate::Codec<T::Message>>::decode_owned(msg.payload.clone()) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     tracing::error!(

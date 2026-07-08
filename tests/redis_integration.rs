@@ -3613,3 +3613,63 @@ async fn autoscaling_scales_up_under_backlog_then_drains_clean() {
         "autoscaling group must drain cleanly; outcome: {outcome:?}"
     );
 }
+
+// ===========================================================================
+// SBE codec — string transports refuse binary frames
+// ===========================================================================
+
+#[cfg(feature = "sbe")]
+mod sbe_codec {
+    use super::*;
+    use shove::{SbeCodec, SbeFrame, SbeHeader, SbeMessage};
+
+    struct SbeOrder;
+    impl SbeMessage for SbeOrder {
+        const SCHEMA_ID: u16 = 42;
+        const TEMPLATE_ID: u16 = 7;
+    }
+
+    shove::define_topic!(
+        SbeTopic,
+        SbeFrame<SbeOrder>,
+        TopologyBuilder::new("redis-sbe").build(),
+        codec = SbeCodec
+    );
+
+    /// Every byte of this frame is valid UTF-8, so the rejection below proves
+    /// the codec refuses string transports outright rather than relying on
+    /// UTF-8 validation.
+    fn utf8_valid_frame() -> SbeFrame<SbeOrder> {
+        let header = SbeHeader {
+            block_length: 16,
+            template_id: SbeOrder::TEMPLATE_ID,
+            schema_id: SbeOrder::SCHEMA_ID,
+            version: 1,
+        };
+        let mut buf = header.to_bytes(SbeOrder::BYTE_ORDER).to_vec();
+        buf.extend_from_slice(&65u64.to_le_bytes());
+        buf.extend_from_slice(&66u64.to_le_bytes());
+        assert!(std::str::from_utf8(&buf).is_ok());
+        SbeFrame::new(buf).expect("valid frame")
+    }
+
+    #[tokio::test]
+    async fn sbe_publish_is_rejected_on_string_transport() {
+        let broker = make_broker("redis-sbe-group").await;
+        broker
+            .topology()
+            .declare::<SbeTopic>()
+            .await
+            .expect("declare");
+        let publisher = broker.publisher().await.expect("publisher");
+
+        let err = publisher
+            .publish::<SbeTopic>(&utf8_valid_frame())
+            .await
+            .expect_err("SBE publish to Redis Streams must fail");
+        match err {
+            shove::ShoveError::Codec { codec, .. } => assert_eq!(codec, "sbe"),
+            other => panic!("expected Codec error, got {other:?}"),
+        }
+    }
+}

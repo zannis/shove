@@ -26,6 +26,7 @@ pub(crate) async fn route_ack(delivery: &Delivery, publisher: &ChannelPublisher)
 
 pub(crate) async fn route_retry(
     delivery: &Delivery,
+    payload: &[u8],
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     retry_count: u32,
@@ -39,7 +40,7 @@ pub(crate) async fn route_retry(
         let headers = clone_headers_with_retry(delivery, new_retry_count);
 
         match publisher
-            .publish_to_queue(hold_queue.name(), &delivery.data, headers)
+            .publish_to_queue(hold_queue.name(), payload, headers)
             .await
         {
             Ok(()) => {
@@ -85,6 +86,7 @@ pub(crate) async fn route_retry(
 
 pub(crate) async fn route_defer(
     delivery: &Delivery,
+    payload: &[u8],
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
 ) -> Result<()> {
@@ -95,7 +97,7 @@ pub(crate) async fn route_defer(
         let headers = clone_headers(delivery);
 
         match publisher
-            .publish_to_queue(hold_queue.name(), &delivery.data, headers)
+            .publish_to_queue(hold_queue.name(), payload, headers)
             .await
         {
             Ok(()) => {

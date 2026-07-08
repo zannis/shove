@@ -5981,3 +5981,120 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
     broker.close().await;
     ctx.cleanup().await;
 }
+
+// ===========================================================================
+// SBE codec — binary frames over a real broker
+// ===========================================================================
+
+#[cfg(feature = "sbe")]
+mod sbe_codec {
+    use super::*;
+    use shove::{SbeCodec, SbeFrame, SbeHeader, SbeMessage};
+    use std::sync::Mutex as StdMutex;
+
+    struct SbeOrder;
+    impl SbeMessage for SbeOrder {
+        const SCHEMA_ID: u16 = 42;
+        const TEMPLATE_ID: u16 = 7;
+    }
+
+    shove::define_topic!(
+        SbeTopic,
+        SbeFrame<SbeOrder>,
+        TopologyBuilder::new("rmq-sbe").dlq().build(),
+        codec = SbeCodec
+    );
+
+    fn encode_frame(price: u64, quantity: u64) -> SbeFrame<SbeOrder> {
+        let header = SbeHeader {
+            block_length: 16,
+            template_id: SbeOrder::TEMPLATE_ID,
+            schema_id: SbeOrder::SCHEMA_ID,
+            version: 1,
+        };
+        let mut buf = header.to_bytes(SbeOrder::BYTE_ORDER).to_vec();
+        buf.extend_from_slice(&price.to_le_bytes());
+        buf.extend_from_slice(&quantity.to_le_bytes());
+        SbeFrame::new(buf).expect("valid frame")
+    }
+
+    fn decode_fields(frame: &SbeFrame<SbeOrder>) -> (u64, u64) {
+        let field = |offset: usize| {
+            frame.body()[offset..offset + 8]
+                .try_into()
+                .map(u64::from_le_bytes)
+                .expect("body holds two u64 fields")
+        };
+        (field(0), field(8))
+    }
+
+    #[derive(Clone, Default)]
+    struct SbeCapture {
+        seen: Arc<StdMutex<Vec<(u64, u64, u16)>>>,
+    }
+
+    impl SbeCapture {
+        async fn wait_for(&self, target: usize, timeout: Duration) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if self.seen.lock().unwrap().len() >= target {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    impl MessageHandler<SbeTopic> for SbeCapture {
+        type Context = ();
+        async fn handle(&self, msg: SbeFrame<SbeOrder>, _: MessageMetadata, _: &()) -> Outcome {
+            let (price, quantity) = decode_fields(&msg);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((price, quantity, msg.header().version));
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn sbe_frame_round_trips_through_broker() {
+        let ctx = TestContext::new().await;
+        let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+        let b = ctx.broker_from(client.clone());
+        b.topology().declare::<SbeTopic>().await.unwrap();
+
+        let publisher = b.publisher().await.unwrap();
+        publisher
+            .publish::<SbeTopic>(&encode_frame(250_000, 12))
+            .await
+            .unwrap();
+
+        let handler = SbeCapture::default();
+        let shutdown = CancellationToken::new();
+        let consumer = RabbitMqConsumer::new(client.clone());
+        let h = handler.clone();
+        let s = shutdown.clone();
+        let consume_handle = tokio::spawn(async move {
+            let opts = ConsumerOptions::<RabbitMqMarker>::new()
+                .with_shutdown(s)
+                .with_max_retries(3)
+                .with_prefetch_count(1);
+            consumer.run::<SbeTopic, _>(h, (), opts).await
+        });
+
+        assert!(
+            handler.wait_for(1, Duration::from_secs(10)).await,
+            "should receive the SBE frame"
+        );
+        shutdown.cancel();
+        consume_handle.await.unwrap().unwrap();
+
+        assert_eq!(handler.seen.lock().unwrap().clone(), vec![(250_000, 12, 1)]);
+        client.shutdown().await;
+        ctx.cleanup().await;
+    }
+}

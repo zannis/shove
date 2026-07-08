@@ -8,3 +8,7 @@
 #[cfg(feature = "protobuf")]
 #[cfg_attr(docsrs, doc(cfg(feature = "protobuf")))]
 pub mod protobuf;
+
+#[cfg(feature = "sbe")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sbe")))]
+pub mod sbe;

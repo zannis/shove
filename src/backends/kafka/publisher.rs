@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rdkafka::client::ClientContext;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -176,8 +177,8 @@ impl KafkaPublisher {
         enc: Option<&PublisherSrEncoder>,
         codec_name: &str,
         topic: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+        payload: Bytes,
+    ) -> Result<Bytes> {
         use crate::schema_registry::{WireFormat, build_frame, default_subject};
 
         let Some(enc) = enc else {
@@ -201,7 +202,7 @@ impl KafkaPublisher {
         // The publisher always frames with message index [0] (the first message
         // type) — the only index byte-identical across Confluent's zig-zag and
         // shove's plain varint encoding, and all the bridge needs.
-        Ok(build_frame(fmt, id, &[0], &payload))
+        Ok(Bytes::from(build_frame(fmt, id, &[0], &payload)))
     }
 
     fn resolve_topic_and_key<T: Topic>(
@@ -243,7 +244,7 @@ impl KafkaPublisher {
 
 impl KafkaPublisher {
     pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         #[cfg(feature = "kafka-schema-registry")]
@@ -273,7 +274,7 @@ impl KafkaPublisher {
         extra_headers: HashMap<String, String>,
     ) -> Result<()> {
         validate_headers(&extra_headers)?;
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let (topic, key) = Self::resolve_topic_and_key::<T>(topology, message);
         #[cfg(feature = "kafka-schema-registry")]
@@ -302,16 +303,15 @@ impl KafkaPublisher {
 
         let topology = T::topology();
         #[allow(clippy::type_complexity)]
-        let prepared: Result<Vec<(&'static str, Option<Vec<u8>>, OwnedHeaders, Vec<u8>)>> =
-            messages
-                .iter()
-                .map(|msg| {
-                    let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
-                    let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
-                    let headers = Self::build_headers(None);
-                    Ok((topic, key, headers, payload))
-                })
-                .collect();
+        let prepared: Result<Vec<(&'static str, Option<Vec<u8>>, OwnedHeaders, Bytes)>> = messages
+            .iter()
+            .map(|msg| {
+                let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(msg)?;
+                let (topic, key) = Self::resolve_topic_and_key::<T>(topology, msg);
+                let headers = Self::build_headers(None);
+                Ok((topic, key, headers, payload))
+            })
+            .collect();
         let prepared = match prepared {
             Ok(v) => v,
             Err(e) => return (0, Err(e)),

@@ -123,12 +123,11 @@ impl NatsPublisher {
 
 impl NatsPublisher {
     pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
         let headers = Self::build_headers(None);
-        self.publish_raw(subject, headers, Bytes::from(payload))
-            .await
+        self.publish_raw(subject, headers, payload).await
     }
 
     pub async fn publish_with_headers<T: Topic>(
@@ -137,12 +136,11 @@ impl NatsPublisher {
         extra_headers: HashMap<String, String>,
     ) -> Result<()> {
         validate_headers(&extra_headers)?;
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode(message)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
         let subject = Self::resolve_subject::<T>(topology, message);
         let headers = Self::build_headers(Some(&extra_headers));
-        self.publish_raw(subject, headers, Bytes::from(payload))
-            .await
+        self.publish_raw(subject, headers, payload).await
     }
 
     pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
@@ -150,10 +148,10 @@ impl NatsPublisher {
         let prepared: Result<Vec<(String, HeaderMap, Bytes)>> = messages
             .iter()
             .map(|msg| {
-                let payload = <T::Codec as crate::Codec<T::Message>>::encode(msg)?;
+                let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(msg)?;
                 let subject = Self::resolve_subject::<T>(topology, msg);
                 let headers = Self::build_headers(None);
-                Ok((subject, headers, Bytes::from(payload)))
+                Ok((subject, headers, payload))
             })
             .collect();
         let prepared = match prepared {

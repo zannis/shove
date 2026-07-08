@@ -196,6 +196,9 @@ pub use codec::{Codec, JsonCodec, RawBytesCodec};
 #[cfg(feature = "protobuf")]
 #[cfg_attr(docsrs, doc(cfg(feature = "protobuf")))]
 pub use codecs::protobuf::ProtobufCodec;
+#[cfg(feature = "sbe")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sbe")))]
+pub use codecs::sbe::{SbeByteOrder, SbeCodec, SbeCodecError, SbeFrame, SbeHeader, SbeMessage};
 pub use consumer::{
     ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };

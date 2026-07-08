@@ -3015,3 +3015,126 @@ async fn autoscaling_scales_up_and_drains_clean() {
 
     broker.close().await;
 }
+
+// ===========================================================================
+// SBE codec — binary frames over a real broker
+// ===========================================================================
+
+#[cfg(feature = "sbe")]
+mod sbe_codec {
+    use super::*;
+    use shove::{SbeCodec, SbeFrame, SbeHeader, SbeMessage};
+    use std::sync::Mutex as StdMutex;
+
+    struct SbeOrder;
+    impl SbeMessage for SbeOrder {
+        const SCHEMA_ID: u16 = 42;
+        const TEMPLATE_ID: u16 = 7;
+    }
+
+    shove::define_topic!(
+        SbeTopic,
+        SbeFrame<SbeOrder>,
+        TopologyBuilder::new("nats-sbe").dlq().build(),
+        codec = SbeCodec
+    );
+
+    fn encode_frame(price: u64, quantity: u64) -> SbeFrame<SbeOrder> {
+        let header = SbeHeader {
+            block_length: 16,
+            template_id: SbeOrder::TEMPLATE_ID,
+            schema_id: SbeOrder::SCHEMA_ID,
+            version: 1,
+        };
+        let mut buf = header.to_bytes(SbeOrder::BYTE_ORDER).to_vec();
+        buf.extend_from_slice(&price.to_le_bytes());
+        buf.extend_from_slice(&quantity.to_le_bytes());
+        SbeFrame::new(buf).expect("valid frame")
+    }
+
+    fn decode_fields(frame: &SbeFrame<SbeOrder>) -> (u64, u64) {
+        let field = |offset: usize| {
+            frame.body()[offset..offset + 8]
+                .try_into()
+                .map(u64::from_le_bytes)
+                .expect("body holds two u64 fields")
+        };
+        (field(0), field(8))
+    }
+
+    #[derive(Clone, Default)]
+    struct SbeCapture {
+        seen: Arc<StdMutex<Vec<(u64, u64, u16)>>>,
+    }
+
+    impl SbeCapture {
+        async fn wait_for(&self, target: usize, timeout: Duration) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if self.seen.lock().unwrap().len() >= target {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    impl MessageHandler<SbeTopic> for SbeCapture {
+        type Context = ();
+        async fn handle(&self, msg: SbeFrame<SbeOrder>, _: MessageMetadata, _: &()) -> Outcome {
+            let (price, quantity) = decode_fields(&msg);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((price, quantity, msg.header().version));
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn sbe_frame_round_trips_through_broker() {
+        let tb = TestBroker::start().await;
+        let broker = tb.broker();
+        let client = tb.client();
+        broker.topology().declare::<SbeTopic>().await.unwrap();
+
+        broker
+            .publisher()
+            .await
+            .unwrap()
+            .publish::<SbeTopic>(&encode_frame(250_000, 12))
+            .await
+            .expect("publish should succeed");
+
+        let handler = SbeCapture::default();
+        let hc = handler.clone();
+        let shutdown = CancellationToken::new();
+        let sc = shutdown.clone();
+
+        let consumer = NatsConsumer::new(client.clone());
+        let handle = tokio::spawn(async move {
+            consumer
+                .run::<SbeTopic, _>(
+                    hc,
+                    (),
+                    ConsumerOptions::<Nats>::new()
+                        .with_shutdown(sc)
+                        .with_prefetch_count(1),
+                )
+                .await
+        });
+
+        assert!(
+            handler.wait_for(1, TIMEOUT).await,
+            "should receive the SBE frame"
+        );
+        shutdown.cancel();
+        handle.await.unwrap().ok();
+
+        assert_eq!(handler.seen.lock().unwrap().clone(), vec![(250_000, 12, 1)]);
+        broker.close().await;
+    }
+}

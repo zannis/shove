@@ -18,7 +18,7 @@ Type-safe async pub/sub for Rust. One API across RabbitMQ, AWS SNS+SQS, NATS Jet
 - **Strict per-key ordering** when you need it, with pluggable failure policies.
 - **Autoscaling consumer groups** driven by queue depth or consumer lag.
 - **Switch backends without changing your code.** Same topic, same handler, six transports.
-- **Pluggable message codecs.** JSON by default; Protobuf, raw bytes, or your own.
+- **Pluggable message codecs.** JSON by default; Protobuf, zero-copy SBE, raw bytes, or your own.
 - **Confluent Schema Registry** for Kafka — opt-in encode on publish and decode on consume (Confluent and Redpanda), with subject enforcement.
 
 ## 30-second tour
@@ -92,7 +92,7 @@ Swap `InMemory` for `RabbitMq`, `Sqs`, `Nats`, `Kafka`, or `Redis` and the topic
 
 `cargo add shove --features <flag>`. Need help choosing? [Choosing a backend](https://shove.rs/backends/choosing).
 
-Optional add-ons: `audit`, `metrics`, `kafka-ssl`, `rabbitmq-transactional`, `protobuf`.
+Optional add-ons: `audit`, `metrics`, `kafka-ssl`, `rabbitmq-transactional`, `protobuf`, `sbe`. Codec details, including the zero-copy SBE path: [Codecs](https://shove.rs/concepts/codecs).
 
 ## Delivery
 
