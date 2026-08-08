@@ -84,6 +84,20 @@ fn partition_lag(committed: Option<i64>, low: i64, high: i64, reset: KafkaAutoOf
     }
 }
 
+/// Total lag across a topic's partitions, each given as
+/// `(committed, low, high)`. Saturates so one extreme partition cannot wrap the
+/// total.
+fn aggregate_lag(
+    per_partition: impl IntoIterator<Item = (Option<i64>, i64, i64)>,
+    reset: KafkaAutoOffsetReset,
+) -> u64 {
+    per_partition
+        .into_iter()
+        .fold(0u64, |total, (committed, low, high)| {
+            total.saturating_add(partition_lag(committed, low, high, reset))
+        })
+}
+
 /// Stats-only `BaseConsumer` that carries whichever `ClientContext` matches the
 /// broker's auth mode. Under MSK IAM the consumer must hold an
 /// [`MskIamContext`] so librdkafka's OAUTHBEARER refresh callback can mint
@@ -335,7 +349,7 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             let c = Arc::clone(&consumer);
             let q = queue.clone();
             tokio::task::spawn_blocking(move || -> Result<u64> {
-                let mut total: u64 = 0;
+                let mut per_partition = Vec::with_capacity(partitions.len());
                 for pid in partitions {
                     let (low, high) = c
                         .fetch_watermarks(&q, pid, Duration::from_secs(5))
@@ -354,9 +368,9 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
                                 rdkafka::Offset::Offset(o) => Some(o),
                                 _ => None,
                             });
-                    total = total.saturating_add(partition_lag(committed_offset, low, high, reset));
+                    per_partition.push((committed_offset, low, high));
                 }
-                Ok(total)
+                Ok(aggregate_lag(per_partition, reset))
             })
             .await
             .map_err(|e| ShoveError::Topology(format!("watermarks task failed: {e}")))??
@@ -647,6 +661,30 @@ mod tests {
             partition_lag(None, i64::MIN, i64::MAX, KafkaAutoOffsetReset::Earliest),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn aggregate_lag_sums_partitions() {
+        let parts = vec![(Some(40), 0, 100), (None, 30, 100), (Some(5), 30, 100)];
+        assert_eq!(
+            aggregate_lag(parts, KafkaAutoOffsetReset::Earliest),
+            60 + 70 + 70
+        );
+    }
+
+    #[test]
+    fn aggregate_lag_saturates_instead_of_wrapping() {
+        // Two partitions each at the full offset span: the sum exceeds u64.
+        let parts = vec![
+            (Some(i64::MIN), i64::MIN, i64::MAX),
+            (Some(i64::MIN), i64::MIN, i64::MAX),
+        ];
+        assert_eq!(aggregate_lag(parts, KafkaAutoOffsetReset::Latest), u64::MAX);
+    }
+
+    #[test]
+    fn aggregate_lag_of_no_partitions_is_zero() {
+        assert_eq!(aggregate_lag(vec![], KafkaAutoOffsetReset::Earliest), 0);
     }
 
     type TestSpawner = Arc<dyn Fn(ConsumerOptions) -> tokio::task::JoinHandle<()> + Send + Sync>;
