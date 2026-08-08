@@ -412,11 +412,14 @@ impl<S: KafkaQueueStatsProvider> AutoscalerBackend for KafkaAutoscalerBackend<S>
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
         let (queue, group_id, prefetch, active, reset) = {
-            let reg = self.registry.lock().await;
+            let mut reg = self.registry.lock().await;
             let g = reg
-                .groups()
-                .get(group)
+                .groups_mut()
+                .get_mut(group)
                 .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
+            // Supervision piggybacks the poll cadence: respawn dead members
+            // before reading counts so the metrics reflect the topped-up group.
+            g.ensure_min();
             (
                 g.queue().to_owned(),
                 g.group_id().to_owned(),
@@ -501,6 +504,7 @@ mod tests {
     use crate::backend::ConsumerOptionsInner as ConsumerOptions;
     use crate::backends::kafka::constants::consumer_group_id;
     use crate::backends::kafka::consumer_group::{KafkaConsumerGroup, KafkaConsumerGroupConfig};
+    use crate::supervision::RespawnSupervisor;
     use tokio_util::sync::CancellationToken;
 
     struct MockKafkaStatsProvider {
@@ -593,6 +597,7 @@ mod tests {
             error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             panic_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             retiring: Vec::new(),
+            respawn: RespawnSupervisor::default(),
         };
         if started {
             group.start();
@@ -885,6 +890,7 @@ mod tests {
             error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             panic_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             retiring: Vec::new(),
+            respawn: RespawnSupervisor::default(),
         };
 
         let mut groups = HashMap::new();
