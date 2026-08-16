@@ -4,7 +4,8 @@ on:
     paths:
       - 'docs/**'
       - 'examples/**'
-      - 'vocs.config.ts'
+      - 'scripts/**'
+      - 'vocs.config.tsx'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/docs-build.yml'
@@ -13,7 +14,8 @@ on:
     paths:
       - 'docs/**'
       - 'examples/**'
-      - 'vocs.config.ts'
+      - 'scripts/**'
+      - 'vocs.config.tsx'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - '.github/workflows/docs-build.yml'
