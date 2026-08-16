@@ -40,9 +40,11 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
     /// the queue name — re-derivation is what caused the bug fixed by arch-K-1.
     ///
     /// `reset` is the group's `auto.offset.reset` policy. It determines the
-    /// effective start position — and therefore the lag — for partitions the
-    /// group has never committed: `earliest` starts at the low watermark,
-    /// `latest` at the high watermark (zero lag).
+    /// effective start position — and therefore the lag — for partitions where
+    /// the group has no usable committed offset, either because it never
+    /// committed or because its commit falls outside the partition's retained
+    /// range: `earliest` starts at the low watermark, `latest` at the high
+    /// watermark (zero lag).
     fn get_queue_stats(
         &self,
         queue: &str,
@@ -51,22 +53,49 @@ pub trait KafkaQueueStatsProvider: Send + Sync {
     ) -> impl Future<Output = Result<KafkaQueueStats>> + Send;
 }
 
+/// Messages between `from` and the high watermark, clamped to `0..=u64::MAX`.
+/// Widened to `i128` because `high - from` can exceed `i64` at the watermark
+/// extremes.
+fn messages_until(high: i64, from: i64) -> u64 {
+    i128::from(high)
+        .saturating_sub(i128::from(from))
+        .clamp(0, i128::from(u64::MAX)) as u64
+}
+
 /// Lag for one partition given the group's committed offset and the
-/// partition watermarks. When the group has never committed, the effective
-/// start position depends on `auto.offset.reset`: `earliest` starts at the
-/// low watermark, `latest` at the high watermark (zero lag).
+/// partition watermarks. When the group has no usable committed offset, the
+/// effective start position depends on `auto.offset.reset`: `earliest` starts
+/// at the low watermark, `latest` at the high watermark (zero lag).
 fn partition_lag(committed: Option<i64>, low: i64, high: i64, reset: KafkaAutoOffsetReset) -> u64 {
-    match committed {
-        Some(offset) => (high - offset).max(0) as u64,
+    // Kafka discards a commit outside `[low, high]` — truncated by retention
+    // below, or stranded past the log end by an unclean truncation above — and
+    // applies `auto.offset.reset`, so lag is measured from the reset position
+    // rather than from the stale offset.
+    match committed.filter(|&offset| offset >= low && offset <= high) {
+        Some(offset) => messages_until(high, offset),
         None => match reset {
             KafkaAutoOffsetReset::Latest => 0,
-            // `None` refuses to start without a committed offset; report the
+            // `None` refuses to start without a usable offset; report the
             // same backlog as `earliest` so the pathology is visible.
             KafkaAutoOffsetReset::Earliest | KafkaAutoOffsetReset::None => {
-                (high - low).max(0) as u64
+                messages_until(high, low)
             }
         },
     }
+}
+
+/// Total lag across a topic's partitions, each given as
+/// `(committed, low, high)`. Saturates so one extreme partition cannot wrap the
+/// total.
+fn aggregate_lag(
+    per_partition: impl IntoIterator<Item = (Option<i64>, i64, i64)>,
+    reset: KafkaAutoOffsetReset,
+) -> u64 {
+    per_partition
+        .into_iter()
+        .fold(0u64, |total, (committed, low, high)| {
+            total.saturating_add(partition_lag(committed, low, high, reset))
+        })
 }
 
 /// Stats-only `BaseConsumer` that carries whichever `ClientContext` matches the
@@ -320,7 +349,7 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
             let c = Arc::clone(&consumer);
             let q = queue.clone();
             tokio::task::spawn_blocking(move || -> Result<u64> {
-                let mut total: u64 = 0;
+                let mut per_partition = Vec::with_capacity(partitions.len());
                 for pid in partitions {
                     let (low, high) = c
                         .fetch_watermarks(&q, pid, Duration::from_secs(5))
@@ -339,9 +368,9 @@ impl KafkaQueueStatsProvider for KafkaLagStatsProvider {
                                 rdkafka::Offset::Offset(o) => Some(o),
                                 _ => None,
                             });
-                    total += partition_lag(committed_offset, low, high, reset);
+                    per_partition.push((committed_offset, low, high));
                 }
-                Ok(total)
+                Ok(aggregate_lag(per_partition, reset))
             })
             .await
             .map_err(|e| ShoveError::Topology(format!("watermarks task failed: {e}")))??
@@ -546,9 +575,24 @@ mod tests {
     }
 
     #[test]
-    fn partition_lag_committed_beyond_high_is_zero() {
+    fn partition_lag_committed_beyond_high_resets_per_policy() {
+        // Past the high watermark is out of range too — Kafka discards the
+        // commit and applies the reset policy.
         assert_eq!(
             partition_lag(Some(120), 0, 100, KafkaAutoOffsetReset::Earliest),
+            100
+        );
+        assert_eq!(
+            partition_lag(Some(120), 0, 100, KafkaAutoOffsetReset::Latest),
+            0
+        );
+    }
+
+    #[test]
+    fn partition_lag_committed_at_high_is_in_range() {
+        // A fully caught-up group sits exactly at the high watermark.
+        assert_eq!(
+            partition_lag(Some(100), 0, 100, KafkaAutoOffsetReset::Earliest),
             0
         );
     }
@@ -569,6 +613,82 @@ mod tests {
             partition_lag(None, 30, 100, KafkaAutoOffsetReset::Latest),
             0
         );
+    }
+
+    #[test]
+    fn partition_lag_committed_below_low_earliest_resets_to_low_watermark() {
+        // Retention advanced past the group's commit: Kafka rejects the offset
+        // as out of range and applies `earliest`, so lag is high - low.
+        assert_eq!(
+            partition_lag(Some(5), 30, 100, KafkaAutoOffsetReset::Earliest),
+            70
+        );
+    }
+
+    #[test]
+    fn partition_lag_committed_below_low_latest_is_zero() {
+        assert_eq!(
+            partition_lag(Some(5), 30, 100, KafkaAutoOffsetReset::Latest),
+            0
+        );
+    }
+
+    #[test]
+    fn partition_lag_committed_below_low_none_reports_earliest_backlog() {
+        assert_eq!(
+            partition_lag(Some(5), 30, 100, KafkaAutoOffsetReset::None),
+            70
+        );
+    }
+
+    #[test]
+    fn partition_lag_committed_at_low_is_in_range() {
+        // The low watermark itself is a valid offset — no reset applies.
+        assert_eq!(
+            partition_lag(Some(30), 30, 100, KafkaAutoOffsetReset::Latest),
+            70
+        );
+    }
+
+    #[test]
+    fn partition_lag_saturates_on_extreme_offsets() {
+        assert_eq!(
+            partition_lag(
+                Some(i64::MIN),
+                i64::MIN,
+                i64::MAX,
+                KafkaAutoOffsetReset::Latest
+            ),
+            u64::MAX
+        );
+        assert_eq!(
+            partition_lag(None, i64::MIN, i64::MAX, KafkaAutoOffsetReset::Earliest),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn aggregate_lag_sums_partitions() {
+        let parts = vec![(Some(40), 0, 100), (None, 30, 100), (Some(5), 30, 100)];
+        assert_eq!(
+            aggregate_lag(parts, KafkaAutoOffsetReset::Earliest),
+            60 + 70 + 70
+        );
+    }
+
+    #[test]
+    fn aggregate_lag_saturates_instead_of_wrapping() {
+        // Two partitions each at the full offset span: the sum exceeds u64.
+        let parts = vec![
+            (Some(i64::MIN), i64::MIN, i64::MAX),
+            (Some(i64::MIN), i64::MIN, i64::MAX),
+        ];
+        assert_eq!(aggregate_lag(parts, KafkaAutoOffsetReset::Latest), u64::MAX);
+    }
+
+    #[test]
+    fn aggregate_lag_of_no_partitions_is_zero() {
+        assert_eq!(aggregate_lag(vec![], KafkaAutoOffsetReset::Earliest), 0);
     }
 
     type TestSpawner = Arc<dyn Fn(ConsumerOptions) -> tokio::task::JoinHandle<()> + Send + Sync>;
