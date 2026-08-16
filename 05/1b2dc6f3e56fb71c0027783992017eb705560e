@@ -1,0 +1,38 @@
+docs/public/robots.txt
+  s_2cf91de2896ac0::t_3e8a3836dcd1a1 1-4
+Cargo.toml
+  s_2cf91de2896ac0::t_4de7aa517ddbac 10-11
+  s_2cf91de2896ac0::t_c2e1699cf95e16 24,26
+vocs.config.tsx
+  s_2cf91de2896ac0::t_a54991abd875fa 12-22,25,78
+  s_2cf91de2896ac0::t_2790e684a2a436 3-4
+README.md
+  s_2cf91de2896ac0::t_e9bbb06919ac98 132-136
+.github/workflows/docs-build.yml
+  s_2cf91de2896ac0::t_f8f9d1cb23a341 7-8,17-18,35
+scripts/sitemap.mjs
+  s_2cf91de2896ac0::t_cf92b963bb523a 4-6,9
+  s_2cf91de2896ac0::t_0bd5e85ff11ff3 1-3,7-8,10-41
+docs/pages/index.mdx
+  s_2cf91de2896ac0::t_2afa4899424262 46-53
+package.json
+  s_2cf91de2896ac0::t_3d30f6dd898d3a 8
+docs/public/sitemap.xml
+  s_2cf91de2896ac0::t_31796f415f3af0 1-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "051b2dc6f3e56fb71c0027783992017eb705560e",
+  "prompts": {},
+  "sessions": {
+    "s_2cf91de2896ac0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3bb31026-ae48-4d8a-a126-7d4772005f20",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
