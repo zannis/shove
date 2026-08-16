@@ -222,6 +222,73 @@ impl fmt::Debug for KafkaSasl {
 }
 
 #[must_use]
+/// Optional librdkafka **producer** performance knobs.
+///
+/// shove pins the correctness-critical producer settings (`acks=all`,
+/// `enable.idempotence=true`) and deliberately keeps them non-configurable.
+/// The three knobs here are orthogonal to those: they trade producer-side
+/// latency for throughput, and librdkafka's defaults (`linger.ms=5`,
+/// no compression) are tuned for low latency rather than for high-rate
+/// pipelines.
+///
+/// Why this matters with idempotence on: `enable.idempotence=true` caps
+/// `max.in.flight.requests.per.connection` at 5, so sustained throughput is
+/// bounded by *messages per request* — i.e. by batching. With a 5 ms linger a
+/// high-rate producer ships many small requests and plateaus well below what
+/// the broker can absorb; raising `linger.ms` and enabling compression raises
+/// that plateau by multiples without touching delivery semantics.
+///
+/// All fields default to `None` = "leave librdkafka's default alone", so this
+/// is inert unless explicitly configured.
+#[derive(Debug, Clone, Default)]
+pub struct KafkaProducerTuning {
+    compression_type: Option<String>,
+    linger_ms: Option<u32>,
+    batch_size: Option<u32>,
+}
+
+impl KafkaProducerTuning {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `compression.type` — e.g. `"lz4"`, `"zstd"`, `"snappy"`, `"gzip"`.
+    /// Compresses the batch on the client, so it cuts producer→broker bytes as
+    /// well as broker storage and replication traffic.
+    pub fn with_compression(mut self, codec: impl Into<String>) -> Self {
+        self.compression_type = Some(codec.into());
+        self
+    }
+
+    /// `linger.ms` — how long the producer waits to accumulate a batch.
+    /// librdkafka defaults to 5 ms; higher values trade a little latency for
+    /// materially larger (and better-compressed) batches.
+    pub fn with_linger_ms(mut self, ms: u32) -> Self {
+        self.linger_ms = Some(ms);
+        self
+    }
+
+    /// `batch.size` — maximum bytes accumulated per batch.
+    pub fn with_batch_size(mut self, bytes: u32) -> Self {
+        self.batch_size = Some(bytes);
+        self
+    }
+
+    /// Apply the configured knobs to a producer `ClientConfig`. Unset fields
+    /// are left at librdkafka's defaults.
+    fn apply(&self, cfg: &mut ClientConfig) {
+        if let Some(codec) = &self.compression_type {
+            cfg.set("compression.type", codec);
+        }
+        if let Some(ms) = self.linger_ms {
+            cfg.set("linger.ms", ms.to_string());
+        }
+        if let Some(bytes) = self.batch_size {
+            cfg.set("batch.size", bytes.to_string());
+        }
+    }
+}
+
 pub struct KafkaConfig {
     pub brokers: String,
     #[cfg(feature = "kafka-ssl")]
@@ -232,6 +299,8 @@ pub struct KafkaConfig {
     /// environments. **Never set this in production.** Default: `false`.
     #[cfg(feature = "kafka-ssl")]
     pub(crate) allow_plaintext_credentials: bool,
+    /// Optional producer throughput knobs; empty = librdkafka defaults.
+    pub(crate) producer_tuning: KafkaProducerTuning,
 }
 
 impl KafkaConfig {
@@ -244,12 +313,21 @@ impl KafkaConfig {
             sasl: None,
             #[cfg(feature = "kafka-ssl")]
             allow_plaintext_credentials: false,
+            producer_tuning: KafkaProducerTuning::default(),
         }
     }
 
     /// Bootstrap brokers string this config was built with.
     pub fn brokers(&self) -> &str {
         &self.brokers
+    }
+
+    /// Set optional producer throughput knobs (compression / linger / batch
+    /// size). Correctness settings (`acks=all`, `enable.idempotence=true`) are
+    /// unaffected. See [`KafkaProducerTuning`].
+    pub fn with_producer_tuning(mut self, tuning: KafkaProducerTuning) -> Self {
+        self.producer_tuning = tuning;
+        self
     }
 
     #[cfg(feature = "kafka-ssl")]
@@ -438,25 +516,29 @@ impl KafkaClient {
         // connection at 5.
         #[cfg(feature = "kafka-msk-iam")]
         let producer = if let Some(ctx) = msk_context.clone() {
-            let p: FutureProducer<MskIamContext> = base_config
-                .clone()
-                .set("client.id", &client_name)
-                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-                .set("acks", "all")
-                .set("enable.idempotence", "true")
-                .create_with_context(ctx)
+            let p: FutureProducer<MskIamContext> = {
+                let mut cfg = base_config.clone();
+                cfg.set("client.id", &client_name)
+                    .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
+                    .set("acks", "all")
+                    .set("enable.idempotence", "true");
+                config.producer_tuning.apply(&mut cfg);
+                cfg.create_with_context(ctx)
+            }
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create MSK IAM producer: {e}"))
                 })?;
             KafkaProducerInner::MskIam(p)
         } else {
-            let p: FutureProducer<DefaultClientContext> = base_config
-                .clone()
-                .set("client.id", &client_name)
-                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-                .set("acks", "all")
-                .set("enable.idempotence", "true")
-                .create()
+            let p: FutureProducer<DefaultClientContext> = {
+                let mut cfg = base_config.clone();
+                cfg.set("client.id", &client_name)
+                    .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
+                    .set("acks", "all")
+                    .set("enable.idempotence", "true");
+                config.producer_tuning.apply(&mut cfg);
+                cfg.create()
+            }
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
                 })?;
@@ -465,13 +547,15 @@ impl KafkaClient {
 
         #[cfg(not(feature = "kafka-msk-iam"))]
         let producer = {
-            let p: FutureProducer<DefaultClientContext> = base_config
-                .clone()
-                .set("client.id", &client_name)
-                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-                .set("acks", "all")
-                .set("enable.idempotence", "true")
-                .create()
+            let p: FutureProducer<DefaultClientContext> = {
+                let mut cfg = base_config.clone();
+                cfg.set("client.id", &client_name)
+                    .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
+                    .set("acks", "all")
+                    .set("enable.idempotence", "true");
+                config.producer_tuning.apply(&mut cfg);
+                cfg.create()
+            }
                 .map_err(|e| {
                     ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
                 })?;
