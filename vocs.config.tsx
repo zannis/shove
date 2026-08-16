@@ -1,5 +1,7 @@
 import { defineConfig } from 'vocs'
 
+const siteUrl = 'https://shove.rs'
+
 export default defineConfig({
   title: 'shove',
   titleTemplate: '%s · shove',
@@ -7,8 +9,17 @@ export default defineConfig({
     'Type-safe async pub/sub for Rust on RabbitMQ, AWS SNS+SQS, NATS JetStream, Apache Kafka, or in-process.',
   iconUrl: { light: '/shove-icon.svg', dark: '/shove-icon-dark.svg' },
   logoUrl: { light: '/shove-lockup.svg', dark: '/shove-lockup-dark.svg' },
-  ogImageUrl: 'https://shove.rs/og-image.png',
+  ogImageUrl: `${siteUrl}/og-image.png`,
   rootDir: 'docs',
+  head({ path }) {
+    const canonical = `${siteUrl}${path}`
+    return (
+      <>
+        <link rel="canonical" href={canonical} />
+        <meta property="og:url" content={canonical} />
+      </>
+    )
+  },
   theme: {
     accentColor: { light: '#CE422B', dark: '#F97316' },
   },

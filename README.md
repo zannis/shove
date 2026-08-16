@@ -129,6 +129,11 @@ Tuning notes, NATS/SQS profiles, and the full benchmark matrix: [Performance](ht
 - Rust 1.91+ (edition 2024)
 - Redis 6.2+ or Valkey (when using `redis-streams`)
 
+## Maintainer
+
+Built and maintained by [Zannis Kalampoukis](https://zannis.xyz) at
+[Synchronicity Labs](https://synchronicitylabs.io).
+
 ## License
 
 [MIT](LICENSE)
