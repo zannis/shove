@@ -188,6 +188,8 @@ pub(crate) mod retry;
     feature = "redis-streams"
 ))]
 pub(crate) mod routing;
+#[cfg(any(feature = "nats", feature = "kafka"))]
+pub(crate) mod supervision;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;

@@ -136,11 +136,14 @@ impl<S: NatsQueueStatsProvider> AutoscalerBackend for NatsAutoscalerBackend<S> {
 
     async fn fetch_metrics(&self, group: &Self::GroupId) -> Result<ScalingMetrics> {
         let (queue, prefetch, active) = {
-            let reg = self.registry.lock().await;
+            let mut reg = self.registry.lock().await;
             let g = reg
-                .groups()
-                .get(group)
+                .groups_mut()
+                .get_mut(group)
                 .ok_or_else(|| ShoveError::Topology(format!("group not found: {group}")))?;
+            // Supervision piggybacks the poll cadence: respawn dead members
+            // before reading counts so the metrics reflect the topped-up group.
+            g.ensure_min();
             (
                 g.queue().to_owned(),
                 g.config().prefetch_count(),
@@ -217,6 +220,7 @@ mod tests {
 
     use crate::backend::ConsumerOptionsInner as ConsumerOptions;
     use crate::backends::nats::consumer_group::{NatsConsumerGroup, NatsConsumerGroupConfig};
+    use crate::supervision::RespawnSupervisor;
     use tokio_util::sync::CancellationToken;
 
     struct MockNatsStatsProvider {
@@ -263,6 +267,7 @@ mod tests {
             error_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             panic_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             retiring: Vec::new(),
+            respawn: RespawnSupervisor::default(),
         };
         if started {
             group.start();

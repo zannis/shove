@@ -22,6 +22,7 @@ use crate::handler::MessageHandler;
 use crate::metrics;
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
+use crate::supervision::RespawnSupervisor;
 use crate::topic::{SequencedTopic, Topic};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY};
 
@@ -352,6 +353,8 @@ pub struct KafkaConsumerGroup {
     /// cancelled; retained here so the final drain awaits/aborts and tallies
     /// them instead of detaching the task.
     pub(crate) retiring: Vec<JoinHandle<()>>,
+    /// Backoff + circuit-breaker state driving [`Self::ensure_min`].
+    pub(crate) respawn: RespawnSupervisor,
 }
 
 impl KafkaConsumerGroup {
@@ -421,6 +424,7 @@ impl KafkaConsumerGroup {
             error_count,
             panic_count: Arc::new(AtomicUsize::new(0)),
             retiring: Vec::new(),
+            respawn: RespawnSupervisor::default(),
         }
     }
 
@@ -498,6 +502,7 @@ impl KafkaConsumerGroup {
             error_count,
             panic_count,
             retiring: Vec::new(),
+            respawn: RespawnSupervisor::default(),
         }
     }
 
@@ -586,6 +591,37 @@ impl KafkaConsumerGroup {
             .iter()
             .filter(|(_, _, handle)| !handle.is_finished())
             .count()
+    }
+
+    /// Top the group back up to `min_consumers`, respecting the respawn
+    /// backoff and circuit-breaker. Driven by the autoscaler tick; returns how
+    /// many members were spawned.
+    pub(crate) fn ensure_min(&mut self) -> usize {
+        // Never respawn into a group that is shutting down: the autoscaler can
+        // still tick between cancellation and the final drain, and a member
+        // spawned there would be born cancelled.
+        if self.group_token.is_cancelled() {
+            return 0;
+        }
+        self.prune_finished();
+        let live = self.active_consumers();
+        let min = self.config.min_consumers as usize;
+        let Some(round) = self.respawn.plan(live, min, &self.queue) else {
+            return 0;
+        };
+        for _ in 0..round.count {
+            self.spawn_one();
+        }
+        self.respawn.commit(live, round);
+        info!(
+            group = %self.queue,
+            spawned = round.count,
+            live_before = live,
+            min,
+            probe = round.probe,
+            "respawned consumers to restore min capacity"
+        );
+        round.count
     }
 
     #[cfg(test)]
@@ -990,6 +1026,9 @@ impl KafkaConsumerGroupRegistry {
 mod tests {
     use super::*;
     use crate::consumer::DEFAULT_HANDLER_TIMEOUT;
+    use crate::supervision::{
+        RESPAWN_BACKOFF_MAX, RESPAWN_CIRCUIT_COOLDOWN, RESPAWN_CIRCUIT_LIMIT,
+    };
 
     fn test_group(config: KafkaConsumerGroupConfig) -> KafkaConsumerGroup {
         let spawner: Spawner = Arc::new(|options: ConsumerOptions| {
@@ -1014,6 +1053,7 @@ mod tests {
             error_count: Arc::new(AtomicUsize::new(0)),
             panic_count: Arc::new(AtomicUsize::new(0)),
             retiring: Vec::new(),
+            respawn: RespawnSupervisor::default(),
         }
     }
 
@@ -1520,6 +1560,101 @@ mod tests {
             fifo_group_id,
             super::super::constants::consumer_group_id("orders")
         );
+    }
+
+    // -- respawn supervision --
+
+    /// Spawner whose tasks all exit immediately: a group that can never stay up.
+    fn always_dies_spawner() -> Spawner {
+        Arc::new(|_options: ConsumerOptions| tokio::spawn(async {}))
+    }
+
+    /// Spawner whose first `n` tasks exit immediately; later ones stay alive
+    /// until their shutdown token fires.
+    fn dies_n_times_spawner(n: usize) -> Spawner {
+        let calls = Arc::new(AtomicUsize::new(0));
+        Arc::new(move |options: ConsumerOptions| {
+            let i = calls.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if i >= n {
+                    options.shutdown.cancelled().await;
+                }
+            })
+        })
+    }
+
+    /// Let immediately-exiting consumer tasks reach completion.
+    async fn settle() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_min_respawns_dead_consumers() {
+        let mut group = test_group_with_spawner(
+            KafkaConsumerGroupConfig::new(2..=4),
+            dies_n_times_spawner(2),
+        );
+        group.start();
+        settle().await;
+        assert_eq!(group.active_consumers(), 0, "both members must have died");
+
+        assert_eq!(group.ensure_min(), 2, "must respawn the full shortfall");
+        assert_eq!(group.active_consumers(), 2);
+        group.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_min_does_not_respawn_during_shutdown() {
+        let mut group =
+            test_group_with_spawner(KafkaConsumerGroupConfig::new(2..=4), always_dies_spawner());
+        group.start();
+        settle().await;
+        group.group_token.cancel();
+
+        assert_eq!(
+            group.ensure_min(),
+            0,
+            "a cancelled group must not respawn members into the drain"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_min_is_a_noop_for_a_healthy_group() {
+        let mut group = test_group(KafkaConsumerGroupConfig::new(2..=4));
+        group.start();
+        assert_eq!(group.ensure_min(), 0, "a group at min must not respawn");
+        assert_eq!(group.active_consumers(), 2);
+        group.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_min_circuit_breaks_then_probes_and_recovers() {
+        let mut group =
+            test_group_with_spawner(KafkaConsumerGroupConfig::new(3..=4), always_dies_spawner());
+        group.start();
+        settle().await;
+
+        for _ in 0..RESPAWN_CIRCUIT_LIMIT {
+            group.ensure_min();
+            settle().await;
+            tokio::time::advance(RESPAWN_BACKOFF_MAX).await;
+        }
+
+        assert_eq!(
+            group.ensure_min(),
+            0,
+            "an open circuit must not spawn before its cooldown"
+        );
+
+        tokio::time::advance(RESPAWN_CIRCUIT_COOLDOWN).await;
+        assert_eq!(
+            group.ensure_min(),
+            1,
+            "an open circuit must half-open with a single probe"
+        );
+        group.shutdown().await;
     }
 
     // -- schema-registry group config (Task 8) --
