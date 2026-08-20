@@ -221,6 +221,32 @@ impl fmt::Debug for KafkaSasl {
     }
 }
 
+/// Producer compression codec. Maps to librdkafka's `compression.type`.
+///
+/// Compresses each batch on the client, so it cuts producer→broker bytes as
+/// well as broker storage and replication traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaCompression {
+    /// No compression (librdkafka's default).
+    None,
+    Gzip,
+    Snappy,
+    Lz4,
+    Zstd,
+}
+
+impl KafkaCompression {
+    pub(crate) fn as_rdkafka_str(self) -> &'static str {
+        match self {
+            KafkaCompression::None => "none",
+            KafkaCompression::Gzip => "gzip",
+            KafkaCompression::Snappy => "snappy",
+            KafkaCompression::Lz4 => "lz4",
+            KafkaCompression::Zstd => "zstd",
+        }
+    }
+}
+
 #[must_use]
 pub struct KafkaConfig {
     pub brokers: String,
@@ -232,6 +258,10 @@ pub struct KafkaConfig {
     /// environments. **Never set this in production.** Default: `false`.
     #[cfg(feature = "kafka-ssl")]
     pub(crate) allow_plaintext_credentials: bool,
+    /// Optional producer throughput knobs; `None` = librdkafka's default.
+    pub(crate) producer_compression: Option<KafkaCompression>,
+    pub(crate) producer_linger_ms: Option<u32>,
+    pub(crate) producer_batch_size: Option<u32>,
 }
 
 impl KafkaConfig {
@@ -244,12 +274,76 @@ impl KafkaConfig {
             sasl: None,
             #[cfg(feature = "kafka-ssl")]
             allow_plaintext_credentials: false,
+            producer_compression: None,
+            producer_linger_ms: None,
+            producer_batch_size: None,
         }
     }
 
     /// Bootstrap brokers string this config was built with.
     pub fn brokers(&self) -> &str {
         &self.brokers
+    }
+
+    /// Producer `compression.type`. Unset = librdkafka's default (no
+    /// compression). See the Kafka backend docs' "Producer tuning" section
+    /// for when and why to tune this.
+    pub fn with_producer_compression(mut self, codec: KafkaCompression) -> Self {
+        self.producer_compression = Some(codec);
+        self
+    }
+
+    /// Producer `linger.ms` — how long the producer waits to accumulate a
+    /// batch. Unset = librdkafka's default (5 ms).
+    ///
+    /// Must be below the pinned `message.timeout.ms` (5000): linger time
+    /// counts toward the message timeout, so values at or above it would make
+    /// every publish expire in the accumulator. Rejected at `connect`.
+    pub fn with_producer_linger_ms(mut self, ms: u32) -> Self {
+        self.producer_linger_ms = Some(ms);
+        self
+    }
+
+    /// Producer `batch.size` — maximum bytes accumulated per batch. Unset =
+    /// librdkafka's default (1 MB). Accepted range `1..=i32::MAX`, checked at
+    /// `connect`.
+    ///
+    /// librdkafka caps the effective batch at
+    /// `min(batch.size, message.max.bytes)` and `message.max.bytes` (default
+    /// 1 MB) is not exposed, so this knob can only lower the cap, not raise it.
+    pub fn with_producer_batch_size(mut self, bytes: u32) -> Self {
+        self.producer_batch_size = Some(bytes);
+        self
+    }
+
+    /// Validate and apply the configured producer knobs to a producer
+    /// `ClientConfig`. Unset knobs are not touched, so an untuned config
+    /// stays byte-identical to librdkafka's defaults.
+    fn apply_producer_tuning(&self, cfg: &mut ClientConfig) -> Result<()> {
+        if let Some(codec) = self.producer_compression {
+            cfg.set("compression.type", codec.as_rdkafka_str());
+        }
+        if let Some(ms) = self.producer_linger_ms {
+            if ms >= MESSAGE_TIMEOUT_MS {
+                return Err(ShoveError::Validation(format!(
+                    "producer linger.ms ({ms}) must be below the pinned \
+                     message.timeout.ms ({MESSAGE_TIMEOUT_MS}); linger time counts \
+                     toward the message timeout, so every publish would expire \
+                     before a batch is sent"
+                )));
+            }
+            cfg.set("linger.ms", ms.to_string());
+        }
+        if let Some(bytes) = self.producer_batch_size {
+            if bytes == 0 || bytes > i32::MAX as u32 {
+                return Err(ShoveError::Validation(format!(
+                    "producer batch.size ({bytes}) must be in 1..={}",
+                    i32::MAX
+                )));
+            }
+            cfg.set("batch.size", bytes.to_string());
+        }
+        Ok(())
     }
 
     #[cfg(feature = "kafka-ssl")]
@@ -292,6 +386,9 @@ impl fmt::Debug for KafkaConfig {
             d.field("tls", &self.tls);
             d.field("sasl", &self.sasl);
         }
+        d.field("producer_compression", &self.producer_compression);
+        d.field("producer_linger_ms", &self.producer_linger_ms);
+        d.field("producer_batch_size", &self.producer_batch_size);
         d.finish()
     }
 }
@@ -436,47 +533,34 @@ impl KafkaClient {
         // once into exactly-once-on-the-broker semantics. Requires Kafka
         // ≥ 0.11 (universal today) and caps in-flight requests per
         // connection at 5.
+        let mut producer_config = base_config.clone();
+        producer_config
+            .set("client.id", &client_name)
+            .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
+            .set("acks", "all")
+            .set("enable.idempotence", "true");
+        config.apply_producer_tuning(&mut producer_config)?;
+
+        fn create_default_producer(cfg: &ClientConfig) -> Result<KafkaProducerInner> {
+            let p: FutureProducer<DefaultClientContext> = cfg.create().map_err(|e| {
+                ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
+            })?;
+            Ok(KafkaProducerInner::Default(p))
+        }
+
         #[cfg(feature = "kafka-msk-iam")]
         let producer = if let Some(ctx) = msk_context.clone() {
-            let p: FutureProducer<MskIamContext> = base_config
-                .clone()
-                .set("client.id", &client_name)
-                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-                .set("acks", "all")
-                .set("enable.idempotence", "true")
-                .create_with_context(ctx)
-                .map_err(|e| {
+            let p: FutureProducer<MskIamContext> =
+                producer_config.create_with_context(ctx).map_err(|e| {
                     ShoveError::Topology(format!("failed to create MSK IAM producer: {e}"))
                 })?;
             KafkaProducerInner::MskIam(p)
         } else {
-            let p: FutureProducer<DefaultClientContext> = base_config
-                .clone()
-                .set("client.id", &client_name)
-                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-                .set("acks", "all")
-                .set("enable.idempotence", "true")
-                .create()
-                .map_err(|e| {
-                    ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
-                })?;
-            KafkaProducerInner::Default(p)
+            create_default_producer(&producer_config)?
         };
 
         #[cfg(not(feature = "kafka-msk-iam"))]
-        let producer = {
-            let p: FutureProducer<DefaultClientContext> = base_config
-                .clone()
-                .set("client.id", &client_name)
-                .set("message.timeout.ms", MESSAGE_TIMEOUT_MS.to_string())
-                .set("acks", "all")
-                .set("enable.idempotence", "true")
-                .create()
-                .map_err(|e| {
-                    ShoveError::Topology(format!("failed to create Kafka producer: {e}"))
-                })?;
-            KafkaProducerInner::Default(p)
-        };
+        let producer = create_default_producer(&producer_config)?;
 
         Ok(Self {
             brokers: config.brokers.clone(),
@@ -1129,6 +1213,107 @@ mod tests {
         assert!(!rendered.contains("NESTED-PASSWORD"));
         assert!(rendered.contains("broker:9093"));
         assert!(rendered.contains("bob"));
+    }
+
+    #[test]
+    fn producer_tuning_sets_exactly_the_configured_properties() {
+        let cfg = KafkaConfig::new("broker:9092")
+            .with_producer_compression(KafkaCompression::Lz4)
+            .with_producer_linger_ms(25)
+            .with_producer_batch_size(500_000);
+        let mut client_cfg = ClientConfig::new();
+        cfg.apply_producer_tuning(&mut client_cfg).unwrap();
+        assert_eq!(client_cfg.get("compression.type"), Some("lz4"));
+        assert_eq!(client_cfg.get("linger.ms"), Some("25"));
+        assert_eq!(client_cfg.get("batch.size"), Some("500000"));
+    }
+
+    #[test]
+    fn unset_producer_tuning_is_a_noop() {
+        let cfg = KafkaConfig::new("broker:9092");
+        let mut client_cfg = ClientConfig::new();
+        cfg.apply_producer_tuning(&mut client_cfg).unwrap();
+        assert_eq!(client_cfg.get("compression.type"), None);
+        assert_eq!(client_cfg.get("linger.ms"), None);
+        assert_eq!(client_cfg.get("batch.size"), None);
+    }
+
+    #[test]
+    fn partial_producer_tuning_sets_only_the_given_knobs() {
+        let cfg = KafkaConfig::new("broker:9092").with_producer_linger_ms(50);
+        let mut client_cfg = ClientConfig::new();
+        cfg.apply_producer_tuning(&mut client_cfg).unwrap();
+        assert_eq!(client_cfg.get("linger.ms"), Some("50"));
+        assert_eq!(client_cfg.get("compression.type"), None);
+        assert_eq!(client_cfg.get("batch.size"), None);
+    }
+
+    #[test]
+    fn linger_at_or_above_message_timeout_is_rejected() {
+        let cfg = KafkaConfig::new("broker:9092").with_producer_linger_ms(MESSAGE_TIMEOUT_MS);
+        let mut client_cfg = ClientConfig::new();
+        let err = cfg.apply_producer_tuning(&mut client_cfg).unwrap_err();
+        assert!(matches!(err, ShoveError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn linger_just_below_message_timeout_is_accepted() {
+        let cfg = KafkaConfig::new("broker:9092").with_producer_linger_ms(MESSAGE_TIMEOUT_MS - 1);
+        let mut client_cfg = ClientConfig::new();
+        cfg.apply_producer_tuning(&mut client_cfg).unwrap();
+        assert_eq!(
+            client_cfg.get("linger.ms"),
+            Some((MESSAGE_TIMEOUT_MS - 1).to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn zero_batch_size_is_rejected() {
+        let cfg = KafkaConfig::new("broker:9092").with_producer_batch_size(0);
+        let mut client_cfg = ClientConfig::new();
+        let err = cfg.apply_producer_tuning(&mut client_cfg).unwrap_err();
+        assert!(matches!(err, ShoveError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn batch_size_above_i32_max_is_rejected() {
+        let cfg = KafkaConfig::new("broker:9092").with_producer_batch_size(i32::MAX as u32 + 1);
+        let mut client_cfg = ClientConfig::new();
+        let err = cfg.apply_producer_tuning(&mut client_cfg).unwrap_err();
+        assert!(matches!(err, ShoveError::Validation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn every_advertised_compression_codec_is_supported() {
+        for codec in [
+            KafkaCompression::None,
+            KafkaCompression::Gzip,
+            KafkaCompression::Snappy,
+            KafkaCompression::Lz4,
+            KafkaCompression::Zstd,
+        ] {
+            let producer: std::result::Result<FutureProducer<DefaultClientContext>, _> =
+                ClientConfig::new()
+                    .set("compression.type", codec.as_rdkafka_str())
+                    .create();
+            assert!(
+                producer.is_ok(),
+                "codec {codec:?} rejected by librdkafka: {:?}",
+                producer.err()
+            );
+        }
+    }
+
+    #[test]
+    fn kafka_config_debug_shows_producer_tuning() {
+        let cfg = KafkaConfig::new("broker:9092")
+            .with_producer_compression(KafkaCompression::Zstd)
+            .with_producer_linger_ms(25);
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("producer_compression"));
+        assert!(rendered.contains("Zstd"));
+        assert!(rendered.contains("producer_linger_ms"));
+        assert!(rendered.contains("25"));
     }
 
     // -- overlay_dynamic_entries: legacy AlterConfigs merge correctness --
