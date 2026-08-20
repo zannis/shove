@@ -308,7 +308,7 @@ pub mod nats {
 #[cfg(feature = "kafka")]
 #[cfg_attr(docsrs, doc(cfg(feature = "kafka")))]
 pub mod kafka {
-    pub use crate::backends::kafka::KafkaConfig;
+    pub use crate::backends::kafka::{KafkaCompression, KafkaConfig};
     pub use crate::markers::Kafka;
 
     pub use crate::backends::kafka::{

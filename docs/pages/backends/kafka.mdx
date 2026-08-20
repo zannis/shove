@@ -90,6 +90,27 @@ See [`examples/kafka/msk_iam.rs`](/backends/kafka/examples/msk_iam) for a runnab
 
 `publisher().await?` returns a `Publisher<Kafka>`. Messages are produced via `rdkafka`. The message key is derived from the topic's partition-key logic (or from `T::sequence_key()` for sequenced topics).
 
+### Producer tuning
+
+shove pins the correctness-critical producer settings (`acks=all`, `enable.idempotence=true`) and keeps them non-configurable. Idempotence caps `max.in.flight.requests.per.connection` at 5, so sustained throughput is bounded by messages per request — i.e. by batching. librdkafka's defaults (`linger.ms=5`, no compression) favor low latency; high-rate pipelines can raise the throughput ceiling with three opt-in knobs on `KafkaConfig`:
+
+```rust
+use shove::kafka::{KafkaCompression, KafkaConfig};
+
+let config = KafkaConfig::new(brokers)
+    .with_producer_compression(KafkaCompression::Lz4)
+    .with_producer_linger_ms(25)
+    .with_producer_batch_size(500_000);
+```
+
+- **`with_producer_compression(KafkaCompression)`** — `compression.type` (`None`, `Gzip`, `Snappy`, `Lz4`, `Zstd`). Compresses each batch on the client, cutting producer→broker bytes as well as broker storage and replication traffic.
+- **`with_producer_linger_ms(u32)`** — `linger.ms`, how long the producer waits to accumulate a batch. Higher values trade a little latency for materially larger (and better-compressed) batches. Must stay below the pinned `message.timeout.ms` (5000): linger time counts toward the message timeout, so values at or above it would expire every publish. Rejected at connect.
+- **`with_producer_batch_size(u32)`** — `batch.size`, maximum bytes accumulated per batch (`1..=i32::MAX`, checked at connect). librdkafka caps the effective batch at `min(batch.size, message.max.bytes)`, and `message.max.bytes` (default 1 MB) is not exposed — so this knob can lower the cap but not raise it above 1 MB.
+
+Each knob left unset keeps librdkafka's default, so an untuned config behaves exactly as before. `acks`, `enable.idempotence`, and `max.in.flight.requests.per.connection` are deliberately not exposed.
+
+The client holds a single producer, shared by `publisher()` and by the consumer's retry, defer, and DLQ republishes — a long linger also delays those republishes (and the offset commits gated on them for sequenced topics), so keep linger modest when consumers republish on the same client.
+
 ## Consume
 
 ```rust
