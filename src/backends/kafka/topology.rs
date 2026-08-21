@@ -26,6 +26,13 @@ fn merge_topic_config(
         .collect()
 }
 
+/// `true` once `replication` is too low to ever satisfy the producer's
+/// hardcoded `acks=all` on a cluster with a non-default (≥ 2)
+/// `min.insync.replicas` — see `warn_if_under_replicated_for_acks_all`.
+fn under_replicated_for_acks_all(replication: i32) -> bool {
+    replication < 2
+}
+
 pub struct KafkaTopologyDeclarer {
     client: KafkaClient,
     /// Minimum number of partitions for the main topic.
@@ -133,6 +140,36 @@ impl KafkaTopologyDeclarer {
         self.replication_factor.unwrap_or(DEFAULT_REPLICATION)
     }
 
+    /// Warn once per `declare()` call when auto-creating topic(s) at the
+    /// RF=1 default while the producer hardcodes `acks=all` (see
+    /// `KafkaClient::connect`'s `sec-K-10` comment) — the pairing is a
+    /// footgun: on any cluster whose `min.insync.replicas` is >= 2 (a common
+    /// production default), a produce to an RF=1 topic can never satisfy
+    /// `acks=all` and surfaces only as a bare `MessageTimedOut`, with no
+    /// hint that the actual cause is under-replication. `create_topic` is
+    /// also idempotent and won't raise an existing topic's replication once
+    /// created, so this is easy to overlook locally (RF=1 works fine on a
+    /// single-broker dev cluster) and only bites in production.
+    ///
+    /// Deliberately does not query the cluster's actual
+    /// `min.insync.replicas` (an extra admin round trip) — this is a blunt,
+    /// unconditional nudge toward `with_replication_factor(n ≥ 2)`.
+    fn warn_if_under_replicated_for_acks_all(&self, queue: &str) {
+        let replication = self.effective_replication();
+        if under_replicated_for_acks_all(replication) {
+            tracing::warn!(
+                queue,
+                replication_factor = replication,
+                "auto-creating Kafka topic(s) at replication_factor=1 while the producer \
+                 requires acks=all — on any cluster with min.insync.replicas >= 2 this topic \
+                 can never satisfy a produce and every send will time out as a bare \
+                 MessageTimedOut with no hint of the real cause. Call \
+                 KafkaTopologyDeclarer::with_replication_factor(n) with n >= 2 to match your \
+                 cluster's min.insync.replicas, or ignore this on a single-broker dev cluster."
+            );
+        }
+    }
+
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
         let partitions = self.effective_partitions(DEFAULT_PARTITIONS);
@@ -196,6 +233,7 @@ impl KafkaTopologyDeclarer {
                  hold-queue topics declared"
             );
         }
+        self.warn_if_under_replicated_for_acks_all(topology.queue());
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {
@@ -206,7 +244,18 @@ impl KafkaTopologyDeclarer {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_topic_config;
+    use super::{merge_topic_config, under_replicated_for_acks_all};
+
+    #[test]
+    fn under_replicated_for_acks_all_flags_rf1() {
+        assert!(under_replicated_for_acks_all(1));
+    }
+
+    #[test]
+    fn under_replicated_for_acks_all_accepts_rf2_and_above() {
+        assert!(!under_replicated_for_acks_all(2));
+        assert!(!under_replicated_for_acks_all(3));
+    }
 
     fn cfg(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
