@@ -85,6 +85,12 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-batch-shutdown").build()
 );
 
+shove::define_topic!(
+    PoisonOnlyTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-poison-only").build()
+);
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -240,6 +246,7 @@ impl_recording_for!(
     BadPayloadTopic,
     OversizeTopic,
     ShutdownTopic,
+    PoisonOnlyTopic,
 );
 
 async fn publish_seq<T>(broker: &Broker<Kafka>, range: std::ops::Range<u32>)
@@ -465,6 +472,94 @@ async fn ack_commits_offsets_so_a_restart_does_not_replay() {
         vec![100],
         "the committed batch must not be replayed, got {:?}",
         second.batches()
+    );
+    broker.close().await;
+}
+
+/// A flush window containing *nothing but* poison still commits its offsets.
+///
+/// This is the forward-progress guarantee: the handler is never called (there
+/// is no surviving message to hand it), so if the empty batch did not commit,
+/// the same poison would be re-read after every restart and a partition whose
+/// unread tail is all poison would never advance again.
+#[tokio::test]
+async fn a_batch_of_only_dropped_messages_still_commits() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<PoisonOnlyTopic>()
+        .await
+        .unwrap();
+
+    // Nothing but undecodable payloads — every one is dropped pre-handler.
+    for _ in 0..3 {
+        publish_raw(&tb.brokers, "kafka-batch-poison-only", b"{not valid json").await;
+    }
+
+    let group = "batch-poison-only-group";
+
+    let first = RecordingBatchHandler::new();
+    let h = first.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<PoisonOnlyTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_group_id(group)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // The handler is never invoked here, so there is no batch to wait on —
+    // just give the age-triggered flush time to fire and commit.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert!(
+        first.batches().is_empty(),
+        "no batch should reach the handler, got {:?}",
+        first.batches()
+    );
+
+    // Second run, same group: the poison must not be re-read. Only the
+    // newly published good message should arrive.
+    publish_seq::<PoisonOnlyTopic>(&broker, 7..8).await;
+
+    let second = RecordingBatchHandler::new();
+    let h = second.clone();
+    let shutdown2 = CancellationToken::new();
+    let sc2 = shutdown2.clone();
+    let consumer2 = KafkaConsumer::new(tb.client());
+    let handle2 = tokio::spawn(async move {
+        consumer2
+            .run_batch::<PoisonOnlyTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_group_id(group)
+                    .with_shutdown(sc2),
+            )
+            .await
+    });
+
+    assert!(second.wait_for_batches(1, TIMEOUT).await);
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
+
+    assert_eq!(
+        second.seen(),
+        vec![7],
+        "offsets past the all-poison window must have been committed"
     );
     broker.close().await;
 }
