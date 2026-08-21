@@ -314,8 +314,8 @@ pub mod kafka {
     pub use crate::markers::Kafka;
 
     pub use crate::backends::kafka::{
-        KafkaAutoOffsetReset, KafkaAutoscalerBackend, KafkaClient, KafkaConsumer,
-        KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
+        BatchConsumerOptions, KafkaAutoOffsetReset, KafkaAutoscalerBackend, KafkaClient,
+        KafkaConsumer, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
         KafkaLagStatsProvider, KafkaPublisher, KafkaPublisherConfig, KafkaQueueStats,
         KafkaQueueStatsProvider, KafkaTopologyDeclarer,
     };
