@@ -37,11 +37,11 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
 use super::msk_iam::MskIamContext;
 
 #[cfg(feature = "kafka-schema-registry")]
-use crate::schema_registry::WireFormat;
-#[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::decode::{RegistryDecode, registry_decode};
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::default_subject;
+#[cfg(feature = "kafka-schema-registry")]
+use crate::schema_registry::{SchemaEnforcement, SchemaRegistry, WireFormat};
 
 use super::client::KafkaClient;
 use super::constants::{
@@ -1253,6 +1253,12 @@ pub struct BatchConsumerOptions {
     kafka_group_id: Option<Arc<str>>,
     kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
     shutdown: CancellationToken,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_registry: Option<Arc<SchemaRegistry>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_enforcement: SchemaEnforcement,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_accepted_subjects: Option<Vec<Arc<str>>>,
 }
 
 impl Default for BatchConsumerOptions {
@@ -1265,6 +1271,13 @@ impl Default for BatchConsumerOptions {
             kafka_group_id: None,
             kafka_auto_offset_reset: None,
             shutdown: CancellationToken::new(),
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_registry: None,
+            // Matches `ConsumerOptions`: enforcement is opt-out, not opt-in.
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_enforcement: SchemaEnforcement::Enforce,
+            #[cfg(feature = "kafka-schema-registry")]
+            schema_accepted_subjects: None,
         }
     }
 }
@@ -1322,6 +1335,42 @@ impl BatchConsumerOptions {
         self.shutdown = shutdown;
         self
     }
+
+    /// Decode batch messages through the Confluent Schema Registry: strip the
+    /// wire frame, gate the resolved subject, then decode the inner payload
+    /// with `T::Codec`.
+    ///
+    /// Same semantics as [`ConsumerOptions::with_schema_registry`] on the
+    /// single-message path, including DLQ routing for frame/subject/decode
+    /// failures. Without a registry the payload is decoded directly by
+    /// `T::Codec`, unchanged.
+    ///
+    /// [`ConsumerOptions::with_schema_registry`]: crate::ConsumerOptions::with_schema_registry
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn with_schema_registry(mut self, registry: Arc<SchemaRegistry>) -> Self {
+        self.schema_registry = Some(registry);
+        self
+    }
+
+    /// Whether a message whose schema subject is not accepted is routed to the
+    /// DLQ (`Enforce`, the default) or decoded anyway with a warning
+    /// (`Permissive`).
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn with_schema_enforcement(mut self, enforcement: SchemaEnforcement) -> Self {
+        self.schema_enforcement = enforcement;
+        self
+    }
+
+    /// Subjects this consumer accepts. Defaults to `{queue}-value`.
+    #[cfg(feature = "kafka-schema-registry")]
+    pub fn accept_schema_subjects<I, S>(mut self, subjects: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Arc<str>>,
+    {
+        self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
+        self
+    }
 }
 
 /// The parts of a batch flush that don't change between flushes.
@@ -1349,6 +1398,132 @@ fn commit_batch_end(
     consumer
         .commit(&tpl, CommitMode::Sync)
         .map_err(|e| map_kafka_error("batch commit failed", e))
+}
+
+/// The parts of a batch decode that don't change between messages.
+struct BatchDecodeCtx<'a> {
+    client: &'a KafkaClient,
+    topology: &'a QueueTopology,
+    queue: &'a str,
+    topic: &'a str,
+    group: Option<&'a str>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_registry: Option<&'a Arc<SchemaRegistry>>,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_enforcement: SchemaEnforcement,
+    #[cfg(feature = "kafka-schema-registry")]
+    schema_accepted: &'a [Arc<str>],
+}
+
+/// Decodes one message on its way into a batch, routing anything undecodable to
+/// the DLQ.
+///
+/// This is the batch path's equivalent of the decode stage in `run_with_inner`,
+/// and deliberately matches it: with a registry configured the frame-strip +
+/// subject gate + inner-codec decode runs, otherwise `T::Codec` decodes the
+/// payload directly, and either way a failure is *published to the DLQ* rather
+/// than silently discarded. Batching changes when offsets are committed, not
+/// what happens to a poison message.
+///
+/// Returns `None` when the message was dropped. The caller has already extended
+/// the batch's offset span, so a dropped message is still committed past.
+async fn decode_batch_message<T: Topic>(
+    dec: &BatchDecodeCtx<'_>,
+    payload_slice: &[u8],
+    key: Option<&[u8]>,
+    headers: &HashMap<String, String>,
+) -> Option<T::Message> {
+    #[cfg(feature = "kafka-schema-registry")]
+    if let Some(registry) = dec.schema_registry {
+        let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
+        let registry_result = match WireFormat::from_codec_name(codec_name) {
+            Some(fmt) => {
+                registry_decode::<T::Message, T::Codec>(
+                    registry,
+                    fmt,
+                    dec.schema_enforcement,
+                    dec.schema_accepted,
+                    payload_slice,
+                )
+                .await
+            }
+            None => {
+                tracing::error!(
+                    codec = codec_name,
+                    queue = dec.queue,
+                    "codec has no Confluent wire format; routing to DLQ"
+                );
+                Ok(RegistryDecode::Dlq("schema_unsupported_codec"))
+            }
+        };
+        return match registry_result {
+            Ok(RegistryDecode::Decoded(m)) => Some(m),
+            Ok(RegistryDecode::Dlq(reason)) => {
+                metrics::record_failed(
+                    dec.topic,
+                    dec.group,
+                    metrics::FailReason::for_schema_reason(reason),
+                );
+                dlq_batch_message(dec, payload_slice, key, headers, reason).await;
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    queue = dec.queue,
+                    "failed to deserialize batch message, sending to DLQ"
+                );
+                metrics::record_failed(dec.topic, dec.group, metrics::FailReason::Deserialize);
+                dlq_batch_message(dec, payload_slice, key, headers, "deserialization_error").await;
+                None
+            }
+        };
+    }
+
+    match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                queue = dec.queue,
+                "failed to deserialize batch message, sending to DLQ"
+            );
+            metrics::record_failed(dec.topic, dec.group, metrics::FailReason::Deserialize);
+            dlq_batch_message(dec, payload_slice, key, headers, "deserialization_error").await;
+            None
+        }
+    }
+}
+
+/// Publishes a dropped batch message to the DLQ, logging a failure to do so.
+///
+/// A DLQ publish failure is not propagated: the offset span has already been
+/// extended, so failing the whole batch here would stall forward progress on a
+/// message that is by definition unprocessable.
+async fn dlq_batch_message(
+    dec: &BatchDecodeCtx<'_>,
+    payload_slice: &[u8],
+    key: Option<&[u8]>,
+    headers: &HashMap<String, String>,
+    reason: &str,
+) {
+    if let Err(dlq_err) = publish_to_dlq(
+        dec.client,
+        dec.topology,
+        payload_slice,
+        key,
+        headers,
+        reason,
+    )
+    .await
+    {
+        tracing::error!(
+            error = %dlq_err,
+            queue = dec.queue,
+            reason,
+            "failed to publish bad batch message to DLQ"
+        );
+    }
 }
 
 /// Hands `batch` to the handler and applies the single returned `Outcome`:
@@ -2058,6 +2233,17 @@ impl KafkaConsumer {
         let topic: Arc<str> = Arc::from(queue);
         let group: Option<Arc<str>> = Some(Arc::from(group_id.as_str()));
 
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_registry = options.schema_registry.clone();
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_enforcement = options.schema_enforcement;
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_accepted: Arc<[Arc<str>]> = options
+            .schema_accepted_subjects
+            .clone()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+
         tracing::info!(
             queue,
             group_id,
@@ -2074,6 +2260,10 @@ impl KafkaConsumer {
             let group_id = group_id.clone();
             let topic = topic.clone();
             let group = group.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_registry = schema_registry.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_accepted = schema_accepted.clone();
             async move {
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 let consumer = create_stream_consumer(
@@ -2095,6 +2285,20 @@ impl KafkaConsumer {
                     topic: topic.as_ref(),
                     group: group.as_deref(),
                     shutdown: &shutdown,
+                };
+
+                let decode_ctx = BatchDecodeCtx {
+                    client: &client,
+                    topology,
+                    queue,
+                    topic: topic.as_ref(),
+                    group: group.as_deref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_registry: schema_registry.as_ref(),
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_enforcement,
+                    #[cfg(feature = "kafka-schema-registry")]
+                    schema_accepted: schema_accepted.as_ref(),
                 };
 
                 let mut batch: Vec<(T::Message, MessageMetadata)> = Vec::with_capacity(max_batch_size);
@@ -2208,22 +2412,31 @@ impl KafkaConsumer {
                                 deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
                             }
 
+                            let key = msg.key().map(Bytes::copy_from_slice);
+                            let headers = extract_string_headers(&msg);
+
                             if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
-                                tracing::warn!(error = %e, queue, partition, offset, "dropping oversized message from batch");
+                                tracing::warn!(error = %e, queue, partition, offset, "oversized message, sending to DLQ");
                                 metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
+                                dlq_batch_message(
+                                    &decode_ctx,
+                                    payload_slice,
+                                    key.as_deref(),
+                                    &headers,
+                                    &e.to_string(),
+                                ).await;
                                 continue;
                             }
 
-                            let decoded = match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::warn!(error = %e, queue, partition, offset, "dropping undeserializable message from batch");
-                                    metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Deserialize);
-                                    continue;
-                                }
+                            let Some(decoded) = decode_batch_message::<T>(
+                                &decode_ctx,
+                                payload_slice,
+                                key.as_deref(),
+                                &headers,
+                            ).await else {
+                                continue;
                             };
 
-                            let headers = extract_string_headers(&msg);
                             let metadata = build_message_metadata(&headers, false);
                             batch.push((decoded, metadata));
 

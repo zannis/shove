@@ -91,6 +91,12 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-batch-poison-only").build()
 );
 
+shove::define_topic!(
+    BatchDlqTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-dlq").dlq().build()
+);
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -147,6 +153,36 @@ async fn publish_raw(brokers: &str, topic: &str, payload: &[u8]) {
         )
         .await
         .expect("raw publish should succeed");
+}
+
+/// Reads up to `expected` raw payloads off `topic`, giving up after `TIMEOUT`.
+///
+/// The batch DLQ test can't use `run_dlq` for this: the whole point is that the
+/// payload failed to decode as `T::Message`, so a typed DLQ consumer would fail
+/// on it too. This reads the bytes back as bytes.
+async fn drain_raw(brokers: &str, topic: &str, expected: usize) -> Vec<Vec<u8>> {
+    use rdkafka::consumer::{Consumer, StreamConsumer};
+    use rdkafka::message::Message;
+
+    let consumer: StreamConsumer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", format!("{topic}-raw-drain"))
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("failed to create raw consumer");
+    consumer.subscribe(&[topic]).expect("subscribe should work");
+
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(TIMEOUT, async {
+        while out.len() < expected {
+            if let Ok(msg) = consumer.recv().await {
+                out.push(msg.payload().unwrap_or_default().to_vec());
+            }
+        }
+    })
+    .await;
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +283,7 @@ impl_recording_for!(
     OversizeTopic,
     ShutdownTopic,
     PoisonOnlyTopic,
+    BatchDlqTopic,
 );
 
 async fn publish_seq<T>(broker: &Broker<Kafka>, range: std::ops::Range<u32>)
@@ -611,6 +648,57 @@ async fn undeserializable_message_is_dropped_from_the_batch() {
         vec![0, 1],
         "the good messages should survive the poison payload"
     );
+    broker.close().await;
+}
+
+/// An undecodable message in a batch is preserved in the DLQ, not silently
+/// discarded — parity with the single-message path.
+#[tokio::test]
+async fn undeserializable_batch_message_lands_in_dlq() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<BatchDlqTopic>().await.unwrap();
+
+    const POISON: &[u8] = b"{not valid json";
+    publish_seq::<BatchDlqTopic>(&broker, 0..1).await;
+    publish_raw(&tb.brokers, "kafka-batch-dlq", POISON).await;
+    publish_seq::<BatchDlqTopic>(&broker, 1..2).await;
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<BatchDlqTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(500))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(handler.wait_for_batches(1, TIMEOUT).await);
+
+    // The poison payload must be recoverable from the DLQ, byte-for-byte.
+    let dead = drain_raw(&tb.brokers, "kafka-batch-dlq-dlq", 1).await;
+    assert_eq!(
+        dead,
+        vec![POISON.to_vec()],
+        "the undecodable payload should be preserved in the DLQ"
+    );
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![0, 1], "the good messages should still flush");
     broker.close().await;
 }
 
