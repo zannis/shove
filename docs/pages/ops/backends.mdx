@@ -58,7 +58,9 @@ If the same role publishes, add `sns:Publish` on each SNS topic it publishes to.
 duplicate_window: 600s  # example: 10-minute dedup window
 ```
 
-**Stream-side vs consumer-side limits.** Storage size and per-message size are set on the JetStream stream itself (configured outside shove). `max_ack_pending`, however, is set by shove on the durable pull consumer at consumer-creation time, derived from `prefetch_count` (and from `max_consumers × prefetch_count` for groups). To override per-consumer, use `ConsumerOptions::<Nats>::with_max_ack_pending(...)`.
+**Stream-side vs consumer-side limits.** Storage size and per-message size are set on the JetStream stream itself (configured outside shove). `max_ack_pending`, however, is set by shove on the durable pull consumer at consumer-creation time, derived from `prefetch_count` (and from `max_consumers × prefetch_count` for groups). To override it, use `ConsumerOptions::<Nats>::with_max_ack_pending(...)` on a single consumer, or `NatsConsumerGroupConfig::with_max_ack_pending(...)` to replace the derived aggregate for a group. Both take a positive budget or `-1` for unbounded, and reject `0` — JetStream reads a zero as "unset" and silently substitutes its own default of 1000.
+
+**Bounding reconnects in a group.** `NatsConsumerGroupConfig::with_max_reconnect_attempts(n)` bounds each group consumer task's *consecutive* reconnect attempts, the same way `ConsumerOptions::<Nats>::with_max_reconnect_attempts` does for a single consumer; the count resets after a sustained healthy period. Leaving it unbounded (the default) lets reconnect backoff grow past `ack_wait`, at which point in-flight messages expire during the backoff itself.
 
 **Subject naming.** shove uses `{queue}.shard.{N}` subjects for sequenced topics. Do not reuse these subjects for other applications or publishers outside of shove — you will interfere with sequencing semantics.
 
