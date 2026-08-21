@@ -23,7 +23,7 @@ use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
@@ -31,7 +31,7 @@ use crate::retry::Backoff;
 use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::{HoldQueue, Kafka, ShoveError};
+use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
@@ -1061,6 +1061,22 @@ impl KafkaStreamConsumer {
             Self::MskIam(c) => c.commit_message(msg, mode),
         }
     }
+
+    /// Rewinds the given partitions to the offsets in `tpl` so the next
+    /// `recv()` re-delivers from there. Used by the batch consumer to
+    /// redeliver an entire un-acked batch instead of silently skipping past
+    /// it (see `run_batch`).
+    pub(super) fn seek_partitions(
+        &self,
+        tpl: TopicPartitionList,
+        timeout: Duration,
+    ) -> KafkaResult<TopicPartitionList> {
+        match self {
+            Self::Default(c) => c.seek_partitions(tpl, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.seek_partitions(tpl, timeout),
+        }
+    }
 }
 
 // Consumer helper
@@ -1144,6 +1160,12 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 /// it; well below the "silent multi-hour wedge" this guards against.
 const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Timeout for `seek_partitions` when redelivering an un-acked batch.
+const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Flat delay after redelivering a batch — see `flush_batch`'s non-Ack arm.
+const BATCH_REDELIVERY_BACKOFF: Duration = Duration::from_secs(1);
+
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
@@ -1201,6 +1223,151 @@ where
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Batch consumer
+// ---------------------------------------------------------------------------
+
+/// Options for [`KafkaConsumer::run_batch`].
+pub struct BatchConsumerOptions {
+    max_batch_size: usize,
+    max_batch_age: Duration,
+    max_reconnect_attempts: Option<u32>,
+    max_message_size: Option<usize>,
+    kafka_group_id: Option<Arc<str>>,
+    kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+    shutdown: CancellationToken,
+}
+
+impl Default for BatchConsumerOptions {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 500,
+            max_batch_age: Duration::from_millis(250),
+            max_reconnect_attempts: None,
+            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
+            kafka_group_id: None,
+            kafka_auto_offset_reset: None,
+            shutdown: CancellationToken::new(),
+        }
+    }
+}
+
+impl BatchConsumerOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Flush once the batch reaches this many messages. Default 500.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0`.
+    pub fn with_max_batch_size(mut self, n: usize) -> Self {
+        assert!(n > 0, "max_batch_size must be > 0");
+        self.max_batch_size = n;
+        self
+    }
+
+    /// Flush once this long has elapsed since the first message in the
+    /// current batch, even if `max_batch_size` hasn't been reached.
+    /// Default 250ms.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `d` is zero.
+    pub fn with_max_batch_age(mut self, d: Duration) -> Self {
+        assert!(!d.is_zero(), "max_batch_age must be positive");
+        self.max_batch_age = d;
+        self
+    }
+
+    pub fn with_max_reconnect_attempts(mut self, n: u32) -> Self {
+        self.max_reconnect_attempts = Some(n);
+        self
+    }
+
+    pub fn with_max_message_size(mut self, n: usize) -> Self {
+        self.max_message_size = Some(n);
+        self
+    }
+
+    pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
+        self.kafka_group_id = Some(group_id.into());
+        self
+    }
+
+    pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
+        self.kafka_auto_offset_reset = Some(reset);
+        self
+    }
+
+    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+}
+
+/// Hands `batch` to the handler and applies the single returned `Outcome`:
+/// `Ack` commits every partition's end offset in `batch_end` in one batched
+/// commit; anything else seeks every partition back to `batch_start` so the
+/// whole batch is re-delivered on the next `recv()` instead of being
+/// silently skipped (offsets were never committed, but this consumer keeps
+/// polling forward without a seek).
+#[allow(clippy::too_many_arguments)]
+async fn flush_batch<T, H>(
+    consumer: &KafkaStreamConsumer,
+    handler: &H,
+    ctx: &H::Context,
+    queue: &str,
+    batch: Vec<(T::Message, MessageMetadata)>,
+    batch_start: &HashMap<i32, i64>,
+    batch_end: &HashMap<i32, i64>,
+) -> Result<()>
+where
+    T: Topic,
+    H: BatchMessageHandler<T>,
+{
+    let batch_size = batch.len();
+    let outcome = handler.handle_batch(batch, ctx).await;
+    match outcome {
+        Outcome::Ack => {
+            let mut tpl = TopicPartitionList::new();
+            for (&partition, &end_offset) in batch_end {
+                tpl.add_partition_offset(queue, partition, Offset::Offset(end_offset))
+                    .ok();
+            }
+            consumer
+                .commit(&tpl, CommitMode::Sync)
+                .map_err(|e| map_kafka_error("batch commit failed", e))?;
+            tracing::debug!(queue, batch_size, "batch committed");
+        }
+        other => {
+            tracing::warn!(
+                queue,
+                batch_size,
+                outcome = ?other,
+                "batch handler returned a non-Ack outcome, redelivering the whole batch"
+            );
+            let mut tpl = TopicPartitionList::new();
+            for (&partition, &start_offset) in batch_start {
+                tpl.add_partition_offset(queue, partition, Offset::Offset(start_offset))
+                    .ok();
+            }
+            consumer
+                .seek_partitions(tpl, SEEK_TIMEOUT)
+                .map_err(|e| map_kafka_error("batch seek-for-redelivery failed", e))?;
+            // No per-batch retry counter or backoff schedule exists at this
+            // level (see the type's doc comment) — a handler stuck
+            // returning non-Ack would otherwise spin the seek-then-recv
+            // cycle with zero delay. This flat delay is deliberately not
+            // configurable in v1; a real backoff schedule is a natural
+            // follow-up once per-message batch outcomes exist.
+            tokio::time::sleep(BATCH_REDELIVERY_BACKOFF).await;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,6 +1864,201 @@ impl KafkaConsumer {
                                     task_processing.store(false, Ordering::Release);
                                 }
                             });
+                        }
+                    }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Consume `T`'s main queue in bounded batches, flushing to `handler`
+    /// once a batch reaches `max_batch_size` messages or `max_batch_age`
+    /// has elapsed since the first message in it — whichever comes first.
+    ///
+    /// This is the primitive DB-sink consumers otherwise hand-roll around
+    /// the single-message API: push decoded messages into a buffer, flush
+    /// on size-or-age, ack-after-flush. See [`BatchMessageHandler`] for the
+    /// outcome semantics — in particular, only `Outcome::Ack` commits;
+    /// every other outcome redelivers the **entire batch** (no per-message
+    /// retry-count tracking or DLQ routing at this level yet).
+    ///
+    /// # Current limitations
+    ///
+    /// - No Confluent Schema Registry integration (even under
+    ///   `kafka-schema-registry`) — messages are decoded directly via
+    ///   `T::Codec`.
+    /// - A message that fails to deserialize or exceeds
+    ///   `options.max_message_size` is dropped from the batch (logged and
+    ///   counted via `metrics::FailReason`) rather than DLQ'd individually.
+    /// - No FIFO/sequenced variant.
+    pub async fn run_batch<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptions,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: BatchMessageHandler<T>,
+    {
+        let topology = T::topology();
+        let queue = topology.queue();
+        let group_id = options
+            .kafka_group_id
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| super::constants::consumer_group_id(queue));
+        let auto_offset_reset = options
+            .kafka_auto_offset_reset
+            .unwrap_or(KafkaAutoOffsetReset::Earliest);
+        let shutdown = options.shutdown.clone();
+        let max_message_size = options.max_message_size;
+        let max_batch_size = options.max_batch_size;
+        let max_batch_age = options.max_batch_age;
+        let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
+        let client = self.client.clone();
+        let topic: Arc<str> = Arc::from(queue);
+        let group: Option<Arc<str>> = Some(Arc::from(group_id.as_str()));
+
+        tracing::info!(
+            queue,
+            group_id,
+            max_batch_size,
+            ?max_batch_age,
+            "Kafka batch consumer started"
+        );
+
+        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
+            let handler = handler.clone();
+            let ctx = ctx.clone();
+            let client = client.clone();
+            let shutdown = shutdown.clone();
+            let group_id = group_id.clone();
+            let topic = topic.clone();
+            let group = group.clone();
+            async move {
+                let (rebalance_tx, _rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
+                let consumer = create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    auto_offset_reset,
+                    queue,
+                    rebalance_tx,
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )?;
+                consumer
+                    .subscribe(&[queue])
+                    .map_err(|e| map_kafka_error("failed to subscribe", e))?;
+
+                let mut batch: Vec<(T::Message, MessageMetadata)> = Vec::with_capacity(max_batch_size);
+                // Exclusive end offset to commit per partition once the
+                // batch acks, and the same batch's start offset per
+                // partition to seek back to if it doesn't — see
+                // `flush_batch`.
+                let mut batch_end: HashMap<i32, i64> = HashMap::new();
+                let mut batch_start: HashMap<i32, i64> = HashMap::new();
+                let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+
+                loop {
+                    let sleep_until_deadline = async {
+                        match deadline.as_mut() {
+                            Some(d) => d.await,
+                            None => std::future::pending().await,
+                        }
+                    };
+
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            if !batch.is_empty() {
+                                flush_batch(
+                                    &consumer,
+                                    handler.as_ref(),
+                                    ctx.as_ref(),
+                                    queue,
+                                    std::mem::take(&mut batch),
+                                    &batch_start,
+                                    &batch_end,
+                                )
+                                .await?;
+                            }
+                            tracing::info!(queue, "shutdown signal received, batch consumer stopped");
+                            return Ok(());
+                        }
+                        () = sleep_until_deadline => {
+                            flush_batch(
+                                &consumer,
+                                handler.as_ref(),
+                                ctx.as_ref(),
+                                queue,
+                                std::mem::take(&mut batch),
+                                &batch_start,
+                                &batch_end,
+                            )
+                            .await?;
+                            batch_start.clear();
+                            batch_end.clear();
+                            deadline = None;
+                        }
+                        msg_result = consumer.recv() => {
+                            let msg = match msg_result {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    tracing::error!(error = %e, queue, "consumer recv error");
+                                    return Err(map_kafka_error(
+                                        &format!("consumer recv error on {queue}"),
+                                        e,
+                                    ));
+                                }
+                            };
+
+                            let partition = msg.partition();
+                            let offset = msg.offset();
+                            let payload_slice = msg.payload().unwrap_or_default();
+                            let headers = extract_string_headers(&msg);
+
+                            metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
+
+                            if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
+                                tracing::warn!(error = %e, queue, partition, offset, "dropping oversized message from batch");
+                                metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
+                                continue;
+                            }
+
+                            let decoded = match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, queue, partition, offset, "dropping undeserializable message from batch");
+                                    metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Deserialize);
+                                    continue;
+                                }
+                            };
+
+                            let metadata = build_message_metadata(&headers, false);
+                            batch_start.entry(partition).or_insert(offset);
+                            batch_end.insert(partition, offset + 1);
+                            batch.push((decoded, metadata));
+
+                            if deadline.is_none() {
+                                deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
+                            }
+                            if batch.len() >= max_batch_size {
+                                flush_batch(
+                                    &consumer,
+                                    handler.as_ref(),
+                                    ctx.as_ref(),
+                                    queue,
+                                    std::mem::take(&mut batch),
+                                    &batch_start,
+                                    &batch_end,
+                                )
+                                .await?;
+                                batch_start.clear();
+                                batch_end.clear();
+                                deadline = None;
+                            }
                         }
                     }
                 }
@@ -2912,6 +3274,90 @@ mod offset_tracker_tests {
             Some(0),
             "a genuinely wedged partition still trips the fence, timed from t1"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_consumer_options_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_documented_values() {
+        let opts = BatchConsumerOptions::default();
+        assert_eq!(opts.max_batch_size, 500);
+        assert_eq!(opts.max_batch_age, Duration::from_millis(250));
+        assert_eq!(opts.max_reconnect_attempts, None);
+        assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
+        assert_eq!(opts.kafka_group_id, None);
+        assert_eq!(opts.kafka_auto_offset_reset, None);
+    }
+
+    #[test]
+    fn new_is_default() {
+        let opts = BatchConsumerOptions::new();
+        assert_eq!(
+            opts.max_batch_size,
+            BatchConsumerOptions::default().max_batch_size
+        );
+    }
+
+    #[test]
+    fn with_max_batch_size_sets_value() {
+        let opts = BatchConsumerOptions::new().with_max_batch_size(1000);
+        assert_eq!(opts.max_batch_size, 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_batch_size must be > 0")]
+    fn with_max_batch_size_zero_panics() {
+        let _ = BatchConsumerOptions::new().with_max_batch_size(0);
+    }
+
+    #[test]
+    fn with_max_batch_age_sets_value() {
+        let opts = BatchConsumerOptions::new().with_max_batch_age(Duration::from_secs(2));
+        assert_eq!(opts.max_batch_age, Duration::from_secs(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "max_batch_age must be positive")]
+    fn with_max_batch_age_zero_panics() {
+        let _ = BatchConsumerOptions::new().with_max_batch_age(Duration::ZERO);
+    }
+
+    #[test]
+    fn with_max_reconnect_attempts_sets_value() {
+        let opts = BatchConsumerOptions::new().with_max_reconnect_attempts(5);
+        assert_eq!(opts.max_reconnect_attempts, Some(5));
+    }
+
+    #[test]
+    fn with_max_message_size_sets_value() {
+        let opts = BatchConsumerOptions::new().with_max_message_size(1024);
+        assert_eq!(opts.max_message_size, Some(1024));
+    }
+
+    #[test]
+    fn with_group_id_sets_value() {
+        let opts = BatchConsumerOptions::new().with_group_id("custom-group");
+        assert_eq!(opts.kafka_group_id.as_deref(), Some("custom-group"));
+    }
+
+    #[test]
+    fn with_auto_offset_reset_sets_value() {
+        let opts = BatchConsumerOptions::new().with_auto_offset_reset(KafkaAutoOffsetReset::Latest);
+        assert_eq!(
+            opts.kafka_auto_offset_reset,
+            Some(KafkaAutoOffsetReset::Latest)
+        );
+    }
+
+    #[test]
+    fn with_shutdown_sets_token() {
+        let token = CancellationToken::new();
+        let opts = BatchConsumerOptions::new().with_shutdown(token.clone());
+        token.cancel();
+        assert!(opts.shutdown.is_cancelled());
     }
 }
 
