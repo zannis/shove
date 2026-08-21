@@ -26,6 +26,45 @@ fn merge_topic_config(
         .collect()
 }
 
+/// `true` once `replication` is too low to ever satisfy the producer's
+/// hardcoded `acks=all` on a cluster with a non-default (≥ 2)
+/// `min.insync.replicas` — see `warn_if_under_replicated_for_acks_all`.
+fn under_replicated_for_acks_all(replication: i32) -> bool {
+    replication < 2
+}
+
+/// Warn once per `declare()` call when auto-creating topic(s) at the RF=1
+/// default while the producer hardcodes `acks=all` (see
+/// `KafkaClient::connect`'s `sec-K-10` comment) — the pairing is a footgun:
+/// on any cluster whose `min.insync.replicas` is >= 2 (a common production
+/// default), a produce to an RF=1 topic can never satisfy `acks=all` and
+/// surfaces only as a bare `MessageTimedOut`, with no hint that the actual
+/// cause is under-replication. `create_topic` is also idempotent and won't
+/// raise an existing topic's replication once created, so this is easy to
+/// overlook locally (RF=1 works fine on a single-broker dev cluster) and
+/// only bites in production.
+///
+/// Deliberately does not query the cluster's actual `min.insync.replicas`
+/// (an extra admin round trip) — this is a blunt, unconditional nudge
+/// toward `with_replication_factor(n ≥ 2)`.
+///
+/// A free function rather than a method so it is reachable from unit tests
+/// without standing up a `KafkaClient`.
+fn warn_if_under_replicated_for_acks_all(queue: &str, replication: i32) {
+    if under_replicated_for_acks_all(replication) {
+        tracing::warn!(
+            queue,
+            replication_factor = replication,
+            "auto-creating Kafka topic(s) at replication_factor=1 while the producer \
+             requires acks=all — on any cluster with min.insync.replicas >= 2 this topic \
+             can never satisfy a produce and every send will time out as a bare \
+             MessageTimedOut with no hint of the real cause. Call \
+             KafkaTopologyDeclarer::with_replication_factor(n) with n >= 2 to match your \
+             cluster's min.insync.replicas, or ignore this on a single-broker dev cluster."
+        );
+    }
+}
+
 pub struct KafkaTopologyDeclarer {
     client: KafkaClient,
     /// Minimum number of partitions for the main topic.
@@ -196,6 +235,7 @@ impl KafkaTopologyDeclarer {
                  hold-queue topics declared"
             );
         }
+        warn_if_under_replicated_for_acks_all(topology.queue(), self.effective_replication());
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {
@@ -206,7 +246,90 @@ impl KafkaTopologyDeclarer {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_topic_config;
+    use super::{
+        merge_topic_config, under_replicated_for_acks_all, warn_if_under_replicated_for_acks_all,
+    };
+
+    #[test]
+    fn under_replicated_for_acks_all_flags_rf1() {
+        assert!(under_replicated_for_acks_all(1));
+    }
+
+    #[test]
+    fn under_replicated_for_acks_all_accepts_rf2_and_above() {
+        assert!(!under_replicated_for_acks_all(2));
+        assert!(!under_replicated_for_acks_all(3));
+    }
+
+    /// RF=1 takes the warning arm. There is no subscriber installed here, so
+    /// this asserts the call is total (does not panic) and covers the
+    /// `tracing::warn!` body — the emitted event itself is asserted in
+    /// `warn_if_under_replicated_for_acks_all_emits_event_for_rf1`.
+    #[test]
+    fn warn_if_under_replicated_for_acks_all_warns_on_rf1() {
+        warn_if_under_replicated_for_acks_all("kafka-under-replicated", 1);
+    }
+
+    /// RF >= 2 takes the silent arm.
+    #[test]
+    fn warn_if_under_replicated_for_acks_all_is_silent_from_rf2() {
+        warn_if_under_replicated_for_acks_all("kafka-replicated", 2);
+        warn_if_under_replicated_for_acks_all("kafka-replicated", 3);
+    }
+
+    /// The RF=1 arm actually emits a WARN carrying the queue and the
+    /// offending replication factor, and the RF>=2 arm emits nothing — the
+    /// warning is the entire deliverable of this code path, so assert on the
+    /// event rather than just on non-panicking.
+    #[test]
+    fn warn_if_under_replicated_for_acks_all_emits_event_for_rf1() {
+        use std::fmt::Debug;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        /// Collects `"<queue>@<replication_factor>"` for every WARN event.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<String>>>);
+
+        impl Visit for Captured {
+            fn record_debug(&mut self, _: &Field, _: &dyn Debug) {}
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                if field.name() == "replication_factor" {
+                    self.0.lock().unwrap().push(format!("@{value}"));
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "queue" {
+                    self.0.lock().unwrap().push(value.to_string());
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for Captured {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    event.record(&mut self.clone());
+                }
+            }
+        }
+
+        let captured = Captured::default();
+        with_default(
+            tracing_subscriber::registry().with(captured.clone()),
+            || {
+                warn_if_under_replicated_for_acks_all("kafka-rf1", 1);
+                warn_if_under_replicated_for_acks_all("kafka-rf3", 3);
+            },
+        );
+
+        // Only the RF=1 call emits, and it carries both fields.
+        assert_eq!(
+            captured.0.lock().unwrap().as_slice(),
+            &["kafka-rf1".to_string(), "@1".to_string()]
+        );
+    }
 
     fn cfg(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
