@@ -55,6 +55,18 @@ use super::consumer_group::KafkaAutoOffsetReset;
 // Offset tracking for concurrent consumption
 // ---------------------------------------------------------------------------
 
+/// Consecutive quiet drains (see `PartitionTracker::drain_committable`) after
+/// which a re-offered commit is assumed to have landed, resolving the
+/// partition's dirty streak.
+///
+/// Must be >= 2: at 1 this degenerates into "clear on the first quiet tick",
+/// which resets a genuinely wedged partition's streak on every iteration and
+/// stops it ever reaching `COMMIT_FENCE_TIMEOUT`. At 2, the tolerated window
+/// is 2 × `HOUSEKEEPING_INTERVAL` — comfortably longer than a commit round
+/// trip, and far inside the fence threshold, so a wedged partition still
+/// trips it on schedule.
+const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
+
 struct PartitionTracker {
     /// Next offset to commit (exclusive — Kafka convention).
     next_to_commit: i64,
@@ -75,6 +87,11 @@ struct PartitionTracker {
     /// intervening rebalance is exactly the "commits rejected, group never
     /// recovers" signature: `PartitionTracker::stuck_for`.
     dirty_since: Option<Instant>,
+    /// Consecutive `drain_committable` calls entered with `dirty == false`.
+    /// See `QUIET_DRAINS_TO_RESOLVE` — this is what lets a *recovered*
+    /// partition clear `dirty_since`, which a successful commit cannot do on
+    /// its own because it is silent.
+    quiet_drains: u32,
 }
 
 impl PartitionTracker {
@@ -84,6 +101,7 @@ impl PartitionTracker {
             completed: BTreeSet::new(),
             dirty: false,
             dirty_since: None,
+            quiet_drains: 0,
         }
     }
 
@@ -103,20 +121,25 @@ impl PartitionTracker {
     /// the start of the unresolved streak if one isn't already in progress.
     fn mark_dirty(&mut self, now: Instant) {
         self.dirty = true;
+        self.quiet_drains = 0;
         self.dirty_since.get_or_insert(now);
     }
 
     /// Returns the offset to commit if progress was made (or a failed commit
     /// needs to be retried — see `dirty`), or None.
     ///
-    /// Deliberately does **not** clear `dirty_since` just because this drain
-    /// found nothing to retry: `commit_callback` only fires on failure (see
-    /// its doc comment), so an async commit's round trip can easily outlast
-    /// one loop iteration — clearing on the first quiet tick would let a
-    /// genuinely wedged partition's streak keep getting reset just before
-    /// each new failure lands, never reaching the fenced threshold. Only a
-    /// resolving rebalance (revoke + reassign, which drops and recreates
-    /// this tracker — see `OffsetTracker::remove`) counts as resolved.
+    /// Deliberately does **not** clear `dirty_since` on the *first* drain
+    /// that finds nothing to retry: `commit_callback` only fires on failure
+    /// (see its doc comment), so an async commit's round trip can easily
+    /// outlast one loop iteration — clearing on the first quiet tick would
+    /// let a genuinely wedged partition's streak get reset just before each
+    /// new failure lands, so it would never reach the fenced threshold.
+    /// `QUIET_DRAINS_TO_RESOLVE` consecutive quiet drains, on the other
+    /// hand, are long enough that a re-offered commit must have landed, and
+    /// clearing there is what stops a *recovered* partition from aging into
+    /// a false fence (a successful commit is silent, so it cannot clear the
+    /// streak itself). A resolving rebalance also clears it, by dropping and
+    /// recreating this tracker — see `OffsetTracker::remove`.
     fn drain_committable(&mut self) -> Option<i64> {
         let mut next = self.next_to_commit;
         while self.completed.remove(&next) {
@@ -125,6 +148,14 @@ impl PartitionTracker {
         let progressed = next > self.next_to_commit;
         let retry = self.dirty;
         self.dirty = false;
+        if retry {
+            self.quiet_drains = 0;
+        } else {
+            self.quiet_drains = self.quiet_drains.saturating_add(1);
+            if self.quiet_drains >= QUIET_DRAINS_TO_RESOLVE {
+                self.dirty_since = None;
+            }
+        }
         if progressed {
             self.next_to_commit = next;
         }
@@ -2585,12 +2616,13 @@ mod offset_tracker_tests {
         );
     }
 
-    /// A commit re-offer that isn't followed by another failure resolves the
-    /// streak: `drain_committable` seeing `dirty == false` on entry clears
-    /// `dirty_since`, so a later, unrelated failure starts a fresh streak
-    /// rather than inheriting the old one's age.
+    /// A *single* quiet drain does not resolve the streak: `commit_callback`
+    /// only fires on failure, so silence one iteration after a re-offer is
+    /// not yet evidence of success — a genuinely wedged partition looks
+    /// identical at this point, and its next failure callback may not land
+    /// for another iteration.
     #[test]
-    fn fenced_streak_survives_a_quiet_drain_with_no_new_failure() {
+    fn fenced_streak_survives_a_single_quiet_drain() {
         let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
@@ -2599,17 +2631,85 @@ mod offset_tracker_tests {
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
         tracker.apply_rebalance_events(&rx, t0);
         let _ = tracker.drain_committable(); // re-offers the failed commit
+        let _ = tracker.drain_committable(); // 1st quiet drain: not yet resolved
 
-        // A quiet drain with no new CommitFailed does NOT resolve the streak:
-        // `commit_callback` only fires on failure, so silence this soon
-        // after a re-offer is not yet evidence of success — a genuinely
-        // wedged partition looks identical at this point, and its next
-        // failure callback may not land for a while yet.
-        let _ = tracker.drain_committable();
         assert_eq!(
             tracker.fenced(t0 + Duration::from_secs(61), Duration::from_secs(60)),
             Some(0),
-            "streak must keep aging through quiet drains with no resolving rebalance"
+            "one quiet drain is within a commit round trip; streak must keep aging"
+        );
+    }
+
+    /// A partition whose re-offered commit actually landed must NOT age into
+    /// a fence. Success is silent (`commit_callback` fires only on failure),
+    /// so `QUIET_DRAINS_TO_RESOLVE` consecutive quiet drains are what stand
+    /// in for the missing positive ack.
+    ///
+    /// Regression: `dirty_since` was previously only ever cleared by a
+    /// resolving rebalance, so a single transient rejection on an otherwise
+    /// healthy consumer forced a spurious reconnect exactly
+    /// `COMMIT_FENCE_TIMEOUT` later — rebalances are rare in a stable group,
+    /// so nothing intervened.
+    #[test]
+    fn fenced_does_not_fire_after_a_transient_failure_recovers() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+        let _ = tracker.drain_committable(); // re-offers; this one succeeds
+
+        // Two consecutive quiet drains: the re-offer must have landed.
+        for _ in 0..QUIET_DRAINS_TO_RESOLVE {
+            let _ = tracker.drain_committable();
+        }
+
+        assert_eq!(
+            tracker.fenced(t0 + Duration::from_secs(61), Duration::from_secs(60)),
+            None,
+            "a recovered partition must not be reported as fenced"
+        );
+        assert_eq!(
+            tracker.fenced(t0 + Duration::from_secs(86_400), Duration::from_secs(60)),
+            None,
+            "and must not age into one later either"
+        );
+    }
+
+    /// After a recovery, a later unrelated failure starts a *fresh* streak
+    /// rather than inheriting the resolved one's age — otherwise the first
+    /// rejection after a long healthy period would fence the consumer
+    /// instantly.
+    #[test]
+    fn fenced_measures_a_later_failure_from_its_own_start() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+        let _ = tracker.drain_committable();
+        for _ in 0..QUIET_DRAINS_TO_RESOLVE {
+            let _ = tracker.drain_committable();
+        }
+
+        // An unrelated rejection an hour later.
+        let t1 = t0 + Duration::from_secs(3_600);
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t1);
+
+        assert_eq!(
+            tracker.fenced(t1 + Duration::from_secs(30), Duration::from_secs(60)),
+            None,
+            "the new streak is 30s old, not an hour"
+        );
+        assert_eq!(
+            tracker.fenced(t1 + Duration::from_secs(61), Duration::from_secs(60)),
+            Some(0),
+            "and still fences once the new streak itself crosses the threshold"
         );
     }
 
