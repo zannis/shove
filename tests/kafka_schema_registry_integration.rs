@@ -889,6 +889,25 @@ async fn cp_real_schema_registry_e2e() {
             handler.counter.wait_for(2, TIMEOUT).await,
             "batch: both framed messages should be decoded and delivered"
         );
+
+        // The unframed payload must be parked in the DLQ, not silently dropped
+        // from the batch. The publish happens as the batch's offsets commit, so
+        // read it before shutting the consumer down.
+        let dlq_topic = BatchTopic::topology().dlq().expect("BatchTopic DLQ");
+        let (dead_payload, dead_reason) = read_dlq(&client, dlq_topic)
+            .await
+            .expect("batch: the unframed payload should land in the DLQ");
+        assert_eq!(
+            dead_payload,
+            br#"{"id":"unframed","qty":3}"#.to_vec(),
+            "batch: DLQ should carry the original unframed bytes"
+        );
+        assert_eq!(
+            dead_reason.as_deref(),
+            Some("schema_frame_invalid"),
+            "batch: DLQ death reason must name the frame strip"
+        );
+
         shutdown.cancel();
         handle.await.unwrap().ok();
 
