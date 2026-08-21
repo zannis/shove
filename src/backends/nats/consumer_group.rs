@@ -127,7 +127,20 @@ impl NatsConsumerGroupConfig {
     /// mode). Set this consistently with any external tuning of prefetch —
     /// a value smaller than the group's live concurrency starves consumers
     /// of ack slots.
+    ///
+    /// Pass `-1` for an unbounded budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `n` is positive or exactly `-1`. `0` is rejected
+    /// rather than forwarded: JetStream treats a zero `max_ack_pending` as
+    /// "unset" and silently substitutes the server default (1000), which
+    /// looks like a working override while quietly ignoring it.
     pub fn with_max_ack_pending(mut self, n: i64) -> Self {
+        assert!(
+            n > 0 || n == -1,
+            "max_ack_pending ({n}) must be positive, or -1 for unbounded"
+        );
         self.max_ack_pending = Some(n);
         self
     }
@@ -1403,6 +1416,40 @@ mod tests {
         assert_eq!(aggregate_max_ack_pending(&concurrent), 40);
     }
 
+    /// The config getter alone does not pin the fix: `spawn_one` has to copy
+    /// the bound onto each per-task `ConsumerOptions`, or group consumers
+    /// reconnect forever no matter what the caller configured.
+    #[tokio::test]
+    async fn spawn_one_threads_max_reconnect_attempts_to_options() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<Option<u32>>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            *cap.lock().unwrap() = Some(options.max_reconnect_attempts);
+            tokio::spawn(async move { options.shutdown.cancelled().await })
+        });
+        let config = NatsConsumerGroupConfig::new(1..=1).with_max_reconnect_attempts(3);
+        let mut group = test_group_with_spawner(config, spawner);
+        group.start();
+        assert_eq!(*captured.lock().unwrap(), Some(Some(3)));
+        group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_one_leaves_max_reconnect_attempts_unbounded_by_default() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<Option<u32>>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let spawner: Spawner = Arc::new(move |options: ConsumerOptions| {
+            *cap.lock().unwrap() = Some(options.max_reconnect_attempts);
+            tokio::spawn(async move { options.shutdown.cancelled().await })
+        });
+        let mut group = test_group_with_spawner(NatsConsumerGroupConfig::new(1..=1), spawner);
+        group.start();
+        assert_eq!(*captured.lock().unwrap(), Some(None));
+        group.shutdown().await;
+    }
+
     // -- config validation --
 
     #[test]
@@ -1410,6 +1457,24 @@ mod tests {
     #[allow(clippy::reversed_empty_ranges)]
     fn new_panics_if_min_greater_than_max() {
         let _ = NatsConsumerGroupConfig::new(5..=2);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_ack_pending (0) must be positive")]
+    fn with_max_ack_pending_panics_on_zero() {
+        let _ = NatsConsumerGroupConfig::new(1..=4).with_max_ack_pending(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_ack_pending (-2) must be positive")]
+    fn with_max_ack_pending_panics_on_negative_other_than_unbounded() {
+        let _ = NatsConsumerGroupConfig::new(1..=4).with_max_ack_pending(-2);
+    }
+
+    #[test]
+    fn with_max_ack_pending_allows_unbounded_sentinel() {
+        let config = NatsConsumerGroupConfig::new(1..=4).with_max_ack_pending(-1);
+        assert_eq!(aggregate_max_ack_pending(&config), -1);
     }
 
     // -- handler timeout tri-state --
