@@ -1130,8 +1130,23 @@ const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Timeout for `seek_partitions` when redelivering an un-acked batch.
 const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Flat delay after redelivering a batch — see `flush_batch`'s non-Ack arm.
-const BATCH_REDELIVERY_BACKOFF: Duration = Duration::from_secs(1);
+/// First delay after redelivering an un-acked batch, escalating to
+/// [`BATCH_REDELIVERY_BACKOFF_MAX`] — see `flush_batch`'s non-Ack arm.
+const BATCH_REDELIVERY_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Ceiling on the redelivery delay for a handler that keeps returning non-Ack.
+const BATCH_REDELIVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Redelivery backoff schedule for a batch the handler did not Ack. Escalates
+/// across *consecutive* non-Ack flushes and is reset on the first Ack, so a
+/// wedged handler backs off instead of spinning the seek-then-recv cycle while
+/// a handler that merely hit one bad batch pays the delay once.
+fn batch_redelivery_backoff() -> Backoff {
+    Backoff::new(
+        BATCH_REDELIVERY_BACKOFF_INITIAL,
+        BATCH_REDELIVERY_BACKOFF_MAX,
+    )
+}
 
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
@@ -1276,45 +1291,98 @@ impl BatchConsumerOptions {
     }
 }
 
+/// The parts of a batch flush that don't change between flushes.
+struct BatchFlushCtx<'a> {
+    consumer: &'a KafkaStreamConsumer,
+    queue: &'a str,
+    topic: &'a str,
+    group: Option<&'a str>,
+    /// Cuts the redelivery backoff short so a wedged handler cannot hold up
+    /// shutdown for the whole (escalated) delay.
+    shutdown: &'a CancellationToken,
+}
+
+/// Commits each partition's exclusive end offset in one batched sync commit.
+fn commit_batch_end(
+    consumer: &KafkaStreamConsumer,
+    queue: &str,
+    batch_end: &HashMap<i32, i64>,
+) -> Result<()> {
+    let mut tpl = TopicPartitionList::new();
+    for (&partition, &end_offset) in batch_end {
+        tpl.add_partition_offset(queue, partition, Offset::Offset(end_offset))
+            .ok();
+    }
+    consumer
+        .commit(&tpl, CommitMode::Sync)
+        .map_err(|e| map_kafka_error("batch commit failed", e))
+}
+
 /// Hands `batch` to the handler and applies the single returned `Outcome`:
 /// `Ack` commits every partition's end offset in `batch_end` in one batched
 /// commit; anything else seeks every partition back to `batch_start` so the
 /// whole batch is re-delivered on the next `recv()` instead of being
 /// silently skipped (offsets were never committed, but this consumer keeps
 /// polling forward without a seek).
-#[allow(clippy::too_many_arguments)]
+///
+/// `batch` may be empty while `batch_end` is not: every message in the offset
+/// span was dropped before the handler (oversize / undeserializable). There is
+/// nothing to hand over, but those offsets still get committed — see the
+/// empty-batch arm.
+///
+/// `redelivery_backoff` escalates across consecutive non-Ack flushes and is
+/// reset here on Ack.
 async fn flush_batch<T, H>(
-    consumer: &KafkaStreamConsumer,
+    flush: &BatchFlushCtx<'_>,
     handler: &H,
     ctx: &H::Context,
-    queue: &str,
     batch: Vec<(T::Message, MessageMetadata)>,
     batch_start: &HashMap<i32, i64>,
     batch_end: &HashMap<i32, i64>,
+    redelivery_backoff: &mut Backoff,
 ) -> Result<()>
 where
     T: Topic,
     H: BatchMessageHandler<T>,
 {
+    let BatchFlushCtx {
+        consumer,
+        queue,
+        topic,
+        group,
+        shutdown,
+    } = *flush;
     let batch_size = batch.len();
+
+    // Every message in this span was dropped pre-handler. The offsets must
+    // still be committed: leaving them uncommitted replays the same poison on
+    // every restart, and a poll window that is *entirely* poison would never
+    // commit anything at all — the consumer would make no forward progress
+    // across restarts, forever.
+    if batch_size == 0 {
+        if batch_end.is_empty() {
+            return Ok(());
+        }
+        commit_batch_end(consumer, queue, batch_end)?;
+        tracing::debug!(queue, "committed offsets past a fully-dropped batch");
+        return Ok(());
+    }
+
     let outcome = handler.handle_batch(batch, ctx).await;
+    metrics::record_consumed_n(topic, group, &outcome, batch_size as u64);
     match outcome {
         Outcome::Ack => {
-            let mut tpl = TopicPartitionList::new();
-            for (&partition, &end_offset) in batch_end {
-                tpl.add_partition_offset(queue, partition, Offset::Offset(end_offset))
-                    .ok();
-            }
-            consumer
-                .commit(&tpl, CommitMode::Sync)
-                .map_err(|e| map_kafka_error("batch commit failed", e))?;
+            commit_batch_end(consumer, queue, batch_end)?;
+            *redelivery_backoff = batch_redelivery_backoff();
             tracing::debug!(queue, batch_size, "batch committed");
         }
         other => {
+            let delay = redelivery_backoff.next().expect("backoff is infinite");
             tracing::warn!(
                 queue,
                 batch_size,
                 outcome = ?other,
+                delay_ms = delay.as_millis() as u64,
                 "batch handler returned a non-Ack outcome, redelivering the whole batch"
             );
             let mut tpl = TopicPartitionList::new();
@@ -1325,16 +1393,78 @@ where
             consumer
                 .seek_partitions(tpl, SEEK_TIMEOUT)
                 .map_err(|e| map_kafka_error("batch seek-for-redelivery failed", e))?;
-            // No per-batch retry counter or backoff schedule exists at this
-            // level (see the type's doc comment) — a handler stuck
-            // returning non-Ack would otherwise spin the seek-then-recv
-            // cycle with zero delay. This flat delay is deliberately not
-            // configurable in v1; a real backoff schedule is a natural
-            // follow-up once per-message batch outcomes exist.
-            tokio::time::sleep(BATCH_REDELIVERY_BACKOFF).await;
+            // There is no per-batch retry counter or DLQ route at this level
+            // (see the type's doc comment), so a handler stuck returning
+            // non-Ack redelivers the same batch forever. The escalating delay
+            // bounds the spin; `messages_consumed_total{outcome="retry"}`
+            // climbing with no matching `outcome="ack"` is the alertable
+            // signal that it is wedged. Shutdown cuts the delay short —
+            // otherwise a wedged handler would add up to
+            // `BATCH_REDELIVERY_BACKOFF_MAX` to every stop.
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = shutdown.cancelled() => {}
+            }
         }
     }
     Ok(())
+}
+
+/// Drains librdkafka's rebalance / commit-failure events, returning whether
+/// any arrived.
+///
+/// The callbacks already log the assignment change itself, so this only
+/// reports *that* ownership moved. Any such event invalidates the in-flight
+/// batch: a commit would be rejected for a stale generation, and part of the
+/// offset span may belong to a partition this member no longer owns. Callers
+/// abandon the whole batch rather than the revoked partitions' slice of it —
+/// see [`rewind_after_rebalance`] for why that is still lossless.
+fn drain_batch_rebalance_events(rx: &std_mpsc::Receiver<RebalanceEvent>) -> bool {
+    let mut seen = false;
+    while rx.try_recv().is_ok() {
+        seen = true;
+    }
+    seen
+}
+
+/// Rewinds every partition of an abandoned in-flight batch to `batch_start`,
+/// best-effort and independently per partition.
+///
+/// This consumer runs `partition.assignment.strategy=cooperative-sticky`, so a
+/// rebalance revokes only *some* partitions and leaves the rest assigned with
+/// their fetch position untouched. Dropping the batch without rewinding would
+/// therefore **lose** the retained partitions' consumed-but-uncommitted
+/// messages: nothing committed them, the position has already advanced past
+/// them, and no other member will ever be assigned them. Seeking back makes
+/// them redeliver.
+///
+/// The seek fails for partitions that *were* revoked; that is expected and only
+/// logged, because the member taking them over resumes from the last committed
+/// offset on its own. Each partition is sought separately so one revoked
+/// partition's failure cannot stop a retained partition from rewinding.
+fn rewind_after_rebalance(
+    consumer: &KafkaStreamConsumer,
+    queue: &str,
+    batch_start: &HashMap<i32, i64>,
+) {
+    for (&partition, &start_offset) in batch_start {
+        let mut tpl = TopicPartitionList::new();
+        if tpl
+            .add_partition_offset(queue, partition, Offset::Offset(start_offset))
+            .is_err()
+        {
+            continue;
+        }
+        if let Err(e) = consumer.seek_partitions(tpl, SEEK_TIMEOUT) {
+            tracing::debug!(
+                error = %e,
+                queue,
+                partition,
+                start_offset,
+                "rewind after rebalance failed; the partition was most likely revoked"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1858,6 +1988,12 @@ impl KafkaConsumer {
     /// - A message that fails to deserialize or exceeds
     ///   `options.max_message_size` is dropped from the batch (logged and
     ///   counted via `metrics::FailReason`) rather than DLQ'd individually.
+    ///   Its offset is still committed with the batch, so poison does not
+    ///   replay forever — but the payload is gone, not parked in a DLQ.
+    /// - A rebalance abandons the whole in-flight batch uncommitted and rewinds
+    ///   the partitions this member keeps, so every message is redelivered —
+    ///   to this consumer for retained partitions, to the new owner for revoked
+    ///   ones. Expect duplicates across a rebalance, never loss.
     /// - No FIFO/sequenced variant.
     pub async fn run_batch<T, H>(
         &self,
@@ -1906,7 +2042,7 @@ impl KafkaConsumer {
             let topic = topic.clone();
             let group = group.clone();
             async move {
-                let (rebalance_tx, _rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
+                let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
                 let consumer = create_stream_consumer(
                     client.base_config(),
                     &group_id,
@@ -1920,6 +2056,14 @@ impl KafkaConsumer {
                     .subscribe(&[queue])
                     .map_err(|e| map_kafka_error("failed to subscribe", e))?;
 
+                let flush_ctx = BatchFlushCtx {
+                    consumer: &consumer,
+                    queue,
+                    topic: topic.as_ref(),
+                    group: group.as_deref(),
+                    shutdown: &shutdown,
+                };
+
                 let mut batch: Vec<(T::Message, MessageMetadata)> = Vec::with_capacity(max_batch_size);
                 // Exclusive end offset to commit per partition once the
                 // batch acks, and the same batch's start offset per
@@ -1928,8 +2072,33 @@ impl KafkaConsumer {
                 let mut batch_end: HashMap<i32, i64> = HashMap::new();
                 let mut batch_start: HashMap<i32, i64> = HashMap::new();
                 let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+                let mut redelivery_backoff = batch_redelivery_backoff();
+
+                // Wakes the loop when neither a message nor the batch deadline
+                // will, so a rebalance that arrives while the topic is idle is
+                // still noticed promptly.
+                let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+                housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {
+                    if drain_batch_rebalance_events(&rebalance_rx)
+                        && (!batch.is_empty() || !batch_end.is_empty())
+                    {
+                        tracing::warn!(
+                            queue,
+                            batch_size = batch.len(),
+                            "group rebalanced mid-batch, abandoning the in-flight batch uncommitted"
+                        );
+                        // Rewind before clearing: under cooperative-sticky the
+                        // partitions this member *keeps* would otherwise have
+                        // their consumed-but-uncommitted messages skipped.
+                        rewind_after_rebalance(&consumer, queue, &batch_start);
+                        batch.clear();
+                        batch_start.clear();
+                        batch_end.clear();
+                        deadline = None;
+                    }
+
                     let sleep_until_deadline = async {
                         match deadline.as_mut() {
                             Some(d) => d.await,
@@ -1939,30 +2108,34 @@ impl KafkaConsumer {
 
                     tokio::select! {
                         _ = shutdown.cancelled() => {
-                            if !batch.is_empty() {
+                            if !batch.is_empty() || !batch_end.is_empty() {
                                 flush_batch(
-                                    &consumer,
+                                    &flush_ctx,
                                     handler.as_ref(),
                                     ctx.as_ref(),
-                                    queue,
                                     std::mem::take(&mut batch),
                                     &batch_start,
                                     &batch_end,
+                                    &mut redelivery_backoff,
                                 )
                                 .await?;
                             }
                             tracing::info!(queue, "shutdown signal received, batch consumer stopped");
                             return Ok(());
                         }
+                        _ = housekeeping.tick() => {
+                            // Nothing to do — the drain at the top of the next
+                            // iteration is the point of the wake-up.
+                        }
                         () = sleep_until_deadline => {
                             flush_batch(
-                                &consumer,
+                                &flush_ctx,
                                 handler.as_ref(),
                                 ctx.as_ref(),
-                                queue,
                                 std::mem::take(&mut batch),
                                 &batch_start,
                                 &batch_end,
+                                &mut redelivery_backoff,
                             )
                             .await?;
                             batch_start.clear();
@@ -1984,9 +2157,23 @@ impl KafkaConsumer {
                             let partition = msg.partition();
                             let offset = msg.offset();
                             let payload_slice = msg.payload().unwrap_or_default();
-                            let headers = extract_string_headers(&msg);
 
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
+
+                            // Extend the offset span *before* the drop checks
+                            // below. A message dropped pre-handler still has to
+                            // be committed past: leaving its offset out of
+                            // `batch_end` replays it after every restart, and a
+                            // window of nothing but poison would never commit
+                            // at all. Arming the deadline here — rather than
+                            // only once a message survives — is what guarantees
+                            // such an all-dropped window still reaches
+                            // `flush_batch` to have its offsets committed.
+                            batch_start.entry(partition).or_insert(offset);
+                            batch_end.insert(partition, offset + 1);
+                            if deadline.is_none() {
+                                deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
+                            }
 
                             if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
                                 tracing::warn!(error = %e, queue, partition, offset, "dropping oversized message from batch");
@@ -2003,23 +2190,19 @@ impl KafkaConsumer {
                                 }
                             };
 
+                            let headers = extract_string_headers(&msg);
                             let metadata = build_message_metadata(&headers, false);
-                            batch_start.entry(partition).or_insert(offset);
-                            batch_end.insert(partition, offset + 1);
                             batch.push((decoded, metadata));
 
-                            if deadline.is_none() {
-                                deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
-                            }
                             if batch.len() >= max_batch_size {
                                 flush_batch(
-                                    &consumer,
+                                    &flush_ctx,
                                     handler.as_ref(),
                                     ctx.as_ref(),
-                                    queue,
                                     std::mem::take(&mut batch),
                                     &batch_start,
                                     &batch_end,
+                                    &mut redelivery_backoff,
                                 )
                                 .await?;
                                 batch_start.clear();

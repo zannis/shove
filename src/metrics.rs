@@ -246,6 +246,27 @@ pub(crate) fn record_consumed(topic: &str, group: Option<&str>, outcome: &Outcom
 #[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
 
+/// `record_consumed` for a whole batch at once, so a batch consumer's
+/// `messages_consumed_total` counts *messages* (comparable with the
+/// single-message consumers) rather than flushes.
+#[cfg(feature = "metrics")]
+pub(crate) fn record_consumed_n(topic: &str, group: Option<&str>, outcome: &Outcome, count: u64) {
+    if count == 0 {
+        return;
+    }
+    ::metrics::counter!(
+        names().messages_consumed_total.as_str(),
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "outcome" => outcome_label(outcome),
+    )
+    .increment(count);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_consumed_n(_: &str, _: Option<&str>, _: &Outcome, _: u64) {}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason) {
     ::metrics::counter!(
