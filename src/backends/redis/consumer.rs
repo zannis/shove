@@ -1156,6 +1156,11 @@ async fn route_outcome(
             }
         }
         RetryDecision::Dlq { reason } => {
+            let fail_reason = match reason {
+                "rejected" => metrics::FailReason::Rejected,
+                _ => metrics::FailReason::MaxRetriesExceeded,
+            };
+            metrics::record_failed(topology.queue(), Some(group), fail_reason);
             // Preserve the pre-refactor death counts: max-retries recorded
             // `retry_count + 1`, reject recorded `retry_count`.
             let death_count = if reason == "rejected" {

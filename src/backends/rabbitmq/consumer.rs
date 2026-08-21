@@ -1010,8 +1010,15 @@ impl RabbitMqConsumer {
                         let msg = in_flight.pop_front().unwrap();
                         let retry_count = get_retry_count(&msg.received.delivery);
                         debug!(queue, ?outcome, "message handled (concurrent)");
-                        route_outcome(&msg.received, outcome, topology, &publisher, retry_count)
-                            .await?;
+                        route_outcome(
+                            &msg.received,
+                            outcome,
+                            topology,
+                            &publisher,
+                            retry_count,
+                            group.as_deref(),
+                        )
+                        .await?;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Closed) => {
@@ -1025,6 +1032,7 @@ impl RabbitMqConsumer {
                             topology,
                             &publisher,
                             retry_count,
+                            group.as_deref(),
                         )
                         .await?;
                     }
@@ -1054,6 +1062,7 @@ impl RabbitMqConsumer {
                             topology,
                             &publisher,
                             retry_count,
+                            group.as_deref(),
                         )
                         .await
                         .ok();
@@ -1074,6 +1083,11 @@ impl RabbitMqConsumer {
                         warn!(
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
+                        );
+                        metrics::record_failed(
+                            &topic,
+                            group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
                         );
                         router::route_reject(&received.delivery, topology, &publisher).await?;
                         continue;
@@ -1184,6 +1198,9 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     retry_count: u32,
+    // Consumer-group label propagated to `metrics::record_failed` on
+    // `Outcome::Reject` — matches Kafka/NATS/Redis `route_outcome`.
+    group: Option<&str>,
 ) -> Result<()> {
     let delivery = &received.delivery;
     match outcome {
@@ -1198,7 +1215,10 @@ async fn route_outcome(
             )
             .await
         }
-        Outcome::Reject => router::route_reject(delivery, topology, publisher).await,
+        Outcome::Reject => {
+            metrics::record_failed(topology.queue(), group, metrics::FailReason::Rejected);
+            router::route_reject(delivery, topology, publisher).await
+        }
         Outcome::Defer => {
             router::route_defer(delivery, &received.payload, topology, publisher).await
         }

@@ -709,9 +709,19 @@ async fn route_outcome(
     let retry_count = get_retry_count(&env.headers);
     match decide_retry(&outcome, retry_count, options.max_retries) {
         RetryDecision::Ack => {}
-        RetryDecision::Dlq { .. } => {
-            // In-memory's DLQ path is `route_reject` for both `Reject` and
-            // `max_retries_exceeded`; it does not differentiate the reason.
+        RetryDecision::Dlq { reason } => {
+            let fail_reason = match reason {
+                "rejected" => metrics::FailReason::Rejected,
+                _ => metrics::FailReason::MaxRetriesExceeded,
+            };
+            metrics::record_failed(
+                topology.queue(),
+                options.consumer_group.as_deref(),
+                fail_reason,
+            );
+            // In-memory's DLQ enqueue path is `route_reject` for both
+            // `Reject` and `max_retries_exceeded`; it does not differentiate
+            // the reason beyond the metric recorded above.
             route_reject(broker, topology, env).await;
         }
         RetryDecision::Hold { increment } => {

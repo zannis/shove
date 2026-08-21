@@ -303,6 +303,10 @@ async fn hold_then_republish(
 #[allow(clippy::too_many_arguments)]
 async fn route_outcome(
     client: &NatsClient,
+    // Consumer-group label propagated to `metrics::record_failed` on
+    // DLQ-terminal outcomes (max_retries_exceeded, Rejected). Matches the
+    // shape `invoke_handler` already uses, and Kafka's `route_outcome`.
+    group: Option<&str>,
     msg: &Message,
     outcome: Outcome,
     topology: &'static QueueTopology,
@@ -320,6 +324,11 @@ async fn route_outcome(
             return;
         }
         RetryDecision::Dlq { reason } => {
+            let fail_reason = match reason {
+                "rejected" => metrics::FailReason::Rejected,
+                _ => metrics::FailReason::MaxRetriesExceeded,
+            };
+            metrics::record_failed(topology.queue(), group, fail_reason);
             match publish_to_dlq(client, topology, msg, reason).await {
                 Ok(()) => {
                     if let Err(e) = msg.ack().await {
@@ -786,6 +795,7 @@ impl NatsConsumer {
 
                                 route_outcome(
                                     &task_client,
+                                    task_group.as_deref(),
                                     &msg,
                                     outcome,
                                     topology,
@@ -1137,6 +1147,7 @@ impl NatsConsumer {
 
                                     route_outcome(
                                         &shard_client,
+                                        shard_group.as_deref(),
                                         &msg,
                                         outcome,
                                         topology,

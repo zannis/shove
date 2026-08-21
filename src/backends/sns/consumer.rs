@@ -390,6 +390,7 @@ where
                         outcome,
                         topology,
                         msg.retry_count,
+                        group.as_deref(),
                     )
                     .await;
                 }
@@ -415,6 +416,7 @@ where
                         Outcome::Retry,
                         topology,
                         msg.retry_count,
+                        group.as_deref(),
                     )
                     .await;
                 }
@@ -474,6 +476,7 @@ where
                         outcome,
                         topology,
                         pending.retry_count,
+                        group.as_deref(),
                     )
                     .await;
                 }
@@ -508,6 +511,11 @@ where
                     retry_count,
                     max_retries = options.max_retries,
                     "message exceeded max retries, rejecting"
+                );
+                metrics::record_failed(
+                    &topic,
+                    group.as_deref(),
+                    metrics::FailReason::MaxRetriesExceeded,
                 );
                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
@@ -652,6 +660,7 @@ where
 ///
 /// `body` and `message_attributes` are accessed lazily: only the Retry and
 /// Defer arms need them, so the common Ack path pays no extraction cost.
+#[allow(clippy::too_many_arguments)]
 async fn route_outcome(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
@@ -660,6 +669,9 @@ async fn route_outcome(
     outcome: Outcome,
     topology: &'static QueueTopology,
     retry_count: u32,
+    // Consumer-group label propagated to `metrics::record_failed` on
+    // `Outcome::Reject` — matches Kafka/NATS/Redis/RabbitMQ `route_outcome`.
+    group: Option<&str>,
 ) {
     match outcome {
         Outcome::Ack => router::route_ack(sqs, queue_url, receipt_handle).await,
@@ -678,7 +690,10 @@ async fn route_outcome(
             )
             .await;
         }
-        Outcome::Reject => router::route_reject(sqs, queue_url, receipt_handle, topology).await,
+        Outcome::Reject => {
+            metrics::record_failed(topology.queue(), group, metrics::FailReason::Rejected);
+            router::route_reject(sqs, queue_url, receipt_handle, topology).await
+        }
         Outcome::Defer => {
             let body = msg.body().unwrap_or_default();
             let empty_attrs = HashMap::new();
