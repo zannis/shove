@@ -471,7 +471,23 @@ impl ConsumerOptions<Sqs> {
 #[cfg_attr(docsrs, doc(cfg(feature = "nats")))]
 impl ConsumerOptions<Nats> {
     /// Override the durable consumer's `max_ack_pending`.
+    ///
+    /// Pass `-1` for an unbounded budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `n` is positive or exactly `-1`, matching
+    /// [`NatsConsumerGroupConfig::with_max_ack_pending`](
+    /// crate::backends::nats::NatsConsumerGroupConfig::with_max_ack_pending).
+    /// `0` is rejected rather than forwarded: JetStream treats a zero
+    /// `max_ack_pending` as "unset" and silently substitutes the server
+    /// default (1000), which looks like a working override while quietly
+    /// ignoring it.
     pub fn with_max_ack_pending(mut self, n: i64) -> Self {
+        assert!(
+            n > 0 || n == -1,
+            "max_ack_pending ({n}) must be positive, or -1 for unbounded"
+        );
         self.max_ack_pending = Some(n);
         self
     }
@@ -950,6 +966,27 @@ mod tests {
     fn nats_with_max_ack_pending_sets_value() {
         let opts = ConsumerOptions::<Nats>::new().with_max_ack_pending(128);
         assert_eq!(opts.max_ack_pending, Some(128));
+    }
+
+    #[cfg(feature = "nats")]
+    #[test]
+    fn nats_with_max_ack_pending_allows_unbounded_sentinel() {
+        let opts = ConsumerOptions::<Nats>::new().with_max_ack_pending(-1);
+        assert_eq!(opts.max_ack_pending, Some(-1));
+    }
+
+    #[cfg(feature = "nats")]
+    #[test]
+    #[should_panic(expected = "max_ack_pending (0) must be positive")]
+    fn nats_with_max_ack_pending_panics_on_zero() {
+        let _ = ConsumerOptions::<Nats>::new().with_max_ack_pending(0);
+    }
+
+    #[cfg(feature = "nats")]
+    #[test]
+    #[should_panic(expected = "max_ack_pending (-2) must be positive")]
+    fn nats_with_max_ack_pending_panics_on_negative_other_than_unbounded() {
+        let _ = ConsumerOptions::<Nats>::new().with_max_ack_pending(-2);
     }
 
     #[test]
