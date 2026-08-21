@@ -76,7 +76,7 @@ shove::define_topic!(
 shove::define_topic!(
     OversizeTopic,
     BatchMessage,
-    TopologyBuilder::new("kafka-batch-oversize").build()
+    TopologyBuilder::new("kafka-batch-oversize").dlq().build()
 );
 
 shove::define_topic!(
@@ -95,6 +95,20 @@ shove::define_topic!(
     BatchDlqTopic,
     BatchMessage,
     TopologyBuilder::new("kafka-batch-dlq").dlq().build()
+);
+
+shove::define_topic!(
+    RejectTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-reject").dlq().build()
+);
+
+shove::define_topic!(
+    PoisonRetryTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-poison-retry")
+        .dlq()
+        .build()
 );
 
 // ---------------------------------------------------------------------------
@@ -161,6 +175,18 @@ async fn publish_raw(brokers: &str, topic: &str, payload: &[u8]) {
 /// payload failed to decode as `T::Message`, so a typed DLQ consumer would fail
 /// on it too. This reads the bytes back as bytes.
 async fn drain_raw(brokers: &str, topic: &str, expected: usize) -> Vec<Vec<u8>> {
+    drain_raw_within(brokers, topic, expected, TIMEOUT).await
+}
+
+/// `drain_raw` with an explicit deadline, for assertions about what *should
+/// not* be there: waiting the full `TIMEOUT` to prove a second copy never
+/// arrives would add a minute to the suite.
+async fn drain_raw_within(
+    brokers: &str,
+    topic: &str,
+    expected: usize,
+    timeout: Duration,
+) -> Vec<Vec<u8>> {
     use rdkafka::consumer::{Consumer, StreamConsumer};
     use rdkafka::message::Message;
 
@@ -174,7 +200,7 @@ async fn drain_raw(brokers: &str, topic: &str, expected: usize) -> Vec<Vec<u8>> 
     consumer.subscribe(&[topic]).expect("subscribe should work");
 
     let mut out = Vec::new();
-    let _ = tokio::time::timeout(TIMEOUT, async {
+    let _ = tokio::time::timeout(timeout, async {
         while out.len() < expected {
             if let Ok(msg) = consumer.recv().await {
                 out.push(msg.payload().unwrap_or_default().to_vec());
@@ -284,6 +310,8 @@ impl_recording_for!(
     ShutdownTopic,
     PoisonOnlyTopic,
     BatchDlqTopic,
+    RejectTopic,
+    PoisonRetryTopic,
 );
 
 async fn publish_seq<T>(broker: &Broker<Kafka>, range: std::ops::Range<u32>)
@@ -703,7 +731,7 @@ async fn undeserializable_batch_message_lands_in_dlq() {
 }
 
 /// A payload over `max_message_size` is dropped from the batch rather than
-/// failing the consumer.
+/// failing the consumer — and lands in the DLQ instead of being discarded.
 #[tokio::test]
 async fn oversized_message_is_dropped_from_the_batch() {
     let tb = TestBroker::start().await;
@@ -715,11 +743,12 @@ async fn oversized_message_is_dropped_from_the_batch() {
         .publish::<OversizeTopic>(&BatchMessage::new(0))
         .await
         .unwrap();
+    let oversized = BatchMessage {
+        seq: 1,
+        padding: "x".repeat(4096),
+    };
     publisher
-        .publish::<OversizeTopic>(&BatchMessage {
-            seq: 1,
-            padding: "x".repeat(4096),
-        })
+        .publish::<OversizeTopic>(&oversized)
         .await
         .unwrap();
     publisher
@@ -749,6 +778,16 @@ async fn oversized_message_is_dropped_from_the_batch() {
     });
 
     assert!(handler.wait_for_batches(1, TIMEOUT).await);
+
+    // Dropped from the batch is not the same as discarded: the payload must be
+    // recoverable from the DLQ, byte-for-byte.
+    let dead = drain_raw(&tb.brokers, "kafka-batch-oversize-dlq", 1).await;
+    assert_eq!(
+        dead,
+        vec![serde_json::to_vec(&oversized).unwrap()],
+        "the oversized payload should be preserved in the DLQ"
+    );
+
     tokio::time::sleep(Duration::from_millis(800)).await;
     shutdown.cancel();
     handle.await.unwrap().ok();
@@ -759,6 +798,119 @@ async fn oversized_message_is_dropped_from_the_batch() {
         seen,
         vec![0, 2],
         "the oversized message should be dropped, its neighbours kept"
+    );
+    broker.close().await;
+}
+
+/// `Outcome::Reject` is terminal on the batch path exactly as it is on the
+/// single-message path: the batch goes to the DLQ and its offsets commit,
+/// instead of being redelivered forever.
+#[tokio::test]
+async fn rejected_batch_lands_in_the_dlq_and_commits() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<RejectTopic>().await.unwrap();
+    publish_seq::<RejectTopic>(&broker, 0..3).await;
+
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Reject]);
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<RejectTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_millis(500))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(handler.wait_for_batches(1, TIMEOUT).await);
+
+    let mut dead = drain_raw(&tb.brokers, "kafka-batch-reject-dlq", 3).await;
+    dead.sort();
+    let mut expected: Vec<Vec<u8>> = (0..3)
+        .map(|seq| serde_json::to_vec(&BatchMessage::new(seq)).unwrap())
+        .collect();
+    expected.sort();
+    assert_eq!(dead, expected, "every rejected message belongs in the DLQ");
+
+    // Give a redelivery every chance to show up: the whole point is that the
+    // offsets committed, so the rejected batch never comes back.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        handler.batches().len(),
+        1,
+        "a rejected batch must not be redelivered, got {:?}",
+        handler.batches()
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    broker.close().await;
+}
+
+/// Poison is DLQ'd once per message, not once per redelivery of the batch it
+/// happened to sit in. The DLQ publish is deferred until the batch's offsets
+/// actually commit, so a `Retry` that seeks back over the same poison does not
+/// duplicate it.
+#[tokio::test]
+async fn poison_is_not_re_dlqd_on_every_batch_redelivery() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<PoisonRetryTopic>()
+        .await
+        .unwrap();
+
+    const POISON: &[u8] = b"{not valid json";
+    publish_seq::<PoisonRetryTopic>(&broker, 0..1).await;
+    publish_raw(&tb.brokers, "kafka-batch-poison-retry", POISON).await;
+    publish_seq::<PoisonRetryTopic>(&broker, 1..2).await;
+
+    // First flush retries the whole batch — including a seek back over the
+    // poison, which fails to decode a second time — then acks.
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Retry]);
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<PoisonRetryTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(500))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Two flushes: the retried one and the acked redelivery.
+    assert!(handler.wait_for_batches(2, TIMEOUT).await);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let dead = drain_raw_within(
+        &tb.brokers,
+        "kafka-batch-poison-retry-dlq",
+        2,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        dead,
+        vec![POISON.to_vec()],
+        "one bad message means one DLQ entry, however many times its batch was redelivered"
     );
     broker.close().await;
 }

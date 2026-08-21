@@ -1375,7 +1375,9 @@ impl BatchConsumerOptions {
 
 /// The parts of a batch flush that don't change between flushes.
 struct BatchFlushCtx<'a> {
-    consumer: &'a KafkaStreamConsumer,
+    consumer: &'a Arc<KafkaStreamConsumer>,
+    client: &'a KafkaClient,
+    topology: &'a QueueTopology,
     queue: &'a str,
     topic: &'a str,
     group: Option<&'a str>,
@@ -1385,25 +1387,37 @@ struct BatchFlushCtx<'a> {
 }
 
 /// Commits each partition's exclusive end offset in one batched sync commit.
-fn commit_batch_end(
-    consumer: &KafkaStreamConsumer,
+///
+/// The commit runs on a blocking thread: `CommitMode::Sync` is a blocking FFI
+/// call into `rd_kafka_commit(…, 0)` that waits a full broker round trip, and
+/// at the default 250 ms `max_batch_age` this fires ~4×/s — enough to park a
+/// runtime worker often enough to starve co-scheduled tasks. The single-message
+/// path can use `CommitMode::Async` because it has the `commit_callback`
+/// machinery to pick up failures; a batch commit has to report its error to the
+/// caller, so it stays synchronous and moves off the runtime instead.
+async fn commit_batch_end(
+    consumer: &Arc<KafkaStreamConsumer>,
     queue: &str,
     batch_end: &HashMap<i32, i64>,
 ) -> Result<()> {
     let mut tpl = TopicPartitionList::new();
     for (&partition, &end_offset) in batch_end {
+        // Not `.ok()`: a partition silently missing from the list is a
+        // partition whose offsets never commit, replaying the whole span on
+        // the next restart. Fail the flush instead and let the reconnect
+        // resume from the last committed offset.
         tpl.add_partition_offset(queue, partition, Offset::Offset(end_offset))
-            .ok();
+            .map_err(|e| map_kafka_error("batch commit offset list rejected a partition", e))?;
     }
-    consumer
-        .commit(&tpl, CommitMode::Sync)
+    let consumer = consumer.clone();
+    tokio::task::spawn_blocking(move || consumer.commit(&tpl, CommitMode::Sync))
+        .await
+        .map_err(|e| ShoveError::Connection(format!("batch commit task failed: {e}")))?
         .map_err(|e| map_kafka_error("batch commit failed", e))
 }
 
 /// The parts of a batch decode that don't change between messages.
 struct BatchDecodeCtx<'a> {
-    client: &'a KafkaClient,
-    topology: &'a QueueTopology,
     queue: &'a str,
     topic: &'a str,
     group: Option<&'a str>,
@@ -1415,24 +1429,32 @@ struct BatchDecodeCtx<'a> {
     schema_accepted: &'a [Arc<str>],
 }
 
+/// Outcome of decoding one message on its way into a batch.
+enum BatchDecode<M> {
+    Decoded(M),
+    /// Undecodable: park the wire bytes for the DLQ under this reason, to be
+    /// published once the batch's offsets commit.
+    Dlq(&'static str),
+}
+
 /// Decodes one message on its way into a batch, routing anything undecodable to
 /// the DLQ.
 ///
 /// This is the batch path's equivalent of the decode stage in `run_with_inner`,
 /// and deliberately matches it: with a registry configured the frame-strip +
 /// subject gate + inner-codec decode runs, otherwise `T::Codec` decodes the
-/// payload directly, and either way a failure is *published to the DLQ* rather
-/// than silently discarded. Batching changes when offsets are committed, not
-/// what happens to a poison message.
+/// payload directly, and either way a failure ends up *in the DLQ* rather than
+/// silently discarded. Batching changes when offsets are committed, not what
+/// happens to a poison message.
 ///
-/// Returns `None` when the message was dropped. The caller has already extended
-/// the batch's offset span, so a dropped message is still committed past.
+/// The failure metric is emitted here, at decode time; the DLQ publish itself
+/// is deferred to the commit — see [`BatchBuffer::pending_dlq`]. The caller has
+/// already extended the batch's offset span, so a dropped message is still
+/// committed past.
 async fn decode_batch_message<T: Topic>(
     dec: &BatchDecodeCtx<'_>,
     payload_slice: &[u8],
-    key: Option<&[u8]>,
-    headers: &HashMap<String, String>,
-) -> Option<T::Message> {
+) -> BatchDecode<T::Message> {
     #[cfg(feature = "kafka-schema-registry")]
     if let Some(registry) = dec.schema_registry {
         let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
@@ -1457,15 +1479,14 @@ async fn decode_batch_message<T: Topic>(
             }
         };
         return match registry_result {
-            Ok(RegistryDecode::Decoded(m)) => Some(m),
+            Ok(RegistryDecode::Decoded(m)) => BatchDecode::Decoded(m),
             Ok(RegistryDecode::Dlq(reason)) => {
                 metrics::record_failed(
                     dec.topic,
                     dec.group,
                     metrics::FailReason::for_schema_reason(reason),
                 );
-                dlq_batch_message(dec, payload_slice, key, headers, reason).await;
-                None
+                BatchDecode::Dlq(reason)
             }
             Err(e) => {
                 tracing::error!(
@@ -1474,14 +1495,13 @@ async fn decode_batch_message<T: Topic>(
                     "failed to deserialize batch message, sending to DLQ"
                 );
                 metrics::record_failed(dec.topic, dec.group, metrics::FailReason::Deserialize);
-                dlq_batch_message(dec, payload_slice, key, headers, "deserialization_error").await;
-                None
+                BatchDecode::Dlq("deserialization_error")
             }
         };
     }
 
     match <T::Codec as crate::Codec<T::Message>>::decode(payload_slice) {
-        Ok(m) => Some(m),
+        Ok(m) => BatchDecode::Decoded(m),
         Err(e) => {
             tracing::error!(
                 error = %e,
@@ -1489,64 +1509,176 @@ async fn decode_batch_message<T: Topic>(
                 "failed to deserialize batch message, sending to DLQ"
             );
             metrics::record_failed(dec.topic, dec.group, metrics::FailReason::Deserialize);
-            dlq_batch_message(dec, payload_slice, key, headers, "deserialization_error").await;
-            None
+            BatchDecode::Dlq("deserialization_error")
         }
     }
 }
 
-/// Publishes a dropped batch message to the DLQ, logging a failure to do so.
+/// The original wire bytes of one batched message.
 ///
-/// A DLQ publish failure is not propagated: the offset span has already been
-/// extended, so failing the whole batch here would stall forward progress on a
-/// message that is by definition unprocessable.
+/// Kept alongside the decoded message only when the topology declares a DLQ:
+/// the sole consumer is the `Outcome::Reject` arm of [`flush_batch`], which
+/// parks the batch in the DLQ byte-for-byte. With no DLQ configured there is
+/// nowhere for those bytes to go, so nothing is retained and a batch costs
+/// exactly what its decoded messages cost.
+#[derive(Clone)]
+struct RawMessage {
+    payload: Bytes,
+    key: Option<Bytes>,
+    headers: Arc<HashMap<String, String>>,
+}
+
+/// A message parked for the DLQ, published once the batch it belongs to
+/// commits — see [`BatchBuffer::pending_dlq`].
+struct PendingDlq {
+    raw: RawMessage,
+    reason: String,
+}
+
+/// The in-flight batch: the decoded messages destined for the handler, the
+/// offset span they cover, and the side buffers that make the flush's DLQ
+/// routing correct.
+struct BatchBuffer<T: Topic> {
+    messages: Vec<(T::Message, MessageMetadata)>,
+    /// Wire bytes, index-parallel to `messages`; empty when the topology has
+    /// no DLQ. See [`RawMessage`].
+    raw: Vec<RawMessage>,
+    /// Poison dropped before the handler (oversize / undecodable), held until
+    /// the batch's offsets actually commit.
+    ///
+    /// Publishing at drop time re-published the same payload on every
+    /// redelivery: a handler returning `Retry` seeks back over the poison,
+    /// which fails to decode again, so a sink that is down for ten minutes
+    /// turns one bad message into dozens of identical DLQ copies and the
+    /// dead-letter alert stops mapping to distinct bad messages. Parking until
+    /// the commit makes it exactly one — and the publish still precedes the
+    /// commit, so the payload is never lost.
+    pending_dlq: Vec<PendingDlq>,
+    /// First offset seen per partition — where a non-`Ack` outcome seeks back
+    /// to. Always has the same key set as `end`.
+    start: HashMap<i32, i64>,
+    /// Exclusive end offset per partition — what an `Ack` commits.
+    end: HashMap<i32, i64>,
+}
+
+impl<T: Topic> BatchBuffer<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            messages: Vec::with_capacity(capacity),
+            raw: Vec::new(),
+            pending_dlq: Vec::new(),
+            start: HashMap::new(),
+            end: HashMap::new(),
+        }
+    }
+
+    /// Nothing to flush: no decoded messages *and* no offset span to commit
+    /// past. `end` can be non-empty while `messages` is empty when every
+    /// message in the span was dropped pre-handler.
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.end.is_empty()
+    }
+
+    /// Extends the offset span to cover `offset` on `partition`.
+    fn extend_span(&mut self, partition: i32, offset: i64) {
+        self.start.entry(partition).or_insert(offset);
+        self.end.insert(partition, offset + 1);
+    }
+
+    fn push(&mut self, message: T::Message, metadata: MessageMetadata, raw: Option<RawMessage>) {
+        self.messages.push((message, metadata));
+        if let Some(raw) = raw {
+            self.raw.push(raw);
+        }
+    }
+
+    fn park_dlq(&mut self, raw: RawMessage, reason: String) {
+        self.pending_dlq.push(PendingDlq { raw, reason });
+    }
+
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.raw.clear();
+        self.pending_dlq.clear();
+        self.start.clear();
+        self.end.clear();
+    }
+}
+
+/// Publishes a batch message to the DLQ, logging a failure to do so.
+///
+/// A DLQ publish failure is not propagated: the offset span is committed either
+/// way, so failing the whole batch here would stall forward progress on a
+/// message that is by definition unprocessable (or explicitly rejected).
 async fn dlq_batch_message(
-    dec: &BatchDecodeCtx<'_>,
-    payload_slice: &[u8],
-    key: Option<&[u8]>,
-    headers: &HashMap<String, String>,
+    client: &KafkaClient,
+    topology: &QueueTopology,
+    queue: &str,
+    raw: &RawMessage,
     reason: &str,
 ) {
     if let Err(dlq_err) = publish_to_dlq(
-        dec.client,
-        dec.topology,
-        payload_slice,
-        key,
-        headers,
+        client,
+        topology,
+        &raw.payload,
+        raw.key.as_deref(),
+        &raw.headers,
         reason,
     )
     .await
     {
         tracing::error!(
             error = %dlq_err,
-            queue = dec.queue,
+            queue,
             reason,
             "failed to publish bad batch message to DLQ"
         );
     }
 }
 
-/// Hands `batch` to the handler and applies the single returned `Outcome`:
-/// `Ack` commits every partition's end offset in `batch_end` in one batched
-/// commit; anything else seeks every partition back to `batch_start` so the
-/// whole batch is re-delivered on the next `recv()` instead of being
-/// silently skipped (offsets were never committed, but this consumer keeps
-/// polling forward without a seek).
+/// Publishes everything parked for the DLQ during this batch, immediately
+/// before its offsets commit.
+async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) {
+    for item in pending {
+        dlq_batch_message(
+            flush.client,
+            flush.topology,
+            flush.queue,
+            &item.raw,
+            &item.reason,
+        )
+        .await;
+    }
+}
+
+/// Hands the buffered batch to the handler and applies the single returned
+/// `Outcome`:
 ///
-/// `batch` may be empty while `batch_end` is not: every message in the offset
-/// span was dropped before the handler (oversize / undeserializable). There is
-/// nothing to hand over, but those offsets still get committed — see the
-/// empty-batch arm.
+/// - `Ack` commits every partition's end offset in one batched commit.
+/// - `Reject` is terminal, exactly as it is on every other consumer path: the
+///   batch is published to the DLQ and its offsets commit.
+/// - `Retry` / `Defer` seek every partition back to the batch's start offset so
+///   the whole batch is re-delivered on the next `recv()` instead of being
+///   silently skipped (offsets were never committed, but this consumer keeps
+///   polling forward without a seek).
 ///
-/// `redelivery_backoff` escalates across consecutive non-Ack flushes and is
-/// reset here on Ack.
+/// The buffer's messages may be empty while its offset span is not: every
+/// message in the span was dropped before the handler (oversize /
+/// undeserializable). There is nothing to hand over, but those offsets still
+/// get committed — see the empty-batch arm.
+///
+/// Anything parked for the DLQ during the batch is published immediately before
+/// the commit, and dropped un-published when the batch is redelivered instead
+/// (it will be re-parked on the way back through). `redelivery_backoff`
+/// escalates across consecutive `Retry`/`Defer` flushes and is reset on `Ack`.
+///
+/// The buffer is left empty on every path; the caller only has to disarm the
+/// deadline.
 async fn flush_batch<T, H>(
     flush: &BatchFlushCtx<'_>,
     handler: &H,
     ctx: &H::Context,
-    batch: Vec<(T::Message, MessageMetadata)>,
-    batch_start: &HashMap<i32, i64>,
-    batch_end: &HashMap<i32, i64>,
+    buffer: &mut BatchBuffer<T>,
     redelivery_backoff: &mut Backoff,
 ) -> Result<()>
 where
@@ -1555,12 +1687,14 @@ where
 {
     let BatchFlushCtx {
         consumer,
+        client,
+        topology,
         queue,
         topic,
         group,
         shutdown,
     } = *flush;
-    let batch_size = batch.len();
+    let batch_size = buffer.messages.len();
 
     // Every message in this span was dropped pre-handler. The offsets must
     // still be committed: leaving them uncommitted replays the same poison on
@@ -1568,21 +1702,71 @@ where
     // commit anything at all — the consumer would make no forward progress
     // across restarts, forever.
     if batch_size == 0 {
-        if batch_end.is_empty() {
+        if buffer.end.is_empty() {
             return Ok(());
         }
-        commit_batch_end(consumer, queue, batch_end)?;
+        publish_pending_dlq(flush, &buffer.pending_dlq).await;
+        commit_batch_end(consumer, queue, &buffer.end).await?;
         tracing::debug!(queue, "committed offsets past a fully-dropped batch");
+        buffer.clear();
         return Ok(());
     }
 
-    let outcome = handler.handle_batch(batch, ctx).await;
+    let messages = std::mem::take(&mut buffer.messages);
+    // Same instrumentation the single-message path gets from `invoke_handler`:
+    // without it, migrating a sink from `run` to `run_batch` silently loses the
+    // handler-latency histogram and the in-flight gauge — and for a batch sink,
+    // flush duration is precisely the signal that says whether `max_batch_age`
+    // is achievable. The duration is one observation per *flush* (the whole
+    // batch), not per message.
+    let outcome = {
+        let _inflight = metrics::InflightGuard::from_refs_n(topic, group, batch_size as u64);
+        let started = std::time::Instant::now();
+        let outcome = handler.handle_batch(messages, ctx).await;
+        metrics::record_processing_duration(
+            topic,
+            group,
+            &outcome,
+            started.elapsed().as_secs_f64(),
+        );
+        outcome
+    };
     metrics::record_consumed_n(topic, group, &outcome, batch_size as u64);
     match outcome {
         Outcome::Ack => {
-            commit_batch_end(consumer, queue, batch_end)?;
+            publish_pending_dlq(flush, &buffer.pending_dlq).await;
+            commit_batch_end(consumer, queue, &buffer.end).await?;
             *redelivery_backoff = batch_redelivery_backoff();
             tracing::debug!(queue, batch_size, "batch committed");
+            buffer.clear();
+        }
+        // `Reject` means terminal-do-not-retry everywhere else in shove, and
+        // it has to mean that here too: routing it through the seek-back arm
+        // pins the partition forever (seek, sleep, redeliver, reject, …) with
+        // the payloads never reaching a DLQ and the offsets never advancing.
+        Outcome::Reject => {
+            metrics::record_failed_n(
+                topic,
+                group,
+                metrics::FailReason::Rejected,
+                batch_size as u64,
+            );
+            if topology.dlq().is_some() {
+                for raw in &buffer.raw {
+                    dlq_batch_message(client, topology, queue, raw, "rejected").await;
+                }
+                tracing::warn!(queue, batch_size, "batch rejected, routed to the DLQ");
+            } else {
+                tracing::warn!(
+                    queue,
+                    batch_size,
+                    "batch rejected but no DLQ is configured, the messages are discarded"
+                );
+            }
+            publish_pending_dlq(flush, &buffer.pending_dlq).await;
+            commit_batch_end(consumer, queue, &buffer.end).await?;
+            *redelivery_backoff = batch_redelivery_backoff();
+            buffer.clear();
         }
         other => {
             let delay = redelivery_backoff.next().expect("backoff is infinite");
@@ -1594,21 +1778,28 @@ where
                 "batch handler returned a non-Ack outcome, redelivering the whole batch"
             );
             let mut tpl = TopicPartitionList::new();
-            for (&partition, &start_offset) in batch_start {
+            for (&partition, &start_offset) in &buffer.start {
+                // Not `.ok()`: a partition missing from the seek list is never
+                // rewound, so its consumed-but-uncommitted messages are skipped
+                // permanently. Failing the flush costs a reconnect and resumes
+                // from the last committed offset instead.
                 tpl.add_partition_offset(queue, partition, Offset::Offset(start_offset))
-                    .ok();
+                    .map_err(|e| {
+                        map_kafka_error("batch seek offset list rejected a partition", e)
+                    })?;
             }
             consumer
                 .seek_partitions(tpl, SEEK_TIMEOUT)
                 .map_err(|e| map_kafka_error("batch seek-for-redelivery failed", e))?;
-            // There is no per-batch retry counter or DLQ route at this level
-            // (see the type's doc comment), so a handler stuck returning
-            // non-Ack redelivers the same batch forever. The escalating delay
-            // bounds the spin; `messages_consumed_total{outcome="retry"}`
-            // climbing with no matching `outcome="ack"` is the alertable
-            // signal that it is wedged. Shutdown cuts the delay short —
-            // otherwise a wedged handler would add up to
-            // `BATCH_REDELIVERY_BACKOFF_MAX` to every stop.
+            // There is no per-batch retry counter at this level (see the
+            // type's doc comment), so a handler stuck returning `Retry`
+            // redelivers the same batch forever. The escalating delay bounds
+            // the spin; `messages_consumed_total{outcome="retry"}` climbing
+            // with no matching `outcome="ack"` is the alertable signal that it
+            // is wedged. Shutdown cuts the delay short — otherwise a wedged
+            // handler would add up to `BATCH_REDELIVERY_BACKOFF_MAX` to every
+            // stop.
+            buffer.clear();
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
                 () = shutdown.cancelled() => {}
@@ -1618,21 +1809,44 @@ where
     Ok(())
 }
 
-/// Drains librdkafka's rebalance / commit-failure events, returning whether
-/// any arrived.
+/// Drains librdkafka's rebalance events, returning the partitions of this
+/// consumer's topic whose ownership changed.
 ///
-/// The callbacks already log the assignment change itself, so this only
-/// reports *that* ownership moved. Any such event invalidates the in-flight
-/// batch: a commit would be rejected for a stale generation, and part of the
-/// offset span may belong to a partition this member no longer owns. Callers
-/// abandon the whole batch rather than the revoked partitions' slice of it —
-/// see [`rewind_after_rebalance`] for why that is still lossless.
-fn drain_batch_rebalance_events(rx: &std_mpsc::Receiver<RebalanceEvent>) -> bool {
-    let mut seen = false;
-    while rx.try_recv().is_ok() {
-        seen = true;
+/// Only a partition the in-flight batch actually spans invalidates it, so the
+/// caller intersects this set with the batch (see
+/// [`rebalance_affects_batch`]) instead of abandoning on any event at all.
+/// Under `cooperative-sticky` the callback fires on *every* member each round —
+/// including members that gain a partition and lose nothing, and with an empty
+/// delta — so treating a bare "something happened" as invalidation throws away
+/// batches that were never at risk, redelivering them as duplicate writes.
+///
+/// `CommitFailed` is deliberately excluded: it is not a rebalance, and the
+/// batch path commits synchronously (see [`commit_batch_end`]) so it surfaces
+/// its own commit errors to the caller rather than through this channel.
+fn drain_batch_rebalance_events(rx: &std_mpsc::Receiver<RebalanceEvent>) -> BTreeSet<i32> {
+    let mut affected = BTreeSet::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions) => {
+                affected.extend(partitions);
+            }
+            RebalanceEvent::CommitFailed(_) => {}
+        }
     }
-    seen
+    affected
+}
+
+/// Whether a rebalance that moved `affected` invalidates a batch spanning
+/// `batch_start`'s partitions.
+///
+/// A revoked partition takes its slice of the batch with it, and a (re-)assigned
+/// one has had its fetch position reset out from under the batch; either way the
+/// batch is no longer a coherent unit and is abandoned. A rebalance that touches
+/// only partitions the batch never read is not this consumer's problem — its own
+/// partitions keep their positions, and the commit that follows carries the new
+/// generation.
+fn rebalance_affects_batch(affected: &BTreeSet<i32>, batch_start: &HashMap<i32, i64>) -> bool {
+    affected.iter().any(|p| batch_start.contains_key(p))
 }
 
 /// Rewinds every partition of an abandoned in-flight batch to `batch_start`,
@@ -2184,24 +2398,43 @@ impl KafkaConsumer {
     /// This is the primitive DB-sink consumers otherwise hand-roll around
     /// the single-message API: push decoded messages into a buffer, flush
     /// on size-or-age, ack-after-flush. See [`BatchMessageHandler`] for the
-    /// outcome semantics — in particular, only `Outcome::Ack` commits;
-    /// every other outcome redelivers the **entire batch** (no per-message
-    /// retry-count tracking or DLQ routing at this level yet).
+    /// outcome semantics.
+    ///
+    /// # Outcomes
+    ///
+    /// - `Ack` commits the whole batch's offsets in one batched commit.
+    /// - `Reject` is terminal: the batch is published to the DLQ (if the
+    ///   topology declares one) and its offsets commit, matching what `Reject`
+    ///   means on every other consumer path.
+    /// - `Retry` / `Defer` redeliver the **entire batch** after an escalating
+    ///   delay. There is no per-batch retry counter, so a handler that never
+    ///   acks redelivers forever — that is the intended back-pressure for a
+    ///   sink that is down, and the escalating delay bounds the spin.
+    ///
+    /// # Poison handling
+    ///
+    /// A message that fails to deserialize (including the schema-registry
+    /// frame-strip and subject gate under `kafka-schema-registry`) or exceeds
+    /// `options.max_message_size` is dropped from the batch and published to
+    /// the DLQ byte-for-byte, and its offset is committed with the batch. The
+    /// DLQ publish is deferred until the batch actually commits, so a batch
+    /// that gets redelivered does not multiply its poison in the DLQ.
+    ///
+    /// # Metrics
+    ///
+    /// `messages_consumed_total`, `messages_failed_total` and
+    /// `messages_inflight` count *messages*, comparable with the
+    /// single-message consumers. `message_processing_duration_seconds` is the
+    /// exception: it records one observation per **flush** (the whole batch),
+    /// which is the signal that says whether `max_batch_age` is achievable.
     ///
     /// # Current limitations
     ///
-    /// - No Confluent Schema Registry integration (even under
-    ///   `kafka-schema-registry`) — messages are decoded directly via
-    ///   `T::Codec`.
-    /// - A message that fails to deserialize or exceeds
-    ///   `options.max_message_size` is dropped from the batch (logged and
-    ///   counted via `metrics::FailReason`) rather than DLQ'd individually.
-    ///   Its offset is still committed with the batch, so poison does not
-    ///   replay forever — but the payload is gone, not parked in a DLQ.
-    /// - A rebalance abandons the whole in-flight batch uncommitted and rewinds
-    ///   the partitions this member keeps, so every message is redelivered —
-    ///   to this consumer for retained partitions, to the new owner for revoked
-    ///   ones. Expect duplicates across a rebalance, never loss.
+    /// - A rebalance that moves a partition the in-flight batch spans abandons
+    ///   the whole batch uncommitted and rewinds the partitions this member
+    ///   keeps, so every message in it is redelivered — to this consumer for
+    ///   retained partitions, to the new owner for revoked ones. Expect
+    ///   duplicates across a rebalance, never loss.
     /// - No FIFO/sequenced variant.
     pub async fn run_batch<T, H>(
         &self,
@@ -2266,7 +2499,9 @@ impl KafkaConsumer {
             let schema_accepted = schema_accepted.clone();
             async move {
                 let (rebalance_tx, rebalance_rx) = std_mpsc::channel::<RebalanceEvent>();
-                let consumer = create_stream_consumer(
+                // Arc so `commit_batch_end` can hand the consumer to
+                // `spawn_blocking` for the duration of the sync commit.
+                let consumer = Arc::new(create_stream_consumer(
                     client.base_config(),
                     &group_id,
                     auto_offset_reset,
@@ -2274,13 +2509,15 @@ impl KafkaConsumer {
                     rebalance_tx,
                     #[cfg(feature = "kafka-msk-iam")]
                     client.msk_context(),
-                )?;
+                )?);
                 consumer
                     .subscribe(&[queue])
                     .map_err(|e| map_kafka_error("failed to subscribe", e))?;
 
                 let flush_ctx = BatchFlushCtx {
                     consumer: &consumer,
+                    client: &client,
+                    topology,
                     queue,
                     topic: topic.as_ref(),
                     group: group.as_deref(),
@@ -2288,8 +2525,6 @@ impl KafkaConsumer {
                 };
 
                 let decode_ctx = BatchDecodeCtx {
-                    client: &client,
-                    topology,
                     queue,
                     topic: topic.as_ref(),
                     group: group.as_deref(),
@@ -2301,13 +2536,10 @@ impl KafkaConsumer {
                     schema_accepted: schema_accepted.as_ref(),
                 };
 
-                let mut batch: Vec<(T::Message, MessageMetadata)> = Vec::with_capacity(max_batch_size);
-                // Exclusive end offset to commit per partition once the
-                // batch acks, and the same batch's start offset per
-                // partition to seek back to if it doesn't — see
-                // `flush_batch`.
-                let mut batch_end: HashMap<i32, i64> = HashMap::new();
-                let mut batch_start: HashMap<i32, i64> = HashMap::new();
+                // Retaining each message's wire bytes only pays for itself if
+                // there is a DLQ to put them in on `Outcome::Reject`.
+                let retain_raw = topology.dlq().is_some();
+                let mut buffer: BatchBuffer<T> = BatchBuffer::new(max_batch_size);
                 let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
                 let mut redelivery_backoff = batch_redelivery_backoff();
 
@@ -2318,22 +2550,28 @@ impl KafkaConsumer {
                 housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {
-                    if drain_batch_rebalance_events(&rebalance_rx)
-                        && (!batch.is_empty() || !batch_end.is_empty())
-                    {
-                        tracing::warn!(
-                            queue,
-                            batch_size = batch.len(),
-                            "group rebalanced mid-batch, abandoning the in-flight batch uncommitted"
-                        );
-                        // Rewind before clearing: under cooperative-sticky the
-                        // partitions this member *keeps* would otherwise have
-                        // their consumed-but-uncommitted messages skipped.
-                        rewind_after_rebalance(&consumer, queue, &batch_start);
-                        batch.clear();
-                        batch_start.clear();
-                        batch_end.clear();
-                        deadline = None;
+                    let moved = drain_batch_rebalance_events(&rebalance_rx);
+                    if !moved.is_empty() && !buffer.is_empty() {
+                        if rebalance_affects_batch(&moved, &buffer.start) {
+                            tracing::warn!(
+                                queue,
+                                batch_size = buffer.messages.len(),
+                                partitions = ?moved,
+                                "group rebalanced mid-batch, abandoning the in-flight batch uncommitted"
+                            );
+                            // Rewind before clearing: under cooperative-sticky the
+                            // partitions this member *keeps* would otherwise have
+                            // their consumed-but-uncommitted messages skipped.
+                            rewind_after_rebalance(&consumer, queue, &buffer.start);
+                            buffer.clear();
+                            deadline = None;
+                        } else {
+                            tracing::debug!(
+                                queue,
+                                partitions = ?moved,
+                                "group rebalanced on partitions the in-flight batch does not span, keeping it"
+                            );
+                        }
                     }
 
                     let sleep_until_deadline = async {
@@ -2345,14 +2583,12 @@ impl KafkaConsumer {
 
                     tokio::select! {
                         _ = shutdown.cancelled() => {
-                            if !batch.is_empty() || !batch_end.is_empty() {
+                            if !buffer.is_empty() {
                                 flush_batch(
                                     &flush_ctx,
                                     handler.as_ref(),
                                     ctx.as_ref(),
-                                    std::mem::take(&mut batch),
-                                    &batch_start,
-                                    &batch_end,
+                                    &mut buffer,
                                     &mut redelivery_backoff,
                                 )
                                 .await?;
@@ -2369,14 +2605,10 @@ impl KafkaConsumer {
                                 &flush_ctx,
                                 handler.as_ref(),
                                 ctx.as_ref(),
-                                std::mem::take(&mut batch),
-                                &batch_start,
-                                &batch_end,
+                                &mut buffer,
                                 &mut redelivery_backoff,
                             )
                             .await?;
-                            batch_start.clear();
-                            batch_end.clear();
                             deadline = None;
                         }
                         msg_result = consumer.recv() => {
@@ -2406,8 +2638,7 @@ impl KafkaConsumer {
                             // only once a message survives — is what guarantees
                             // such an all-dropped window still reaches
                             // `flush_batch` to have its offsets committed.
-                            batch_start.entry(partition).or_insert(offset);
-                            batch_end.insert(partition, offset + 1);
+                            buffer.extend_span(partition, offset);
                             if deadline.is_none() {
                                 deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
                             }
@@ -2418,41 +2649,52 @@ impl KafkaConsumer {
                             if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
                                 tracing::warn!(error = %e, queue, partition, offset, "oversized message, sending to DLQ");
                                 metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
-                                dlq_batch_message(
-                                    &decode_ctx,
-                                    payload_slice,
-                                    key.as_deref(),
-                                    &headers,
-                                    &e.to_string(),
-                                ).await;
+                                buffer.park_dlq(
+                                    RawMessage {
+                                        payload: Bytes::copy_from_slice(payload_slice),
+                                        key,
+                                        headers,
+                                    },
+                                    e.to_string(),
+                                );
                                 continue;
                             }
 
-                            let Some(decoded) = decode_batch_message::<T>(
+                            let decoded = match decode_batch_message::<T>(
                                 &decode_ctx,
                                 payload_slice,
-                                key.as_deref(),
-                                &headers,
-                            ).await else {
-                                continue;
+                            ).await {
+                                BatchDecode::Decoded(m) => m,
+                                BatchDecode::Dlq(reason) => {
+                                    buffer.park_dlq(
+                                        RawMessage {
+                                            payload: Bytes::copy_from_slice(payload_slice),
+                                            key,
+                                            headers,
+                                        },
+                                        reason.to_string(),
+                                    );
+                                    continue;
+                                }
                             };
 
                             let metadata = build_message_metadata(&headers, false);
-                            batch.push((decoded, metadata));
+                            let raw = retain_raw.then(|| RawMessage {
+                                payload: Bytes::copy_from_slice(payload_slice),
+                                key,
+                                headers: headers.clone(),
+                            });
+                            buffer.push(decoded, metadata, raw);
 
-                            if batch.len() >= max_batch_size {
+                            if buffer.messages.len() >= max_batch_size {
                                 flush_batch(
                                     &flush_ctx,
                                     handler.as_ref(),
                                     ctx.as_ref(),
-                                    std::mem::take(&mut batch),
-                                    &batch_start,
-                                    &batch_end,
+                                    &mut buffer,
                                     &mut redelivery_backoff,
                                 )
                                 .await?;
-                                batch_start.clear();
-                                batch_end.clear();
                                 deadline = None;
                             }
                         }
@@ -3669,6 +3911,94 @@ mod offset_tracker_tests {
             tracker.fenced(t1 + Duration::from_secs(61), Duration::from_secs(60)),
             Some(0),
             "a genuinely wedged partition still trips the fence, timed from t1"
+        );
+    }
+}
+
+/// The batch path's rebalance handling: which events invalidate an in-flight
+/// batch, and which are noise that would otherwise throw away — and duplicate —
+/// thousands of buffered rows.
+#[cfg(test)]
+mod batch_rebalance_tests {
+    use super::*;
+
+    fn batch_over(partitions: &[i32]) -> HashMap<i32, i64> {
+        partitions.iter().map(|&p| (p, 0)).collect()
+    }
+
+    #[test]
+    fn drain_reports_assigned_and_revoked_partitions() {
+        let (tx, rx) = std_mpsc::channel();
+        tx.send(RebalanceEvent::Revoke(vec![1, 2])).unwrap();
+        tx.send(RebalanceEvent::Assign(vec![5])).unwrap();
+
+        assert_eq!(
+            drain_batch_rebalance_events(&rx),
+            BTreeSet::from([1, 2, 5]),
+            "every partition whose ownership moved should be reported"
+        );
+    }
+
+    #[test]
+    fn drain_is_empty_when_nothing_happened() {
+        let (_tx, rx) = std_mpsc::channel::<RebalanceEvent>();
+        assert!(drain_batch_rebalance_events(&rx).is_empty());
+    }
+
+    /// `CommitFailed` is not a rebalance. The batch path commits
+    /// synchronously and surfaces its own errors, so letting this event
+    /// abandon the batch would discard it for no reason at all.
+    #[test]
+    fn commit_failed_is_not_a_rebalance() {
+        let (tx, rx) = std_mpsc::channel();
+        tx.send(RebalanceEvent::CommitFailed(vec![0, 1])).unwrap();
+
+        assert!(
+            drain_batch_rebalance_events(&rx).is_empty(),
+            "a failed commit says nothing about partition ownership"
+        );
+    }
+
+    #[test]
+    fn a_revoked_batch_partition_invalidates_the_batch() {
+        let moved = BTreeSet::from([1]);
+        assert!(rebalance_affects_batch(&moved, &batch_over(&[0, 1])));
+    }
+
+    /// The regression this exists for: another member leaves, this one is
+    /// *assigned* a partition and loses nothing. Abandoning here rewinds
+    /// partitions {0,1} and redelivers the whole in-flight batch as duplicate
+    /// writes, for a rebalance that never touched it.
+    #[test]
+    fn an_assignment_elsewhere_leaves_the_batch_alone() {
+        let moved = BTreeSet::from([5]);
+        assert!(!rebalance_affects_batch(&moved, &batch_over(&[0, 1])));
+    }
+
+    /// `cooperative-sticky` invokes the rebalance callback on every member
+    /// each round, so an empty delta is routine — and must not cost a batch.
+    #[test]
+    fn an_empty_delta_leaves_the_batch_alone() {
+        assert!(!rebalance_affects_batch(
+            &BTreeSet::new(),
+            &batch_over(&[0, 1])
+        ));
+    }
+
+    /// An eager (non-cooperative) rebalance revokes everything first; the
+    /// batch's own partitions are in that list, so it is abandoned.
+    #[test]
+    fn an_eager_revoke_all_invalidates_the_batch() {
+        let moved = BTreeSet::from([0, 1, 2, 3]);
+        assert!(rebalance_affects_batch(&moved, &batch_over(&[1])));
+    }
+
+    #[test]
+    fn a_reassignment_of_a_batch_partition_invalidates_the_batch() {
+        let moved = BTreeSet::from([0]);
+        assert!(
+            rebalance_affects_batch(&moved, &batch_over(&[0])),
+            "the fetch position was reset out from under the batch"
         );
     }
 }

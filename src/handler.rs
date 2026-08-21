@@ -84,11 +84,15 @@ impl<T: Topic, H: MessageHandler<T>> MessageHandlerExt<T> for H {
 ///   primitive this trait exists for (see the module-level rationale on
 ///   the batch entry point: the classic accumulate-then-flush pattern DB
 ///   sinks reimplement by hand around a single-message consumer).
-/// - Any other outcome (`Retry`, `Reject`, `Defer`) redelivers the entire
-///   batch as a unit — there is no per-message retry-count tracking or
-///   DLQ routing at the batch level. A handler that needs to split a
-///   partially-failed batch should ack what it durably wrote and return
-///   `Retry` only for the remainder on its *next* delivery, or handle
+/// - `Reject` is terminal for the **whole batch**, as it is on the
+///   single-message path: every message in it is published to the DLQ (if
+///   the topology declares one) and the offsets commit. Return it only for
+///   a batch that will never become acceptable.
+/// - `Retry` and `Defer` redeliver the entire batch as a unit, after an
+///   escalating delay. There is no per-message retry-count tracking or
+///   per-message DLQ routing at the batch level, so a handler that needs to
+///   split a partially-failed batch should ack what it durably wrote and
+///   return `Retry` only for the remainder on its *next* delivery, or handle
 ///   partial failure inside `handle_batch` itself (e.g. write successes,
 ///   then return `Retry` so the whole batch — successes included, which
 ///   your sink should treat idempotently — is redelivered for the rest).
