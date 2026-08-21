@@ -283,58 +283,52 @@ mod tests {
     /// event rather than just on non-panicking.
     #[test]
     fn warn_if_under_replicated_for_acks_all_emits_event_for_rf1() {
+        use std::fmt::Debug;
         use std::sync::{Arc, Mutex};
         use tracing::field::{Field, Visit};
         use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-        #[derive(Default)]
-        struct Captured {
-            queues: Vec<String>,
-            replication_factors: Vec<i64>,
-        }
+        /// Collects `"<queue>@<replication_factor>"` for every WARN event.
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<String>>>);
 
-        struct CaptureVisitor<'a>(&'a mut Captured);
-        impl Visit for CaptureVisitor<'_> {
+        impl Visit for Captured {
+            fn record_debug(&mut self, _: &Field, _: &dyn Debug) {}
             fn record_i64(&mut self, field: &Field, value: i64) {
                 if field.name() == "replication_factor" {
-                    self.0.replication_factors.push(value);
+                    self.0.lock().unwrap().push(format!("@{value}"));
                 }
             }
             fn record_str(&mut self, field: &Field, value: &str) {
                 if field.name() == "queue" {
-                    self.0.queues.push(value.to_string());
+                    self.0.lock().unwrap().push(value.to_string());
                 }
             }
-            fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
         }
 
-        struct CaptureSubscriber(Arc<Mutex<Captured>>);
-        impl tracing::Subscriber for CaptureSubscriber {
-            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-                *meta.level() == tracing::Level::WARN
+        impl<S: tracing::Subscriber> Layer<S> for Captured {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    event.record(&mut self.clone());
+                }
             }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
-            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-            fn event(&self, event: &tracing::Event<'_>) {
-                let mut captured = self.0.lock().unwrap();
-                event.record(&mut CaptureVisitor(&mut captured));
-            }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
         }
 
-        let captured = Arc::new(Mutex::new(Captured::default()));
-        with_default(CaptureSubscriber(captured.clone()), || {
-            warn_if_under_replicated_for_acks_all("kafka-rf1", 1);
-            warn_if_under_replicated_for_acks_all("kafka-rf3", 3);
-        });
+        let captured = Captured::default();
+        with_default(
+            tracing_subscriber::registry().with(captured.clone()),
+            || {
+                warn_if_under_replicated_for_acks_all("kafka-rf1", 1);
+                warn_if_under_replicated_for_acks_all("kafka-rf3", 3);
+            },
+        );
 
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.queues, vec!["kafka-rf1".to_string()]);
-        assert_eq!(captured.replication_factors, vec![1]);
+        // Only the RF=1 call emits, and it carries both fields.
+        assert_eq!(
+            captured.0.lock().unwrap().as_slice(),
+            &["kafka-rf1".to_string(), "@1".to_string()]
+        );
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
