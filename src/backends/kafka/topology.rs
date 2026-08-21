@@ -33,6 +33,38 @@ fn under_replicated_for_acks_all(replication: i32) -> bool {
     replication < 2
 }
 
+/// Warn once per `declare()` call when auto-creating topic(s) at the RF=1
+/// default while the producer hardcodes `acks=all` (see
+/// `KafkaClient::connect`'s `sec-K-10` comment) — the pairing is a footgun:
+/// on any cluster whose `min.insync.replicas` is >= 2 (a common production
+/// default), a produce to an RF=1 topic can never satisfy `acks=all` and
+/// surfaces only as a bare `MessageTimedOut`, with no hint that the actual
+/// cause is under-replication. `create_topic` is also idempotent and won't
+/// raise an existing topic's replication once created, so this is easy to
+/// overlook locally (RF=1 works fine on a single-broker dev cluster) and
+/// only bites in production.
+///
+/// Deliberately does not query the cluster's actual `min.insync.replicas`
+/// (an extra admin round trip) — this is a blunt, unconditional nudge
+/// toward `with_replication_factor(n ≥ 2)`.
+///
+/// A free function rather than a method so it is reachable from unit tests
+/// without standing up a `KafkaClient`.
+fn warn_if_under_replicated_for_acks_all(queue: &str, replication: i32) {
+    if under_replicated_for_acks_all(replication) {
+        tracing::warn!(
+            queue,
+            replication_factor = replication,
+            "auto-creating Kafka topic(s) at replication_factor=1 while the producer \
+             requires acks=all — on any cluster with min.insync.replicas >= 2 this topic \
+             can never satisfy a produce and every send will time out as a bare \
+             MessageTimedOut with no hint of the real cause. Call \
+             KafkaTopologyDeclarer::with_replication_factor(n) with n >= 2 to match your \
+             cluster's min.insync.replicas, or ignore this on a single-broker dev cluster."
+        );
+    }
+}
+
 pub struct KafkaTopologyDeclarer {
     client: KafkaClient,
     /// Minimum number of partitions for the main topic.
@@ -140,36 +172,6 @@ impl KafkaTopologyDeclarer {
         self.replication_factor.unwrap_or(DEFAULT_REPLICATION)
     }
 
-    /// Warn once per `declare()` call when auto-creating topic(s) at the
-    /// RF=1 default while the producer hardcodes `acks=all` (see
-    /// `KafkaClient::connect`'s `sec-K-10` comment) — the pairing is a
-    /// footgun: on any cluster whose `min.insync.replicas` is >= 2 (a common
-    /// production default), a produce to an RF=1 topic can never satisfy
-    /// `acks=all` and surfaces only as a bare `MessageTimedOut`, with no
-    /// hint that the actual cause is under-replication. `create_topic` is
-    /// also idempotent and won't raise an existing topic's replication once
-    /// created, so this is easy to overlook locally (RF=1 works fine on a
-    /// single-broker dev cluster) and only bites in production.
-    ///
-    /// Deliberately does not query the cluster's actual
-    /// `min.insync.replicas` (an extra admin round trip) — this is a blunt,
-    /// unconditional nudge toward `with_replication_factor(n ≥ 2)`.
-    fn warn_if_under_replicated_for_acks_all(&self, queue: &str) {
-        let replication = self.effective_replication();
-        if under_replicated_for_acks_all(replication) {
-            tracing::warn!(
-                queue,
-                replication_factor = replication,
-                "auto-creating Kafka topic(s) at replication_factor=1 while the producer \
-                 requires acks=all — on any cluster with min.insync.replicas >= 2 this topic \
-                 can never satisfy a produce and every send will time out as a bare \
-                 MessageTimedOut with no hint of the real cause. Call \
-                 KafkaTopologyDeclarer::with_replication_factor(n) with n >= 2 to match your \
-                 cluster's min.insync.replicas, or ignore this on a single-broker dev cluster."
-            );
-        }
-    }
-
     async fn declare_standard(&self, topology: &QueueTopology) -> Result<()> {
         let queue = topology.queue();
         let partitions = self.effective_partitions(DEFAULT_PARTITIONS);
@@ -233,7 +235,7 @@ impl KafkaTopologyDeclarer {
                  hold-queue topics declared"
             );
         }
-        self.warn_if_under_replicated_for_acks_all(topology.queue());
+        warn_if_under_replicated_for_acks_all(topology.queue(), self.effective_replication());
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {
@@ -244,7 +246,9 @@ impl KafkaTopologyDeclarer {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_topic_config, under_replicated_for_acks_all};
+    use super::{
+        merge_topic_config, under_replicated_for_acks_all, warn_if_under_replicated_for_acks_all,
+    };
 
     #[test]
     fn under_replicated_for_acks_all_flags_rf1() {
@@ -255,6 +259,82 @@ mod tests {
     fn under_replicated_for_acks_all_accepts_rf2_and_above() {
         assert!(!under_replicated_for_acks_all(2));
         assert!(!under_replicated_for_acks_all(3));
+    }
+
+    /// RF=1 takes the warning arm. There is no subscriber installed here, so
+    /// this asserts the call is total (does not panic) and covers the
+    /// `tracing::warn!` body — the emitted event itself is asserted in
+    /// `warn_if_under_replicated_for_acks_all_emits_event_for_rf1`.
+    #[test]
+    fn warn_if_under_replicated_for_acks_all_warns_on_rf1() {
+        warn_if_under_replicated_for_acks_all("kafka-under-replicated", 1);
+    }
+
+    /// RF >= 2 takes the silent arm.
+    #[test]
+    fn warn_if_under_replicated_for_acks_all_is_silent_from_rf2() {
+        warn_if_under_replicated_for_acks_all("kafka-replicated", 2);
+        warn_if_under_replicated_for_acks_all("kafka-replicated", 3);
+    }
+
+    /// The RF=1 arm actually emits a WARN carrying the queue and the
+    /// offending replication factor, and the RF>=2 arm emits nothing — the
+    /// warning is the entire deliverable of this code path, so assert on the
+    /// event rather than just on non-panicking.
+    #[test]
+    fn warn_if_under_replicated_for_acks_all_emits_event_for_rf1() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::subscriber::with_default;
+
+        #[derive(Default)]
+        struct Captured {
+            queues: Vec<String>,
+            replication_factors: Vec<i64>,
+        }
+
+        struct CaptureVisitor<'a>(&'a mut Captured);
+        impl Visit for CaptureVisitor<'_> {
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                if field.name() == "replication_factor" {
+                    self.0.replication_factors.push(value);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "queue" {
+                    self.0.queues.push(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+        }
+
+        struct CaptureSubscriber(Arc<Mutex<Captured>>);
+        impl tracing::Subscriber for CaptureSubscriber {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                *meta.level() == tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut captured = self.0.lock().unwrap();
+                event.record(&mut CaptureVisitor(&mut captured));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let captured = Arc::new(Mutex::new(Captured::default()));
+        with_default(CaptureSubscriber(captured.clone()), || {
+            warn_if_under_replicated_for_acks_all("kafka-rf1", 1);
+            warn_if_under_replicated_for_acks_all("kafka-rf3", 3);
+        });
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.queues, vec!["kafka-rf1".to_string()]);
+        assert_eq!(captured.replication_factors, vec![1]);
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
