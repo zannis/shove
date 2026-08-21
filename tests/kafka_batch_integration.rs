@@ -1,0 +1,634 @@
+//! Integration tests for the Kafka batch consumer (`KafkaConsumer::run_batch`).
+//!
+//! These cover the parts of `run_batch`/`flush_batch` that only a real broker
+//! exercises: the size- and age-triggered flush boundaries, the offset commit
+//! on `Ack`, the seek-and-redeliver path on every other outcome, the
+//! drop-from-batch arms for oversized/undeserializable payloads, and the
+//! flush-on-shutdown drain.
+
+#![cfg(feature = "kafka")]
+
+use serde::{Deserialize, Serialize};
+use shove::broker::Broker;
+use shove::handler::BatchMessageHandler;
+use shove::kafka::{BatchConsumerOptions, KafkaClient, KafkaConfig, KafkaConsumer};
+use shove::markers::Kafka;
+use shove::metadata::MessageMetadata;
+use shove::outcome::Outcome;
+use shove::topic::Topic;
+use shove::topology::TopologyBuilder;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaContainer};
+use tokio::sync::Notify;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+const TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct BatchMessage {
+    seq: u32,
+    padding: String,
+}
+
+impl BatchMessage {
+    fn new(seq: u32) -> Self {
+        Self {
+            seq,
+            padding: String::new(),
+        }
+    }
+}
+
+shove::define_topic!(
+    SizeTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-size").build()
+);
+
+shove::define_topic!(
+    AgeTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-age").build()
+);
+
+shove::define_topic!(
+    RedeliverTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-redeliver").build()
+);
+
+shove::define_topic!(
+    CommitTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-commit").build()
+);
+
+shove::define_topic!(
+    BadPayloadTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-bad-payload").build()
+);
+
+shove::define_topic!(
+    OversizeTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-oversize").build()
+);
+
+shove::define_topic!(
+    ShutdownTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-shutdown").build()
+);
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+struct TestBroker {
+    _container: testcontainers::ContainerAsync<KafkaContainer>,
+    client: KafkaClient,
+    brokers: String,
+}
+
+impl TestBroker {
+    async fn start() -> Self {
+        let container = KafkaContainer::default()
+            .start()
+            .await
+            .expect("failed to start Kafka container");
+        let port = container
+            .get_host_port_ipv4(apache::KAFKA_PORT)
+            .await
+            .expect("failed to get Kafka port");
+        let brokers = format!("127.0.0.1:{port}");
+        let client = KafkaClient::connect_with_retry(&KafkaConfig::new(&brokers), 10)
+            .await
+            .expect("failed to connect to Kafka");
+        Self {
+            _container: container,
+            client,
+            brokers,
+        }
+    }
+
+    fn broker(&self) -> Broker<Kafka> {
+        Broker::<Kafka>::from_client(self.client.clone())
+    }
+
+    fn client(&self) -> KafkaClient {
+        self.client.clone()
+    }
+}
+
+/// Publish a payload straight through rdkafka, bypassing shove's codec — the
+/// only way to land a body that `T::Codec` cannot decode.
+async fn publish_raw(brokers: &str, topic: &str, payload: &[u8]) {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let producer: FutureProducer = rdkafka::ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("failed to create raw producer");
+    producer
+        .send(
+            FutureRecord::<(), [u8]>::to(topic).payload(payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("raw publish should succeed");
+}
+
+// ---------------------------------------------------------------------------
+// Recording batch handler
+// ---------------------------------------------------------------------------
+
+/// Records the `seq` of every message in every batch it is handed, and
+/// returns outcomes from a scripted queue (defaulting to `Ack` once the
+/// script is exhausted).
+#[derive(Clone)]
+struct RecordingBatchHandler {
+    batches: Arc<Mutex<Vec<Vec<u32>>>>,
+    scripted: Arc<Mutex<VecDeque<Outcome>>>,
+    signal: Arc<Notify>,
+}
+
+impl RecordingBatchHandler {
+    fn new() -> Self {
+        Self {
+            batches: Arc::new(Mutex::new(Vec::new())),
+            scripted: Arc::new(Mutex::new(VecDeque::new())),
+            signal: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Outcomes returned for the first N flushes, in order.
+    fn scripting(self, outcomes: impl IntoIterator<Item = Outcome>) -> Self {
+        *self.scripted.lock().unwrap() = outcomes.into_iter().collect();
+        self
+    }
+
+    fn record(&self, batch: &[(BatchMessage, MessageMetadata)]) -> Outcome {
+        self.batches
+            .lock()
+            .unwrap()
+            .push(batch.iter().map(|(m, _)| m.seq).collect());
+        let outcome = self
+            .scripted
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Outcome::Ack);
+        self.signal.notify_waiters();
+        outcome
+    }
+
+    fn batches(&self) -> Vec<Vec<u32>> {
+        self.batches.lock().unwrap().clone()
+    }
+
+    /// All `seq` values seen across every batch, flattened.
+    fn seen(&self) -> Vec<u32> {
+        self.batches().into_iter().flatten().collect()
+    }
+
+    /// Wait until at least `n` batches have been flushed.
+    async fn wait_for_batches(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.batches.lock().unwrap().len() >= n {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.batches.lock().unwrap().len() >= n;
+                }
+            }
+        }
+    }
+}
+
+/// One `BatchMessageHandler` impl per topic — the trait is parameterized on
+/// the topic, so a single blanket impl is not possible.
+macro_rules! impl_recording_for {
+    ($($topic:ty),* $(,)?) => {
+        $(
+            impl BatchMessageHandler<$topic> for RecordingBatchHandler {
+                type Context = ();
+                async fn handle_batch(
+                    &self,
+                    messages: Vec<(BatchMessage, MessageMetadata)>,
+                    _: &(),
+                ) -> Outcome {
+                    self.record(&messages)
+                }
+            }
+        )*
+    };
+}
+
+impl_recording_for!(
+    SizeTopic,
+    AgeTopic,
+    RedeliverTopic,
+    CommitTopic,
+    BadPayloadTopic,
+    OversizeTopic,
+    ShutdownTopic,
+);
+
+async fn publish_seq<T>(broker: &Broker<Kafka>, range: std::ops::Range<u32>)
+where
+    T: Topic<Message = BatchMessage>,
+{
+    let publisher = broker.publisher().await.unwrap();
+    for seq in range {
+        publisher
+            .publish::<T>(&BatchMessage::new(seq))
+            .await
+            .expect("publish should succeed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// A batch flushes as soon as it reaches `max_batch_size`, and no message is
+/// lost or duplicated across the resulting batches.
+#[tokio::test]
+async fn batch_flushes_on_max_batch_size() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<SizeTopic>().await.unwrap();
+    publish_seq::<SizeTopic>(&broker, 0..10).await;
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<SizeTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(5)
+                    // Long enough that only the size trigger can fire.
+                    .with_max_batch_age(Duration::from_secs(30))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(
+        handler.wait_for_batches(2, TIMEOUT).await,
+        "expected two size-triggered batches, got {:?}",
+        handler.batches()
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let batches = handler.batches();
+    assert!(
+        batches.iter().all(|b| b.len() == 5),
+        "every batch should hold exactly max_batch_size messages, got {batches:?}"
+    );
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen, (0..10).collect::<Vec<_>>());
+    broker.close().await;
+}
+
+/// A batch below `max_batch_size` still flushes once `max_batch_age` elapses.
+#[tokio::test]
+async fn batch_flushes_on_max_batch_age() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<AgeTopic>().await.unwrap();
+    publish_seq::<AgeTopic>(&broker, 0..3).await;
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<AgeTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    // Far above the 3 published, so only the age trigger fires.
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(
+        handler.wait_for_batches(1, TIMEOUT).await,
+        "age trigger should flush a partial batch"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![0, 1, 2]);
+    broker.close().await;
+}
+
+/// A non-`Ack` outcome seeks every partition back to the batch's start
+/// offset, so the *whole* batch is redelivered rather than skipped.
+#[tokio::test]
+async fn non_ack_outcome_redelivers_the_whole_batch() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<RedeliverTopic>().await.unwrap();
+    publish_seq::<RedeliverTopic>(&broker, 0..3).await;
+
+    // First flush retries (seek back), second acks.
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Retry]);
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<RedeliverTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_secs(30))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(
+        handler.wait_for_batches(2, TIMEOUT).await,
+        "the retried batch should be redelivered, got {:?}",
+        handler.batches()
+    );
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    // The topic has 8 partitions, so a batch's *order* follows poll order
+    // across partitions, not publish order — compare as sets.
+    let sorted = |b: &Vec<u32>| {
+        let mut v = b.clone();
+        v.sort_unstable();
+        v
+    };
+    let batches = handler.batches();
+    assert_eq!(
+        sorted(&batches[0]),
+        sorted(&batches[1]),
+        "redelivery should replay the identical batch, got {batches:?}"
+    );
+    assert_eq!(sorted(&batches[0]), vec![0, 1, 2]);
+    broker.close().await;
+}
+
+/// `Ack` commits the batch's end offsets, so a second consumer in the same
+/// group starts past them instead of replaying.
+#[tokio::test]
+async fn ack_commits_offsets_so_a_restart_does_not_replay() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<CommitTopic>().await.unwrap();
+    publish_seq::<CommitTopic>(&broker, 0..4).await;
+
+    let group = "batch-commit-group";
+
+    // First run: consume and ack all 4.
+    let first = RecordingBatchHandler::new();
+    let h = first.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<CommitTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(4)
+                    .with_max_batch_age(Duration::from_secs(30))
+                    .with_group_id(group)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+    assert!(first.wait_for_batches(1, TIMEOUT).await);
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+    assert_eq!(first.seen().len(), 4);
+
+    // Second run, same group: only the newly published message is delivered.
+    publish_seq::<CommitTopic>(&broker, 100..101).await;
+
+    let second = RecordingBatchHandler::new();
+    let h = second.clone();
+    let shutdown2 = CancellationToken::new();
+    let sc2 = shutdown2.clone();
+    let consumer2 = KafkaConsumer::new(tb.client());
+    let handle2 = tokio::spawn(async move {
+        consumer2
+            .run_batch::<CommitTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(300))
+                    .with_group_id(group)
+                    .with_shutdown(sc2),
+            )
+            .await
+    });
+    assert!(second.wait_for_batches(1, TIMEOUT).await);
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
+
+    assert_eq!(
+        second.seen(),
+        vec![100],
+        "the committed batch must not be replayed, got {:?}",
+        second.batches()
+    );
+    broker.close().await;
+}
+
+/// An undeserializable payload is dropped from the batch; its neighbours
+/// still flush.
+#[tokio::test]
+async fn undeserializable_message_is_dropped_from_the_batch() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<BadPayloadTopic>()
+        .await
+        .unwrap();
+
+    publish_seq::<BadPayloadTopic>(&broker, 0..1).await;
+    publish_raw(&tb.brokers, "kafka-batch-bad-payload", b"{not valid json").await;
+    publish_seq::<BadPayloadTopic>(&broker, 1..2).await;
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<BadPayloadTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(500))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(handler.wait_for_batches(1, TIMEOUT).await);
+    // Let any straggler flush land before asserting on the full set.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0, 1],
+        "the good messages should survive the poison payload"
+    );
+    broker.close().await;
+}
+
+/// A payload over `max_message_size` is dropped from the batch rather than
+/// failing the consumer.
+#[tokio::test]
+async fn oversized_message_is_dropped_from_the_batch() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<OversizeTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<OversizeTopic>(&BatchMessage::new(0))
+        .await
+        .unwrap();
+    publisher
+        .publish::<OversizeTopic>(&BatchMessage {
+            seq: 1,
+            padding: "x".repeat(4096),
+        })
+        .await
+        .unwrap();
+    publisher
+        .publish::<OversizeTopic>(&BatchMessage::new(2))
+        .await
+        .unwrap();
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<OversizeTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_millis(500))
+                    // Comfortably above a bare BatchMessage, far below the
+                    // 4 KiB-padded one.
+                    .with_max_message_size(512)
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    assert!(handler.wait_for_batches(1, TIMEOUT).await);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0, 2],
+        "the oversized message should be dropped, its neighbours kept"
+    );
+    broker.close().await;
+}
+
+/// Cancelling the shutdown token drains a partially-filled batch to the
+/// handler instead of discarding it.
+#[tokio::test]
+async fn shutdown_flushes_the_pending_partial_batch() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<ShutdownTopic>().await.unwrap();
+    publish_seq::<ShutdownTopic>(&broker, 0..2).await;
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<ShutdownTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    // Neither trigger can fire on its own: the batch only
+                    // reaches the handler via the shutdown drain.
+                    .with_max_batch_size(1000)
+                    .with_max_batch_age(Duration::from_secs(3600))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Give the consumer time to join the group and buffer both messages.
+    // Nothing may flush in that window — both triggers are set out of reach,
+    // so a batch arriving here would mean the drain is not what delivered it.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(
+        handler.batches().is_empty(),
+        "neither trigger should have fired before shutdown, got {:?}",
+        handler.batches()
+    );
+
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let mut seen = handler.seen();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0, 1],
+        "shutdown should drain the pending batch, got {:?}",
+        handler.batches()
+    );
+    broker.close().await;
+}
