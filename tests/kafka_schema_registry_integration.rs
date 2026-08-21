@@ -50,8 +50,8 @@ use rdkafka::message::{Headers as _, OwnedHeaders};
 use serde::{Deserialize, Serialize};
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
-use shove::handler::MessageHandler;
-use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer};
+use shove::handler::{BatchMessageHandler, MessageHandler};
+use shove::kafka::{BatchConsumerOptions, KafkaClient, KafkaConfig, KafkaConsumer};
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
@@ -158,6 +158,12 @@ shove::define_topic!(
     TopologyBuilder::new("cp-sr-permissive").dlq().build()
 );
 
+shove::define_topic!(
+    BatchTopic,
+    OrderEvent,
+    TopologyBuilder::new("cp-sr-batch").dlq().build()
+);
+
 // ---------------------------------------------------------------------------
 // Capturing handler (generic over the JSON topics)
 // ---------------------------------------------------------------------------
@@ -198,6 +204,39 @@ impl_capture_handler!(HappyTopic);
 impl_capture_handler!(EnforceTopic);
 impl_capture_handler!(PermissiveTopic);
 
+/// Batch-side twin of [`CaptureHandler`]: records every message in every batch
+/// and acks, so the scenario can assert on what the registry decode produced.
+#[derive(Clone)]
+struct CaptureBatchHandler {
+    counter: WaitableCounter,
+    received: Arc<Mutex<Vec<OrderEvent>>>,
+}
+
+impl CaptureBatchHandler {
+    fn new() -> Self {
+        Self {
+            counter: WaitableCounter::new(),
+            received: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    async fn messages(&self) -> Vec<OrderEvent> {
+        self.received.lock().await.clone()
+    }
+}
+
+impl BatchMessageHandler<BatchTopic> for CaptureBatchHandler {
+    type Context = ();
+    async fn handle_batch(&self, messages: Vec<(OrderEvent, MessageMetadata)>, _: &()) -> Outcome {
+        let mut received = self.received.lock().await;
+        for (msg, _) in messages {
+            received.push(msg);
+            self.counter.increment();
+        }
+        Outcome::Ack
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Framing + produce helpers
 // ---------------------------------------------------------------------------
@@ -227,6 +266,21 @@ async fn produce_framed(client: &KafkaClient, topic: &str, schema_id: u32, event
         )
         .await
         .expect("framed publish should succeed");
+}
+
+/// Produce an unframed payload to `topic` — no magic byte, no schema id.
+async fn produce_raw(client: &KafkaClient, topic: &str, payload: &[u8]) {
+    client
+        .publish_with_retry(
+            topic,
+            None,
+            OwnedHeaders::new(),
+            payload,
+            5,
+            "produce raw test message",
+        )
+        .await
+        .expect("raw publish should succeed");
 }
 
 /// Read the first message off the DLQ topic, returning (payload, death-reason).
@@ -780,6 +834,71 @@ async fn cp_real_schema_registry_e2e() {
         assert_eq!(received[0].qty, 10, "protobuf: first qty must match");
         assert_eq!(received[1].id, "proto-2", "protobuf: second id must match");
         assert_eq!(received[1].qty, 20, "protobuf: second qty must match");
+    }
+
+    // =======================================================================
+    // Scenario 5 — batch consumption decodes Confluent-framed payloads.
+    //
+    // `run_batch` must run the same frame-strip + subject gate + inner decode
+    // as `run`. Without it a framed payload fails `T::Codec` outright and
+    // EVERY message is dropped, which makes the batch API unusable for exactly
+    // the schema-registry consumers it was built for. An unframed payload on
+    // the same topic must land in the DLQ rather than vanish.
+    // =======================================================================
+    {
+        broker.topology().declare::<BatchTopic>().await.unwrap();
+        let queue = BatchTopic::topology().queue();
+        let subject = format!("{queue}-value");
+        let schema_id = register_json_schema(&sr_base, &subject).await;
+
+        let first = OrderEvent {
+            id: "batch-1".into(),
+            qty: 1,
+        };
+        let second = OrderEvent {
+            id: "batch-2".into(),
+            qty: 2,
+        };
+        produce_framed(&client, queue, schema_id, &first).await;
+        produce_framed(&client, queue, schema_id, &second).await;
+        // Unframed: no magic byte, so the frame strip rejects it -> DLQ.
+        produce_raw(&client, queue, br#"{"id":"unframed","qty":3}"#).await;
+
+        let registry = SchemaRegistry::builder(sr_base.clone()).build();
+        let handler = CaptureBatchHandler::new();
+        let hc = handler.clone();
+        let shutdown = CancellationToken::new();
+        let sc = shutdown.clone();
+
+        let consumer = KafkaConsumer::new(client.clone());
+        let handle = tokio::spawn(async move {
+            consumer
+                .run_batch::<BatchTopic, _>(
+                    hc,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(1000)
+                        .with_max_batch_age(Duration::from_millis(500))
+                        .with_shutdown(sc)
+                        .with_schema_registry(registry),
+                )
+                .await
+        });
+
+        assert!(
+            handler.counter.wait_for(2, TIMEOUT).await,
+            "batch: both framed messages should be decoded and delivered"
+        );
+        shutdown.cancel();
+        handle.await.unwrap().ok();
+
+        let mut received = handler.messages().await;
+        received.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            received,
+            vec![first, second],
+            "batch: decoded payloads must match what was produced"
+        );
     }
 
     broker.close().await;
