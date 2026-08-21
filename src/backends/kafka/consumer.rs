@@ -16,6 +16,7 @@ use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
 use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionList};
 use tokio::sync::{Semaphore, mpsc};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
@@ -65,6 +66,15 @@ struct PartitionTracker {
     /// the current `next_to_commit` even without new completions, so the
     /// failed commit is retried instead of silently lost.
     dirty: bool,
+    /// When `dirty` was first raised in the current unresolved streak.
+    /// `commit_callback` only fires on failure (see its doc comment), so
+    /// there is no positive ack that a re-offered commit landed — but any
+    /// *resolved* rebalance always revokes and reassigns the partition,
+    /// which drops and recreates this tracker (see `OffsetTracker::remove`).
+    /// So a `dirty_since` that keeps aging across repeated re-offers with no
+    /// intervening rebalance is exactly the "commits rejected, group never
+    /// recovers" signature: `PartitionTracker::stuck_for`.
+    dirty_since: Option<Instant>,
 }
 
 impl PartitionTracker {
@@ -73,6 +83,7 @@ impl PartitionTracker {
             next_to_commit: first_offset,
             completed: BTreeSet::new(),
             dirty: false,
+            dirty_since: None,
         }
     }
 
@@ -88,8 +99,24 @@ impl PartitionTracker {
         self.completed.insert(offset);
     }
 
+    /// Flags this partition dirty (see the `dirty` field), recording `now` as
+    /// the start of the unresolved streak if one isn't already in progress.
+    fn mark_dirty(&mut self, now: Instant) {
+        self.dirty = true;
+        self.dirty_since.get_or_insert(now);
+    }
+
     /// Returns the offset to commit if progress was made (or a failed commit
     /// needs to be retried — see `dirty`), or None.
+    ///
+    /// Deliberately does **not** clear `dirty_since` just because this drain
+    /// found nothing to retry: `commit_callback` only fires on failure (see
+    /// its doc comment), so an async commit's round trip can easily outlast
+    /// one loop iteration — clearing on the first quiet tick would let a
+    /// genuinely wedged partition's streak keep getting reset just before
+    /// each new failure lands, never reaching the fenced threshold. Only a
+    /// resolving rebalance (revoke + reassign, which drops and recreates
+    /// this tracker — see `OffsetTracker::remove`) counts as resolved.
     fn drain_committable(&mut self) -> Option<i64> {
         let mut next = self.next_to_commit;
         while self.completed.remove(&next) {
@@ -106,6 +133,13 @@ impl PartitionTracker {
         } else {
             None
         }
+    }
+
+    /// How long this partition has been continuously dirty, or `None` if
+    /// it's currently clean.
+    fn stuck_for(&self, now: Instant) -> Option<Duration> {
+        self.dirty_since
+            .map(|since| now.saturating_duration_since(since))
     }
 }
 
@@ -153,16 +187,16 @@ impl OffsetTracker {
     /// drain, because an async commit that covered it was rejected. No-ops if
     /// the partition's tracker is gone (revoked meanwhile) — a commit must
     /// never be retried for a partition this member no longer owns.
-    fn mark_dirty(&mut self, partition: i32) {
+    fn mark_dirty(&mut self, partition: i32, now: Instant) {
         if let Some(tracker) = self.partitions.get_mut(&partition) {
-            tracker.dirty = true;
+            tracker.mark_dirty(now);
         }
     }
 
     /// Applies all queued rebalance/commit-failure events from librdkafka's
     /// callbacks. Cheap when the channel is empty (a single failed
     /// `try_recv`), so callers run it every loop iteration.
-    fn apply_rebalance_events(&mut self, rx: &std_mpsc::Receiver<RebalanceEvent>) {
+    fn apply_rebalance_events(&mut self, rx: &std_mpsc::Receiver<RebalanceEvent>, now: Instant) {
         while let Ok(event) = rx.try_recv() {
             match event {
                 RebalanceEvent::Assign(partitions) | RebalanceEvent::Revoke(partitions) => {
@@ -180,16 +214,37 @@ impl OffsetTracker {
                     // an assign round, so the last re-offer lands after the
                     // group is stable again.
                     for tracker in self.partitions.values_mut() {
-                        tracker.dirty = true;
+                        tracker.mark_dirty(now);
                     }
                 }
                 RebalanceEvent::CommitFailed(partitions) => {
                     for partition in partitions {
-                        self.mark_dirty(partition);
+                        self.mark_dirty(partition, now);
                     }
                 }
             }
         }
+    }
+
+    /// Returns the first partition that has been continuously dirty for at
+    /// least `threshold`, or `None` if every partition is either clean or
+    /// still within a normal rebalance's timing budget.
+    ///
+    /// This is the fenced-member signature from the 2026-07 staging
+    /// incident: offset commits kept getting rejected ("Specified group
+    /// generation id is not valid") with no resolving rebalance ever
+    /// arriving, so the consumer sat wedged — silently, since the receive
+    /// loop never errored and the task never finished, so it kept reporting
+    /// as an active group member. `threshold` should comfortably exceed the
+    /// broker's own rebalance protocol timing (`SESSION_TIMEOUT_MS`) so this
+    /// never fires during an ordinary, self-resolving rebalance.
+    fn fenced(&self, now: Instant, threshold: Duration) -> Option<i32> {
+        self.partitions.iter().find_map(|(&partition, tracker)| {
+            tracker
+                .stuck_for(now)
+                .filter(|&stuck| stuck >= threshold)
+                .map(|_| partition)
+        })
     }
 
     /// Returns the partitions that have new contiguous-from-start offsets to
@@ -1012,6 +1067,14 @@ const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(60);
 /// retry commits when no messages or completions arrive to wake it.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long a partition may sit with offset commits continuously rejected,
+/// no resolving rebalance ever arriving, before the receive loop treats
+/// itself as fenced from the group and forces a clean reconnect (see
+/// `OffsetTracker::fenced`). Well above `SESSION_TIMEOUT_MS` so an ordinary
+/// rebalance — which by protocol resolves inside that window — never trips
+/// it; well below the "silent multi-hour wedge" this guards against.
+const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
@@ -1220,7 +1283,27 @@ impl KafkaConsumer {
                     while let Ok((partition, offset)) = completion_rx.try_recv() {
                         tracker.mark_complete(partition, offset);
                     }
-                    tracker.apply_rebalance_events(&rebalance_rx);
+                    let now = Instant::now();
+                    tracker.apply_rebalance_events(&rebalance_rx, now);
+                    if let Some(partition) = tracker.fenced(now, COMMIT_FENCE_TIMEOUT) {
+                        metrics::record_backend_error(
+                            metrics::BackendLabel::Kafka,
+                            metrics::BackendErrorKind::Connection,
+                        );
+                        tracing::error!(
+                            queue,
+                            group_id,
+                            partition,
+                            stuck_for = ?COMMIT_FENCE_TIMEOUT,
+                            "consumer appears fenced from its group (offset commits rejected \
+                             with no resolving rebalance); forcing a clean reconnect"
+                        );
+                        return Err(ShoveError::Connection(format!(
+                            "consumer on '{queue}' appears fenced from group '{group_id}': \
+                             partition {partition} has had offset commits rejected for over \
+                             {COMMIT_FENCE_TIMEOUT:?} with no resolving rebalance"
+                        )));
+                    }
                     if let Some(tpl) = tracker.drain_committable() {
                         consumer
                             .commit(&tpl, CommitMode::Async)
@@ -1235,7 +1318,7 @@ impl KafkaConsumer {
                             while let Ok((partition, offset)) = completion_rx.try_recv() {
                                 tracker.mark_complete(partition, offset);
                             }
-                            tracker.apply_rebalance_events(&rebalance_rx);
+                            tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
                             if let Some(tpl) = tracker.drain_committable()
                                 && let Err(e) = consumer.commit(&tpl, CommitMode::Sync)
                             {
@@ -1290,7 +1373,7 @@ impl KafkaConsumer {
                             // events BEFORE tracking — otherwise the next
                             // iteration's drain would wipe the tracker entry this
                             // message is about to seed.
-                            tracker.apply_rebalance_events(&rebalance_rx);
+                            tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
                             tracker.track_received(partition, offset);
 
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
@@ -2359,7 +2442,7 @@ mod offset_tracker_tests {
 
         // The async commit of offset 1 was rejected mid-rebalance.
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx);
+        tracker.apply_rebalance_events(&rx, Instant::now());
         let tpl = tracker
             .drain_committable()
             .expect("failed commit must be re-offered without new completions");
@@ -2387,7 +2470,7 @@ mod offset_tracker_tests {
         // Another member joins: partitions 0-3 move away; the commit of
         // (4, 1) submitted during the rebalance may have been dropped.
         tx.send(RebalanceEvent::Revoke(vec![0, 1, 2, 3])).unwrap();
-        tracker.apply_rebalance_events(&rx);
+        tracker.apply_rebalance_events(&rx, Instant::now());
         let tpl = tracker
             .drain_committable()
             .expect("retained partition must re-offer its position");
@@ -2412,7 +2495,7 @@ mod offset_tracker_tests {
 
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
-        tracker.apply_rebalance_events(&rx);
+        tracker.apply_rebalance_events(&rx, Instant::now());
         assert!(
             tracker.drain_committable().is_none(),
             "no retry for a revoked partition"
@@ -2431,7 +2514,7 @@ mod offset_tracker_tests {
 
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
         tx.send(RebalanceEvent::Assign(vec![1])).unwrap();
-        tracker.apply_rebalance_events(&rx);
+        tracker.apply_rebalance_events(&rx, Instant::now());
 
         tracker.mark_complete(0, 5);
         tracker.mark_complete(1, 7);
@@ -2440,6 +2523,120 @@ mod offset_tracker_tests {
         assert_eq!(committed_offset(&tpl, 0), None, "revoked: removed");
         assert_eq!(committed_offset(&tpl, 1), None, "reassigned: removed");
         assert_eq!(committed_offset(&tpl, 2), Some(10), "untouched partition");
+    }
+
+    // -- fenced-member detection (CAF-25 / uc04) --
+
+    /// A clean tracker (never dirty) is never fenced, regardless of `now`.
+    #[test]
+    fn fenced_is_none_for_a_clean_tracker() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let now = Instant::now();
+        assert_eq!(tracker.fenced(now, Duration::from_secs(60)), None);
+        assert_eq!(
+            tracker.fenced(now + Duration::from_secs(1_000), Duration::from_secs(60)),
+            None
+        );
+    }
+
+    /// A single rejected commit is well within a normal rebalance's timing
+    /// budget — must not trip the fenced check.
+    #[test]
+    fn fenced_is_none_within_threshold() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+
+        assert_eq!(
+            tracker.fenced(t0 + Duration::from_secs(59), Duration::from_secs(60)),
+            None
+        );
+    }
+
+    /// Offset commits rejected continuously (re-offered every drain, failing
+    /// again every time) past the threshold with no resolving rebalance
+    /// trips the fenced check on the affected partition.
+    #[test]
+    fn fenced_fires_after_sustained_unresolved_commit_failures() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+
+        // Every re-offer fails again immediately — no gap wide enough to
+        // resolve the streak, and no revoke/assign ever arrives.
+        let t1 = t0 + Duration::from_secs(30);
+        let _ = tracker.drain_committable();
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t1);
+
+        let t2 = t0 + Duration::from_secs(61);
+        assert_eq!(
+            tracker.fenced(t2, Duration::from_secs(60)),
+            Some(0),
+            "partition 0 has been continuously dirty since t0"
+        );
+    }
+
+    /// A commit re-offer that isn't followed by another failure resolves the
+    /// streak: `drain_committable` seeing `dirty == false` on entry clears
+    /// `dirty_since`, so a later, unrelated failure starts a fresh streak
+    /// rather than inheriting the old one's age.
+    #[test]
+    fn fenced_streak_survives_a_quiet_drain_with_no_new_failure() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+        let _ = tracker.drain_committable(); // re-offers the failed commit
+
+        // A quiet drain with no new CommitFailed does NOT resolve the streak:
+        // `commit_callback` only fires on failure, so silence this soon
+        // after a re-offer is not yet evidence of success — a genuinely
+        // wedged partition looks identical at this point, and its next
+        // failure callback may not land for a while yet.
+        let _ = tracker.drain_committable();
+        assert_eq!(
+            tracker.fenced(t0 + Duration::from_secs(61), Duration::from_secs(60)),
+            Some(0),
+            "streak must keep aging through quiet drains with no resolving rebalance"
+        );
+    }
+
+    /// A resolving rebalance (revoke + reassign) drops and recreates the
+    /// tracker, which clears any in-progress streak even if the old one had
+    /// already crossed the threshold.
+    #[test]
+    fn fenced_clears_on_partition_revoke_and_reassign() {
+        let (tx, rx) = std_mpsc::channel();
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        let t0 = Instant::now();
+        tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t0);
+
+        let t1 = t0 + Duration::from_secs(90);
+        assert_eq!(tracker.fenced(t1, Duration::from_secs(60)), Some(0));
+
+        tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
+        tracker.apply_rebalance_events(&rx, t1);
+        tracker.track_received(0, 42);
+
+        assert_eq!(
+            tracker.fenced(t1, Duration::from_secs(60)),
+            None,
+            "reassignment recreated the tracker; the old streak is gone"
+        );
     }
 }
 
