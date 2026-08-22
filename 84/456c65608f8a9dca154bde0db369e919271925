@@ -1,0 +1,23 @@
+.github/workflows/publish.yml
+  s_cc6efa4ffe2059::t_7e98c5477b608e 33,105
+.github/workflows/ci.yml
+  s_cc6efa4ffe2059::t_7e98c5477b608e 43,78,137
+benches/consumer_overhead.rs
+  s_cc6efa4ffe2059::t_7e98c5477b608e 353-357
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "84456c65608f8a9dca154bde0db369e919271925",
+  "prompts": {},
+  "sessions": {
+    "s_cc6efa4ffe2059": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02b7c-07a5-74d1-ad14-53abd1ea79cc",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
