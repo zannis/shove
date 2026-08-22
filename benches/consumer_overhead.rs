@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+#[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::RabbitMqConsumerGroupConfig;
@@ -349,12 +350,11 @@ fn current_rss_bytes() -> u64 {
     }
     #[cfg(target_os = "linux")]
     {
-        if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(rss_pages) = content.split_whitespace().nth(1) {
-                if let Ok(pages) = rss_pages.parse::<u64>() {
-                    return pages * 4096;
-                }
-            }
+        if let Ok(content) = std::fs::read_to_string("/proc/self/statm")
+            && let Some(rss_pages) = content.split_whitespace().nth(1)
+            && let Ok(pages) = rss_pages.parse::<u64>()
+        {
+            return pages * 4096;
         }
         0
     }
