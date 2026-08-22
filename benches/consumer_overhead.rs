@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+#[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::RabbitMqConsumerGroupConfig;
