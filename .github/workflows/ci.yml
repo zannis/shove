@@ -51,6 +51,14 @@ jobs:
       - run: cargo clippy -q --all-features --all-targets -- -D warnings
       - run: cargo clippy -q --no-default-features --all-targets -- -D warnings
       - run: cargo test --no-default-features
+      # The schema-registry mock suite drives an in-process axum registry, so
+      # unlike the other two SR files it needs no Docker (11 tests, ~0.2s) and
+      # can run here as well as in the coverage entry. That keeps a fast signal
+      # on the registry client — caching, single-flight, negative caching, auth
+      # headers — that does not depend on the container-backed entry being
+      # healthy. `--all-features` so it reuses the dependency build the
+      # clippy/publish steps already paid for.
+      - run: cargo test --all-features --test kafka_schema_registry
       - run: cargo publish --dry-run --all-features
 
   msrv:
@@ -116,6 +124,10 @@ jobs:
             # contending with the `kafka` entry's containers. `protobuf` turns
             # on the framed-protobuf scenario in the cp integration test.
             features: kafka,kafka-schema-registry,protobuf
+            # `kafka-schema-registry` implies `kafka`, so without a filter this
+            # entry would re-run the entire Kafka suite the `kafka` entry
+            # already covers. Restrict it to the three schema-registry binaries.
+            filter: -E 'binary(/^kafka_schema_registry/)'
           - name: redis-streams
             features: redis-streams,sbe
     steps:
@@ -125,7 +137,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
-      - run: cargo llvm-cov nextest --features ${{ matrix.features }} --lcov --output-path lcov.info
+      # `matrix.filter` is unset for every entry but kafka-schema-registry,
+      # where it expands to empty and the full suite runs as before.
+      - run: cargo llvm-cov nextest --features ${{ matrix.features }} ${{ matrix.filter }} --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v5
         with:
           use_oidc: true
