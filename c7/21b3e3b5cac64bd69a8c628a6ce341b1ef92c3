@@ -1,0 +1,19 @@
+benches/consumer_overhead.rs
+  s_ced4c4d3f4d881::t_65e8901d71f670 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "c721b3e3b5cac64bd69a8c628a6ce341b1ef92c3",
+  "prompts": {},
+  "sessions": {
+    "s_ced4c4d3f4d881": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a02b08-5a61-73d0-98b2-e2a6d14b6f52",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
