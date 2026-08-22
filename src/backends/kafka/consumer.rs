@@ -1139,6 +1139,12 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(5);
 const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for `seek_partitions` when redelivering an un-acked batch.
+///
+/// **Must stay non-zero.** `rd_kafka_seek_partitions` only waits for the
+/// per-partition seeks — and so only fills in their real results — when it is
+/// given a timeout; with zero it returns immediately, leaving every partition
+/// marked `__IN_PROGRESS`. [`seek_errors`] would then read every seek as
+/// failed and every redelivery would escalate to a reconnect.
 const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// First delay after redelivering an un-acked batch, escalating to
@@ -2090,6 +2096,8 @@ fn rewind_after_rebalance(
 /// `rd_kafka_seek_partitions` reports each partition's outcome in that
 /// element's `err` field and only returns a top-level error for argument-level
 /// problems, so an `Ok(_)` here does **not** mean every partition was sought.
+///
+/// Relies on the caller passing a non-zero timeout — see [`SEEK_TIMEOUT`].
 fn seek_errors(result: &TopicPartitionList) -> Vec<(i32, KafkaError)> {
     result
         .elements()
