@@ -111,6 +111,32 @@ shove::define_topic!(
         .build()
 );
 
+shove::define_topic!(
+    PoisonFloodTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-poison-flood")
+        .dlq()
+        .build()
+);
+
+shove::define_topic!(
+    PanicTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-panic").build()
+);
+
+shove::define_topic!(
+    HandlerTimeoutTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-handler-timeout").build()
+);
+
+shove::define_topic!(
+    HungShutdownTopic,
+    BatchMessage,
+    TopologyBuilder::new("kafka-batch-hung-shutdown").build()
+);
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -312,7 +338,122 @@ impl_recording_for!(
     BatchDlqTopic,
     RejectTopic,
     PoisonRetryTopic,
+    PoisonFloodTopic,
 );
+
+// ---------------------------------------------------------------------------
+// Misbehaving batch handler
+// ---------------------------------------------------------------------------
+
+/// What the handler does *instead* of returning an outcome.
+#[derive(Clone, Copy)]
+enum Misbehaviour {
+    /// Panic on the first flush, behave on every one after.
+    PanicOnce,
+    /// Outlast any sane handler timeout on the first flush, behave after.
+    HangOnce,
+    /// Never return, on any flush.
+    HangForever,
+}
+
+/// A handler that panics or hangs, to prove `run_batch` survives both.
+///
+/// Neither is hypothetical for a DB sink: an `unwrap` on a poisoned lock or a
+/// row that violates an assumption panics, and a driver waiting on a lost
+/// connection hangs. Before batch invocation got `catch_unwind` + timeout, the
+/// first killed the consumer task outright and the second wedged it — along
+/// with offset commits, rebalance handling, and shutdown — forever.
+#[derive(Clone)]
+struct MisbehavingBatchHandler {
+    mode: Misbehaviour,
+    /// The `seq` list handed to each flush, in order. Recorded *before*
+    /// misbehaving, so a panicking or hanging call still shows up.
+    calls: Arc<Mutex<Vec<Vec<u32>>>>,
+    signal: Arc<Notify>,
+}
+
+impl MisbehavingBatchHandler {
+    fn new(mode: Misbehaviour) -> Self {
+        Self {
+            mode,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            signal: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn act(&self, batch: &[(BatchMessage, MessageMetadata)]) -> Outcome {
+        let nth = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(batch.iter().map(|(m, _)| m.seq).collect());
+            calls.len()
+        };
+        self.signal.notify_waiters();
+
+        let misbehave = match self.mode {
+            Misbehaviour::HangForever => true,
+            Misbehaviour::PanicOnce | Misbehaviour::HangOnce => nth == 1,
+        };
+        if !misbehave {
+            return Outcome::Ack;
+        }
+        match self.mode {
+            Misbehaviour::PanicOnce => panic!("batch handler panicked on flush {nth}"),
+            // Longer than any timeout the tests configure and longer than
+            // `TIMEOUT`, so a test that hangs fails on its own deadline rather
+            // than on this sleep expiring.
+            Misbehaviour::HangOnce | Misbehaviour::HangForever => {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Outcome::Ack
+            }
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<u32>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    async fn wait_for_calls(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.calls.lock().unwrap().len() >= n {
+                return true;
+            }
+            tokio::select! {
+                _ = self.signal.notified() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.calls.lock().unwrap().len() >= n;
+                }
+            }
+        }
+    }
+}
+
+macro_rules! impl_misbehaving_for {
+    ($($topic:ty),* $(,)?) => {
+        $(
+            impl BatchMessageHandler<$topic> for MisbehavingBatchHandler {
+                type Context = ();
+                async fn handle_batch(
+                    &self,
+                    messages: Vec<(BatchMessage, MessageMetadata)>,
+                    _: &(),
+                ) -> Outcome {
+                    self.act(&messages).await
+                }
+            }
+        )*
+    };
+}
+
+impl_misbehaving_for!(PanicTopic, HandlerTimeoutTopic, HungShutdownTopic);
+
+/// The test topics have 8 partitions, so a batch's *order* follows poll order
+/// across partitions rather than publish order — compare batches as sets.
+fn sorted(batch: &[u32]) -> Vec<u32> {
+    let mut v = batch.to_vec();
+    v.sort_unstable();
+    v
+}
 
 async fn publish_seq<T>(broker: &Broker<Kafka>, range: std::ops::Range<u32>)
 where
@@ -455,13 +596,6 @@ async fn non_ack_outcome_redelivers_the_whole_batch() {
     shutdown.cancel();
     handle.await.unwrap().ok();
 
-    // The topic has 8 partitions, so a batch's *order* follows poll order
-    // across partitions, not publish order — compare as sets.
-    let sorted = |b: &Vec<u32>| {
-        let mut v = b.clone();
-        v.sort_unstable();
-        v
-    };
     let batches = handler.batches();
     assert_eq!(
         sorted(&batches[0]),
@@ -469,6 +603,166 @@ async fn non_ack_outcome_redelivers_the_whole_batch() {
         "redelivery should replay the identical batch, got {batches:?}"
     );
     assert_eq!(sorted(&batches[0]), vec![0, 1, 2]);
+    broker.close().await;
+}
+
+/// A panicking flush is a redelivery, not the end of the consumer.
+///
+/// The regression: `flush_batch` awaited `handle_batch` directly, so the panic
+/// unwound the `run_batch` task itself. The consumer stopped consuming and
+/// stayed stopped — the single-message path has turned the same panic into
+/// `Outcome::Retry` since forever. Here the batch must come back intact and
+/// the second flush must be able to ack it.
+#[tokio::test]
+async fn a_panicking_flush_is_redelivered_and_the_consumer_survives() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker.topology().declare::<PanicTopic>().await.unwrap();
+    publish_seq::<PanicTopic>(&broker, 0..3).await;
+
+    let handler = MisbehavingBatchHandler::new(Misbehaviour::PanicOnce);
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<PanicTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_secs(30))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    let got_two = handler.wait_for_calls(2, TIMEOUT).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let calls = handler.calls();
+    assert!(
+        got_two,
+        "the panic must be caught and the batch redelivered; the handler was \
+         called {} time(s): {calls:?}",
+        calls.len()
+    );
+    assert_eq!(
+        sorted(&calls[0]),
+        vec![0, 1, 2],
+        "first flush sees the whole batch, then panics"
+    );
+    assert_eq!(
+        sorted(&calls[1]),
+        vec![0, 1, 2],
+        "the same batch comes back — the panic acked nothing"
+    );
+    broker.close().await;
+}
+
+/// A flush that outlasts `handler_timeout` is abandoned and redelivered.
+///
+/// Without the timeout the batch loop — a single task — sits inside the hung
+/// future indefinitely: no commits, no rebalance handling, no shutdown. The
+/// timeout has to end the flush *and* leave the batch un-acked so it returns.
+#[tokio::test]
+async fn a_flush_that_outlasts_the_handler_timeout_is_redelivered() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<HandlerTimeoutTopic>()
+        .await
+        .unwrap();
+    publish_seq::<HandlerTimeoutTopic>(&broker, 0..3).await;
+
+    let handler = MisbehavingBatchHandler::new(Misbehaviour::HangOnce);
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<HandlerTimeoutTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_secs(30))
+                    .with_handler_timeout(Duration::from_secs(2))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    let got_two = handler.wait_for_calls(2, TIMEOUT).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let calls = handler.calls();
+    assert!(
+        got_two,
+        "the hung flush must time out and redeliver; the handler was called {} \
+         time(s): {calls:?}",
+        calls.len()
+    );
+    assert_eq!(
+        sorted(&calls[1]),
+        vec![0, 1, 2],
+        "the timed-out batch is redelivered whole"
+    );
+    broker.close().await;
+}
+
+/// `shutdown.cancel()` must return even while a flush is hung.
+///
+/// The reason the timeout is opt-*out* rather than opt-in: with no timeout,
+/// this test never finishes. The consumer only reaches its shutdown branch
+/// between flushes, so the bound on stopping is the bound on one flush.
+#[tokio::test]
+async fn shutdown_completes_while_a_flush_is_hung() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<HungShutdownTopic>()
+        .await
+        .unwrap();
+    publish_seq::<HungShutdownTopic>(&broker, 0..3).await;
+
+    let handler = MisbehavingBatchHandler::new(Misbehaviour::HangForever);
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<HungShutdownTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_secs(30))
+                    .with_handler_timeout(Duration::from_secs(2))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    // Cancel from *inside* a hung flush — the case that used to never return.
+    assert!(
+        handler.wait_for_calls(1, TIMEOUT).await,
+        "the handler must be entered before shutdown is signalled"
+    );
+    shutdown.cancel();
+
+    let stopped = tokio::time::timeout(Duration::from_secs(30), handle).await;
+    assert!(
+        stopped.is_ok(),
+        "shutdown must not wait on a flush that never returns"
+    );
     broker.close().await;
 }
 
@@ -625,6 +919,63 @@ async fn a_batch_of_only_dropped_messages_still_commits() {
         second.seen(),
         vec![7],
         "offsets past the all-poison window must have been committed"
+    );
+    broker.close().await;
+}
+
+/// `max_batch_size` has to bound a batch of nothing but poison too.
+///
+/// Dropped messages never reach `messages`, so counting only decoded ones left
+/// the size trigger unreachable for an all-poison window: the batch grew until
+/// `max_batch_age` alone ended it, holding every parked DLQ payload in memory
+/// for the full window. `max_batch_age` here is 120s — far longer than the
+/// test will wait — so the DLQ can only fill if the *size* trigger fired.
+#[tokio::test]
+async fn a_flood_of_poison_still_trips_the_size_trigger() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<PoisonFloodTopic>()
+        .await
+        .unwrap();
+
+    const POISON: &[u8] = b"{not valid json";
+    for _ in 0..3 {
+        publish_raw(&tb.brokers, "kafka-batch-poison-flood", POISON).await;
+    }
+
+    let handler = RecordingBatchHandler::new();
+    let h = handler.clone();
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = KafkaConsumer::new(tb.client());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_batch::<PoisonFloodTopic, _>(
+                h,
+                (),
+                BatchConsumerOptions::new()
+                    .with_max_batch_size(3)
+                    .with_max_batch_age(Duration::from_secs(120))
+                    .with_shutdown(sc),
+            )
+            .await
+    });
+
+    let dead = drain_raw(&tb.brokers, "kafka-batch-poison-flood-dlq", 3).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    assert_eq!(
+        dead.len(),
+        3,
+        "three poison messages fill a max_batch_size of 3 and must flush on size, \
+         not wait out the 120s age window; got {dead:?}"
+    );
+    assert!(
+        handler.batches().is_empty(),
+        "none of them decode, so the handler is never called"
     );
     broker.close().await;
 }
