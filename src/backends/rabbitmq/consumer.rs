@@ -28,7 +28,7 @@ use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{hold_index, retries_exhausted};
+use crate::routing::{handler_timeout_outcome, hold_index, retries_exhausted};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
 use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
@@ -781,6 +781,7 @@ impl RabbitMqConsumer {
                                 message,
                                 metadata,
                                 options.handler_timeout,
+                                options.handler_timeout_outcome,
                                 &completed_tx,
                                 seq_key.clone(),
                                 topic.clone(),
@@ -909,6 +910,7 @@ impl RabbitMqConsumer {
                         message,
                         metadata,
                         options.handler_timeout,
+                        options.handler_timeout_outcome,
                         completed_tx,
                         key.to_string(),
                         topic.clone(),
@@ -1113,6 +1115,7 @@ impl RabbitMqConsumer {
                             message,
                             metadata,
                             options.handler_timeout,
+                            options.handler_timeout_outcome,
                             &notify,
                             topic.clone(),
                             group.clone(),
@@ -1324,6 +1327,7 @@ async fn nack_requeue_all_pending(
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -1342,9 +1346,10 @@ where
             }
             Err(_) => {
                 join.abort();
-                warn!("handler exceeded timeout ({duration:?}), retrying message");
+                let resolved = handler_timeout_outcome(timeout_outcome);
+                warn!(outcome = ?resolved, "handler exceeded timeout ({duration:?})");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                Outcome::Retry
+                resolved
             }
         },
         None => match join.await {
@@ -1370,6 +1375,7 @@ fn spawn_handler<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     notify: &Arc<Notify>,
     topic: Arc<str>,
     group: Option<Arc<str>>,
@@ -1386,6 +1392,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -1406,6 +1413,7 @@ fn spawn_handler_keyed<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key: String,
     topic: Arc<str>,
@@ -1423,6 +1431,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -1695,14 +1704,15 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_handler_returns_outcome_without_timeout() {
-        let outcome = invoke_handler(async { Outcome::Ack }, None, "test-topic", None).await;
+        let outcome = invoke_handler(async { Outcome::Ack }, None, None, "test-topic", None).await;
         assert!(matches!(outcome, Outcome::Ack));
     }
 
     #[tokio::test]
     async fn invoke_handler_returns_outcome_within_timeout() {
         let timeout = Some(Duration::from_secs(1));
-        let outcome = invoke_handler(async { Outcome::Reject }, timeout, "test-topic", None).await;
+        let outcome =
+            invoke_handler(async { Outcome::Reject }, timeout, None, "test-topic", None).await;
         assert!(matches!(outcome, Outcome::Reject));
     }
 
@@ -1715,6 +1725,7 @@ mod tests {
                 Outcome::Ack
             },
             timeout,
+            None,
             "test-topic",
             None,
         )
@@ -1730,6 +1741,7 @@ mod tests {
         // metrics are recorded for the requeued message.
         let outcome = invoke_handler::<std::pin::Pin<Box<dyn Future<Output = Outcome> + Send>>>(
             Box::pin(async { panic!("boom") }),
+            None,
             None,
             "test-topic",
             None,

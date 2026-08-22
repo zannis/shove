@@ -15,6 +15,7 @@ use crate::markers::Nats;
 use crate::markers::RabbitMq;
 #[cfg(feature = "aws-sns-sqs")]
 use crate::markers::Sqs;
+use crate::outcome::Outcome;
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 
@@ -115,6 +116,10 @@ pub struct ConsumerOptions<B: Backend> {
     ///
     /// Default: [`DEFAULT_HANDLER_TIMEOUT`] (30 s). Set to `None` to disable.
     pub handler_timeout: Option<Duration>,
+    /// What a handler timeout resolves to. `None` keeps each backend's
+    /// historical default — see
+    /// [`with_handler_timeout_outcome`](Self::with_handler_timeout_outcome).
+    pub handler_timeout_outcome: Option<Outcome>,
     /// Maximum number of locally buffered messages per sequence key in
     /// concurrent-sequenced consumers. When the limit is reached, new
     /// deliveries for that key are rejected to the DLQ.
@@ -231,6 +236,7 @@ impl<B: Backend> ConsumerOptions<B> {
             prefetch_count: 10,
             concurrent_processing: true,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout_outcome: None,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             max_reconnect_attempts: None,
@@ -297,6 +303,40 @@ impl<B: Backend> ConsumerOptions<B> {
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = Some(timeout);
+        self
+    }
+
+    /// Choose what a handler timeout resolves to, instead of each backend's
+    /// default.
+    ///
+    /// A timeout is the library's verdict on a *slow consumer*, not evidence
+    /// that the message itself is bad, but the two are indistinguishable from
+    /// the outside — so the choice belongs to the caller:
+    ///
+    /// - [`Outcome::Retry`] — the historical default on every backend except
+    ///   Redis. Consumes retry budget, so a persistently slow handler
+    ///   eventually dead-letters (or, with no DLQ declared, is discarded).
+    /// - [`Outcome::Defer`] — redeliver via `hold_queues[0]` **without**
+    ///   consuming retry budget, so a slow handler never dead-letters a valid
+    ///   message. Note [`Outcome::Defer`]'s infinite-loop caveat: nothing
+    ///   bounds the redeliveries, and sequenced consumers downgrade it back to
+    ///   [`Outcome::Retry`] because it violates ordering.
+    /// - [`Outcome::Reject`] — treat a timeout as terminal and dead-letter on
+    ///   the first occurrence, consuming no retry budget.
+    /// - [`Outcome::Ack`] — drop the message. The handler is cancelled
+    ///   mid-flight, so any work it had not yet committed is lost.
+    ///
+    /// Leaving this unset preserves current behaviour exactly. On Redis
+    /// Streams the default is not an outcome at all: a timed-out entry is left
+    /// in the PEL and reclaimed by `XAUTOCLAIM` after the idle deadline, which
+    /// redelivers without consuming retry budget. Setting this option makes
+    /// Redis route the given outcome instead, which for [`Outcome::Defer`]
+    /// means the configured hold-queue delay rather than the idle deadline.
+    ///
+    /// Handler *panics* are unaffected and always resolve to
+    /// [`Outcome::Retry`] — a panic is a failed attempt, not a slow one.
+    pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
+        self.handler_timeout_outcome = Some(outcome);
         self
     }
 
@@ -385,6 +425,7 @@ impl<B: Backend> ConsumerOptions<B> {
             max_retries: self.max_retries,
             prefetch_count: effective_prefetch,
             handler_timeout: self.handler_timeout,
+            handler_timeout_outcome: self.handler_timeout_outcome,
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
             max_reconnect_attempts: self.max_reconnect_attempts,
@@ -426,6 +467,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             prefetch_count: self.prefetch_count,
             concurrent_processing: self.concurrent_processing,
             handler_timeout: self.handler_timeout,
+            handler_timeout_outcome: self.handler_timeout_outcome.clone(),
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
             max_reconnect_attempts: self.max_reconnect_attempts,

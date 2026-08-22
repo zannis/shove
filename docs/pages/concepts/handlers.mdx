@@ -83,6 +83,8 @@ group.register::<Orders, _>(cfg, || Handler).await?;
 
 Every handler call runs under a wall-clock deadline. If it does not return within the timeout, the future is dropped, `Outcome::Retry` is recorded, and `metrics::record_failed(..., FailReason::Timeout)` is emitted. The default is 30 seconds.
 
+The outcome a timeout resolves to is configurable — see [Choosing what a timeout means](#choosing-what-a-timeout-means) below.
+
 Three layers control the timeout, in priority order — the first one set wins:
 
 1. **Per-group override** — `<Backend>ConsumerGroupConfig::with_handler_timeout(Duration)`. Lives on the group config; rebuilt per `register` call.

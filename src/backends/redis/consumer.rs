@@ -718,18 +718,29 @@ where
                             {
                                 Ok(o) => Some(o),
                                 Err(_) => {
-                                    tracing::warn!(
-                                        entry_id,
-                                        timeout = ?timeout_dur,
-                                        "handler timed out — leaving in PEL for XAUTOCLAIM"
-                                    );
+                                    // With no override, do NOT ack: XAUTOCLAIM
+                                    // reclaims the entry after idle_ms, which
+                                    // redelivers without touching retry_count.
+                                    let resolved = options.handler_timeout_outcome;
+                                    match resolved {
+                                        Some(o) => tracing::warn!(
+                                            entry_id,
+                                            timeout = ?timeout_dur,
+                                            outcome = ?o,
+                                            "handler timed out"
+                                        ),
+                                        None => tracing::warn!(
+                                            entry_id,
+                                            timeout = ?timeout_dur,
+                                            "handler timed out — leaving in PEL for XAUTOCLAIM"
+                                        ),
+                                    }
                                     metrics::record_failed(
                                         &topic_arc,
                                         group_arc.as_deref(),
                                         metrics::FailReason::Timeout,
                                     );
-                                    // Do NOT ack — XAUTOCLAIM will reclaim it after idle_ms.
-                                    None
+                                    resolved
                                 }
                             }
                         }
@@ -836,6 +847,7 @@ where
     let max_retries = options.max_retries;
     let max_message_size = options.max_message_size;
     let handler_timeout = options.handler_timeout;
+    let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
     let processing = options.processing.clone();
 
     run_with_reconnect(&shutdown, stream, options.max_reconnect_attempts, || {
@@ -1049,17 +1061,29 @@ where
                                 {
                                     Ok(o) => Some(o),
                                     Err(_) => {
-                                        tracing::warn!(
-                                            entry_id,
-                                            timeout = ?timeout_dur,
-                                            "handler timed out — leaving in PEL for XAUTOCLAIM"
-                                        );
+                                        // See the non-concurrent path: `None`
+                                        // leaves the entry in the PEL for
+                                        // XAUTOCLAIM to reclaim.
+                                        let resolved = handler_timeout_outcome_cfg;
+                                        match resolved {
+                                            Some(o) => tracing::warn!(
+                                                entry_id,
+                                                timeout = ?timeout_dur,
+                                                outcome = ?o,
+                                                "handler timed out"
+                                            ),
+                                            None => tracing::warn!(
+                                                entry_id,
+                                                timeout = ?timeout_dur,
+                                                "handler timed out — leaving in PEL for XAUTOCLAIM"
+                                            ),
+                                        }
                                         metrics::record_failed(
                                             &task_topic,
                                             task_group_metric.as_deref(),
                                             metrics::FailReason::Timeout,
                                         );
-                                        None
+                                        resolved
                                     }
                                 }
                             }

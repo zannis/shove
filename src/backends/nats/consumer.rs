@@ -26,7 +26,7 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{RetryDecision, decide_retry, hold_index};
+use crate::routing::{RetryDecision, decide_retry, handler_timeout_outcome, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
@@ -392,6 +392,7 @@ async fn route_outcome(
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -410,9 +411,10 @@ where
             }
             Err(_) => {
                 join.abort();
-                tracing::warn!("handler timed out after {duration:?}, retrying");
+                let resolved = handler_timeout_outcome(timeout_outcome);
+                tracing::warn!(outcome = ?resolved, "handler timed out after {duration:?}");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                Outcome::Retry
+                resolved
             }
         },
         None => match join.await {
@@ -567,6 +569,7 @@ impl NatsConsumer {
         let max_retries = options.max_retries;
         let prefetch_count = options.prefetch_count;
         let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
         let hold_queues = topology.hold_queues();
 
         let max_message_size = options.max_message_size;
@@ -788,6 +791,7 @@ impl NatsConsumer {
                                         task_handler.handle(payload, metadata, task_ctx.as_ref()).await
                                     },
                                     handler_timeout,
+                                    handler_timeout_outcome_cfg,
                                     &task_topic,
                                     task_group.as_deref(),
                                 )
@@ -938,6 +942,7 @@ impl NatsConsumer {
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
         let topic: Arc<str> = Arc::from(queue);
@@ -1133,6 +1138,7 @@ impl NatsConsumer {
                                             let o = invoke_handler(
                                                 async move { h.handle(payload, metadata, c.as_ref()).await },
                                                 handler_timeout,
+                                                handler_timeout_outcome_cfg,
                                                 &spawn_topic,
                                                 spawn_group.as_deref(),
                                             ).await;

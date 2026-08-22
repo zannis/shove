@@ -21,6 +21,7 @@ use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
+use crate::routing::handler_timeout_outcome;
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
@@ -203,6 +204,7 @@ where
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -221,9 +223,10 @@ where
             }
             Err(_) => {
                 join.abort();
-                warn!("handler exceeded timeout ({duration:?}), retrying message");
+                let resolved = handler_timeout_outcome(timeout_outcome);
+                warn!(outcome = ?resolved, "handler exceeded timeout ({duration:?})");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                Outcome::Retry
+                resolved
             }
         },
         None => match join.await {
@@ -249,6 +252,7 @@ fn spawn_handler<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     notify: &Arc<Notify>,
     topic: Arc<str>,
     group: Option<Arc<str>>,
@@ -265,6 +269,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -562,6 +567,7 @@ where
                 message,
                 metadata,
                 options.handler_timeout,
+                options.handler_timeout_outcome,
                 &notify,
                 Arc::clone(&topic),
                 group.clone(),
@@ -748,6 +754,7 @@ fn spawn_handler_keyed<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key: String,
     topic: Arc<str>,
@@ -765,6 +772,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -1316,6 +1324,7 @@ where
                         message,
                         metadata,
                         options.handler_timeout,
+                        options.handler_timeout_outcome,
                         &completed_tx,
                         seq_key.clone(),
                         Arc::clone(&topic),
@@ -1468,6 +1477,7 @@ async fn drain_pending_for_key<T, H>(
             message,
             metadata,
             options.handler_timeout,
+            options.handler_timeout_outcome,
             completed_tx,
             key.to_string(),
             Arc::clone(topic),

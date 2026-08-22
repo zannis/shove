@@ -93,6 +93,9 @@ pub struct KafkaConsumerGroupConfig {
     max_consumers: u16,
     max_retries: u32,
     pub(crate) handler_timeout: HandlerTimeoutConfig,
+    /// What a handler timeout resolves to. `None` keeps the backend's
+    /// historical default.
+    pub(crate) handler_timeout_outcome: Option<crate::Outcome>,
     concurrent_processing: bool,
     max_pending_per_key: Option<usize>,
     max_message_size: Option<usize>,
@@ -149,6 +152,7 @@ impl KafkaConsumerGroupConfig {
             max_consumers: max,
             max_retries: 10,
             handler_timeout: HandlerTimeoutConfig::Inherit,
+            handler_timeout_outcome: None,
             concurrent_processing: false,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
@@ -176,6 +180,16 @@ impl KafkaConsumerGroupConfig {
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = HandlerTimeoutConfig::Set(timeout);
+        self
+    }
+
+    /// Choose what a handler timeout resolves to for consumers in this group,
+    /// instead of the backend default. See
+    /// [`ConsumerOptions::with_handler_timeout_outcome`](crate::ConsumerOptions::with_handler_timeout_outcome)
+    /// for the semantics of each outcome; leaving it unset preserves current
+    /// behaviour exactly.
+    pub fn with_handler_timeout_outcome(mut self, outcome: crate::Outcome) -> Self {
+        self.handler_timeout_outcome = Some(outcome);
         self
     }
 
@@ -760,6 +774,7 @@ impl KafkaConsumerGroup {
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
+        options.handler_timeout_outcome = self.config.handler_timeout_outcome;
         if let Some(limit) = self.config.max_pending_per_key {
             options.max_pending_per_key = Some(limit);
         }

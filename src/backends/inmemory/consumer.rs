@@ -20,7 +20,7 @@ use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
-use crate::routing::{RetryDecision, decide_retry, hold_index};
+use crate::routing::{RetryDecision, decide_retry, handler_timeout_outcome, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
@@ -193,6 +193,7 @@ where
             let ctx_clone = Arc::clone(&ctx);
             let max_size = options.max_message_size;
             let timeout_opt = options.handler_timeout;
+            let timeout_outcome = options.handler_timeout_outcome;
             let env_for_task = env.clone();
             let group = options.consumer_group.clone();
 
@@ -203,6 +204,7 @@ where
                     &env_for_task,
                     max_size,
                     timeout_opt,
+                    timeout_outcome,
                     T::topology().queue(),
                     group.as_deref(),
                 )
@@ -502,6 +504,7 @@ async fn run_fifo_shard<T, H>(
                     &env,
                     options.max_message_size,
                     options.handler_timeout,
+                    options.handler_timeout_outcome,
                     &shutdown,
                     &broker_shutdown,
                     T::topology().queue(),
@@ -876,6 +879,7 @@ async fn run_handler<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout_opt: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -888,9 +892,10 @@ where
             match tokio::time::timeout(timeout_dur, handler.handle(message, metadata, &ctx)).await {
                 Ok(o) => o,
                 Err(_) => {
-                    tracing::warn!(timeout = ?timeout_dur, "handler timed out — retrying");
+                    let resolved = handler_timeout_outcome(timeout_outcome);
+                    tracing::warn!(timeout = ?timeout_dur, outcome = ?resolved, "handler timed out");
                     metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                    Outcome::Retry
+                    resolved
                 }
             }
         }
@@ -906,6 +911,7 @@ async fn invoke_handler<T, H>(
     env: &Envelope,
     max_size: Option<usize>,
     timeout_opt: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -920,8 +926,17 @@ where
 
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let outcome =
-        run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt, topic, group).await;
+    let outcome = run_handler::<T, H>(
+        handler,
+        ctx,
+        message,
+        metadata,
+        timeout_opt,
+        timeout_outcome,
+        topic,
+        group,
+    )
+    .await;
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
     metrics::record_processing_duration(topic, group, &outcome, elapsed);
@@ -938,6 +953,7 @@ async fn invoke_handler_caught<T, H>(
     env: &Envelope,
     max_size: Option<usize>,
     timeout_opt: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     shutdown: &CancellationToken,
     broker_shutdown: &CancellationToken,
     topic: &str,
@@ -970,6 +986,7 @@ where
                 message,
                 metadata,
                 timeout_opt,
+                timeout_outcome,
                 &topic_owned,
                 group_owned.as_deref(),
             )

@@ -28,6 +28,19 @@ pub(crate) enum RetryDecision {
     Hold { increment: bool },
 }
 
+/// The outcome a handler timeout resolves to, given the consumer's optional
+/// `handler_timeout_outcome` override. `None` means "keep the historical
+/// default", which is [`Outcome::Retry`] on every backend that maps a timeout
+/// onto an outcome at all. Redis Streams does not — it leaves the entry in the
+/// PEL for `XAUTOCLAIM` — and only reaches this helper once an override is set.
+///
+/// Single source of truth so the five backends that hand-roll their own
+/// `invoke_handler` cannot drift apart on the default.
+#[allow(dead_code)] // every consumer is feature-gated; dead under --no-default-features
+pub(crate) fn handler_timeout_outcome(configured: Option<Outcome>) -> Outcome {
+    configured.unwrap_or(Outcome::Retry)
+}
+
 /// Whether the retry budget is exhausted. `max_retries = N` permits N retries,
 /// so a message is terminal once `retry_count >= max_retries`. Single source of
 /// truth for the boundary shared by `decide_retry` and pre-handler gates.
@@ -139,5 +152,26 @@ mod tests {
             decide_retry(&Outcome::Defer, 99, 0),
             RetryDecision::Hold { increment: false }
         );
+    }
+
+    #[test]
+    fn handler_timeout_outcome_defaults_to_retry() {
+        assert!(matches!(handler_timeout_outcome(None), Outcome::Retry));
+    }
+
+    #[test]
+    fn handler_timeout_outcome_honours_override() {
+        assert!(matches!(
+            handler_timeout_outcome(Some(Outcome::Defer)),
+            Outcome::Defer
+        ));
+        assert!(matches!(
+            handler_timeout_outcome(Some(Outcome::Reject)),
+            Outcome::Reject
+        ));
+        assert!(matches!(
+            handler_timeout_outcome(Some(Outcome::Ack)),
+            Outcome::Ack
+        ));
     }
 }

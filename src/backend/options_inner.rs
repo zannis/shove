@@ -15,6 +15,7 @@ use crate::consumer::{
     validate_message_size,
 };
 use crate::error::Result;
+use crate::outcome::Outcome;
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 
@@ -24,6 +25,11 @@ pub(crate) struct ConsumerOptionsInner {
     pub max_retries: u32,
     pub prefetch_count: u16,
     pub handler_timeout: Option<Duration>,
+    /// What a handler timeout resolves to. `None` keeps each backend's
+    /// historical default (`Outcome::Retry` everywhere except Redis, which
+    /// leaves the entry in the PEL for `XAUTOCLAIM`). Set via
+    /// `ConsumerOptions::with_handler_timeout_outcome`.
+    pub handler_timeout_outcome: Option<Outcome>,
     pub max_pending_per_key: Option<usize>,
     pub max_message_size: Option<usize>,
     pub max_reconnect_attempts: Option<u32>,
@@ -80,6 +86,7 @@ impl ConsumerOptionsInner {
             max_retries: 10,
             prefetch_count: 10,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout_outcome: None,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             max_reconnect_attempts: None,
