@@ -51,6 +51,9 @@ pub(crate) fn extract_message_metadata(delivery: &Delivery) -> MessageMetadata {
         retry_count: get_retry_count(delivery),
         delivery_id: delivery.delivery_tag.to_string(),
         redelivered: delivery.redelivered,
+        // AMQP 0-9-1 carries a `redelivered` flag and nothing more — there is no
+        // per-message delivery counter to report.
+        delivery_count: None,
         headers: Arc::new(headers),
     }
 }
@@ -348,6 +351,12 @@ mod tests {
         assert_eq!(meta.retry_count, 3);
         assert_eq!(meta.delivery_id, "42");
         assert!(meta.redelivered);
+        assert_eq!(
+            meta.delivery_count, None,
+            "AMQP 0-9-1 has no delivery counter — `redelivered` is all the \
+             protocol carries, and reporting a fabricated count would be worse \
+             than reporting `None`"
+        );
         assert_eq!(meta.headers.get("x-trace-id"), Some(&"tid-001".to_string()));
     }
 

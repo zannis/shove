@@ -18,6 +18,43 @@ use super::constants::DEFAULT_QUEUE_CAPACITY;
 pub(super) struct Envelope {
     pub payload: bytes::Bytes,
     pub headers: HashMap<String, String>,
+    /// Deliveries so far including the pending one, surfaced as
+    /// [`MessageMetadata::delivery_count`](crate::MessageMetadata::delivery_count).
+    ///
+    /// Carried on the envelope rather than in `headers` because the in-process
+    /// broker owns every redelivery: unlike the header-based `retry_count`, a
+    /// publisher cannot forge it.
+    ///
+    /// The lifecycle mirrors JetStream's `num_delivered`, the backend this
+    /// field exists to expose, so that handler logic written against the
+    /// in-process broker holds in production: bumped on an
+    /// [`Outcome::Defer`](crate::Outcome::Defer) hop (a nak in place — same
+    /// message, one more attempt) and reset by an
+    /// [`Outcome::Retry`](crate::Outcome::Retry) hop (a republish, which starts
+    /// a fresh message the broker has never delivered).
+    pub delivery_count: u32,
+}
+
+impl Envelope {
+    /// A first-delivery envelope.
+    pub fn new(payload: bytes::Bytes, headers: HashMap<String, String>) -> Self {
+        Self {
+            payload,
+            headers,
+            delivery_count: 1,
+        }
+    }
+
+    /// Marks this envelope as being handed to a consumer one more time.
+    pub fn mark_redelivery(&mut self) {
+        self.delivery_count = self.delivery_count.saturating_add(1);
+    }
+
+    /// Marks this envelope as a fresh message — the in-process equivalent of
+    /// the republish that `Retry` performs on every other backend.
+    pub fn reset_delivery_count(&mut self) {
+        self.delivery_count = 1;
+    }
 }
 
 /// State of a single declared queue: main, DLQ, hold queue, or FIFO shard.
@@ -202,10 +239,7 @@ mod tests {
     async fn enqueue_dequeue_basic() {
         let broker = InMemoryBroker::new();
         let queue = broker.declare("t");
-        let env = Envelope {
-            payload: bytes::Bytes::from_static(b"hello"),
-            headers: HashMap::new(),
-        };
+        let env = Envelope::new(bytes::Bytes::from_static(b"hello"), HashMap::new());
         broker.enqueue(&queue, env).await.unwrap();
         let popped = queue.buffer.lock().await.pop_front().unwrap();
         assert_eq!(&popped.payload[..], b"hello");
@@ -222,10 +256,7 @@ mod tests {
         broker
             .enqueue(
                 &queue,
-                Envelope {
-                    payload: bytes::Bytes::from_static(b"first"),
-                    headers: HashMap::new(),
-                },
+                Envelope::new(bytes::Bytes::from_static(b"first"), HashMap::new()),
             )
             .await
             .unwrap();
@@ -237,10 +268,7 @@ mod tests {
             broker2
                 .enqueue(
                     &queue2,
-                    Envelope {
-                        payload: bytes::Bytes::from_static(b"second"),
-                        headers: HashMap::new(),
-                    },
+                    Envelope::new(bytes::Bytes::from_static(b"second"), HashMap::new()),
                 )
                 .await
         });
@@ -265,13 +293,7 @@ mod tests {
         let queue = broker.declare("t");
         // Fill the queue so the next publish must wait.
         broker
-            .enqueue(
-                &queue,
-                Envelope {
-                    payload: bytes::Bytes::new(),
-                    headers: HashMap::new(),
-                },
-            )
+            .enqueue(&queue, Envelope::new(bytes::Bytes::new(), HashMap::new()))
             .await
             .unwrap();
 
@@ -279,13 +301,7 @@ mod tests {
         let queue2 = Arc::clone(&queue);
         let publish_task = tokio::spawn(async move {
             broker2
-                .enqueue(
-                    &queue2,
-                    Envelope {
-                        payload: bytes::Bytes::new(),
-                        headers: HashMap::new(),
-                    },
-                )
+                .enqueue(&queue2, Envelope::new(bytes::Bytes::new(), HashMap::new()))
                 .await
         });
 

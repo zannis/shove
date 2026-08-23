@@ -1010,6 +1010,103 @@ async fn defer_schedules_redelivery_without_incrementing_retry() {
 }
 
 // ---------------------------------------------------------------------------
+// MessageMetadata::delivery_count — the counter Defer *does* advance
+// ---------------------------------------------------------------------------
+
+/// A handler that defers forever pins `retry_count` at 0, so "stuck at N
+/// attempts" is inexpressible through it. `delivery_count` is the field that
+/// advances across `Defer` hops, which is what makes that condition detectable
+/// from inside the handler.
+///
+/// `Retry` is the other half of the contract: it republishes a copy on every
+/// real backend, which starts the broker's counter over, so the in-process
+/// broker resets it too. Both halves are pinned here because they are easy to
+/// get inconsistent between backends.
+#[tokio::test]
+async fn delivery_count_advances_across_defers_and_resets_on_retry() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .unwrap();
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<OrdersTopic>(&Order { id: 7 })
+        .await
+        .unwrap();
+
+    // Defer, Defer, Retry, Defer, then Ack.
+    const OUTCOMES: [Outcome; 4] = [
+        Outcome::Defer,
+        Outcome::Defer,
+        Outcome::Retry,
+        Outcome::Defer,
+    ];
+
+    /// `(delivery_count, retry_count)` captured on each delivery.
+    type Seen = Arc<Mutex<Vec<(Option<u32>, u32)>>>;
+
+    #[derive(Clone)]
+    struct Scripted {
+        seen: Seen,
+    }
+    impl MessageHandler<OrdersTopic> for Scripted {
+        type Context = ();
+        async fn handle(&self, _: Order, m: MessageMetadata, _: &()) -> Outcome {
+            let mut seen = self.seen.lock().await;
+            seen.push((m.delivery_count, m.retry_count));
+            OUTCOMES
+                .get(seen.len() - 1)
+                .cloned()
+                .unwrap_or(Outcome::Ack)
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let handler = Scripted { seen: seen.clone() };
+
+    let mut supervisor = broker.consumer_supervisor();
+    let opts = ConsumerOptions::<InMemory>::new()
+        .with_shutdown(CancellationToken::new())
+        .with_prefetch_count(1);
+    supervisor
+        .register::<OrdersTopic, _>(handler, opts)
+        .unwrap();
+
+    let token = supervisor.cancellation_token();
+    let probe = seen.clone();
+    let t = token.clone();
+    tokio::spawn(async move {
+        poll_until(
+            move || probe.try_lock().is_ok_and(|s| s.len() > OUTCOMES.len()),
+            Duration::from_secs(5),
+        )
+        .await;
+        t.cancel();
+    });
+
+    let outcome = supervisor
+        .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+        .await;
+    assert!(outcome.is_clean());
+
+    let seen = seen.lock().await;
+    assert_eq!(
+        *seen,
+        vec![
+            // Defer keeps the same message: the count climbs, retry budget untouched.
+            (Some(1), 0),
+            (Some(2), 0),
+            (Some(3), 0),
+            // Retry republished a copy: count restarts, retry_count advances.
+            (Some(1), 1),
+            (Some(2), 1),
+        ],
+        "delivery_count must advance across Defer hops and reset on Retry"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // FailAll poison cleared once the shard buffer empties
 // ---------------------------------------------------------------------------
 

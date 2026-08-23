@@ -113,7 +113,24 @@ Use cases for `Defer`:
 
 Use `Retry` (not `Defer`) for genuine transient failures — network errors, database timeouts, temporary unavailability. `Retry` increments the counter and escalates through the hold queues. `Defer` is specifically for "the message is fine but not yet actionable."
 
-**Caution:** because `Defer` never increments the retry counter, a handler that always returns `Defer` will bounce the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. Ensure your handler has a condition (e.g. a deadline or a maximum deferral count tracked in the message body) that eventually resolves to `Ack`, `Retry`, or `Reject`.
+**Caution:** because `Defer` never increments the retry counter, a handler that always returns `Defer` will bounce the message between the main queue and `hold_queues[0]` indefinitely. There is no built-in circuit breaker. Ensure your handler has a condition that eventually resolves to `Ack`, `Retry`, or `Reject`.
+
+On NATS (and on the in-process broker, which models it) `Defer` naks the message in place rather than republishing a copy, so `MessageMetadata::delivery_count` advances on every deferred hop even though `retry_count` does not. That gives the handler a deferral count without having to track one in the message body:
+
+```rust,no_run
+async fn handle(&self, msg: Order, meta: MessageMetadata, _: &()) -> Outcome {
+    if meta.delivery_count.is_some_and(|n| n > 20) {
+        tracing::error!(delivery_count = ?meta.delivery_count, "deferred too long");
+        return Outcome::Reject; // to the DLQ instead of deferring again
+    }
+    if !self.is_ready(&msg).await {
+        return Outcome::Defer;
+    }
+    Outcome::Ack
+}
+```
+
+On backends where `Defer` re-sends the message (SQS) or where no delivery counter exists at all (RabbitMQ, Kafka, Redis Streams), `delivery_count` will not accumulate across deferrals — carry a deadline or a counter in the message body there. See [`retry_count` vs `delivery_count`](/concepts/handlers#retry_count-vs-delivery_count) for the full table.
 
 If no hold queues are configured, `Defer` falls back to nack-with-requeue (broker-level immediate redelivery) and a warning is logged.
 
