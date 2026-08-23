@@ -167,9 +167,9 @@ where
     // surfaces panics as `JoinError` without killing the consumer loop. The
     // envelope lives in a sidecar map keyed by `tokio::task::Id` so we can
     // recover it (for retry routing) when a handler panics.
-    let mut inflight: JoinSet<(u64, Outcome)> = JoinSet::new();
+    let mut inflight: JoinSet<(u64, Routed)> = JoinSet::new();
     let mut envelopes: HashMap<tokio::task::Id, (u64, Envelope)> = HashMap::new();
-    let mut pending: BTreeMap<u64, (Envelope, Outcome)> = BTreeMap::new();
+    let mut pending: BTreeMap<u64, (Envelope, Routed)> = BTreeMap::new();
     let mut next_ticket: u64 = 0;
     let mut next_route: u64 = 0;
 
@@ -197,7 +197,7 @@ where
             let group = options.consumer_group.clone();
 
             let abort = inflight.spawn(async move {
-                let outcome = invoke_handler::<T, H>(
+                let routed = invoke_handler::<T, H>(
                     handler_clone,
                     ctx_clone,
                     &env_for_task,
@@ -207,7 +207,7 @@ where
                     group.as_deref(),
                 )
                 .await;
-                (ticket, outcome)
+                (ticket, routed)
             });
             envelopes.insert(abort.id(), (ticket, env));
         }
@@ -225,9 +225,9 @@ where
             _ = broker_shutdown.cancelled() => break,
             join = inflight.join_next_with_id(), if !inflight.is_empty() => {
                 match join {
-                    Some(Ok((task_id, (ticket, outcome)))) => {
+                    Some(Ok((task_id, (ticket, routed)))) => {
                         if let Some((_, env)) = envelopes.remove(&task_id) {
-                            pending.insert(ticket, (env, outcome));
+                            pending.insert(ticket, (env, routed));
                             drain_pending(
                                 &broker,
                                 topology,
@@ -246,7 +246,7 @@ where
                         let task_id = join_err.id();
                         if let Some((ticket, env)) = envelopes.remove(&task_id) {
                             tracing::warn!(error = ?join_err, ticket, "handler task panicked — retrying message");
-                            pending.insert(ticket, (env, Outcome::Retry));
+                            pending.insert(ticket, (env, Routed::handled(Outcome::Retry)));
                             drain_pending(
                                 &broker,
                                 topology,
@@ -273,16 +273,16 @@ where
     // Graceful drain.
     while let Some(res) = inflight.join_next_with_id().await {
         match res {
-            Ok((task_id, (ticket, outcome))) => {
+            Ok((task_id, (ticket, routed))) => {
                 if let Some((_, env)) = envelopes.remove(&task_id) {
-                    pending.insert(ticket, (env, outcome));
+                    pending.insert(ticket, (env, routed));
                 }
             }
             Err(join_err) => {
                 let task_id = join_err.id();
                 if let Some((ticket, env)) = envelopes.remove(&task_id) {
                     tracing::warn!(error = ?join_err, ticket, "handler task panicked during drain — retrying message");
-                    pending.insert(ticket, (env, Outcome::Retry));
+                    pending.insert(ticket, (env, Routed::handled(Outcome::Retry)));
                 }
             }
         }
@@ -304,12 +304,12 @@ async fn drain_pending(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     queue: &QueueState,
-    pending: &mut BTreeMap<u64, (Envelope, Outcome)>,
+    pending: &mut BTreeMap<u64, (Envelope, Routed)>,
     next_route: &mut u64,
     options: &ConsumerOptionsInner,
 ) {
-    while let Some((env, outcome)) = pending.remove(next_route) {
-        route_outcome(broker, topology, env, outcome, options).await;
+    while let Some((env, routed)) = pending.remove(next_route) {
+        route_outcome(broker, topology, env, routed, options).await;
         queue.in_flight.fetch_sub(1, Ordering::Release);
         *next_route += 1;
     }
@@ -488,13 +488,13 @@ async fn run_fifo_shard<T, H>(
 
             let skip_handler = on_failure == SequenceFailure::FailAll && poisoned.contains(&key);
 
-            let outcome = if skip_handler {
+            let routed = if skip_handler {
                 tracing::debug!(
                     shard = %shard_name,
                     %key,
                     "sequence key poisoned — routing message to DLQ without invoking handler"
                 );
-                Outcome::Reject
+                Routed::handled(Outcome::Reject)
             } else {
                 let raw = invoke_handler_caught::<T, H>(
                     Arc::clone(&handler),
@@ -519,22 +519,31 @@ async fn run_fifo_shard<T, H>(
                         finish(&shard, &busy, &options);
                         return;
                     }
-                    Some(Outcome::Defer) => {
+                    Some(Routed {
+                        outcome: Outcome::Defer,
+                        ..
+                    }) => {
                         tracing::warn!(
                             shard = %shard_name,
                             "Defer is not supported on sequenced consumers — treating as Retry"
                         );
-                        Outcome::Retry
+                        Routed::handled(Outcome::Retry)
                     }
                     Some(other) => other,
                 }
             };
 
-            match outcome {
+            match routed.outcome {
                 Outcome::Ack => {}
                 Outcome::Retry => {
                     let retry_count = get_retry_count(&env.headers);
                     if retry_count >= options.max_retries {
+                        record_dlq_failure(
+                            topology,
+                            &options,
+                            "max_retries_exceeded",
+                            routed.counted,
+                        );
                         route_reject_sequenced(
                             &broker,
                             topology,
@@ -579,6 +588,7 @@ async fn run_fifo_shard<T, H>(
                     }
                 }
                 Outcome::Reject => {
+                    record_dlq_failure(topology, &options, "rejected", routed.counted);
                     route_reject_sequenced(&broker, topology, env, &key, &mut poisoned, on_failure)
                         .await;
                 }
@@ -699,26 +709,76 @@ where
 // Outcome routing
 // ---------------------------------------------------------------------------
 
+/// A handler outcome plus whether its `messages_failed_total` increment has
+/// already been emitted.
+///
+/// The pre-handler gates (oversize, deserialize) record the failure themselves
+/// with a precise `reason` label and then hand back `Outcome::Reject`. Every
+/// other backend routes such a message straight to the DLQ from the gate, so it
+/// never reaches terminal routing and is counted exactly once. In-memory
+/// instead funnels the reject back through [`route_outcome`] to preserve
+/// ordering, so it needs this flag to avoid counting the same message a second
+/// time as `reason="rejected"`.
+#[derive(Debug, Clone)]
+struct Routed {
+    outcome: Outcome,
+    /// `true` when a pre-handler gate already emitted `messages_failed_total`.
+    counted: bool,
+}
+
+impl Routed {
+    /// The handler ran and returned `outcome`; nothing counted yet.
+    fn handled(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            counted: false,
+        }
+    }
+
+    /// Rejected before the handler ran, with the failure already counted under
+    /// its precise reason.
+    fn pre_counted(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            counted: true,
+        }
+    }
+}
+
+/// Emit `messages_failed_total` for a message being retired to the DLQ, unless
+/// a pre-handler gate already counted it under a more precise reason.
+fn record_dlq_failure(
+    topology: &'static QueueTopology,
+    options: &ConsumerOptionsInner,
+    reason: &str,
+    already_counted: bool,
+) {
+    if already_counted {
+        return;
+    }
+    let fail_reason = match reason {
+        "rejected" => metrics::FailReason::Rejected,
+        _ => metrics::FailReason::MaxRetriesExceeded,
+    };
+    metrics::record_failed(
+        topology.queue(),
+        options.consumer_group.as_deref(),
+        fail_reason,
+    );
+}
+
 async fn route_outcome(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     env: Envelope,
-    outcome: Outcome,
+    routed: Routed,
     options: &ConsumerOptionsInner,
 ) {
     let retry_count = get_retry_count(&env.headers);
-    match decide_retry(&outcome, retry_count, options.max_retries) {
+    match decide_retry(&routed.outcome, retry_count, options.max_retries) {
         RetryDecision::Ack => {}
         RetryDecision::Dlq { reason } => {
-            let fail_reason = match reason {
-                "rejected" => metrics::FailReason::Rejected,
-                _ => metrics::FailReason::MaxRetriesExceeded,
-            };
-            metrics::record_failed(
-                topology.queue(),
-                options.consumer_group.as_deref(),
-                fail_reason,
-            );
+            record_dlq_failure(topology, options, reason, routed.counted);
             // In-memory's DLQ enqueue path is `route_reject` for both
             // `Reject` and `max_retries_exceeded`; it does not differentiate
             // the reason beyond the metric recorded above.
@@ -908,14 +968,14 @@ async fn invoke_handler<T, H>(
     timeout_opt: Option<Duration>,
     topic: &str,
     group: Option<&str>,
-) -> Outcome
+) -> Routed
 where
     T: Topic,
     H: MessageHandler<T>,
 {
     let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
         Ok(pair) => pair,
-        Err(o) => return o,
+        Err(o) => return Routed::pre_counted(o),
     };
 
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
@@ -925,7 +985,7 @@ where
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
     metrics::record_processing_duration(topic, group, &outcome, elapsed);
-    outcome
+    Routed::handled(outcome)
 }
 
 /// Runs the handler with panic-catching and shutdown-awareness for paths
@@ -942,7 +1002,7 @@ async fn invoke_handler_caught<T, H>(
     broker_shutdown: &CancellationToken,
     topic: &str,
     group: Option<&str>,
-) -> Option<Outcome>
+) -> Option<Routed>
 where
     T: Topic,
     H: MessageHandler<T>,
@@ -952,7 +1012,7 @@ where
     // on every FIFO message.
     let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
         Ok(pair) => pair,
-        Err(o) => return Some(o),
+        Err(o) => return Some(Routed::pre_counted(o)),
     };
 
     let topic_owned: std::sync::Arc<str> = std::sync::Arc::from(topic);
@@ -992,7 +1052,7 @@ where
         metrics::record_consumed(&topic_owned, group_owned.as_deref(), o);
         metrics::record_processing_duration(&topic_owned, group_owned.as_deref(), o, elapsed);
     }
-    outcome_opt
+    outcome_opt.map(Routed::handled)
 }
 
 // ---------------------------------------------------------------------------
