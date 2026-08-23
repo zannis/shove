@@ -174,14 +174,19 @@ pub(crate) enum FailReason {
     SchemaValidation,
     /// The broker delivered something that is not a well-formed `shove`
     /// message for this consumer, so it was retired without ever reaching the
-    /// handler: a Redis stream entry with no payload field, or an SQS message
-    /// with no `MessageGroupId` on a sequenced queue.
+    /// handler: a Redis stream entry with no payload field.
     ///
     /// Distinct from [`FailReason::Deserialize`], which means the payload was
     /// present and the codec rejected it. `Malformed` means the envelope
     /// itself is unusable, which points at a foreign writer or a publisher
     /// that is not using `shove` — a different fix. The specific missing field
     /// is in the accompanying `warn!`.
+    ///
+    /// In practice this is **Redis-only**. The SQS sequenced consumer carries
+    /// the same guard for a message with no `MessageGroupId`, but shard queues
+    /// are declared FIFO and SQS refuses such a send outright, so that arm
+    /// cannot fire on the supported topology — do not treat `malformed` as an
+    /// SQS signal.
     Malformed,
     /// A sequence key sat in `AwaitingRetry` past `hold_queue_timeout`, so
     /// every message buffered behind it was dead-lettered to unblock the key.
