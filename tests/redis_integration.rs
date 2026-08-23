@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use redis::aio::MultiplexedConnection;
 use serde::{Deserialize, Serialize};
@@ -4254,11 +4254,39 @@ mod lease_tests {
             .await;
             assert!(entered, "the first two handlers never both started");
 
-            // Let batch 2's XREADGROUP land and park on the permit, leaving
-            // the undecodable entry read but not yet inspected.
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-
             let mut conn = raw_conn().await;
+
+            // Wait for the precondition itself rather than guessing at a
+            // delay: batch 2's XREADGROUP has landed, and the undecodable
+            // entry is sitting in the *real* consumer's PEL, read but not yet
+            // inspected because the entry ahead of it is parked acquiring a
+            // permit. Polling this instead of sleeping is what keeps the test
+            // from silently de-staging itself if the loop's timing shifts.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let owner_before = loop {
+                let owner = pending(&mut conn, stream, group_name)
+                    .await
+                    .ids
+                    .into_iter()
+                    .find(|e| e.id == stolen_id)
+                    .map(|e| e.consumer);
+                if owner.is_some() {
+                    break owner;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "test setup: the undecodable entry never entered the \
+                     consumer's PEL, so there was nothing for the reaper to steal",
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert_ne!(
+                owner_before.as_deref(),
+                Some("foreign-reaper"),
+                "test setup: the entry must be owned by the real consumer \
+                 before the steal",
+            );
+
             let _: redis::Value = redis::cmd("XCLAIM")
                 .arg(stream)
                 .arg(group_name)
