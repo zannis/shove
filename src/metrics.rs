@@ -375,14 +375,19 @@ impl PendingDiscard {
     /// Call this only against a broker-acknowledged retirement — a
     /// server-confirmed ack (NATS `double_ack`), an `XACK` that reported
     /// actually acknowledging the entry, or a synchronous commit that returned
-    /// `Ok`. The one path that cannot supply such an acknowledgement is
-    /// Kafka's concurrent consumer, whose offsets are committed asynchronously
-    /// by a shared tracker and can be dropped mid-rebalance with no callback
-    /// at all; it settles at offset hand-off instead, and
-    /// `backends::kafka::consumer::signal_completion` documents exactly what
-    /// that is worth. That error direction double-counts a redelivered message
-    /// rather than missing a real drop — the failure this metric exists to
-    /// prevent.
+    /// `Ok`. Handing a message off to something that will retire it later does
+    /// not qualify: Kafka's concurrent consumer therefore carries the pending
+    /// record into its offset tracker rather than settling at hand-off, and
+    /// the tracker commits a batch containing a terminal offset with
+    /// `CommitMode::Sync` so there is a real acknowledgement to settle
+    /// against. See `backends::kafka::consumer::signal_completion`.
+    ///
+    /// Where a retirement is genuinely ambiguous — a commit that failed, a
+    /// partition revoked before its commit landed — settle with [`survived`]
+    /// instead. Undercounting a drop that did happen is acceptable;
+    /// counting one that did not defeats the purpose of the metric.
+    ///
+    /// [`survived`]: Self::survived
     pub(crate) fn confirm(self) {
         if !self.has_dlq {
             record_discarded(&self.topic, self.group.as_deref(), self.reason);
