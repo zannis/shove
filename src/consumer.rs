@@ -362,6 +362,14 @@ impl<B: Backend> ConsumerOptions<B> {
     /// Redis route the given outcome instead, which for [`Outcome::Defer`]
     /// means the configured hold-queue delay rather than the idle deadline.
     ///
+    /// Combined with [`without_handler_timeout`](Self::without_handler_timeout)
+    /// this setting has nothing to act on and is inert: no handler timeout ever
+    /// fires. It is deliberately *not* borrowed by the shutdown drain's own
+    /// backstop on RabbitMQ and SNS/SQS either — that backstop bounds shutdown,
+    /// not the handler, and with deadlines disabled it can expire while the
+    /// handler is still running, so it stays [`Outcome::Retry`] and lets the
+    /// broker redeliver rather than retiring live work.
+    ///
     /// # Redis: this narrows a race, it does not remove one
     ///
     /// With the option unset, a timed-out Redis entry has exactly one actor —

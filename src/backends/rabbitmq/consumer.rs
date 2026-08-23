@@ -30,7 +30,8 @@ use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::routing::{
-    handler_timeout_outcome, hold_index, retries_exhausted, shutdown_drain_timeout,
+    drain_timeout_outcome, handler_timeout_outcome, hold_index, retries_exhausted,
+    shutdown_drain_timeout,
 };
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
@@ -511,18 +512,24 @@ impl RabbitMqConsumer {
                         in_flight_count
                     );
                     // Wait for all in-flight handlers to complete.
-                    // The handler is already bounded by `handler_timeout` and
-                    // resolves its own timeout; this wait is only a backstop so
-                    // shutdown cannot hang on a channel that never delivers.
-                    // Hence the grace, and hence resolving to the *configured*
-                    // timeout outcome rather than assuming Retry.
+                    // When a `handler_timeout` is set the handler is already
+                    // bounded by it and resolves its own timeout; this wait is
+                    // only a backstop so shutdown cannot hang on a channel that
+                    // never delivers. Hence the grace, and hence resolving to
+                    // the *configured* timeout outcome rather than assuming
+                    // Retry. With deadlines disabled the handler is still
+                    // running when this fires, so `drain_timeout_outcome` keeps
+                    // the backstop at Retry — see its docs.
                     let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
                     for (key, state) in key_states.drain() {
                         if let KeyState::InFlight { received, outcome_rx } = state {
                             let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
                                 .await
                                 .unwrap_or_else(|_| {
-                                    let resolved = handler_timeout_outcome(options.handler_timeout_outcome.clone());
+                                    let resolved = drain_timeout_outcome(
+                                        options.handler_timeout,
+                                        options.handler_timeout_outcome.clone(),
+                                    );
                                     warn!(queue, sequence_key = %key, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
                                     Ok(resolved)
                                 })

@@ -155,6 +155,8 @@ This is the one place the timeout configuration has to be consistent to be corre
 
 Handler **panics** are unaffected by this setting and always resolve to `Outcome::Retry` — a panic is a failed attempt, not a slow one.
 
+**With `without_handler_timeout()` the setting is inert**, because no timeout ever fires. That includes shutdown: RabbitMQ and SNS/SQS bound their shutdown drain with a backstop so a channel that never delivers cannot hang the process, but that backstop bounds *shutdown*, not the handler. With deadlines disabled the handler is still running when it expires, so the drain resolves to `Outcome::Retry` and lets the broker redeliver — it will not `Ack` away or dead-letter work that is still in flight.
+
 ## MessageMetadata
 
 Every `handle()` invocation receives a `MessageMetadata` describing the delivery:

@@ -71,6 +71,31 @@ pub(crate) fn shutdown_drain_timeout(handler_timeout: Option<Duration>) -> Durat
         .saturating_add(DRAIN_GRACE)
 }
 
+/// What the shutdown drain's own expiry resolves to.
+///
+/// `handler_timeout_outcome` answers "what does a *handler timeout* mean here",
+/// so honouring it in the drain is only correct when a handler deadline exists
+/// and has therefore already fired: the drain waits `handler_timeout +
+/// DRAIN_GRACE`, so its expiry implies the inner deadline expired first and the
+/// handler is no longer running.
+///
+/// With `without_handler_timeout()` the handler is unbounded — the drain's
+/// expiry is a *shutdown* backstop firing against a task that is still working.
+/// Retiring the delivery there would lose in-flight work: `Ack` deletes it and
+/// `Reject` sends it to the DLQ (or drops it, with no DLQ configured), while the
+/// handler runs on and may still succeed. So the backstop stays at `Retry` and
+/// the broker redelivers, regardless of the configured timeout outcome.
+#[allow(dead_code)] // only the backends with a spawned-handler drain use this
+pub(crate) fn drain_timeout_outcome(
+    handler_timeout: Option<Duration>,
+    configured: Option<Outcome>,
+) -> Outcome {
+    match handler_timeout {
+        Some(_) => handler_timeout_outcome(configured),
+        None => Outcome::Retry,
+    }
+}
+
 /// Whether the retry budget is exhausted. `max_retries = N` permits N retries,
 /// so a message is terminal once `retry_count >= max_retries`. Single source of
 /// truth for the boundary shared by `decide_retry` and pre-handler gates.
@@ -231,6 +256,41 @@ mod tests {
             shutdown_drain_timeout(None),
             crate::DEFAULT_HANDLER_TIMEOUT + DRAIN_GRACE
         );
+    }
+
+    #[test]
+    fn drain_expiry_honours_the_override_when_a_deadline_exists() {
+        let handler = Some(Duration::from_secs(30));
+        assert!(matches!(
+            drain_timeout_outcome(handler, Some(Outcome::Ack)),
+            Outcome::Ack
+        ));
+        assert!(matches!(
+            drain_timeout_outcome(handler, Some(Outcome::Reject)),
+            Outcome::Reject
+        ));
+        assert!(matches!(
+            drain_timeout_outcome(handler, None),
+            Outcome::Retry
+        ));
+    }
+
+    #[test]
+    fn drain_expiry_stays_retry_when_handler_deadlines_are_disabled() {
+        // `without_handler_timeout()` leaves the handler unbounded, so the
+        // drain's expiry fires while it is still running. Retiring the delivery
+        // there — Ack deletes it, Reject DLQs or drops it — would lose in-flight
+        // work, so the configured timeout outcome must not apply.
+        for configured in [Outcome::Ack, Outcome::Reject, Outcome::Defer] {
+            assert!(
+                matches!(
+                    drain_timeout_outcome(None, Some(configured.clone())),
+                    Outcome::Retry
+                ),
+                "drain backstop retired a still-running handler for {configured:?}"
+            );
+        }
+        assert!(matches!(drain_timeout_outcome(None, None), Outcome::Retry));
     }
 
     #[test]

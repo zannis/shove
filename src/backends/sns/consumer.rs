@@ -22,7 +22,7 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{handler_timeout_outcome, shutdown_drain_timeout};
+use crate::routing::{drain_timeout_outcome, handler_timeout_outcome, shutdown_drain_timeout};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
@@ -465,11 +465,13 @@ where
                     router::route_requeue(sqs, queue_url, rh).await;
                 }
             }
-            // The handler is already bounded by `handler_timeout` and resolves
-            // its own timeout; this wait is only a backstop so shutdown cannot
-            // hang on a channel that never delivers. Hence the grace, and hence
-            // resolving to the *configured* timeout outcome rather than
-            // assuming Retry.
+            // When a `handler_timeout` is set the handler is already bounded by
+            // it and resolves its own timeout; this wait is only a backstop so
+            // shutdown cannot hang on a channel that never delivers. Hence the
+            // grace, and hence resolving to the *configured* timeout outcome
+            // rather than assuming Retry. With deadlines disabled the handler is
+            // still running when this fires, so `drain_timeout_outcome` keeps
+            // the backstop at Retry — see its docs.
             let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
             // Collect Acks into a batch; non-Ack outcomes still need
             // per-message routing (Retry/Reject/Defer touch distinct queues).
@@ -478,8 +480,10 @@ where
                 let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
                     .await
                     .unwrap_or_else(|_| {
-                        let resolved =
-                            handler_timeout_outcome(options.handler_timeout_outcome.clone());
+                        let resolved = drain_timeout_outcome(
+                            options.handler_timeout,
+                            options.handler_timeout_outcome.clone(),
+                        );
                         warn!(
                             queue_url,
                             outcome = ?resolved,
