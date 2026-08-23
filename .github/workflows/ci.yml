@@ -105,8 +105,8 @@ jobs:
         include:
           - name: inmemory
             features: inmemory,metrics,sbe
-          # `metrics` on every backend entry below that has — or is about to
-          # have — a `metrics_*` integration binary. Every one of those is
+          # `metrics` on every backend entry below that has a `metrics_*`
+          # integration binary. Every one of those is
           # gated `#![cfg(all(feature = "<backend>", feature = "metrics"))]`,
           # so without the feature the binary compiles to zero tests and the
           # entry still reports green: coverage that asserts nothing. The
@@ -114,8 +114,10 @@ jobs:
           # with no recorder installed each call is a no-op, so no entry gets
           # materially slower.
           - name: rabbitmq
+            # Asserted by `metrics_rabbitmq_sequenced`.
             features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe
           - name: aws-sns-sqs
+            # Asserted by `metrics_sqs_sequenced`.
             features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
           # `nats` and `kafka` stay without `metrics` on purpose: neither has a
           # `metrics_*` binary to run, so the feature would buy coverage of the
@@ -141,6 +143,7 @@ jobs:
             # already covers. Restrict it to the three schema-registry binaries.
             filter: -E 'binary(/^kafka_schema_registry/)'
           - name: redis-streams
+            # Asserted by `metrics_redis_sequenced`.
             features: redis-streams,metrics,sbe
     steps:
       - uses: actions/checkout@v6

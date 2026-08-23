@@ -140,6 +140,12 @@ impl HoldQueue {
 ///
 /// Messages for *other* sequence keys (e.g. `ACC-B`) are unaffected by either
 /// policy — poisoning is scoped to the failing key only.
+///
+/// # Backend support
+///
+/// Both policies are honoured on all six backends, with identical semantics.
+/// See `docs/design/sequence-failure-parity.md` for the per-backend key source
+/// and the rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceFailure {
     /// Dead-letter the failed message, skip it, and continue processing
@@ -147,7 +153,23 @@ pub enum SequenceFailure {
     Skip,
     /// Dead-letter the failed message and automatically dead-letter all
     /// remaining messages for the same sequence key ("poison" the key).
-    /// The key stays poisoned for the lifetime of the consumer process.
+    ///
+    /// A key is poisoned by any permanent failure of one of its messages:
+    /// [`Outcome::Reject`](crate::Outcome::Reject), an exhausted retry budget,
+    /// or a pre-handler rejection (oversize or undeserializable payload).
+    /// Poisoned messages are dead-lettered without invoking the handler.
+    ///
+    /// # Scope and limits
+    ///
+    /// - The key stays poisoned for the **lifetime of the consumer task**, and
+    ///   survives a broker reconnect.
+    /// - The poison set is **process-local**. A second consumer of the same
+    ///   topic keeps its own set and will still invoke the handler for a key
+    ///   the first consumer poisoned. On Kafka, a partition moved by a
+    ///   rebalance likewise arrives at its new owner unpoisoned. Ordering is
+    ///   preserved in both cases; the poison record is not shared.
+    /// - Messages with no sequence key are never poisoned — an unkeyed message
+    ///   belongs to no sequence.
     FailAll,
 }
 

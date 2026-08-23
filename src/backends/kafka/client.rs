@@ -225,7 +225,15 @@ impl fmt::Debug for KafkaSasl {
 ///
 /// Compresses each batch on the client, so it cuts producer→broker bytes as
 /// well as broker storage and replication traffic.
+///
+/// `#[non_exhaustive]` because librdkafka's codec list grows — it gained
+/// `zstd` after the other four — so a downstream `match` needs a `_` arm and a
+/// future codec stays an additive change. Naming a variant is unaffected,
+/// which is the only thing callers do with this type. Applied now because the
+/// type is unreleased: adding the attribute after 0.12.3 would itself be
+/// breaking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KafkaCompression {
     /// No compression (librdkafka's default).
     None,
