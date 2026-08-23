@@ -1107,11 +1107,17 @@ async fn delivery_count_advances_across_defers_and_resets_on_retry() {
 }
 
 // ---------------------------------------------------------------------------
-// FailAll poison cleared once the shard buffer empties
+// FailAll poison survives the shard buffer emptying
 // ---------------------------------------------------------------------------
 
+/// `SequenceFailure::FailAll` documents that a key stays poisoned for the
+/// lifetime of the consumer task. InMemory used to clear its poison set
+/// whenever the shard buffer drained, which made it the only backend where a
+/// quiet moment silently un-poisoned a key — the exact divergence CAF-84 is
+/// about, and the worst place for it, since InMemory is what users assert
+/// against in their own tests.
 #[tokio::test]
-async fn poison_cleared_after_shard_drains() {
+async fn poison_survives_shard_drain() {
     // run_fifo — keep InMemoryConsumer for the consumer task.
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
@@ -1177,20 +1183,42 @@ async fn poison_cleared_after_shard_drains() {
             .await
     });
 
-    // Wait until the shard has drained the first batch (seq 0 acked, 1 rejected, 2 DLQ'd).
-    let probe = acked.clone();
+    let dlq_count = Arc::new(AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct DlqHandler(Arc<AtomicUsize>);
+    impl MessageHandler<LedgerFailAllTopic> for DlqHandler {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+        async fn handle_dead(&self, _: Event, _: shove::DeadMessageMetadata, _: &()) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let dlq_handle = {
+        let consumer = InMemoryConsumer::new(client.clone());
+        let handler = DlqHandler(dlq_count.clone());
+        tokio::spawn(async move { consumer.run_dlq::<LedgerFailAllTopic, _>(handler, ()).await })
+    };
+
+    // First batch settles: seq 0 acks, seq 1 rejects (poisoning "A"), seq 2 is
+    // dead-lettered behind the poison → 2 DLQ entries.
+    let dlq_probe = dlq_count.clone();
     assert!(
         poll_until(
-            move || probe.try_lock().map(|v| v.contains(&0)).unwrap_or(false),
-            Duration::from_secs(2),
+            move || dlq_probe.load(Ordering::Relaxed) == 2,
+            Duration::from_secs(3),
         )
-        .await
+        .await,
+        "expected seq 1 (rejected) and seq 2 (poisoned) in the DLQ; got {}",
+        dlq_count.load(Ordering::Relaxed)
     );
 
-    // Give the shard a moment to notice its buffer is empty and clear poisons.
+    // Let the shard sit on an empty buffer — this is what used to clear it.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Publish more A messages — none should be poisoned now.
+    // Publish more A messages — the key is still poisoned, so they must be
+    // dead-lettered without reaching the handler.
     publisher
         .publish::<LedgerFailAllTopic>(&Event {
             account: "A".into(),
@@ -1206,24 +1234,26 @@ async fn poison_cleared_after_shard_drains() {
         .await
         .unwrap();
 
-    let probe = acked.clone();
+    let dlq_probe = dlq_count.clone();
     assert!(
         poll_until(
-            move || {
-                probe
-                    .try_lock()
-                    .map(|v| v.contains(&10) && v.contains(&11))
-                    .unwrap_or(false)
-            },
-            Duration::from_secs(2),
+            move || dlq_probe.load(Ordering::Relaxed) == 4,
+            Duration::from_secs(3),
         )
         .await,
-        "post-drain publishes must be handled, not DLQ'd"
+        "post-drain publishes must stay poisoned and land in the DLQ; dlq={}",
+        dlq_count.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        *acked.lock().await,
+        vec![0],
+        "only the pre-poison message may reach the handler"
     );
 
     shutdown.cancel();
     client.shutdown();
     let _ = handle.await;
+    let _ = dlq_handle.await;
 }
 
 // ---------------------------------------------------------------------------

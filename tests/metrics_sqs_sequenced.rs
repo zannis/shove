@@ -14,14 +14,24 @@
 //! # Where the cascade comes from here, and why each scenario gets its own topic
 //!
 //! SQS does not republish on reject: `route_reject` sets visibility to 0 and
-//! lets **native redrive** retire the message at `maxReceiveCount = 10`. So a
-//! message whose key has been poisoned is redelivered nine more times before it
-//! reaches the DLQ, and every one of those redeliveries hits the poisoned-key
-//! skip — the site marked `// Cascade: intentionally not counted`. They would
-//! satisfy `retry_count >= max_retries` too, since `retry_count` is derived from
-//! `ApproximateReceiveCount`. That makes arrival on the DLQ a *proof* that nine
-//! cascade discards happened, and a counter still reading 1 a proof that none of
-//! them were counted. Count either site and this test reads ~9, not 1.
+//! lets **native redrive** retire the message. So a message whose key has been
+//! poisoned is redelivered until redrive retires it, and every one of those
+//! redeliveries hits the poisoned-key skip — the site marked
+//! `// Cascade: intentionally not counted`. They would satisfy
+//! `retry_count >= max_retries` too, since `retry_count` is derived from
+//! `ApproximateReceiveCount`. That makes arrival on the DLQ a *proof* that
+//! cascade discards happened, and a counter still reading 1 a proof that none
+//! of them were counted. Count either site and this test reads 3, not 1.
+//!
+//! The library default is `maxReceiveCount = 10`
+//! (`DEFAULT_MAX_RECEIVE_COUNT`), and every one of those receives is a
+//! sequential round trip on a single FIFO message group — the dominant cost of
+//! this test. [`shorten_redrive`] drops it to [`SHORT_MAX_RECEIVE_COUNT`] on
+//! this test's own queues, which keeps at least one cascade receive per
+//! scenario (so the assertions keep their teeth) while cutting the redelivery
+//! wall clock roughly threefold. The margin matters more than the minutes: the
+//! earlier ten-receive version ran ~70s against a 90s handler deadline on a
+//! loaded runner.
 //!
 //! That redelivery loop is also why the two scenarios get a topic each rather
 //! than two keys on one. A message being retired by redrive is re-received
@@ -45,6 +55,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use aws_sdk_sqs::types::QueueAttributeName;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
@@ -90,6 +101,49 @@ async fn wait_for_localstack_ready(endpoint_url: &str) {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// How many receives a message gets before native redrive retires it to the
+/// DLQ, for this test's queues only.
+///
+/// The library declares shard queues at `DEFAULT_MAX_RECEIVE_COUNT = 10`
+/// (`src/backends/sns/topology.rs`). Three is the smallest value that still
+/// leaves a cascade receive after the counted one in both scenarios: the
+/// reject key is counted on receive 1 and skipped on 2 and 3, and the retry key
+/// is counted on receive 2 (`retry_count = ApproximateReceiveCount - 1`
+/// reaching `max_retries`) and skipped on 3. So a regression that counted the
+/// cascade site would read 3 or 2 rather than 1, and the assertions stay exact.
+const SHORT_MAX_RECEIVE_COUNT: u32 = 3;
+
+/// Rewrite one shard queue's redrive policy to [`SHORT_MAX_RECEIVE_COUNT`].
+///
+/// Done with the raw SQS SDK against the queue this test just declared, rather
+/// than by plumbing a `max_receive_count` knob through `TopologyBuilder`:
+/// public library surface whose only caller is a test is not worth its weight.
+async fn shorten_redrive(sqs: &aws_sdk_sqs::Client, shard_url: &str, dlq_url: &str) {
+    let dlq_arn = sqs
+        .get_queue_attributes()
+        .queue_url(dlq_url)
+        .attribute_names(QueueAttributeName::QueueArn)
+        .send()
+        .await
+        .expect("failed to read DLQ attributes")
+        .attributes()
+        .and_then(|attrs| attrs.get(&QueueAttributeName::QueueArn).cloned())
+        .expect("DLQ has no ARN attribute");
+
+    let redrive = serde_json::json!({
+        "deadLetterTargetArn": dlq_arn,
+        "maxReceiveCount": SHORT_MAX_RECEIVE_COUNT,
+    })
+    .to_string();
+
+    sqs.set_queue_attributes()
+        .queue_url(shard_url)
+        .attributes(QueueAttributeName::RedrivePolicy, redrive)
+        .send()
+        .await
+        .expect("failed to shorten the shard queue's redrive policy");
 }
 
 struct TestBroker {
@@ -322,6 +376,23 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         .await
         .expect("declare retry topology");
 
+    // Shorten both shard queues' redrive loops before anything is published, so
+    // every delivery in this test is governed by the short policy.
+    let sqs = test_broker.sqs_client().await;
+    let registry = sns_client.queue_registry();
+    let queue_url = |key: &'static str| async move {
+        registry
+            .get(key)
+            .await
+            .unwrap_or_else(|| panic!("queue '{key}' should be registered after declare"))
+    };
+    let reject_dlq = queue_url("metrics-sqs-rej-dlq").await;
+    let retry_dlq = queue_url("metrics-sqs-ret-dlq").await;
+    let reject_shard = queue_url("metrics-sqs-rej-seq-0").await;
+    let retry_shard = queue_url("metrics-sqs-ret-seq-0").await;
+    shorten_redrive(&sqs, &reject_shard, &reject_dlq).await;
+    shorten_redrive(&sqs, &retry_shard, &retry_dlq).await;
+
     let publisher: Publisher<Sqs> = broker.publisher().await.expect("publisher");
     publisher
         .publish::<RejectLedger>(&LedgerEntry {
@@ -376,21 +447,10 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     );
 
     // Each message must reach its DLQ, which on SQS only happens through native
-    // redrive at `maxReceiveCount = 10`. That is what makes the counter
-    // assertions below exact rather than incidental: arrival means the message
-    // was received ten times, so nine of those receives took a cascade path
-    // that must not have counted.
-    let sqs = test_broker.sqs_client().await;
-    let reject_dlq = sns_client
-        .queue_registry()
-        .get("metrics-sqs-rej-dlq")
-        .await
-        .expect("reject DLQ should be registered");
-    let retry_dlq = sns_client
-        .queue_registry()
-        .get("metrics-sqs-ret-dlq")
-        .await
-        .expect("retry DLQ should be registered");
+    // redrive — here at `SHORT_MAX_RECEIVE_COUNT`. That is what makes the
+    // counter assertions below exact rather than incidental: arrival means the
+    // message was received three times, so the receives after the counted one
+    // took a cascade path that must not have counted.
     let (rejected_dead, retried_dead) = tokio::join!(
         wait_for_dlq_count(&sqs, &reject_dlq, 1, Duration::from_secs(150)),
         wait_for_dlq_count(&sqs, &retry_dlq, 1, Duration::from_secs(150)),
@@ -416,8 +476,8 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     let snapshot = snapshotter.snapshot().into_hashmap();
 
     // The handler-returned Reject is an independent failure — counted once, on
-    // the receive that reached the handler. The nine redeliveries that followed
-    // it were skipped as cascade of that same failure and must not be counted.
+    // the receive that reached the handler. The redeliveries that followed it
+    // were skipped as cascade of that same failure and must not be counted.
     assert_eq!(
         failed_total(&snapshot, "rejected"),
         1,

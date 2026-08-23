@@ -16,7 +16,7 @@ use crate::topic::Topic;
 use crate::{QueueTopology, ShoveError};
 
 use super::client::NatsClient;
-use super::constants::RETRY_COUNT_HEADER;
+use super::constants::{RETRY_COUNT_HEADER, SEQUENCE_KEY_HEADER};
 
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
@@ -84,18 +84,26 @@ impl NatsPublisher {
         Ok(Self { client })
     }
 
-    fn resolve_subject<T: Topic>(topology: &'static QueueTopology, message: &T::Message) -> String {
+    /// Resolve the publish subject and, on a sequenced topic, the sequence key.
+    ///
+    /// The key is returned (not just hashed into the subject) because the
+    /// consumer needs it to implement `SequenceFailure::FailAll` — the subject
+    /// only identifies the shard, and a shard holds many keys.
+    fn resolve_subject_and_key<T: Topic>(
+        topology: &'static QueueTopology,
+        message: &T::Message,
+    ) -> (String, Option<String>) {
         if let Some(seq) = topology.sequencing()
             && let Some(key_fn) = T::SEQUENCE_KEY_FN
         {
             let key = key_fn(message);
             let shard = shard_for_key(&key, seq.routing_shards());
-            return format!("{}.shard.{shard}", topology.queue());
+            return (format!("{}.shard.{shard}", topology.queue()), Some(key));
         }
-        topology.queue().to_string()
+        (topology.queue().to_string(), None)
     }
 
-    fn build_headers(extra: Option<&HashMap<String, String>>) -> HeaderMap {
+    fn build_headers(extra: Option<&HashMap<String, String>>, seq_key: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(NATS_MESSAGE_ID, Uuid::new_v4().to_string().as_str());
         headers.insert(RETRY_COUNT_HEADER, "0");
@@ -105,6 +113,15 @@ impl NatsPublisher {
                 headers.insert(k.as_str(), v.as_str());
             }
         }
+
+        // After the user headers: the sequence key drives FailAll poisoning, so
+        // a caller must not be able to overwrite it. (`validate_headers` guards
+        // the `x-` internal names shared with the other backends, but not the
+        // `Shove-` names this backend uses.)
+        if let Some(key) = seq_key {
+            headers.insert(SEQUENCE_KEY_HEADER, key);
+        }
+
         headers
     }
 
@@ -125,8 +142,8 @@ impl NatsPublisher {
     pub async fn publish<T: Topic>(&self, message: &T::Message) -> Result<()> {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
-        let subject = Self::resolve_subject::<T>(topology, message);
-        let headers = Self::build_headers(None);
+        let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);
+        let headers = Self::build_headers(None, seq_key.as_deref());
         self.publish_raw(subject, headers, payload).await
     }
 
@@ -138,8 +155,8 @@ impl NatsPublisher {
         validate_headers(&extra_headers)?;
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
-        let subject = Self::resolve_subject::<T>(topology, message);
-        let headers = Self::build_headers(Some(&extra_headers));
+        let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, message);
+        let headers = Self::build_headers(Some(&extra_headers), seq_key.as_deref());
         self.publish_raw(subject, headers, payload).await
     }
 
@@ -149,8 +166,8 @@ impl NatsPublisher {
             .iter()
             .map(|msg| {
                 let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(msg)?;
-                let subject = Self::resolve_subject::<T>(topology, msg);
-                let headers = Self::build_headers(None);
+                let (subject, seq_key) = Self::resolve_subject_and_key::<T>(topology, msg);
+                let headers = Self::build_headers(None, seq_key.as_deref());
                 Ok((subject, headers, payload))
             })
             .collect();
