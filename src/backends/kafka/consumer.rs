@@ -638,6 +638,36 @@ impl TerminalDiscard {
     }
 }
 
+/// How a terminally-rejected message's discard must be settled.
+///
+/// Shared by the single-message and batch reject paths so the two cannot drift:
+/// the decision depends only on whether the topology declares a DLQ and whether
+/// this message's publish to it landed, never on which path asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectSettlement {
+    /// It is in the DLQ, so it exists whatever the commit does. Settle now and
+    /// keep the ordinary dead-letter path off the commit round trip.
+    InDlq,
+    /// No DLQ declared: retiring this message drops it. Counts if the commit
+    /// lands.
+    Retired,
+    /// A DLQ was declared and did not receive it. Nothing holds a copy, so this
+    /// is data loss whatever the topology says. Counts if the commit lands.
+    Lost,
+}
+
+/// Classify a rejected message for [`RejectSettlement`].
+///
+/// `reached_dlq` is meaningful only when `has_dlq`; with no DLQ declared there
+/// was no publish to succeed or fail, and the message is simply dropped.
+fn reject_settlement(has_dlq: bool, reached_dlq: bool) -> RejectSettlement {
+    match (has_dlq, reached_dlq) {
+        (false, _) => RejectSettlement::Retired,
+        (true, true) => RejectSettlement::InDlq,
+        (true, false) => RejectSettlement::Lost,
+    }
+}
+
 /// Hand this delivery's offset to the tracker so it can be committed.
 ///
 /// Returns whether the offset was actually handed over. A full channel means
@@ -761,19 +791,22 @@ async fn route_outcome(
                     // Commit even though this is terminal: the message has
                     // exhausted retries (or was rejected) and looping it
                     // forever produces a poison hot-spot.
-                    if topology.dlq().is_some() {
-                        // The message is in the DLQ, so it exists whatever the
-                        // commit does and `confirm` could never count it.
-                        // Settling now keeps the ordinary dead-letter path off
-                        // the synchronous commit a pending record would force.
-                        pending.survived();
-                        signal_completion(completion, topic, None);
-                    } else {
-                        signal_completion(
-                            completion,
-                            topic,
-                            Some(TerminalDiscard::Retired(pending)),
-                        );
+                    match reject_settlement(topology.dlq().is_some(), true) {
+                        RejectSettlement::InDlq => {
+                            // Settling now keeps the ordinary dead-letter path
+                            // off the synchronous commit a pending record would
+                            // force.
+                            pending.survived();
+                            signal_completion(completion, topic, None);
+                        }
+                        settled => {
+                            debug_assert_eq!(settled, RejectSettlement::Retired);
+                            signal_completion(
+                                completion,
+                                topic,
+                                Some(TerminalDiscard::Retired(pending)),
+                            );
+                        }
                     }
                     (true, None)
                 }
@@ -792,6 +825,12 @@ async fn route_outcome(
                     if fifo {
                         pending.survived();
                     } else {
+                        // `publish_to_dlq` is `Ok(())` when no DLQ is declared,
+                        // so reaching this arm at all means one was.
+                        debug_assert_eq!(
+                            reject_settlement(topology.dlq().is_some(), false),
+                            RejectSettlement::Lost
+                        );
                         signal_completion(completion, topic, Some(TerminalDiscard::Lost(pending)));
                     }
                     (false, None)
@@ -1576,12 +1615,33 @@ impl BatchConsumerOptions {
     /// What a batch handler timeout resolves to, instead of the default
     /// [`Outcome::Retry`].
     ///
-    /// Same semantics and the same motivation as
-    /// [`ConsumerOptions::with_handler_timeout_outcome`]: a slow flush is
-    /// usually backpressure rather than a poison batch, and resolving it to
-    /// `Retry` burns the retry budget of every message in the batch — which,
-    /// on a topology with no DLQ, ends in a silent discard of the whole batch.
-    /// [`Outcome::Defer`] redelivers without spending the budget.
+    /// The same motivation as
+    /// [`ConsumerOptions::with_handler_timeout_outcome`] — a slow flush is
+    /// usually backpressure, not a poison batch — but **not** the same
+    /// mechanics, because the outcome applies batch-wide and `run_batch` has
+    /// no per-message retry counter:
+    ///
+    /// | Outcome | Effect on the whole batch |
+    /// |---|---|
+    /// | `Retry` (default) | Seek back and redeliver after an escalating delay. Forever, if the handler keeps timing out. |
+    /// | `Defer` | **Identical to `Retry` here.** Same seek-back arm, same backoff. |
+    /// | `Ack` | Commit every offset in the batch. The messages are gone, unprocessed, with no DLQ copy. |
+    /// | `Reject` | Terminal: dead-letter every message (or discard it, with no DLQ declared) and commit. |
+    ///
+    /// The `Retry`/`Defer` distinction that matters on the single-message path
+    /// — spending the retry budget versus not — has no meaning here. There is
+    /// no budget to spend: a batch is never dead-lettered for exhausting one,
+    /// so a timeout can never turn into the silent budget-exhaustion discard
+    /// this option exists to avoid elsewhere. Setting `Defer` over the default
+    /// is therefore a no-op, kept legal only so the two option types read the
+    /// same.
+    ///
+    /// That leaves the real choice as *redeliver forever* (`Retry`/`Defer`)
+    /// versus *give up on this batch* (`Ack`/`Reject`). Both of the latter
+    /// retire messages the handler never finished, so reach for them only when
+    /// a stalled flush genuinely means the payloads are no longer worth
+    /// processing — and prefer `Reject` to `Ack` unless the topology has no
+    /// DLQ, since `Reject` at least preserves them.
     ///
     /// [`ConsumerOptions::with_handler_timeout_outcome`]: crate::ConsumerOptions::with_handler_timeout_outcome
     pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
@@ -1914,13 +1974,19 @@ impl<T: Topic> BatchBuffer<T> {
 /// A DLQ publish failure is not propagated: the offset span is committed either
 /// way, so failing the whole batch here would stall forward progress on a
 /// message that is by definition unprocessable (or explicitly rejected).
+///
+/// Returns whether the message reached the DLQ. Committing past a message the
+/// DLQ never received is data loss even on a topology that declares one, so the
+/// terminal-accounting caller needs the distinction — `false` is what makes it
+/// settle with [`metrics::PendingDiscard::confirm_lost`] rather than the
+/// topology-derived `confirm`.
 async fn dlq_batch_message(
     client: &KafkaClient,
     topology: &QueueTopology,
     queue: &str,
     raw: &RawMessage,
     reason: &str,
-) {
+) -> bool {
     if let Err(dlq_err) = publish_to_dlq(
         client,
         topology,
@@ -1937,14 +2003,20 @@ async fn dlq_batch_message(
             reason,
             "failed to publish bad batch message to DLQ"
         );
+        return false;
     }
+    true
 }
 
 /// Publishes everything parked for the DLQ during this batch, immediately
 /// before its offsets commit.
 async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) {
     for item in pending {
-        dlq_batch_message(
+        // The publish result is logged inside and deliberately not acted on
+        // here: pre-handler drops are not part of the terminal-accounting
+        // contract on this backend (they never reach `record_terminal`), so
+        // there is no pending discard to settle either way.
+        let _reached_dlq = dlq_batch_message(
             flush.client,
             flush.topology,
             flush.queue,
@@ -1993,8 +2065,17 @@ async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) 
 /// acked, so its offsets are not committed, and the caller seeks back and
 /// redelivers it. The messages themselves were moved into the abandoned
 /// future — they come back from the broker, not from memory.
-async fn invoke_batch_handler<F>(
-    fut: F,
+///
+/// The handler future is built by `make_fut` *inside* the guard rather than
+/// passed in ready-made. `BatchMessageHandler::handle_batch` is an ordinary
+/// `fn -> impl Future`, so an implementation may panic while assembling its
+/// future — before any of it is awaited. Constructing at the call site put
+/// that panic outside `catch_unwind`, where it unwound `flush_batch` and
+/// killed `run_batch` instead of resolving to `Retry` as the contract above
+/// promises. This mirrors the single-message path, which never materializes
+/// the handler future outside its own guard.
+async fn invoke_batch_handler<F, Fut>(
+    make_fut: F,
     timeout: Option<Duration>,
     timeout_outcome: Option<Outcome>,
     topic: &str,
@@ -2002,14 +2083,15 @@ async fn invoke_batch_handler<F>(
     batch_size: u64,
 ) -> Outcome
 where
-    F: std::future::Future<Output = Outcome>,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Outcome>,
 {
     use futures_util::FutureExt;
     use std::panic::AssertUnwindSafe;
 
     let _inflight = metrics::InflightGuard::from_refs_n(topic, group, batch_size);
     let started = std::time::Instant::now();
-    let safe_fut = AssertUnwindSafe(fut).catch_unwind();
+    let safe_fut = AssertUnwindSafe(async move { make_fut().await }).catch_unwind();
     let outcome = match timeout {
         Some(duration) => match tokio::time::timeout(duration, safe_fut).await {
             Ok(Ok(o)) => o,
@@ -2097,7 +2179,9 @@ where
     // is achievable. The duration is one observation per *flush* (the whole
     // batch), not per message.
     let outcome = invoke_batch_handler(
-        handler.handle_batch(messages, ctx),
+        // Closure, not a ready-made future: `handle_batch` itself may panic
+        // while building it, and that has to happen inside the guard.
+        || handler.handle_batch(messages, ctx),
         handler_timeout,
         handler_timeout_outcome.clone(),
         topic,
@@ -2118,16 +2202,41 @@ where
         // pins the partition forever (seek, sleep, redeliver, reject, …) with
         // the payloads never reaching a DLQ and the offsets never advancing.
         Outcome::Reject => {
-            metrics::record_failed_n(
-                topic,
-                group,
-                metrics::FailReason::Rejected,
-                batch_size as u64,
+            // Same terminal contract the single-message path applies in
+            // `route_outcome`, in batch units. The failure is counted now
+            // because it already happened; the *discard* is a claim that the
+            // message no longer exists, and nothing has retired these messages
+            // until the commit below lands. Recording it up front would fire a
+            // data-loss alert during the broker outage that made the commit
+            // fail — precisely when the batch is about to be redelivered.
+            let has_dlq = topology.dlq().is_some();
+            // Settled only by the commit's result, so they outlive this block.
+            let mut unsettled: Vec<TerminalDiscard> = Vec::new();
+            // With no DLQ the buffer keeps no wire bytes, so there is nothing
+            // to iterate and nothing to publish — but there are still
+            // `batch_size` messages about to be dropped on the floor, which is
+            // exactly what the discard counter exists to report. Drive the loop
+            // off the batch size and let `raw` be empty in that case.
+            debug_assert!(
+                !has_dlq || buffer.raw.len() == batch_size,
+                "`raw` is index-parallel to `messages` whenever a DLQ is declared"
             );
-            if topology.dlq().is_some() {
-                for raw in &buffer.raw {
-                    dlq_batch_message(client, topology, queue, raw, "rejected").await;
+            for i in 0..batch_size {
+                let pending =
+                    metrics::record_terminal(topic, group, metrics::FailReason::Rejected, has_dlq);
+                let reached_dlq = match buffer.raw.get(i) {
+                    Some(raw) => dlq_batch_message(client, topology, queue, raw, "rejected").await,
+                    None => false,
+                };
+                match reject_settlement(has_dlq, reached_dlq) {
+                    RejectSettlement::InDlq => pending.survived(),
+                    RejectSettlement::Retired => {
+                        unsettled.push(TerminalDiscard::Retired(pending));
+                    }
+                    RejectSettlement::Lost => unsettled.push(TerminalDiscard::Lost(pending)),
                 }
+            }
+            if has_dlq {
                 tracing::warn!(queue, batch_size, "batch rejected, routed to the DLQ");
             } else {
                 tracing::warn!(
@@ -2137,7 +2246,15 @@ where
                 );
             }
             publish_pending_dlq(flush, &buffer.pending_dlq).await;
-            commit_batch_end(consumer, queue, &buffer.end).await?;
+            let committed = commit_batch_end(consumer, queue, &buffer.end).await;
+            match committed {
+                // The offsets advanced: these messages are genuinely gone.
+                Ok(()) => unsettled.into_iter().for_each(TerminalDiscard::confirm),
+                // The commit did not land, so the offsets did not advance and
+                // the whole batch is redelivered. Nothing was lost.
+                Err(_) => unsettled.into_iter().for_each(TerminalDiscard::survived),
+            }
+            committed?;
             *redelivery_backoff = batch_redelivery_backoff();
             buffer.clear();
         }
@@ -3014,14 +3131,23 @@ impl KafkaConsumer {
     ///
     /// # Handler failures
     ///
-    /// A flush that panics or outruns `options.handler_timeout` (default
-    /// [`DEFAULT_HANDLER_TIMEOUT`], 30 s) is treated as `Retry`: nothing is
-    /// committed and the whole batch is redelivered. Same containment the
-    /// single-message path gets, and it carries more weight here — the batch
-    /// loop is a single task, so a flush that never returns would otherwise
-    /// stop offset commits, rebalance handling and shutdown along with it.
-    /// [`BatchConsumerOptions::without_handler_timeout`] opts out, at the cost
-    /// of making a hung flush unrecoverable.
+    /// A flush that **panics** — including a panic raised while `handle_batch`
+    /// is still building its future, before any of it runs — is treated as
+    /// `Retry`: nothing is committed and the whole batch is redelivered. Same
+    /// containment the single-message path gets, and it carries more weight
+    /// here, because the batch loop is a single task: an unguarded panic would
+    /// kill offset commits, rebalance handling and shutdown along with it.
+    ///
+    /// A flush that outruns `options.handler_timeout` (default
+    /// [`DEFAULT_HANDLER_TIMEOUT`], 30 s) resolves to `Retry` too, but that is
+    /// a *default*, not a rule:
+    /// [`BatchConsumerOptions::with_handler_timeout_outcome`] can make it any
+    /// `Outcome`, and `Ack`/`Reject` commit or dead-letter the entire batch
+    /// rather than redelivering it. See that method for the batch-wide outcome
+    /// table — the mapping differs from the single-message path, and `Defer`
+    /// in particular is indistinguishable from `Retry` here.
+    /// [`BatchConsumerOptions::without_handler_timeout`] opts out of the
+    /// deadline entirely, at the cost of making a hung flush unrecoverable.
     ///
     /// # Metrics
     ///
@@ -4892,6 +5018,71 @@ mod batch_buffer_tests {
     }
 }
 
+/// [`reject_settlement`]: the terminal-discard decision for a rejected
+/// message.
+///
+/// `messages_discarded_total` promises every increment is a message that no
+/// longer exists, so getting this matrix wrong is either a false data-loss
+/// alert or the silent loss this PR exists to surface. Both the single-message
+/// `route_outcome` and the batch `flush_batch` reject arm route through it, so
+/// the two paths cannot drift the way earlier cross-backend fixes did.
+#[cfg(test)]
+mod reject_settlement_tests {
+    use super::*;
+
+    /// With no DLQ there is nothing to publish to, so a reject drops the
+    /// message. This is the bare-topology shape from CAF-35: the discard has to
+    /// be counted, which is precisely what the batch path used to skip.
+    #[test]
+    fn no_dlq_is_always_a_plain_discard() {
+        assert_eq!(
+            reject_settlement(false, false),
+            RejectSettlement::Retired,
+            "no DLQ declared: the message is dropped and must be counted"
+        );
+    }
+
+    /// `reached_dlq` is meaningless without a DLQ — there was no publish. A
+    /// caller that passes `true` anyway (a batch with no `raw` bytes buffered,
+    /// say) must still get a countable discard rather than a silent `InDlq`.
+    #[test]
+    fn no_dlq_ignores_the_publish_flag() {
+        assert_eq!(reject_settlement(false, true), RejectSettlement::Retired);
+    }
+
+    /// The message exists in the DLQ, so no discard is owed however the commit
+    /// resolves. Counting here would be a false data-loss alert on the
+    /// perfectly ordinary dead-letter path.
+    #[test]
+    fn a_landed_dlq_publish_owes_no_discard() {
+        assert_eq!(reject_settlement(true, true), RejectSettlement::InDlq);
+    }
+
+    /// The case `has_dlq` alone gets wrong: a DLQ was declared, the publish
+    /// failed, and the offsets commit anyway. Nothing holds a copy, so this is
+    /// data loss even though the topology says otherwise — it must settle with
+    /// `confirm_lost`, which counts regardless of `has_dlq`.
+    #[test]
+    fn a_failed_dlq_publish_is_loss_despite_the_topology() {
+        assert_eq!(reject_settlement(true, false), RejectSettlement::Lost);
+    }
+
+    /// Only `InDlq` may skip the commit round trip. The other two are claims
+    /// that a message is gone, and nothing has retired it until the offsets
+    /// actually advance — settling them early is the false-alert-during-an-
+    /// outage failure `PendingDiscard` was introduced to prevent.
+    #[test]
+    fn everything_but_in_dlq_waits_for_the_commit() {
+        for (has_dlq, reached_dlq) in [(false, false), (false, true), (true, false)] {
+            assert_ne!(
+                reject_settlement(has_dlq, reached_dlq),
+                RejectSettlement::InDlq,
+                "has_dlq={has_dlq} reached_dlq={reached_dlq} must wait for the commit"
+            );
+        }
+    }
+}
+
 /// [`invoke_batch_handler`]: a batch flush must not be able to take the
 /// consumer task down with it, and must not be able to hang it forever.
 #[cfg(test)]
@@ -4904,7 +5095,7 @@ mod batch_handler_isolation_tests {
     #[tokio::test]
     async fn a_panicking_batch_becomes_retry() {
         let outcome = invoke_batch_handler(
-            async { panic!("flush blew up") },
+            || async { panic!("flush blew up") },
             Some(Duration::from_secs(5)),
             None,
             "topic",
@@ -4922,7 +5113,7 @@ mod batch_handler_isolation_tests {
     #[tokio::test(start_paused = true)]
     async fn a_hung_batch_times_out_into_retry() {
         let outcome = invoke_batch_handler(
-            async {
+            || async {
                 tokio::time::sleep(Duration::from_secs(600)).await;
                 Outcome::Ack
             },
@@ -4943,7 +5134,7 @@ mod batch_handler_isolation_tests {
     #[tokio::test]
     async fn panics_are_caught_with_no_timeout_configured() {
         let outcome = invoke_batch_handler(
-            async { panic!("flush blew up") },
+            || async { panic!("flush blew up") },
             None,
             None,
             "topic",
@@ -4955,10 +5146,60 @@ mod batch_handler_isolation_tests {
         assert!(matches!(outcome, Outcome::Retry));
     }
 
+    /// `BatchMessageHandler::handle_batch` is an ordinary `fn -> impl Future`,
+    /// so an implementation may panic while *building* its future — validating
+    /// an argument, indexing a config map — before returning anything to await.
+    ///
+    /// That panic used to escape containment: the call was evaluated at the
+    /// `flush_batch` call site, outside the `catch_unwind`, so it unwound the
+    /// batch task and killed `run_batch` instead of becoming a redelivery. The
+    /// closure is what moves construction inside the guard, and this test is
+    /// what stops the ready-made-future form coming back — with a plain
+    /// `Future` parameter it does not even compile.
+    #[tokio::test]
+    async fn a_panic_while_building_the_future_is_contained() {
+        fn build_future() -> impl std::future::Future<Output = Outcome> {
+            panic!("handle_batch blew up before returning a future");
+            #[allow(unreachable_code)]
+            async {
+                unreachable!()
+            }
+        }
+
+        let outcome = invoke_batch_handler(
+            build_future,
+            Some(Duration::from_secs(5)),
+            None,
+            "topic",
+            None,
+            3,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    /// The same, with the deadline disabled — the no-timeout arm has its own
+    /// `catch_unwind` and has to construct inside it too.
+    #[tokio::test]
+    async fn a_panic_while_building_the_future_is_contained_with_no_timeout() {
+        fn build_future() -> impl std::future::Future<Output = Outcome> {
+            panic!("handle_batch blew up before returning a future");
+            #[allow(unreachable_code)]
+            async {
+                unreachable!()
+            }
+        }
+
+        let outcome = invoke_batch_handler(build_future, None, None, "topic", None, 1).await;
+
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
     #[tokio::test]
     async fn a_normal_outcome_passes_through_untouched() {
         let ack = invoke_batch_handler(
-            async { Outcome::Ack },
+            || async { Outcome::Ack },
             Some(Duration::from_secs(5)),
             None,
             "topic",
@@ -4969,7 +5210,7 @@ mod batch_handler_isolation_tests {
         assert!(matches!(ack, Outcome::Ack));
 
         let reject = invoke_batch_handler(
-            async { Outcome::Reject },
+            || async { Outcome::Reject },
             Some(Duration::from_secs(5)),
             None,
             "topic",
@@ -4987,7 +5228,7 @@ mod batch_handler_isolation_tests {
     #[tokio::test(start_paused = true)]
     async fn a_hung_batch_honours_the_configured_timeout_outcome() {
         let outcome = invoke_batch_handler(
-            async {
+            || async {
                 tokio::time::sleep(Duration::from_secs(600)).await;
                 Outcome::Ack
             },
