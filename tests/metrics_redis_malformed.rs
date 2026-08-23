@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 use tokio_util::sync::CancellationToken;
@@ -157,7 +158,11 @@ async fn payload_less_entry_is_counted_once_and_left_unclaimable() {
     let snapshotter: Snapshotter = recorder.snapshotter();
     recorder.install().expect("install debugging recorder");
 
+    // `7.0`, matching `redis_integration.rs`: the testcontainers module still
+    // defaults to Redis 5.0.14, which `shove` rejects at connect (it requires
+    // 6.2+), and XAUTOCLAIM below is itself a 6.2 command.
     let container = RedisContainer::default()
+        .with_tag("7.0")
         .start()
         .await
         .expect("failed to start Redis container");
