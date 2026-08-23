@@ -88,10 +88,20 @@ jobs:
       # Generate the notes *before* `cargo publish`, the one irreversible step
       # in this job: a crate version cannot be unpublished, so anything that can
       # fail the release should fail while the run is still recoverable.
+      #
+      # The notes are written to $RUNNER_TEMP, *not* the working tree. `cargo
+      # publish` refuses to run when the working directory has uncommitted
+      # changes, and an untracked RELEASE_NOTES.md counts -- so generating them
+      # in-tree before the publish (which is the whole point of this ordering)
+      # makes the publish fail every time. That is exactly what happened on the
+      # first v0.13.0 attempt. Keeping the file outside the repo also stops it
+      # being packaged into the .crate, since `.github/` is not in Cargo.toml's
+      # `exclude` list.
       - name: Generate changelog
         run: |
           cargo install -q git-cliff --locked
           VERSION="${{ steps.version.outputs.version }}"
+          NOTES="${RUNNER_TEMP}/RELEASE_NOTES.md"
           # Do not use `--latest`: on the `bump: none` path the "Commit and tag"
           # step is skipped, so the tag does not exist yet and the newest tag is
           # still the *previous* release -- `--latest` then re-emits that
@@ -101,21 +111,31 @@ jobs:
                    --exclude "v${VERSION}" HEAD 2>/dev/null || true)
           if [ -n "$PREV" ]; then
             echo "Generating notes for ${PREV}..HEAD"
-            git-cliff --strip header --tag "v${VERSION}" "${PREV}..HEAD" -o RELEASE_NOTES.md
+            git-cliff --strip header --tag "v${VERSION}" "${PREV}..HEAD" -o "$NOTES"
           else
             echo "No previous tag found; generating notes over full history"
-            git-cliff --strip header --tag "v${VERSION}" -o RELEASE_NOTES.md
+            git-cliff --strip header --tag "v${VERSION}" -o "$NOTES"
           fi
           # Test for *blank*, not just zero-length: `--strip header` on a range
           # whose every commit was filtered leaves a file of bare newlines, which
           # `[ -s ]` reports as non-empty. That is the realistic failure -- a
           # release squashed into a single `release:` commit, which cliff.toml
           # skips -- so the weaker test would let empty notes through.
-          if ! grep -q '[^[:space:]]' RELEASE_NOTES.md; then
-            echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write RELEASE_NOTES.md by hand and re-run, or re-cut the release with the individual commits intact."
+          if ! grep -q '[^[:space:]]' "$NOTES"; then
+            echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write ${NOTES} by hand and re-run, or re-cut the release with the individual commits intact."
             exit 1
           fi
-          cat RELEASE_NOTES.md
+          cat "$NOTES"
+
+      # Nothing after this point may write to the working tree: `cargo publish`
+      # rejects a dirty one, and the next step is the irreversible publish.
+      - name: Fail early if the working tree is dirty
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain
+            echo "::error::Working tree is dirty going into 'cargo publish', which will refuse to run. A step above wrote into the repo; write it to \$RUNNER_TEMP instead."
+            exit 1
+          fi
 
       - name: Authenticate with crates.io (trusted publishing)
         id: crates-auth
@@ -129,7 +149,7 @@ jobs:
       - name: Create GitHub release
         run: |
           gh release create "v${{ steps.version.outputs.version }}" \
-            -F RELEASE_NOTES.md \
+            -F "${RUNNER_TEMP}/RELEASE_NOTES.md" \
             --target "${{ github.sha }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
