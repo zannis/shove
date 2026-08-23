@@ -325,8 +325,9 @@ pub mod kafka {
     pub use crate::backends::kafka::{
         BatchConsumerOptions, KafkaAutoOffsetReset, KafkaAutoscalerBackend, KafkaClient,
         KafkaConsumer, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
-        KafkaLagStatsProvider, KafkaPublisher, KafkaPublisherConfig, KafkaQueueStats,
-        KafkaQueueStatsProvider, KafkaTopologyDeclarer,
+        KafkaLagStatsProvider, KafkaOffsetReset, KafkaOffsetResetReport, KafkaPartitionOffsetReset,
+        KafkaPublisher, KafkaPublisherConfig, KafkaQueueStats, KafkaQueueStatsProvider,
+        KafkaTopologyDeclarer,
     };
     #[cfg(feature = "kafka-ssl")]
     #[cfg_attr(docsrs, doc(cfg(feature = "kafka-ssl")))]

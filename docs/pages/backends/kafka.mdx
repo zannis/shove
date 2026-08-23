@@ -161,6 +161,42 @@ The resolved group IDs follow the topology:
 | DLQ drain | `order-settlement-dlq-consumer` | `order-settlement-settlement-audit-dlq-consumer` |
 
 Precedence is: an explicit `with_group_id` (on either `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`) > the topology's fan-out group > the `{queue}-consumer` default. The explicit override staying on top means adding `for_consumer_group` to a topology cannot move an already-deployed consumer off the group it holds committed offsets under. The autoscaler resolves the same group ID as the broker-side consumer in every case, so lag is read from the group that is actually committing.
+### Re-anchoring a group (seek to tail / head / timestamp)
+
+`auto.offset.reset` only decides where a group starts when it has **no** usable committed offset. Once the group has committed, the setting is inert — which is why "just seek to the tail" so often turns into minting a throwaway group ID (`orders-v2`, `orders-20260812`, …). That works, but it strands the old group's offsets and its lag metrics forever, and the generation suffix becomes a permanent piece of config nobody dares remove.
+
+`reset_consumer_group_offsets` rewrites the group's committed offsets in place — the library-side equivalent of `kafka-consumer-groups.sh --reset-offsets --execute`:
+
+```rust,no_run
+use shove::kafka::{KafkaConsumerGroupConfig, KafkaOffsetReset};
+
+let config = KafkaConsumerGroupConfig::new(1..=4);
+
+// Operator-initiated: re-anchor at the tail before the consumers start.
+if std::env::var("PRICES_SEEK_TO_TAIL").is_ok() {
+    let report = broker
+        .reset_consumer_group_offsets::<Prices>(&config, KafkaOffsetReset::Latest)
+        .await?;
+    tracing::warn!(?report, "re-anchored the prices group at the tail");
+}
+
+let mut group = broker.consumer_group();
+group
+    .register::<Prices, _>(ConsumerGroupConfig::new(config), || Handler)
+    .await?;
+```
+
+- **`KafkaOffsetReset::Latest`** — every partition's high watermark. The seek-to-tail case: a latest-value sink that must serve fresh data now rather than after crawling days of backlog.
+- **`KafkaOffsetReset::Earliest`** — every partition's low watermark: replay all retained history.
+- **`KafkaOffsetReset::Timestamp(ms)`** — the first record at or after that point, in milliseconds since the Unix epoch (the same unit as `--to-datetime`). Partitions with no record at or after it re-anchor at their high watermark.
+
+The group ID is resolved from `config` and the topology exactly as `register` would resolve it — following the same precedence as the fan-out table above, plus the `-fifo` suffix for a sequenced topic — so the offsets rewritten are the ones the consumers will actually read.
+
+**The group must be inactive.** Kafka only accepts an offset reset while the group has no live members; with consumers running the call returns `ShoveError::Validation` naming the active member count, and the broker enforces the same rule independently. Re-anchor at process start, before the group is registered. A group does not go inactive the instant its consumers stop — the coordinator drops each member as its `LeaveGroup` lands — so a reset issued immediately after `run_until_timeout` returns may need a brief retry.
+
+The returned `KafkaOffsetResetReport` carries one entry per partition with the previous and new offsets (and `delta()`, positive for records skipped, negative for history replayed). It is the only record of where the group was before it moved, so log it. `is_noop()` reports that every partition already sat at its target.
+
+Kafka is the only backend with this API: it is the only one shove supports where a group's read position is a broker-side committed offset an operator can rewrite. Redis Streams' `XGROUP SETID` is the nearest equivalent and is not yet exposed.
 
 ### Replication factor
 

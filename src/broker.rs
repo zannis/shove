@@ -146,9 +146,14 @@ impl<B: HasCoordinatedGroups> Broker<B> {
 }
 
 #[cfg(feature = "kafka")]
-use crate::backends::kafka::{KafkaPublisher, KafkaPublisherConfig};
+use crate::backends::kafka::{
+    KafkaConsumerGroupConfig, KafkaOffsetReset, KafkaOffsetResetReport, KafkaPublisher,
+    KafkaPublisherConfig, reset_group_offsets, resolved_reset_group_id,
+};
 #[cfg(feature = "kafka")]
 use crate::markers::Kafka;
+#[cfg(feature = "kafka")]
+use crate::topic::Topic;
 
 #[cfg(feature = "kafka")]
 impl Broker<Kafka> {
@@ -164,5 +169,79 @@ impl Broker<Kafka> {
     pub async fn publisher_with(&self, config: KafkaPublisherConfig) -> Result<Publisher<Kafka>> {
         let inner = KafkaPublisher::with_config(self.client.clone(), config).await?;
         Ok(Publisher::new(inner))
+    }
+
+    /// Re-anchor `T`'s consumer group at a new position without minting a new
+    /// group ID.
+    ///
+    /// [`KafkaConsumerGroupConfig::with_auto_offset_reset`] only decides where
+    /// a group starts when it has **no** usable committed offset. Once the
+    /// group has committed, the only way to move it is to rewrite those
+    /// offsets — otherwise the sole way to seek to the tail is to join under a
+    /// throwaway group ID (`my-group-v2`, `my-group-20260812`, …), which
+    /// strands the old group's offsets and its lag metrics forever.
+    ///
+    /// This is the library-side equivalent of
+    /// `kafka-consumer-groups.sh --reset-offsets --execute`. The group ID is
+    /// resolved from `config` and `T`'s topology exactly as
+    /// [`ConsumerGroup::register`] would resolve it — a [`with_group_id`]
+    /// override, otherwise the topology's
+    /// [`for_consumer_group`](crate::TopologyBuilder::for_consumer_group)
+    /// fan-out group, otherwise the `{queue}-consumer` default, plus the
+    /// `-fifo` suffix for a sequenced topic — so the offsets rewritten here are
+    /// the ones the consumers will actually read.
+    ///
+    /// # The group must be inactive
+    ///
+    /// Kafka only accepts an offset reset while the group has no live members.
+    /// Call this **before** starting the group's consumers (or after stopping
+    /// them); with consumers running it returns
+    /// [`ShoveError::Validation`](crate::ShoveError::Validation) naming the
+    /// active member count. The broker enforces the same rule independently,
+    /// so a member that joins mid-reset fails the commit rather than silently
+    /// losing it.
+    ///
+    /// A group does not become inactive the instant its consumers stop: the
+    /// coordinator drops each member as its `LeaveGroup` lands. A reset issued
+    /// immediately after
+    /// [`run_until_timeout`](crate::ConsumerGroup::run_until_timeout) returns
+    /// may therefore need a brief retry. Re-anchoring at process start —
+    /// before the group is registered — avoids the race entirely and is the
+    /// intended shape.
+    ///
+    /// # Example
+    ///
+    /// A tailing sink that re-anchors on demand, under a stable group ID:
+    ///
+    /// ```no_run
+    /// # use shove::kafka::{Kafka, KafkaConsumerGroupConfig, KafkaOffsetReset};
+    /// # use shove::{Broker, define_topic, TopologyBuilder};
+    /// # define_topic!(Prices, String, TopologyBuilder::new("prices").build());
+    /// # async fn run(broker: &Broker<Kafka>) -> Result<(), shove::ShoveError> {
+    /// let config = KafkaConsumerGroupConfig::new(1..=4);
+    ///
+    /// if std::env::var("PRICES_SEEK_TO_TAIL").is_ok() {
+    ///     let report = broker
+    ///         .reset_consumer_group_offsets::<Prices>(&config, KafkaOffsetReset::Latest)
+    ///         .await?;
+    ///     tracing::warn!(?report, "re-anchored prices consumer group at the tail");
+    /// }
+    ///
+    /// let mut group = broker.consumer_group();
+    /// // group.register::<Prices, _>(config.into(), ...).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`with_group_id`]: KafkaConsumerGroupConfig::with_group_id
+    /// [`ConsumerGroup::register`]: crate::ConsumerGroup::register
+    pub async fn reset_consumer_group_offsets<T: Topic>(
+        &self,
+        config: &KafkaConsumerGroupConfig,
+        to: KafkaOffsetReset,
+    ) -> Result<KafkaOffsetResetReport> {
+        let topology = T::topology();
+        let group_id = resolved_reset_group_id(config, topology);
+        reset_group_offsets(&self.client, topology.queue(), &group_id, to).await
     }
 }
