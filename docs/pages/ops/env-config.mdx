@@ -44,20 +44,31 @@ only `MIN_CONSUMERS` pins a fixed-size group. `MIN > MAX` is an error that names
 both variables.
 
 ```rust
+use shove::RabbitMq;
+use shove::consumer_group::ConsumerGroupConfig;
 use shove::env::ConsumerTuning;
 use shove::rabbitmq::RabbitMqConsumerGroupConfig;
 
 let tuning = ConsumerTuning::from_env("ORDERS")?;
 
-let config = RabbitMqConsumerGroupConfig::new("orders", tuning.range())
-    .with_prefetch_count(tuning.prefetch_count_or(10));
+let config: ConsumerGroupConfig<RabbitMq> = ConsumerGroupConfig::new(
+    RabbitMqConsumerGroupConfig::new(tuning.range())
+        .with_prefetch_count(tuning.prefetch_count_or(10)),
+);
+
+group.register::<Orders, _>(config, || OrderHandler).await?;
 ```
 
 `prefetch_count_or` keeps the call site a single unconditional call: it returns
 the configured value when the variable is set and your own default when it
-isn't. Every backend's group config takes the same
-`new(name, range)` + `.with_prefetch_count(n)` shape, so the same `tuning`
-feeds all six.
+isn't.
+
+Every coordinated-group backend — RabbitMQ, NATS, Kafka, Redis, in-memory —
+takes the same `new(range)` + `.with_prefetch_count(n)` shape, so one `tuning`
+feeds all five unchanged. SQS has no consumer group; it uses
+[`ConsumerSupervisor`](/backends/sqs/examples/basic), whose `register` takes
+`ConsumerOptions`, so `prefetch_count_or` still applies there and `range()`
+does not.
 
 ## Autoscaler
 

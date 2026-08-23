@@ -15,8 +15,8 @@
 //!
 //! - [`EnvVars`] — the primitive: a prefix-scoped, typed, bounded reader.
 //!   Use it directly for knobs shove doesn't model.
-//! - [`ConsumerTuning`] — consumer range + prefetch, the knobs every backend's
-//!   consumer-group config takes.
+//! - [`ConsumerTuning`] — consumer range + prefetch, the knobs every
+//!   coordinated-group backend's consumer-group config takes.
 //! - [`KafkaTopicTuning`] — replication factor and partition floor.
 //! - [`AutoscalerConfig::from_env`](crate::autoscaler::AutoscalerConfig::from_env)
 //!   and [`NatsStreamConfig::from_env`](crate::topology::NatsStreamConfig::from_env)
@@ -279,8 +279,10 @@ fn type_hint<T>() -> &'static str {
 /// Consumer-group sizing read from the environment: the autoscaler's consumer
 /// range plus the per-consumer prefetch count.
 ///
-/// These are the three knobs every backend's consumer-group config takes, so
-/// `ConsumerTuning` is backend-agnostic and feeds them all.
+/// These are the three knobs every coordinated-group backend's consumer-group
+/// config takes, so `ConsumerTuning` is backend-agnostic and feeds them all.
+/// SQS has no consumer group — there [`prefetch_count_or`](Self::prefetch_count_or)
+/// feeds `ConsumerOptions` and the range does not apply.
 ///
 /// | Variable | Type | Default |
 /// |---|---|---|
@@ -304,13 +306,24 @@ fn type_hint<T>() -> &'static str {
 /// # Ok::<_, shove::ShoveError>(())
 /// ```
 ///
-/// Wiring it into a group config (RabbitMQ shown; every backend is the same
-/// shape):
+/// Wiring it into a group config (RabbitMQ shown; every coordinated-group
+/// backend takes the same `new(range)` shape):
 ///
-/// ```ignore
-/// let tuning = ConsumerTuning::from_env("ORDERS")?;
-/// let config = RabbitMqConsumerGroupConfig::new("orders", tuning.range())
-///     .with_prefetch_count(tuning.prefetch_count_or(10));
+/// ```
+/// # #[cfg(feature = "rabbitmq")] {
+/// use shove::RabbitMq;
+/// use shove::consumer_group::ConsumerGroupConfig;
+/// use shove::env::ConsumerTuning;
+/// use shove::rabbitmq::RabbitMqConsumerGroupConfig;
+///
+/// let tuning = ConsumerTuning::from_pairs("ORDERS", [("ORDERS_MAX_CONSUMERS", "16")])?;
+/// let config: ConsumerGroupConfig<RabbitMq> = ConsumerGroupConfig::new(
+///     RabbitMqConsumerGroupConfig::new(tuning.range())
+///         .with_prefetch_count(tuning.prefetch_count_or(10)),
+/// );
+/// # let _ = config;
+/// # }
+/// # Ok::<_, shove::ShoveError>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerTuning {
@@ -358,7 +371,7 @@ impl ConsumerTuning {
     }
 
     /// The consumer range, ready to hand to a backend's
-    /// `ConsumerGroupConfig::new(name, range)`.
+    /// `ConsumerGroupConfig::new(range)`.
     pub fn range(&self) -> RangeInclusive<u16> {
         self.min_consumers..=self.max_consumers
     }
