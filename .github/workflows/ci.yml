@@ -106,13 +106,12 @@ jobs:
           - name: inmemory
             features: inmemory,metrics,sbe
           # `metrics` on every backend entry below that has a `metrics_*`
-          # integration binary. Every one of those is
-          # gated `#![cfg(all(feature = "<backend>", feature = "metrics"))]`,
-          # so without the feature the binary compiles to zero tests and the
-          # entry still reports green: coverage that asserts nothing. The
-          # feature only adds counter emission behind the `metrics` facade;
-          # with no recorder installed each call is a no-op, so no entry gets
-          # materially slower.
+          # integration binary. Every one of those is gated
+          # `#![cfg(all(feature = "<backend>", feature = "metrics"))]`, so
+          # without the feature the binary compiles to zero tests and the entry
+          # still reports green: coverage that asserts nothing. The feature only
+          # adds counter emission behind the `metrics` facade; with no recorder
+          # installed each call is a no-op, so no entry gets materially slower.
           - name: rabbitmq
             # Asserted by `metrics_rabbitmq_sequenced`.
             features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe
