@@ -1073,11 +1073,14 @@ where
                         }
                     }
                 }
-                // Pending deliveries: change visibility to 0 so they are redelivered.
+                // Pending deliveries were received but never handed to a
+                // handler. Release them (visibility 0) so another consumer can
+                // pick them up — this is not a rejection, so it must not go
+                // through the DLQ-semantics path.
                 for (_key, msgs) in pending_deliveries.drain() {
                     for msg in msgs {
                         let rh = msg.receipt_handle().unwrap_or_default();
-                        router::route_reject(sqs, queue_url, rh, topology).await;
+                        router::route_requeue(sqs, queue_url, rh).await;
                     }
                 }
                 return Ok(());
