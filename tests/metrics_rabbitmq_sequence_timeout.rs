@@ -23,7 +23,7 @@
 //!    the stall is sitting in the broker-side hold queue, untouched by the
 //!    eviction arm — it will be redelivered when its TTL expires. Counting it
 //!    would report a discard for a message that was never discarded. The hold
-//!    queue TTL here is 60s against a test that finishes in seconds, so that
+//!    queue TTL here is 300s against a test bounded well under that, so that
 //!    message is still in the broker when the snapshot is taken: three
 //!    messages published, two counted, one handler call.
 //!
@@ -66,10 +66,16 @@ use tokio_util::sync::CancellationToken;
 // Test harness
 // ---------------------------------------------------------------------------
 
-/// How long the parked message stays in the broker-side hold queue. Long
-/// enough that it cannot be redelivered before the test finishes: if it came
-/// back it would clear `AwaitingRetry` and the eviction would never fire.
-const HOLD_QUEUE_TTL: Duration = Duration::from_secs(60);
+/// How long the parked message stays in the broker-side hold queue. It must
+/// not be redelivered before the test finishes: coming back would clear
+/// `AwaitingRetry`, and the "held message is not counted" assertion below
+/// depends on that message still being in the broker at snapshot time.
+///
+/// Sized against the test's own worst case rather than its typical runtime:
+/// the two waits below are 30s each and the settle sleep is 2s, so a maximally
+/// unlucky run reaches the snapshot ~62s in. 300s leaves that a wide margin —
+/// the TTL costs nothing, since the message is never waited on.
+const HOLD_QUEUE_TTL: Duration = Duration::from_secs(300);
 
 /// How long a key may sit in `AwaitingRetry` before its buffered messages are
 /// evicted. The consumer polls at half this, so eviction lands within ~1.5×.
@@ -459,7 +465,7 @@ async fn hold_queue_eviction_counts_buffered_messages_but_not_the_held_one() {
     );
 
     // (2) The held message is not counted. It is still in the shard hold queue
-    // — `HOLD_QUEUE_TTL` is 60s and this test takes seconds — so it has been
+    // — `HOLD_QUEUE_TTL` is 300s, well beyond this test's worst case — so it has been
     // neither dead-lettered nor discarded, and counting it would report a
     // discard that never happened. Three published, two counted, and the
     // handler saw exactly the one that is still parked.

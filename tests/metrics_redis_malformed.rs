@@ -137,6 +137,41 @@ fn failed_total(
         .sum()
 }
 
+/// Poll XPENDING until the group has nothing outstanding, or give up.
+///
+/// Reply is `[count, min-id, max-id, consumers]`; only the count is read.
+async fn wait_for_empty_pel(
+    conn: &mut redis::aio::MultiplexedConnection,
+    stream: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let reply: redis::Value = redis::cmd("XPENDING")
+            .arg(stream)
+            .arg(GROUP)
+            .query_async(conn)
+            .await
+            .expect("XPENDING");
+        let pending = match &reply {
+            redis::Value::Array(parts) => match parts.first() {
+                Some(redis::Value::Int(n)) => *n,
+                // An empty PEL answers with a nil-ish head on some versions.
+                _ => 0,
+            },
+            redis::Value::Nil => 0,
+            other => panic!("unexpected XPENDING reply: {other:?}"),
+        };
+        if pending == 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_handler(ctx: &Counters, target: u32, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
@@ -234,6 +269,19 @@ async fn payload_less_entry_is_counted_once_and_left_unclaimable() {
         wait_for_handler(&counters, 1, Duration::from_secs(30)).await,
         "timed out waiting for the sentinel to reach the handler; without it \
          there is no proof the corrupt entry was processed at all"
+    );
+
+    // The handler counter ticks *inside* the handler, before the consumer
+    // XACKs the sentinel, so cancelling on that signal alone could stop the
+    // consumer with the sentinel still pending and make the PEL check below
+    // fail for a reason that has nothing to do with the corrupt entry. Wait
+    // for the group's PEL to drain first. The corrupt entry is XACKed strictly
+    // before the sentinel — it is the earlier stream id and this consumer is
+    // the sequential loop — so an empty PEL means both are acked.
+    assert!(
+        wait_for_empty_pel(&mut raw_conn, stream, Duration::from_secs(30)).await,
+        "timed out waiting for the pending-entries list to drain; entries left \
+         in the PEL would be re-XADDed by the reaper"
     );
 
     shutdown.cancel();
