@@ -1106,11 +1106,7 @@ impl NatsConsumer {
                                             sequence_key = %seq_key,
                                             "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                                         );
-                                        metrics::record_failed(
-                                            &shard_topic,
-                                            shard_group.as_deref(),
-                                            metrics::FailReason::Rejected,
-                                        );
+                                        // Cascade: intentionally not counted — see `metrics::FailReason`.
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &shard_client,
                                             topology,
