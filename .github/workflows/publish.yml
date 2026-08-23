@@ -40,6 +40,25 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Resolve the rehearsal flag once, and fail closed: an unrecognised value
+      # must not quietly mean "real release". `type: boolean` makes this
+      # unreachable from the Actions UI, but a dispatch through the API can put
+      # anything in the field. Read through the environment rather than
+      # interpolating the input into the script.
+      - name: Resolve release mode
+        env:
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          case "$DRY_RUN_INPUT" in
+            true)  echo "Rehearsal: nothing will be pushed or published." ;;
+            false) echo "Real release." ;;
+            *)
+              echo "::error::dry_run must be 'true' or 'false', got '$DRY_RUN_INPUT'."
+              exit 1
+              ;;
+          esac
+          echo "DRY_RUN=$DRY_RUN_INPUT" >> "$GITHUB_ENV"
+
       - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
 
       - uses: dtolnay/rust-toolchain@1.91
@@ -98,7 +117,7 @@ jobs:
           # The commit and tag above are created for real even on a rehearsal --
           # signing them is a step that can fail, so it has to be exercised.
           # Only the push is withheld, leaving both objects local to the runner.
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          if [ "$DRY_RUN" = "true" ]; then
             echo "dry run: not pushing v${{ steps.version.outputs.version }} to ${{ github.ref_name }}"
             git --no-pager log -1 --show-signature
             git tag -v "v${{ steps.version.outputs.version }}"
@@ -163,13 +182,13 @@ jobs:
       # no step uses.
       - name: Authenticate with crates.io (trusted publishing)
         id: crates-auth
-        if: ${{ !inputs.dry_run }}
+        if: env.DRY_RUN != 'true'
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish to crates.io
         run: |
           set -- cargo publish -q --all-features
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          if [ "$DRY_RUN" = "true" ]; then
             set -- "$@" --dry-run
           fi
           "$@"
@@ -181,7 +200,7 @@ jobs:
           set -- gh release create "v${{ steps.version.outputs.version }}" \
             -F "${RUNNER_TEMP}/RELEASE_NOTES.md" \
             --target "${{ github.sha }}"
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          if [ "$DRY_RUN" = "true" ]; then
             # A rehearsal cannot create the release: `gh release create` would
             # create the tag on the remote, which is the push we just withheld.
             # Assert instead that the notes file `-F` reads is still there and
