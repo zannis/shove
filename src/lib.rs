@@ -208,7 +208,9 @@ pub use consumer::{
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::ShoveError;
 pub use handler::{MessageHandler, MessageHandlerExt};
-pub use metadata::{DeadMessageMetadata, MessageMetadata};
+pub use metadata::{
+    DeadMessageMetadata, DeadMessageMetadataBuilder, MessageMetadata, MessageMetadataBuilder,
+};
 pub use outcome::Outcome;
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 use std::time::Duration;

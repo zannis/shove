@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +20,9 @@ use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
-use crate::routing::{RetryDecision, decide_retry, handler_timeout_outcome, hold_index};
+use crate::routing::{
+    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
+};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
@@ -448,7 +450,7 @@ async fn run_fifo_shard<T, H>(
     T: SequencedTopic,
     H: MessageHandler<T>,
 {
-    let mut poisoned: HashSet<String> = HashSet::new();
+    let poisoned = PoisonedKeys::new(on_failure);
     let shutdown = options.shutdown.clone();
     let broker_shutdown = broker.shutdown_token().clone();
 
@@ -488,7 +490,7 @@ async fn run_fifo_shard<T, H>(
 
             let key = env.headers.get(X_SEQUENCE_KEY).cloned().unwrap_or_default();
 
-            let skip_handler = on_failure == SequenceFailure::FailAll && poisoned.contains(&key);
+            let skip_handler = poisoned.is_poisoned(&key);
 
             let outcome = if skip_handler {
                 tracing::debug!(
@@ -547,16 +549,8 @@ async fn run_fifo_shard<T, H>(
                             metrics::FailReason::MaxRetriesExceeded,
                             topology.dlq().is_some(),
                         );
-                        route_reject_sequenced(
-                            &broker,
-                            topology,
-                            env,
-                            &key,
-                            &mut poisoned,
-                            on_failure,
-                            pending,
-                        )
-                        .await;
+                        route_reject_sequenced(&broker, topology, env, &key, &poisoned, pending)
+                            .await;
                     } else {
                         // Inline sleep (blocks this shard until republish completes).
                         let hold_queues = topology.hold_queues();
@@ -608,28 +602,12 @@ async fn run_fifo_shard<T, H>(
                     } else {
                         metrics::record_terminal(queue, group, reason, has_dlq)
                     };
-                    route_reject_sequenced(
-                        &broker,
-                        topology,
-                        env,
-                        &key,
-                        &mut poisoned,
-                        on_failure,
-                        pending,
-                    )
-                    .await;
+                    route_reject_sequenced(&broker, topology, env, &key, &poisoned, pending).await;
                 }
                 Outcome::Defer => unreachable!("Defer normalized to Retry above"),
             }
 
             finish(&shard, &busy, &options);
-
-            // Bounded drain of poisoned set: when this shard's buffer empties,
-            // the FailAll penalty expires for any poisoned key. Subsequent
-            // messages with that key start fresh.
-            if shard.buffer.lock().await.is_empty() {
-                poisoned.clear();
-            }
         }
     }
 }
@@ -670,14 +648,11 @@ async fn route_reject_sequenced(
     topology: &'static QueueTopology,
     env: Envelope,
     key: &str,
-    poisoned: &mut HashSet<String>,
-    on_failure: SequenceFailure,
+    poisoned: &PoisonedKeys,
     pending: metrics::PendingDiscard,
 ) {
     resolve_reject(route_reject(broker, topology, env).await, pending);
-    if on_failure == SequenceFailure::FailAll && !key.is_empty() {
-        poisoned.insert(key.to_string());
-    }
+    poisoned.poison(key);
 }
 
 // ---------------------------------------------------------------------------

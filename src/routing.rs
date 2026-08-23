@@ -1,9 +1,12 @@
 //! Backend-agnostic retry/DLQ routing decisions, shared across consumer
 //! backends so the boundary logic lives (and is tested) in exactly one place.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::Outcome;
+use crate::topology::SequenceFailure;
 
 /// Hold-queue tier for a given retry count, clamped to the last tier.
 /// Caller guarantees `hold_queue_count > 0`.
@@ -129,6 +132,66 @@ pub(crate) fn decide_retry(outcome: &Outcome, retry_count: u32, max_retries: u32
             }
         }
         Outcome::Defer => RetryDecision::Hold { increment: false },
+    }
+}
+
+/// The set of sequence keys poisoned by [`SequenceFailure::FailAll`].
+///
+/// Every sequenced consumer holds one of these. The semantics are identical on
+/// all six backends — see `docs/design/sequence-failure-parity.md`:
+///
+/// * Under [`SequenceFailure::Skip`] the tracker is **inert**: [`poison`] does
+///   nothing and [`is_poisoned`] is always `false`, so the `Skip` path never
+///   allocates and never takes a lock.
+/// * A key is poisoned by any DLQ-terminal event for one of its messages —
+///   `Outcome::Reject`, an exhausted retry budget, or a pre-handler rejection
+///   (oversize / undeserializable payload).
+/// * A poisoned key stays poisoned for the lifetime of the consumer task, as
+///   documented on [`SequenceFailure::FailAll`].
+/// * The empty key is never poisoned. A message with no sequence key carries
+///   no ordering relationship, and poisoning `""` would dead-letter every
+///   other unkeyed message that shares the shard.
+///
+/// Cloning shares the underlying set. That matters because NATS, Kafka and
+/// Redis rebuild their inner consume loop through a reconnect wrapper: without
+/// shared state a broker blip would silently un-poison every key.
+///
+/// [`poison`]: PoisonedKeys::poison
+/// [`is_poisoned`]: PoisonedKeys::is_poisoned
+#[derive(Clone, Default)]
+pub(crate) struct PoisonedKeys(Option<Arc<Mutex<HashSet<String>>>>);
+
+impl PoisonedKeys {
+    /// Build a tracker for `on_failure`. `Skip` yields an inert tracker.
+    pub(crate) fn new(on_failure: SequenceFailure) -> Self {
+        match on_failure {
+            SequenceFailure::Skip => Self(None),
+            SequenceFailure::FailAll => Self(Some(Arc::new(Mutex::new(HashSet::new())))),
+        }
+    }
+
+    /// Whether messages for `key` must bypass the handler and be dead-lettered.
+    pub(crate) fn is_poisoned(&self, key: &str) -> bool {
+        match &self.0 {
+            None => false,
+            Some(set) => !key.is_empty() && Self::lock(set).contains(key),
+        }
+    }
+
+    /// Poison `key` after a DLQ-terminal event. Returns whether this call
+    /// changed anything, so callers can log the transition exactly once.
+    pub(crate) fn poison(&self, key: &str) -> bool {
+        match &self.0 {
+            None => false,
+            Some(set) => !key.is_empty() && Self::lock(set).insert(key.to_owned()),
+        }
+    }
+
+    /// A poisoned `Mutex` only means some other consumer task panicked while
+    /// holding the set; the set itself is still a valid `HashSet`, and losing
+    /// the poison record would be worse than reusing it.
+    fn lock(set: &Mutex<HashSet<String>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        set.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -298,5 +361,48 @@ mod tests {
         // A caller is free to pass Duration::MAX; adding the grace must not
         // panic in a release build's debug-assert-free arithmetic.
         assert_eq!(shutdown_drain_timeout(Some(Duration::MAX)), Duration::MAX);
+    }
+
+    // ── PoisonedKeys ──
+
+    #[test]
+    fn skip_policy_never_poisons() {
+        let poisoned = PoisonedKeys::new(SequenceFailure::Skip);
+        assert!(!poisoned.poison("acct-1"));
+        assert!(!poisoned.is_poisoned("acct-1"));
+    }
+
+    #[test]
+    fn fail_all_poisons_only_the_failing_key() {
+        let poisoned = PoisonedKeys::new(SequenceFailure::FailAll);
+        assert!(poisoned.poison("acct-A"));
+        assert!(poisoned.is_poisoned("acct-A"));
+        assert!(!poisoned.is_poisoned("acct-B"));
+    }
+
+    #[test]
+    fn poison_reports_only_the_first_transition() {
+        let poisoned = PoisonedKeys::new(SequenceFailure::FailAll);
+        assert!(poisoned.poison("acct-A"));
+        assert!(!poisoned.poison("acct-A"));
+    }
+
+    #[test]
+    fn empty_key_is_never_poisoned() {
+        // An unkeyed message has no sequence to fail; poisoning "" would
+        // dead-letter every other unkeyed message on the shard.
+        let poisoned = PoisonedKeys::new(SequenceFailure::FailAll);
+        assert!(!poisoned.poison(""));
+        assert!(!poisoned.is_poisoned(""));
+    }
+
+    #[test]
+    fn clones_share_the_same_set() {
+        // NATS/Kafka/Redis rebuild their consume loop on reconnect; the clone
+        // handed to the new attempt must still see keys poisoned before it.
+        let poisoned = PoisonedKeys::new(SequenceFailure::FailAll);
+        let reconnected = poisoned.clone();
+        poisoned.poison("acct-A");
+        assert!(reconnected.is_poisoned("acct-A"));
     }
 }

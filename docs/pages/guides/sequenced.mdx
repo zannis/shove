@@ -118,6 +118,11 @@ Use `FailAll` when messages are **causally dependent** — each message assumes 
 
 Both policies only affect the failing sequence key. Other keys (e.g. `ACC-B`) are completely unaffected — they continue to be processed normally regardless of what happens to `ACC-A`.
 
+`FailAll` is honoured on all six backends, with two limits worth knowing:
+
+- **The poison record is process-local.** It survives a broker reconnect, but it is not shared between consumers. A second consumer of the same topic keeps its own set and will still invoke the handler for a key the first one poisoned; on Kafka, a partition moved by a rebalance likewise arrives at its new owner unpoisoned. Ordering is preserved in both cases — only the poison record is lost.
+- **NATS carries the key in a `Shove-Sequence-Key` header** added in the release that brought `FailAll` to NATS. Messages published by an older version carry no key and are never poisoned, so they degrade to `Skip` rather than taking out the shard. Messages in flight across an upgrade are safe; drain them, or republish, before relying on `FailAll` on NATS.
+
 ## Per-backend mapping
 
 The sequenced topic abstraction maps to different broker primitives depending on the backend in use. The consumer-visible contract is identical across all backends — per-key strict ordering with the configured failure policy — but the underlying mechanism differs.
@@ -128,6 +133,7 @@ The sequenced topic abstraction maps to different broker primitives depending on
 | AWS SNS+SQS | FIFO topic + `MessageGroupId` | Native SQS FIFO ordering |
 | NATS JetStream | Subject shard | `max_ack_pending=1` per subject |
 | Apache Kafka | Partition key | Consumer-group partition assignment |
+| Redis/Valkey Streams | Per-shard stream `{queue}-seq-{shard}` | One sequential reader per shard stream |
 | In-process | Per-key FIFO shards | `tokio::sync::Mutex` per key |
 
 For RabbitMQ, the consistent-hash exchange name is derived from the queue name as `{queue}-seq-hash` (visible in `SequenceConfig::exchange()`). Each routing shard gets its own sub-queue. The hold-queue names for sequenced topics use the shard index: `{queue}-seq-{shard_index}-hold-{N}s`.

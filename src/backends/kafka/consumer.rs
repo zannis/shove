@@ -28,7 +28,9 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{RetryDecision, decide_retry, handler_timeout_outcome, hold_index};
+use crate::routing::{
+    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
+};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{HoldQueue, Kafka, ShoveError};
@@ -493,6 +495,14 @@ fn headers_for_dlq(
 // ---------------------------------------------------------------------------
 // Outcome routing functions
 // ---------------------------------------------------------------------------
+
+/// Record a `FailAll` poisoning, logging only the first transition per key.
+/// A no-op under `SequenceFailure::Skip` and for unkeyed messages.
+fn poison_key(poisoned: &PoisonedKeys, key: &str, queue: &str) {
+    if poisoned.poison(key) {
+        tracing::info!(queue, sequence_key = %key, "poisoning sequence key (FailAll)");
+    }
+}
 
 fn adjust_outcome_for_fifo(outcome: Outcome) -> Outcome {
     match outcome {
@@ -1970,11 +1980,19 @@ impl KafkaConsumer {
         // is unreachable under correct callers. Returning an error instead
         // of expect()-panicking keeps misuse (e.g. from a future caller
         // path) recoverable.
-        let _seq_config = topology.sequencing().ok_or_else(|| {
+        let seq_config = topology.sequencing().ok_or_else(|| {
             ShoveError::Topology(format!(
                 "run_fifo called on {queue} without sequencing config"
             ))
         })?;
+        // Kafka has a single FIFO task covering every assigned partition, so
+        // one poison set covers every key this consumer sees. It lives outside
+        // the reconnect wrapper below: a broker blip must not un-poison a key.
+        //
+        // Scope is this consumer task, as documented on `SequenceFailure`. A
+        // partition reassigned to a sibling consumer starts with that
+        // consumer's own (empty) set — the same per-process scope RabbitMQ has.
+        let poisoned = PoisonedKeys::new(seq_config.on_failure());
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -2035,6 +2053,7 @@ impl KafkaConsumer {
                 let schema_registry = schema_registry.clone();
                 #[cfg(feature = "kafka-schema-registry")]
                 let schema_accepted = schema_accepted.clone();
+                let poisoned = poisoned.clone();
                 async move {
                     // FIFO commits per message via commit_message and keeps no
                     // offset tracker, so rebalance events are irrelevant — the
@@ -2078,8 +2097,51 @@ impl KafkaConsumer {
                                 let headers = extract_string_headers(&msg);
                                 // perf-K-9: Bytes for cheap refcount-clone semantics.
                                 let key = msg.key().map(Bytes::copy_from_slice);
+                                // The Kafka message key *is* the sequence key —
+                                // the publisher sets it from `SEQUENCE_KEY_FN`.
+                                let seq_key = key
+                                    .as_deref()
+                                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                                    .unwrap_or_default();
 
                                 metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
+
+                                // ── FailAll: skip poisoned keys ──
+                                // Inert unless this topic is configured
+                                // `SequenceFailure::FailAll`.
+                                if poisoned.is_poisoned(&seq_key) {
+                                    tracing::warn!(
+                                        queue,
+                                        sequence_key = %seq_key,
+                                        "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
+                                    );
+                                    metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        metrics::FailReason::Rejected,
+                                    );
+                                    if let Err(dlq_err) = publish_to_dlq(
+                                        &client,
+                                        topology,
+                                        payload_bytes,
+                                        key.as_deref(),
+                                        &headers,
+                                        "rejected",
+                                    ).await {
+                                        // Leave the offset uncommitted so the
+                                        // message is redelivered rather than
+                                        // silently dropped — the same
+                                        // at-least-once rule the routing path
+                                        // below follows.
+                                        tracing::error!(
+                                            error = %dlq_err,
+                                            "failed to publish poisoned-key message to DLQ"
+                                        );
+                                        continue;
+                                    }
+                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                    continue;
+                                }
 
                                 // Reject oversized messages before deserialization
                                 if let Err(e) = validate_message_size(payload_bytes.len(), max_message_size) {
@@ -2093,6 +2155,7 @@ impl KafkaConsumer {
                                         group.as_deref(),
                                         metrics::FailReason::Oversize,
                                     );
+                                    poison_key(&poisoned, &seq_key, &queue);
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
@@ -2142,6 +2205,7 @@ impl KafkaConsumer {
                                                 group.as_deref(),
                                                 metrics::FailReason::for_schema_reason(reason),
                                             );
+                                            poison_key(&poisoned, &seq_key, &queue);
                                             if let Err(dlq_err) = publish_to_dlq(
                                                 &client,
                                                 topology,
@@ -2166,6 +2230,7 @@ impl KafkaConsumer {
                                                 group.as_deref(),
                                                 metrics::FailReason::Deserialize,
                                             );
+                                            poison_key(&poisoned, &seq_key, &queue);
                                             if let Err(dlq_err) = publish_to_dlq(
                                                 &client,
                                                 topology,
@@ -2194,6 +2259,7 @@ impl KafkaConsumer {
                                                 group.as_deref(),
                                                 metrics::FailReason::Deserialize,
                                             );
+                                            poison_key(&poisoned, &seq_key, &queue);
                                             if let Err(dlq_err) = publish_to_dlq(
                                                 &client,
                                                 topology,
@@ -2224,6 +2290,7 @@ impl KafkaConsumer {
                                             group.as_deref(),
                                             metrics::FailReason::Deserialize,
                                         );
+                                        poison_key(&poisoned, &seq_key, &queue);
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &client,
                                             topology,
@@ -2269,6 +2336,16 @@ impl KafkaConsumer {
                                 )
                                 .await;
                                 let outcome = adjust_outcome_for_fifo(outcome);
+
+                                                                // FailAll: a DLQ-terminal outcome poisons the
+                                // key, so every later message for it is
+                                // dead-lettered instead of handled.
+                                if matches!(
+                                    decide_retry(&outcome, retry_count, max_retries),
+                                    RetryDecision::Dlq { .. }
+                                ) {
+                                    poison_key(&poisoned, &seq_key, &queue);
+                                }
 
                                 let (route_ok, pending) = route_outcome(
                                     &client,
