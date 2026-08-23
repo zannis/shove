@@ -4132,19 +4132,30 @@ mod lease_tests {
     // -----------------------------------------------------------------------
     // A pre-handler terminal outcome must respect the lease too.
     //
-    // `XREADGROUP COUNT prefetch` admits the whole batch to this consumer's
-    // PEL in one call, but the entries are inspected one at a time. An entry
-    // near the end of the batch can therefore be reclaimed by a foreign reaper
-    // before the consumer has even looked at it — and the paths that reject an
-    // entry *without* running a handler (missing payload, oversize,
-    // undecodable) used to dead-letter it regardless, adding a second copy
-    // alongside the reaper's re-add.
+    // `XREADGROUP COUNT prefetch` admits a whole batch to this consumer's PEL
+    // in one call, but the entries are inspected one at a time. An entry near
+    // the end of a batch can therefore be reclaimed by a foreign reaper before
+    // the consumer has even looked at it — and the paths that reject an entry
+    // *without* running a handler (missing payload, oversize, undecodable)
+    // used to dead-letter it regardless, adding a second copy alongside the
+    // reaper's re-add.
     //
-    // Setup: prefetch 2, so one XREADGROUP takes both entries. The first is
-    // valid and its handler blocks; while it blocks, the test steals the
-    // second — an undecodable payload — exactly as a reaper at its idle
-    // threshold would. When the handler finishes and the loop reaches the
-    // stolen entry, it must decline to dead-letter it.
+    // Producing that window takes some care, because the concurrent loop only
+    // parks mid-batch when it runs out of in-flight permits, and the permit is
+    // acquired *after* the decode. With `prefetch_count(2)`:
+    //
+    //   batch 1 = [slow, slow]  -> both dispatch, both permits held for 8 s
+    //   batch 2 = [slow, bad ]  -> the third slow entry decodes fine and then
+    //                              blocks acquiring a permit, leaving `bad`
+    //                              sitting in our PEL, read but not inspected
+    //
+    // That park is the window. The test steals `bad` during it, exactly as a
+    // reaper at its idle threshold would, and asserts the consumer declines to
+    // dead-letter an entry it no longer owns.
+    //
+    // Note `prefetch_count` is clamped to 1 unless `concurrent_processing` is
+    // on (see `RedisConsumerGroupConfig::with_prefetch_count`), so this has to
+    // be a concurrent group — a non-concurrent one never batches at all.
     // -----------------------------------------------------------------------
 
     struct PrefetchSkipTopic;
@@ -4161,14 +4172,14 @@ mod lease_tests {
         }
     }
 
-    struct BlockUntilStolenHandler;
-    impl MessageHandler<PrefetchSkipTopic> for BlockUntilStolenHandler {
+    struct SlowAckHandler;
+    impl MessageHandler<PrefetchSkipTopic> for SlowAckHandler {
         type Context = RenewCtx;
         async fn handle(&self, _msg: Leased, _meta: MessageMetadata, ctx: &RenewCtx) -> Outcome {
             ctx.started.fetch_add(1, Ordering::SeqCst);
-            // Long enough for the test to steal the *other* prefetched entry
-            // before this returns and the loop advances to it.
-            tokio::time::sleep(Duration::from_secs(6)).await;
+            // Holds an in-flight permit long enough for the test to steal the
+            // entry that is parked behind it.
+            tokio::time::sleep(Duration::from_secs(8)).await;
             Outcome::Ack
         }
     }
@@ -4188,13 +4199,16 @@ mod lease_tests {
             .dlq()
             .expect("topic has a DLQ");
 
-        // Entry 1: valid, handled slowly. Entry 2: not decodable as `Leased`,
-        // so it takes the pre-handler deserialize path with no handler run.
+        // Three valid entries to occupy the permits, then one that cannot be
+        // decoded as `Leased` — it takes the pre-handler deserialize path with
+        // no handler run.
         let publisher = broker.publisher().await.expect("publisher");
-        publisher
-            .publish::<PrefetchSkipTopic>(&Leased { id: 1 })
-            .await
-            .expect("publish");
+        for id in 1..=3 {
+            publisher
+                .publish::<PrefetchSkipTopic>(&Leased { id })
+                .await
+                .expect("publish");
+        }
 
         let mut seed = raw_conn().await;
         let bad_id: String = redis::cmd("XADD")
@@ -4214,7 +4228,8 @@ mod lease_tests {
             .register::<PrefetchSkipTopic, _>(
                 ConsumerGroupConfig::new(
                     RedisConsumerGroupConfig::new(1..=1)
-                        // Both entries arrive in one XREADGROUP.
+                        // Two per XREADGROUP, and two in-flight permits.
+                        .with_concurrent_processing(true)
                         .with_prefetch_count(2)
                         .with_handler_timeout(Duration::from_secs(30))
                         // Makes this consumer lease-holding: without an
@@ -4222,7 +4237,7 @@ mod lease_tests {
                         // check.
                         .with_handler_timeout_outcome(Outcome::Reject),
                 ),
-                || BlockUntilStolenHandler,
+                || SlowAckHandler,
             )
             .await
             .expect("register");
@@ -4231,15 +4246,18 @@ mod lease_tests {
         let started_probe = ctx.started.clone();
         let stolen_id = bad_id.clone();
         let thief = tokio::spawn(async move {
+            // Both permits taken => the loop has moved on to batch 2.
             let entered = poll_until(
-                move || started_probe.load(Ordering::SeqCst) >= 1,
-                Duration::from_secs(10),
+                move || started_probe.load(Ordering::SeqCst) >= 2,
+                Duration::from_secs(15),
             )
             .await;
-            assert!(entered, "handler was never invoked");
+            assert!(entered, "the first two handlers never both started");
 
-            // The handler is running on entry 1, so entry 2 is sitting in this
-            // consumer's PEL untouched. Steal it.
+            // Let batch 2's XREADGROUP land and park on the permit, leaving
+            // the undecodable entry read but not yet inspected.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+
             let mut conn = raw_conn().await;
             let _: redis::Value = redis::cmd("XCLAIM")
                 .arg(stream)
@@ -4251,9 +4269,25 @@ mod lease_tests {
                 .await
                 .expect("XCLAIM");
 
-            // Past the handler's 6 s, with margin for the DLQ write it would
-            // make if the pre-handler path were unguarded.
-            tokio::time::sleep(Duration::from_secs(11)).await;
+            // The steal is the whole premise of this test: if the entry was
+            // not in a PEL yet, XCLAIM is a silent no-op and everything below
+            // would be testing nothing. Fail loudly here instead.
+            let claimed = pending(&mut conn, stream, group_name).await;
+            let owner = claimed
+                .ids
+                .iter()
+                .find(|e| e.id == stolen_id)
+                .map(|e| e.consumer.clone());
+            assert_eq!(
+                owner.as_deref(),
+                Some("foreign-reaper"),
+                "test setup: the undecodable entry was not pending when the \
+                 thief claimed it, so the reclaim race was never staged",
+            );
+
+            // Past the handlers' 8 s, with margin for the DLQ write the
+            // consumer would make if the pre-handler path were unguarded.
+            tokio::time::sleep(Duration::from_secs(14)).await;
 
             let dlq_len: i64 = redis::cmd("XLEN")
                 .arg(dlq)
@@ -4266,7 +4300,7 @@ mod lease_tests {
         });
 
         let outcome = group
-            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(40))
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(60))
             .await;
         let (dlq_len, after) = thief.await.expect("thief");
         assert!(outcome.is_clean(), "outcome: {outcome:?}");
