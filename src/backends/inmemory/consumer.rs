@@ -510,10 +510,12 @@ async fn run_fifo_shard<T, H>(
                 .await;
                 match raw {
                     None => {
+                        // Shutdown drop: intentionally not counted — see
+                        // `metrics::FailReason`.
                         warn_shutdown_drop(
                             &shard_name,
                             &key,
-                            &env.headers,
+                            message_id_of(&env.headers),
                             "shutdown cancelled an in-flight sequenced handler — message dropped",
                         );
                         finish(&shard, &busy, &options);
@@ -568,17 +570,32 @@ async fn run_fifo_shard<T, H>(
                             _ = broker_shutdown.cancelled() => true,
                         };
                         if cancelled {
+                            // Shutdown drop: intentionally not counted — see
+                            // `metrics::FailReason`.
                             warn_shutdown_drop(
                                 &shard_name,
                                 &key,
-                                &new_env.headers,
+                                message_id_of(&new_env.headers),
                                 "shutdown cancelled a pending sequenced retry — message dropped",
                             );
                             finish(&shard, &busy, &options);
                             return;
                         }
 
+                        // `enqueue` only fails once the broker's shutdown token
+                        // is cancelled, so this is the same class as the two
+                        // arms above — but it dropped the message without even
+                        // a log line, which is what made it invisible.
+                        // Shutdown drop: intentionally not counted — see
+                        // `metrics::FailReason`.
+                        let message_id = message_id_of(&new_env.headers).to_owned();
                         if broker.enqueue(&shard, new_env).await.is_err() {
+                            warn_shutdown_drop(
+                                &shard_name,
+                                &key,
+                                &message_id,
+                                "broker shutdown rejected a sequenced retry re-enqueue — message dropped",
+                            );
                             finish(&shard, &busy, &options);
                             return;
                         }
@@ -785,11 +802,13 @@ fn schedule_redelivery(
     let broker_shutdown = broker.shutdown_token().clone();
     let main_queue = topology.queue().to_string();
 
+    // Every `return` below destroys the message. None is counted — see
+    // `metrics::FailReason` for why in-process broker drops stay log-only.
     tokio::spawn(async move {
+        let message_id = message_id_of(&env.headers).to_owned();
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = broker_shutdown.cancelled() => {
-                let message_id = env.headers.get(X_MESSAGE_ID).map(String::as_str).unwrap_or("");
                 tracing::warn!(
                     queue = %main_queue,
                     %message_id,
@@ -801,21 +820,36 @@ fn schedule_redelivery(
         // Re-check shutdown after sleep — the broker may have shut down while
         // awaiting capacity.
         if broker_shutdown.is_cancelled() {
+            tracing::warn!(
+                queue = %main_queue,
+                %message_id,
+                "broker shut down during redelivery backoff — message dropped"
+            );
             return;
         }
         let Ok(q) = broker_clone.lookup(&main_queue) else {
-            tracing::warn!(queue = %main_queue, "redelivery target queue no longer exists");
+            tracing::warn!(
+                queue = %main_queue,
+                %message_id,
+                "redelivery target queue no longer exists — message dropped"
+            );
             return;
         };
         let redelivery_timeout = Duration::from_secs(30);
         match tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                tracing::warn!(queue = %main_queue, error = %e, "redelivery enqueue failed");
+                tracing::warn!(
+                    queue = %main_queue,
+                    %message_id,
+                    error = %e,
+                    "redelivery enqueue failed — message dropped"
+                );
             }
             Err(_elapsed) => {
                 tracing::warn!(
                     queue = %main_queue,
+                    %message_id,
                     "redelivery enqueue timed out after {}s — message dropped",
                     redelivery_timeout.as_secs()
                 );
@@ -1023,13 +1057,17 @@ where
 // Metadata helpers
 // ---------------------------------------------------------------------------
 
-fn warn_shutdown_drop(
-    shard_name: &str,
-    key: &str,
-    headers: &HashMap<String, String>,
-    reason: &'static str,
-) {
-    let message_id = headers.get(X_MESSAGE_ID).map(String::as_str).unwrap_or("");
+fn message_id_of(headers: &HashMap<String, String>) -> &str {
+    headers.get(X_MESSAGE_ID).map(String::as_str).unwrap_or("")
+}
+
+/// Log a message the in-process broker destroyed at shutdown.
+///
+/// These drops are deliberately not counted in `messages_failed_total`; the
+/// reasoning is on `metrics::FailReason`. This is the only surface they have,
+/// so every field an operator would need to identify the lost message belongs
+/// here.
+fn warn_shutdown_drop(shard_name: &str, key: &str, message_id: &str, reason: &'static str) {
     tracing::warn!(
         shard = %shard_name,
         %key,
