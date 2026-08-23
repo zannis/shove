@@ -554,7 +554,7 @@ async fn route_outcome(
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_failed(topic, group, fail_reason);
+            metrics::record_terminal(topic, group, fail_reason, topology.dlq().is_some());
             let dlq_ok =
                 publish_to_dlq(client, topology, payload, key.as_deref(), headers, reason).await;
             // Commit even if the DLQ publish failed: the message has

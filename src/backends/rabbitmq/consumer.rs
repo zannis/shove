@@ -1086,10 +1086,11 @@ impl RabbitMqConsumer {
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
                         );
-                        metrics::record_failed(
+                        metrics::record_terminal(
                             &topic,
                             group.as_deref(),
                             metrics::FailReason::MaxRetriesExceeded,
+                            topology.dlq().is_some(),
                         );
                         router::route_reject(&received.delivery, topology, &publisher).await?;
                         continue;
@@ -1219,7 +1220,12 @@ async fn route_outcome(
             .await
         }
         Outcome::Reject => {
-            metrics::record_failed(topology.queue(), group, metrics::FailReason::Rejected);
+            metrics::record_terminal(
+                topology.queue(),
+                group,
+                metrics::FailReason::Rejected,
+                topology.dlq().is_some(),
+            );
             router::route_reject(delivery, topology, publisher).await
         }
         Outcome::Defer => {

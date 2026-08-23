@@ -517,10 +517,11 @@ where
                     max_retries = options.max_retries,
                     "message exceeded max retries, rejecting"
                 );
-                metrics::record_failed(
+                metrics::record_terminal(
                     &topic,
                     group.as_deref(),
                     metrics::FailReason::MaxRetriesExceeded,
+                    topology.dlq().is_some(),
                 );
                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 continue;
@@ -697,7 +698,12 @@ async fn route_outcome(
             .await;
         }
         Outcome::Reject => {
-            metrics::record_failed(topology.queue(), group, metrics::FailReason::Rejected);
+            metrics::record_terminal(
+                topology.queue(),
+                group,
+                metrics::FailReason::Rejected,
+                topology.dlq().is_some(),
+            );
             router::route_reject(sqs, queue_url, receipt_handle, topology).await
         }
         Outcome::Defer => {

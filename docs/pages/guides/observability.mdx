@@ -62,6 +62,7 @@ shove::metrics::set_prefix("billing_shove");
 |---|---|---|
 | `shove_messages_consumed_total` | counter | `topic`, `consumer_group`, `outcome` |
 | `shove_messages_failed_total` | counter | `topic`, `consumer_group`, `reason` |
+| `shove_messages_discarded_total` | counter | `topic`, `consumer_group`, `reason` |
 | `shove_messages_published_total` | counter | `topic`, `outcome` |
 | `shove_message_processing_duration_seconds` | histogram | `topic`, `consumer_group`, `outcome` |
 | `shove_message_publish_duration_seconds` | histogram | `topic`, `outcome` |
@@ -78,6 +79,7 @@ shove::metrics::set_prefix("billing_shove");
 - `outcome` on `messages_consumed_total` and `message_processing_duration_seconds`: `ack`, `retry`, `reject`, `defer`. These mirror the `Outcome` enum returned by handlers.
 - `outcome` on `messages_published_total` and `message_publish_duration_seconds`: `success`, `error`.
 - `reason` on `messages_failed_total`: `oversize`, `deserialize`, `pending_full`, `timeout`, `max_retries_exceeded`, `rejected`. The first four cover failures that happen *before* the handler runs; `max_retries_exceeded` and `rejected` are emitted after the handler runs when the message is dead-lettered.
+- `reason` on `messages_discarded_total`: `max_retries_exceeded`, `rejected`. This counter is a strict subset of `messages_failed_total` — it increments *in addition* to it, only when the topic declares **no DLQ**, so the message was dropped on the floor rather than dead-lettered. Any non-zero rate is data loss. See [Alerting on silent discards](#alerting-on-silent-discards).
 - `direction` on `autoscaler_decisions_total`: `up`, `down`, `hold`.
 - `shove_autoscaler_messages_ready`, `shove_autoscaler_messages_in_flight`, and `shove_autoscaler_active_consumers` are emitted once per group on every autoscaler poll, carrying only the `consumer_group` label. They expose the raw signal the scaling decision is made from: backlog waiting, messages in flight, and the live consumer count. Watching `messages_ready` stay high while `active_consumers` is flat at `max` is the canonical "saturated / scaling commands not keeping up" signal.
 - `backend` on `backend_errors_total`: `inmemory`, `rabbitmq`, `kafka`, `nats`, `sns_sqs`, `redis`.
@@ -88,6 +90,27 @@ shove::metrics::set_prefix("billing_shove");
 `shove_backend_errors_total` covers the most operationally-meaningful error sites (connection drops, topology conflicts, broker NACKs, consume-stream closures, ack failures); not every possible internal `Err` propagation produces a counter increment. Treat the counter as a "something is wrong with backend X" signal rather than an exhaustive error count.
 
 `shove_messages_published_total` increments once per message in a batch publish, matching what consumers see downstream. `shove_message_publish_duration_seconds` records one sample per batch (the user-observable call latency). Empty batches are no-ops and emit no events.
+
+### Alerting on silent discards
+
+A topic declared with a bare `TopologyBuilder::new("...").build()` has no DLQ. When such a message exhausts its retry budget — or a handler returns `Outcome::Reject` — there is nowhere to route it, so `shove` drops it. This is the intended behaviour for a topology that opted out of a DLQ, but it is easy to arrive at by accident, and until `shove_messages_discarded_total` existed the only evidence was a `WARN` log line.
+
+Alert on any discard at all:
+
+```
+sum(rate(shove_messages_discarded_total[5m])) by (topic, reason) > 0
+```
+
+Every increment is a message that no longer exists anywhere. The fix is almost always to give the topic a DLQ:
+
+```rust,no_run
+TopologyBuilder::new("prices").with_dlq("prices.dlq").build()
+```
+
+Two limits worth knowing:
+
+- The counter covers the **terminal-outcome** path (retry-budget exhaustion and explicit rejects) on all six backends. Pre-handler rejections — oversize payloads and deserialize failures — reach the DLQ through a different code path on the RabbitMQ, SNS/SQS and Kafka consumers and are **not** yet counted. Treat the counter as a lower bound on dropped messages.
+- A slow handler that keeps timing out will burn retry budget and eventually land here. If that is the failure mode you are seeing, `ConsumerOptions::with_handler_timeout_outcome` lets a timeout resolve to something other than `Retry` so a slow consumer stops consuming budget — see [Handlers](/concepts/handlers).
 
 ### Histogram buckets
 

@@ -717,10 +717,11 @@ async fn route_outcome(
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_failed(
+            metrics::record_terminal(
                 topology.queue(),
                 options.consumer_group.as_deref(),
                 fail_reason,
+                topology.dlq().is_some(),
             );
             // In-memory's DLQ enqueue path is `route_reject` for both
             // `Reject` and `max_retries_exceeded`; it does not differentiate

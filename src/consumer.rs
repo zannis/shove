@@ -23,6 +23,26 @@ use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Default handler timeout: 30 seconds.
+///
+/// Applied when [`ConsumerOptions::handler_timeout`] is left unset. This is the
+/// value downstream code should reference — not a hardcoded `30`— when it needs
+/// to keep its own internal deadline below shove's, which is the usual way to
+/// make a stalled handler resolve to a deliberate [`Outcome`] instead of being
+/// cancelled mid-flight:
+///
+/// ```
+/// use shove::DEFAULT_HANDLER_TIMEOUT;
+/// const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// const _: () = assert!(SUBMIT_TIMEOUT.as_secs() < DEFAULT_HANDLER_TIMEOUT.as_secs());
+/// ```
+///
+/// Treat the constant as stable: it is part of the public API and a change to
+/// it is a breaking change, so an assertion like the one above will fail at
+/// compile time rather than silently invert the ordering.
+///
+/// If you are wrapping handlers in an internal timeout purely to avoid shove
+/// turning a slow handler into a budget-burning retry, prefer
+/// [`ConsumerOptions::with_handler_timeout_outcome`] instead.
 pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Two-state used by each backend's `ConsumerGroupConfig` so the

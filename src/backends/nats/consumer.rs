@@ -328,7 +328,12 @@ async fn route_outcome(
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_failed(topology.queue(), group, fail_reason);
+            metrics::record_terminal(
+                topology.queue(),
+                group,
+                fail_reason,
+                topology.dlq().is_some(),
+            );
             match publish_to_dlq(client, topology, msg, reason).await {
                 Ok(()) => {
                     if let Err(e) = msg.ack().await {

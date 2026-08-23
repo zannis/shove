@@ -137,9 +137,11 @@ group
 
 Leaving it unset preserves the existing behaviour on every backend.
 
-**Pick `Defer` when a timeout means "too slow right now", not "poisoned".** That is the case a service hits when its handler stalls on a downstream dependency: under `Retry` the stall burns the whole retry budget and the message is dead-lettered — or silently discarded, if the topology declares no DLQ — even though nothing was ever wrong with it. `Defer` is the outcome that survives a slow dependency without losing valid data.
+**Pick `Defer` when a timeout means "too slow right now", not "poisoned".** That is the case a service hits when its handler stalls on a downstream dependency: under `Retry` the stall burns the whole retry budget and the message is dead-lettered — or discarded, if the topology declares no DLQ — even though nothing was ever wrong with it. `Defer` is the outcome that survives a slow dependency without losing valid data.
 
-Two caveats before you reach for it, both inherited from [`Outcome::Defer`](/concepts/outcomes) itself:
+That discard is no longer silent: it increments `shove_messages_discarded_total`, which is worth alerting on whichever outcome you pick here. See [Alerting on silent discards](/guides/observability#alerting-on-silent-discards).
+
+Three caveats before you reach for it, all inherited from [`Outcome::Defer`](/concepts/outcomes) itself:
 
 - **Nothing bounds the redeliveries.** `Defer` has no circuit breaker, so a handler that times out forever is redelivered forever. Pair it with your own attempt ceiling — or with monitoring on `FailReason::Timeout` — if the work can genuinely never succeed.
 - **`Defer` is not supported on sequenced consumers**, because deferral would violate ordering guarantees; it is treated as `Retry` and a warning is logged. On ordered topics the override therefore does not spare the retry budget.

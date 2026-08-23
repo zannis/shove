@@ -50,6 +50,7 @@ fn prefix() -> &'static str {
 pub(crate) struct MetricNames {
     pub messages_consumed_total: String,
     pub messages_failed_total: String,
+    pub messages_discarded_total: String,
     pub messages_published_total: String,
     pub message_processing_duration_seconds: String,
     pub message_publish_duration_seconds: String,
@@ -69,6 +70,7 @@ pub(crate) fn names() -> &'static MetricNames {
         MetricNames {
             messages_consumed_total: format!("{p}_messages_consumed_total"),
             messages_failed_total: format!("{p}_messages_failed_total"),
+            messages_discarded_total: format!("{p}_messages_discarded_total"),
             messages_published_total: format!("{p}_messages_published_total"),
             message_processing_duration_seconds: format!("{p}_message_processing_duration_seconds"),
             message_publish_duration_seconds: format!("{p}_message_publish_duration_seconds"),
@@ -236,6 +238,49 @@ pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason
 #[cfg(not(feature = "metrics"))]
 #[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_failed(_: &str, _: Option<&str>, _: FailReason) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_discarded(topic: &str, group: Option<&str>, reason: FailReason) {
+    ::metrics::counter!(
+        names().messages_discarded_total.as_str(),
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "reason" => reason.as_label(),
+    )
+    .increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
+
+/// Record a message being retired by a *terminal outcome* — retry-budget
+/// exhaustion or an explicit [`Outcome::Reject`] — and, when the topic declares
+/// no DLQ so the message is dropped rather than dead-lettered, additionally
+/// increment `messages_discarded_total`.
+///
+/// All six backends' `route_outcome` terminal arms call this rather than
+/// [`record_failed`] directly, so the pairing cannot drift backend-to-backend:
+/// `messages_failed_total` counts everything that failed,
+/// `messages_discarded_total` counts the subset that was lost because there was
+/// nowhere to put it. A non-zero discard rate means data loss, and is the
+/// alerting signal that retry-budget exhaustion on a bare topology previously
+/// lacked entirely — it was visible only as a `WARN` line.
+///
+/// Scope: this covers the terminal-outcome path only. Pre-handler rejections
+/// (oversize, deserialize failure) reach the DLQ via a direct `route_reject`
+/// call in the RabbitMQ, SNS/SQS and Kafka consumers, bypassing
+/// `route_outcome`; those discards are not yet counted here. Treat this counter
+/// as a lower bound on dropped messages, not a total.
+///
+/// `has_dlq` is `topology.dlq().is_some()` at the call site.
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_terminal(topic: &str, group: Option<&str>, reason: FailReason, has_dlq: bool) {
+    record_failed(topic, group, reason);
+    if !has_dlq {
+        record_discarded(topic, group, reason);
+    }
+}
 
 #[cfg(feature = "metrics")]
 pub(crate) fn record_published(topic: &str, ok: bool) {
@@ -451,6 +496,10 @@ mod tests {
         assert_eq!(
             n.messages_failed_total.as_str(),
             "shove_messages_failed_total"
+        );
+        assert_eq!(
+            n.messages_discarded_total.as_str(),
+            "shove_messages_discarded_total"
         );
         assert_eq!(
             n.messages_published_total.as_str(),
