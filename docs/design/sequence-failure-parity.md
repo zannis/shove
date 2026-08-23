@@ -163,7 +163,7 @@ behaviour.
 the five rules above and match on all of them, including the empty-key guard:
 neither can reach the poison path with an empty key (RabbitMQ's key is the
 delivery routing key, and SQS rejects a message with no `MessageGroupId` before
-the poison check at `src/backends/sns/consumer.rs:1140`). Porting them onto the
+the poison check at `src/backends/sns/consumer.rs:1159`). Porting them onto the
 shared tracker is a mechanical refactor with no behaviour change, so it is
 deliberately not bundled into this correctness fix.
 

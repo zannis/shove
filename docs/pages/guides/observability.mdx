@@ -84,7 +84,7 @@ shove::metrics::set_prefix("billing_shove");
   |---|---|---|
   | `oversize` | Payload exceeds `max_message_size` | all |
   | `deserialize` | Payload present, codec rejected it | all |
-  | `malformed` | The delivery is not a well-formed `shove` message at all — a Redis stream entry with no payload field, or an SQS message with no `MessageGroupId` on a sequenced queue. Points at a foreign writer or a non-`shove` publisher, which is a different fix from `deserialize` | Redis, SQS |
+  | `malformed` | The delivery is not a well-formed `shove` message at all — a Redis stream entry with no payload field. Points at a foreign writer or a non-`shove` publisher, which is a different fix from `deserialize` | Redis |
   | `pending_full` | The in-order routing buffer is full | RabbitMQ |
   | `schema_frame` / `schema_validation` | Schema-registry frame decode / subject-resolve or validation failure | Kafka (`kafka-schema-registry`) |
   | `timeout` | A single handler exceeded `handler_timeout` | all |
@@ -97,6 +97,8 @@ shove::metrics::set_prefix("billing_shove");
   Two discard classes are deliberately **not** counted *as failures*. On a sequenced topic using `SequenceFailure::FailAll`, only the message that actually failed is counted — the messages dead-lettered behind its poisoned key are collateral of that one already-counted failure, and counting them would scale the counter by queue depth. And the in-process backend's shutdown drops are log-only, because it has no durability to begin with and counting only the drops visible to consumer code would under-report by an unbounded amount. Both classes warn with the queue (or shard), the message id, and the sequence key where there is one.
 
   The cascade exclusion applies to `messages_failed_total` only. A cascaded message dropped with no DLQ is just as gone as any other, so it still increments `messages_discarded_total` — see below.
+
+  `malformed` is **Redis-only in practice**, which is why SQS is not listed against it. The SQS sequenced consumer carries the same guard for a message with no `MessageGroupId`, but `declare` creates sequenced shard queues as FIFO and SQS rejects a send with no group id outright, so the guard cannot fire on the supported topology. It is kept deliberately, against a future non-FIFO sequenced transport. Do not build an SQS alert on `malformed`.
 - `reason` on `messages_discarded_total`: the same values, minus the ones that cannot be terminal on the backend in question. This counter increments *in addition* to `messages_failed_total`, only when the message was actually retired with nowhere to go — the topic declares **no DLQ**, or a DLQ was declared and the publish to it failed. Any non-zero rate is data loss. It is not a strict subset of `messages_failed_total`: a `FailAll` cascade adds a discard without adding a failure. See [Alerting on silent discards](#alerting-on-silent-discards).
 - `direction` on `autoscaler_decisions_total`: `up`, `down`, `hold`.
 - `shove_autoscaler_messages_ready`, `shove_autoscaler_messages_in_flight`, and `shove_autoscaler_active_consumers` are emitted once per group on every autoscaler poll, carrying only the `consumer_group` label. They expose the raw signal the scaling decision is made from: backlog waiting, messages in flight, and the live consumer count. Watching `messages_ready` stay high while `active_consumers` is flat at `max` is the canonical "saturated / scaling commands not keeping up" signal.
