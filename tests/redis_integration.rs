@@ -1062,6 +1062,32 @@ impl Topic for HeaderExhaustTopic {
     }
 }
 
+/// Sequenced `FailAll`, so a poisoned key is dead-lettered without ever
+/// reaching the handler — its own write-back path.
+struct HeaderFailAllTopic;
+impl Topic for HeaderFailAllTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-hdr-failall")
+                .sequenced(SequenceFailure::FailAll)
+                .routing_shards(1)
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+    const SEQUENCE_KEY_FN: Option<fn(&Self::Message) -> String> =
+        Some(HeaderFailAllTopic::sequence_key);
+}
+impl SequencedTopic for HeaderFailAllTopic {
+    fn sequence_key(msg: &Event) -> String {
+        msg.account.clone()
+    }
+}
+
 struct BatchTopic;
 impl Topic for BatchTopic {
     type Message = Order;
@@ -1543,6 +1569,94 @@ async fn user_headers_present_on_dlq_entry_after_retry_exhaustion() {
         entry.get("x-death-reason").map(String::as_str),
         Some("max_retries_exceeded"),
         "death reason must still be written: {entry:?}"
+    );
+}
+
+/// The `FailAll` poison-skip path dead-letters a message without invoking the
+/// handler, so it re-serialises the entry on its own. It must carry the user's
+/// headers too — a poisoned message is exactly one you need to triage.
+#[tokio::test]
+async fn user_headers_present_on_dlq_entry_after_failall_poison_skip() {
+    let broker = make_broker("redis-int-hdr-failall-grp").await;
+    broker
+        .topology()
+        .declare::<HeaderFailAllTopic>()
+        .await
+        .expect("declare");
+    let dlq = HeaderFailAllTopic::topology()
+        .dlq()
+        .expect("topic has a DLQ");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for seq in 0..2u64 {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-trace-id".to_string(), format!("trace-failall-{seq}"));
+        publisher
+            .publish_with_headers::<HeaderFailAllTopic>(
+                &Event {
+                    account: "acct-poison".into(),
+                    seq,
+                },
+                headers,
+            )
+            .await
+            .expect("publish_with_headers");
+    }
+
+    #[derive(Clone)]
+    struct RejectFirstH;
+    impl MessageHandler<HeaderFailAllTopic> for RejectFirstH {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Reject
+        }
+    }
+
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<HeaderFailAllTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::default().with_max_retries(0)),
+            move || RejectFirstH,
+        )
+        .await
+        .expect("register_fifo");
+
+    let mut raw = redis::Client::open(redis_url().await)
+        .expect("raw client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let dlq_len: i64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(0);
+            if dlq_len >= 2 || std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    // seq 0 is rejected by the handler; seq 1 is dead-lettered by the
+    // poison-skip path without the handler ever seeing it. Both must carry
+    // their header.
+    let entries = read_stream_entries(dlq).await;
+    let traces: Vec<Option<&str>> = entries
+        .iter()
+        .map(|e| e.get("x-trace-id").map(String::as_str))
+        .collect();
+    assert!(
+        traces.contains(&Some("trace-failall-0")) && traces.contains(&Some("trace-failall-1")),
+        "both the rejected and the poison-skipped dead letter must keep their header: {entries:?}"
     );
 }
 
