@@ -774,7 +774,7 @@ impl KafkaConsumerGroup {
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
-        options.handler_timeout_outcome = self.config.handler_timeout_outcome;
+        options.handler_timeout_outcome = self.config.handler_timeout_outcome.clone();
         if let Some(limit) = self.config.max_pending_per_key {
             options.max_pending_per_key = Some(limit);
         }

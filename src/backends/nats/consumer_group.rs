@@ -613,7 +613,7 @@ impl NatsConsumerGroup {
         options.prefetch_count = self.config.prefetch_count;
         options.processing = processing.clone();
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
-        options.handler_timeout_outcome = self.config.handler_timeout_outcome;
+        options.handler_timeout_outcome = self.config.handler_timeout_outcome.clone();
         options.max_pending_per_key = self.config.max_pending_per_key;
         options.max_message_size = self.config.max_message_size;
         options.max_reconnect_attempts = self.config.max_reconnect_attempts;

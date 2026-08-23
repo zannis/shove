@@ -721,8 +721,8 @@ where
                                     // With no override, do NOT ack: XAUTOCLAIM
                                     // reclaims the entry after idle_ms, which
                                     // redelivers without touching retry_count.
-                                    let resolved = options.handler_timeout_outcome;
-                                    match resolved {
+                                    let resolved = options.handler_timeout_outcome.clone();
+                                    match resolved.as_ref() {
                                         Some(o) => tracing::warn!(
                                             entry_id,
                                             timeout = ?timeout_dur,
@@ -847,7 +847,7 @@ where
     let max_retries = options.max_retries;
     let max_message_size = options.max_message_size;
     let handler_timeout = options.handler_timeout;
-    let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
+    let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
     let processing = options.processing.clone();
 
     run_with_reconnect(&shutdown, stream, options.max_reconnect_attempts, || {
@@ -861,6 +861,7 @@ where
         let semaphore = Arc::clone(&semaphore);
         let processing = Arc::clone(&processing);
         let group = group.clone();
+        let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
 
         async move {
             let mut conn = client.dedicated_conn().await?;
@@ -1044,6 +1045,7 @@ where
                     let task_stream = stream.to_owned();
                     let task_processing = Arc::clone(&processing);
                     let task_semaphore = Arc::clone(&semaphore);
+                    let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
 
                     fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     tokio::spawn(async move {
@@ -1064,8 +1066,8 @@ where
                                         // See the non-concurrent path: `None`
                                         // leaves the entry in the PEL for
                                         // XAUTOCLAIM to reclaim.
-                                        let resolved = handler_timeout_outcome_cfg;
-                                        match resolved {
+                                        let resolved = task_timeout_outcome.clone();
+                                        match resolved.as_ref() {
                                             Some(o) => tracing::warn!(
                                                 entry_id,
                                                 timeout = ?timeout_dur,

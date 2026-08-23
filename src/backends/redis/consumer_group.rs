@@ -576,7 +576,7 @@ impl RedisConsumerGroup {
         options.prefetch_count = self.config.prefetch_count();
         options.max_retries = self.config.max_retries();
         options.handler_timeout = Some(resolve_handler_timeout(self.config.handler_timeout, None));
-        options.handler_timeout_outcome = self.config.handler_timeout_outcome;
+        options.handler_timeout_outcome = self.config.handler_timeout_outcome.clone();
         options.processing = processing.clone();
         options.consumer_group = Some(Arc::from(self.queue.as_str()));
         options.max_pending_per_key = self.config.max_pending_per_key();

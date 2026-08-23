@@ -1223,7 +1223,7 @@ impl KafkaConsumer {
         let max_retries = options.max_retries;
         let prefetch_count = options.prefetch_count;
         let handler_timeout = options.handler_timeout;
-        let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
 
@@ -1624,7 +1624,7 @@ impl KafkaConsumer {
                                             .await
                                     },
                                     handler_timeout,
-                                    handler_timeout_outcome_cfg,
+                                    handler_timeout_outcome_cfg.clone(),
                                     &task_topic,
                                     task_group.as_deref(),
                                 )
@@ -1741,7 +1741,7 @@ impl KafkaConsumer {
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
-        let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
 
@@ -2023,7 +2023,7 @@ impl KafkaConsumer {
                                             .await
                                     },
                                     handler_timeout,
-                                    handler_timeout_outcome_cfg,
+                                    handler_timeout_outcome_cfg.clone(),
                                     &topic,
                                     group.as_deref(),
                                 )

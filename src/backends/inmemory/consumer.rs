@@ -193,7 +193,7 @@ where
             let ctx_clone = Arc::clone(&ctx);
             let max_size = options.max_message_size;
             let timeout_opt = options.handler_timeout;
-            let timeout_outcome = options.handler_timeout_outcome;
+            let timeout_outcome = options.handler_timeout_outcome.clone();
             let env_for_task = env.clone();
             let group = options.consumer_group.clone();
 
@@ -504,7 +504,7 @@ async fn run_fifo_shard<T, H>(
                     &env,
                     options.max_message_size,
                     options.handler_timeout,
-                    options.handler_timeout_outcome,
+                    options.handler_timeout_outcome.clone(),
                     &shutdown,
                     &broker_shutdown,
                     T::topology().queue(),

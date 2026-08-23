@@ -569,7 +569,7 @@ impl NatsConsumer {
         let max_retries = options.max_retries;
         let prefetch_count = options.prefetch_count;
         let handler_timeout = options.handler_timeout;
-        let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let hold_queues = topology.hold_queues();
 
         let max_message_size = options.max_message_size;
@@ -603,6 +603,7 @@ impl NatsConsumer {
             let semaphore = semaphore.clone();
             let topic = topic.clone();
             let group = group.clone();
+            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
             async move {
                 let stream = client
                     .jetstream()
@@ -782,6 +783,7 @@ impl NatsConsumer {
                             let task_topic = topic.clone();
                             let task_group = group.clone();
                             let task_shutdown = shutdown.clone();
+                            let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
 
                             tokio::spawn(async move {
                                 task_processing.store(true, Ordering::Release);
@@ -791,7 +793,7 @@ impl NatsConsumer {
                                         task_handler.handle(payload, metadata, task_ctx.as_ref()).await
                                     },
                                     handler_timeout,
-                                    handler_timeout_outcome_cfg,
+                                    task_timeout_outcome,
                                     &task_topic,
                                     task_group.as_deref(),
                                 )
@@ -942,7 +944,7 @@ impl NatsConsumer {
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
-        let handler_timeout_outcome_cfg = options.handler_timeout_outcome;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
         let topic: Arc<str> = Arc::from(queue);
@@ -975,6 +977,7 @@ impl NatsConsumer {
             let shard_processing = processing.clone();
             let shard_topic = topic.clone();
             let shard_group = group.clone();
+            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
 
             let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
                 run_with_reconnect(&shard_shutdown, &consumer_name, max_reconnect_attempts, || {
@@ -987,6 +990,7 @@ impl NatsConsumer {
                     let shard_group = shard_group.clone();
                     let consumer_name = consumer_name.clone();
                     let filter_subject = filter_subject.clone();
+                    let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
                     async move {
                         let stream = shard_client
                             .jetstream()
@@ -1134,11 +1138,12 @@ impl NatsConsumer {
                                         let c = shard_ctx.clone();
                                         let spawn_topic = shard_topic.clone();
                                         let spawn_group = shard_group.clone();
+                                        let spawn_timeout_outcome = handler_timeout_outcome_cfg.clone();
                                         tokio::spawn(async move {
                                             let o = invoke_handler(
                                                 async move { h.handle(payload, metadata, c.as_ref()).await },
                                                 handler_timeout,
-                                                handler_timeout_outcome_cfg,
+                                                spawn_timeout_outcome,
                                                 &spawn_topic,
                                                 spawn_group.as_deref(),
                                             ).await;
