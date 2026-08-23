@@ -11,6 +11,11 @@
 //! importantly — asserts that a `SequenceFailure::FailAll` cascade is *not*
 //! counted. See `metrics::FailReason` for why the cascade is excluded.
 //!
+//! It also pins the discard half of that accounting:
+//! `shove_messages_discarded_total` stays at zero, because the cascade's
+//! pending discards settle against a DLQ that was observed receiving every
+//! message. See the assertion at the end for what would make it move.
+//!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the global
 //! recorder slot, and whose `snapshot()` *drains* every counter it reads. So:
 //! own integration binary, a single `#[test]`, and exactly one snapshot taken
@@ -247,19 +252,19 @@ impl MessageHandler<Ledger> for DlqCounter {
     }
 }
 
+/// What `Snapshotter::snapshot().into_hashmap()` hands back.
+type Snapshot = std::collections::HashMap<
+    metrics_util::CompositeKey,
+    (
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    ),
+>;
+
 /// Sum `shove_messages_failed_total` across every series whose `reason` label
 /// matches, so the assertion is on the number the operator actually alerts on.
-fn failed_total(
-    snapshot: &std::collections::HashMap<
-        metrics_util::CompositeKey,
-        (
-            Option<metrics::Unit>,
-            Option<metrics::SharedString>,
-            DebugValue,
-        ),
-    >,
-    reason: &str,
-) -> u64 {
+fn failed_total(snapshot: &Snapshot, reason: &str) -> u64 {
     snapshot
         .iter()
         .filter(|(k, _)| k.key().name() == "shove_messages_failed_total")
@@ -273,6 +278,30 @@ fn failed_total(
             other => panic!("shove_messages_failed_total is not a counter: {other:?}"),
         })
         .sum()
+}
+
+/// Every `shove_messages_discarded_total` series in the snapshot, as
+/// `(reason, count)` pairs.
+///
+/// Returned rather than summed because the assertion on it is "none at all":
+/// a failure that names the reason label points straight at the call site that
+/// recorded it, where a bare `0 != 1` would not.
+fn discarded_series(snapshot: &Snapshot) -> Vec<(String, u64)> {
+    snapshot
+        .iter()
+        .filter(|(k, _)| k.key().name() == "shove_messages_discarded_total")
+        .map(|(k, (_, _, value))| {
+            let reason = k
+                .key()
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map_or_else(|| "<unlabelled>".to_string(), |l| l.value().to_string());
+            match value {
+                DebugValue::Counter(n) => (reason, *n),
+                other => panic!("shove_messages_discarded_total is not a counter: {other:?}"),
+            }
+        })
+        .collect()
 }
 
 /// Wait until both handlers have run, so the reject has poisoned its key and
@@ -418,5 +447,26 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         1,
         "the retry-key message is dead-lettered on its way back in, so the \
          handler must see it exactly once"
+    );
+
+    // The other half of the accounting: nothing here claims data loss.
+    //
+    // `route_reject_cascade` decides a `metrics::pending_discard` for every
+    // cascaded delivery — the cascade is excluded from `messages_failed_total`,
+    // not from the discard bookkeeping. But this topic declares a DLQ, and all
+    // four messages were observed arriving on it above, so every one of those
+    // pending discards settles through `PendingDiscard::confirm` with
+    // `has_dlq = true` and records nothing: the messages still exist.
+    //
+    // So a count here is a false data-loss alert. A cascade *is* meant to move
+    // this counter when the message misses the DLQ — but on RabbitMQ that means
+    // a topology that declares no DLQ at all, where the reject nacks with
+    // `requeue: false` and the message is simply dropped. `reject_with` settles
+    // every delivery through `confirm()`, and the backend has no `confirm_lost`
+    // call site, so the DLQ-present topology under test cannot reach it.
+    let discarded = discarded_series(&snapshot);
+    assert!(
+        discarded.is_empty(),
+        "a cascade that reached the DLQ must not claim data loss; got {discarded:?}"
     );
 }

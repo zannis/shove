@@ -11,6 +11,10 @@
 //! importantly — asserts that a `SequenceFailure::FailAll` cascade is *not*
 //! counted. See `metrics::FailReason` for why the cascade is excluded.
 //!
+//! It also pins SQS's discard semantics, which differ from every other
+//! backend's: `shove_messages_discarded_total` must not move at all, because
+//! the reject path deletes nothing. See the assertion at the end.
+//!
 //! # Where the cascade comes from here, and why each scenario gets its own topic
 //!
 //! SQS does not republish on reject: `route_reject` sets visibility to 0 and
@@ -267,19 +271,19 @@ impl MessageHandler<RetryLedger> for RetryHandler {
     }
 }
 
+/// What `Snapshotter::snapshot().into_hashmap()` hands back.
+type Snapshot = std::collections::HashMap<
+    metrics_util::CompositeKey,
+    (
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    ),
+>;
+
 /// Sum `shove_messages_failed_total` across every series whose `reason` label
 /// matches, so the assertion is on the number the operator actually alerts on.
-fn failed_total(
-    snapshot: &std::collections::HashMap<
-        metrics_util::CompositeKey,
-        (
-            Option<metrics::Unit>,
-            Option<metrics::SharedString>,
-            DebugValue,
-        ),
-    >,
-    reason: &str,
-) -> u64 {
+fn failed_total(snapshot: &Snapshot, reason: &str) -> u64 {
     snapshot
         .iter()
         .filter(|(k, _)| k.key().name() == "shove_messages_failed_total")
@@ -293,6 +297,30 @@ fn failed_total(
             other => panic!("shove_messages_failed_total is not a counter: {other:?}"),
         })
         .sum()
+}
+
+/// Every `shove_messages_discarded_total` series in the snapshot, as
+/// `(reason, count)` pairs.
+///
+/// Returned rather than summed because the assertion on it is "none at all":
+/// a failure that names the reason label points straight at the call site that
+/// recorded it, where a bare `0 != 1` would not.
+fn discarded_series(snapshot: &Snapshot) -> Vec<(String, u64)> {
+    snapshot
+        .iter()
+        .filter(|(k, _)| k.key().name() == "shove_messages_discarded_total")
+        .map(|(k, (_, _, value))| {
+            let reason = k
+                .key()
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map_or_else(|| "<unlabelled>".to_string(), |l| l.value().to_string());
+            match value {
+                DebugValue::Counter(n) => (reason, *n),
+                other => panic!("shove_messages_discarded_total is not a counter: {other:?}"),
+            }
+        })
+        .collect()
 }
 
 /// Wait until both handlers have run at least once.
@@ -504,5 +532,31 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         1,
         "the retry-key message is dead-lettered on its way back in, so the \
          handler must see it exactly once"
+    );
+
+    // SQS records no discard at all — not for the cascade, and not for the two
+    // counted failures either. This is a deliberate per-backend deviation, and
+    // the assertion is on the whole snapshot rather than on a cascade subset
+    // because the rule has no exceptions here.
+    //
+    // The reason is that on SQS a reject deletes nothing: `route_reject` and
+    // `route_reject_cascade` both fall through to `reject_visibility`, which
+    // resets the visibility timeout to 0 and leaves the message on the queue
+    // for native redrive to retire. Neither calls `record_terminal` or
+    // `pending_discard`, so the consumer never makes a data-loss claim about a
+    // message AWS still owns. See the doc comments on
+    // `sns::router::route_reject` and `metrics::record_terminal`.
+    //
+    // Worth pinning because the pull is toward the opposite: RabbitMQ and
+    // inmemory both route every terminal path through the shared helper, so
+    // wiring SQS into it "for cross-backend consistency" looks like a fix. It
+    // would publish a discard for every message this test drove to a DLQ that
+    // demonstrably received them — and, on the redelivery path, one per
+    // cascade receive. This goes red instead.
+    let discarded = discarded_series(&snapshot);
+    assert!(
+        discarded.is_empty(),
+        "SQS must record no discards — its reject path deletes nothing and \
+         leaves the message to native redrive; got {discarded:?}"
     );
 }
