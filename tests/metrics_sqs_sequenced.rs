@@ -103,8 +103,8 @@ async fn wait_for_localstack_ready(endpoint_url: &str) {
     }
 }
 
-/// Receives a message gets before native redrive retires it to the DLQ, for
-/// this test's queues only.
+/// How many receives a message gets before native redrive retires it to the
+/// DLQ, for this test's queues only.
 ///
 /// The library declares shard queues at `DEFAULT_MAX_RECEIVE_COUNT = 10`
 /// (`src/backends/sns/topology.rs`). Three is the smallest value that still
