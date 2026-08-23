@@ -306,6 +306,7 @@ pub(crate) fn group_label(group: Option<&str>) -> &str {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_consumed(topic: &str, group: Option<&str>, outcome: &Outcome) {
     ::metrics::counter!(
         names().messages_consumed_total.as_str(),
@@ -324,6 +325,7 @@ pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
 /// `messages_consumed_total` counts *messages* (comparable with the
 /// single-message consumers) rather than flushes.
 #[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_consumed_n(topic: &str, group: Option<&str>, outcome: &Outcome, count: u64) {
     if count == 0 {
         return;
@@ -573,6 +575,7 @@ pub(crate) fn record_published_n(topic: &str, ok: bool, count: u64) {
 pub(crate) fn record_published_n(_: &str, _: bool, _: u64) {}
 
 #[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_processing_duration(
     topic: &str,
     group: Option<&str>,
@@ -607,6 +610,7 @@ pub(crate) fn record_publish_duration(topic: &str, ok: bool, elapsed_secs: f64) 
 pub(crate) fn record_publish_duration(_: &str, _: bool, _: f64) {}
 
 #[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize) {
     ::metrics::histogram!(
         names().message_size_bytes.as_str(),
@@ -791,6 +795,7 @@ pub(crate) fn record_autoscaler_backlog(
 pub(crate) fn record_autoscaler_backlog(_: &str, _: u64, _: u64, _: u16) {}
 
 #[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_backend_error(backend: BackendLabel, kind: BackendErrorKind) {
     ::metrics::counter!(
         names().backend_errors_total.as_str(),
