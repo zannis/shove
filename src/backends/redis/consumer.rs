@@ -739,7 +739,14 @@ where
                             )
                             .await
                             {
-                                Ok(o) => Some(o),
+                                // A lease can be lost while the handler is
+                                // still running, so normal completion is
+                                // guarded exactly like a timeout: routing an
+                                // outcome onto an entry a reaper already
+                                // re-added is what produces the duplicate.
+                                Ok(o) => {
+                                    resolve_under_lease(&mut conn, &lease, leased, Some(o)).await
+                                }
                                 Err(_) => {
                                     // With no override, do NOT ack: XAUTOCLAIM
                                     // reclaims the entry after idle_ms, which
@@ -763,7 +770,7 @@ where
                                         group_arc.as_deref(),
                                         metrics::FailReason::Timeout,
                                     );
-                                    resolve_timeout_outcome(&mut conn, &lease, resolved).await
+                                    resolve_under_lease(&mut conn, &lease, leased, resolved).await
                                 }
                             }
                         }
@@ -1106,7 +1113,18 @@ where
                                 )
                                 .await
                                 {
-                                    Ok(o) => Some(o),
+                                    // See the non-concurrent path: a lease lost
+                                    // mid-handler makes normal completion just
+                                    // as much of a race as a timeout.
+                                    Ok(o) => {
+                                        resolve_under_lease(
+                                            &mut task_conn,
+                                            &lease,
+                                            leased,
+                                            Some(o),
+                                        )
+                                        .await
+                                    }
                                     Err(_) => {
                                         // See the non-concurrent path: `None`
                                         // leaves the entry in the PEL for
@@ -1130,9 +1148,10 @@ where
                                             task_group_metric.as_deref(),
                                             metrics::FailReason::Timeout,
                                         );
-                                        resolve_timeout_outcome(
+                                        resolve_under_lease(
                                             &mut task_conn,
                                             &lease,
+                                            leased,
                                             resolved,
                                         )
                                         .await
@@ -1456,48 +1475,98 @@ async fn requeue_to_stream(
     }
 }
 
-/// Decide whether a timed-out handler's configured outcome may still be
-/// routed onto the entry it timed out on.
+/// How many times a *failed* ownership check is retried before the outcome is
+/// routed anyway.
 ///
-/// `resolved` is the consumer's `handler_timeout_outcome`; `None` means the
-/// consumer leaves timed-out entries to the reaper and there is nothing to
-/// guard. Otherwise the outcome is only returned if this consumer still holds
-/// the entry's lease. Having lost it, a reaper already owns the entry's
-/// redelivery, and routing anyway would put the owner's copy — a DLQ entry, a
-/// hold-queue entry, a requeue — on the stream *alongside* the reaper's
-/// re-add. Declining leaves exactly the reaper's copy, which is the behaviour
-/// this consumer would have had with no override at all.
+/// A check that answers "not yours" is believed immediately. A check that
+/// cannot answer at all is retried, because both readings of it are bad: see
+/// [`resolve_under_lease`].
+const OWNERSHIP_CHECK_ATTEMPTS: u32 = 3;
+
+/// Pause between [`OWNERSHIP_CHECK_ATTEMPTS`]. Short — the whole retry budget
+/// has to fit inside the margin the lease bought us, which is one renewal
+/// interval.
+const OWNERSHIP_CHECK_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Decide whether this consumer may apply `outcome` to the entry it holds.
 ///
-/// A renewal that errors is treated as lost for the same reason: an entry left
-/// in the PEL is redelivered, never dropped.
-async fn resolve_timeout_outcome(
+/// Called on both paths that produce an outcome under a lease — a handler that
+/// returned normally and one that hit its deadline — because a lease can be
+/// lost either way. `leased` is false for consumers without
+/// `handler_timeout_outcome` set: they hold no lease, so there is nothing to
+/// check and `outcome` passes straight through (as does `None`, the "leave the
+/// timed-out entry to the reaper" case).
+///
+/// When a lease *is* held, the outcome is only returned if we still own the
+/// entry. Having lost it, a reaper already owns the entry's redelivery, and
+/// routing anyway would put our copy — a DLQ entry, a hold-queue entry, a
+/// requeue — on the stream *alongside* the reaper's re-add. Declining leaves
+/// exactly the reaper's copy, which is the behaviour this consumer would have
+/// had with no override at all.
+///
+/// ## Why an errored check is not treated as a loss
+///
+/// It used to be, on the reasoning that an entry left in the PEL is
+/// redelivered rather than dropped. That is only true when something is
+/// actually reclaiming: [`super::maintenance`] disables XAUTOCLAIM for the
+/// whole `(client, stream, group)` key as soon as one
+/// `without_handler_timeout()` consumer joins it, and a deployment may have no
+/// other process sweeping. Declining on an error can therefore strand the
+/// entry in the PEL indefinitely — a worse failure than the duplicate it
+/// avoids, and a silent one.
+///
+/// So the check is retried, and if it still cannot be answered the outcome is
+/// applied. Redis Streams delivery is at-least-once; a duplicate is within
+/// contract, a permanently stuck message is not.
+async fn resolve_under_lease(
     conn: &mut RedisConnection,
     lease: &lease::Lease<'_>,
-    resolved: Option<Outcome>,
+    leased: bool,
+    outcome: Option<Outcome>,
 ) -> Option<Outcome> {
-    let outcome = resolved?;
-    match lease::touch(conn, lease).await {
-        Ok(true) => Some(outcome),
-        Ok(false) => {
-            tracing::warn!(
-                stream = lease.stream,
-                entry_id = lease.entry_id,
-                "handler-timeout outcome not routed — a reaper reclaimed the \
-                 entry and now owns its redelivery",
-            );
-            None
-        }
-        Err(e) => {
-            tracing::warn!(
-                stream = lease.stream,
-                entry_id = lease.entry_id,
-                error = %e,
-                "could not confirm entry ownership — leaving the timed-out \
-                 entry in the PEL for XAUTOCLAIM",
-            );
-            None
+    let outcome = outcome?;
+    if !leased {
+        return Some(outcome);
+    }
+
+    let mut last_error = None;
+    for attempt in 0..OWNERSHIP_CHECK_ATTEMPTS {
+        match lease::touch(conn, lease).await {
+            Ok(true) => return Some(outcome),
+            Ok(false) => {
+                tracing::warn!(
+                    stream = lease.stream,
+                    entry_id = lease.entry_id,
+                    ?outcome,
+                    "outcome not routed — a reaper reclaimed the entry and now \
+                     owns its redelivery",
+                );
+                metrics::record_backend_error(
+                    metrics::BackendLabel::Redis,
+                    metrics::BackendErrorKind::Ack,
+                );
+                return None;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt + 1 < OWNERSHIP_CHECK_ATTEMPTS {
+                    tokio::time::sleep(OWNERSHIP_CHECK_BACKOFF).await;
+                }
+            }
         }
     }
+
+    tracing::warn!(
+        stream = lease.stream,
+        entry_id = lease.entry_id,
+        ?outcome,
+        error = ?last_error.map(|e| e.to_string()),
+        attempts = OWNERSHIP_CHECK_ATTEMPTS,
+        "could not confirm entry ownership — routing the outcome anyway rather \
+         than risk stranding the entry; it may be delivered again",
+    );
+    metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+    Some(outcome)
 }
 
 async fn xack(conn: &mut RedisConnection, stream: &str, group: &str, entry_id: &str) -> Result<()> {

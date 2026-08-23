@@ -30,25 +30,58 @@
 //! While such a handler runs, [`run_under_lease`] re-asserts ownership of the
 //! entry every [`renew_interval`] — half the handler timeout. Each renewal is
 //! a [`touch`], which resets the entry's idle clock to zero. A foreign reaper
-//! needs the entry idle for at least its own threshold, so as long as that
-//! threshold is not shorter than half our handler timeout it can never reach
-//! it while we are working. At the deadline the idle clock reads at most half
-//! the timeout, leaving the owner the other half to route its outcome.
+//! needs the entry idle for at least its own threshold, so it only reaches
+//! that threshold if a renewal gap exceeds it.
 //!
-//! This does not remove the requirement to configure handler timeouts
-//! consistently across every consumer of a stream and group — a process whose
-//! timeout is under half of ours reclaims inside the renewal gap. It does
-//! close the case the requirement could not: same timeout everywhere,
-//! differing only in whether the outcome override is set.
+//! The condition, stated exactly: a foreign reaper is kept off the entry while
+//! we work iff its idle threshold is **strictly greater** than our largest
+//! successful-renewal gap. That gap is [`renew_interval`] *plus* whatever
+//! scheduling and Redis latency the renewal actually incurs — it is not a
+//! clean `T / 2`.
+//!
+//! Two consequences worth naming, because both are observable rather than
+//! theoretical:
+//!
+//! - Handler timeouts must be configured **consistently** across every
+//!   consumer of a stream and group. This was already required (see
+//!   `ConsumerOptions::with_handler_timeout`); the lease does not relax it.
+//!   With a consistent `T` the foreign threshold is `T` and the renewal gap is
+//!   `T / 2`, so the margin is real. With `T = 60s` here and `T = 30s` there,
+//!   it is not: the 30 s sweep and our 30 s renewal come due together and
+//!   ordinary timer jitter decides the order.
+//! - The [`MIN_RENEW_INTERVAL`] floor means the gap is `max(T / 2, 100ms)`, so
+//!   below `T = 200ms` the floor — not the proportional rule — sets it, and
+//!   the margin narrows from `T / 2` to `T - 100ms`. At `T <= 100ms` it is
+//!   gone entirely: the first renewal is not due until the deadline has
+//!   already passed, so such consumers get no lease protection at all.
 //!
 //! ## What a lease cannot do
 //!
-//! Losing the lease is still possible — the owner may be descheduled past a
-//! renewal, or the renewal may fail against an unhealthy connection. [`touch`]
-//! therefore doubles as the guard the owner runs immediately before routing a
-//! timeout outcome: it reports whether we still hold the entry, atomically
-//! with the renewal, so an owner that lost the race declines to route rather
-//! than adding a second copy alongside the reaper's re-add.
+//! **It does not make the owner the only actor, and this backend does not
+//! claim it does.** Losing the lease is always possible — the owner may be
+//! descheduled past a renewal, or the renewal may fail against an unhealthy
+//! connection. [`touch`] therefore doubles as a guard the owner runs
+//! immediately before routing an outcome (see
+//! `super::consumer::resolve_under_lease`): it reports whether we still hold
+//! the entry, atomically with the renewal, so an owner that has already lost
+//! the race declines to route rather than adding a second copy alongside the
+//! reaper's re-add.
+//!
+//! That guard is check-then-act, and the two halves are *not* serialized
+//! against each other. `touch` returning true is a statement about the past.
+//! Applying an outcome is a separate round trip — often two, an `XADD` to a
+//! DLQ or hold queue followed by an `XACK` — and cannot be folded into the
+//! same script, because those destinations are different keys and would
+//! `CROSSSLOT`-fail on Redis Cluster. An owner descheduled between the check
+//! and the write can still be overtaken by a reaper, leaving a duplicate.
+//!
+//! So the honest guarantee is: the lease **narrows** the window in which a
+//! foreign reaper and a resolving owner both act on one entry, from "every
+//! handler that reaches its deadline" to "an owner that loses its lease and
+//! does not notice in time". It does not close it. Redis Streams delivery is
+//! at-least-once, and a reclaim-induced duplicate stays within that contract —
+//! which is why the guard errs toward the duplicate whenever ownership cannot
+//! be established, rather than toward dropping or stranding the entry.
 
 use std::future::Future;
 use std::time::Duration;
@@ -95,10 +128,15 @@ return 1
 /// How often to renew a lease for a handler with the given timeout.
 ///
 /// Half the timeout, floored at [`MIN_RENEW_INTERVAL`]. Half means the idle
-/// clock is never above `timeout / 2` while the handler runs, which keeps a
-/// foreign reaper sweeping at the same `timeout` from ever reaching its
-/// threshold, and leaves the owner `timeout / 2` of margin to route its
-/// outcome once the deadline fires.
+/// clock stays around `timeout / 2` while the handler runs, so a foreign
+/// reaper sweeping at the same `timeout` has roughly that much margin before
+/// it can reach its threshold, and the owner has roughly that much to route
+/// its outcome once the deadline fires.
+///
+/// "Roughly" is load-bearing: the actual gap is this interval plus the latency
+/// of the renewal itself, and below `2 * MIN_RENEW_INTERVAL` the floor takes
+/// over from the proportional rule entirely. See the module docs for what that
+/// does and does not buy.
 pub(super) fn renew_interval(handler_timeout: Duration) -> Duration {
     (handler_timeout / 2).max(MIN_RENEW_INTERVAL)
 }
@@ -188,8 +226,10 @@ mod tests {
 
     #[test]
     fn renew_interval_is_half_the_timeout() {
-        // Half keeps the idle clock under any reaper sweeping at the same
+        // Half keeps the idle clock under a reaper sweeping at the same
         // handler timeout, and leaves the other half for outcome routing.
+        // Only against the *same* timeout: see `renew_interval_gives_no_margin_
+        // against_a_shorter_foreign_timeout` for what a mismatch costs.
         assert_eq!(
             renew_interval(Duration::from_secs(30)),
             Duration::from_secs(15)
@@ -214,6 +254,48 @@ mod tests {
         assert_eq!(
             renew_interval(Duration::from_millis(400)),
             Duration::from_millis(200)
+        );
+    }
+
+    /// The floor is not free: below `2 * MIN_RENEW_INTERVAL` it, not the
+    /// proportional rule, sets the renewal gap, so the margin against a
+    /// same-timeout sweep shrinks from `T / 2` to `T - 100ms` and reaches zero
+    /// at the floor itself. Pinned so the module docs' claim about sub-100 ms
+    /// timeouts cannot quietly stop being true.
+    #[test]
+    fn the_floor_erases_the_margin_for_sub_100ms_timeouts() {
+        // At or under the floor the first renewal is not due until the
+        // deadline has already passed — there is no lease at all.
+        for t in [Duration::from_millis(40), MIN_RENEW_INTERVAL] {
+            assert!(
+                renew_interval(t) >= t,
+                "renew_interval({t:?}) is not sooner than the deadline itself",
+            );
+        }
+        // Between the floor and twice it, a margin exists but is the floor's
+        // remainder rather than half the timeout.
+        let t = Duration::from_millis(150);
+        assert_eq!(renew_interval(t), MIN_RENEW_INTERVAL);
+        assert_eq!(t - renew_interval(t), Duration::from_millis(50));
+        // At exactly 2x the floor the two rules agree and the margin is back
+        // to a clean half.
+        let boundary = MIN_RENEW_INTERVAL * 2;
+        assert_eq!(renew_interval(boundary), boundary / 2);
+    }
+
+    /// A foreign reaper is only kept off the entry when its threshold exceeds
+    /// our renewal gap. Consistent handler timeouts are what make that true;
+    /// this pins the counterexample the docs cite, so "configure them
+    /// consistently" stays a stated requirement rather than a hope.
+    #[test]
+    fn renew_interval_gives_no_margin_against_a_shorter_foreign_timeout() {
+        let ours = Duration::from_secs(60);
+        let theirs = Duration::from_secs(30);
+        assert_eq!(
+            renew_interval(ours),
+            theirs,
+            "our renewal and their sweep come due together, so jitter decides \
+             which of us acts on the entry first",
         );
     }
 

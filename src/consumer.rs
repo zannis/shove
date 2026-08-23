@@ -362,15 +362,43 @@ impl<B: Backend> ConsumerOptions<B> {
     /// Redis route the given outcome instead, which for [`Outcome::Defer`]
     /// means the configured hold-queue delay rather than the idle deadline.
     ///
-    /// Setting it also makes a Redis consumer hold a lease on the entry it is
-    /// working on, renewed every half handler-timeout, so no `XAUTOCLAIM`
-    /// sweep can reclaim the entry the consumer is about to resolve. That
-    /// holds across processes, but only while handler timeouts are configured
-    /// consistently across every consumer of a stream and group: a consumer
-    /// whose timeout is under *half* of another's reclaims inside the renewal
-    /// gap. Should a lease be lost anyway, the timeout outcome is not routed —
-    /// the reclaiming sweep redelivers the entry instead, which is the
-    /// behaviour this consumer would have had with the option unset.
+    /// # Redis: this narrows a race, it does not remove one
+    ///
+    /// With the option unset, a timed-out Redis entry has exactly one actor —
+    /// the reaper. Setting it makes the consumer act at that same deadline, so
+    /// the consumer and any `XAUTOCLAIM` sweep can both touch the entry.
+    ///
+    /// Two things keep them apart. Within a process, the maintenance registry
+    /// backs its sweep threshold off to twice the handler timeout, which is a
+    /// real guarantee because the registry sees every consumer there. Across
+    /// processes, the consumer holds a *lease* on the entry it is working on —
+    /// renewed at half the handler timeout, which keeps the entry's idle clock
+    /// below a foreign sweep threshold — and re-checks that lease before
+    /// applying any outcome, dropping the outcome if a reaper got there first.
+    ///
+    /// What that buys you, stated without varnish:
+    ///
+    /// - It requires handler timeouts configured **consistently** across every
+    ///   consumer of a stream and group — already the rule for
+    ///   [`with_handler_timeout`](Self::with_handler_timeout), and not relaxed
+    ///   here. A process sweeping at 30 s against a 60 s handler elsewhere is
+    ///   racing the renewal, not beaten by it.
+    /// - The re-check is check-then-act. Applying an outcome takes further
+    ///   round trips (`XADD` then `XACK`) that cannot join the check's script,
+    ///   because a DLQ or hold queue is a different key and would
+    ///   `CROSSSLOT`-fail on Redis Cluster. A consumer stalled between the two
+    ///   can still be overtaken.
+    /// - The renewal interval has a 100 ms floor, so below a 200 ms handler
+    ///   timeout the margin narrows from half the timeout to whatever is left
+    ///   over that floor — and at 100 ms or under there is none: the first
+    ///   renewal would fall due after the deadline has already passed.
+    ///
+    /// So the window shrinks from "every handler that reaches its deadline" to
+    /// "a consumer that loses its lease and does not notice in time", but a
+    /// reclaim-induced duplicate remains possible — as it already is for any
+    /// Redis Streams consumer group, which is at-least-once. Where ownership
+    /// cannot be established at all, the outcome is applied anyway rather than
+    /// leaving an entry that may have no reaper to recover it.
     ///
     /// Handler *panics* are unaffected and always resolve to
     /// [`Outcome::Retry`] — a panic is a failed attempt, not a slow one.

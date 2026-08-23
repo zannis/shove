@@ -35,10 +35,18 @@
 //! Consistent timeouts alone would not save a consumer that resolves its own:
 //! a second process with the same timeout and no override still sweeps at the
 //! deadline its owner resolves on, and no policy visible here can stop it.
-//! Those consumers therefore defend the entry directly, by holding a
-//! renewed PEL lease on it — see [`super::lease`]. The backoff below is what
-//! keeps the owner's chosen outcome winning in the ordinary single-process
-//! case; the lease is what makes it correct when it does not.
+//! Those consumers therefore defend the entry directly, by holding a renewed
+//! PEL lease on it — see [`super::lease`].
+//!
+//! The two mechanisms have different reach, and it matters not to conflate
+//! them. The `2x` backoff below is a **single-process** guarantee: within one
+//! process the registry sees every consumer on the key, so it can place the
+//! sidecar's threshold beyond every owner's deadline. The lease only
+//! *narrows* the same race across processes — narrowing is the whole claim.
+//! It does not make the owner the sole actor, and the ownership check it
+//! offers is not serialized against the writes that apply an outcome. See
+//! [`super::lease`] for the exact bound and its failure modes; the short
+//! version is that Redis Streams stays at-least-once here.
 //!
 //! The key includes the client identity so two clients pointed at different
 //! Redis servers never share a maintenance task; two distinct clients on the
@@ -172,12 +180,18 @@ fn sidecar_timing(handler_timeout: Option<Duration>) -> (Duration, Option<u64>) 
 /// redeliver the very entry its owner is concurrently resolving — leaving a
 /// duplicate on the stream after a timeout-to-`Ack`, or two redeliveries after
 /// a timeout-to-`Defer`. Backing the threshold off to twice the timeout keeps
-/// the two apart: a live owner always resolves first, and a genuinely dead one
-/// is still recovered, just one extra timeout later.
+/// *this process's* sidecar clear of *this process's* owners: a live owner
+/// resolves first, and a genuinely dead one is still recovered, just one extra
+/// timeout later.
 ///
 /// The margin is proportional rather than a fixed constant so it scales with
 /// whatever the caller considers "too slow", and so short timeouts don't
 /// inherit a multi-second crash-recovery delay.
+///
+/// It buys nothing against a sidecar in another process, which seeds its own
+/// threshold from its own consumers and may sweep at plain `handler_timeout`.
+/// That case is the [`super::lease`]'s to narrow, and narrowing is all it can
+/// do — see the module docs above.
 fn reclaim_policy(handler_timeout: Option<Duration>, resolves_own_timeout: bool) -> Policy {
     match handler_timeout {
         Some(timeout) if resolves_own_timeout => Some(timeout.saturating_mul(2)),
