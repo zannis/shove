@@ -41,6 +41,9 @@ macro_rules! define_topic {
                 TOPOLOGY.get_or_init(|| $topology)
             }
         }
+        // Unsequenced topics are batch-consumable. `define_sequenced_topic!`
+        // deliberately omits this impl — see `NotSequenced`.
+        impl $crate::NotSequenced for $name {}
     };
 }
 

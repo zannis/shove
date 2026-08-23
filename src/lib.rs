@@ -206,14 +206,14 @@ pub use consumer::{
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::ShoveError;
-pub use handler::{MessageHandler, MessageHandlerExt};
+pub use handler::{BatchMessageHandler, MessageHandler, MessageHandlerExt};
 pub use metadata::{
     DeadMessageMetadata, DeadMessageMetadataBuilder, MessageMetadata, MessageMetadataBuilder,
 };
 pub use outcome::Outcome;
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 use std::time::Duration;
-pub use topic::{SequencedTopic, Topic};
+pub use topic::{NotSequenced, SequencedTopic, Topic};
 #[cfg(feature = "kafka")]
 pub use topology::KafkaCleanupPolicy;
 pub use topology::{HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder};
@@ -314,8 +314,8 @@ pub mod kafka {
     pub use crate::markers::Kafka;
 
     pub use crate::backends::kafka::{
-        KafkaAutoOffsetReset, KafkaAutoscalerBackend, KafkaClient, KafkaConsumer,
-        KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
+        BatchConsumerOptions, KafkaAutoOffsetReset, KafkaAutoscalerBackend, KafkaClient,
+        KafkaConsumer, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
         KafkaLagStatsProvider, KafkaPublisher, KafkaPublisherConfig, KafkaQueueStats,
         KafkaQueueStatsProvider, KafkaTopologyDeclarer,
     };

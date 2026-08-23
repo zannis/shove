@@ -1144,6 +1144,11 @@ where
                                 queue_url,
                                 "message missing MessageGroupId, rejecting"
                             );
+                            metrics::record_failed(
+                                &topic,
+                                group.as_deref(),
+                                metrics::FailReason::Malformed,
+                            );
                             router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                             continue;
                         }

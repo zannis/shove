@@ -120,10 +120,45 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
 /// cascade's size is an ordering-policy consequence, observable through the
 /// `warn!`/`info!` logs at each poisoning site, not a failure count.
 ///
-/// The rule applies to every backend that implements poisoned-key semantics
-/// (in-memory, RabbitMQ, SQS). Each cascade site is marked with a
+/// The rule applies to every backend that implements poisoned-key semantics —
+/// since `SequenceFailure::FailAll` reached parity, that is all six. Each
+/// cascade site is marked with a
 /// `// Cascade: intentionally not counted` comment pointing back here, so the
 /// backends do not drift apart the next time one of them is touched.
+///
+/// ## Hold-queue eviction is *not* a cascade
+///
+/// [`FailReason::SequenceTimeout`] looks like a cascade — one stuck key, every
+/// message buffered behind it dead-lettered — but the test above is whether an
+/// already-counted failure accounts for the discard, and here none does. A key
+/// enters `AwaitingRetry` because a handler returned `Retry`, which is not a
+/// failure and is not counted; the retried message itself survives in its hold
+/// queue. The buffered messages are destroyed with nothing else standing in for
+/// them, so each one is counted individually.
+///
+/// # In-process broker drops are log-only
+///
+/// The in-memory backend destroys messages in a handful of places a real
+/// backend cannot: an in-flight handler cancelled by shutdown, a sequenced
+/// retry cancelled during its backoff sleep, a retry re-enqueue refused because
+/// the broker is already shutting down, and an unsequenced redelivery whose
+/// target queue is gone or whose enqueue exceeds the 30s capacity timeout.
+/// None of them is counted, deliberately:
+///
+/// - The in-process broker has no durability by construction. Shutdown also
+///   destroys everything still sitting in its queues, which is not observable
+///   from consumer code — so counting only the drops that happen to pass
+///   through a consumer would publish a precise-looking number that is wrong
+///   by an unbounded amount.
+/// - No other backend can emit such a reason. Real brokers redeliver after a
+///   consumer stops, precisely because nothing was acked, so a `shutdown_drop`
+///   label would be permanently single-backend — exactly the drift this
+///   section exists to prevent.
+///
+/// The condition is a property of the backend rather than of the message, so
+/// logs are the right surface: every such site warns with the queue (or shard),
+/// sequence key where there is one, and message id, and the sequenced ones are
+/// marked `// Shutdown drop: intentionally not counted`.
 ///
 /// [`SequenceFailure::FailAll`]: crate::topology::SequenceFailure
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +172,26 @@ pub(crate) enum FailReason {
     Rejected,
     SchemaFrame,
     SchemaValidation,
+    /// The broker delivered something that is not a well-formed `shove`
+    /// message for this consumer, so it was retired without ever reaching the
+    /// handler: a Redis stream entry with no payload field, or an SQS message
+    /// with no `MessageGroupId` on a sequenced queue.
+    ///
+    /// Distinct from [`FailReason::Deserialize`], which means the payload was
+    /// present and the codec rejected it. `Malformed` means the envelope
+    /// itself is unusable, which points at a foreign writer or a publisher
+    /// that is not using `shove` — a different fix. The specific missing field
+    /// is in the accompanying `warn!`.
+    Malformed,
+    /// A sequence key sat in `AwaitingRetry` past `hold_queue_timeout`, so
+    /// every message buffered behind it was dead-lettered to unblock the key.
+    ///
+    /// Deliberately not [`FailReason::Timeout`], which means a single handler
+    /// exceeded `handler_timeout`. Conflating them would hide a stuck
+    /// *ordering* key — a topology/backoff problem — inside a handler-latency
+    /// alert. Currently RabbitMQ-only; it is the only backend that implements
+    /// hold-queue eviction.
+    SequenceTimeout,
 }
 
 #[allow(dead_code)]
@@ -151,6 +206,8 @@ impl FailReason {
             FailReason::Rejected => "rejected",
             FailReason::SchemaFrame => "schema_frame",
             FailReason::SchemaValidation => "schema_validation",
+            FailReason::Malformed => "malformed",
+            FailReason::SequenceTimeout => "sequence_timeout",
         }
     }
 
@@ -246,6 +303,27 @@ pub(crate) fn record_consumed(topic: &str, group: Option<&str>, outcome: &Outcom
 #[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
 
+/// `record_consumed` for a whole batch at once, so a batch consumer's
+/// `messages_consumed_total` counts *messages* (comparable with the
+/// single-message consumers) rather than flushes.
+#[cfg(feature = "metrics")]
+pub(crate) fn record_consumed_n(topic: &str, group: Option<&str>, outcome: &Outcome, count: u64) {
+    if count == 0 {
+        return;
+    }
+    ::metrics::counter!(
+        names().messages_consumed_total.as_str(),
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "outcome" => outcome_label(outcome),
+    )
+    .increment(count);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_consumed_n(_: &str, _: Option<&str>, _: &Outcome, _: u64) {}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason) {
     ::metrics::counter!(
@@ -260,6 +338,28 @@ pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason
 #[cfg(not(feature = "metrics"))]
 #[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_failed(_: &str, _: Option<&str>, _: FailReason) {}
+
+/// `record_failed` for a whole batch at once, so a batch consumer's
+/// `messages_failed_total` counts *messages* (comparable with the
+/// single-message consumers) rather than flushes.
+#[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_failed_n(topic: &str, group: Option<&str>, reason: FailReason, count: u64) {
+    if count == 0 {
+        return;
+    }
+    ::metrics::counter!(
+        names().messages_failed_total.as_str(),
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "reason" => reason.as_label(),
+    )
+    .increment(count);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_failed_n(_: &str, _: Option<&str>, _: FailReason, _: u64) {}
 
 #[cfg(feature = "metrics")]
 pub(crate) fn record_published(topic: &str, ok: bool) {
@@ -336,30 +436,30 @@ pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize
 pub(crate) fn record_message_size(_: &str, _: Option<&str>, _: usize) {}
 
 #[cfg(feature = "metrics")]
-pub(crate) fn inc_inflight(topic: &str, group: Option<&str>) {
+pub(crate) fn inc_inflight(topic: &str, group: Option<&str>, count: u64) {
     ::metrics::gauge!(
         names().messages_inflight.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
     )
-    .increment(1.0);
+    .increment(count as f64);
 }
 
 #[cfg(not(feature = "metrics"))]
-pub(crate) fn inc_inflight(_: &str, _: Option<&str>) {}
+pub(crate) fn inc_inflight(_: &str, _: Option<&str>, _: u64) {}
 
 #[cfg(feature = "metrics")]
-pub(crate) fn dec_inflight(topic: &str, group: Option<&str>) {
+pub(crate) fn dec_inflight(topic: &str, group: Option<&str>, count: u64) {
     ::metrics::gauge!(
         names().messages_inflight.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
     )
-    .decrement(1.0);
+    .decrement(count as f64);
 }
 
 #[cfg(not(feature = "metrics"))]
-pub(crate) fn dec_inflight(_: &str, _: Option<&str>) {}
+pub(crate) fn dec_inflight(_: &str, _: Option<&str>, _: u64) {}
 
 /// RAII handle that increments the inflight gauge on construction and
 /// decrements it on drop. Use this instead of paired `inc_inflight` /
@@ -369,18 +469,44 @@ pub(crate) fn dec_inflight(_: &str, _: Option<&str>) {}
 pub(crate) struct InflightGuard {
     topic: std::sync::Arc<str>,
     group: Option<std::sync::Arc<str>>,
+    count: u64,
 }
 
 #[allow(dead_code)]
 impl InflightGuard {
     pub(crate) fn new(topic: std::sync::Arc<str>, group: Option<std::sync::Arc<str>>) -> Self {
-        inc_inflight(&topic, group.as_deref());
-        Self { topic, group }
+        Self::with_count(topic, group, 1)
+    }
+
+    /// Batch variant: the gauge counts *messages* in flight, so a batch of
+    /// `count` messages handed to a handler moves it by `count`, not by one.
+    /// Keeps `messages_inflight` comparable between the single-message and
+    /// batch consumers.
+    pub(crate) fn with_count(
+        topic: std::sync::Arc<str>,
+        group: Option<std::sync::Arc<str>>,
+        count: u64,
+    ) -> Self {
+        inc_inflight(&topic, group.as_deref(), count);
+        Self {
+            topic,
+            group,
+            count,
+        }
     }
 
     /// Convenience constructor for borrowed inputs.
     pub(crate) fn from_refs(topic: &str, group: Option<&str>) -> Self {
         Self::new(std::sync::Arc::from(topic), group.map(std::sync::Arc::from))
+    }
+
+    /// Convenience constructor for borrowed inputs — see [`Self::with_count`].
+    pub(crate) fn from_refs_n(topic: &str, group: Option<&str>, count: u64) -> Self {
+        Self::with_count(
+            std::sync::Arc::from(topic),
+            group.map(std::sync::Arc::from),
+            count,
+        )
     }
 
     pub(crate) fn topic(&self) -> &str {
@@ -394,7 +520,7 @@ impl InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        dec_inflight(&self.topic, self.group.as_deref());
+        dec_inflight(&self.topic, self.group.as_deref(), self.count);
     }
 }
 
@@ -541,6 +667,64 @@ mod tests {
         assert_eq!(
             n.autoscaler_active_consumers.as_str(),
             "shove_autoscaler_active_consumers"
+        );
+    }
+
+    /// `reason` label values are a public observability surface: operators
+    /// write alerts against these exact strings, so renaming one silently
+    /// breaks dashboards in a way no compiler catches. Pin every value, and
+    /// pin the set — a new variant must add a line here, which is the prompt
+    /// to also document it in `docs/pages/guides/observability.mdx`.
+    #[test]
+    fn fail_reason_labels_are_stable() {
+        let all = [
+            (FailReason::Oversize, "oversize"),
+            (FailReason::Deserialize, "deserialize"),
+            (FailReason::PendingFull, "pending_full"),
+            (FailReason::Timeout, "timeout"),
+            (FailReason::MaxRetriesExceeded, "max_retries_exceeded"),
+            (FailReason::Rejected, "rejected"),
+            (FailReason::SchemaFrame, "schema_frame"),
+            (FailReason::SchemaValidation, "schema_validation"),
+            (FailReason::Malformed, "malformed"),
+            (FailReason::SequenceTimeout, "sequence_timeout"),
+        ];
+        for (reason, label) in all {
+            assert_eq!(reason.as_label(), label, "label changed for {reason:?}");
+        }
+
+        // Distinctness matters as much as the strings: two reasons collapsing
+        // onto one label would merge series an operator expects to separate.
+        let labels: std::collections::HashSet<&str> =
+            all.iter().map(|(r, _)| r.as_label()).collect();
+        assert_eq!(labels.len(), all.len(), "two FailReasons share a label");
+
+        // Prometheus label values are unconstrained, but these are used as
+        // alert selectors — keep them snake_case and machine-friendly.
+        for (_, label) in all {
+            assert!(
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "label {label:?} is not snake_case"
+            );
+        }
+    }
+
+    /// `sequence_timeout` exists because reusing `timeout` would hide a stuck
+    /// ordering key inside a handler-latency alert; `malformed` exists because
+    /// reusing `deserialize` would hide a foreign writer inside a codec alert.
+    /// Both distinctions are the point of the variants — assert them directly
+    /// so a future "simplification" has to argue with a test.
+    #[test]
+    fn new_reasons_do_not_collapse_onto_the_ones_they_refine() {
+        assert_ne!(
+            FailReason::SequenceTimeout.as_label(),
+            FailReason::Timeout.as_label()
+        );
+        assert_ne!(
+            FailReason::Malformed.as_label(),
+            FailReason::Deserialize.as_label()
         );
     }
 
