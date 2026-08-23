@@ -96,8 +96,8 @@ applies to the retry budget.
    so a blip cannot un-poison a key.
 5. **The empty key is never poisoned.** A message with no sequence key carries
    no ordering relationship, and poisoning `""` would dead-letter every other
-   unkeyed message sharing the shard. This mirrors the `!key.is_empty()` guard
-   InMemory already had (`src/backends/inmemory/consumer.rs:632`).
+   unkeyed message sharing the shard. This generalises the `!key.is_empty()`
+   guard InMemory already had before it moved onto the shared tracker.
 
 ### Scope of the poison set
 
@@ -143,20 +143,31 @@ already in flight during an upgrade are therefore safe.
 | Backend | `FailAll` honoured | Key source | Poison scope |
 |---|---|---|---|
 | InMemory | yes | `x-sequence-key` header | per shard task¹ |
-| RabbitMQ | yes | delivery routing key | per shard consumer |
-| SQS | yes | message group ID | per consumer |
+| RabbitMQ | yes | delivery routing key | per shard consumer² |
+| SQS | yes | message group ID | per consumer² |
 | NATS | yes (new) | `Shove-Sequence-Key` header | per shard task |
-| Kafka | yes (new) | Kafka message key | per consumer task² |
+| Kafka | yes (new) | Kafka message key | per consumer task³ |
 | Redis | yes (new) | `x-sequence-key` stream field | per shard task |
 
-¹ InMemory additionally clears its poison set whenever the shard buffer drains
-(`src/backends/inmemory/consumer.rs:593`). That is a deliberate bounded-drain
-heuristic, but it is narrower than the documented "lifetime of the consumer"
-contract, and it is only expressible because the queue is in-process. Left as
-is — changing it is a behaviour change to a tested backend and is out of scope
-for this issue — but it is the one remaining deviation in the table.
+¹ InMemory previously cleared its poison set whenever the shard buffer drained
+(a deliberate bounded-drain heuristic, only expressible because the queue is
+in-process). That was narrower than the documented "lifetime of the consumer"
+contract and made InMemory the one backend where a quiet moment silently
+un-poisoned a key — the worst place to diverge, since InMemory is what users
+assert against in their own tests. It now uses `PoisonedKeys` like the rest;
+`tests/inmemory_integration.rs::poison_survives_shard_drain` pins the new
+behaviour.
 
-² Covers every partition currently assigned; see the rebalance note above.
+² RabbitMQ and SQS predate `PoisonedKeys` and still carry their own
+`HashSet<String>` threaded through the consume loop. They were audited against
+the five rules above and match on all of them, including the empty-key guard:
+neither can reach the poison path with an empty key (RabbitMQ's key is the
+delivery routing key, and SQS rejects a message with no `MessageGroupId` before
+the poison check at `src/backends/sns/consumer.rs:1140`). Porting them onto the
+shared tracker is a mechanical refactor with no behaviour change, so it is
+deliberately not bundled into this correctness fix.
+
+³ Covers every partition currently assigned; see the rebalance note above.
 
 ## Testing
 
