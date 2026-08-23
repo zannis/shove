@@ -102,6 +102,15 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
 /// and post-handler terminal outcomes (timeout, max_retries_exceeded,
 /// rejected) so operators can alert on every code path that retires a
 /// message without an Ack.
+///
+/// [`FailReason::Rejected`] also labels the collateral discards a
+/// `SequenceFailure::FailAll` topic produces: when a poisoned sequence key
+/// retires the messages queued behind it, those messages never reach a
+/// handler and never spend a retry, so neither `rejected` nor
+/// `max_retries_exceeded` describes them exactly — but the sequence is failed
+/// as a unit by a real `Reject`, and splitting the burst into its own label
+/// would fragment the one series operators alert on. All three backends with
+/// FailAll semantics (in-memory, RabbitMQ, SQS) agree on `rejected`.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) enum FailReason {

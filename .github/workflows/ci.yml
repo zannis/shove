@@ -105,10 +105,14 @@ jobs:
         include:
           - name: inmemory
             features: inmemory,metrics,sbe
+          # `metrics` is required here, not optional: the sequenced discard
+          # counters added for these two backends live behind `#[cfg(feature =
+          # "metrics")]`, so without it `metrics_rabbitmq_discard_fifo` /
+          # `metrics_sqs_discard_fifo` compile to nothing and pass vacuously.
           - name: rabbitmq
-            features: rabbitmq,audit,rabbitmq-transactional,sbe
+            features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe
           - name: aws-sns-sqs
-            features: pub-aws-sns,aws-sns-sqs,audit,sbe
+            features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
           - name: nats
             features: nats,audit,sbe
           - name: kafka
