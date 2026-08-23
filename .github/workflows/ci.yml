@@ -105,26 +105,27 @@ jobs:
         include:
           - name: inmemory
             features: inmemory,metrics,sbe
+          # `metrics` on every backend entry below that has a `metrics_*`
+          # integration binary. Every one of those is gated
+          # `#![cfg(all(feature = "<backend>", feature = "metrics"))]`, so
+          # without the feature the binary compiles to zero tests and the entry
+          # still reports green: coverage that asserts nothing. The feature only
+          # adds counter emission behind the `metrics` facade; with no recorder
+          # installed each call is a no-op, so no entry gets materially slower.
           - name: rabbitmq
-            # `metrics` so the discard counters this backend emits are actually
-            # executed: `metrics_rabbitmq_sequenced` asserts them against a real
-            # broker. Without the feature the emission sites are cfg-compiled
-            # out and the leg cannot observe them even in principle.
+            # Asserted by `metrics_rabbitmq_sequenced`.
             features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe
           - name: aws-sns-sqs
-            # `metrics` — see the rabbitmq entry; asserted by
-            # `metrics_sqs_sequenced`.
+            # Asserted by `metrics_sqs_sequenced`.
             features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
           - name: nats
-            # `metrics` — see the rabbitmq entry; asserted by
-            # `metrics_nats_failall`.
+            # Asserted by `metrics_nats_failall`.
             features: nats,audit,metrics,sbe
           - name: kafka
             # kafka-msk-iam + test-support compile and run the MSK IAM tests,
             # including the OAUTHBEARER admin integration test (local Kafka
             # container + unsecured JWT; no AWS/LocalStack needed).
-            # `metrics` — see the rabbitmq entry; asserted by
-            # `metrics_kafka_failall`.
+            # `metrics` asserted by `metrics_kafka_failall`.
             features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe
           - name: kafka-schema-registry
             # Split out from the `kafka` entry rather than folded into it: the
@@ -139,8 +140,8 @@ jobs:
             # already covers. Restrict it to the three schema-registry binaries.
             filter: -E 'binary(/^kafka_schema_registry/)'
           - name: redis-streams
-            # `metrics` — see the rabbitmq entry; asserted by
-            # `metrics_redis_failall`.
+            # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`
+            # and `metrics_redis_failall`.
             features: redis-streams,metrics,sbe
     steps:
       - uses: actions/checkout@v6
