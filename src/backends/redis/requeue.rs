@@ -46,10 +46,27 @@ const POLL_INTERVAL: Duration = Duration::from_millis(REQUEUE_POLL_MS);
 /// be redelivered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HoldEntry {
+    /// Unique storage identity for this hold generation. Redis sorted-set
+    /// members are the serialized entry itself; without a nonce, a handler
+    /// that immediately defers a just-released retry can enqueue an identical
+    /// member before the requeuer's ZREM, and that ZREM deletes the new hold.
+    /// `default` keeps entries persisted by older shove versions readable.
+    #[serde(default)]
+    hold_id: String,
     /// Target stream to XADD back into (the main stream or shard stream).
     pub stream: String,
     /// All fields (payload + metadata) to restore on redeliver, as key-value pairs.
     pub fields: Vec<(String, String)>,
+}
+
+impl HoldEntry {
+    pub(crate) fn new(stream: String, fields: Vec<(String, String)>) -> Self {
+        Self {
+            hold_id: uuid::Uuid::new_v4().to_string(),
+            stream,
+            fields,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,13 +268,13 @@ mod tests {
     #[test]
     fn hold_entry_roundtrips() {
         use super::super::constants::{PAYLOAD_FIELD, X_RETRY_COUNT};
-        let entry = HoldEntry {
-            stream: "orders".into(),
-            fields: vec![
+        let entry = HoldEntry::new(
+            "orders".into(),
+            vec![
                 (PAYLOAD_FIELD.into(), "{}".into()),
                 (X_RETRY_COUNT.into(), "1".into()),
             ],
-        };
+        );
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.stream, "orders");
@@ -272,10 +289,7 @@ mod tests {
 
     #[test]
     fn hold_entry_with_empty_fields_roundtrips() {
-        let entry = HoldEntry {
-            stream: "my-stream".into(),
-            fields: vec![],
-        };
+        let entry = HoldEntry::new("my-stream".into(), vec![]);
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.stream, "my-stream");
@@ -285,19 +299,40 @@ mod tests {
     #[test]
     fn hold_entry_fields_order_preserved() {
         // JSON round-trip must preserve insertion order of fields.
-        let entry = HoldEntry {
-            stream: "order-stream".into(),
-            fields: vec![
+        let entry = HoldEntry::new(
+            "order-stream".into(),
+            vec![
                 ("alpha".into(), "1".into()),
                 ("beta".into(), "2".into()),
                 ("gamma".into(), "3".into()),
             ],
-        };
+        );
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: HoldEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.fields[0], ("alpha".into(), "1".into()));
         assert_eq!(decoded.fields[1], ("beta".into(), "2".into()));
         assert_eq!(decoded.fields[2], ("gamma".into(), "3".into()));
+    }
+
+    #[test]
+    fn consecutive_hold_generations_have_distinct_sorted_set_members() {
+        let fields = vec![("payload".into(), "same-message".into())];
+        let first = HoldEntry::new("orders".into(), fields.clone());
+        let second = HoldEntry::new("orders".into(), fields);
+
+        assert_ne!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn hold_entries_from_before_the_nonce_remain_readable() {
+        let decoded: HoldEntry =
+            serde_json::from_str(r#"{"stream":"orders","fields":[["payload","legacy"]]}"#).unwrap();
+
+        assert!(decoded.hold_id.is_empty());
+        assert_eq!(decoded.stream, "orders");
     }
 
     #[test]

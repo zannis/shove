@@ -13,6 +13,16 @@ use crate::topology::QueueTopology;
 #[cfg(feature = "aws-sns-sqs")]
 const DEFAULT_MAX_RECEIVE_COUNT: u32 = 10;
 
+#[cfg(feature = "aws-sns-sqs")]
+fn validate_shared_queue_dlq(topology: &QueueTopology) -> Result<()> {
+    if topology.consumer_group().is_some() && topology.dlq().is_some() {
+        return Err(ShoveError::Topology(
+            "SQS does not support for_consumer_group() with a DLQ on a shared queue".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Registry mapping queue names to SNS topic ARNs.
 ///
 /// Populated by the topology declarer or pre-configured ARNs.
@@ -404,6 +414,14 @@ impl SnsTopologyDeclarer {
 
 impl SnsTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // SQS RedrivePolicy belongs to the source queue. A fan-out topology
+        // keeps that queue name shared, so it cannot attach a second,
+        // group-specific DLQ. Reject this before the registry can make the
+        // second declaration look idempotent while silently retaining the
+        // incumbent queue's redrive policy.
+        #[cfg(feature = "aws-sns-sqs")]
+        validate_shared_queue_dlq(topology)?;
+
         // If the registry already has an ARN for this queue (pre-configured),
         // validate it exists and skip creation.
         if let Some(arn) = self.topic_registry().get(topology.queue()).await {
@@ -469,6 +487,18 @@ mod tests {
     use crate::SequenceFailure;
     use crate::topology::TopologyBuilder;
     use std::time::Duration;
+
+    #[cfg(feature = "aws-sns-sqs")]
+    #[test]
+    fn grouped_dlq_is_rejected_before_declaration() {
+        let topology = TopologyBuilder::new("orders")
+            .for_consumer_group("audit")
+            .dlq()
+            .build();
+
+        let error = validate_shared_queue_dlq(&topology).unwrap_err();
+        assert!(error.to_string().contains("shared queue"));
+    }
 
     #[test]
     fn sns_topic_name_standard() {

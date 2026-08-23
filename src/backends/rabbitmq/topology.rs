@@ -28,6 +28,15 @@ fn hold_queue_args(route_back_to: &str, ttl_ms: i64) -> FieldTable {
     args
 }
 
+fn validate_shared_queue_dlq(topology: &QueueTopology) -> Result<()> {
+    if topology.consumer_group().is_some() && topology.dlq().is_some() {
+        return Err(ShoveError::Topology(
+            "RabbitMQ does not support for_consumer_group() with a DLQ on a shared queue".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Declares RabbitMQ broker resources for a topic's topology.
 ///
 /// All declarations are idempotent — safe to call on every startup.
@@ -143,10 +152,34 @@ impl RabbitMqTopologyDeclarer {
 
 impl RabbitMqTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // RabbitMQ dead-letter routing is an immutable argument on the source
+        // queue. `for_consumer_group()` deliberately leaves that queue name
+        // shared, so attaching a namespaced DLQ would redeclare the same queue
+        // with a different x-dead-letter-routing-key and close the channel with
+        // PRECONDITION_FAILED. Fail before making any partial declarations.
+        validate_shared_queue_dlq(topology)?;
+
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {
             self.declare_unsequenced(topology).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TopologyBuilder;
+
+    #[test]
+    fn grouped_dlq_is_rejected_before_declaration() {
+        let topology = TopologyBuilder::new("orders")
+            .for_consumer_group("audit")
+            .dlq()
+            .build();
+
+        let error = validate_shared_queue_dlq(&topology).unwrap_err();
+        assert!(error.to_string().contains("shared queue"));
     }
 }

@@ -227,6 +227,16 @@ define_topic!(
         .build()
 );
 
+define_topic!(
+    GroupedSimpleWork,
+    SimpleMessage,
+    TopologyBuilder::new("test-simple")
+        .for_consumer_group("second-reader")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 struct OrderMessage {
     account: String,
@@ -1486,6 +1496,29 @@ async fn topology_declare_creates_queues() {
     assert!(resp.status().is_success(), "hold queue should exist");
 
     client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+#[tokio::test]
+async fn grouped_dlq_on_a_shared_queue_fails_before_broker_declaration() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client);
+    b.topology().declare::<SimpleWork>().await.unwrap();
+
+    let error = b
+        .topology()
+        .declare::<GroupedSimpleWork>()
+        .await
+        .expect_err("RabbitMQ cannot attach a group-specific DLQ to a shared queue");
+    assert!(
+        error.to_string().contains(
+            "RabbitMQ does not support for_consumer_group() with a DLQ on a shared queue"
+        ),
+        "unexpected error: {error}"
+    );
+
+    b.close().await;
     ctx.cleanup().await;
 }
 

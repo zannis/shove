@@ -289,6 +289,16 @@ define_topic!(
 );
 
 define_topic!(
+    GroupedWorkTopic,
+    SimpleMessage,
+    TopologyBuilder::new("sqs-work")
+        .for_consumer_group("second-reader")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .build()
+);
+
+define_topic!(
     NoDlqTopic,
     SimpleMessage,
     TopologyBuilder::new("sqs-nodlq").build()
@@ -580,6 +590,26 @@ async fn topology_declares_standard_queue_and_dlq() {
         .await
         .expect("topic ARN should be registered");
     assert!(arn.contains("sqs-work"));
+}
+
+#[tokio::test]
+async fn grouped_dlq_on_a_shared_queue_is_rejected() {
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<WorkTopic>().await;
+
+    let error = setup
+        .broker
+        .topology()
+        .declare::<GroupedWorkTopic>()
+        .await
+        .expect_err("SQS cannot attach a group-specific redrive policy to a shared queue");
+    assert!(
+        error
+            .to_string()
+            .contains("SQS does not support for_consumer_group() with a DLQ on a shared queue"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]

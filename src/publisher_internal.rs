@@ -5,8 +5,13 @@ use crate::error::{Result, ShoveError};
 /// Header prefixes reserved for internal use. Callers may not set headers
 /// that start with any of these via `Publisher::publish_with_headers`.
 #[allow(dead_code)] // Used by feature-gated backend publishers.
-const RESERVED_HEADER_PREFIXES: &[&str] =
-    &["x-retry-count", "x-message-id", "x-death", "x-sequence-key"];
+const RESERVED_HEADER_PREFIXES: &[&str] = &[
+    "x-retry-count",
+    "x-retry-group",
+    "x-message-id",
+    "x-death",
+    "x-sequence-key",
+];
 
 /// Rejects user-supplied headers that collide with internal header keys.
 #[allow(dead_code)] // Used by feature-gated backend publishers.
@@ -65,6 +70,13 @@ mod tests {
     fn rejects_retry_count_header() {
         let mut h = HashMap::new();
         h.insert("x-retry-count".into(), "5".into());
+        assert!(validate_headers(&h).is_err());
+    }
+
+    #[test]
+    fn rejects_retry_group_header() {
+        let mut h = HashMap::new();
+        h.insert("x-retry-group".into(), "other-service".into());
         assert!(validate_headers(&h).is_err());
     }
 

@@ -142,7 +142,7 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 
 ### Fan-out — a second reader on the same topic
 
-A bare `with_group_id` splits the *group* but not the retry chain: both readers still derive `{queue}-dlq` and `{queue}-hold-*`, so each drains the other's dead and held messages. Declaring the second reader's topology with [`for_consumer_group`](/concepts/topics#fan-out-two-readers-on-one-topic) splits both:
+A bare `with_group_id` splits broker delivery and Retry/Defer copies are targeted back to that resolved group, but both readers still derive the same `{queue}-dlq`. Declaring the second reader's topology with [`for_consumer_group`](/concepts/topics#fan-out-two-readers-on-one-topic) isolates the DLQ names as well:
 
 ```rust,no_run
 TopologyBuilder::new("order-settlement")
@@ -161,6 +161,8 @@ The resolved group IDs follow the topology:
 | DLQ drain | `order-settlement-dlq-consumer` | `order-settlement-settlement-audit-dlq-consumer` |
 
 Precedence is: an explicit `with_group_id` (on either `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`) > the topology's fan-out group > the `{queue}-consumer` default. The explicit override staying on top means adding `for_consumer_group` to a topology cannot move an already-deployed consumer off the group it holds committed offsets under. The autoscaler resolves the same group ID as the broker-side consumer in every case, so lag is read from the group that is actually committing.
+
+Retry and Defer republish to the shared main topic, but carry the resolved `group.id` that originated them. Every other Kafka group commits those copies without invoking its handler, so a retry chain cannot fan out into sibling services.
 
 ### Replication factor
 

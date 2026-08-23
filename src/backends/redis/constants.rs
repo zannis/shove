@@ -4,6 +4,8 @@
 
 pub(super) const PAYLOAD_FIELD: &str = "payload";
 pub(super) const X_RETRY_COUNT: &str = "x-retry-count";
+/// Redis XGROUP that owns a Retry/Defer copy re-added to the shared stream.
+pub(super) const X_RETRY_TARGET_GROUP: &str = "x-retry-group";
 /// Reserved for future distributed-tracing support; not yet written or read.
 pub(super) const X_TRACE_ID: &str = "x-trace-id";
 pub(super) const X_MESSAGE_ID: &str = "x-message-id";

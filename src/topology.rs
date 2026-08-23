@@ -519,18 +519,23 @@ impl TopologyBuilder {
     /// groups*, which is a backend-level notion:
     ///
     /// - **Kafka** — the group is wired through: the `group.id` defaults to
-    ///   `{queue}-{group}` instead of `{queue}-consumer`, so the two readers
+    ///   `{queue}-{group}-consumer` instead of `{queue}-consumer`, so the two readers
     ///   get independent partition assignments rather than splitting one set.
+    ///   Retry/Defer republishes are tagged with their resolved `group.id` and
+    ///   filtered by every other group on the shared topic.
     ///   An explicit
     ///   [`ConsumerOptions::with_group_id`](crate::ConsumerOptions::with_group_id)
     ///   or [`KafkaConsumerGroupConfig::with_group_id`](crate::kafka::KafkaConsumerGroupConfig::with_group_id)
     ///   still wins.
     /// - **Redis** — the XGROUP name is a client-level setting; give the second
-    ///   reader a client with a different group and this namespaces its chain.
-    /// - **NATS / RabbitMQ / SQS** — the group namespaces the retry chain, but
-    ///   the readers still share one durable consumer / queue and therefore
-    ///   compete for messages. Real fan-out needs a second stream consumer or a
-    ///   fan-out exchange, which shove does not derive for you.
+    ///   reader a client with a different group. Retry/Defer copies carry their
+    ///   originating XGROUP and are acknowledged without dispatch by every
+    ///   other group.
+    /// - **NATS** — the group namespaces the retry chain, but readers still
+    ///   share one durable consumer and therefore compete for messages.
+    /// - **RabbitMQ / SQS** — a DLQ/redrive policy belongs to the shared source
+    ///   queue, so declaring a grouped topology with a DLQ returns a topology
+    ///   error. Real fan-out requires separately named queues/subscriptions.
     ///
     /// # Panics
     ///

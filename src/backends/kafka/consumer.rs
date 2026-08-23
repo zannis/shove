@@ -49,7 +49,7 @@ use super::client::KafkaClient;
 use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, FETCH_MIN_BYTES, FETCH_WAIT_MAX_MS,
     MAX_POLL_INTERVAL_MS, MAX_PUBLISH_ATTEMPTS, MESSAGE_ID_HEADER, ORIGINAL_QUEUE_HEADER,
-    RETRY_COUNT_HEADER, SESSION_TIMEOUT_MS,
+    RETRY_COUNT_HEADER, RETRY_TARGET_GROUP_HEADER, SESSION_TIMEOUT_MS,
 };
 use super::consumer_group::KafkaAutoOffsetReset;
 
@@ -399,6 +399,14 @@ fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
         .unwrap_or(0)
 }
 
+/// Whether this delivery is either an original publish (no target) or a
+/// Retry/Defer copy owned by this resolved Kafka consumer group.
+fn retry_targets_group(headers: &HashMap<String, String>, group_id: &str) -> bool {
+    headers
+        .get(RETRY_TARGET_GROUP_HEADER)
+        .is_none_or(|target| target == group_id)
+}
+
 fn build_message_metadata(
     headers: &Arc<HashMap<String, String>>,
     redelivered: bool,
@@ -443,12 +451,13 @@ fn headers_with_retry_count(
     original: &HashMap<String, String>,
     retry_count: u32,
     message_id_suffix: &str,
+    retry_target_group: &str,
 ) -> OwnedHeaders {
-    // perf-K-8: original.len() bounds the carried-over headers; +2 for the
-    // RETRY_COUNT_HEADER and MESSAGE_ID_HEADER we always re-insert.
-    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 2);
+    // perf-K-8: original.len() bounds the carried-over headers; +3 for the
+    // retry count, message ID and retry-target group we always re-insert.
+    let mut headers = OwnedHeaders::new_with_capacity(original.len() + 3);
     for (k, v) in original {
-        if k == RETRY_COUNT_HEADER || k == MESSAGE_ID_HEADER {
+        if k == RETRY_COUNT_HEADER || k == MESSAGE_ID_HEADER || k == RETRY_TARGET_GROUP_HEADER {
             continue;
         }
         headers = headers.insert(Header {
@@ -466,6 +475,10 @@ fn headers_with_retry_count(
     headers = headers.insert(Header {
         key: MESSAGE_ID_HEADER,
         value: Some(new_id.as_bytes()),
+    });
+    headers = headers.insert(Header {
+        key: RETRY_TARGET_GROUP_HEADER,
+        value: Some(retry_target_group.as_bytes()),
     });
     headers
 }
@@ -736,6 +749,9 @@ async fn route_outcome(
     // on DLQ-terminal outcomes (max_retries_exceeded, Rejected). Matches the
     // shape `invoke_handler` already uses.
     group: Option<&str>,
+    // Resolved broker-side `group.id`; Retry/Defer copies are stamped with it
+    // so the other fan-out groups on the shared topic can filter them.
+    retry_target_group: &str,
     payload: &[u8],
     // perf-K-9: take key as Option<Bytes> by value. Each match arm uses it
     // once, so we move it instead of cloning. The receive loop's Bytes
@@ -846,8 +862,12 @@ async fn route_outcome(
                 hold_queues[idx].delay()
             };
 
-            let retry_headers =
-                headers_with_retry_count(headers, new_count, &format!("-r{new_count}"));
+            let retry_headers = headers_with_retry_count(
+                headers,
+                new_count,
+                &format!("-r{new_count}"),
+                retry_target_group,
+            );
 
             (
                 run_delayed_republish(
@@ -878,6 +898,7 @@ async fn route_outcome(
                 headers,
                 retry_count,
                 &format!("-d{}", uuid::Uuid::new_v4()),
+                retry_target_group,
             );
 
             (
@@ -2840,6 +2861,22 @@ impl KafkaConsumer {
                             tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
                             tracker.track_received(partition, offset);
 
+                            if !retry_targets_group(&headers, &group_id) {
+                                tracing::debug!(
+                                    queue,
+                                    retry_target = headers.get(RETRY_TARGET_GROUP_HEADER),
+                                    consumer_group = group_id,
+                                    "committing Retry/Defer copy owned by another fan-out group"
+                                );
+                                if completion_tx
+                                    .try_send(Completion::plain(partition, offset))
+                                    .is_err()
+                                {
+                                    tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
+                                }
+                                continue;
+                            }
+
                             metrics::record_message_size(&topic, group.as_deref(), payload_slice.len());
 
                             // Reject oversized messages before deserialization
@@ -3038,6 +3075,7 @@ impl KafkaConsumer {
                             let task_handler = handler.clone();
                             let task_ctx = ctx.clone();
                             let task_group = group.clone();
+                            let task_retry_target_group = group_id.clone();
                             let task_shutdown = shutdown.clone();
                             let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
 
@@ -3076,6 +3114,7 @@ impl KafkaConsumer {
                                     &task_client,
                                     &task_topic,
                                     task_group.as_deref(),
+                                    &task_retry_target_group,
                                     &payload_bytes,
                                     key,
                                     &headers,
@@ -3410,6 +3449,16 @@ impl KafkaConsumer {
                             let key = msg.key().map(Bytes::copy_from_slice);
                             let headers = extract_string_headers(&msg);
 
+                            if !retry_targets_group(&headers, &group_id) {
+                                tracing::debug!(
+                                    queue,
+                                    retry_target = headers.get(RETRY_TARGET_GROUP_HEADER),
+                                    consumer_group = group_id,
+                                    "dropping Retry/Defer copy owned by another fan-out group from batch"
+                                );
+                                continue;
+                            }
+
                             if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
                                 tracing::warn!(error = %e, queue, partition, offset, dlq = retain_raw, "oversized message, dropped before the handler");
                                 metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
@@ -3645,6 +3694,18 @@ impl KafkaConsumer {
                                 // directly instead of allocating a Vec<u8> copy.
                                 let payload_bytes = msg.payload().unwrap_or_default();
                                 let headers = extract_string_headers(&msg);
+
+                                if !retry_targets_group(&headers, &group_id) {
+                                    tracing::debug!(
+                                        queue,
+                                        retry_target = headers.get(RETRY_TARGET_GROUP_HEADER),
+                                        consumer_group = group_id,
+                                        "committing FIFO Retry/Defer copy owned by another fan-out group"
+                                    );
+                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                    continue;
+                                }
+
                                 // perf-K-9: Bytes for cheap refcount-clone semantics.
                                 let key = msg.key().map(Bytes::copy_from_slice);
                                 // The Kafka message key *is* the sequence key —
@@ -3945,6 +4006,7 @@ impl KafkaConsumer {
                                     &client,
                                     &queue,
                                     group.as_deref(),
+                                    &group_id,
                                     payload_bytes,
                                     key,
                                     &headers,
@@ -4311,6 +4373,21 @@ impl KafkaConsumer {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod retry_target_tests {
+    use super::*;
+
+    #[test]
+    fn originals_and_matching_retries_dispatch_but_foreign_retries_do_not() {
+        let mut headers = HashMap::new();
+        assert!(retry_targets_group(&headers, "reader-a"));
+
+        headers.insert(RETRY_TARGET_GROUP_HEADER.into(), "reader-a".into());
+        assert!(retry_targets_group(&headers, "reader-a"));
+        assert!(!retry_targets_group(&headers, "reader-b"));
     }
 }
 

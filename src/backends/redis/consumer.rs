@@ -26,7 +26,7 @@ use crate::topology::{HoldQueue, QueueTopology};
 use super::client::{RedisClient, RedisConnection};
 use super::constants::{
     BLOCK_MS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID, X_ORIGINAL_QUEUE,
-    X_RETRY_COUNT, X_SEQUENCE_KEY,
+    X_RETRY_COUNT, X_RETRY_TARGET_GROUP, X_SEQUENCE_KEY,
 };
 use super::lease;
 use super::requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
@@ -659,6 +659,10 @@ where
                     };
                     let leased = options.handler_timeout_outcome.is_some();
 
+                    if skip_retry_for_other_group(&mut conn, &pre_lease, leased, &fields).await {
+                        continue;
+                    }
+
                     // Extract payload — take ownership to avoid cloning on the hot path.
                     let payload_raw = match fields.remove(PAYLOAD_FIELD) {
                         Some(s) => s,
@@ -1148,6 +1152,10 @@ where
                     };
                     let leased = handler_timeout_outcome_cfg.is_some();
 
+                    if skip_retry_for_other_group(&mut conn, &pre_lease, leased, &fields).await {
+                        continue;
+                    }
+
                     // Extract payload — take ownership to avoid cloning on the hot path.
                     let payload_raw = match fields.remove(PAYLOAD_FIELD) {
                         Some(s) => s,
@@ -1457,6 +1465,48 @@ where
 // Outcome routing
 // ---------------------------------------------------------------------------
 
+fn retry_targets_group(fields: &HashMap<String, String>, group: &str) -> bool {
+    fields
+        .get(X_RETRY_TARGET_GROUP)
+        .is_none_or(|target| target == group)
+}
+
+/// A Retry/Defer copy is written to the shared stream so every Redis XGROUP
+/// observes it. Groups other than its origin acknowledge their own copy
+/// without invoking the handler; the target group remains independently able
+/// to consume it.
+async fn skip_retry_for_other_group(
+    conn: &mut RedisConnection,
+    entry: &lease::Lease<'_>,
+    leased: bool,
+    fields: &HashMap<String, String>,
+) -> bool {
+    if retry_targets_group(fields, entry.group) {
+        return false;
+    }
+
+    tracing::debug!(
+        stream = entry.stream,
+        entry_id = entry.entry_id,
+        retry_target = fields.get(X_RETRY_TARGET_GROUP),
+        consumer_group = entry.group,
+        "acknowledging Retry/Defer copy owned by another fan-out group"
+    );
+    if !may_act_on_entry(conn, entry, leased, &"retry-target-mismatch").await {
+        return true;
+    }
+    if let Err(e) = xack(conn, entry.stream, entry.group, entry.entry_id).await {
+        tracing::warn!(
+            stream = entry.stream,
+            entry_id = entry.entry_id,
+            error = %e,
+            "XACK failed for Retry/Defer copy owned by another group"
+        );
+        metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn route_outcome(
     conn: &mut RedisConnection,
@@ -1537,7 +1587,7 @@ async fn route_outcome(
                 // Only ack once the replacement copy exists — see
                 // `requeue_to_stream`. On failure the entry stays in the PEL
                 // and the reaper redelivers it.
-                if requeue_to_stream(conn, stream, fields, user_headers, new_retry)
+                if requeue_to_stream(conn, stream, group, fields, user_headers, new_retry)
                     .await
                     .is_ok()
                     && let Err(e) = xack(conn, stream, group, entry_id).await
@@ -1577,7 +1627,7 @@ async fn route_outcome(
                 );
                 // Same ordering as the Retry arm above: the XADD is the copy,
                 // so a failed re-add must not be followed by an ack.
-                if requeue_to_stream(conn, stream, fields, user_headers, retry_count)
+                if requeue_to_stream(conn, stream, group, fields, user_headers, retry_count)
                     .await
                     .is_ok()
                     && let Err(e) = xack(conn, stream, group, entry_id).await
@@ -1622,15 +1672,13 @@ async fn route_to_hold(
     new_retry_count: u32,
 ) {
     let mut hold_fields: Vec<(String, String)> =
-        merged_entry_fields(fields, user_headers, Some(X_RETRY_COUNT))
+        merged_entry_fields(fields, user_headers, &[X_RETRY_COUNT, X_RETRY_TARGET_GROUP])
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
     hold_fields.push((X_RETRY_COUNT.into(), new_retry_count.to_string()));
+    hold_fields.push((X_RETRY_TARGET_GROUP.into(), group.to_owned()));
 
-    let entry = HoldEntry {
-        stream: stream.to_owned(),
-        fields: hold_fields,
-    };
+    let entry = HoldEntry::new(stream.to_owned(), hold_fields);
 
     if let Err(e) = enqueue_hold(conn, hold_name, entry, delay).await {
         tracing::warn!(error = %e, hold_name, "enqueue_hold failed — message may be lost");
@@ -1700,7 +1748,7 @@ async fn route_to_dlq(
         .saturating_add(9);
     let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count.saturating_mul(16));
     cmd.arg("XADD").arg(dlq).arg("*");
-    for (k, v) in merged_entry_fields(fields, user_headers, None) {
+    for (k, v) in merged_entry_fields(fields, user_headers, &[]) {
         cmd.arg(k).arg(v);
     }
     cmd.arg(X_DEATH_REASON).arg(reason);
@@ -1750,6 +1798,7 @@ async fn route_to_dlq(
 async fn requeue_to_stream(
     conn: &mut RedisConnection,
     stream: &str,
+    group: &str,
     fields: &HashMap<String, String>,
     user_headers: &HashMap<String, String>,
     retry_count: u32,
@@ -1763,10 +1812,12 @@ async fn requeue_to_stream(
         .saturating_add(4);
     let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count.saturating_mul(16));
     cmd.arg("XADD").arg(stream).arg("*");
-    for (k, v) in merged_entry_fields(fields, user_headers, Some(X_RETRY_COUNT)) {
+    for (k, v) in merged_entry_fields(fields, user_headers, &[X_RETRY_COUNT, X_RETRY_TARGET_GROUP])
+    {
         cmd.arg(k).arg(v);
     }
     cmd.arg(X_RETRY_COUNT).arg(retry_count.to_string());
+    cmd.arg(X_RETRY_TARGET_GROUP).arg(group);
     conn.query::<redis::Value>(&mut cmd).await.map(|_| ()).map_err(|e| {
         tracing::warn!(error = %e, stream, "XADD on immediate requeue failed — leaving the entry in the PEL");
         ShoveError::Connection(format!("XADD on immediate requeue failed: {e}"))
@@ -2024,6 +2075,7 @@ pub(super) fn parse_xreadgroup_reply(
 const INTERNAL_KEYS: &[&str] = &[
     PAYLOAD_FIELD,
     X_RETRY_COUNT,
+    X_RETRY_TARGET_GROUP,
     X_SEQUENCE_KEY,
     X_MESSAGE_ID,
     X_DEATH_REASON,
@@ -2066,12 +2118,12 @@ fn partition_entry_fields(
 fn merged_entry_fields<'a>(
     internal_fields: &'a HashMap<String, String>,
     user_headers: &'a HashMap<String, String>,
-    exclude: Option<&'a str>,
+    exclude: &'a [&'a str],
 ) -> impl Iterator<Item = (&'a str, &'a str)> {
     internal_fields
         .iter()
         .chain(user_headers.iter())
-        .filter(move |(k, _)| Some(k.as_str()) != exclude)
+        .filter(move |(k, _)| !exclude.contains(&k.as_str()))
         .map(|(k, v)| (k.as_str(), v.as_str()))
 }
 
@@ -2097,6 +2149,16 @@ pub(super) fn hold_level<T>(retry_count: u32, hold_queues: &[T]) -> Option<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn originals_and_matching_retries_dispatch_but_foreign_retries_do_not() {
+        let mut fields = HashMap::new();
+        assert!(retry_targets_group(&fields, "reader-a"));
+
+        fields.insert(X_RETRY_TARGET_GROUP.into(), "reader-a".into());
+        assert!(retry_targets_group(&fields, "reader-a"));
+        assert!(!retry_targets_group(&fields, "reader-b"));
+    }
 
     #[test]
     fn retry_count_routing_to_hold_level() {
@@ -2225,6 +2287,7 @@ mod tests {
         let fields_vec = vec![
             (PAYLOAD_FIELD.to_string(), "data".to_string()),
             (X_RETRY_COUNT.to_string(), "2".to_string()),
+            (X_RETRY_TARGET_GROUP.to_string(), "reader-a".to_string()),
             (X_SEQUENCE_KEY.to_string(), "acct-1".to_string()),
             ("x-custom".to_string(), "val".to_string()),
         ];
@@ -2241,6 +2304,7 @@ mod tests {
         let fields_vec = vec![
             (PAYLOAD_FIELD.to_string(), "data".to_string()),
             (X_RETRY_COUNT.to_string(), "2".to_string()),
+            (X_RETRY_TARGET_GROUP.to_string(), "reader-a".to_string()),
             (X_SEQUENCE_KEY.to_string(), "acct-1".to_string()),
             (X_MESSAGE_ID.to_string(), "msg-abc".to_string()),
             (
@@ -2288,7 +2352,7 @@ mod tests {
         ];
         let (internal, user) = partition_entry_fields(fields_vec.clone());
 
-        let mut merged: Vec<(String, String)> = merged_entry_fields(&internal, &user, None)
+        let mut merged: Vec<(String, String)> = merged_entry_fields(&internal, &user, &[])
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
         merged.sort();
@@ -2306,7 +2370,7 @@ mod tests {
         ]);
 
         let merged: HashMap<&str, &str> =
-            merged_entry_fields(&internal, &user, Some(X_RETRY_COUNT)).collect();
+            merged_entry_fields(&internal, &user, &[X_RETRY_COUNT]).collect();
         assert_eq!(merged.len(), 2);
         assert!(!merged.contains_key(X_RETRY_COUNT));
         assert_eq!(merged.get(PAYLOAD_FIELD), Some(&"data"));
@@ -2317,7 +2381,7 @@ mod tests {
     fn merged_entry_fields_preserves_user_headers_when_internal_is_empty() {
         let internal = HashMap::new();
         let user = HashMap::from([("x-trace-id".to_string(), "trace-1".to_string())]);
-        let merged: Vec<(&str, &str)> = merged_entry_fields(&internal, &user, None).collect();
+        let merged: Vec<(&str, &str)> = merged_entry_fields(&internal, &user, &[]).collect();
         assert_eq!(merged, vec![("x-trace-id", "trace-1")]);
     }
 

@@ -118,6 +118,26 @@ shove::define_topic!(
     TopologyBuilder::new("kafka-defer-nohold").dlq().build()
 );
 
+shove::define_topic!(
+    FanoutRetryTopicA,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-fanout-retry-isolation")
+        .for_consumer_group("reader-a")
+        .dlq()
+        .hold_queue(Duration::from_millis(100))
+        .build()
+);
+
+shove::define_topic!(
+    FanoutRetryTopicB,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-fanout-retry-isolation")
+        .for_consumer_group("reader-b")
+        .dlq()
+        .hold_queue(Duration::from_millis(100))
+        .build()
+);
+
 shove::define_sequenced_topic!(
     SeqSkipTopic,
     OrderMessage,
@@ -3045,6 +3065,130 @@ async fn standard_group_id_override_consumes_independently() {
     );
     sd2.cancel();
     j2.await.unwrap().ok();
+    broker.close().await;
+}
+
+#[tokio::test]
+async fn republished_retry_and_defer_stay_in_the_originating_fanout_group() {
+    #[derive(Clone)]
+    struct RetryThenDefer {
+        calls: WaitableCounter,
+    }
+
+    impl MessageHandler<FanoutRetryTopicA> for RetryThenDefer {
+        type Context = ();
+
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            let call = self.calls.get();
+            self.calls.increment();
+            match call {
+                0 => Outcome::Retry,
+                1 => Outcome::Defer,
+                _ => Outcome::Ack,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct AckOnly {
+        calls: WaitableCounter,
+    }
+
+    impl MessageHandler<FanoutRetryTopicB> for AckOnly {
+        type Context = ();
+
+        async fn handle(&self, _msg: SimpleMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.calls.increment();
+            Outcome::Ack
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<FanoutRetryTopicA>()
+        .await
+        .unwrap();
+    broker
+        .topology()
+        .declare::<FanoutRetryTopicB>()
+        .await
+        .unwrap();
+
+    let a = RetryThenDefer {
+        calls: WaitableCounter::new(),
+    };
+    let b = AckOnly {
+        calls: WaitableCounter::new(),
+    };
+    let shutdown_a = CancellationToken::new();
+    let shutdown_b = CancellationToken::new();
+
+    let task_a = {
+        let consumer = KafkaConsumer::new(client.clone());
+        let handler = a.clone();
+        let shutdown = shutdown_a.clone();
+        tokio::spawn(async move {
+            consumer
+                .run::<FanoutRetryTopicA, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new()
+                        .with_shutdown(shutdown)
+                        .with_prefetch_count(1),
+                )
+                .await
+        })
+    };
+    let task_b = {
+        let consumer = KafkaConsumer::new(client);
+        let handler = b.clone();
+        let shutdown = shutdown_b.clone();
+        tokio::spawn(async move {
+            consumer
+                .run::<FanoutRetryTopicB, _>(
+                    handler,
+                    (),
+                    ConsumerOptions::<Kafka>::new()
+                        .with_shutdown(shutdown)
+                        .with_prefetch_count(1),
+                )
+                .await
+        })
+    };
+
+    broker
+        .publisher()
+        .await
+        .unwrap()
+        .publish::<FanoutRetryTopicA>(&SimpleMessage {
+            id: "fanout-retry".into(),
+            content: "one logical delivery per group".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        a.calls.wait_for(3, TIMEOUT).await,
+        "reader A must retry, defer, then ack"
+    );
+    assert!(
+        b.calls.wait_for(1, TIMEOUT).await,
+        "reader B must receive the original publish"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        b.calls.get(),
+        1,
+        "reader B must not receive reader A's Retry/Defer republishes"
+    );
+
+    shutdown_a.cancel();
+    shutdown_b.cancel();
+    task_a.await.unwrap().unwrap();
+    task_b.await.unwrap().unwrap();
     broker.close().await;
 }
 

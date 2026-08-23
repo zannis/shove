@@ -95,7 +95,7 @@ The builder derives all queue names from the primary name:
 
 Deriving every name from the topic name is right for one reader and wrong for two. If a second service declares the same topology to read the same topic, it derives the *same* `order-settlement-dlq` and the *same* `order-settlement-hold-5s` — so each service drains the other's held and dead messages. The workaround was to give the second reader a **bare** topology (no `.dlq()`, no `.hold_queue()`), which costs it `Outcome::Retry` and `Outcome::Reject` entirely: without a DLQ both of those discard.
 
-`.for_consumer_group(name)` removes the trade-off. The topic stays shared; every derived name is namespaced by the group:
+On Kafka and Redis, `.for_consumer_group(name)` removes the trade-off. The topic stays shared; every derived name is namespaced by the group:
 
 ```rust,no_run
 // Service A — the incumbent reader, unchanged.
@@ -121,16 +121,17 @@ TopologyBuilder::new("order-settlement")
 Notes:
 
 - Call order does not matter — the names resolve at `.build()`, so `.for_consumer_group(...)` may appear anywhere in the chain.
-- `.dlq_named(...)` is used verbatim. Two readers naming the same DLQ share it on purpose.
+- `.dlq_named(...)` is used verbatim. Two readers naming the same DLQ share it on purpose, except that RabbitMQ and SQS reject any grouped topology with a DLQ because their redrive policy belongs to the shared source queue.
 - Omitting `.for_consumer_group(...)` reproduces every historical name exactly, so upgrading shove never re-points a deployed topology at a fresh, empty DLQ.
 
 Namespacing the retry chain is necessary for fan-out but not sufficient on its own — the two readers must also be in different *consumer groups*, which is a backend-level notion:
 
 | Backend | Does the group give you fan-out? |
 |---------|----------------------------------|
-| Kafka | Yes — the `group.id` becomes `{queue}-{group}-consumer`, so the readers get independent partition assignments. An explicit `with_group_id` still wins. |
-| Redis Streams | Yes — give the second reader a client configured with a different XGROUP name; the topology group namespaces its chain to match. |
-| NATS, RabbitMQ, SQS | Partly — the retry chain is namespaced, but the readers still share one durable consumer / queue and compete for messages. Real fan-out needs a second stream consumer or a fan-out exchange, which shove does not derive for you. |
+| Kafka | Yes — the `group.id` becomes `{queue}-{group}-consumer`, so the readers get independent partition assignments. Retry/Defer copies are tagged for that resolved group and filtered by every other group. An explicit `with_group_id` still wins. |
+| Redis Streams | Yes — give the second reader a client configured with a different XGROUP name. Retry/Defer copies carry the originating XGROUP and every other group acknowledges them without dispatch. |
+| NATS | Partly — the retry chain is namespaced, but readers still share one durable consumer and compete for messages. Real fan-out needs a second stream consumer. |
+| RabbitMQ, SQS | No for DLQ-enabled topologies — dead-letter/redrive policy belongs to the shared source queue, so declaration fails fast. Real fan-out requires separately named queues/subscriptions. |
 
 ## Hold queues
 

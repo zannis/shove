@@ -12,6 +12,10 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 pub(super) const RETRY_COUNT_HEADER: &str = "Shove-Retry-Count";
+/// Resolved Kafka `group.id` that owns a republished Retry/Defer copy.
+/// Other fan-out groups consume and commit the shared-topic copy without
+/// dispatching it to their handler.
+pub(super) const RETRY_TARGET_GROUP_HEADER: &str = "x-retry-group";
 pub(super) const DEATH_REASON_HEADER: &str = "Shove-Death-Reason";
 pub(super) const ORIGINAL_QUEUE_HEADER: &str = "Shove-Original-Queue";
 pub(super) const DEATH_COUNT_HEADER: &str = "Shove-Death-Count";

@@ -20,6 +20,7 @@ use testcontainers::ImageExt;
 use testcontainers::core::ContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
+use tokio_util::sync::CancellationToken;
 
 use shove::consumer_group::ConsumerGroupConfig;
 use shove::redis::{
@@ -225,6 +226,38 @@ impl Topic for RetryTopic {
         static T: OnceLock<shove::QueueTopology> = OnceLock::new();
         T.get_or_init(|| {
             TopologyBuilder::new("redis-int-retry")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+struct FanoutRetryTopicA;
+impl Topic for FanoutRetryTopicA {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-fanout-retry-isolation")
+                .for_consumer_group("reader-a")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+struct FanoutRetryTopicB;
+impl Topic for FanoutRetryTopicB {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-fanout-retry-isolation")
+                .for_consumer_group("reader-b")
                 .hold_queue(Duration::from_millis(100))
                 .dlq()
                 .build()
@@ -511,6 +544,121 @@ async fn retry_then_ack_on_redeliver() {
         2,
         "handler must be called exactly twice (retry + ack)"
     );
+}
+
+#[tokio::test]
+async fn republished_retry_and_defer_stay_in_the_originating_fanout_group() {
+    #[derive(Clone)]
+    struct RetryThenDefer(Arc<AtomicUsize>);
+    impl MessageHandler<FanoutRetryTopicA> for RetryThenDefer {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            match self.0.fetch_add(1, Ordering::Relaxed) {
+                0 => Outcome::Retry,
+                1 => Outcome::Defer,
+                _ => Outcome::Ack,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct AckOnly(Arc<AtomicUsize>);
+    impl MessageHandler<FanoutRetryTopicB> for AckOnly {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Ack
+        }
+    }
+
+    let broker_a = make_broker("reader-a").await;
+    let broker_b = make_broker("reader-b").await;
+    broker_a
+        .topology()
+        .declare::<FanoutRetryTopicA>()
+        .await
+        .expect("declare reader A");
+    broker_b
+        .topology()
+        .declare::<FanoutRetryTopicB>()
+        .await
+        .expect("declare reader B");
+
+    let calls_a = Arc::new(AtomicUsize::new(0));
+    let calls_b = Arc::new(AtomicUsize::new(0));
+    let mut supervisor_a = broker_a.consumer_supervisor();
+    supervisor_a
+        .register::<FanoutRetryTopicA, _>(
+            RetryThenDefer(calls_a.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(5),
+        )
+        .expect("register reader A");
+    let mut supervisor_b = broker_b.consumer_supervisor();
+    supervisor_b
+        .register::<FanoutRetryTopicB, _>(
+            AckOnly(calls_b.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(5),
+        )
+        .expect("register reader B");
+
+    let probe_a = calls_a.clone();
+    let task_a = tokio::spawn(async move {
+        let signal = async move {
+            poll_until(
+                || probe_a.load(Ordering::Relaxed) >= 3,
+                Duration::from_secs(10),
+            )
+            .await;
+        };
+        supervisor_a
+            .run_until_timeout(signal, Duration::from_secs(2))
+            .await
+    });
+    let stop_b = CancellationToken::new();
+    let stop_b_task = stop_b.clone();
+    let task_b = tokio::spawn(async move {
+        supervisor_b
+            .run_until_timeout(stop_b_task.cancelled_owned(), Duration::from_secs(2))
+            .await
+    });
+
+    broker_a
+        .publisher()
+        .await
+        .expect("publisher")
+        .publish::<FanoutRetryTopicA>(&Order { id: 99 })
+        .await
+        .expect("publish");
+
+    assert!(
+        poll_until(
+            || calls_a.load(Ordering::Relaxed) >= 3,
+            Duration::from_secs(10)
+        )
+        .await,
+        "reader A must retry, defer, then ack; calls={}",
+        calls_a.load(Ordering::Relaxed)
+    );
+    assert!(
+        poll_until(
+            || calls_b.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(10)
+        )
+        .await,
+        "reader B must receive the original publish"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        calls_b.load(Ordering::Relaxed),
+        1,
+        "reader B must not receive reader A's Retry/Defer republishes"
+    );
+
+    stop_b.cancel();
+    assert!(task_a.await.unwrap().is_clean());
+    assert!(task_b.await.unwrap().is_clean());
+    broker_a.close().await;
+    broker_b.close().await;
 }
 
 // Regression for the hold-tier off-by-one: the first retry must use hold
