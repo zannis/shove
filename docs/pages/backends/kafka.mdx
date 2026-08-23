@@ -137,8 +137,30 @@ let cfg = KafkaConsumerGroupConfig::new(1..=8)
 - **`with_max_retries(u32)`** — retry budget before dead-lettering. Default `10`.
 - **`with_handler_timeout(Duration)`** — per-message wall-clock deadline. Default `30s` (see [Handlers & Context](/concepts/handlers#handler-timeouts)).
 - **`with_concurrent_processing(bool)`** — dispatch each fetched message to its own tokio task (rejected for sequenced topics). Default `false`.
-- **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions.
+- **`with_group_id(impl Into<String>)`** — override the broker-side consumer group ID. Defaults to `"{queue}-consumer"`. Set this when two independent services consume the same topic and must each receive every message (fan-out) — otherwise they share a group and compete for partitions. Prefer `.for_consumer_group(...)` on the topology (below), which sets the group *and* the DLQ/hold-queue names together.
 - **`with_auto_offset_reset(KafkaAutoOffsetReset)`** — `Earliest` (default, replay history), `Latest` (tail-only), or `None` (refuse silent replay/skip on a fresh group).
+
+### Fan-out — a second reader on the same topic
+
+A bare `with_group_id` splits the *group* but not the retry chain: both readers still derive `{queue}-dlq` and `{queue}-hold-*`, so each drains the other's dead and held messages. Declaring the second reader's topology with [`for_consumer_group`](/concepts/topics#fan-out-two-readers-on-one-topic) splits both:
+
+```rust,no_run
+TopologyBuilder::new("order-settlement")
+    .for_consumer_group("settlement-audit")
+    .hold_queue(Duration::from_secs(5))
+    .dlq()                                   // order-settlement-settlement-audit-dlq
+    .build()
+```
+
+The resolved group IDs follow the topology:
+
+| Consumer | No fan-out group | `for_consumer_group("settlement-audit")` |
+|----------|------------------|------------------------------------------|
+| Standard | `order-settlement-consumer` | `order-settlement-settlement-audit-consumer` |
+| FIFO (sequenced) | `order-settlement-fifo` | `order-settlement-settlement-audit-fifo` |
+| DLQ drain | `order-settlement-dlq-consumer` | `order-settlement-settlement-audit-dlq-consumer` |
+
+Precedence is: an explicit `with_group_id` (on either `KafkaConsumerGroupConfig` or `ConsumerOptions::<Kafka>`) > the topology's fan-out group > the `{queue}-consumer` default. The explicit override staying on top means adding `for_consumer_group` to a topology cannot move an already-deployed consumer off the group it holds committed offsets under. The autoscaler resolves the same group ID as the broker-side consumer in every case, so lag is read from the group that is actually committing.
 
 ### Replication factor
 

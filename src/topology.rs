@@ -275,6 +275,10 @@ impl SequenceConfig {
 #[derive(Debug, Clone)]
 pub struct QueueTopology {
     pub(crate) queue: String,
+    /// Fan-out group this topology belongs to (see
+    /// [`TopologyBuilder::for_consumer_group`]). `None` is the historical
+    /// single-reader shape, where every derived name is topic-derived only.
+    pub(crate) consumer_group: Option<String>,
     pub(crate) dlq: Option<String>,
     pub(crate) hold_queues: Vec<HoldQueue>,
     pub(crate) sequencing: Option<SequenceConfig>,
@@ -298,6 +302,16 @@ pub struct QueueTopology {
 impl QueueTopology {
     pub fn queue(&self) -> &str {
         &self.queue
+    }
+
+    /// The fan-out group this topology was declared for, if set via
+    /// [`TopologyBuilder::for_consumer_group`].
+    ///
+    /// `None` means the topology is the historical single-reader shape: the
+    /// DLQ, hold queues and sequencing exchange are derived from the queue
+    /// name alone, so two readers of the same topic would share them.
+    pub fn consumer_group(&self) -> Option<&str> {
+        self.consumer_group.as_deref()
     }
 
     pub fn dlq(&self) -> Option<&str> {
@@ -351,17 +365,32 @@ impl QueueTopology {
     }
 
     pub fn shard_hold_queue_names(&self, shard_index: u16) -> Vec<HoldQueue> {
+        let prefix = aux_prefix(&self.queue, self.consumer_group.as_deref());
         self.hold_queues
             .iter()
             .map(|hq| HoldQueue {
                 name: format!(
-                    "{}-seq-{shard_index}-hold-{}",
-                    self.queue,
+                    "{prefix}-seq-{shard_index}-hold-{}",
                     hold_delay_suffix(hq.delay)
                 ),
                 delay: hq.delay,
             })
             .collect()
+    }
+}
+
+/// The prefix every *derived* auxiliary name (DLQ, hold queues, sequencing
+/// exchange) is built from.
+///
+/// Without a fan-out group this is the queue name, which is what shove has
+/// always used. With one it is `{queue}-{group}`, so two independent readers
+/// of the same topic get disjoint retry/DLQ chains instead of draining each
+/// other's held and dead messages. The main queue name is never rewritten —
+/// the whole point is that the topic stays shared.
+fn aux_prefix(queue: &str, consumer_group: Option<&str>) -> String {
+    match consumer_group {
+        Some(group) => format!("{queue}-{group}"),
+        None => queue.to_owned(),
     }
 }
 
@@ -387,10 +416,21 @@ fn hold_delay_suffix(delay: Duration) -> String {
 // TopologyBuilder
 // ---------------------------------------------------------------------------
 
+/// How the DLQ name was requested. Resolved at `build()` rather than at call
+/// time so `for_consumer_group()` can be called in any order relative to
+/// `dlq()`; last write still wins between `dlq()` and `dlq_named()`.
+enum DlqName {
+    /// `.dlq()` — derive `{queue}[-{group}]-dlq` at build time.
+    Derived,
+    /// `.dlq_named(..)` — use this name verbatim, group or no group.
+    Explicit(String),
+}
+
 #[must_use]
 pub struct TopologyBuilder {
     queue: String,
-    dlq: Option<String>,
+    consumer_group: Option<String>,
+    dlq: Option<DlqName>,
     hold_queues: Vec<Duration>,
     sequencing: Option<SequenceConfig>,
     allow_message_loss: bool,
@@ -412,6 +452,7 @@ impl TopologyBuilder {
     pub fn new(queue: impl Into<String>) -> Self {
         Self {
             queue: queue.into(),
+            consumer_group: None,
             dlq: None,
             hold_queues: Vec::new(),
             sequencing: None,
@@ -429,6 +470,74 @@ impl TopologyBuilder {
             #[cfg(feature = "kafka")]
             kafka_retention_forever: false,
         }
+    }
+
+    /// Declare this topology on behalf of a named fan-out group, so a second
+    /// independent reader of the same topic gets its **own** retry/DLQ chain.
+    ///
+    /// shove derives every auxiliary name from the queue name: `{queue}-dlq`,
+    /// `{queue}-hold-5s`, `{queue}-seq-hash`. That is right for one reader and
+    /// wrong for two — two services consuming the same topic would share one
+    /// DLQ and one set of hold queues, so each would drain the other's held
+    /// and dead messages. The workaround was to declare a *bare* topology
+    /// (no `.dlq()`, no `.hold_queue()`) on the second reader, which gives up
+    /// [`Outcome::Retry`](crate::Outcome::Retry) and
+    /// [`Outcome::Reject`](crate::Outcome::Reject) entirely — both silently
+    /// discard without a DLQ.
+    ///
+    /// With a group set, the derived names become `{queue}-{group}-dlq`,
+    /// `{queue}-{group}-hold-5s` and `{queue}-{group}-seq-hash`. The queue
+    /// name itself is untouched — the topic stays shared, which is the point.
+    /// A name given explicitly to [`dlq_named`](Self::dlq_named) is used
+    /// verbatim; the group only affects *derived* names.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Service A — the original reader, unchanged.
+    /// define_topic!(pub PriceEvents, PriceEvent,
+    ///     TopologyBuilder::new("price-events")
+    ///         .hold_queue(Duration::from_secs(5))
+    ///         .dlq()                       // price-events-dlq
+    ///         .build()
+    /// );
+    ///
+    /// // Service B — same topic, its own failure-handling chain.
+    /// define_topic!(pub PriceEventsLatest, PriceEvent,
+    ///     TopologyBuilder::new("price-events")
+    ///         .for_consumer_group("price-latest")
+    ///         .hold_queue(Duration::from_secs(5))  // price-events-price-latest-hold-5s
+    ///         .dlq()                               // price-events-price-latest-dlq
+    ///         .build()
+    /// );
+    /// ```
+    ///
+    /// # Backend notes
+    ///
+    /// Namespacing the retry chain is necessary for fan-out but not by itself
+    /// sufficient — the two readers must also be *in different consumer
+    /// groups*, which is a backend-level notion:
+    ///
+    /// - **Kafka** — the group is wired through: the `group.id` defaults to
+    ///   `{queue}-{group}` instead of `{queue}-consumer`, so the two readers
+    ///   get independent partition assignments rather than splitting one set.
+    ///   An explicit
+    ///   [`ConsumerOptions::with_group_id`](crate::ConsumerOptions::with_group_id)
+    ///   or [`KafkaConsumerGroupConfig::with_group_id`](crate::kafka::KafkaConsumerGroupConfig::with_group_id)
+    ///   still wins.
+    /// - **Redis** — the XGROUP name is a client-level setting; give the second
+    ///   reader a client with a different group and this namespaces its chain.
+    /// - **NATS / RabbitMQ / SQS** — the group namespaces the retry chain, but
+    ///   the readers still share one durable consumer / queue and therefore
+    ///   compete for messages. Real fan-out needs a second stream consumer or a
+    ///   fan-out exchange, which shove does not derive for you.
+    ///
+    /// # Panics
+    ///
+    /// `build()` panics if the group name is empty or blank.
+    pub fn for_consumer_group(mut self, group: impl Into<String>) -> Self {
+        self.consumer_group = Some(group.into());
+        self
     }
 
     /// Create and own a NATS JetStream WorkQueue stream over the given
@@ -575,11 +684,12 @@ impl TopologyBuilder {
     ///
     /// Defaults to **8** routing shards (override with [`routing_shards`](Self::routing_shards)).
     pub fn sequenced(mut self, on_failure: SequenceFailure) -> Self {
-        let exchange = format!("{}-seq-hash", self.queue);
+        // The exchange name is re-derived in `build()` so it picks up a
+        // `for_consumer_group()` call made after this one.
         self.sequencing = Some(SequenceConfig {
             on_failure,
             routing_shards: 8,
-            exchange,
+            exchange: String::new(),
         });
         self
     }
@@ -623,16 +733,21 @@ impl TopologyBuilder {
         self
     }
 
-    /// Enables a dead-letter queue with the default name `{queue}-dlq`.
+    /// Enables a dead-letter queue with the default name `{queue}-dlq`, or
+    /// `{queue}-{group}-dlq` under
+    /// [`for_consumer_group`](Self::for_consumer_group).
     pub fn dlq(mut self) -> Self {
-        self.dlq = Some(format!("{}-dlq", self.queue));
+        self.dlq = Some(DlqName::Derived);
         self
     }
 
     /// Enables a dead-letter queue with a custom name.
     ///
     /// Use this when the default `{queue}-dlq` suffix doesn't match your
-    /// naming convention or when the DLQ is shared across topics.
+    /// naming convention or when the DLQ is shared across topics. An explicit
+    /// name is used verbatim — [`for_consumer_group`](Self::for_consumer_group)
+    /// does not namespace it, so two readers naming the same DLQ share it on
+    /// purpose.
     ///
     /// # Example
     ///
@@ -642,7 +757,7 @@ impl TopologyBuilder {
     ///     .build();
     /// ```
     pub fn dlq_named(mut self, name: impl Into<String>) -> Self {
-        self.dlq = Some(name.into());
+        self.dlq = Some(DlqName::Explicit(name.into()));
         self
     }
 
@@ -670,7 +785,15 @@ impl TopologyBuilder {
     ///   [`allow_message_loss`](Self::allow_message_loss) is set).
     /// - Sequencing enabled without at least one hold queue (unless
     ///   [`allow_message_loss`](Self::allow_message_loss) is set).
-    pub fn build(self) -> QueueTopology {
+    /// - [`for_consumer_group`](Self::for_consumer_group) given an empty or
+    ///   blank group name.
+    pub fn build(mut self) -> QueueTopology {
+        if let Some(ref group) = self.consumer_group {
+            assert!(
+                !group.trim().is_empty(),
+                "for_consumer_group() requires a non-empty group name"
+            );
+        }
         #[cfg(feature = "nats")]
         {
             assert!(
@@ -742,19 +865,31 @@ impl TopologyBuilder {
             }
         }
 
-        let dlq = self.dlq;
+        // Every derived name resolves here, off one prefix, so a
+        // `for_consumer_group()` call anywhere in the chain is honoured.
+        let prefix = aux_prefix(&self.queue, self.consumer_group.as_deref());
+
+        let dlq = self.dlq.map(|name| match name {
+            DlqName::Derived => format!("{prefix}-dlq"),
+            DlqName::Explicit(name) => name,
+        });
 
         let hold_queues = self
             .hold_queues
             .into_iter()
             .map(|delay| HoldQueue {
-                name: format!("{}-hold-{}", self.queue, hold_delay_suffix(delay)),
+                name: format!("{prefix}-hold-{}", hold_delay_suffix(delay)),
                 delay,
             })
             .collect();
 
+        if let Some(ref mut seq) = self.sequencing {
+            seq.exchange = format!("{prefix}-seq-hash");
+        }
+
         QueueTopology {
             queue: self.queue,
+            consumer_group: self.consumer_group,
             dlq,
             hold_queues,
             sequencing: self.sequencing,
@@ -1099,6 +1234,165 @@ mod tests {
             .dlq()
             .build();
         assert_eq!(topology.dlq(), Some("orders-dlq"));
+    }
+
+    // -- fan-out groups --
+
+    #[test]
+    fn fan_out_group_is_none_by_default() {
+        let topology = TopologyBuilder::new("orders").dlq().build();
+        assert_eq!(topology.consumer_group(), None);
+    }
+
+    #[test]
+    fn fan_out_group_leaves_the_main_queue_shared() {
+        // The topic is the thing both readers share; namespacing it would
+        // defeat the purpose.
+        let topology = TopologyBuilder::new("price-events")
+            .for_consumer_group("price-latest")
+            .build();
+        assert_eq!(topology.queue(), "price-events");
+        assert_eq!(topology.consumer_group(), Some("price-latest"));
+    }
+
+    #[test]
+    fn fan_out_group_namespaces_the_derived_dlq() {
+        let topology = TopologyBuilder::new("price-events")
+            .for_consumer_group("price-latest")
+            .dlq()
+            .build();
+        assert_eq!(topology.dlq(), Some("price-events-price-latest-dlq"));
+    }
+
+    #[test]
+    fn fan_out_group_namespaces_hold_queues() {
+        let topology = TopologyBuilder::new("price-events")
+            .for_consumer_group("price-latest")
+            .hold_queue(Duration::from_secs(5))
+            .hold_queue(Duration::from_millis(250))
+            .dlq()
+            .build();
+        let names: Vec<_> = topology
+            .hold_queues()
+            .iter()
+            .map(|hq| hq.name().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "price-events-price-latest-hold-5s",
+                "price-events-price-latest-hold-250ms",
+            ]
+        );
+    }
+
+    #[test]
+    fn fan_out_group_namespaces_the_sequencing_exchange_and_shard_hold_queues() {
+        let topology = TopologyBuilder::new("payments")
+            .for_consumer_group("ledger-mirror")
+            .sequenced(SequenceFailure::FailAll)
+            .routing_shards(4)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .build();
+        assert_eq!(
+            topology.sequencing().unwrap().exchange(),
+            "payments-ledger-mirror-seq-hash"
+        );
+        assert_eq!(
+            topology.shard_hold_queue_names(2)[0].name(),
+            "payments-ledger-mirror-seq-2-hold-5s"
+        );
+    }
+
+    // Call order must not matter: the builder is a set of independent knobs
+    // everywhere else, and a group applied only to the calls that follow it
+    // would produce a half-namespaced chain — the exact silent-overlap bug the
+    // feature exists to prevent.
+    #[test]
+    fn fan_out_group_applies_regardless_of_call_order() {
+        let before = TopologyBuilder::new("price-events")
+            .for_consumer_group("price-latest")
+            .sequenced(SequenceFailure::Skip)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .build();
+        let after = TopologyBuilder::new("price-events")
+            .sequenced(SequenceFailure::Skip)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .for_consumer_group("price-latest")
+            .build();
+        assert_eq!(before.dlq(), after.dlq());
+        assert_eq!(
+            before.hold_queues()[0].name(),
+            after.hold_queues()[0].name()
+        );
+        assert_eq!(
+            before.sequencing().unwrap().exchange(),
+            after.sequencing().unwrap().exchange()
+        );
+    }
+
+    // An explicitly named DLQ is a deliberate choice — two readers naming the
+    // same one are asking to share it.
+    #[test]
+    fn fan_out_group_leaves_an_explicit_dlq_name_alone() {
+        let topology = TopologyBuilder::new("price-events")
+            .for_consumer_group("price-latest")
+            .dlq_named("shared-dead-letters")
+            .build();
+        assert_eq!(topology.dlq(), Some("shared-dead-letters"));
+    }
+
+    #[test]
+    fn two_fan_out_groups_share_the_topic_and_nothing_else() {
+        let a = TopologyBuilder::new("price-events")
+            .for_consumer_group("book")
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .build();
+        let b = TopologyBuilder::new("price-events")
+            .for_consumer_group("latest")
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .build();
+        assert_eq!(a.queue(), b.queue());
+        assert_ne!(a.dlq(), b.dlq());
+        assert_ne!(a.hold_queues()[0].name(), b.hold_queues()[0].name());
+    }
+
+    // Every derived name keeps its historical spelling when no group is set,
+    // so upgrading shove never silently re-points a deployed topology at a
+    // fresh, empty DLQ.
+    #[test]
+    fn no_fan_out_group_keeps_every_historical_name() {
+        let topology = TopologyBuilder::new("payments")
+            .sequenced(SequenceFailure::FailAll)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .build();
+        assert_eq!(topology.dlq(), Some("payments-dlq"));
+        assert_eq!(topology.hold_queues()[0].name(), "payments-hold-5s");
+        assert_eq!(
+            topology.sequencing().unwrap().exchange(),
+            "payments-seq-hash"
+        );
+        assert_eq!(
+            topology.shard_hold_queue_names(1)[0].name(),
+            "payments-seq-1-hold-5s"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "for_consumer_group() requires a non-empty group name")]
+    fn fan_out_group_rejects_a_blank_name() {
+        // A blank group would produce `orders--dlq` and read as a typo'd
+        // deployment rather than a shared one.
+        let _ = TopologyBuilder::new("orders")
+            .for_consumer_group("  ")
+            .dlq()
+            .build();
     }
 
     #[test]

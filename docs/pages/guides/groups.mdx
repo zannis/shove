@@ -2,6 +2,8 @@
 
 When your topic fills up faster than one consumer can drain it, you add consumers. When traffic drops off at night and you don't need ten idle workers, the autoscaler removes them. `broker.consumer_group()` is `shove`'s answer to both: a coordinated, min/max-bounded group of consumers that the autoscaler can grow or shrink based on queue depth. Available on RabbitMQ, NATS JetStream, Apache Kafka, Redis Streams, and InMemory.
 
+This page is about **splitting one workload across many consumers** — every message is handled once, by whichever consumer picks it up. If you instead want **two independent services to each receive every message** on a shared topic, that is fan-out: see [`for_consumer_group`](/concepts/topics#fan-out-two-readers-on-one-topic) on the topology builder, which gives the second reader its own DLQ and hold queues rather than making it share the first reader's.
+
 ## ConsumerGroupConfig shape
 
 Each backend has its own concrete `ConsumerGroupConfig` type. The generic `ConsumerGroupConfig\<B\>` wrapper in the top-level API holds the backend-specific inner config:

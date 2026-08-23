@@ -210,6 +210,12 @@ impl KafkaConsumerGroupConfig {
     /// identified within the registry by the topic name. A FIFO group rebases
     /// onto the override as `"{group}-fifo"` so a custom group does not
     /// re-collide on the default `"{queue}-fifo"`.
+    ///
+    /// For fan-out, prefer
+    /// [`TopologyBuilder::for_consumer_group`](crate::TopologyBuilder::for_consumer_group):
+    /// it derives this group ID *and* namespaces the DLQ/hold-queue chain, so
+    /// the second reader is not left sharing the first reader's DLQ. An
+    /// override set here still takes precedence over it.
     pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
         self.group_id = Some(group_id.into());
         self
@@ -222,32 +228,39 @@ impl KafkaConsumerGroupConfig {
     }
 
     /// Resolves the broker-side consumer group ID for `queue`: the explicit
-    /// override if set via [`with_group_id`], otherwise the default
-    /// `"{queue}-consumer"`. The autoscaler and broker-side consumer must
-    /// resolve the same value — keeping this in one place is the regression
-    /// guard for the arch-K-1-style "phantom backlog" footgun.
+    /// override if set via [`with_group_id`], else the topology's fan-out group
+    /// (`"{queue}-{group}-consumer"`, from
+    /// [`TopologyBuilder::for_consumer_group`](crate::TopologyBuilder::for_consumer_group)),
+    /// else the default `"{queue}-consumer"`. The autoscaler and broker-side
+    /// consumer must resolve the same value — keeping this in one place is the
+    /// regression guard for the arch-K-1-style "phantom backlog" footgun.
     ///
     /// [`with_group_id`]: Self::with_group_id
-    pub(crate) fn resolved_group_id(&self, queue: &str) -> String {
+    pub(crate) fn resolved_group_id(&self, queue: &str, fan_out_group: Option<&str>) -> String {
         self.group_id
             .clone()
-            .unwrap_or_else(|| super::constants::consumer_group_id(queue))
+            .unwrap_or_else(|| super::constants::consumer_group_id_scoped(queue, fan_out_group))
     }
 
     /// Resolves the broker-side FIFO consumer group ID for `queue`. When an
     /// override is set via [`with_group_id`] the FIFO group is rebased onto it
     /// as `"{group}-fifo"`, so a custom group does not re-collide on the
-    /// default `"{queue}-fifo"`. Otherwise falls back to that default.
+    /// default `"{queue}-fifo"`. Otherwise it follows the same fan-out-group
+    /// fallback as [`resolved_group_id`], as `"{queue}-{group}-fifo"`.
     ///
     /// Like [`resolved_group_id`], this is the single source the FIFO consumer
     /// and the autoscaler both resolve through.
     ///
     /// [`with_group_id`]: Self::with_group_id
     /// [`resolved_group_id`]: Self::resolved_group_id
-    pub(crate) fn resolved_fifo_group_id(&self, queue: &str) -> String {
+    pub(crate) fn resolved_fifo_group_id(
+        &self,
+        queue: &str,
+        fan_out_group: Option<&str>,
+    ) -> String {
         match self.group_id.as_deref() {
             Some(base) => super::constants::fifo_group_id_from_base(base),
-            None => super::constants::consumer_group_id_fifo(queue),
+            None => super::constants::consumer_group_id_fifo_scoped(queue, fan_out_group),
         }
     }
 
@@ -425,9 +438,10 @@ impl KafkaConsumerGroup {
 
         // arch-K-1 follow-up: honor the per-group `with_group_id` override here
         // so the autoscaler queries committed offsets under the same group the
-        // broker-side consumer actually joined. Falling back to the default
-        // `"{queue}-consumer"` keeps existing callers unchanged.
-        let group_id = config.resolved_group_id(&queue_str);
+        // broker-side consumer actually joined. Falling back to the topology's
+        // fan-out group and then to `"{queue}-consumer"` keeps existing callers
+        // unchanged.
+        let group_id = config.resolved_group_id(&queue_str, T::topology().consumer_group());
         Self {
             queue: queue_str,
             group_id,
@@ -505,7 +519,7 @@ impl KafkaConsumerGroup {
         // the autoscaler queries committed offsets under the same `{group}-fifo`
         // the broker-side FIFO consumer joins. Both resolve through
         // `fifo_group_id_from_base` — same arch-K-1 guard as the standard path.
-        let group_id = config.resolved_fifo_group_id(&queue_str);
+        let group_id = config.resolved_fifo_group_id(&queue_str, T::topology().consumer_group());
         Self {
             queue: queue_str,
             group_id,
@@ -1502,13 +1516,39 @@ mod tests {
     #[test]
     fn resolved_group_id_returns_override_when_set() {
         let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
-        assert_eq!(cfg.resolved_group_id("orders"), "my-service");
+        assert_eq!(cfg.resolved_group_id("orders", None), "my-service");
     }
 
     #[test]
     fn resolved_group_id_falls_back_to_default_derivation() {
         let cfg = KafkaConsumerGroupConfig::new(1..=1);
-        assert_eq!(cfg.resolved_group_id("orders"), "orders-consumer");
+        assert_eq!(cfg.resolved_group_id("orders", None), "orders-consumer");
+    }
+
+    // Fan-out (CAF-33): a topology declared with `for_consumer_group` gives the
+    // second reader of a shared topic its own group without the caller having
+    // to hand-write a `with_group_id`. Without this the two readers land in
+    // `orders-consumer` together and split partitions instead of each seeing
+    // every message.
+    #[test]
+    fn resolved_group_id_uses_topology_fan_out_group() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(
+            cfg.resolved_group_id("orders", Some("price-latest")),
+            "orders-price-latest-consumer"
+        );
+    }
+
+    // An explicit override still outranks the topology group — otherwise
+    // upgrading a topology to `for_consumer_group` would silently move a
+    // deployed consumer off the group it has committed offsets under.
+    #[test]
+    fn resolved_group_id_override_outranks_topology_fan_out_group() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
+        assert_eq!(
+            cfg.resolved_group_id("orders", Some("price-latest")),
+            "my-service"
+        );
     }
 
     // The override must also rebase the FIFO group so a custom group does not
@@ -1519,13 +1559,37 @@ mod tests {
     #[test]
     fn resolved_fifo_group_id_returns_suffixed_override_when_set() {
         let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
-        assert_eq!(cfg.resolved_fifo_group_id("orders"), "my-service-fifo");
+        assert_eq!(
+            cfg.resolved_fifo_group_id("orders", None),
+            "my-service-fifo"
+        );
     }
 
     #[test]
     fn resolved_fifo_group_id_falls_back_to_default_derivation() {
         let cfg = KafkaConsumerGroupConfig::new(1..=1);
-        assert_eq!(cfg.resolved_fifo_group_id("orders"), "orders-fifo");
+        assert_eq!(cfg.resolved_fifo_group_id("orders", None), "orders-fifo");
+    }
+
+    // The FIFO path takes the same fan-out fallback, and keeps the `-fifo`
+    // suffix rather than stacking onto `-consumer`, so the autoscaler's group
+    // and the broker-side FIFO consumer's group stay one string.
+    #[test]
+    fn resolved_fifo_group_id_uses_topology_fan_out_group() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1);
+        assert_eq!(
+            cfg.resolved_fifo_group_id("orders", Some("price-latest")),
+            "orders-price-latest-fifo"
+        );
+    }
+
+    #[test]
+    fn resolved_fifo_group_id_override_outranks_topology_fan_out_group() {
+        let cfg = KafkaConsumerGroupConfig::new(1..=1).with_group_id("my-service");
+        assert_eq!(
+            cfg.resolved_fifo_group_id("orders", Some("price-latest")),
+            "my-service-fifo"
+        );
     }
 
     // -- auto.offset.reset --
