@@ -1248,6 +1248,21 @@ where
 
                 let metadata = extract_dead_metadata(delivery);
 
+                // Before the size gate, exactly as `try_deserialize_or_reject`
+                // places it on the main loop. Labelled with the SOURCE topic
+                // rather than the DLQ queue name, and with whatever group the
+                // options carry (`run_dlq` builds defaults, so none): Redis
+                // already drains its DLQ through `run_stream_loop`, which
+                // labels every metric `topology.queue()` whichever stream it
+                // reads, so a DLQ name here would make `topic` mean two
+                // different things depending on the backend and would stop a
+                // per-topic size profile summing across the main and DLQ paths.
+                metrics::record_message_size(
+                    T::topology().queue(),
+                    options.consumer_group.as_deref(),
+                    received.payload.len(),
+                );
+
                 if let Err(e) = options.validate_payload_message_size(received.payload.len()) {
                     warn!(
                         error = %e,

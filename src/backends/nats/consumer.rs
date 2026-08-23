@@ -1353,6 +1353,17 @@ impl NatsConsumer {
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
+        // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic,
+        // not the DLQ stream name, and with no consumer group — `run_dlq`
+        // takes no `ConsumerOptions`, so there is no group to carry, and the
+        // internal `{dlq}-consumer` durable is not one. Redis already drains
+        // its DLQ through `run_stream_loop`, which labels every metric
+        // `topology.queue()` whichever stream it reads; a DLQ name here would
+        // make `topic` mean two different things depending on the backend, and
+        // would stop a per-topic size profile summing across the main and DLQ
+        // paths. The DLQ drain stays distinguishable through the metrics that
+        // exist to name it, not by overloading `topic`.
+        let topic: Arc<str> = Arc::from(topology.queue());
 
         tracing::info!(
             dlq,
@@ -1366,6 +1377,7 @@ impl NatsConsumer {
             let client = client.clone();
             let shutdown = shutdown.clone();
             let dlq_consumer_name = dlq_consumer_name.clone();
+            let topic = topic.clone();
             async move {
                 let stream = client
                     .jetstream()
@@ -1427,6 +1439,12 @@ impl NatsConsumer {
                                     ));
                                 }
                             };
+
+                            // Before the size gate, exactly as on the main loop: the
+                            // histogram describes what arrived on the wire, so the
+                            // payload the gate is about to discard is precisely the
+                            // sample an operator sizing `max_message_size` needs.
+                            metrics::record_message_size(&topic, None, msg.payload.len());
 
                             // Discard oversized DLQ messages
                             if msg.payload.len() > DEFAULT_MAX_MESSAGE_SIZE {
