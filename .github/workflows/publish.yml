@@ -85,15 +85,9 @@ jobs:
           git tag -m "v${{ steps.version.outputs.version }}" "v${{ steps.version.outputs.version }}"
           git push origin "HEAD:${{ github.ref_name }}" --follow-tags
 
-      - name: Authenticate with crates.io (trusted publishing)
-        id: crates-auth
-        uses: rust-lang/crates-io-auth-action@v1
-
-      - name: Publish to crates.io
-        run: cargo publish -q --all-features
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
-
+      # Generate the notes *before* `cargo publish`, the one irreversible step
+      # in this job: a crate version cannot be unpublished, so anything that can
+      # fail the release should fail while the run is still recoverable.
       - name: Generate changelog
         run: |
           cargo install -q git-cliff --locked
@@ -112,11 +106,25 @@ jobs:
             echo "No previous tag found; generating notes over full history"
             git-cliff --strip header --tag "v${VERSION}" -o RELEASE_NOTES.md
           fi
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "::error::Generated release notes for v${VERSION} are empty" >&2
+          # Test for *blank*, not just zero-length: `--strip header` on a range
+          # whose every commit was filtered leaves a file of bare newlines, which
+          # `[ -s ]` reports as non-empty. That is the realistic failure -- a
+          # release squashed into a single `release:` commit, which cliff.toml
+          # skips -- so the weaker test would let empty notes through.
+          if ! grep -q '[^[:space:]]' RELEASE_NOTES.md; then
+            echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write RELEASE_NOTES.md by hand and re-run, or re-cut the release with the individual commits intact."
             exit 1
           fi
           cat RELEASE_NOTES.md
+
+      - name: Authenticate with crates.io (trusted publishing)
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        run: cargo publish -q --all-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
 
       - name: Create GitHub release
         run: |
