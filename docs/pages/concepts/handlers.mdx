@@ -149,6 +149,10 @@ Three caveats before you reach for it, all inherited from [`Outcome::Defer`](/co
 
 **Redis Streams starts from a different default.** With no override, a timed-out entry is not mapped to an outcome at all: it is left in the PEL and reclaimed by `XAUTOCLAIM` after the idle deadline, which already redelivers without consuming retry budget. Setting this option makes Redis route the given outcome instead — so `Defer` there means the configured hold-queue delay rather than the idle deadline.
 
+That override also puts the consumer and the `XAUTOCLAIM` reaper on the same deadline: one wants to route an outcome at the handler timeout, the other wants to reclaim the entry and redeliver it. Redis consumers with the override set therefore hold a **lease** on the entry they are working on, re-asserted every half handler-timeout, which keeps the entry's idle clock away from any reaper's threshold — including a reaper in another process, which shove cannot otherwise see.
+
+This is the one place the timeout configuration has to be consistent to be correct. **Keep handler timeouts within 2× of each other across every consumer of a stream and group.** A consumer whose timeout is under half of another's reclaims inside the renewal gap and can take an entry its owner was about to resolve. Should that happen the owner does not route its outcome at all — the reclaiming consumer redelivers instead, exactly as it would have with the override unset, so the message is never both dead-lettered and redelivered.
+
 Handler **panics** are unaffected by this setting and always resolve to `Outcome::Retry` — a panic is a failed attempt, not a slow one.
 
 ## MessageMetadata

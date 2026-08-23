@@ -32,6 +32,14 @@
 //! configured consistently across every consumer of a stream and group —
 //! see `ConsumerOptions::with_handler_timeout`.
 //!
+//! Consistent timeouts alone would not save a consumer that resolves its own:
+//! a second process with the same timeout and no override still sweeps at the
+//! deadline its owner resolves on, and no policy visible here can stop it.
+//! Those consumers therefore defend the entry directly, by holding a
+//! renewed PEL lease on it — see [`super::lease`]. The backoff below is what
+//! keeps the owner's chosen outcome winning in the ordinary single-process
+//! case; the lease is what makes it correct when it does not.
+//!
 //! The key includes the client identity so two clients pointed at different
 //! Redis servers never share a maintenance task; two distinct clients on the
 //! same server merely run duplicate sweeps, which XAUTOCLAIM and the

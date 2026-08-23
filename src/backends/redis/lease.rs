@@ -146,6 +146,11 @@ pub(super) async fn run_under_lease<F: Future>(
     };
 
     let mut ticker = tokio::time::interval(renew_interval(handler_timeout));
+    // What matters is the gap since the last *successful* renewal, not
+    // keeping to an absolute schedule. Under the default `Burst` behaviour a
+    // renewal that took longer than the interval would be followed by a run
+    // of immediate catch-up ticks, which renew an already-fresh idle clock.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval`'s first tick resolves immediately; the entry was just read,
     // so its idle clock is already at zero.
     ticker.tick().await;

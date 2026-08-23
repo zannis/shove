@@ -362,6 +362,16 @@ impl<B: Backend> ConsumerOptions<B> {
     /// Redis route the given outcome instead, which for [`Outcome::Defer`]
     /// means the configured hold-queue delay rather than the idle deadline.
     ///
+    /// Setting it also makes a Redis consumer hold a lease on the entry it is
+    /// working on, renewed every half handler-timeout, so no `XAUTOCLAIM`
+    /// sweep can reclaim the entry the consumer is about to resolve. That
+    /// holds across processes, but only while handler timeouts are configured
+    /// consistently across every consumer of a stream and group: a consumer
+    /// whose timeout is under *half* of another's reclaims inside the renewal
+    /// gap. Should a lease be lost anyway, the timeout outcome is not routed —
+    /// the reclaiming sweep redelivers the entry instead, which is the
+    /// behaviour this consumer would have had with the option unset.
+    ///
     /// Handler *panics* are unaffected and always resolve to
     /// [`Outcome::Retry`] — a panic is a failed attempt, not a slow one.
     pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
