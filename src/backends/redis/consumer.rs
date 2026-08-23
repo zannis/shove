@@ -694,6 +694,19 @@ where
                         }
                     };
 
+                    // Recorded before every pre-handler drop below — the
+                    // FailAll cascade, the size check, the decode — and not
+                    // after. `shove_message_size_bytes` describes what arrived
+                    // on the wire, so an oversize payload is precisely the
+                    // sample an operator sizing `max_message_size` needs to
+                    // see; sizing only what survives would hide it. Every
+                    // other backend places the call the same way (RabbitMQ
+                    // `try_deserialize_or_reject`, Kafka/NATS/SQS immediately
+                    // after the payload is in hand, InMemory
+                    // `prepare_message`), and a cross-backend split here would
+                    // be worse than either choice.
+                    metrics::record_message_size(topic_name, consumer_group, payload_raw.len());
+
                     let retry_count = fields
                         .get(X_RETRY_COUNT)
                         .and_then(|s| s.parse::<u32>().ok())
@@ -1182,6 +1195,11 @@ where
                             continue;
                         }
                     };
+
+                    // Same placement as the sequential loop above: before the
+                    // size check, so an oversize payload still lands in the
+                    // histogram.
+                    metrics::record_message_size(topic_name, consumer_group, payload_raw.len());
 
                     let retry_count = fields
                         .get(X_RETRY_COUNT)
