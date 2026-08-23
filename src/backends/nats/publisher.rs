@@ -188,7 +188,10 @@ impl NatsPublisher {
             Ok(v) => v,
             Err(e) => return BatchReport::wholly_unattempted(messages.len(), e),
         };
-        let total = prepared.len();
+        // `prepared` is a 1:1 map over `messages`, so indices line up with the
+        // caller's slice — which is what `resolve` is handed.
+        let total = messages.len();
+        debug_assert_eq!(prepared.len(), total);
 
         // Fire all publishes, then await all acks — O(1 RTT) instead of O(N RTT).
         // Submission and ack are tracked separately so the wrapper can

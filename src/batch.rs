@@ -1,6 +1,6 @@
 //! Per-record outcome of a [`Publisher::publish_batch`] call.
 //!
-//! Backends report a batch as a [`BatchReport`] — an internal record of which
+//! Backends report a batch as an internal `BatchReport` — a record of which
 //! indices were rejected and which were never resolved. The public wrapper
 //! normalises that into either `Ok(())`, a bare backend error, or
 //! [`ShoveError::PartialBatch`] carrying a [`BatchFailure`].
@@ -71,12 +71,21 @@ impl BatchFailure {
 
     /// `failed ∪ unattempted`, ascending and deduplicated — exactly the
     /// records to re-publish, and never empty.
+    ///
+    /// The two sets are disjoint, so this is also their concatenation:
+    /// `to_republish().len() == failed().len() + unattempted().len()`.
     pub fn to_republish(&self) -> &[usize] {
         &self.to_republish
     }
 
-    /// How many records the backend confirmed. Always `>= 1`, and always
-    /// `msgs.len() - to_republish().len()`.
+    /// How many records the backend confirmed. Always `>= 1`.
+    ///
+    /// Both halves of the batch invariant hold:
+    ///
+    /// ```text
+    /// succeeded() + failed().len() + unattempted().len() == msgs.len()
+    /// succeeded() + to_republish().len()                 == msgs.len()
+    /// ```
     pub fn succeeded(&self) -> usize {
         self.succeeded
     }
@@ -230,8 +239,15 @@ impl BatchReport {
              failed={failed:?} unattempted={unattempted:?}"
         );
 
-        let to_republish = merge_ascending(&failed, &unattempted, total);
-        let unresolved = to_republish.len();
+        let failed = normalize(failed, total);
+        // `failed` wins any overlap: an index the backend explicitly rejected
+        // is not also "never submitted". Keeping the two sets disjoint is what
+        // makes `succeeded() + failed().len() + unattempted().len()` equal the
+        // batch size, rather than only `succeeded() + to_republish().len()`.
+        let mut unattempted = normalize(unattempted, total);
+        unattempted.retain(|i| failed.binary_search(i).is_err());
+
+        let unresolved = failed.len().saturating_add(unattempted.len());
         let succeeded = total.saturating_sub(unresolved);
 
         let Some(err) = first_err else {
@@ -251,8 +267,12 @@ impl BatchReport {
         // always returned, so existing `matches!(e, ShoveError::Topology(_))`
         // style matching does not regress.
         let result = if succeeded > 0 && unresolved > 0 {
-            let failed = dedup_ascending(failed, total);
-            let unattempted = dedup_ascending(unattempted, total);
+            // Both sides are sorted, deduplicated and disjoint, so the union
+            // is just the concatenation re-sorted.
+            let mut to_republish = Vec::with_capacity(unresolved);
+            to_republish.extend_from_slice(&failed);
+            to_republish.extend_from_slice(&unattempted);
+            to_republish.sort_unstable();
             Err(ShoveError::PartialBatch(Box::new(BatchFailure {
                 failed,
                 unattempted,
@@ -272,29 +292,17 @@ impl BatchReport {
     }
 }
 
-fn dedup_ascending(mut idx: Vec<usize>, total: usize) -> Vec<usize> {
-    idx.retain(|&i| i < total);
-    idx.sort_unstable();
-    idx.dedup();
-    idx
-}
-
-/// `failed ∪ unattempted`, ascending, deduplicated, and clamped to the batch.
+/// Sort, deduplicate, and clamp an index set to the batch.
 ///
 /// The clamp is a release-mode backstop for the `debug_assert!` in
 /// [`BatchReport::resolve`]: a backend that reported an index outside the batch
 /// has a bug, and dropping the index keeps `succeeded` honest rather than
-/// letting a bad index inflate the failure count.
-fn merge_ascending(failed: &[usize], unattempted: &[usize], total: usize) -> Vec<usize> {
-    let mut merged: Vec<usize> = failed
-        .iter()
-        .chain(unattempted.iter())
-        .copied()
-        .filter(|&i| i < total)
-        .collect();
-    merged.sort_unstable();
-    merged.dedup();
-    merged
+/// letting a bogus index inflate the failure count.
+fn normalize(mut idx: Vec<usize>, total: usize) -> Vec<usize> {
+    idx.retain(|&i| i < total);
+    idx.sort_unstable();
+    idx.dedup();
+    idx
 }
 
 /// Lossless on every target this crate supports; saturates rather than
@@ -385,30 +393,45 @@ mod tests {
 
     #[test]
     fn to_republish_is_sorted_deduped_and_merged() {
+        let out = BatchReport::sparse(vec![4, 1], vec![2, 5], Some(conn("boom"))).resolve(7);
+        let f = partial(&out);
+        assert_eq!(f.failed(), &[1, 4]);
+        assert_eq!(f.unattempted(), &[2, 5]);
+        assert_eq!(f.to_republish(), &[1, 2, 4, 5]);
+        assert_eq!(f.succeeded(), 3);
+        // The invariant, stated exactly as the contract does.
+        assert_eq!(f.succeeded() + f.failed().len() + f.unattempted().len(), 7);
+        assert_eq!(f.succeeded() + f.to_republish().len(), 7);
+    }
+
+    /// An index cannot be both "explicitly rejected" and "never submitted".
+    /// If a backend ever reported both, the two sets must stay disjoint —
+    /// otherwise `succeeded + failed.len() + unattempted.len()` over-counts
+    /// and the documented invariant becomes a lie.
+    #[test]
+    fn an_index_in_both_sets_counts_once_as_failed() {
         let out = BatchReport::sparse(vec![4, 1], vec![4, 2, 5], Some(conn("boom"))).resolve(7);
         let f = partial(&out);
-        assert_eq!(f.to_republish(), &[1, 2, 4, 5]);
         assert_eq!(f.failed(), &[1, 4]);
-        assert_eq!(f.unattempted(), &[2, 4, 5]);
-        // The invariant holds against the *merged* set, which is what
-        // `to_republish` promises.
-        assert_eq!(f.succeeded() + f.to_republish().len(), 7);
+        assert_eq!(f.unattempted(), &[2, 5], "4 is already accounted for");
+        assert_eq!(f.to_republish(), &[1, 2, 4, 5]);
+        assert_eq!(f.succeeded() + f.failed().len() + f.unattempted().len(), 7);
     }
 
     /// A backend reporting an index outside the batch is a bug, and
     /// `resolve`'s `debug_assert!` catches it in every test build. This pins
     /// the release-mode backstop underneath that assert: the index is dropped
     /// rather than trusted, so it cannot inflate the failure count or make
-    /// `succeeded` go negative-by-saturation.
+    /// `succeeded` saturate to zero.
     #[test]
-    fn merge_drops_out_of_range_indices() {
-        assert_eq!(merge_ascending(&[1, 99], &[], 3), vec![1]);
-        assert_eq!(merge_ascending(&[], &[3, 4], 3), Vec::<usize>::new());
+    fn normalize_drops_out_of_range_indices() {
+        assert_eq!(normalize(vec![1, 99], 3), vec![1]);
+        assert_eq!(normalize(vec![3, 4], 3), Vec::<usize>::new());
     }
 
     #[test]
-    fn merge_sorts_and_dedups_across_both_sets() {
-        assert_eq!(merge_ascending(&[4, 1], &[4, 2, 5], 7), vec![1, 2, 4, 5]);
+    fn normalize_sorts_and_dedups() {
+        assert_eq!(normalize(vec![4, 1, 4, 2], 7), vec![1, 2, 4]);
     }
 
     #[test]

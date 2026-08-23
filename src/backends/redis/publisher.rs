@@ -150,8 +150,8 @@ impl RedisPublisher {
 
     /// Publish a batch on a single multiplexed connection.
     ///
-    /// Prefix semantics per the [`PublisherImpl::publish_batch`] contract:
-    /// XADDs are issued sequentially and the call returns at the first error,
+    /// Prefix semantics: XADDs are issued sequentially and the call returns
+    /// at the first error,
     /// so that index is the failure and the remainder was never attempted.
     /// Failing to acquire the connection at all leaves the whole batch
     /// unattempted.

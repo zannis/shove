@@ -347,8 +347,9 @@ impl RabbitMqPublisher {
 
     /// Prefix semantics: confirms are awaited in order and the call stops at
     /// the first nack, so that index is the failure and the tail behind it is
-    /// outstanding. See [`Self::do_publish_batch`] for the submit-failure case,
-    /// where already-submitted-but-unconfirmed records are also outstanding.
+    /// outstanding. In the submit-failure case, already-submitted-but-
+    /// unconfirmed records are outstanding too — their fate is unknown, and
+    /// this crate resolves that toward re-publishing.
     pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
         self.publish_batch_report::<T>(messages)
             .await
