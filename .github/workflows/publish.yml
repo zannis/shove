@@ -83,7 +83,7 @@ jobs:
           git add Cargo.toml Cargo.lock package.json pnpm-lock.yaml
           git commit -m "release: v${{ steps.version.outputs.version }}"
           git tag -m "v${{ steps.version.outputs.version }}" "v${{ steps.version.outputs.version }}"
-          git push origin main --follow-tags
+          git push origin "HEAD:${{ github.ref_name }}" --follow-tags
 
       - name: Authenticate with crates.io (trusted publishing)
         id: crates-auth
@@ -100,6 +100,9 @@ jobs:
           git-cliff --latest --strip header -o RELEASE_NOTES.md
 
       - name: Create GitHub release
-        run: gh release create "v${{ steps.version.outputs.version }}" -F RELEASE_NOTES.md
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            -F RELEASE_NOTES.md \
+            --target "${{ github.sha }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

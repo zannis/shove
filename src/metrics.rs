@@ -102,6 +102,30 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
 /// and post-handler terminal outcomes (timeout, max_retries_exceeded,
 /// rejected) so operators can alert on every code path that retires a
 /// message without an Ack.
+///
+/// # Sequenced consumers: count independent failures, not cascades
+///
+/// On a sequenced topic declared with [`SequenceFailure::FailAll`], one
+/// message failing poisons its sequence key: every delivery already buffered
+/// for that key, plus every later delivery that arrives while the key stays
+/// poisoned, is dead-lettered without ever reaching the handler.
+///
+/// Only the message that *actually* failed is counted. The cascade is not.
+///
+/// The reason is that a cascade discard is not an independent failure — it is
+/// collateral of one already-counted failure. Counting it would scale
+/// `shove_messages_failed_total` by the queue depth behind the poisoned key,
+/// so a single bad message could register as hundreds of failures and make the
+/// counter useless for exactly the alerting it exists to support. The
+/// cascade's size is an ordering-policy consequence, observable through the
+/// `warn!`/`info!` logs at each poisoning site, not a failure count.
+///
+/// The rule applies to every backend that implements poisoned-key semantics
+/// (in-memory, RabbitMQ, SQS). Each cascade site is marked with a
+/// `// Cascade: intentionally not counted` comment pointing back here, so the
+/// backends do not drift apart the next time one of them is touched.
+///
+/// [`SequenceFailure::FailAll`]: crate::topology::SequenceFailure
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) enum FailReason {
