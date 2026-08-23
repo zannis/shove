@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use crate::batch::BatchReport;
 use crate::error::Result;
 use crate::topic::Topic;
 
@@ -23,15 +24,23 @@ pub(crate) trait PublisherImpl: Send + Sync {
         headers: HashMap<String, String>,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Publish a batch, returning the number of messages the backend
-    /// confirmed as accepted alongside the overall result. On `Ok(())` the
-    /// caller can assume `succeeded == msgs.len()`; on `Err(_)` the count
-    /// reflects how many were accepted before the failure surfaced (e.g.
-    /// SNS chunks, Kafka per-partition acks, RabbitMQ confirms), so the
-    /// `messages_published_total` counter doesn't have to choose between
-    /// overcounting failures or undercounting successes.
+    /// Publish a batch, reporting per-index what happened.
+    ///
+    /// A backend describes only what it observed — which indices it attempted
+    /// and had rejected ([`BatchReport::sparse`] / [`BatchReport::prefix`]),
+    /// and which it never resolved. It does **not** decide whether that counts
+    /// as a partial failure: [`BatchReport::resolve`] does that once, in
+    /// `Publisher::publish_batch`, so the `messages_published_total` split and
+    /// the [`ShoveError::PartialBatch`] contract stay identical across all six
+    /// backends.
+    ///
+    /// The one rule a backend must honour: a record whose fate is **unknown**
+    /// (submitted but unconfirmed) is `unattempted`, never confirmed.
+    /// Duplicates over loss.
+    ///
+    /// [`ShoveError::PartialBatch`]: crate::error::ShoveError::PartialBatch
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send;
+    ) -> impl Future<Output = BatchReport> + Send;
 }

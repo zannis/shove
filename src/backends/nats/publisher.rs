@@ -8,6 +8,7 @@ use bytes::Bytes;
 use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
+use crate::batch::BatchReport;
 use crate::error::Result;
 use crate::metrics;
 use crate::publisher_internal::{shard_for_key, validate_headers};
@@ -160,7 +161,19 @@ impl NatsPublisher {
         self.publish_raw(subject, headers, payload).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    /// Mixed semantics: ack failures are exact over the submitted prefix, and
+    /// a submission break leaves an unattempted tail behind it.
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+        self.publish_batch_report::<T>(messages)
+            .await
+            .resolve(messages.len())
+            .result
+    }
+
+    pub(crate) async fn publish_batch_report<T: Topic>(
+        &self,
+        messages: &[T::Message],
+    ) -> BatchReport {
         let topology = T::topology();
         let prepared: Result<Vec<(String, HeaderMap, Bytes)>> = messages
             .iter()
@@ -173,29 +186,38 @@ impl NatsPublisher {
             .collect();
         let prepared = match prepared {
             Ok(v) => v,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return BatchReport::wholly_unattempted(messages.len(), e),
         };
+        let total = prepared.len();
 
         // Fire all publishes, then await all acks — O(1 RTT) instead of O(N RTT).
         // Submission and ack are tracked separately so the wrapper can
         // attribute partial-failure counters to what NATS actually accepted
-        // before we surface the first error.
-        let mut ack_futures = Vec::with_capacity(prepared.len());
+        // before we surface the first error. Each ack carries its own index so
+        // a sparse ack failure is reported at the record it belongs to rather
+        // than collapsed into a count.
+        let mut ack_futures = Vec::with_capacity(total);
+        let mut failed: Vec<usize> = Vec::new();
+        let mut unattempted: Vec<usize> = Vec::new();
         let mut first_err: Option<ShoveError> = None;
-        for (subject, headers, payload) in prepared {
+        for (i, (subject, headers, payload)) in prepared.into_iter().enumerate() {
             match self
                 .client
                 .jetstream()
                 .publish_with_headers(subject, headers, payload)
                 .await
             {
-                Ok(ack) => ack_futures.push(ack),
+                Ok(ack) => ack_futures.push((i, ack)),
                 Err(e) => {
                     metrics::record_backend_error(
                         metrics::BackendLabel::Nats,
                         metrics::BackendErrorKind::Publish,
                     );
                     first_err = Some(ShoveError::Connection(format!("batch publish failed: {e}")));
+                    // This record was attempted and rejected; everything after
+                    // it never left the process.
+                    failed.push(i);
+                    unattempted.extend(i.saturating_add(1)..total);
                     break;
                 }
             }
@@ -205,27 +227,28 @@ impl NatsPublisher {
         // those messages were accepted by NATS and must be counted, not
         // abandoned. A submission error takes precedence in `first_err`; an
         // ack error only replaces it when nothing has failed yet.
-        let mut succeeded: u64 = 0;
-        for ack in ack_futures {
-            match ack.await {
-                Ok(_) => succeeded += 1,
-                Err(e) => {
-                    metrics::record_backend_error(
-                        metrics::BackendLabel::Nats,
-                        metrics::BackendErrorKind::Publish,
-                    );
-                    if first_err.is_none() {
-                        first_err = Some(ShoveError::Connection(format!(
-                            "batch publish ack failed: {e}"
-                        )));
-                    }
+        let mut ack_failed: Vec<usize> = Vec::new();
+        for (i, ack) in ack_futures {
+            if let Err(e) = ack.await {
+                metrics::record_backend_error(
+                    metrics::BackendLabel::Nats,
+                    metrics::BackendErrorKind::Publish,
+                );
+                ack_failed.push(i);
+                if first_err.is_none() {
+                    first_err = Some(ShoveError::Connection(format!(
+                        "batch publish ack failed: {e}"
+                    )));
                 }
             }
         }
-        match first_err {
-            Some(e) => (succeeded, Err(e)),
-            None => (succeeded, Ok(())),
+        if first_err.is_none() {
+            return BatchReport::all_succeeded();
         }
+        // Ack failures all sit below the submission break, so prepending them
+        // keeps `failed` ascending.
+        ack_failed.extend(failed);
+        BatchReport::sparse(ack_failed, unattempted, first_err)
     }
 }
 
@@ -245,7 +268,7 @@ impl PublisherImpl for NatsPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
-        NatsPublisher::publish_batch::<T>(self, msgs)
+    ) -> impl Future<Output = BatchReport> + Send {
+        NatsPublisher::publish_batch_report::<T>(self, msgs)
     }
 }

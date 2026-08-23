@@ -10,6 +10,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use uuid::Uuid;
 
 use crate::backend::PublisherImpl;
+use crate::batch::BatchReport;
 use crate::error::Result;
 use crate::metrics;
 use crate::publisher_internal::validate_headers;
@@ -298,7 +299,21 @@ impl KafkaPublisher {
             .await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    /// Sparse semantics: every record is submitted independently, so the
+    /// report names exactly the rejected indices and nothing is left
+    /// unattempted. An encoding failure rejects the batch before anything is
+    /// submitted, which is wholly-unattempted rather than partial.
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+        self.publish_batch_report::<T>(messages)
+            .await
+            .resolve(messages.len())
+            .result
+    }
+
+    pub(crate) async fn publish_batch_report<T: Topic>(
+        &self,
+        messages: &[T::Message],
+    ) -> BatchReport {
         use futures_util::future::join_all;
 
         let topology = T::topology();
@@ -314,7 +329,7 @@ impl KafkaPublisher {
             .collect();
         let prepared = match prepared {
             Ok(v) => v,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return BatchReport::wholly_unattempted(messages.len(), e),
         };
 
         // Submit every record concurrently so librdkafka's internal batching
@@ -349,22 +364,22 @@ impl KafkaPublisher {
             }))
             .await;
 
-        let mut succeeded: u64 = 0;
+        // `results` is positional — `join_all` preserves input order — so the
+        // index of an `Err` is the index of the record that was rejected.
+        let mut failed: Vec<usize> = Vec::new();
         let mut first_err: Option<ShoveError> = None;
-        for r in results {
-            match r {
-                Ok(()) => succeeded += 1,
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+        for (i, r) in results.into_iter().enumerate() {
+            if let Err(e) = r {
+                failed.push(i);
+                if first_err.is_none() {
+                    first_err = Some(e);
                 }
             }
         }
-        match first_err {
-            Some(e) => (succeeded, Err(e)),
-            None => (succeeded, Ok(())),
+        if first_err.is_none() {
+            return BatchReport::all_succeeded();
         }
+        BatchReport::sparse(failed, Vec::new(), first_err)
     }
 }
 
@@ -384,7 +399,7 @@ impl PublisherImpl for KafkaPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
-        KafkaPublisher::publish_batch::<T>(self, msgs)
+    ) -> impl Future<Output = BatchReport> + Send {
+        KafkaPublisher::publish_batch_report::<T>(self, msgs)
     }
 }

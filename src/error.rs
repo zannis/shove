@@ -1,3 +1,5 @@
+use crate::batch::BatchFailure;
+
 /// Errors that can occur during pub/sub operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -33,14 +35,37 @@ pub enum ShoveError {
     /// Treated as non-retryable so it surfaces immediately to the operator.
     #[error("unknown backend error: {0}")]
     Unknown(String),
+
+    /// A [`Publisher::publish_batch`] call partially succeeded: the backend
+    /// confirmed at least one record and did not confirm at least one other.
+    ///
+    /// The payload names the indices that still need re-publishing, so a
+    /// caller can retry only those instead of re-producing the whole batch.
+    /// A batch that fails as a *whole* does not use this variant — it returns
+    /// the same bare error it always has.
+    ///
+    /// Boxed to keep `ShoveError` small: it is returned by value from every
+    /// fallible call in the crate.
+    ///
+    /// [`Publisher::publish_batch`]: crate::publisher::Publisher::publish_batch
+    #[error("batch publish: {0}")]
+    PartialBatch(Box<BatchFailure>),
 }
 
 impl ShoveError {
     /// Returns `true` for transient errors that may succeed on retry (connection
     /// failures). Non-transient errors (topology, serialization) are returned
     /// immediately so callers don't waste time retrying.
+    ///
+    /// A [`PartialBatch`](Self::PartialBatch) delegates to the backend error
+    /// behind it: re-publishing the outstanding records is worth attempting
+    /// exactly when that error was.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, ShoveError::Connection(_))
+        match self {
+            ShoveError::Connection(_) => true,
+            ShoveError::PartialBatch(f) => f.source().is_retryable(),
+            _ => false,
+        }
     }
 }
 
@@ -97,5 +122,30 @@ mod tests {
             source: inner,
         };
         assert!(!err.is_retryable());
+    }
+
+    /// `PartialBatch` has no retryability of its own — it inherits the
+    /// backend error's. A connection blip is worth re-publishing for; a
+    /// topology error is not, no matter how many records got through.
+    #[test]
+    fn partial_batch_delegates_retryability_to_its_source() {
+        let retryable = crate::batch::BatchReport::prefix(
+            1,
+            3,
+            ShoveError::Connection("channel closed".into()),
+        )
+        .resolve(3)
+        .result
+        .unwrap_err();
+        assert!(matches!(retryable, ShoveError::PartialBatch(_)));
+        assert!(retryable.is_retryable());
+
+        let permanent =
+            crate::batch::BatchReport::prefix(1, 3, ShoveError::Topology("missing queue".into()))
+                .resolve(3)
+                .result
+                .unwrap_err();
+        assert!(matches!(permanent, ShoveError::PartialBatch(_)));
+        assert!(!permanent.is_retryable());
     }
 }

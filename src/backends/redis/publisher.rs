@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::backend::publisher::PublisherImpl;
+use crate::batch::BatchReport;
 use crate::error::{Result, ShoveError};
 use crate::publisher_internal::{shard_for_key as shared_shard_for_key, validate_headers};
 use crate::topic::Topic;
@@ -149,28 +150,33 @@ impl RedisPublisher {
 
     /// Publish a batch on a single multiplexed connection.
     ///
-    /// Returns `(succeeded, result)` per the [`PublisherImpl::publish_batch`]
-    /// contract — on `Ok(())` the caller may assume `succeeded == msgs.len()`;
-    /// on `Err(_)` `succeeded` is the count accepted before the failure.
-    pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> (u64, Result<()>) {
+    /// Prefix semantics per the [`PublisherImpl::publish_batch`] contract:
+    /// XADDs are issued sequentially and the call returns at the first error,
+    /// so that index is the failure and the remainder was never attempted.
+    /// Failing to acquire the connection at all leaves the whole batch
+    /// unattempted.
+    pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> Result<()> {
+        self.publish_batch_report::<T>(msgs)
+            .await
+            .resolve(msgs.len())
+            .result
+    }
+
+    pub(crate) async fn publish_batch_report<T: Topic>(&self, msgs: &[T::Message]) -> BatchReport {
         let mut conn = match self.cached_conn().await {
             Ok(c) => c,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return BatchReport::wholly_unattempted(msgs.len(), e),
         };
-        let mut succeeded: u64 = 0;
-        for msg in msgs {
-            match self
+        for (i, msg) in msgs.iter().enumerate() {
+            if let Err(e) = self
                 .publish_inner::<T>(msg, HashMap::new(), Some(&mut conn))
                 .await
             {
-                Ok(()) => succeeded += 1,
-                Err(e) => {
-                    self.invalidate_conn().await;
-                    return (succeeded, Err(e));
-                }
+                self.invalidate_conn().await;
+                return BatchReport::prefix(i, msgs.len(), e);
             }
         }
-        (succeeded, Ok(()))
+        BatchReport::all_succeeded()
     }
 }
 
@@ -197,8 +203,8 @@ impl PublisherImpl for RedisPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl std::future::Future<Output = (u64, Result<()>)> + Send {
-        RedisPublisher::publish_batch::<T>(self, msgs)
+    ) -> impl std::future::Future<Output = BatchReport> + Send {
+        RedisPublisher::publish_batch_report::<T>(self, msgs)
     }
 }
 

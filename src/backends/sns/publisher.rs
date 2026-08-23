@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::backend::PublisherImpl;
 use crate::backends::sns::client::SnsClient;
 use crate::backends::sns::topology::TopicRegistry;
+use crate::batch::BatchReport;
 use crate::error::{Result, ShoveError};
 use crate::metrics;
 use crate::publisher_internal::{fnv1a_64, shard_for_key, validate_headers};
@@ -248,7 +249,25 @@ impl SnsPublisher {
         self.do_publish::<T>(message, Some(headers)).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    /// Sparse semantics: SNS names the entries it rejects, and every entry is
+    /// stamped with its **global** index in `messages`, so a rejected entry
+    /// maps straight back to the record the caller passed in.
+    ///
+    /// Two coarser failure modes exist and both resolve to *unattempted*
+    /// rather than *failed*, because neither tells us per-record what
+    /// happened: a chunk whose `PublishBatch` call errors outright, and every
+    /// chunk after the one that broke the loop.
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+        self.publish_batch_report::<T>(messages)
+            .await
+            .resolve(messages.len())
+            .result
+    }
+
+    pub(crate) async fn publish_batch_report<T: Topic>(
+        &self,
+        messages: &[T::Message],
+    ) -> BatchReport {
         let topology = T::topology();
         let key_fn = T::SEQUENCE_KEY_FN;
 
@@ -261,24 +280,25 @@ impl SnsPublisher {
         // Pre-compute routing keys while we still have access to messages.
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
 
+        let total = messages.len();
         let payloads = match serialized {
             Ok(v) => v,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return BatchReport::wholly_unattempted(total, e),
         };
         let queue_name = topology.queue();
         let topic_arn = match self.resolve_arn(queue_name).await {
             Ok(arn) => arn,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return BatchReport::wholly_unattempted(total, e),
         };
 
         let has_sequencing = topology.sequencing().is_some();
 
         if has_sequencing && routing_keys.is_none() {
-            return (
-                0,
-                Err(ShoveError::Topology(
+            return BatchReport::wholly_unattempted(
+                total,
+                ShoveError::Topology(
                     "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
-                )),
+                ),
             );
         }
 
@@ -322,21 +342,33 @@ impl SnsPublisher {
             .collect::<Result<Vec<_>>>();
         let entries = match entries {
             Ok(v) => v,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return BatchReport::wholly_unattempted(total, e),
         };
 
-        // Chunk into groups of 10 and send. Track the per-chunk outcome so
-        // the wrapper can record accurate per-message counters even on partial
-        // failure — the API-level `Result<()>` collapses the success/failure
-        // split that SNS actually reports.
-        let mut succeeded: u64 = 0;
+        // Chunk into groups of 10 and send. Track which *indices* each chunk
+        // resolved so the wrapper can record accurate per-message counters and
+        // hand the caller exact re-publish indices — the API-level
+        // `Result<()>` collapses the split that SNS actually reports.
+        let mut failed_idx: Vec<usize> = Vec::new();
+        let mut unattempted_idx: Vec<usize> = Vec::new();
         let mut first_err: Option<ShoveError> = None;
+        let mut chunk_start: usize = 0;
         for chunk in entries.chunks(SNS_BATCH_LIMIT) {
+            // Entry ids are the global index (`.id(i.to_string())` above), so
+            // this range is exactly the records in this chunk.
+            let chunk_range = chunk_start..chunk_start.saturating_add(chunk.len());
+            chunk_start = chunk_range.end;
+
             let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
             let mut chunk_err: Option<ShoveError> = None;
-            let mut chunk_succeeded: u64 = 0;
+            // Indices this chunk resolved as rejected, and indices it left
+            // unresolved. Exactly one of the two is populated per outcome.
+            let mut chunk_failed: Vec<usize> = Vec::new();
+            let mut chunk_unresolved: Vec<usize> = Vec::new();
 
             for attempt in 0..3u32 {
+                chunk_failed.clear();
+                chunk_unresolved.clear();
                 match self
                     .client
                     .inner()
@@ -348,7 +380,6 @@ impl SnsPublisher {
                 {
                     Ok(result) => {
                         let failed = result.failed();
-                        chunk_succeeded = (chunk.len() - failed.len()) as u64;
                         if !failed.is_empty() {
                             metrics::record_backend_error(
                                 metrics::BackendLabel::SnsSqs,
@@ -361,6 +392,21 @@ impl SnsPublisher {
                                 failed[0].message().unwrap_or("unknown"),
                                 failed[0].code(),
                             )));
+                            match parse_failed_indices(failed.iter().map(|f| f.id()), &chunk_range)
+                            {
+                                Some(idx) => chunk_failed = idx,
+                                // SNS named an entry we can't map back to a
+                                // record. Rather than guess, treat the whole
+                                // chunk as outstanding.
+                                None => {
+                                    warn!(
+                                        queue_name,
+                                        "SNS named a failed entry id outside this chunk; \
+                                         re-publishing the whole chunk"
+                                    );
+                                    chunk_unresolved = chunk_range.clone().collect();
+                                }
+                            }
                             // Partial failures are not transient — don't retry
                             break;
                         }
@@ -373,7 +419,9 @@ impl SnsPublisher {
                             metrics::BackendErrorKind::Publish,
                         );
                         let err = map_sns_error("SNS batch publish failed", e);
-                        chunk_succeeded = 0;
+                        // The call itself failed, so SNS reported nothing
+                        // per-record: every entry in the chunk is outstanding.
+                        chunk_unresolved = chunk_range.clone().collect();
                         // Permanent failures (auth, invalid params, topic not
                         // found) can't succeed on retry — stop early.
                         if !err.is_retryable() {
@@ -390,21 +438,45 @@ impl SnsPublisher {
                 }
             }
 
-            succeeded += chunk_succeeded;
+            failed_idx.append(&mut chunk_failed);
+            unattempted_idx.append(&mut chunk_unresolved);
             if let Some(err) = chunk_err {
                 first_err = Some(err);
+                // The loop stops here, so every remaining chunk is untouched.
+                unattempted_idx.extend(chunk_range.end..total);
                 break;
             }
         }
 
-        match first_err {
-            Some(err) => (succeeded, Err(err)),
-            None => {
-                debug!(queue_name, count = payloads.len(), "batch published to SNS");
-                (succeeded, Ok(()))
-            }
+        if first_err.is_none() {
+            debug!(queue_name, count = payloads.len(), "batch published to SNS");
+            return BatchReport::all_succeeded();
         }
+        BatchReport::sparse(failed_idx, unattempted_idx, first_err)
     }
+}
+
+/// Map SNS's failed-entry ids back to indices in the original `messages`
+/// slice.
+///
+/// Entries are stamped with their global index, so the id is the index. Returns
+/// `None` if any id is unparseable or falls outside the chunk it came from —
+/// the caller then treats the whole chunk as outstanding rather than trusting
+/// a mapping it can't verify.
+fn parse_failed_indices<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    chunk_range: &std::ops::Range<usize>,
+) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for id in ids {
+        let idx: usize = id.parse().ok()?;
+        if !chunk_range.contains(&idx) {
+            return None;
+        }
+        out.push(idx);
+    }
+    out.sort_unstable();
+    Some(out)
 }
 
 impl PublisherImpl for SnsPublisher {
@@ -423,8 +495,8 @@ impl PublisherImpl for SnsPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
-        SnsPublisher::publish_batch::<T>(self, msgs)
+    ) -> impl Future<Output = BatchReport> + Send {
+        SnsPublisher::publish_batch_report::<T>(self, msgs)
     }
 }
 

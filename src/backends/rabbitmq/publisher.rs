@@ -15,6 +15,7 @@ use crate::backend::PublisherImpl;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
+use crate::batch::BatchReport;
 use crate::error::{Result, ShoveError};
 use crate::metrics;
 use crate::publisher_internal::validate_headers;
@@ -174,8 +175,8 @@ impl RabbitMqPublisher {
         Ok(())
     }
 
-    /// Returns `(succeeded, result)` for the batch. On success `succeeded ==
-    /// items.len()`; on failure it reflects the count from the final attempt
+    /// Returns the per-index report for the batch. On success nothing is
+    /// outstanding; on failure the report reflects the **final** attempt
     /// (retries replay the full batch on a fresh channel, so the previous
     /// attempts' confirmations are no longer attributable to a single
     /// publish call).
@@ -183,38 +184,41 @@ impl RabbitMqPublisher {
         &self,
         exchange: &str,
         items: &[(&str, bytes::Bytes)],
-    ) -> (u64, Result<()>) {
+    ) -> BatchReport {
         let slot = self.pool.get();
 
         debug!(exchange, count = items.len(), "publishing batch");
 
         let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(2));
-        let mut last: (u64, Result<()>) = (0, Ok(()));
+        let mut last = BatchReport::all_succeeded();
 
         for attempt in 0..3u32 {
             // Clone the channel before releasing the lock — same rationale as
             // `publish_raw`: the mutex is held only for the Arc clone, not for
             // the network round-trips inside `do_publish_batch`.
             let channel = slot.lock().await.clone();
-            let (succeeded, result) = Self::do_publish_batch(&channel, exchange, items).await;
-            match result {
-                Ok(()) => {
+            let report = Self::do_publish_batch(&channel, exchange, items).await;
+            match report.first_err() {
+                None => {
                     debug!(
                         exchange,
                         count = items.len(),
                         "batch published and confirmed"
                     );
-                    return (succeeded, Ok(()));
+                    return report;
                 }
-                Err(e) => {
+                Some(e) => {
                     warn!(exchange, attempt, error = %e, "batch publish failed, recovering channel");
-                    last = (succeeded, Err(e));
+                    last = report;
                     if attempt < 2 {
                         let delay = backoff.next().expect("backoff is infinite");
                         tokio::time::sleep(delay).await;
                         match self.client.create_confirm_channel().await {
                             Ok(fresh) => *slot.lock().await = fresh,
-                            Err(e) => return (last.0, Err(e)),
+                            // The last attempt's indices are still what needs
+                            // re-publishing; the channel error is what the
+                            // caller should see.
+                            Err(e) => return last.with_error(e, items.len()),
                         }
                     }
                 }
@@ -224,20 +228,24 @@ impl RabbitMqPublisher {
         last
     }
 
-    /// Submit every message and await each publisher confirm, returning the
-    /// number of confirmed-acked messages alongside the first error
-    /// encountered. The success count reflects only confirmations actually
-    /// observed: messages submitted to the channel but unconfirmed when an
-    /// earlier basic_publish fails are not counted, since we don't know if
-    /// the broker ever received them.
+    /// Submit every message and await each publisher confirm, reporting which
+    /// indices were rejected and which are outstanding.
+    ///
+    /// Only confirmations actually observed count as successes: messages
+    /// submitted to the channel but unconfirmed when a later `basic_publish`
+    /// fails are reported as **unattempted**, since we don't know if the
+    /// broker ever received them. Re-publishing them risks a duplicate;
+    /// not re-publishing them risks a loss, and this crate always picks the
+    /// duplicate.
     async fn do_publish_batch(
         channel: &Channel,
         exchange: &str,
         items: &[(&str, bytes::Bytes)],
-    ) -> (u64, Result<()>) {
-        let mut confirms = Vec::with_capacity(items.len());
+    ) -> BatchReport {
+        let total = items.len();
+        let mut confirms = Vec::with_capacity(total);
         let props = base_properties();
-        for (routing_key, payload) in items {
+        for (i, (routing_key, payload)) in items.iter().enumerate() {
             match channel
                 .basic_publish(
                     exchange.into(),
@@ -249,12 +257,22 @@ impl RabbitMqPublisher {
                 .await
             {
                 Ok(confirm) => confirms.push(confirm),
-                Err(e) => return (0, Err(map_lapin_error("batch publish failed", e))),
+                Err(e) => {
+                    // Index `i` was attempted and rejected. Indices before it
+                    // were submitted but will never be confirmed now, and
+                    // indices after it were never submitted — both are
+                    // outstanding.
+                    let unattempted = (0..i).chain(i.saturating_add(1)..total).collect();
+                    return BatchReport::sparse(
+                        vec![i],
+                        unattempted,
+                        Some(map_lapin_error("batch publish failed", e)),
+                    );
+                }
             }
         }
 
-        let mut succeeded: u64 = 0;
-        for confirm in confirms {
+        for (i, confirm) in confirms.into_iter().enumerate() {
             match confirm.await {
                 Ok(result) => {
                     if result.is_nack() {
@@ -262,20 +280,26 @@ impl RabbitMqPublisher {
                             metrics::BackendLabel::RabbitMq,
                             metrics::BackendErrorKind::Publish,
                         );
-                        return (
-                            succeeded,
-                            Err(ShoveError::Connection(
+                        return BatchReport::prefix(
+                            i,
+                            total,
+                            ShoveError::Connection(
                                 "broker NACKed a batch message".to_string(),
-                            )),
+                            ),
                         );
                     }
-                    succeeded += 1;
                 }
-                Err(e) => return (succeeded, Err(map_lapin_error("batch confirm failed", e))),
+                Err(e) => {
+                    return BatchReport::prefix(
+                        i,
+                        total,
+                        map_lapin_error("batch confirm failed", e),
+                    );
+                }
             }
         }
 
-        (succeeded, Ok(()))
+        BatchReport::all_succeeded()
     }
 }
 
@@ -323,7 +347,21 @@ impl RabbitMqPublisher {
         }
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
+    /// Prefix semantics: confirms are awaited in order and the call stops at
+    /// the first nack, so that index is the failure and the tail behind it is
+    /// outstanding. See [`Self::do_publish_batch`] for the submit-failure case,
+    /// where already-submitted-but-unconfirmed records are also outstanding.
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+        self.publish_batch_report::<T>(messages)
+            .await
+            .resolve(messages.len())
+            .result
+    }
+
+    pub(crate) async fn publish_batch_report<T: Topic>(
+        &self,
+        messages: &[T::Message],
+    ) -> BatchReport {
         let topology = T::topology();
         let queue = topology.queue();
         let sequencing = topology.sequencing();
@@ -335,7 +373,7 @@ impl RabbitMqPublisher {
             .collect();
         let payloads = match payloads {
             Ok(v) => v,
-            Err(e) => return (0, Err(e)),
+            Err(e) => return BatchReport::wholly_unattempted(messages.len(), e),
         };
 
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
@@ -349,11 +387,11 @@ impl RabbitMqPublisher {
                     .collect();
                 self.publish_batch_raw(seq.exchange(), &items).await
             }
-            (Some(_), None) => (
-                0,
-                Err(ShoveError::Topology(
+            (Some(_), None) => BatchReport::wholly_unattempted(
+                messages.len(),
+                ShoveError::Topology(
                     "topic has sequencing config but no SEQUENCE_KEY_FN defined".to_string(),
-                )),
+                ),
             ),
             (None, _) => {
                 let items: Vec<(&str, bytes::Bytes)> =
@@ -380,8 +418,8 @@ impl PublisherImpl for RabbitMqPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
-        RabbitMqPublisher::publish_batch::<T>(self, msgs)
+    ) -> impl Future<Output = BatchReport> + Send {
+        RabbitMqPublisher::publish_batch_report::<T>(self, msgs)
     }
 }
 

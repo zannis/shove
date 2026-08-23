@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::Topic;
 use crate::backend::PublisherImpl;
+use crate::batch::BatchReport;
 use crate::error::{Result, ShoveError};
 use crate::publisher_internal::{shard_for_key, validate_headers};
 
@@ -86,15 +87,32 @@ impl InMemoryPublisher {
         self.publish_one::<T>(message, headers).await
     }
 
-    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> (u64, Result<()>) {
-        let mut succeeded: u64 = 0;
-        for message in messages {
-            match self.publish_one::<T>(message, HashMap::new()).await {
-                Ok(()) => succeeded += 1,
-                Err(e) => return (succeeded, Err(e)),
+    /// Publish a batch, as [`Publisher::publish_batch`] does but without the
+    /// metrics wrapper.
+    ///
+    /// A partial failure returns [`ShoveError::PartialBatch`] carrying the
+    /// indices still to re-publish. This backend has prefix semantics: the
+    /// failing index is the only entry in `failed()`, and everything after it
+    /// is `unattempted()`.
+    ///
+    /// [`Publisher::publish_batch`]: crate::publisher::Publisher::publish_batch
+    pub async fn publish_batch<T: Topic>(&self, messages: &[T::Message]) -> Result<()> {
+        self.publish_batch_report::<T>(messages)
+            .await
+            .resolve(messages.len())
+            .result
+    }
+
+    pub(crate) async fn publish_batch_report<T: Topic>(
+        &self,
+        messages: &[T::Message],
+    ) -> BatchReport {
+        for (i, message) in messages.iter().enumerate() {
+            if let Err(e) = self.publish_one::<T>(message, HashMap::new()).await {
+                return BatchReport::prefix(i, messages.len(), e);
             }
         }
-        (succeeded, Ok(()))
+        BatchReport::all_succeeded()
     }
 }
 
@@ -114,8 +132,8 @@ impl PublisherImpl for InMemoryPublisher {
     fn publish_batch<T: Topic>(
         &self,
         msgs: &[T::Message],
-    ) -> impl Future<Output = (u64, Result<()>)> + Send {
-        InMemoryPublisher::publish_batch::<T>(self, msgs)
+    ) -> impl Future<Output = BatchReport> + Send {
+        InMemoryPublisher::publish_batch_report::<T>(self, msgs)
     }
 }
 
@@ -125,11 +143,13 @@ fn shard_index(key: &str, shards: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::OnceLock;
 
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use super::super::client::InMemoryConfig;
     use crate::topic::{SequencedTopic, Topic as TopicTrait};
     use crate::topology::{QueueTopology, SequenceFailure, TopologyBuilder};
 
@@ -276,12 +296,75 @@ mod tests {
         let publisher = InMemoryPublisher::new(broker.clone());
 
         let messages: Vec<Msg> = (0..5).map(|i| Msg { id: i }).collect();
-        let (succeeded, res) = publisher.publish_batch::<SimpleTopic>(&messages).await;
-        res.unwrap();
-        assert_eq!(succeeded, messages.len() as u64);
+        let outcome = publisher
+            .publish_batch_report::<SimpleTopic>(&messages)
+            .await
+            .resolve(messages.len());
+        outcome.result.unwrap();
+        assert_eq!(outcome.succeeded, messages.len() as u64);
+        assert_eq!(outcome.failed, 0);
 
         let queue = broker.lookup("simple-pub").unwrap();
         assert_eq!(queue.buffer.lock().await.len(), 5);
+    }
+
+    /// A batch that stops partway reports the failing index and the tail it
+    /// never tried — the prefix shape.
+    ///
+    /// Made deterministic without any timing: the broker is shut down *first*,
+    /// and the queue capacity is 2. Messages 0 and 1 take the fast path in
+    /// `InMemoryBroker::enqueue` (space available, shutdown not consulted);
+    /// message 2 finds the buffer full and the already-cancelled shutdown
+    /// token resolves immediately.
+    #[tokio::test]
+    async fn publish_batch_reports_prefix_indices_on_partial_failure() {
+        let capacity = NonZeroUsize::new(2).expect("2 is non-zero");
+        let broker =
+            InMemoryBroker::with_config(InMemoryConfig::default().with_default_capacity(capacity));
+        setup::<SimpleTopic>(&broker).await;
+        broker.shutdown();
+
+        let publisher = InMemoryPublisher::new(broker.clone());
+        let messages: Vec<Msg> = (0..5).map(|i| Msg { id: i }).collect();
+        let outcome = publisher
+            .publish_batch_report::<SimpleTopic>(&messages)
+            .await
+            .resolve(messages.len());
+
+        assert_eq!(outcome.succeeded, 2);
+        assert_eq!(outcome.failed, 3);
+        let Err(ShoveError::PartialBatch(f)) = outcome.result else {
+            panic!("expected a PartialBatch for a 2-of-5 batch");
+        };
+        assert_eq!(f.succeeded(), 2);
+        assert_eq!(f.failed(), &[2]);
+        assert_eq!(f.unattempted(), &[3, 4]);
+        assert_eq!(f.to_republish(), &[2, 3, 4]);
+        assert!(matches!(f.source(), ShoveError::Connection(_)));
+
+        // The invariant, asserted for this backend.
+        assert_eq!(f.succeeded() + f.to_republish().len(), messages.len());
+
+        let queue = broker.lookup("simple-pub").unwrap();
+        assert_eq!(queue.buffer.lock().await.len(), 2);
+    }
+
+    /// A batch where *nothing* landed is not partial, so it keeps returning
+    /// the bare error it returned before `PartialBatch` existed.
+    #[tokio::test]
+    async fn publish_batch_wholly_failed_returns_the_bare_error() {
+        let broker = InMemoryBroker::new();
+        // No declare — every message fails the queue lookup.
+        let publisher = InMemoryPublisher::new(broker);
+        let messages: Vec<Msg> = (0..3).map(|i| Msg { id: i }).collect();
+        let outcome = publisher
+            .publish_batch_report::<SimpleTopic>(&messages)
+            .await
+            .resolve(messages.len());
+
+        assert_eq!(outcome.succeeded, 0);
+        assert_eq!(outcome.failed, 3);
+        assert!(matches!(outcome.result, Err(ShoveError::Topology(_))));
     }
 
     #[tokio::test]
