@@ -96,6 +96,12 @@ withholds only the three effects that cannot be taken back:
 | Publish to crates.io | `cargo publish` | `cargo publish --dry-run` (no auth token minted) |
 | Create GitHub release | `gh release create` | asserts the notes file exists, prints the command |
 
+One more difference: empty release notes **fail** a real release and only
+**warn** on a rehearsal. A rehearsal is normally dispatched from the branch
+that changes `publish.yml`, so every commit in its range is a `ci:` one, which
+`cliff.toml` skips — stopping there would leave the steps after the changelog
+untested. The rehearsal substitutes a stand-in file and carries on.
+
 Run one on a branch after changing `publish.yml`; the `bump: <x>` path is
 otherwise only ever exercised by a real release.
 
