@@ -971,6 +971,7 @@ where
                         );
                         poisoned_keys.insert(key.clone());
                     }
+                    metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Rejected);
                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     in_flight_count -= 1;
                     drain_pending_for_key::<T, H>(
@@ -1186,11 +1187,6 @@ where
                                 }
                             }
                         }
-                        metrics::record_failed(
-                            &topic,
-                            group.as_deref(),
-                            metrics::FailReason::MaxRetriesExceeded,
-                        );
                         router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                         continue;
                     }
