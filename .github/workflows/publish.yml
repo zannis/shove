@@ -28,6 +28,10 @@ on:
 permissions:
   contents: write
   id-token: write
+  # Read-only, for the "Require a green ci.yml run" gate below: listing a
+  # commit's workflow runs and their jobs is the Actions API, not the checks
+  # API, so `contents: read` does not cover it.
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,6 +62,47 @@ jobs:
               ;;
           esac
           echo "DRY_RUN=$DRY_RUN_INPUT" >> "$GITHUB_ENV"
+
+      # Do not ship code CI never ran. v0.13.0 was published from b36dcff, a
+      # commit with zero ci.yml legs -- ci.yml's `paths:` filter skipped it --
+      # and it was sound only by luck. The gate resolves the ci.yml run for the
+      # commit being released and requires every leg by name; the details, and
+      # why "no run" must fail rather than skip, are in the script.
+      #
+      # Which SHA: `github.sha` is the commit this job checked out. On
+      # `bump: none` that is the commit that gets published. On `bump: <x>` the
+      # release commit does not exist yet and, by construction, can never have
+      # CI of its own -- so `github.sha` is its parent, the last commit that
+      # went through PR CI, and "Assert the release commit is a pure version
+      # bump" below closes the gap between that gated tree and the shipped one.
+      #
+      # Placed here so a commit that never ran CI costs seconds rather than a
+      # toolchain install, and so it stops the job long before anything has
+      # been pushed, signed or published.
+      - name: Require a green ci.yml run for the commit being released
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATED_SHA: ${{ github.sha }}
+        run: |
+          # A rehearsal downgrades this to a warning, exactly as the changelog
+          # step does, and for the same reason: a rehearsal is normally
+          # dispatched from the branch that changes publish.yml, and such a
+          # branch touches no path in ci.yml's filter, so it has no ci.yml run
+          # to be green. Hard-failing there would make the rehearsal useless
+          # for the one change it exists to validate -- and a rehearsal
+          # publishes nothing, so there is no untested release to prevent. The
+          # verdict is still resolved and printed in full either way.
+          if [ "$DRY_RUN" = "true" ]; then
+            export GATE_LEVEL=warning
+          fi
+          if .github/scripts/require-green-ci.sh "$GATED_SHA"; then
+            exit 0
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::warning::A real release would stop here. Continuing the rehearsal so the steps below still get exercised."
+            exit 0
+          fi
+          exit 1
 
       - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
 
@@ -124,6 +169,44 @@ jobs:
             exit 0
           fi
           git push origin "HEAD:${{ github.ref_name }}" --follow-tags
+
+      # The gate above vouched for `github.sha`, not for the commit created by
+      # the step before this one. This is what makes the two the same claim:
+      # the release commit must sit directly on the gated commit and differ
+      # from it only by the version bump. Anything else -- a different parent,
+      # or a file outside those four -- means the tree about to be published is
+      # not the tree CI tested, and the gate would be vouching for the wrong
+      # thing.
+      #
+      # `Commit and tag` only stages those four paths, so today this cannot
+      # fire; it is here so that a future edit loosening that `git add` fails
+      # loudly instead of quietly widening what ships untested. It runs on a
+      # rehearsal too -- the commit and tag are created for real there, only
+      # the push is withheld.
+      - name: Assert the release commit is a pure version bump
+        if: inputs.bump != 'none'
+        env:
+          GATED_SHA: ${{ github.sha }}
+        run: |
+          parent=$(git rev-parse HEAD^)
+          if [ "$parent" != "$GATED_SHA" ]; then
+            echo "::error::The release commit's parent is ${parent}, but the CI gate checked ${GATED_SHA}. The commit being published is not sitting on the commit that was tested."
+            exit 1
+          fi
+          changed=$(git diff --name-only HEAD^ HEAD)
+          if [ -z "$changed" ]; then
+            echo "::error::The release commit is empty -- no version bump was recorded."
+            exit 1
+          fi
+          unexpected=$(printf '%s\n' "$changed" \
+            | grep -vxE 'Cargo\.toml|Cargo\.lock|package\.json|pnpm-lock\.yaml' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::The release commit changes files beyond the version bump. CI never saw these, and this job does not test them:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          echo "Release commit is a pure version bump over the gated commit ${GATED_SHA}:"
+          printf '%s\n' "$changed"
 
       # Generate the notes *before* `cargo publish`, the one irreversible step
       # in this job: a crate version cannot be unpublished, so anything that can

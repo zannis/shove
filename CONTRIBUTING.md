@@ -78,6 +78,30 @@ Releases run through the **Publish** workflow
 manually with a `bump` of `patch`/`minor`/`major` (or `none` to re-run a
 release whose version commit already landed).
 
+### The commit being released must have a green CI run
+
+Before anything else, the workflow resolves the `ci.yml` run for the commit it
+is about to release and refuses to go on unless every leg — `check`, `msrv`,
+`audit` and all seven `coverage` entries — completed successfully
+([`.github/scripts/require-green-ci.sh`](.github/scripts/require-green-ci.sh)).
+
+**A missing run fails the gate.** `ci.yml` has a `paths:` filter, so a commit
+that touches only workflows or docs gets no run at all — which is how v0.13.0
+came to be published from a commit no test job ever saw. The checks that were
+green on it (CodeQL, the docs Workers build) say nothing about the crate, so
+the gate names the `ci.yml` legs it wants rather than accepting "all checks
+passed". An unfinished run is not a pass either.
+
+The practical consequence: **cut a release from a commit that actually ran
+CI**. If `main`'s head is a docs- or workflow-only commit, the gate will stop
+the release; release from before it, or land a change under one of `ci.yml`'s
+`paths:` entries first. On a `bump: <x>` dispatch the release commit is created
+by the job and has no CI of its own by construction, so the gate checks its
+parent and a follow-up step asserts the release commit differs from that parent
+by nothing but the version bump.
+
+### Rehearsing with `dry_run`
+
 Because a crate version cannot be unpublished, the workflow takes a `dry_run`
 input that rehearses the whole job without shipping anything:
 
@@ -96,11 +120,21 @@ withholds only the three effects that cannot be taken back:
 | Publish to crates.io | `cargo publish` | `cargo publish --dry-run` (no auth token minted) |
 | Create GitHub release | `gh release create` | asserts the notes file exists, prints the command |
 
-One more difference: empty release notes **fail** a real release and only
-**warn** on a rehearsal. A rehearsal is normally dispatched from the branch
-that changes `publish.yml`, so every commit in its range is a `ci:` one, which
-`cliff.toml` skips — stopping there would leave the steps after the changelog
-untested. The rehearsal substitutes a stand-in file and carries on.
+Two steps are downgraded rather than withheld, both for the same reason: a
+rehearsal is normally dispatched from the branch that changes `publish.yml`,
+and such a branch touches no path in `ci.yml`'s filter and carries only `ci:`
+commits.
+
+- **Empty release notes** fail a real release and only **warn** on a rehearsal
+  — every commit in the branch's range is a `ci:` one, which `cliff.toml`
+  skips. The rehearsal substitutes a stand-in file and carries on.
+- **The CI gate** fails a real release and only **warns** on a rehearsal — such
+  a branch has no `ci.yml` run to be green, so hard-failing would make the
+  rehearsal useless for the one change it exists to validate. The verdict is
+  still resolved and printed in full.
+
+In both cases stopping would leave the later steps untested, and a rehearsal
+publishes nothing, so there is no bad release to prevent.
 
 Run one on a branch after changing `publish.yml`; the `bump: <x>` path is
 otherwise only ever exercised by a real release.
