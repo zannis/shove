@@ -159,16 +159,6 @@ jobs:
           git add Cargo.toml Cargo.lock package.json pnpm-lock.yaml
           git commit -m "release: v${{ steps.version.outputs.version }}"
           git tag -m "v${{ steps.version.outputs.version }}" "v${{ steps.version.outputs.version }}"
-          # The commit and tag above are created for real even on a rehearsal --
-          # signing them is a step that can fail, so it has to be exercised.
-          # Only the push is withheld, leaving both objects local to the runner.
-          if [ "$DRY_RUN" = "true" ]; then
-            echo "dry run: not pushing v${{ steps.version.outputs.version }} to ${{ github.ref_name }}"
-            git --no-pager log -1 --show-signature
-            git tag -v "v${{ steps.version.outputs.version }}"
-            exit 0
-          fi
-          git push origin "HEAD:${{ github.ref_name }}" --follow-tags
 
       # The gate above vouched for `github.sha`, not for the commit created by
       # the step before this one. This is what makes the two the same claim:
@@ -183,6 +173,12 @@ jobs:
       # loudly instead of quietly widening what ships untested. It runs on a
       # rehearsal too -- the commit and tag are created for real there, only
       # the push is withheld.
+      #
+      # It sits *between* creating the commit and pushing it, not after the
+      # push, so that a failure leaves the bad release commit local to the
+      # runner and the branch untouched. Same principle as generating the
+      # changelog before `cargo publish`: fail while the run is still cheap to
+      # throw away.
       - name: Assert the release commit is a pure version bump
         if: inputs.bump != 'none'
         env:
@@ -207,6 +203,20 @@ jobs:
           fi
           echo "Release commit is a pure version bump over the gated commit ${GATED_SHA}:"
           printf '%s\n' "$changed"
+
+      - name: Push the release commit and tag
+        if: inputs.bump != 'none'
+        run: |
+          # The commit and tag were created for real even on a rehearsal --
+          # signing them is a step that can fail, so it has to be exercised.
+          # Only the push is withheld, leaving both objects local to the runner.
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run: not pushing v${{ steps.version.outputs.version }} to ${{ github.ref_name }}"
+            git --no-pager log -1 --show-signature
+            git tag -v "v${{ steps.version.outputs.version }}"
+            exit 0
+          fi
+          git push origin "HEAD:${{ github.ref_name }}" --follow-tags
 
       # Generate the notes *before* `cargo publish`, the one irreversible step
       # in this job: a crate version cannot be unpublished, so anything that can
