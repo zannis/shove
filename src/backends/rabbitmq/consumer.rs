@@ -401,7 +401,14 @@ impl RabbitMqConsumer {
                                 );
                                 poisoned_keys.insert(key.clone());
                             }
-                            router::route_reject(delivery, topology, &publisher).await?;
+                            router::route_reject(
+                                delivery,
+                                topology,
+                                &publisher,
+                                group.as_deref(),
+                                metrics::FailReason::Rejected,
+                            )
+                            .await?;
                         }
                         in_flight_count -= 1;
 
@@ -535,7 +542,15 @@ impl RabbitMqConsumer {
                                     .await;
                                 }
                                 Outcome::Reject => {
-                                    router::route_reject(delivery, topology, &publisher).await.ok();
+                                    router::route_reject(
+                                        delivery,
+                                        topology,
+                                        &publisher,
+                                        group.as_deref(),
+                                        metrics::FailReason::Rejected,
+                                    )
+                                    .await
+                                    .ok();
                                 }
                                 Outcome::Defer => {
                                     if shard_hold_queues.is_empty() {
@@ -617,7 +632,7 @@ impl RabbitMqConsumer {
                         key_states.remove(&key);
                         if let Some(pending) = pending_deliveries.remove(&key) {
                             for pd in pending {
-                                router::route_reject(&pd.delivery, topology, &publisher).await?;
+                                router::route_reject(&pd.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::HoldQueueTimeout).await?;
                             }
                         }
                     }
@@ -638,7 +653,7 @@ impl RabbitMqConsumer {
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
-                        router::route_reject(delivery, topology, &publisher).await?;
+                        router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::Rejected).await?;
                         continue;
                     }
 
@@ -660,12 +675,12 @@ impl RabbitMqConsumer {
                             // Also reject all pending deliveries for this key.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
-                                    router::route_reject(&pd.delivery, topology, &publisher)
+                                    router::route_reject(&pd.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded)
                                         .await?;
                                 }
                             }
                         }
-                        router::route_reject(delivery, topology, &publisher).await?;
+                        router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded).await?;
                         continue;
                     }
 
@@ -684,12 +699,7 @@ impl RabbitMqConsumer {
                                         limit,
                                         "per-key pending buffer full, rejecting to DLQ"
                                     );
-                                    metrics::record_failed(
-                                        &topic,
-                                        group.as_deref(),
-                                        metrics::FailReason::PendingFull,
-                                    );
-                                    router::route_reject(delivery, topology, &publisher).await?;
+                                    router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::PendingFull).await?;
                                     continue;
                                 }
                             }
@@ -730,12 +740,7 @@ impl RabbitMqConsumer {
                                             limit,
                                             "per-key pending buffer full, rejecting to DLQ"
                                         );
-                                        metrics::record_failed(
-                                            &topic,
-                                            group.as_deref(),
-                                            metrics::FailReason::PendingFull,
-                                        );
-                                        router::route_reject(delivery, topology, &publisher).await?;
+                                        router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::PendingFull).await?;
                                         continue;
                                     }
                                 }
@@ -832,9 +837,15 @@ impl RabbitMqConsumer {
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
-                    router::route_reject(&pd.delivery, topology, publisher)
-                        .await
-                        .ok();
+                    router::route_reject(
+                        &pd.delivery,
+                        topology,
+                        publisher,
+                        group.as_deref(),
+                        metrics::FailReason::Rejected,
+                    )
+                    .await
+                    .ok();
                 }
             }
             return;
@@ -859,20 +870,38 @@ impl RabbitMqConsumer {
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
                     // Reject remaining pending for this key too.
-                    router::route_reject(&received.delivery, topology, publisher)
+                    router::route_reject(
+                        &received.delivery,
+                        topology,
+                        publisher,
+                        group.as_deref(),
+                        metrics::FailReason::MaxRetriesExceeded,
+                    )
+                    .await
+                    .ok();
+                    while let Some(pd) = pending.pop_front() {
+                        router::route_reject(
+                            &pd.delivery,
+                            topology,
+                            publisher,
+                            group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
+                        )
                         .await
                         .ok();
-                    while let Some(pd) = pending.pop_front() {
-                        router::route_reject(&pd.delivery, topology, publisher)
-                            .await
-                            .ok();
                     }
                     pending_deliveries.remove(key);
                     return;
                 }
-                router::route_reject(&received.delivery, topology, publisher)
-                    .await
-                    .ok();
+                router::route_reject(
+                    &received.delivery,
+                    topology,
+                    publisher,
+                    group.as_deref(),
+                    metrics::FailReason::MaxRetriesExceeded,
+                )
+                .await
+                .ok();
                 continue;
             }
 
@@ -894,9 +923,15 @@ impl RabbitMqConsumer {
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {
-                            router::route_reject(&pd.delivery, topology, publisher)
-                                .await
-                                .ok();
+                            router::route_reject(
+                                &pd.delivery,
+                                topology,
+                                publisher,
+                                group.as_deref(),
+                                metrics::FailReason::Deserialize,
+                            )
+                            .await
+                            .ok();
                         }
                         pending_deliveries.remove(key);
                         return;
@@ -1086,13 +1121,7 @@ impl RabbitMqConsumer {
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
                         );
-                        metrics::record_terminal(
-                            &topic,
-                            group.as_deref(),
-                            metrics::FailReason::MaxRetriesExceeded,
-                            topology.dlq().is_some(),
-                        );
-                        router::route_reject(&received.delivery, topology, &publisher).await?;
+                        router::route_reject(&received.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded).await?;
                         continue;
                     }
 
@@ -1202,8 +1231,8 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     retry_count: u32,
-    // Consumer-group label propagated to `metrics::record_failed` on
-    // `Outcome::Reject` — matches Kafka/NATS/Redis `route_outcome`.
+    // Consumer-group label propagated to the terminal metric that
+    // `router::route_reject` records — matches Kafka/NATS/Redis `route_outcome`.
     group: Option<&str>,
 ) -> Result<()> {
     let delivery = &received.delivery;
@@ -1220,13 +1249,14 @@ async fn route_outcome(
             .await
         }
         Outcome::Reject => {
-            metrics::record_terminal(
-                topology.queue(),
+            router::route_reject(
+                delivery,
+                topology,
+                publisher,
                 group,
                 metrics::FailReason::Rejected,
-                topology.dlq().is_some(),
-            );
-            router::route_reject(delivery, topology, publisher).await
+            )
+            .await
         }
         Outcome::Defer => {
             router::route_defer(delivery, &received.payload, topology, publisher).await
@@ -1471,10 +1501,15 @@ async fn try_deserialize_or_reject<T: Topic>(
             queue,
             "rejecting oversized message"
         );
-        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
-        router::route_reject(&received.delivery, topology, publisher)
-            .await
-            .ok();
+        router::route_reject(
+            &received.delivery,
+            topology,
+            publisher,
+            group,
+            metrics::FailReason::Oversize,
+        )
+        .await
+        .ok();
         return None;
     }
     match <T::Codec as crate::Codec<T::Message>>::decode_owned(received.payload.clone()) {
@@ -1486,10 +1521,15 @@ async fn try_deserialize_or_reject<T: Topic>(
                 queue = %queue,
                 "failed to deserialize message"
             );
-            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
-            router::route_reject(&received.delivery, topology, publisher)
-                .await
-                .ok();
+            router::route_reject(
+                &received.delivery,
+                topology,
+                publisher,
+                group,
+                metrics::FailReason::Deserialize,
+            )
+            .await
+            .ok();
             None
         }
     }

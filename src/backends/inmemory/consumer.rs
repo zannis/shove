@@ -545,6 +545,8 @@ async fn run_fifo_shard<T, H>(
                             &key,
                             &mut poisoned,
                             on_failure,
+                            &options,
+                            metrics::FailReason::MaxRetriesExceeded,
                         )
                         .await;
                     } else {
@@ -582,8 +584,17 @@ async fn run_fifo_shard<T, H>(
                     }
                 }
                 Outcome::Reject => {
-                    route_reject_sequenced(&broker, topology, env, &key, &mut poisoned, on_failure)
-                        .await;
+                    route_reject_sequenced(
+                        &broker,
+                        topology,
+                        env,
+                        &key,
+                        &mut poisoned,
+                        on_failure,
+                        &options,
+                        metrics::FailReason::Rejected,
+                    )
+                    .await;
                 }
                 Outcome::Defer => unreachable!("Defer normalized to Retry above"),
             }
@@ -623,6 +634,14 @@ async fn pop_or_wait(
     }
 }
 
+/// Terminal routing for the sequenced loop. Every sequenced path that gives up
+/// on a message — retry-budget exhaustion, an explicit `Reject`, and the
+/// FailAll cascade onto a poisoned key — funnels through here, so the terminal
+/// metric lives here rather than at each call site. The unsequenced loop's
+/// equivalent is the `RetryDecision::Dlq` arm of `route_outcome`.
+// Same shape as the sequenced loop's other helpers: the FailAll bookkeeping
+// (key, poisoned set, failure mode) and the routing target travel together.
+#[allow(clippy::too_many_arguments)]
 async fn route_reject_sequenced(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
@@ -630,7 +649,15 @@ async fn route_reject_sequenced(
     key: &str,
     poisoned: &mut HashSet<String>,
     on_failure: SequenceFailure,
+    options: &ConsumerOptionsInner,
+    reason: metrics::FailReason,
 ) {
+    metrics::record_terminal(
+        topology.queue(),
+        options.consumer_group.as_deref(),
+        reason,
+        topology.dlq().is_some(),
+    );
     route_reject(broker, topology, env).await;
     if on_failure == SequenceFailure::FailAll && !key.is_empty() {
         poisoned.insert(key.to_string());

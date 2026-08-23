@@ -78,8 +78,8 @@ shove::metrics::set_prefix("billing_shove");
 
 - `outcome` on `messages_consumed_total` and `message_processing_duration_seconds`: `ack`, `retry`, `reject`, `defer`. These mirror the `Outcome` enum returned by handlers.
 - `outcome` on `messages_published_total` and `message_publish_duration_seconds`: `success`, `error`.
-- `reason` on `messages_failed_total`: `oversize`, `deserialize`, `pending_full`, `timeout`, `max_retries_exceeded`, `rejected`. The first four cover failures that happen *before* the handler runs; `max_retries_exceeded` and `rejected` are emitted after the handler runs when the message is dead-lettered.
-- `reason` on `messages_discarded_total`: `max_retries_exceeded`, `rejected`. This counter is a strict subset of `messages_failed_total` — it increments *in addition* to it, only when the topic declares **no DLQ**, so the message was dropped on the floor rather than dead-lettered. Any non-zero rate is data loss. See [Alerting on silent discards](#alerting-on-silent-discards).
+- `reason` on `messages_failed_total`: `oversize`, `deserialize`, `pending_full`, `timeout`, `hold_queue_timeout`, `max_retries_exceeded`, `rejected`. The first four cover failures that happen *before* the handler runs; `hold_queue_timeout` is RabbitMQ-only and means a sequence key sat in `AwaitingRetry` past its `hold_queue_timeout`; `max_retries_exceeded` and `rejected` are emitted after the handler runs when the message is dead-lettered.
+- `reason` on `messages_discarded_total`: the same values, minus the ones that cannot be terminal on the backend in question. This counter is a strict subset of `messages_failed_total` — it increments *in addition* to it, only when the topic declares **no DLQ**, so the message was dropped on the floor rather than dead-lettered. Any non-zero rate is data loss. See [Alerting on silent discards](#alerting-on-silent-discards).
 - `direction` on `autoscaler_decisions_total`: `up`, `down`, `hold`.
 - `shove_autoscaler_messages_ready`, `shove_autoscaler_messages_in_flight`, and `shove_autoscaler_active_consumers` are emitted once per group on every autoscaler poll, carrying only the `consumer_group` label. They expose the raw signal the scaling decision is made from: backlog waiting, messages in flight, and the live consumer count. Watching `messages_ready` stay high while `active_consumers` is flat at `max` is the canonical "saturated / scaling commands not keeping up" signal.
 - `backend` on `backend_errors_total`: `inmemory`, `rabbitmq`, `kafka`, `nats`, `sns_sqs`, `redis`.
@@ -107,10 +107,11 @@ Every increment is a message that no longer exists anywhere. The fix is almost a
 TopologyBuilder::new("prices").with_dlq("prices.dlq").build()
 ```
 
-Two limits worth knowing:
+Three limits worth knowing:
 
-- The counter covers the **terminal-outcome** path (retry-budget exhaustion and explicit rejects) on all six backends. Pre-handler rejections — oversize payloads and deserialize failures — reach the DLQ through a different code path on the RabbitMQ, SNS/SQS and Kafka consumers and are **not** yet counted. Treat the counter as a lower bound on dropped messages.
-- A slow handler that keeps timing out will burn retry budget and eventually land here. If that is the failure mode you are seeing, `ConsumerOptions::with_handler_timeout_outcome` lets a timeout resolve to something other than `Retry` so a slow consumer stops consuming budget — see [Handlers](/concepts/handlers).
+- **Coverage is per backend.** RabbitMQ and the in-memory backend funnel every terminal path through a single reject helper, so they count all of them — retry-budget exhaustion, explicit rejects, poisoned sequence keys, and pre-handler oversize/deserialize rejections. Kafka, NATS and Redis Streams count the terminal-outcome path; their pre-handler rejections route to the DLQ separately and are **not** counted. Treat the counter as a lower bound on dropped messages.
+- **SNS/SQS never increments it, by design.** SQS's terminal path deletes nothing: it sets the message's visibility timeout to zero, which hands it back to the queue. Whether it then reaches a DLQ is decided by the queue's AWS-side redrive policy, which `shove` does not own — and with no redrive policy the message cycles until the retention period expires rather than being discarded. Counting that as a discard would be wrong twice: the message still exists, and its receive count stays above the budget, so every later receive would count the same message again. On SQS, alert on the `WARN` line and on `shove_messages_failed_total{reason="max_retries_exceeded"}` instead, and configure a redrive policy on the queue.
+- **A slow handler that keeps timing out** will burn retry budget and eventually land here. If that is the failure mode you are seeing, `ConsumerOptions::with_handler_timeout_outcome` lets a timeout resolve to something other than `Retry` so a slow consumer stops consuming budget — see [Handlers](/concepts/handlers).
 
 ### Histogram buckets
 

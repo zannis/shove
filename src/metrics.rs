@@ -111,6 +111,10 @@ pub(crate) enum FailReason {
     Deserialize,
     PendingFull,
     Timeout,
+    /// RabbitMQ-only: a sequence key sat in `AwaitingRetry` past
+    /// `hold_queue_timeout`, so its buffered messages are dead-lettered. Distinct
+    /// from [`FailReason::Timeout`], which is a handler exceeding its deadline.
+    HoldQueueTimeout,
     MaxRetriesExceeded,
     Rejected,
     SchemaFrame,
@@ -125,6 +129,7 @@ impl FailReason {
             FailReason::Deserialize => "deserialize",
             FailReason::PendingFull => "pending_full",
             FailReason::Timeout => "timeout",
+            FailReason::HoldQueueTimeout => "hold_queue_timeout",
             FailReason::MaxRetriesExceeded => "max_retries_exceeded",
             FailReason::Rejected => "rejected",
             FailReason::SchemaFrame => "schema_frame",
@@ -259,19 +264,24 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 /// no DLQ so the message is dropped rather than dead-lettered, additionally
 /// increment `messages_discarded_total`.
 ///
-/// All six backends' `route_outcome` terminal arms call this rather than
-/// [`record_failed`] directly, so the pairing cannot drift backend-to-backend:
-/// `messages_failed_total` counts everything that failed,
-/// `messages_discarded_total` counts the subset that was lost because there was
-/// nowhere to put it. A non-zero discard rate means data loss, and is the
-/// alerting signal that retry-budget exhaustion on a bare topology previously
-/// lacked entirely — it was visible only as a `WARN` line.
+/// Backends call this rather than [`record_failed`] directly, so the pairing
+/// cannot drift backend-to-backend: `messages_failed_total` counts everything
+/// that failed, `messages_discarded_total` counts the subset that was lost
+/// because there was nowhere to put it. A non-zero discard rate means data
+/// loss, and is the alerting signal that retry-budget exhaustion on a bare
+/// topology previously lacked entirely — it was visible only as a `WARN` line.
 ///
-/// Scope: this covers the terminal-outcome path only. Pre-handler rejections
-/// (oversize, deserialize failure) reach the DLQ via a direct `route_reject`
-/// call in the RabbitMQ, SNS/SQS and Kafka consumers, bypassing
-/// `route_outcome`; those discards are not yet counted here. Treat this counter
-/// as a lower bound on dropped messages, not a total.
+/// Scope, in the two directions it is easy to get wrong:
+///
+/// - **Not everything that discards is counted.** Kafka counts the
+///   terminal-outcome path only; its pre-handler rejections (oversize,
+///   deserialize failure) route to the DLQ without passing through here.
+///   RabbitMQ and the in-memory backend fold every terminal path — pre-handler
+///   included — into one reject helper, so they are complete. Treat the counter
+///   as a lower bound on dropped messages, not a total.
+/// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never
+///   calls this: its reject path deletes nothing, it makes the message visible
+///   again for AWS-side redrive. See `backends::sns::router::route_reject`.
 ///
 /// `has_dlq` is `topology.dlq().is_some()` at the call site.
 #[allow(dead_code)] // Callers gated behind backend features.

@@ -5,6 +5,7 @@ use crate::Outcome;
 
 /// Hold-queue tier for a given retry count, clamped to the last tier.
 /// Caller guarantees `hold_queue_count > 0`.
+#[allow(dead_code)] // unused in an aws-sns-sqs-only build; see the note on `decide_retry`
 pub(crate) fn hold_index(retry_count: u32, hold_queue_count: usize) -> usize {
     debug_assert!(
         hold_queue_count > 0,
@@ -17,6 +18,7 @@ pub(crate) fn hold_index(retry_count: u32, hold_queue_count: usize) -> usize {
 /// handler returns `outcome`. Execution (ack/commit/publish/DLQ) and the
 /// empty-hold-queue fallback are intentionally left to each backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // unused in an aws-sns-sqs-only build; see the note on `decide_retry`
 pub(crate) enum RetryDecision {
     /// Handler succeeded — ack/commit the message.
     Ack,
@@ -44,6 +46,7 @@ pub(crate) fn handler_timeout_outcome(configured: Option<Outcome>) -> Outcome {
 /// Whether the retry budget is exhausted. `max_retries = N` permits N retries,
 /// so a message is terminal once `retry_count >= max_retries`. Single source of
 /// truth for the boundary shared by `decide_retry` and pre-handler gates.
+#[allow(dead_code)] // unused in an aws-sns-sqs-only build; see the note on `decide_retry`
 pub(crate) fn retries_exhausted(retry_count: u32, max_retries: u32) -> bool {
     retry_count >= max_retries
 }
@@ -51,6 +54,14 @@ pub(crate) fn retries_exhausted(retry_count: u32, max_retries: u32) -> bool {
 /// Decide the routing for `outcome`. The retry-budget boundary lives here:
 /// `max_retries = N` permits 1 initial attempt + N retries, so the message
 /// goes to the DLQ once `retry_count >= max_retries`.
+///
+/// This module is compiled for any backend feature because SNS/SQS needs
+/// [`handler_timeout_outcome`], but SNS/SQS hand-rolls its own retry-budget
+/// checks and reaches none of the rest — so in a build with `aws-sns-sqs` and
+/// no other backend, everything here except that one helper is genuinely
+/// unused. Hence the `dead_code` allows, rather than a narrower `cfg`, which
+/// would have to enumerate the other five backends on every item.
+#[allow(dead_code)]
 pub(crate) fn decide_retry(outcome: &Outcome, retry_count: u32, max_retries: u32) -> RetryDecision {
     match outcome {
         Outcome::Ack => RetryDecision::Ack,

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::backends::rabbitmq::headers::{MESSAGE_ID_KEY, RETRY_COUNT_KEY};
 use crate::backends::rabbitmq::publisher::ChannelPublisher;
 use crate::error::{Result, ShoveError};
+use crate::metrics;
 use crate::routing::hold_index;
 use crate::topology::QueueTopology;
 
@@ -133,11 +134,24 @@ pub(crate) async fn route_defer(
     Ok(())
 }
 
+/// Terminal routing: nack without requeue, so the broker moves the delivery to
+/// the queue's dead-letter exchange — or, with no DLX bound, drops it.
+///
+/// The terminal metric is recorded here rather than at the call sites. This
+/// consumer hand-rolls its retry-budget checks at a dozen-odd places (standard,
+/// sharded, concurrent-sequenced, buffered-pending, AwaitingRetry timeout,
+/// FailAll cascade, pre-handler rejects), and instrumenting them individually
+/// is how the discard counter came to miss half of them. Every path that gives
+/// up on a delivery ends here, so `reason` is a required argument: a new
+/// terminal path cannot be added without accounting for it.
 pub(crate) async fn route_reject(
     delivery: &Delivery,
     topology: &QueueTopology,
     publisher: &ChannelPublisher,
+    group: Option<&str>,
+    reason: metrics::FailReason,
 ) -> Result<()> {
+    metrics::record_terminal(topology.queue(), group, reason, topology.dlq().is_some());
     if topology.dlq().is_none() {
         warn!(
             queue = topology.queue(),
