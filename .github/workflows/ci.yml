@@ -104,7 +104,14 @@ jobs:
       matrix:
         include:
           - name: inmemory
-            features: inmemory,metrics,sbe
+            # `env-config` here and on the `nats`/`kafka` entries below: the
+            # env-schema tests are gated `#[cfg(all(test, feature =
+            # "env-config"))]`, so without the feature they compile to zero
+            # tests and the entry still reports green. This entry covers the
+            # backend-agnostic ones (`env::tests`,
+            # `autoscaler::env_config_tests`). The feature is std-only and
+            # adds no dependencies, so it costs this entry nothing.
+            features: inmemory,metrics,sbe,env-config
           # `metrics` on every backend entry below that has a `metrics_*`
           # integration binary. Every one of those is gated
           # `#![cfg(all(feature = "<backend>", feature = "metrics"))]`, so
@@ -119,14 +126,16 @@ jobs:
             # Asserted by `metrics_sqs_sequenced`.
             features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
           - name: nats
-            # Asserted by `metrics_nats_failall`.
-            features: nats,audit,metrics,sbe
+            # Asserted by `metrics_nats_failall`. `env-config` runs
+            # `topology::nats_env_config_tests` (NatsStreamConfig::from_env).
+            features: nats,audit,metrics,sbe,env-config
           - name: kafka
             # kafka-msk-iam + test-support compile and run the MSK IAM tests,
             # including the OAUTHBEARER admin integration test (local Kafka
             # container + unsecured JWT; no AWS/LocalStack needed).
             # `metrics` asserted by `metrics_kafka_failall`.
-            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe
+            # `env-config` runs the `KafkaTopicTuning` tests.
+            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config
           - name: kafka-schema-registry
             # Split out from the `kafka` entry rather than folded into it: the
             # two schema-registry suites each pin FIXED host ports (cp stack
