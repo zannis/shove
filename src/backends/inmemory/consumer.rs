@@ -63,7 +63,7 @@ impl InMemoryConsumer {
         T: SequencedTopic,
         H: MessageHandler<T>,
     {
-        run_fifo_impl::<T, H>(self.broker.clone(), handler, ctx, options.into_inner())
+        self.run_fifo_with_inner::<T, H>(handler, ctx, options.into_inner())
     }
 
     pub async fn run_fifo_until_timeout<T, H, S>(

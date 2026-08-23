@@ -322,6 +322,7 @@ pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
 /// `messages_consumed_total` counts *messages* (comparable with the
 /// single-message consumers) rather than flushes.
 #[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_consumed_n(topic: &str, group: Option<&str>, outcome: &Outcome, count: u64) {
     if count == 0 {
         return;
@@ -605,6 +606,7 @@ pub(crate) fn record_publish_duration(topic: &str, ok: bool, elapsed_secs: f64) 
 pub(crate) fn record_publish_duration(_: &str, _: bool, _: f64) {}
 
 #[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize) {
     ::metrics::histogram!(
         names().message_size_bytes.as_str(),

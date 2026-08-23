@@ -159,8 +159,10 @@ pub(crate) fn decide_retry(outcome: &Outcome, retry_count: u32, max_retries: u32
 /// [`poison`]: PoisonedKeys::poison
 /// [`is_poisoned`]: PoisonedKeys::is_poisoned
 #[derive(Clone, Default)]
+#[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) struct PoisonedKeys(Option<Arc<Mutex<HashSet<String>>>>);
 
+#[allow(dead_code)] // Callers gated behind backend features.
 impl PoisonedKeys {
     /// Build a tracker for `on_failure`. `Skip` yields an inert tracker.
     pub(crate) fn new(on_failure: SequenceFailure) -> Self {
