@@ -328,7 +328,7 @@ async fn route_outcome(
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_terminal(
+            let pending = metrics::record_terminal(
                 topology.queue(),
                 group,
                 fail_reason,
@@ -336,12 +336,23 @@ async fn route_outcome(
             );
             match publish_to_dlq(client, topology, msg, reason).await {
                 Ok(()) => {
-                    if let Err(e) = msg.ack().await {
-                        tracing::error!(error = %e, "failed to ack after DLQ publish");
+                    // The ack is what retires the message; until it lands
+                    // JetStream still owns the delivery and will redeliver on
+                    // ack-wait expiry, so a failed ack is not a discard.
+                    match msg.ack().await {
+                        Ok(()) => pending.confirm(),
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to ack after DLQ publish");
+                            pending.survived();
+                        }
                     }
                     return;
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    // Not acked, so JetStream redelivers.
+                    pending.survived();
+                    Err(e)
+                }
             }
         }
         RetryDecision::Hold { increment: true } => {

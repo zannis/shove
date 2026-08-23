@@ -144,6 +144,13 @@ pub(crate) async fn route_defer(
 /// is how the discard counter came to miss half of them. Every path that gives
 /// up on a delivery ends here, so `reason` is a required argument: a new
 /// terminal path cannot be added without accounting for it.
+///
+/// The discard half of that metric is held until the broker has accepted the
+/// nack — and, on a transactional channel, until the commit that makes it
+/// durable. A nack that fails on a closing channel leaves the delivery
+/// unacknowledged, so the broker requeues it on close and the message is very
+/// much still alive; counting a discard there would report data loss during
+/// precisely the connection failure an operator is trying to diagnose.
 pub(crate) async fn route_reject(
     delivery: &Delivery,
     topology: &QueueTopology,
@@ -151,7 +158,8 @@ pub(crate) async fn route_reject(
     group: Option<&str>,
     reason: metrics::FailReason,
 ) -> Result<()> {
-    metrics::record_terminal(topology.queue(), group, reason, topology.dlq().is_some());
+    let pending =
+        metrics::record_terminal(topology.queue(), group, reason, topology.dlq().is_some());
     if topology.dlq().is_none() {
         warn!(
             queue = topology.queue(),
@@ -166,13 +174,20 @@ pub(crate) async fn route_reject(
         .await
     {
         error!("failed to nack-reject delivery: {e}");
+        // Unacknowledged: the broker requeues it when the channel closes.
+        pending.survived();
+        return Ok(());
     }
     if let Err(e) = publisher.commit_if_tx().await {
         error!("tx_commit failed after reject: {e}");
+        // On a transactional channel the nack only takes effect at commit, so
+        // a failed commit rolls it back and the delivery is redelivered.
+        pending.survived();
         return Err(ShoveError::Connection(format!(
             "tx_commit failed after reject: {e}"
         )));
     }
+    pending.confirm();
     Ok(())
 }
 

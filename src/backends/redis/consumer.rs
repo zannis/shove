@@ -1236,7 +1236,7 @@ async fn route_outcome(
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_terminal(
+            let pending = metrics::record_terminal(
                 topology.queue(),
                 Some(group),
                 fail_reason,
@@ -1249,7 +1249,7 @@ async fn route_outcome(
             } else {
                 retry_count + 1
             };
-            route_to_dlq(
+            let retired = match route_to_dlq(
                 conn,
                 topology,
                 stream,
@@ -1259,7 +1259,21 @@ async fn route_outcome(
                 reason,
                 death_count,
             )
-            .await?;
+            .await
+            {
+                Ok(retired) => retired,
+                Err(e) => {
+                    // XADD to the DLQ failed; the entry stays in the PEL for
+                    // the reaper to redeliver, so nothing was discarded.
+                    pending.survived();
+                    return Err(e);
+                }
+            };
+            if retired {
+                pending.confirm();
+            } else {
+                pending.survived();
+            }
         }
         RetryDecision::Hold { increment: true } => {
             let new_retry = retry_count + 1;
@@ -1365,6 +1379,12 @@ async fn route_to_hold(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Dead-letter `entry_id`, or drop it when the topology declares no DLQ.
+///
+/// Returns whether the entry was actually retired from the group — that is,
+/// whether the `XACK` landed. A failed `XACK` leaves the entry in the PEL, so
+/// the reaper reclaims and redelivers it and the message still exists; callers
+/// holding a [`metrics::PendingDiscard`] must not confirm it in that case.
 async fn route_to_dlq(
     conn: &mut RedisConnection,
     topology: &'static QueueTopology,
@@ -1374,7 +1394,7 @@ async fn route_to_dlq(
     fields: &HashMap<String, String>,
     reason: &str,
     death_count: u32,
-) -> Result<()> {
+) -> Result<bool> {
     let dlq = match topology.dlq() {
         Some(d) => d,
         None => {
@@ -1385,8 +1405,9 @@ async fn route_to_dlq(
                     metrics::BackendLabel::Redis,
                     metrics::BackendErrorKind::Ack,
                 );
+                return Ok(false);
             }
-            return Ok(());
+            return Ok(true);
         }
     };
 
@@ -1409,8 +1430,9 @@ async fn route_to_dlq(
     if let Err(e) = xack(conn, stream, group, entry_id).await {
         tracing::warn!(stream, entry_id, error = %e, "XACK failed after DLQ enqueue");
         metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn requeue_to_stream(

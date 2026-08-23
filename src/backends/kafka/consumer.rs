@@ -497,17 +497,28 @@ async fn publish_to_dlq(
 /// proceed with `consumer.commit_message`.
 type CompletionHandle = Option<(mpsc::Sender<(i32, i64)>, i32, i64)>;
 
-fn signal_completion(handle: CompletionHandle, queue: &str) {
-    if let Some((tx, partition, offset)) = handle
-        && tx.try_send((partition, offset)).is_err()
-    {
+/// Hand this delivery's offset to the tracker so it can be committed.
+///
+/// Returns whether the offset was actually handed over. A full channel means
+/// it is never committed, so the message is redelivered from the last
+/// committed position on the next rebalance or restart — callers about to
+/// assert the message is gone must not do so when this returns `false`.
+fn signal_completion(handle: CompletionHandle, queue: &str) -> bool {
+    // No tracker attached (the FIFO path commits inline): nothing to signal,
+    // and nothing holding the delivery back either.
+    let Some((tx, partition, offset)) = handle else {
+        return true;
+    };
+    if tx.try_send((partition, offset)).is_err() {
         tracing::error!(
             queue,
             partition,
             offset,
             "completion channel full — logic bug in offset tracker"
         );
+        return false;
     }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,18 +554,16 @@ async fn route_outcome(
 ) -> bool {
     match decide_retry(&outcome, retry_count, max_retries) {
         RetryDecision::Ack => {
-            signal_completion(completion, topic);
+            let _ = signal_completion(completion, topic);
             true
         }
         RetryDecision::Dlq { reason } => {
-            // Emit before the DLQ publish so the metric fires regardless
-            // of DLQ outcome — silent loss on DLQ failure is what the
-            // counter has to surface to alerting.
             let fail_reason = match reason {
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_terminal(topic, group, fail_reason, topology.dlq().is_some());
+            let pending =
+                metrics::record_terminal(topic, group, fail_reason, topology.dlq().is_some());
             let dlq_ok =
                 publish_to_dlq(client, topology, payload, key.as_deref(), headers, reason).await;
             // Commit even if the DLQ publish failed: the message has
@@ -562,11 +571,30 @@ async fn route_outcome(
             // produces a poison hot-spot. The error trace + metric give
             // operators what they need to investigate. Matches the existing
             // pre-refactor semantic (the outer task committed regardless).
-            signal_completion(completion, topic);
+            let retired = signal_completion(completion, topic);
             match dlq_ok {
-                Ok(()) => true,
+                Ok(()) => {
+                    // `publish_to_dlq` is `Ok(())` both when it dead-lettered
+                    // and when no DLQ is configured; `confirm` distinguishes
+                    // them from the topology.
+                    if retired {
+                        pending.confirm();
+                    } else {
+                        pending.survived();
+                    }
+                    true
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to publish to DLQ");
+                    // A DLQ was configured and did not receive the message. If
+                    // the offset still advanced, nothing holds a copy — that is
+                    // data loss even though the topology declares a DLQ, so it
+                    // is counted rather than excused by `has_dlq`.
+                    if retired {
+                        pending.confirm_lost();
+                    } else {
+                        pending.survived();
+                    }
                     false
                 }
             }
@@ -684,7 +712,7 @@ async fn run_delayed_republish(
                     .await
                 {
                     Ok(()) => {
-                        signal_completion(completion, &topic);
+                        let _ = signal_completion(completion, &topic);
                     }
                     Err(e) => {
                         // Don't signal — leaving the offset uncommitted is the

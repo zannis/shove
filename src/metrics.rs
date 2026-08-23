@@ -260,9 +260,9 @@ pub(crate) fn record_discarded(topic: &str, group: Option<&str>, reason: FailRea
 pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 
 /// Record a message being retired by a *terminal outcome* — retry-budget
-/// exhaustion or an explicit [`Outcome::Reject`] — and, when the topic declares
-/// no DLQ so the message is dropped rather than dead-lettered, additionally
-/// increment `messages_discarded_total`.
+/// exhaustion or an explicit [`Outcome::Reject`] — and return the pending
+/// `messages_discarded_total` increment for the caller to [confirm] once the
+/// broker has actually retired the message.
 ///
 /// Backends call this rather than [`record_failed`] directly, so the pairing
 /// cannot drift backend-to-backend: `messages_failed_total` counts everything
@@ -270,6 +270,13 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 /// because there was nowhere to put it. A non-zero discard rate means data
 /// loss, and is the alerting signal that retry-budget exhaustion on a bare
 /// topology previously lacked entirely — it was visible only as a `WARN` line.
+///
+/// The failure is counted immediately because it already happened — the
+/// handler rejected the message or burned its last retry, and nothing the
+/// broker does next changes that. The *discard* is deliberately not, because
+/// it is a claim about the message no longer existing, and at this point the
+/// nack / delete / commit that retires it has not been issued yet. See
+/// [`PendingDiscard`].
 ///
 /// Scope, in the two directions it is easy to get wrong:
 ///
@@ -284,12 +291,86 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 ///   again for AWS-side redrive. See `backends::sns::router::route_reject`.
 ///
 /// `has_dlq` is `topology.dlq().is_some()` at the call site.
+///
+/// [confirm]: PendingDiscard::confirm
 #[allow(dead_code)] // Callers gated behind backend features.
-pub(crate) fn record_terminal(topic: &str, group: Option<&str>, reason: FailReason, has_dlq: bool) {
+pub(crate) fn record_terminal(
+    topic: &str,
+    group: Option<&str>,
+    reason: FailReason,
+    has_dlq: bool,
+) -> PendingDiscard {
     record_failed(topic, group, reason);
-    if !has_dlq {
-        record_discarded(topic, group, reason);
+    PendingDiscard {
+        topic: topic.to_string(),
+        group: group.map(str::to_string),
+        reason,
+        has_dlq,
     }
+}
+
+/// A `messages_discarded_total` increment that has been *decided* but not yet
+/// *earned*.
+///
+/// `messages_discarded_total` carries a strong public guarantee: every
+/// increment is a message that no longer exists. Recording it at the moment a
+/// terminal outcome is decided breaks that guarantee, because the operation
+/// that retires the message can still fail — a `basic.nack` on a closing
+/// RabbitMQ channel, a transactional reject that never commits, a Redis `XACK`
+/// against a dropped connection. In each of those cases the delivery stays
+/// unacknowledged and the broker redelivers it, so a discard recorded up front
+/// is a false data-loss alert during exactly the backend outage an operator is
+/// already trying to read.
+///
+/// So the increment is held here and only applied when the caller confirms the
+/// retirement landed. The type is `#[must_use]`: a terminal path that neither
+/// confirms nor explicitly drops this is a compile-time warning, which is what
+/// keeps the accounting honest as new terminal paths are added.
+///
+/// Dropping it without confirming is the correct move when the message
+/// survived — the counter simply does not move, and `messages_failed_total`
+/// still records that processing failed.
+#[must_use = "a discard is not counted until `confirm`/`confirm_lost` is called; \
+              drop it explicitly when the message survived"]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) struct PendingDiscard {
+    topic: String,
+    group: Option<String>,
+    reason: FailReason,
+    has_dlq: bool,
+}
+
+#[allow(dead_code)] // Callers gated behind backend features.
+impl PendingDiscard {
+    /// The broker confirmed the message is retired.
+    ///
+    /// Records the discard when the topic declares no DLQ, so the message was
+    /// dropped rather than dead-lettered. With a DLQ configured the message
+    /// still exists — in the DLQ — so nothing is counted.
+    pub(crate) fn confirm(self) {
+        if !self.has_dlq {
+            record_discarded(&self.topic, self.group.as_deref(), self.reason);
+        }
+    }
+
+    /// The message is retired and the DLQ did not receive it.
+    ///
+    /// For backends that retire a delivery even when the dead-letter publish
+    /// failed, rather than looping a poison message forever. The message is
+    /// gone and nothing holds a copy, so this is data loss whether or not a
+    /// DLQ was configured — the case a plain [`confirm`] would miss, because
+    /// `has_dlq` describes the topology, not where the message ended up.
+    ///
+    /// [`confirm`]: Self::confirm
+    pub(crate) fn confirm_lost(self) {
+        record_discarded(&self.topic, self.group.as_deref(), self.reason);
+    }
+
+    /// The message survived — it was requeued, redelivered, or left pending.
+    ///
+    /// Records nothing. Exists so a call site can say so explicitly instead of
+    /// silencing the `must_use` with a `let _ =` that reads like an oversight.
+    pub(crate) fn survived(self) {}
 }
 
 #[cfg(feature = "metrics")]
