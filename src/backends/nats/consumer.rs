@@ -26,7 +26,7 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{RetryDecision, decide_retry, hold_index};
+use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
@@ -34,6 +34,7 @@ use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
 use super::client::NatsClient;
 use super::constants::{
     DEATH_COUNT_HEADER, DEATH_REASON_HEADER, ORIGINAL_QUEUE_HEADER, RETRY_COUNT_HEADER,
+    SEQUENCE_KEY_HEADER,
 };
 use super::publisher::publish_with_retry;
 
@@ -77,6 +78,28 @@ fn get_retry_count(headers: &Option<HeaderMap>) -> u32 {
         .and_then(|hm| hm.get(RETRY_COUNT_HEADER))
         .and_then(|v| v.as_str().parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+/// Reads `Shove-Sequence-Key` from headers.
+///
+/// Empty when the message carries no key — either it predates the header or it
+/// was published by something other than shove's publisher. `PoisonedKeys`
+/// never poisons the empty key, so such a message falls back to `Skip`
+/// behaviour rather than poisoning every unkeyed message on the shard.
+fn get_sequence_key(headers: &Option<HeaderMap>) -> String {
+    headers
+        .as_ref()
+        .and_then(|hm| hm.get(SEQUENCE_KEY_HEADER))
+        .map(|v| v.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// Record a `FailAll` poisoning, logging only the first transition per key.
+/// A no-op under `SequenceFailure::Skip` and for unkeyed messages.
+fn poison_key(poisoned: &PoisonedKeys, key: &str, queue: &str) {
+    if poisoned.poison(key) {
+        tracing::info!(queue, sequence_key = %key, "poisoning sequence key (FailAll)");
+    }
 }
 
 /// Extracts message metadata from a JetStream message.
@@ -942,6 +965,7 @@ impl NatsConsumer {
             .sequencing()
             .expect("run_fifo requires a sequenced topology");
         let routing_shards = seq_config.routing_shards();
+        let on_failure = seq_config.on_failure();
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
@@ -979,6 +1003,11 @@ impl NatsConsumer {
             let shard_processing = processing.clone();
             let shard_topic = topic.clone();
             let shard_group = group.clone();
+            // One poison set per shard task, created outside the reconnect
+            // wrapper so a broker blip cannot un-poison a failed key. A
+            // sequence key always hashes to the same shard, so per-shard
+            // tracking sees every message that key will produce here.
+            let shard_poisoned = PoisonedKeys::new(on_failure);
 
             let task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
                 run_with_reconnect(&shard_shutdown, &consumer_name, max_reconnect_attempts, || {
@@ -991,6 +1020,7 @@ impl NatsConsumer {
                     let shard_group = shard_group.clone();
                     let consumer_name = consumer_name.clone();
                     let filter_subject = filter_subject.clone();
+                    let shard_poisoned = shard_poisoned.clone();
                     async move {
                         let stream = shard_client
                             .jetstream()
@@ -1066,6 +1096,38 @@ impl NatsConsumer {
                                         msg.payload.len(),
                                     );
 
+                                    // ── FailAll: skip poisoned keys ──
+                                    // Inert unless this topic is configured
+                                    // `SequenceFailure::FailAll`.
+                                    let seq_key = get_sequence_key(&msg.headers);
+                                    if shard_poisoned.is_poisoned(&seq_key) {
+                                        tracing::warn!(
+                                            shard,
+                                            sequence_key = %seq_key,
+                                            "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
+                                        );
+                                        metrics::record_failed(
+                                            &shard_topic,
+                                            shard_group.as_deref(),
+                                            metrics::FailReason::Rejected,
+                                        );
+                                        if let Err(dlq_err) = publish_to_dlq(
+                                            &shard_client,
+                                            topology,
+                                            &msg,
+                                            "rejected",
+                                        ).await {
+                                            tracing::error!(
+                                                error = %dlq_err,
+                                                "failed to publish poisoned-key message to DLQ, nak-ing"
+                                            );
+                                            let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                            continue;
+                                        }
+                                        let _ = msg.ack().await;
+                                        continue;
+                                    }
+
                                     // Reject oversized messages before deserialization
                                     if let Err(e) = validate_message_size(msg.payload.len(), max_message_size) {
                                         tracing::warn!(
@@ -1078,6 +1140,7 @@ impl NatsConsumer {
                                             shard_group.as_deref(),
                                             metrics::FailReason::Oversize,
                                         );
+                                        poison_key(&shard_poisoned, &seq_key, queue);
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &shard_client,
                                             topology,
@@ -1109,6 +1172,7 @@ impl NatsConsumer {
                                                 shard_group.as_deref(),
                                                 metrics::FailReason::Deserialize,
                                             );
+                                            poison_key(&shard_poisoned, &seq_key, queue);
                                             if let Err(dlq_err) = publish_to_dlq(
                                                 &shard_client,
                                                 topology,
@@ -1153,6 +1217,16 @@ impl NatsConsumer {
                                         })
                                     };
                                     let outcome = adjust_outcome_for_fifo(outcome);
+
+                                    // FailAll: a DLQ-terminal outcome poisons
+                                    // the key, so every later message for it is
+                                    // dead-lettered instead of handled.
+                                    if matches!(
+                                        decide_retry(&outcome, retry_count, max_retries),
+                                        RetryDecision::Dlq { .. }
+                                    ) {
+                                        poison_key(&shard_poisoned, &seq_key, queue);
+                                    }
 
                                     route_outcome(
                                         &shard_client,
