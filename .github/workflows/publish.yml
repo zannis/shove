@@ -85,6 +85,38 @@ jobs:
           git tag -m "v${{ steps.version.outputs.version }}" "v${{ steps.version.outputs.version }}"
           git push origin "HEAD:${{ github.ref_name }}" --follow-tags
 
+      # Generate the notes *before* `cargo publish`, the one irreversible step
+      # in this job: a crate version cannot be unpublished, so anything that can
+      # fail the release should fail while the run is still recoverable.
+      - name: Generate changelog
+        run: |
+          cargo install -q git-cliff --locked
+          VERSION="${{ steps.version.outputs.version }}"
+          # Do not use `--latest`: on the `bump: none` path the "Commit and tag"
+          # step is skipped, so the tag does not exist yet and the newest tag is
+          # still the *previous* release -- `--latest` then re-emits that
+          # release's notes. Resolve the range explicitly instead, and pass
+          # --tag so untagged commits are attributed to the version being cut.
+          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' \
+                   --exclude "v${VERSION}" HEAD 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            echo "Generating notes for ${PREV}..HEAD"
+            git-cliff --strip header --tag "v${VERSION}" "${PREV}..HEAD" -o RELEASE_NOTES.md
+          else
+            echo "No previous tag found; generating notes over full history"
+            git-cliff --strip header --tag "v${VERSION}" -o RELEASE_NOTES.md
+          fi
+          # Test for *blank*, not just zero-length: `--strip header` on a range
+          # whose every commit was filtered leaves a file of bare newlines, which
+          # `[ -s ]` reports as non-empty. That is the realistic failure -- a
+          # release squashed into a single `release:` commit, which cliff.toml
+          # skips -- so the weaker test would let empty notes through.
+          if ! grep -q '[^[:space:]]' RELEASE_NOTES.md; then
+            echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write RELEASE_NOTES.md by hand and re-run, or re-cut the release with the individual commits intact."
+            exit 1
+          fi
+          cat RELEASE_NOTES.md
+
       - name: Authenticate with crates.io (trusted publishing)
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@v1
@@ -93,11 +125,6 @@ jobs:
         run: cargo publish -q --all-features
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
-
-      - name: Generate changelog
-        run: |
-          cargo install -q git-cliff --locked
-          git-cliff --latest --strip header -o RELEASE_NOTES.md
 
       - name: Create GitHub release
         run: |
