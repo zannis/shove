@@ -156,6 +156,7 @@ shove::define_sequenced_topic!(
     |msg: &OrderMessage| msg.order_id.clone(),
     TopologyBuilder::new("kafka-metrics-failall")
         .sequenced(SequenceFailure::FailAll)
+        .routing_shards(2)
         .hold_queue(Duration::from_millis(200))
         .dlq()
         .build()
