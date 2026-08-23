@@ -37,6 +37,54 @@ pub struct RabbitMq;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// SQS likewise has no ephemeral per-instance subscription: per-pod fan-out
+/// would mean creating and deleting a real queue plus an SNS subscription per
+/// process, and a leaked queue costs money for as long as nobody notices. So
+/// `Sqs` does not implement
+/// [`HasBroadcast`](crate::backend::capability::HasBroadcast) either, and
+/// `broadcast_subscriber()` is a compile error rather than a lossy
+/// approximation:
+///
+/// ```compile_fail
+/// # #[cfg(feature = "aws-sns-sqs")]
+/// # async fn _x() -> shove::error::Result<()> {
+/// use shove::{Broker, Sqs};
+/// use shove::sns::SnsConfig;
+///
+/// let broker = Broker::<Sqs>::new(SnsConfig {
+///     region: None,
+///     endpoint_url: None,
+/// }).await?;
+/// // error: no method named `broadcast_subscriber` for `Broker<Sqs>`
+/// let _ = broker.broadcast_subscriber();
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The control for the test above. A `compile_fail` doctest passes on *any*
+/// compile error (see the note on [`NotSequenced`](crate::topic::NotSequenced)),
+/// so on its own it would keep passing if the imports rotted or `SnsConfig`
+/// changed shape — it would have become a typo test asserting nothing about
+/// capabilities. This twin is byte-identical except for the final method, which
+/// `Broker<Sqs>` *does* have. It compiling is what pins the failure above to
+/// the missing `HasBroadcast` impl and nothing else.
+///
+/// ```rust,no_run
+/// # #[cfg(feature = "aws-sns-sqs")]
+/// # async fn _x() -> shove::error::Result<()> {
+/// use shove::{Broker, Sqs};
+/// use shove::sns::SnsConfig;
+///
+/// let broker = Broker::<Sqs>::new(SnsConfig {
+///     region: None,
+///     endpoint_url: None,
+/// }).await?;
+/// // The supported path for SQS: N independent pollers, not a fan-out.
+/// let _ = broker.consumer_supervisor();
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(feature = "aws-sns-sqs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aws-sns-sqs")))]
 pub struct Sqs;

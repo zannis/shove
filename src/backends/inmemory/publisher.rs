@@ -30,6 +30,20 @@ impl InMemoryPublisher {
         let topology = T::topology();
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
 
+        if topology.broadcast() {
+            // Broadcast has no shared queue to publish into — the message goes
+            // to each live subscriber's own buffer, or nowhere if there are
+            // none. `.broadcast()` forbids sequencing and a DLQ at build time,
+            // so neither branch below can apply.
+            headers
+                .entry(X_MESSAGE_ID.to_string())
+                .or_insert_with(|| Uuid::new_v4().to_string());
+            self.broker
+                .broadcast_publish(topology.queue(), Envelope::new(payload, headers))
+                .await?;
+            return Ok(());
+        }
+
         let queue_name = if let Some(seq) = topology.sequencing() {
             let key_fn = T::SEQUENCE_KEY_FN.ok_or_else(|| {
                 ShoveError::Topology(format!(

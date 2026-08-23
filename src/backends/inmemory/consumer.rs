@@ -140,6 +140,59 @@ impl InMemoryConsumer {
     {
         run_dlq_impl::<T, H>(self.broker.clone(), handler, ctx)
     }
+
+    pub(crate) fn run_broadcast_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        run_broadcast_impl::<T, H>(self.broker.clone(), handler, ctx, options)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast — one ephemeral subscription per call
+// ---------------------------------------------------------------------------
+
+/// Register this call's own subscription to `T`'s topic and run the ordinary
+/// concurrent loop against its private buffer.
+///
+/// Deliver-new and "nothing survives" are both structural here rather than
+/// enforced: the subscription is created after this future starts, so it cannot
+/// see earlier publishes, and its registry entry is owned by a guard on this
+/// future's stack, so it is gone whether the loop returns, is cancelled, or is
+/// aborted outright.
+async fn run_broadcast_impl<T, H>(
+    broker: InMemoryBroker,
+    handler: H,
+    ctx: H::Context,
+    options: ConsumerOptionsInner,
+) -> Result<()>
+where
+    T: Topic,
+    H: MessageHandler<T>,
+{
+    let topology = T::topology();
+    if !topology.broadcast() {
+        return Err(ShoveError::Topology(format!(
+            "topic '{}' is not a broadcast topology; a broadcast subscription to it \
+             would receive nothing, because publishes go to the shared queue",
+            topology.queue()
+        )));
+    }
+
+    let subscription = broker.broadcast_subscribe(topology.queue());
+    let queue = Arc::clone(subscription.queue());
+    let result = run_concurrent_on::<T, H>(broker, queue, handler, ctx, options).await;
+    // Explicit rather than implicit: dropping the guard is what deregisters
+    // this subscriber, and it must happen after the loop, not before it.
+    drop(subscription);
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +209,27 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
+    let queue = broker.lookup(T::topology().queue())?;
+    run_concurrent_on::<T, H>(broker, queue, handler, ctx, options).await
+}
+
+/// The concurrent delivery loop, against an already-resolved queue.
+///
+/// Split out from [`run_concurrent`] so the broadcast path can run the very
+/// same loop against a subscription's private buffer — which has no name to
+/// look up — instead of the shared, declared queue.
+async fn run_concurrent_on<T, H>(
+    broker: InMemoryBroker,
+    queue: Arc<QueueState>,
+    handler: H,
+    ctx: H::Context,
+    options: ConsumerOptionsInner,
+) -> Result<()>
+where
+    T: Topic,
+    H: MessageHandler<T>,
+{
     let topology = T::topology();
-    let queue = broker.lookup(topology.queue())?;
     let handler = Arc::new(handler);
     let ctx = Arc::new(ctx);
 
@@ -307,13 +379,22 @@ where
 async fn drain_pending(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
-    queue: &QueueState,
+    queue: &Arc<QueueState>,
     pending: &mut BTreeMap<u64, (Envelope, Handled)>,
     next_route: &mut u64,
     options: &ConsumerOptionsInner,
 ) {
     while let Some((env, (outcome, pre_handler_reason))) = pending.remove(next_route) {
-        route_outcome(broker, topology, env, outcome, pre_handler_reason, options).await;
+        route_outcome(
+            broker,
+            topology,
+            queue,
+            env,
+            outcome,
+            pre_handler_reason,
+            options,
+        )
+        .await;
         queue.in_flight.fetch_sub(1, Ordering::Release);
         *next_route += 1;
     }
@@ -740,6 +821,9 @@ where
 async fn route_outcome(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
+    // The queue this delivery came from. Used as the redelivery target for a
+    // broadcast subscription, whose buffer is private and has no name.
+    source: &Arc<QueueState>,
     env: Envelope,
     outcome: Outcome,
     // `Some` when the message was rejected before the handler ran; overrides
@@ -768,7 +852,7 @@ async fn route_outcome(
             resolve_reject(route_reject(broker, topology, env).await, pending);
         }
         RetryDecision::Hold { increment } => {
-            schedule_redelivery(broker, topology, env, increment);
+            schedule_redelivery(broker, topology, source, env, increment);
         }
     }
 }
@@ -792,6 +876,7 @@ fn resolve_reject(reached_dlq: bool, pending: metrics::PendingDiscard) {
 fn schedule_redelivery(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
+    source: &Arc<QueueState>,
     env: Envelope,
     increment: bool,
 ) {
@@ -827,6 +912,13 @@ fn schedule_redelivery(
     let broker_clone = broker.clone();
     let broker_shutdown = broker.shutdown_token().clone();
     let main_queue = topology.queue().to_string();
+    // A broadcast subscription's buffer is private and unnamed, so redelivery
+    // resolves it by holding the `Arc` rather than by name. Redelivering to the
+    // topic would be wrong even if it were addressable: a `Defer` belongs to
+    // the one subscriber that deferred, not to the whole fan-out. Named
+    // topologies keep the historical lookup, whose failure case (queue removed
+    // mid-backoff) still applies to them.
+    let target: Option<Arc<QueueState>> = topology.broadcast().then(|| Arc::clone(source));
 
     // Every `return` below destroys the message. None is counted — see
     // `metrics::FailReason` for why in-process broker drops stay log-only.
@@ -853,13 +945,19 @@ fn schedule_redelivery(
             );
             return;
         }
-        let Ok(q) = broker_clone.lookup(&main_queue) else {
-            tracing::warn!(
-                queue = %main_queue,
-                %message_id,
-                "redelivery target queue no longer exists — message dropped"
-            );
-            return;
+        let q = match target {
+            Some(q) => q,
+            None => {
+                let Ok(q) = broker_clone.lookup(&main_queue) else {
+                    tracing::warn!(
+                        queue = %main_queue,
+                        %message_id,
+                        "redelivery target queue no longer exists — message dropped"
+                    );
+                    return;
+                };
+                q
+            }
         };
         let redelivery_timeout = Duration::from_secs(30);
         match tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env)).await {
