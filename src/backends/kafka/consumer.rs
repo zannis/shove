@@ -2212,11 +2212,22 @@ where
             let has_dlq = topology.dlq().is_some();
             // Settled only by the commit's result, so they outlive this block.
             let mut unsettled: Vec<TerminalDiscard> = Vec::new();
-            // With no DLQ the buffer keeps no wire bytes, so there is nothing
-            // to iterate and nothing to publish — but there are still
-            // `batch_size` messages about to be dropped on the floor, which is
-            // exactly what the discard counter exists to report. Drive the loop
-            // off the batch size and let `raw` be empty in that case.
+            // Driven off `batch_size`, not `buffer.raw.len()`. With no DLQ the
+            // buffer keeps no wire bytes at all (`retain_raw` in the receive
+            // loop is the same `topology.dlq().is_some()`), so `raw` is empty
+            // — but there are still `batch_size` messages about to be dropped
+            // on the floor, which is exactly what the discard counter exists
+            // to report. Iterating `raw` would count none of them.
+            //
+            // With a DLQ, `push` supplies `Some(raw)` for every buffered
+            // message and is the only writer, so the two stay index-parallel.
+            // The `get` below is nevertheless a `match` rather than an index:
+            // if that invariant ever broke, the fallback is `reached_dlq =
+            // false`, which is *honest* — no bytes means no dead-letter
+            // publish happened, so the message really is gone with no copy,
+            // and `Lost` counts it. A panic or a silent `InDlq` would both be
+            // worse. The assert catches the programming error in tests without
+            // making release behaviour depend on it.
             debug_assert!(
                 !has_dlq || buffer.raw.len() == batch_size,
                 "`raw` is index-parallel to `messages` whenever a DLQ is declared"
