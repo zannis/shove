@@ -140,6 +140,9 @@
 //! - Per-backend modules: [`rabbitmq`], [`sns`], [`nats`], [`kafka`],
 //!   [`inmemory`] — expose the config and client types bound to each
 //!   marker.
+//! - The `env-config` feature and the `env` module for optional, prefix-scoped
+//!   `from_env()` constructors for the tuning knobs (consumer range, prefetch,
+//!   autoscaler, Kafka replication, NATS stream config).
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -153,6 +156,9 @@ pub mod codecs;
 pub mod consumer;
 pub mod consumer_group;
 pub mod consumer_supervisor;
+#[cfg(feature = "env-config")]
+#[cfg_attr(docsrs, doc(cfg(feature = "env-config")))]
+pub mod env;
 pub mod error;
 pub mod handler;
 #[doc(hidden)]

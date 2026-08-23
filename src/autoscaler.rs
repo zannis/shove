@@ -1,4 +1,8 @@
+#[cfg(feature = "env-config")]
+use crate::env::EnvVars;
 use crate::error::Result;
+#[cfg(feature = "env-config")]
+use crate::error::ShoveError;
 use crate::metrics;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -35,6 +39,83 @@ impl Default for AutoscalerConfig {
             cooldown_duration: Duration::from_secs(30),
         }
     }
+}
+
+#[cfg(feature = "env-config")]
+#[cfg_attr(docsrs, doc(cfg(feature = "env-config")))]
+impl AutoscalerConfig {
+    /// Read the autoscaler knobs from the environment under `prefix`.
+    ///
+    /// | Variable | Type | Default |
+    /// |---|---|---|
+    /// | `{PREFIX}_POLL_INTERVAL_SECS` | `u64`, `>= 1` | `5` |
+    /// | `{PREFIX}_SCALE_UP_MULTIPLIER` | `f64`, `> 0` | `2.0` |
+    /// | `{PREFIX}_SCALE_DOWN_MULTIPLIER` | `f64`, `> 0` | `0.5` |
+    /// | `{PREFIX}_HYSTERESIS_SECS` | `u64` | `10` |
+    /// | `{PREFIX}_COOLDOWN_SECS` | `u64` | `30` |
+    ///
+    /// Unset variables keep the [`Default`] value; a set-but-invalid value is
+    /// an error. `SCALE_DOWN_MULTIPLIER` must be strictly below
+    /// `SCALE_UP_MULTIPLIER` — at or above it both scaling conditions can hold
+    /// for the same queue depth, which makes the group flap.
+    ///
+    /// ```
+    /// use shove::autoscaler::AutoscalerConfig;
+    ///
+    /// let config = AutoscalerConfig::from_env("ORDERS")?;
+    /// # let _ = config.poll_interval;
+    /// # Ok::<_, shove::ShoveError>(())
+    /// ```
+    pub fn from_env(prefix: impl Into<String>) -> Result<Self> {
+        Self::from_vars(&EnvVars::with_prefix(prefix))
+    }
+
+    /// Read from an existing [`EnvVars`], so one reader can populate several
+    /// config structs (and so tests can supply an explicit map instead of
+    /// mutating the process environment).
+    pub fn from_vars(vars: &EnvVars) -> Result<Self> {
+        let defaults = Self::default();
+        let scale_up_multiplier =
+            positive_multiplier(vars, "SCALE_UP_MULTIPLIER", defaults.scale_up_multiplier)?;
+        let scale_down_multiplier = positive_multiplier(
+            vars,
+            "SCALE_DOWN_MULTIPLIER",
+            defaults.scale_down_multiplier,
+        )?;
+        if scale_down_multiplier >= scale_up_multiplier {
+            return Err(ShoveError::Validation(format!(
+                "{} ({scale_down_multiplier}) must be < {} ({scale_up_multiplier}); \
+                 otherwise scale-up and scale-down can both trigger at the same \
+                 queue depth and the group flaps",
+                vars.var_name("SCALE_DOWN_MULTIPLIER"),
+                vars.var_name("SCALE_UP_MULTIPLIER"),
+            )));
+        }
+        Ok(Self {
+            poll_interval: Duration::from_secs(vars.parse_in(
+                "POLL_INTERVAL_SECS",
+                defaults.poll_interval.as_secs(),
+                1..=u64::MAX,
+            )?),
+            scale_up_multiplier,
+            scale_down_multiplier,
+            hysteresis_duration: vars.secs("HYSTERESIS_SECS", defaults.hysteresis_duration)?,
+            cooldown_duration: vars.secs("COOLDOWN_SECS", defaults.cooldown_duration)?,
+        })
+    }
+}
+
+/// A multiplier must be finite and strictly positive: `0` makes the
+/// corresponding threshold fire on every poll, and `NaN`/`inf` make it never
+/// fire.
+#[cfg(feature = "env-config")]
+fn positive_multiplier(vars: &EnvVars, key: &str, default: f64) -> Result<f64> {
+    let value = vars.parse::<f64>(key, default)?;
+    if !value.is_finite() || value <= 0.0 {
+        let raw = vars.get(key).unwrap_or_default();
+        return Err(vars.invalid(key, &raw, "expected a finite number > 0"));
+    }
+    Ok(value)
 }
 
 /// Per-group mutable state tracked between polling iterations.
@@ -310,6 +391,81 @@ impl<B: AutoscalerBackend, S: ScalingStrategy> Autoscaler<B, S> {
 
         let group_refs: Vec<String> = groups.iter().map(|g| g.to_string()).collect();
         self.strategy.gc(&group_refs);
+    }
+}
+
+#[cfg(all(test, feature = "env-config"))]
+mod env_config_tests {
+    use super::AutoscalerConfig;
+    use crate::env::EnvVars;
+    use std::time::Duration;
+
+    fn vars(pairs: &[(&str, &str)]) -> EnvVars {
+        EnvVars::from_pairs("ORDERS", pairs.to_vec())
+    }
+
+    #[test]
+    fn all_unset_matches_default() {
+        let from_env = AutoscalerConfig::from_vars(&vars(&[])).unwrap();
+        let defaults = AutoscalerConfig::default();
+        assert_eq!(from_env.poll_interval, defaults.poll_interval);
+        assert_eq!(from_env.scale_up_multiplier, defaults.scale_up_multiplier);
+        assert_eq!(
+            from_env.scale_down_multiplier,
+            defaults.scale_down_multiplier
+        );
+        assert_eq!(from_env.hysteresis_duration, defaults.hysteresis_duration);
+        assert_eq!(from_env.cooldown_duration, defaults.cooldown_duration);
+    }
+
+    #[test]
+    fn reads_every_knob() {
+        let config = AutoscalerConfig::from_vars(&vars(&[
+            ("ORDERS_POLL_INTERVAL_SECS", "2"),
+            ("ORDERS_SCALE_UP_MULTIPLIER", "3.5"),
+            ("ORDERS_SCALE_DOWN_MULTIPLIER", "0.25"),
+            ("ORDERS_HYSTERESIS_SECS", "20"),
+            ("ORDERS_COOLDOWN_SECS", "60"),
+        ]))
+        .unwrap();
+        assert_eq!(config.poll_interval, Duration::from_secs(2));
+        assert_eq!(config.scale_up_multiplier, 3.5);
+        assert_eq!(config.scale_down_multiplier, 0.25);
+        assert_eq!(config.hysteresis_duration, Duration::from_secs(20));
+        assert_eq!(config.cooldown_duration, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn rejects_a_zero_poll_interval() {
+        // A 0 s poll interval is a hot loop against the broker's stats API.
+        assert!(AutoscalerConfig::from_vars(&vars(&[("ORDERS_POLL_INTERVAL_SECS", "0")])).is_err());
+    }
+
+    #[test]
+    fn rejects_non_positive_and_non_finite_multipliers() {
+        for bad in ["0", "-1", "nan", "inf"] {
+            assert!(
+                AutoscalerConfig::from_vars(&vars(&[("ORDERS_SCALE_UP_MULTIPLIER", bad)])).is_err(),
+                "accepted SCALE_UP_MULTIPLIER={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_scale_down_at_or_above_scale_up() {
+        // Both thresholds true at once ⇒ the group flaps.
+        let err = AutoscalerConfig::from_vars(&vars(&[
+            ("ORDERS_SCALE_UP_MULTIPLIER", "2.0"),
+            ("ORDERS_SCALE_DOWN_MULTIPLIER", "2.0"),
+        ]))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ORDERS_SCALE_DOWN_MULTIPLIER"), "got: {msg}");
+        assert!(msg.contains("ORDERS_SCALE_UP_MULTIPLIER"), "got: {msg}");
+
+        assert!(
+            AutoscalerConfig::from_vars(&vars(&[("ORDERS_SCALE_DOWN_MULTIPLIER", "5.0")])).is_err()
+        );
     }
 }
 

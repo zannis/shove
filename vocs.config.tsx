@@ -192,6 +192,7 @@ export default defineConfig({
       collapsed: false,
       items: [
         { text: 'Performance Tuning', link: '/ops/performance' },
+        { text: 'Environment Configuration', link: '/ops/env-config' },
         { text: 'Backend Ops Notes', link: '/ops/backends' },
       ],
     },
