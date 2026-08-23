@@ -96,7 +96,7 @@ recording_handler_for!(TickTopic, TimeTravelTopic, ActiveGuardTopic);
 
 struct TestBroker {
     _container: testcontainers::ContainerAsync<KafkaContainer>,
-    client: KafkaClient,
+    port: u16,
 }
 
 impl TestBroker {
@@ -109,18 +109,28 @@ impl TestBroker {
             .get_host_port_ipv4(apache::KAFKA_PORT)
             .await
             .expect("failed to get Kafka port");
-        let client =
-            KafkaClient::connect_with_retry(&KafkaConfig::new(format!("127.0.0.1:{port}")), 10)
-                .await
-                .expect("failed to connect to Kafka");
         Self {
             _container: container,
-            client,
+            port,
         }
     }
 
-    fn broker(&self) -> Broker<Kafka> {
-        Broker::<Kafka>::from_client(self.client.clone())
+    /// A broker on its **own** client, against the same container.
+    ///
+    /// Every call must get a fresh client: `run_until_timeout` cancels the
+    /// *client's* shutdown token when its signal fires, so a client that has
+    /// hosted one group lifecycle is spent — a second group built from it
+    /// shuts down before consuming anything. Reconnecting per round is also
+    /// the faithful model of what these tests are about: a process restart
+    /// rejoining the same Kafka consumer group.
+    async fn broker(&self) -> Broker<Kafka> {
+        let client = KafkaClient::connect_with_retry(
+            &KafkaConfig::new(format!("127.0.0.1:{}", self.port)),
+            10,
+        )
+        .await
+        .expect("failed to connect to Kafka");
+        Broker::<Kafka>::from_client(client)
     }
 }
 
@@ -144,13 +154,16 @@ macro_rules! publish {
 /// Runs a consumer group until `$expect` messages have landed (plus a settle
 /// window), shuts it down, and returns the sorted IDs the handler saw.
 ///
-/// Each call registers a *fresh* group handle, so consecutive calls model a
-/// process restart against the same Kafka consumer group.
+/// Takes the `TestBroker`, not a broker: each call connects its own client and
+/// closes it again, so consecutive calls model a process restart against the
+/// same Kafka consumer group. See [`TestBroker::broker`] for why sharing a
+/// client across rounds does not work.
 macro_rules! drain {
-    ($broker:expr, $topic:ty, $config:expr, $expect:expr) => {{
+    ($tb:expr, $topic:ty, $config:expr, $expect:expr) => {{
+        let broker = $tb.broker().await;
         let handler = RecordingHandler::default();
         let h = handler.clone();
-        let mut group = $broker.consumer_group();
+        let mut group = broker.consumer_group();
         group
             .register::<$topic, _>(ConsumerGroupConfig::new($config), move || h.clone())
             .await
@@ -172,6 +185,7 @@ macro_rules! drain {
             outcome.is_clean(),
             "consumer group did not shut down cleanly"
         );
+        broker.close().await;
         handler.sorted_ids().await
     }};
 }
@@ -213,7 +227,7 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 #[tokio::test]
 async fn reset_moves_a_committed_group_to_the_tail_and_back() {
     let tb = TestBroker::start().await;
-    let broker = tb.broker();
+    let broker = tb.broker().await;
     broker.topology().declare::<TickTopic>().await.unwrap();
 
     let config = KafkaConsumerGroupConfig::new(1..=1).with_prefetch_count(50);
@@ -221,7 +235,7 @@ async fn reset_moves_a_committed_group_to_the_tail_and_back() {
     // Round 1: consume a first batch so the group has real committed offsets.
     let first = ids("first", 10);
     publish!(&broker, TickTopic, first);
-    let seen = drain!(&broker, TickTopic, config.clone(), 10);
+    let seen = drain!(&tb, TickTopic, config.clone(), 10);
     assert_eq!(seen, sorted(first), "round 1 should drain the first batch");
 
     // A backlog accumulates while the group is down.
@@ -239,21 +253,21 @@ async fn reset_moves_a_committed_group_to_the_tail_and_back() {
         !report.is_noop(),
         "the group was 10 messages behind the tail: {report:?}"
     );
-    let skipped: i64 = report
-        .partitions()
-        .iter()
-        .filter_map(|p| p.delta())
-        .filter(|d| *d > 0)
-        .sum();
-    assert!(
-        (1..=10).contains(&skipped),
-        "the reset should skip at most the 10-message backlog, skipped {skipped}: {report:?}"
+    // Every partition must now sit at its high watermark, and with nothing
+    // deleted those watermarks sum to the number of records published. Measured
+    // in absolute offsets rather than by summing `delta()`: the backlog can land
+    // entirely on partitions this group never committed, and those report
+    // `delta() == None` — a real skip that per-partition deltas cannot see.
+    let tail: i64 = report.partitions().iter().map(|p| p.new_offset()).sum();
+    assert_eq!(
+        tail, 20,
+        "Latest must anchor every partition at its high watermark, 20 records published: {report:?}"
     );
 
     // Round 2: only messages published *after* the re-anchor arrive.
     let fresh = ids("fresh", 5);
     publish!(&broker, TickTopic, fresh);
-    let seen = drain!(&broker, TickTopic, config.clone(), 5);
+    let seen = drain!(&tb, TickTopic, config.clone(), 5);
     assert_eq!(
         seen,
         sorted(fresh),
@@ -267,7 +281,7 @@ async fn reset_moves_a_committed_group_to_the_tail_and_back() {
         !report.is_noop(),
         "the group was at the tail, not the head: {report:?}"
     );
-    let seen = drain!(&broker, TickTopic, config.clone(), 25);
+    let seen = drain!(&tb, TickTopic, config.clone(), 25);
     assert_eq!(
         seen.len(),
         25,
@@ -288,7 +302,7 @@ async fn reset_moves_a_committed_group_to_the_tail_and_back() {
 #[tokio::test]
 async fn reset_to_timestamp_replays_only_records_after_that_point() {
     let tb = TestBroker::start().await;
-    let broker = tb.broker();
+    let broker = tb.broker().await;
     broker
         .topology()
         .declare::<TimeTravelTopic>()
@@ -321,7 +335,7 @@ async fn reset_to_timestamp_replays_only_records_after_that_point() {
         "a group that never committed has no previous offsets: {report:?}"
     );
 
-    let seen = drain!(&broker, TimeTravelTopic, config.clone(), 6);
+    let seen = drain!(&tb, TimeTravelTopic, config.clone(), 6);
     assert_eq!(
         seen,
         sorted(after),
@@ -336,7 +350,7 @@ async fn reset_to_timestamp_replays_only_records_after_that_point() {
 #[tokio::test]
 async fn reset_is_refused_while_the_group_has_members() {
     let tb = TestBroker::start().await;
-    let broker = tb.broker();
+    let broker = tb.broker().await;
     broker
         .topology()
         .declare::<ActiveGuardTopic>()
@@ -356,7 +370,7 @@ async fn reset_is_refused_while_the_group_has_members() {
 
     let token = group.cancellation_token();
     let t = token.clone();
-    let probe_broker = tb.broker();
+    let probe_broker = tb.broker().await;
     let probe_config = config.clone();
     let probe_handler = handler.clone();
     // Everything in here must end by cancelling the token: `run_until_timeout`
