@@ -142,7 +142,7 @@ jobs:
             # already covers. Restrict it to the three schema-registry binaries.
             filter: -E 'binary(/^kafka_schema_registry/)'
           - name: redis-streams
-            # Asserted by `metrics_redis_sequenced`.
+            # Asserted by `metrics_redis_sequenced` and `metrics_redis_malformed`.
             features: redis-streams,metrics,sbe
     steps:
       - uses: actions/checkout@v6
