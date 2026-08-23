@@ -1616,7 +1616,10 @@ mod tests {
             .hold_queue(Duration::from_secs(5))
             .dlq()
             .build();
-        assert_eq!(sequenced.sequencing().map(|s| s.exchange()), Some("ledger-seq-hash"));
+        assert_eq!(
+            sequenced.sequencing().map(|s| s.exchange()),
+            Some("ledger-seq-hash")
+        );
         assert_eq!(
             sequenced.shard_hold_queue_names(2)[0].name(),
             "ledger-seq-2-hold-5s"

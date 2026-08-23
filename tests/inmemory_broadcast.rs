@@ -480,7 +480,11 @@ async fn a_second_subscription_to_the_same_topic_is_refused() {
 async fn an_ordinary_topology_is_unaffected() {
     let client = InMemoryBroker::new();
     let broker = Broker::<InMemory>::from_client(client.clone());
-    broker.topology().declare::<PlainOrders>().await.expect("declare");
+    broker
+        .topology()
+        .declare::<PlainOrders>()
+        .await
+        .expect("declare");
     let publisher = broker.publisher().await.expect("publisher");
 
     let recorder = Recorder::new();
