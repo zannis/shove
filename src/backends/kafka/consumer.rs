@@ -2147,13 +2147,30 @@ impl KafkaConsumer {
                                         pending.survived();
                                         continue;
                                     }
-                                    // Terminal: this commit is what actually
+                                    if topology.dlq().is_some() {
+                                        // The message is in the DLQ, so it
+                                        // exists whatever the commit does and
+                                        // `confirm` could never count it.
+                                        // Settling now keeps the dead-lettered
+                                        // cascade off the synchronous commit a
+                                        // live pending record would force —
+                                        // the same short-circuit the routing
+                                        // path below takes, and it matters more
+                                        // here: a poisoned key drains its whole
+                                        // backlog through this branch, so a
+                                        // per-message round trip is a far
+                                        // heavier tax than on an ordinary
+                                        // terminal outcome.
+                                        pending.survived();
+                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        continue;
+                                    }
+                                    // No DLQ: this commit is what actually
                                     // drops the message, so it decides the
                                     // discard accounting. `Async` only queues
                                     // the request and reports nothing, so
                                     // commit synchronously and settle on the
-                                    // broker's answer — the same rule the
-                                    // routing path below follows.
+                                    // broker's answer.
                                     match consumer.commit_message(&msg, CommitMode::Sync) {
                                         Ok(()) => pending.confirm(),
                                         Err(e) => {

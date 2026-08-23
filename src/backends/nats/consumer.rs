@@ -1172,12 +1172,30 @@ impl NatsConsumer {
                                             pending.survived();
                                             continue;
                                         }
-                                        // `double_ack` rather than `ack`: this
-                                        // is the arm that decides whether a
-                                        // discard happened, and `ack` returns
-                                        // as soon as `+ACK` is written to the
-                                        // connection. Same reasoning as
-                                        // `route_outcome`'s Dlq arm.
+                                        if topology.dlq().is_some() {
+                                            // The message is in the DLQ, so it
+                                            // exists whatever the ack does and
+                                            // `confirm` could never count it.
+                                            // Settling now keeps the
+                                            // dead-lettered cascade off the
+                                            // `double_ack` round trip the live
+                                            // pending record below needs — and
+                                            // a poisoned key drains its whole
+                                            // backlog through this branch, so
+                                            // that tax is per message.
+                                            pending.survived();
+                                            let _ = msg.ack().await;
+                                            continue;
+                                        }
+                                        // No DLQ, so this ack is what drops the
+                                        // message and it decides the discard
+                                        // accounting. `double_ack` rather than
+                                        // `ack`: `ack` returns as soon as
+                                        // `+ACK` is written to the connection,
+                                        // so a connection lost before JetStream
+                                        // applies it would redeliver a message
+                                        // already counted gone. Same reasoning
+                                        // as `route_outcome`'s Dlq arm.
                                         match msg.double_ack().await {
                                             Ok(()) => pending.confirm(),
                                             Err(e) => {
