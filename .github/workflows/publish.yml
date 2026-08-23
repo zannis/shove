@@ -12,6 +12,18 @@ on:
           - minor
           - major
           - none
+      # A rehearsal runs *every* step of the real release in the same job, so
+      # the path being exercised cannot drift from the path that ships. Only
+      # the three irreversible/outward-facing effects are withheld: the push of
+      # the release commit and tag, the crates.io upload (`--dry-run`
+      # substituted) and the GitHub release. Everything before them -- the
+      # version bump, the package.json/lockfile sync, the GPG-signed commit and
+      # tag, the changelog and the dirty-working-tree guard -- runs for real.
+      dry_run:
+        description: "Rehearse the release: run every step, publish nothing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -83,6 +95,15 @@ jobs:
           git add Cargo.toml Cargo.lock package.json pnpm-lock.yaml
           git commit -m "release: v${{ steps.version.outputs.version }}"
           git tag -m "v${{ steps.version.outputs.version }}" "v${{ steps.version.outputs.version }}"
+          # The commit and tag above are created for real even on a rehearsal --
+          # signing them is a step that can fail, so it has to be exercised.
+          # Only the push is withheld, leaving both objects local to the runner.
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry run: not pushing v${{ steps.version.outputs.version }} to ${{ github.ref_name }}"
+            git --no-pager log -1 --show-signature
+            git tag -v "v${{ steps.version.outputs.version }}"
+            exit 0
+          fi
           git push origin "HEAD:${{ github.ref_name }}" --follow-tags
 
       # Generate the notes *before* `cargo publish`, the one irreversible step
@@ -137,19 +158,42 @@ jobs:
             exit 1
           fi
 
+      # Skipped on a rehearsal: `cargo publish --dry-run` never contacts the
+      # registry, so minting a publish token for it would hand out a credential
+      # no step uses.
       - name: Authenticate with crates.io (trusted publishing)
         id: crates-auth
+        if: ${{ !inputs.dry_run }}
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish to crates.io
-        run: cargo publish -q --all-features
+        run: |
+          set -- cargo publish -q --all-features
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            set -- "$@" --dry-run
+          fi
+          "$@"
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
 
       - name: Create GitHub release
         run: |
-          gh release create "v${{ steps.version.outputs.version }}" \
+          set -- gh release create "v${{ steps.version.outputs.version }}" \
             -F "${RUNNER_TEMP}/RELEASE_NOTES.md" \
             --target "${{ github.sha }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            # A rehearsal cannot create the release: `gh release create` would
+            # create the tag on the remote, which is the push we just withheld.
+            # Assert instead that the notes file `-F` reads is still there and
+            # non-blank at this point in the job -- the failure this guards
+            # against is a step in between moving or clobbering it.
+            if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/RELEASE_NOTES.md"; then
+              echo "::error::${RUNNER_TEMP}/RELEASE_NOTES.md is missing or blank at the release step; 'gh release create -F' would fail here."
+              exit 1
+            fi
+            echo "dry run: would run: $*"
+            exit 0
+          fi
+          "$@"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
