@@ -66,7 +66,11 @@ This is why the payload is a **set of indices** rather than "the index of the fi
 
 A record whose fate is genuinely unknown — submitted to the broker but never confirmed — is reported as `unattempted`, never as succeeded. RabbitMQ hits this when a `basic_publish` fails partway through a batch: earlier messages are on the channel, but nothing has confirmed them, and the client cannot tell whether the broker received them.
 
-`shove` always resolves that ambiguity toward re-publishing. If your consumers are not already idempotent, make them so — see [Exactly-Once (RabbitMQ)](/guides/exactly-once) and the `x-message-id` header that every backend stamps.
+`shove` always resolves that ambiguity toward re-publishing. **So make your consumers idempotent** — that is the one thing a `to_republish()` retry loop asks of you.
+
+Deduplicate on a key from **your own payload**, not on `shove`'s message id. The `x-message-id` / `Shove-Message-Id` / `Nats-Msg-Id` header each backend stamps is minted fresh on every publish call, so a re-published record arrives with a *different* id — those headers deduplicate a broker-side redelivery of one publish, not a deliberate re-publish of the same record. The one exception is SNS FIFO, whose `MessageDeduplicationId` is derived from the payload content and so does collapse an identical re-publish inside its dedup window.
+
+See [Exactly-Once (RabbitMQ)](/guides/exactly-once) for the strongest available guarantee.
 
 ## Metrics
 
