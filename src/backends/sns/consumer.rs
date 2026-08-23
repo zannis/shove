@@ -1187,6 +1187,11 @@ where
                                 }
                             }
                         }
+                        metrics::record_failed(
+                            &topic,
+                            group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
+                        );
                         router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                         continue;
                     }
