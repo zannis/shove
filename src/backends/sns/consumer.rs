@@ -971,6 +971,7 @@ where
                         );
                         poisoned_keys.insert(key.clone());
                     }
+                    metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Rejected);
                     router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     in_flight_count -= 1;
                     drain_pending_for_key::<T, H>(
@@ -1053,6 +1054,11 @@ where
                                 router::route_ack(sqs, queue_url, &receipt_handle).await;
                             }
                             Outcome::Reject => {
+                                metrics::record_failed(
+                                    &topic,
+                                    group.as_deref(),
+                                    metrics::FailReason::Rejected,
+                                );
                                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                             }
                             Outcome::Retry => {
@@ -1152,6 +1158,7 @@ where
                             queue_url,
                             "message with poisoned sequence key, rejecting"
                         );
+                        // Cascade: intentionally not counted — see `metrics::FailReason`.
                         router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                         continue;
                     }
@@ -1172,6 +1179,7 @@ where
                             );
                             poisoned_keys.insert(seq_key.clone());
                             // Reject all pending deliveries for this key.
+                            // Cascade: intentionally not counted — see `metrics::FailReason`.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
                                     let rh = pd.receipt_handle().unwrap_or_default();
@@ -1179,6 +1187,11 @@ where
                                 }
                             }
                         }
+                        metrics::record_failed(
+                            &topic,
+                            group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
+                        );
                         router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                         continue;
                     }
@@ -1376,6 +1389,7 @@ async fn drain_pending_for_key<T, H>(
     H: MessageHandler<T>,
 {
     // If the key is poisoned, reject all pending deliveries for it.
+    // Cascade: intentionally not counted — see `metrics::FailReason`.
     if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
         if let Some(pending) = pending_deliveries.remove(key) {
             for pd in pending {
@@ -1403,10 +1417,16 @@ async fn drain_pending_for_key<T, H>(
                 retry_count,
                 "buffered message exceeded max retries, rejecting"
             );
+            metrics::record_failed(
+                topic,
+                group.as_deref(),
+                metrics::FailReason::MaxRetriesExceeded,
+            );
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
-                // Reject remaining pending for this key too.
                 router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                // Reject remaining pending for this key too.
+                // Cascade: intentionally not counted — see `metrics::FailReason`.
                 while let Some(pd) = pending.pop_front() {
                     let rh = pd.receipt_handle().unwrap_or_default();
                     router::route_reject(sqs, queue_url, rh, topology).await;
@@ -1431,6 +1451,7 @@ async fn drain_pending_for_key<T, H>(
                 "rejecting oversized buffered message"
             );
             metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Oversize);
+            // Cascade: intentionally not counted — see `metrics::FailReason`.
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
                 while let Some(pd) = pending.pop_front() {
@@ -1459,6 +1480,7 @@ async fn drain_pending_for_key<T, H>(
                         group.as_deref(),
                         metrics::FailReason::Deserialize,
                     );
+                    // Cascade: intentionally not counted — see `metrics::FailReason`.
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {

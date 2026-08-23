@@ -401,6 +401,11 @@ impl RabbitMqConsumer {
                                 );
                                 poisoned_keys.insert(key.clone());
                             }
+                            metrics::record_failed(
+                                &topic,
+                                group.as_deref(),
+                                metrics::FailReason::Rejected,
+                            );
                             router::route_reject(delivery, topology, &publisher).await?;
                         }
                         in_flight_count -= 1;
@@ -535,6 +540,11 @@ impl RabbitMqConsumer {
                                     .await;
                                 }
                                 Outcome::Reject => {
+                                    metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        metrics::FailReason::Rejected,
+                                    );
                                     router::route_reject(delivery, topology, &publisher).await.ok();
                                 }
                                 Outcome::Defer => {
@@ -638,6 +648,7 @@ impl RabbitMqConsumer {
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
+                        // Cascade: intentionally not counted — see `metrics::FailReason`.
                         router::route_reject(delivery, topology, &publisher).await?;
                         continue;
                     }
@@ -658,6 +669,7 @@ impl RabbitMqConsumer {
                             );
                             poisoned_keys.insert(seq_key.clone());
                             // Also reject all pending deliveries for this key.
+                            // Cascade: intentionally not counted — see `metrics::FailReason`.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
                                     router::route_reject(&pd.delivery, topology, &publisher)
@@ -665,6 +677,11 @@ impl RabbitMqConsumer {
                                 }
                             }
                         }
+                        metrics::record_failed(
+                            &topic,
+                            group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
+                        );
                         router::route_reject(delivery, topology, &publisher).await?;
                         continue;
                     }
@@ -828,6 +845,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         // If the key is poisoned, reject all pending deliveries for it.
+        // Cascade: intentionally not counted — see `metrics::FailReason`.
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
@@ -855,12 +873,18 @@ impl RabbitMqConsumer {
                     retry_count,
                     "buffered message exceeded max retries, sending to DLQ"
                 );
+                metrics::record_failed(
+                    topic,
+                    group.as_deref(),
+                    metrics::FailReason::MaxRetriesExceeded,
+                );
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
-                    // Reject remaining pending for this key too.
                     router::route_reject(&received.delivery, topology, publisher)
                         .await
                         .ok();
+                    // Reject remaining pending for this key too.
+                    // Cascade: intentionally not counted — see `metrics::FailReason`.
                     while let Some(pd) = pending.pop_front() {
                         router::route_reject(&pd.delivery, topology, publisher)
                             .await
@@ -889,7 +913,10 @@ impl RabbitMqConsumer {
             .await
             {
                 None => {
-                    // Extra FailAll poisoning on deserialization failure.
+                    // Extra FailAll poisoning on deserialization failure. The
+                    // failure itself is already counted inside
+                    // `try_deserialize_or_reject`.
+                    // Cascade: intentionally not counted — see `metrics::FailReason`.
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {
