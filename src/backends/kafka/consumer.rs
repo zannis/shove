@@ -2600,11 +2600,15 @@ impl KafkaConsumer {
     {
         let topology = T::topology();
         let queue = topology.queue();
+        // Precedence: explicit `with_group_id` > the topology's fan-out group
+        // (`{queue}-{group}-consumer`) > the topic default `{queue}-consumer`.
         let group_id = options
             .kafka_group_id
             .as_deref()
             .map(str::to_string)
-            .unwrap_or_else(|| super::constants::consumer_group_id(queue));
+            .unwrap_or_else(|| {
+                super::constants::consumer_group_id_scoped(queue, topology.consumer_group())
+            });
         let auto_offset_reset = options
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
@@ -3203,11 +3207,15 @@ impl KafkaConsumer {
                  batching and sequencing are mutually exclusive — use run_fifo"
             )));
         }
+        // Same precedence as `run_with_inner`: explicit override, then the
+        // topology's fan-out group, then the topic default.
         let group_id = options
             .kafka_group_id
             .as_deref()
             .map(str::to_string)
-            .unwrap_or_else(|| super::constants::consumer_group_id(queue));
+            .unwrap_or_else(|| {
+                super::constants::consumer_group_id_scoped(queue, topology.consumer_group())
+            });
         let auto_offset_reset = options
             .kafka_auto_offset_reset
             .unwrap_or(KafkaAutoOffsetReset::Earliest);
@@ -3552,10 +3560,13 @@ impl KafkaConsumer {
         // Honor the `group.id` override (registry: set by `spawn_one` from
         // `KafkaConsumerGroupConfig::with_group_id`; direct: set by
         // `ConsumerOptions::<Kafka>::with_group_id`) by rebasing onto it as
-        // `{group}-fifo`. `None` keeps the default `{queue}-fifo`.
+        // `{group}-fifo`. `None` falls back to the topology's fan-out group
+        // (`{queue}-{group}-fifo`), then to the default `{queue}-fifo`.
         let group_id = match options.kafka_group_id.as_deref() {
             Some(base) => super::constants::fifo_group_id_from_base(base),
-            None => super::constants::consumer_group_id_fifo(&queue),
+            None => {
+                super::constants::consumer_group_id_fifo_scoped(&queue, topology.consumer_group())
+            }
         };
         let auto_offset_reset = options
             .kafka_auto_offset_reset

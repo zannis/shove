@@ -34,7 +34,35 @@ pub(super) fn consumer_group_id_fifo(queue: &str) -> String {
     format!("{queue}-fifo")
 }
 
+/// Derives the consumer group ID for a topology declared with
+/// [`TopologyBuilder::for_consumer_group`](crate::TopologyBuilder::for_consumer_group).
+///
+/// Without a fan-out group this is the historical `{queue}-consumer`. With one
+/// it is `{queue}-{group}-consumer`, so a second service reading the same topic
+/// is assigned its own partition set instead of splitting the first service's.
+/// An explicit `with_group_id` override outranks both — see
+/// `KafkaConsumerGroupConfig::resolved_group_id`.
+pub(super) fn consumer_group_id_scoped(queue: &str, fan_out_group: Option<&str>) -> String {
+    match fan_out_group {
+        Some(group) => format!("{queue}-{group}-consumer"),
+        None => consumer_group_id(queue),
+    }
+}
+
+/// FIFO counterpart of [`consumer_group_id_scoped`]: `{queue}-{group}-fifo`,
+/// mirroring how the unscoped FIFO group drops the `-consumer` suffix.
+pub(super) fn consumer_group_id_fifo_scoped(queue: &str, fan_out_group: Option<&str>) -> String {
+    match fan_out_group {
+        Some(group) => format!("{queue}-{group}-fifo"),
+        None => consumer_group_id_fifo(queue),
+    }
+}
+
 /// Derives the DLQ consumer group ID from a DLQ topic name.
+///
+/// Takes the *resolved* DLQ topic name, so a fan-out group needs no special
+/// case here: its DLQ is already `{queue}-{group}-dlq`, giving the drain group
+/// `{queue}-{group}-dlq-consumer`.
 pub(super) fn dlq_consumer_group_id(dlq: &str) -> String {
     format!("{dlq}-consumer")
 }
@@ -134,6 +162,50 @@ mod tests {
         assert_eq!(consumer_group_id("orders"), "orders-consumer");
         assert_eq!(consumer_group_id_fifo("orders"), "orders-fifo");
         assert_eq!(dlq_consumer_group_id("orders-dlq"), "orders-dlq-consumer");
+    }
+
+    #[test]
+    fn scoped_group_ids_match_the_unscoped_ones_without_a_fan_out_group() {
+        // `None` must be byte-identical to the historical derivation: an
+        // existing deployment upgrading to this version keeps its group and
+        // its committed offsets.
+        assert_eq!(
+            consumer_group_id_scoped("orders", None),
+            consumer_group_id("orders")
+        );
+        assert_eq!(
+            consumer_group_id_fifo_scoped("orders", None),
+            consumer_group_id_fifo("orders")
+        );
+    }
+
+    #[test]
+    fn scoped_group_ids_namespace_by_fan_out_group() {
+        assert_eq!(
+            consumer_group_id_scoped("orders", Some("price-latest")),
+            "orders-price-latest-consumer"
+        );
+        assert_eq!(
+            consumer_group_id_fifo_scoped("orders", Some("price-latest")),
+            "orders-price-latest-fifo"
+        );
+        // Two fan-out groups on one topic never collide — the property the
+        // whole feature rests on.
+        assert_ne!(
+            consumer_group_id_scoped("orders", Some("a")),
+            consumer_group_id_scoped("orders", Some("b"))
+        );
+    }
+
+    #[test]
+    fn dlq_drain_group_follows_the_namespaced_dlq_topic() {
+        // The DLQ group needs no fan-out case of its own: it is derived from
+        // the resolved DLQ topic, which `for_consumer_group` already
+        // namespaced.
+        assert_eq!(
+            dlq_consumer_group_id("orders-price-latest-dlq"),
+            "orders-price-latest-dlq-consumer"
+        );
     }
 
     #[test]

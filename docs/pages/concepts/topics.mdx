@@ -63,6 +63,7 @@ The macro and the manual form are identical in behaviour. Use the macro; it is l
 The full chain of methods, in the order you would typically call them:
 
 - `.new(name)` — required; the primary queue name.
+- `.for_consumer_group(name)` — declare this topology on behalf of a named fan-out group, so a second independent reader of the same topic gets its own retry/DLQ chain. See [Fan-out](#fan-out-two-readers-on-one-topic).
 - `.hold_queue(Duration)` — add a delayed-redelivery queue; callable multiple times for escalating backoff.
 - `.dlq()` — add a dead-letter queue named `{name}-dlq`.
 - `.dlq_named(name)` — add a dead-letter queue with a custom name.
@@ -89,6 +90,47 @@ The builder derives all queue names from the primary name:
 | Hold (5s) | `order-settlement-hold-5s` |
 | Hold (30s) | `order-settlement-hold-30s` |
 | DLQ | `order-settlement-dlq` |
+
+## Fan-out: two readers on one topic
+
+Deriving every name from the topic name is right for one reader and wrong for two. If a second service declares the same topology to read the same topic, it derives the *same* `order-settlement-dlq` and the *same* `order-settlement-hold-5s` — so each service drains the other's held and dead messages. The workaround was to give the second reader a **bare** topology (no `.dlq()`, no `.hold_queue()`), which costs it `Outcome::Retry` and `Outcome::Reject` entirely: without a DLQ both of those discard.
+
+`.for_consumer_group(name)` removes the trade-off. The topic stays shared; every derived name is namespaced by the group:
+
+```rust,no_run
+// Service A — the incumbent reader, unchanged.
+TopologyBuilder::new("order-settlement")
+    .hold_queue(Duration::from_secs(5))
+    .dlq()
+    .build()
+
+// Service B — same topic, its own failure-handling chain.
+TopologyBuilder::new("order-settlement")
+    .for_consumer_group("settlement-audit")
+    .hold_queue(Duration::from_secs(5))
+    .dlq()
+    .build()
+```
+
+| Component | Service A | Service B |
+|-----------|-----------|-----------|
+| Main queue | `order-settlement` | `order-settlement` *(shared — the point)* |
+| Hold (5s) | `order-settlement-hold-5s` | `order-settlement-settlement-audit-hold-5s` |
+| DLQ | `order-settlement-dlq` | `order-settlement-settlement-audit-dlq` |
+
+Notes:
+
+- Call order does not matter — the names resolve at `.build()`, so `.for_consumer_group(...)` may appear anywhere in the chain.
+- `.dlq_named(...)` is used verbatim. Two readers naming the same DLQ share it on purpose.
+- Omitting `.for_consumer_group(...)` reproduces every historical name exactly, so upgrading shove never re-points a deployed topology at a fresh, empty DLQ.
+
+Namespacing the retry chain is necessary for fan-out but not sufficient on its own — the two readers must also be in different *consumer groups*, which is a backend-level notion:
+
+| Backend | Does the group give you fan-out? |
+|---------|----------------------------------|
+| Kafka | Yes — the `group.id` becomes `{queue}-{group}-consumer`, so the readers get independent partition assignments. An explicit `with_group_id` still wins. |
+| Redis Streams | Yes — give the second reader a client configured with a different XGROUP name; the topology group namespaces its chain to match. |
+| NATS, RabbitMQ, SQS | Partly — the retry chain is namespaced, but the readers still share one durable consumer / queue and compete for messages. Real fan-out needs a second stream consumer or a fan-out exchange, which shove does not derive for you. |
 
 ## Hold queues
 

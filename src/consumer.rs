@@ -651,13 +651,17 @@ impl ConsumerOptions<Kafka> {
     ///
     /// The standard consumer joins this value verbatim; a DLQ drain joins
     /// `"{group}-dlq"`; a FIFO consumer joins `"{group}-fifo"`. `None` (the
-    /// default) keeps the topic-derived ids: `"{queue}-consumer"`,
+    /// default) falls back to the topology's fan-out group if it has one, and
+    /// otherwise to the topic-derived ids: `"{queue}-consumer"`,
     /// `"{dlq}-consumer"`, and `"{queue}-fifo"`.
     ///
     /// Use this when two independent services consume the same topic and each
     /// must receive every message (fan-out): without distinct group IDs they
-    /// share one consumer group and compete for partitions. For the coordinated
-    /// registry path the equivalent is
+    /// share one consumer group and compete for partitions. Prefer
+    /// [`TopologyBuilder::for_consumer_group`](crate::TopologyBuilder::for_consumer_group),
+    /// which sets the group *and* namespaces the DLQ/hold-queue chain — an
+    /// override here splits the group but leaves both readers sharing one DLQ.
+    /// For the coordinated registry path the equivalent is
     /// [`KafkaConsumerGroupConfig::with_group_id`](crate::kafka::KafkaConsumerGroupConfig::with_group_id).
     pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
         self.kafka_group_id = Some(group_id.into());

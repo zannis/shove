@@ -17,7 +17,7 @@ The full API reference for `shove` is auto-generated rustdoc on **[docs.rs/shove
 - [`MessageHandler`](https://docs.rs/shove/latest/shove/trait.MessageHandler.html) — handler trait, parameterized on `Topic`
 - [`MessageHandlerExt`](https://docs.rs/shove/latest/shove/trait.MessageHandlerExt.html) — fluent helpers (`.audited(...)`)
 - [`Topic`](https://docs.rs/shove/latest/shove/trait.Topic.html), [`SequencedTopic`](https://docs.rs/shove/latest/shove/trait.SequencedTopic.html) — topic traits
-- [`TopologyBuilder`](https://docs.rs/shove/latest/shove/struct.TopologyBuilder.html) — `.hold_queue`, `.sequenced`, `.routing_shards`, `.dlq`
+- [`TopologyBuilder`](https://docs.rs/shove/latest/shove/struct.TopologyBuilder.html) — `.hold_queue`, `.sequenced`, `.routing_shards`, `.dlq`, `.for_consumer_group`
 - [`ConsumerOptions`](https://docs.rs/shove/latest/shove/struct.ConsumerOptions.html) — per-consumer tuning
 - [`Codec`](https://docs.rs/shove/latest/shove/trait.Codec.html) — per-topic wire encoding (`JsonCodec`, `ProtobufCodec`, `SbeCodec`, `RawBytesCodec`)
 - [`SbeFrame`](https://docs.rs/shove/latest/shove/struct.SbeFrame.html), [`SbeMessage`](https://docs.rs/shove/latest/shove/trait.SbeMessage.html) — zero-copy SBE wire frames (`sbe` feature)
