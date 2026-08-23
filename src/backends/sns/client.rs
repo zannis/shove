@@ -5,7 +5,9 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "aws-sns-sqs")]
 use crate::backends::sns::topology::QueueRegistry;
 use crate::backends::sns::topology::TopicRegistry;
-use crate::error::{Result, ShoveError};
+use crate::error::Result;
+#[cfg(feature = "aws-sns-sqs")]
+use crate::error::ShoveError;
 
 /// AWS SNS connection configuration.
 #[derive(Clone)]
