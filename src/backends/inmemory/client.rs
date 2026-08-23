@@ -265,27 +265,36 @@ impl InMemoryBroker {
     }
 
     /// Deliver `env` to every live broadcast subscriber of `topic`, one clone
-    /// each. Returns how many subscribers it reached.
+    /// each.
     ///
     /// A topic nobody is subscribed to is a successful no-op: broadcast is
     /// deliver-new, so a message published with no listeners was never anyone's
-    /// to receive. The subscriber list is copied out before any `await` so a
-    /// subscriber arriving or leaving mid-publish cannot deadlock against the
-    /// enqueue.
-    pub(super) async fn broadcast_publish(&self, topic: &str, env: Envelope) -> Result<usize> {
+    /// to receive.
+    ///
+    /// The subscriber list is copied out before the first `await`, so the
+    /// `DashMap` shard lock is never held across one — a subscriber arriving or
+    /// leaving mid-publish cannot deadlock against the enqueue. The cost is
+    /// that a subscriber which leaves during a publish may still be handed the
+    /// message, which is harmless: its buffer is about to be dropped.
+    ///
+    /// Backpressure is shared, as it is for every other in-process publish:
+    /// `enqueue` awaits capacity, so a subscriber whose handler has stalled
+    /// with a full buffer holds up delivery to the others behind it. That is
+    /// the existing `InMemoryConfig::default_capacity` contract rather than
+    /// something broadcast introduces — and dropping instead would be a second
+    /// discard path, invisible to the discard metrics.
+    pub(super) async fn broadcast_publish(&self, topic: &str, env: Envelope) -> Result<()> {
         let subscribers: Vec<Arc<QueueState>> = match self.inner.broadcast.get(topic) {
             Some(subs) => subs.iter().map(|(_, q)| Arc::clone(q)).collect(),
-            None => return Ok(0),
+            None => return Ok(()),
         };
 
-        let mut delivered = 0usize;
         for queue in &subscribers {
             // Each subscriber gets its own envelope; the payload is `Bytes`, so
             // the clone shares one buffer rather than copying the message.
             self.enqueue(queue, env.clone()).await?;
-            delivered += 1;
         }
-        Ok(delivered)
+        Ok(())
     }
 
     /// Number of live subscriptions to `topic`. Test/observability hook — the
