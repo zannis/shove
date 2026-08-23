@@ -135,7 +135,9 @@ jobs:
             # already covers. Restrict it to the three schema-registry binaries.
             filter: -E 'binary(/^kafka_schema_registry/)'
           - name: redis-streams
-            features: redis-streams,sbe
+            # `metrics` — see the rabbitmq entry; asserted by
+            # `metrics_redis_malformed`.
+            features: redis-streams,metrics,sbe
     steps:
       - uses: actions/checkout@v6
       - if: startsWith(matrix.name, 'kafka')
