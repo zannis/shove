@@ -261,6 +261,27 @@ pub(crate) fn record_consumed(topic: &str, group: Option<&str>, outcome: &Outcom
 #[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_consumed(_: &str, _: Option<&str>, _: &Outcome) {}
 
+/// `record_consumed` for a whole batch at once, so a batch consumer's
+/// `messages_consumed_total` counts *messages* (comparable with the
+/// single-message consumers) rather than flushes.
+#[cfg(feature = "metrics")]
+pub(crate) fn record_consumed_n(topic: &str, group: Option<&str>, outcome: &Outcome, count: u64) {
+    if count == 0 {
+        return;
+    }
+    ::metrics::counter!(
+        names().messages_consumed_total.as_str(),
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "outcome" => outcome_label(outcome),
+    )
+    .increment(count);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_consumed_n(_: &str, _: Option<&str>, _: &Outcome, _: u64) {}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason) {
     ::metrics::counter!(
@@ -275,6 +296,28 @@ pub(crate) fn record_failed(topic: &str, group: Option<&str>, reason: FailReason
 #[cfg(not(feature = "metrics"))]
 #[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_failed(_: &str, _: Option<&str>, _: FailReason) {}
+
+/// `record_failed` for a whole batch at once, so a batch consumer's
+/// `messages_failed_total` counts *messages* (comparable with the
+/// single-message consumers) rather than flushes.
+#[cfg(feature = "metrics")]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_failed_n(topic: &str, group: Option<&str>, reason: FailReason, count: u64) {
+    if count == 0 {
+        return;
+    }
+    ::metrics::counter!(
+        names().messages_failed_total.as_str(),
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "reason" => reason.as_label(),
+    )
+    .increment(count);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_failed_n(_: &str, _: Option<&str>, _: FailReason, _: u64) {}
 
 #[cfg(feature = "metrics")]
 pub(crate) fn record_discarded(topic: &str, group: Option<&str>, reason: FailReason) {
@@ -519,30 +562,30 @@ pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize
 pub(crate) fn record_message_size(_: &str, _: Option<&str>, _: usize) {}
 
 #[cfg(feature = "metrics")]
-pub(crate) fn inc_inflight(topic: &str, group: Option<&str>) {
+pub(crate) fn inc_inflight(topic: &str, group: Option<&str>, count: u64) {
     ::metrics::gauge!(
         names().messages_inflight.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
     )
-    .increment(1.0);
+    .increment(count as f64);
 }
 
 #[cfg(not(feature = "metrics"))]
-pub(crate) fn inc_inflight(_: &str, _: Option<&str>) {}
+pub(crate) fn inc_inflight(_: &str, _: Option<&str>, _: u64) {}
 
 #[cfg(feature = "metrics")]
-pub(crate) fn dec_inflight(topic: &str, group: Option<&str>) {
+pub(crate) fn dec_inflight(topic: &str, group: Option<&str>, count: u64) {
     ::metrics::gauge!(
         names().messages_inflight.as_str(),
         "topic" => topic.to_string(),
         "consumer_group" => group_label(group).to_string(),
     )
-    .decrement(1.0);
+    .decrement(count as f64);
 }
 
 #[cfg(not(feature = "metrics"))]
-pub(crate) fn dec_inflight(_: &str, _: Option<&str>) {}
+pub(crate) fn dec_inflight(_: &str, _: Option<&str>, _: u64) {}
 
 /// RAII handle that increments the inflight gauge on construction and
 /// decrements it on drop. Use this instead of paired `inc_inflight` /
@@ -552,18 +595,44 @@ pub(crate) fn dec_inflight(_: &str, _: Option<&str>) {}
 pub(crate) struct InflightGuard {
     topic: std::sync::Arc<str>,
     group: Option<std::sync::Arc<str>>,
+    count: u64,
 }
 
 #[allow(dead_code)]
 impl InflightGuard {
     pub(crate) fn new(topic: std::sync::Arc<str>, group: Option<std::sync::Arc<str>>) -> Self {
-        inc_inflight(&topic, group.as_deref());
-        Self { topic, group }
+        Self::with_count(topic, group, 1)
+    }
+
+    /// Batch variant: the gauge counts *messages* in flight, so a batch of
+    /// `count` messages handed to a handler moves it by `count`, not by one.
+    /// Keeps `messages_inflight` comparable between the single-message and
+    /// batch consumers.
+    pub(crate) fn with_count(
+        topic: std::sync::Arc<str>,
+        group: Option<std::sync::Arc<str>>,
+        count: u64,
+    ) -> Self {
+        inc_inflight(&topic, group.as_deref(), count);
+        Self {
+            topic,
+            group,
+            count,
+        }
     }
 
     /// Convenience constructor for borrowed inputs.
     pub(crate) fn from_refs(topic: &str, group: Option<&str>) -> Self {
         Self::new(std::sync::Arc::from(topic), group.map(std::sync::Arc::from))
+    }
+
+    /// Convenience constructor for borrowed inputs — see [`Self::with_count`].
+    pub(crate) fn from_refs_n(topic: &str, group: Option<&str>, count: u64) -> Self {
+        Self::with_count(
+            std::sync::Arc::from(topic),
+            group.map(std::sync::Arc::from),
+            count,
+        )
     }
 
     pub(crate) fn topic(&self) -> &str {
@@ -577,7 +646,7 @@ impl InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        dec_inflight(&self.topic, self.group.as_deref());
+        dec_inflight(&self.topic, self.group.as_deref(), self.count);
     }
 }
 
