@@ -136,7 +136,9 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
 /// enters `AwaitingRetry` because a handler returned `Retry`, which is not a
 /// failure and is not counted; the retried message itself survives in its hold
 /// queue. The buffered messages are destroyed with nothing else standing in for
-/// them, so each one is counted individually.
+/// them, so each one is counted individually — the count therefore scales with
+/// the depth behind the stuck key, deliberately, because that number is the
+/// size of the loss and is what an operator alerting on this needs.
 ///
 /// # In-process broker drops are log-only
 ///
@@ -199,13 +201,9 @@ pub(crate) enum FailReason {
     /// alert. Currently RabbitMQ-only; it is the only backend that implements
     /// hold-queue eviction.
     ///
-    /// Counted once per dead-lettered message, so it does scale with the depth
-    /// behind the stuck key — deliberately, and not in conflict with the
-    /// cascade rule above. A cascade is excluded because the failure it
-    /// descends from was already counted; here nothing else counts these
-    /// messages at all, so skipping them would retire a whole key's backlog
-    /// with no failure metric anywhere. The number is the size of the loss,
-    /// which is what an operator alerting on this needs.
+    /// Counted once per dead-lettered message rather than excluded as a
+    /// cascade — see "Hold-queue eviction is *not* a cascade" on this enum for
+    /// why.
     SequenceTimeout,
 }
 
