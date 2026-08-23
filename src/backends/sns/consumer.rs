@@ -96,8 +96,18 @@ fn extract_metadata(msg: &Message) -> MessageMetadata {
         retry_count,
         delivery_id: msg.message_id().unwrap_or_default().to_string(),
         redelivered: retry_count > 0,
+        delivery_count: approximate_receive_count(msg),
         headers: Arc::new(router::extract_message_attributes(msg)),
     }
+}
+
+/// Reads SQS's `ApproximateReceiveCount`, which counts receives including this
+/// one (so a first delivery reports 1). Every `receive_message` call in this
+/// backend requests the attribute; it is `None` only when SQS omitted it.
+fn approximate_receive_count(msg: &Message) -> Option<u32> {
+    msg.attributes()
+        .and_then(|attrs| attrs.get(&MessageSystemAttributeName::ApproximateReceiveCount))
+        .and_then(|v| v.parse::<u32>().ok())
 }
 
 /// SNS notification envelope that wraps message payloads when `RawMessageDelivery`
@@ -1221,6 +1231,7 @@ where
                             );
                             poisoned_keys.insert(seq_key.clone());
                             // Reject all pending deliveries for this key.
+                            // Cascade: intentionally not counted — see `metrics::FailReason`.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
                                     let rh = pd.receipt_handle().unwrap_or_default();
@@ -1454,6 +1465,7 @@ async fn drain_pending_for_key<T, H>(
     H: MessageHandler<T>,
 {
     // If the key is poisoned, reject all pending deliveries for it.
+    // Cascade: intentionally not counted — see `metrics::FailReason`.
     if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
         if let Some(pending) = pending_deliveries.remove(key) {
             for pd in pending {
@@ -1965,5 +1977,34 @@ impl SqsConsumer {
             })
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn approximate_receive_count_is_read_from_system_attributes() {
+        let msg = Message::builder()
+            .body("{}")
+            .attributes(MessageSystemAttributeName::ApproximateReceiveCount, "4")
+            .build();
+        assert_eq!(approximate_receive_count(&msg), Some(4));
+    }
+
+    #[test]
+    fn approximate_receive_count_is_none_when_sqs_omits_it() {
+        let msg = Message::builder().body("{}").build();
+        assert_eq!(approximate_receive_count(&msg), None);
+    }
+
+    #[test]
+    fn approximate_receive_count_is_none_when_unparseable() {
+        let msg = Message::builder()
+            .body("{}")
+            .attributes(MessageSystemAttributeName::ApproximateReceiveCount, "many")
+            .build();
+        assert_eq!(approximate_receive_count(&msg), None);
     }
 }

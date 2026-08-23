@@ -90,7 +90,15 @@ fn extract_message_metadata(msg: &Message) -> MessageMetadata {
         .map(|v| v.as_str().to_string())
         .unwrap_or_default();
 
-    let redelivered = msg.info().map(|info| info.delivered > 1).unwrap_or(false);
+    // `info.delivered` is JetStream's `num_delivered`: attempts so far including
+    // this one, so the first delivery reports 1. It is absent for messages that
+    // did not come from a stream (`info()` errors), which is why the count is
+    // optional rather than defaulted to 1.
+    let delivery_count = msg
+        .info()
+        .ok()
+        .map(|info| u32::try_from(info.delivered).unwrap_or(u32::MAX));
+    let redelivered = delivery_count.is_some_and(|n| n > 1);
 
     let headers = extract_string_headers(&msg.headers);
 
@@ -98,6 +106,7 @@ fn extract_message_metadata(msg: &Message) -> MessageMetadata {
         retry_count,
         delivery_id,
         redelivered,
+        delivery_count,
         headers: Arc::new(headers),
     }
 }

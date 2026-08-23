@@ -673,6 +673,7 @@ impl RabbitMqConsumer {
                             );
                             poisoned_keys.insert(seq_key.clone());
                             // Also reject all pending deliveries for this key.
+                            // Cascade: intentionally not counted — see `metrics::FailReason`.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
                                     router::route_reject(&pd.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded)
@@ -834,6 +835,7 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         // If the key is poisoned, reject all pending deliveries for it.
+        // Cascade: intentionally not counted — see `metrics::FailReason`.
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
@@ -919,7 +921,10 @@ impl RabbitMqConsumer {
             .await
             {
                 None => {
-                    // Extra FailAll poisoning on deserialization failure.
+                    // Extra FailAll poisoning on deserialization failure. The
+                    // failure itself is already counted inside
+                    // `try_deserialize_or_reject`.
+                    // Cascade: intentionally not counted — see `metrics::FailReason`.
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {

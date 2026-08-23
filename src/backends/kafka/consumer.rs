@@ -334,6 +334,11 @@ fn build_message_metadata(
         retry_count,
         delivery_id,
         redelivered,
+        // Kafka delivery is offset-based: the broker keeps no per-message
+        // attempt counter, and a redelivery after a rebalance or restart is
+        // indistinguishable from a first read. Reporting `retry_count + 1` here
+        // would silently under-count exactly those cases, so report "unknown".
+        delivery_count: None,
         headers: Arc::clone(headers),
     }
 }

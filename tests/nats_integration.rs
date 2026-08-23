@@ -2131,12 +2131,14 @@ async fn defer_preserves_retry_count() {
     struct DeferCheckRetry {
         counter: WaitableCounter,
         retry_counts: Arc<Mutex<Vec<u32>>>,
+        delivery_counts: Arc<Mutex<Vec<Option<u32>>>>,
     }
 
     impl MessageHandler<WorkTopic> for DeferCheckRetry {
         type Context = ();
         async fn handle(&self, _msg: SimpleMessage, meta: MessageMetadata, _: &()) -> Outcome {
             self.retry_counts.lock().await.push(meta.retry_count);
+            self.delivery_counts.lock().await.push(meta.delivery_count);
             let call = self.counter.get();
             self.counter.increment();
             match call {
@@ -2163,9 +2165,11 @@ async fn defer_preserves_retry_count() {
 
     let counter = WaitableCounter::new();
     let retry_counts = Arc::new(Mutex::new(Vec::new()));
+    let delivery_counts = Arc::new(Mutex::new(Vec::new()));
     let handler = DeferCheckRetry {
         counter: counter.clone(),
         retry_counts: retry_counts.clone(),
+        delivery_counts: delivery_counts.clone(),
     };
 
     let shutdown = CancellationToken::new();
@@ -2202,6 +2206,32 @@ async fn defer_preserves_retry_count() {
     assert_eq!(
         counts[2], 1,
         "third call (after Defer): retry_count should still be 1"
+    );
+
+    // `delivery_count` is JetStream's `num_delivered`, and it moves where
+    // `retry_count` does not — and vice versa. Retry republishes a copy, so the
+    // broker sees a message it has never delivered; Defer naks in place, so the
+    // same message comes back with one more attempt on it. Relative assertions
+    // rather than exact values: an ack_wait expiring mid-test could add a
+    // redelivery, which must not turn a correct implementation red.
+    let deliveries = delivery_counts.lock().await;
+    assert_eq!(
+        deliveries[0],
+        Some(1),
+        "first call: JetStream has delivered this message once"
+    );
+    assert_eq!(
+        deliveries[1],
+        Some(1),
+        "second call (after Retry): a republished copy is a fresh message, \
+         so the broker's delivery count restarts"
+    );
+    assert!(
+        deliveries[2].is_some_and(|n| n > deliveries[1].unwrap_or(u32::MAX)),
+        "third call (after Defer): Defer naks in place, so the same message's \
+         delivery count must advance — got {:?} after {:?}",
+        deliveries[2],
+        deliveries[1]
     );
 
     broker.close().await;

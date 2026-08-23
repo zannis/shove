@@ -53,7 +53,7 @@ impl InMemoryPublisher {
             .or_insert_with(|| Uuid::new_v4().to_string());
 
         self.broker
-            .enqueue(&queue, Envelope { payload, headers })
+            .enqueue(&queue, Envelope::new(payload, headers))
             .await
     }
 }
