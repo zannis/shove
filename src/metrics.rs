@@ -138,6 +138,14 @@ pub(crate) enum FailReason {
     /// RabbitMQ-only: a sequence key sat in `AwaitingRetry` past
     /// `hold_queue_timeout`, so its buffered messages are dead-lettered. Distinct
     /// from [`FailReason::Timeout`], which is a handler exceeding its deadline.
+    ///
+    /// Counted once per dead-lettered message, so it does scale with the depth
+    /// behind the stuck key — deliberately, and not in conflict with the cascade
+    /// rule above. A cascade is excluded because the failure it descends from
+    /// was already counted; here nothing else counts these messages at all, so
+    /// skipping them would retire a whole key's backlog with no failure metric
+    /// anywhere. The number is the size of the loss, which is what an operator
+    /// alerting on this needs.
     HoldQueueTimeout,
     MaxRetriesExceeded,
     Rejected,
