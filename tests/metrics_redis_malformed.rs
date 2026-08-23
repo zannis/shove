@@ -85,7 +85,9 @@ struct Event {
 define_topic!(
     Events,
     Event,
-    TopologyBuilder::new("metrics-malformed-redis").dlq().build()
+    TopologyBuilder::new("metrics-malformed-redis")
+        .dlq()
+        .build()
 );
 
 /// Counts handler invocations. Used purely as the progress signal: the
