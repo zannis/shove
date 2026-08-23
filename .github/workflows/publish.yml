@@ -162,8 +162,20 @@ jobs:
           # release squashed into a single `release:` commit, which cliff.toml
           # skips -- so the weaker test would let empty notes through.
           if ! grep -q '[^[:space:]]' "$NOTES"; then
-            echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write ${NOTES} by hand and re-run, or re-cut the release with the individual commits intact."
-            exit 1
+            if [ "$DRY_RUN" = "true" ]; then
+              # Not a failure on a rehearsal. A rehearsal is dispatched from the
+              # branch that changes *this file*, so every commit in its range is
+              # a `ci:` one -- which cliff.toml skips. Stopping here would leave
+              # the four steps below (the working-tree guard, the packaging and
+              # the release) unexercised, which is the whole reason the rehearsal
+              # exists. Say what a real release would do, substitute a stand-in
+              # so those steps still have a file to read, and carry on.
+              echo "::warning::No release notes for ${PREV:-<root>}..HEAD -- every commit was filtered out. A real release would fail here."
+              echo "_Rehearsal stand-in: no releasable commits in ${PREV:-<root>}..HEAD._" > "$NOTES"
+            else
+              echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write ${NOTES} by hand and re-run, or re-cut the release with the individual commits intact."
+              exit 1
+            fi
           fi
           cat "$NOTES"
 
