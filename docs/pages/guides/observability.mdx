@@ -85,6 +85,8 @@ shove::metrics::set_prefix("billing_shove");
 - `topic`: the queue name from the topology (`QueueTopology::queue()`).
 - `consumer_group`: the group name set by a coordinated group registry, or `"default"` when the consumer was registered through `ConsumerSupervisor` directly.
 
+A message increments `shove_messages_failed_total` **at most once**: the pre-handler reasons and the dead-letter reasons are mutually exclusive for any given delivery, so a payload rejected by the oversize gate is counted as `oversize` and *not* additionally as `rejected`. That makes `sum(rate(shove_messages_failed_total[5m]))` a usable count of retired-without-ack messages rather than an inflated one. On sequenced topics using `SequenceFailure::FailAll`, only the delivery that actually failed is counted — the messages dead-lettered behind the poisoned key are collateral of an already-counted failure, so the counter reports one bad message rather than scaling with the queue depth behind it.
+
 `shove_backend_errors_total` covers the most operationally-meaningful error sites (connection drops, topology conflicts, broker NACKs, consume-stream closures, ack failures); not every possible internal `Err` propagation produces a counter increment. Treat the counter as a "something is wrong with backend X" signal rather than an exhaustive error count.
 
 `shove_messages_published_total` increments once per message in a batch publish, matching what consumers see downstream. `shove_message_publish_duration_seconds` records one sample per batch (the user-observable call latency). Empty batches are no-ops and emit no events.
