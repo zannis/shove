@@ -118,17 +118,15 @@ jobs:
           - name: aws-sns-sqs
             # Asserted by `metrics_sqs_sequenced`.
             features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
-          # `nats` and `kafka` stay without `metrics` on purpose: neither has a
-          # `metrics_*` binary to run, so the feature would buy coverage of the
-          # emission sites but assert nothing. Add it here alongside the first
-          # test that actually exercises those backends' counters.
           - name: nats
-            features: nats,audit,sbe
+            # Asserted by `metrics_nats_failall`.
+            features: nats,audit,metrics,sbe
           - name: kafka
             # kafka-msk-iam + test-support compile and run the MSK IAM tests,
             # including the OAUTHBEARER admin integration test (local Kafka
             # container + unsecured JWT; no AWS/LocalStack needed).
-            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,sbe
+            # `metrics` asserted by `metrics_kafka_failall`.
+            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe
           - name: kafka-schema-registry
             # Split out from the `kafka` entry rather than folded into it: the
             # two schema-registry suites each pin FIXED host ports (cp stack
@@ -142,7 +140,8 @@ jobs:
             # already covers. Restrict it to the three schema-registry binaries.
             filter: -E 'binary(/^kafka_schema_registry/)'
           - name: redis-streams
-            # Asserted by `metrics_redis_sequenced` and `metrics_redis_malformed`.
+            # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`
+            # and `metrics_redis_failall`.
             features: redis-streams,metrics,sbe
     steps:
       - uses: actions/checkout@v6
