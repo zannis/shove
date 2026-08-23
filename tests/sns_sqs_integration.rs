@@ -20,7 +20,7 @@
 //!
 //! Run with: `cargo test --features aws-sns-sqs,audit --test sns_sqs_integration`
 
-use aws_sdk_sqs::types::Message;
+use aws_sdk_sqs::types::{Message, MessageSystemAttributeName};
 use shove::Broker;
 use shove::Sqs;
 use shove::publisher::Publisher as PublisherV2;
@@ -1769,6 +1769,181 @@ async fn fifo_topic_deduplicates_identical_payloads() {
     assert_eq!(
         records[0].1, 100,
         "the delivered message should have amount=100"
+    );
+}
+
+/// A buffered-but-never-dispatched sequenced message must come back to the
+/// shard queue on graceful shutdown, not be routed as a rejection.
+///
+/// Two messages share a sequence key, so SQS FIFO hands both back in one
+/// `ReceiveMessage` call: the first goes in-flight, the second parks in the
+/// consumer's `pending_deliveries` buffer. Shutting down while the handler is
+/// still blocked leaves that second message never seen by a handler — it must
+/// be released back to the queue for another consumer, and must not land in
+/// the DLQ.
+///
+/// The redelivery window is generous on purpose. LocalStack does not reliably
+/// honour a `ChangeMessageVisibility(0)` issued while another message of the
+/// same FIFO message group is still in flight — observed in CI, the released
+/// message sometimes only reappears when its original 30s visibility timeout
+/// expires. That is a LocalStack fidelity gap, not consumer behaviour, so this
+/// test asserts *where* the message ends up, not how fast it gets there.
+#[tokio::test]
+async fn sequenced_shutdown_requeues_never_handled_buffered_message() {
+    #[derive(Clone)]
+    struct BlockingHandler {
+        entered: WaitableCounter,
+        release: Arc<Notify>,
+        handled: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl MessageHandler<SeqSkipTopic> for BlockingHandler {
+        type Context = ();
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.handled.lock().await.push(msg.amount);
+            self.entered.increment();
+            // `notify_one` stores a permit, so releasing before we park here
+            // is safe — no lost-wakeup race with the test thread.
+            self.release.notified().await;
+            Outcome::Ack
+        }
+    }
+
+    let broker = TestBroker::start().await;
+    let setup = TestSetup::new(&broker).await;
+    setup.declare::<SeqSkipTopic>().await;
+
+    for amount in 1..=2 {
+        setup
+            .publisher
+            .publish::<SeqSkipTopic>(&OrderMessage {
+                order_id: "ORD-DRAIN".to_string(),
+                amount,
+            })
+            .await
+            .expect("publish should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let handler = BlockingHandler {
+        entered: WaitableCounter::new(),
+        release: Arc::new(Notify::new()),
+        handled: Arc::new(Mutex::new(Vec::new())),
+    };
+    let handler_clone = handler.clone();
+
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+
+    let consumer = SqsConsumer::new(setup.sns_client.clone(), setup.queue_registry().clone());
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqSkipTopic, _>(
+                handler_clone,
+                (),
+                ConsumerOptions::<Sqs>::new()
+                    .with_shutdown(sc)
+                    .with_prefetch_count(10),
+            )
+            .await
+    });
+
+    // Wait until the handler is holding message 1, which is when message 2 is
+    // sitting in the pending-deliveries buffer.
+    assert!(
+        handler.entered.wait_for(1, Duration::from_secs(30)).await,
+        "handler should have been entered for the first message"
+    );
+
+    shutdown.cancel();
+    handler.release.notify_one();
+    handle.await.expect("consumer task should not panic").ok();
+
+    let handled = handler.handled.lock().await.clone();
+    assert_eq!(
+        handled,
+        vec![1],
+        "only the first message should ever have reached a handler"
+    );
+
+    let sqs_client = broker.sqs_client().await;
+
+    // The never-handled message must be back on one of the shard queues. We
+    // don't know which one the key hashes to, so poll both concurrently.
+    let mut shard_urls = Vec::new();
+    for i in 0..2 {
+        shard_urls.push(
+            setup
+                .queue_registry()
+                .get(&format!("sqs-seq-skip-seq-{i}"))
+                .await
+                .expect("shard queue should be registered"),
+        );
+    }
+    // Longer than the queue's 30s visibility timeout — see the note on this
+    // test about LocalStack's handling of a visibility change inside a busy
+    // FIFO message group.
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(45);
+    let mut redelivered: Vec<Message> = Vec::new();
+    while redelivered.is_empty() && Instant::now() < deadline {
+        for url in &shard_urls {
+            let out = sqs_client
+                .receive_message()
+                .queue_url(url)
+                .max_number_of_messages(10)
+                .wait_time_seconds(1)
+                .message_attribute_names("All")
+                .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+                .send()
+                .await
+                .expect("failed to receive SQS messages");
+            redelivered.extend(out.messages().iter().cloned());
+        }
+    }
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "exactly the never-handled message should be redelivered, got {} after {elapsed:?}",
+        redelivered.len()
+    );
+    // SNS wraps the payload as an escaped JSON string inside the envelope.
+    let body = redelivered[0].body().unwrap_or_default().replace('\\', "");
+    assert!(
+        body.contains("\"amount\":2"),
+        "the redelivered message should be the buffered one (amount=2), body was: {body}"
+    );
+
+    // ApproximateReceiveCount proves the drain actually ran: the consumer
+    // received this message once (count 1) and released it, so our receive
+    // above is count 2. A count of 1 would mean the consumer never buffered
+    // it at all and the test never exercised the shutdown drain.
+    let receive_count = redelivered[0]
+        .attributes()
+        .and_then(|a| a.get(&MessageSystemAttributeName::ApproximateReceiveCount))
+        .and_then(|v| v.parse::<u32>().ok())
+        .expect("ApproximateReceiveCount should be present on the redelivered message");
+    assert!(
+        receive_count >= 2,
+        "the redelivered message should have been received by the consumer and released \
+         (ApproximateReceiveCount >= 2), got {receive_count}"
+    );
+
+    // ...and must not have been dead-lettered.
+    let dlq_url = setup
+        .queue_registry()
+        .get("sqs-seq-skip-dlq")
+        .await
+        .expect("DLQ should be registered");
+    let dead = broker
+        .receive_messages(&sqs_client, &dlq_url, 1, Duration::from_secs(5))
+        .await;
+    assert!(
+        dead.is_empty(),
+        "a never-handled buffered message must not be dead-lettered on shutdown, found {}",
+        dead.len()
     );
 }
 
