@@ -107,7 +107,14 @@ shove::metrics::set_prefix("billing_shove");
 - `topic`: the queue name from the topology (`QueueTopology::queue()`).
 - `consumer_group`: the group name set by a coordinated group registry, or `"default"` when the consumer was registered through `ConsumerSupervisor` directly.
 
-A message increments `shove_messages_failed_total` **at most once**: the pre-handler reasons and the dead-letter reasons are mutually exclusive for any given delivery, so a payload rejected by the oversize gate is counted as `oversize` and *not* additionally as `rejected`. Together with the two uncounted discard classes above, that makes `sum(rate(shove_messages_failed_total[5m]))` a usable count of retired-without-ack messages rather than an inflated one.
+**A pre-handler rejection is counted once, under its precise reason.** A payload rejected by the oversize gate is counted as `oversize` and *not* additionally as `rejected` when it is retired; the same holds for `deserialize`, `malformed`, and the schema-registry reasons. That is what makes the `reason` label trustworthy: `oversize` means the gate fired, not "something failed somewhere upstream of the DLQ".
+
+`shove_messages_failed_total` counts **failed attempts, not retired messages** — do not read its rate as a count of messages lost or dead-lettered. Two cases make one message contribute more than one increment:
+
+- **A handler timeout is counted every time it happens.** `timeout` is recorded when the deadline fires, whatever the timeout resolves to. With the default `Retry` (or `Defer`) the message is redelivered and survives, so a handler that times out on five attempts contributes five increments and may still eventually `Ack`.
+- **A timeout that resolves to a terminal outcome is counted twice.** `with_handler_timeout_outcome(Outcome::Reject)` records `timeout` for the deadline and then `rejected` for the retirement — and on `run_batch` the second is recorded once per message in the batch.
+
+If you want *retired-without-ack*, the counter you want is `shove_messages_discarded_total` (messages that were dropped with nowhere to go) plus your DLQ's own depth or ingest rate — not a rate over `messages_failed_total`.
 
 `shove_backend_errors_total` covers the most operationally-meaningful error sites (connection drops, topology conflicts, broker NACKs, consume-stream closures, ack failures); not every possible internal `Err` propagation produces a counter increment. Treat the counter as a "something is wrong with backend X" signal rather than an exhaustive error count.
 
