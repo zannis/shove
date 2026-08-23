@@ -11,26 +11,33 @@
 //! importantly — asserts that a `SequenceFailure::FailAll` cascade is *not*
 //! counted. See `metrics::FailReason` for why the cascade is excluded.
 //!
-//! The cascade assertion has real teeth on SQS specifically, and gets it from
-//! redelivery rather than from queueing messages behind the poisoned key. SQS
-//! retries by resetting the message's visibility rather than republishing, so a
-//! rejected message keeps coming back until native redrive retires it at
-//! `maxReceiveCount = 10`. Receive 1 goes to the handler; receives 2..10 all hit
-//! the poisoned-key skip, the very site marked `// Cascade: intentionally not
-//! counted` — and they would *also* satisfy `retry_count >= max_retries`, since
-//! `retry_count` is derived from `ApproximateReceiveCount`. So arrival on the
-//! DLQ proves nine cascade discards happened, and both counters reading 1 proves
-//! none of them were counted. Count either site and this test reads ~9, not 2.
+//! # Where the cascade comes from here, and why each scenario gets its own topic
 //!
-//! Which is why one message per key is enough — and better than several. Extra
-//! messages behind a poisoned key are only *received* once the one ahead of them
-//! is retired, so each one costs another ten redelivery rounds of wall clock
-//! while adding no assertion the redeliveries do not already make.
+//! SQS does not republish on reject: `route_reject` sets visibility to 0 and
+//! lets **native redrive** retire the message at `maxReceiveCount = 10`. So a
+//! message whose key has been poisoned is redelivered nine more times before it
+//! reaches the DLQ, and every one of those redeliveries hits the poisoned-key
+//! skip — the site marked `// Cascade: intentionally not counted`. They would
+//! satisfy `retry_count >= max_retries` too, since `retry_count` is derived from
+//! `ApproximateReceiveCount`. That makes arrival on the DLQ a *proof* that nine
+//! cascade discards happened, and a counter still reading 1 a proof that none of
+//! them were counted. Count either site and this test reads ~9, not 1.
+//!
+//! That redelivery loop is also why the two scenarios get a topic each rather
+//! than two keys on one. A message being retired by redrive is re-received
+//! continuously on a zero visibility timeout, and on one shard queue that
+//! starved the other scenario's key on CI — in both directions across runs
+//! (`reject=1 retry=0`, then `reject=0 retry=1` once the publish order was
+//! swapped). The second of those starved a key that had never been delivered
+//! even once, so this is contention for the receive loop rather than anything
+//! the poisoning does; no claim is made here about which SQS or LocalStack
+//! FIFO rule produces it. Two topics means two shard queues and two consumers,
+//! which removes the interaction rather than reasoning about it.
 //!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the global
 //! recorder slot, and whose `snapshot()` *drains* every counter it reads. So:
 //! own integration binary, a single `#[test]`, and exactly one snapshot taken
-//! at the end — progress is waited on through handler counters and the DLQ,
+//! at the end — progress is waited on through handler counters and the DLQs,
 //! never by peeking at the metrics.
 
 use std::collections::HashSet;
@@ -141,7 +148,7 @@ impl TestBroker {
 }
 
 // ---------------------------------------------------------------------------
-// Topic and handler
+// Topics and handlers — one topic per scenario, see the module docs
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -150,10 +157,10 @@ struct LedgerEntry {
 }
 
 define_sequenced_topic!(
-    Ledger,
+    RejectLedger,
     LedgerEntry,
     |msg: &LedgerEntry| msg.account.clone(),
-    TopologyBuilder::new("metrics-sqs-seq")
+    TopologyBuilder::new("metrics-sqs-rej")
         .sequenced(SequenceFailure::FailAll)
         .routing_shards(1)
         .hold_queue(Duration::from_secs(1))
@@ -161,29 +168,48 @@ define_sequenced_topic!(
         .build()
 );
 
-#[derive(Clone)]
-struct Counters {
-    /// Handler invocations for the key that gets poisoned. Must stay at 1: the
-    /// message is redelivered until redrive retires it, and every redelivery
-    /// after the first is skipped without reaching the handler — that is the
-    /// cascade.
-    reject_key_calls: Arc<AtomicU32>,
-    /// Handler invocations for the key that exhausts its retry budget. Likewise
-    /// 1: after the budget is spent its key is poisoned too.
-    retry_key_calls: Arc<AtomicU32>,
+define_sequenced_topic!(
+    RetryLedger,
+    LedgerEntry,
+    |msg: &LedgerEntry| msg.account.clone(),
+    TopologyBuilder::new("metrics-sqs-ret")
+        .sequenced(SequenceFailure::FailAll)
+        .routing_shards(1)
+        .hold_queue(Duration::from_secs(1))
+        .dlq()
+        .build()
+);
+
+/// Rejects on the first delivery, poisoning its key. Every redelivery after
+/// that is skipped without reaching the handler, so the count must stay at 1.
+struct RejectHandler;
+impl MessageHandler<RejectLedger> for RejectHandler {
+    type Context = Arc<AtomicU32>;
+    async fn handle(
+        &self,
+        _msg: LedgerEntry,
+        _meta: MessageMetadata,
+        calls: &Arc<AtomicU32>,
+    ) -> Outcome {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Reject
+    }
 }
 
-struct Handler;
-impl MessageHandler<Ledger> for Handler {
-    type Context = Counters;
-    async fn handle(&self, msg: LedgerEntry, _meta: MessageMetadata, ctx: &Counters) -> Outcome {
-        if msg.account.starts_with("acct-reject") {
-            ctx.reject_key_calls.fetch_add(1, Ordering::SeqCst);
-            Outcome::Reject
-        } else {
-            ctx.retry_key_calls.fetch_add(1, Ordering::SeqCst);
-            Outcome::Retry
-        }
+/// Always retries. With `max_retries(1)` the message comes back once, exhausts
+/// the budget before reaching the handler again, and poisons its key — so this
+/// count must stay at 1 as well.
+struct RetryHandler;
+impl MessageHandler<RetryLedger> for RetryHandler {
+    type Context = Arc<AtomicU32>;
+    async fn handle(
+        &self,
+        _msg: LedgerEntry,
+        _meta: MessageMetadata,
+        calls: &Arc<AtomicU32>,
+    ) -> Outcome {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Outcome::Retry
     }
 }
 
@@ -215,14 +241,15 @@ fn failed_total(
         .sum()
 }
 
-/// Wait until both handlers have run, so the reject has poisoned its key and
-/// the retry has been parked behind its visibility timeout.
-async fn wait_for_handlers(ctx: &Counters, timeout: Duration) -> bool {
+/// Wait until both handlers have run at least once.
+async fn wait_for_handlers(
+    reject_calls: &Arc<AtomicU32>,
+    retry_calls: &Arc<AtomicU32>,
+    timeout: Duration,
+) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if ctx.reject_key_calls.load(Ordering::SeqCst) >= 1
-            && ctx.retry_key_calls.load(Ordering::SeqCst) >= 1
-        {
+        if reject_calls.load(Ordering::SeqCst) >= 1 && retry_calls.load(Ordering::SeqCst) >= 1 {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -230,13 +257,11 @@ async fn wait_for_handlers(ctx: &Counters, timeout: Duration) -> bool {
     false
 }
 
-/// Count distinct messages that have landed on the topic's DLQ, stopping as
-/// soon as `target` of them have been seen.
+/// Wait for `target` distinct messages to land on `dlq_url`.
 ///
-/// Each message is deleted once counted. The DLQ is FIFO, so leaving them
-/// in-flight would hold the rest of their message group behind them for a full
-/// visibility timeout — three of the four expected messages share the poisoned
-/// key's group. Ids are still deduplicated in case a delete does not land.
+/// Each message is deleted once counted, so a FIFO group is never held behind
+/// an in-flight message; ids are still deduplicated in case a delete does not
+/// land.
 async fn wait_for_dlq_count(
     sqs: &aws_sdk_sqs::Client,
     dlq_url: &str,
@@ -288,82 +313,106 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     let broker = Broker::<Sqs>::from_client(sns_client.clone());
     broker
         .topology()
-        .declare::<Ledger>()
+        .declare::<RejectLedger>()
         .await
-        .expect("declare topology");
+        .expect("declare reject topology");
+    broker
+        .topology()
+        .declare::<RetryLedger>()
+        .await
+        .expect("declare retry topology");
 
-    // One message per key, published before the consumer starts. The retry key
-    // goes first: a FIFO queue hands out the oldest message first, and the
-    // reject key is about to start a redelivery loop that would otherwise
-    // compete with it for the receive batch.
     let publisher: Publisher<Sqs> = broker.publisher().await.expect("publisher");
     publisher
-        .publish::<Ledger>(&LedgerEntry {
-            account: "acct-retry".into(),
-        })
-        .await
-        .expect("publish retry-key message");
-    publisher
-        .publish::<Ledger>(&LedgerEntry {
+        .publish::<RejectLedger>(&LedgerEntry {
             account: "acct-reject".into(),
         })
         .await
         .expect("publish reject-key message");
+    publisher
+        .publish::<RetryLedger>(&LedgerEntry {
+            account: "acct-retry".into(),
+        })
+        .await
+        .expect("publish retry-key message");
 
-    let counters = Counters {
-        reject_key_calls: Arc::new(AtomicU32::new(0)),
-        retry_key_calls: Arc::new(AtomicU32::new(0)),
+    let reject_calls = Arc::new(AtomicU32::new(0));
+    let retry_calls = Arc::new(AtomicU32::new(0));
+    let shutdown = CancellationToken::new();
+
+    // `max_retries(1)` = one initial attempt plus one retry, so the retry-key
+    // message is dead-lettered as soon as it comes back from its visibility
+    // timeout with `retry_count = 1`.
+    let opts = || {
+        ConsumerOptions::<Sqs>::new()
+            .with_shutdown(shutdown.clone())
+            .with_prefetch_count(10)
+            .with_max_retries(1)
     };
 
-    let shutdown = CancellationToken::new();
-    let consumer = SqsConsumer::new(sns_client.clone(), sns_client.queue_registry().clone());
-    let handler_ctx = counters.clone();
-    let s = shutdown.clone();
-    let consume_handle = tokio::spawn(async move {
-        // `max_retries(1)` = one initial attempt plus one retry, so the
-        // retry-key message is dead-lettered as soon as it comes back from its
-        // visibility timeout with `retry_count = 1`.
-        let opts = ConsumerOptions::<Sqs>::new()
-            .with_shutdown(s)
-            .with_prefetch_count(10)
-            .with_max_retries(1);
-        consumer
-            .run_fifo::<Ledger, _>(Handler, handler_ctx, opts)
+    let reject_consumer = SqsConsumer::new(sns_client.clone(), sns_client.queue_registry().clone());
+    let reject_ctx = reject_calls.clone();
+    let reject_opts = opts();
+    let reject_handle = tokio::spawn(async move {
+        reject_consumer
+            .run_fifo::<RejectLedger, _>(RejectHandler, reject_ctx, reject_opts)
+            .await
+    });
+
+    let retry_consumer = SqsConsumer::new(sns_client.clone(), sns_client.queue_registry().clone());
+    let retry_ctx = retry_calls.clone();
+    let retry_opts = opts();
+    let retry_handle = tokio::spawn(async move {
+        retry_consumer
+            .run_fifo::<RetryLedger, _>(RetryHandler, retry_ctx, retry_opts)
             .await
     });
 
     assert!(
-        wait_for_handlers(&counters, Duration::from_secs(90)).await,
+        wait_for_handlers(&reject_calls, &retry_calls, Duration::from_secs(90)).await,
         "timed out waiting for both handlers: reject={} retry={}",
-        counters.reject_key_calls.load(Ordering::SeqCst),
-        counters.retry_key_calls.load(Ordering::SeqCst),
+        reject_calls.load(Ordering::SeqCst),
+        retry_calls.load(Ordering::SeqCst),
     );
 
-    // Both messages must reach the DLQ, which on SQS only happens through
-    // native redrive at `maxReceiveCount = 10`. That is what makes the counter
-    // assertions below exact rather than incidental: reaching the DLQ means
-    // each message was received ten times, so nine of those receives took a
-    // cascade path that must not have counted.
+    // Each message must reach its DLQ, which on SQS only happens through native
+    // redrive at `maxReceiveCount = 10`. That is what makes the counter
+    // assertions below exact rather than incidental: arrival means the message
+    // was received ten times, so nine of those receives took a cascade path
+    // that must not have counted.
     let sqs = test_broker.sqs_client().await;
-    let dlq_url = sns_client
+    let reject_dlq = sns_client
         .queue_registry()
-        .get("metrics-sqs-seq-dlq")
+        .get("metrics-sqs-rej-dlq")
         .await
-        .expect("DLQ should be registered");
-    let dlq_count = wait_for_dlq_count(&sqs, &dlq_url, 2, Duration::from_secs(150)).await;
+        .expect("reject DLQ should be registered");
+    let retry_dlq = sns_client
+        .queue_registry()
+        .get("metrics-sqs-ret-dlq")
+        .await
+        .expect("retry DLQ should be registered");
+    let (rejected_dead, retried_dead) = tokio::join!(
+        wait_for_dlq_count(&sqs, &reject_dlq, 1, Duration::from_secs(150)),
+        wait_for_dlq_count(&sqs, &retry_dlq, 1, Duration::from_secs(150)),
+    );
     assert_eq!(
-        dlq_count, 2,
-        "expected both messages to be dead-lettered within 150s, saw {dlq_count}"
+        (rejected_dead, retried_dead),
+        (1, 1),
+        "expected both messages to be dead-lettered within 150s"
     );
 
     shutdown.cancel();
-    consume_handle
+    reject_handle
         .await
-        .expect("consumer task panicked")
-        .expect("consumer returned an error");
+        .expect("reject consumer task panicked")
+        .expect("reject consumer returned an error");
+    retry_handle
+        .await
+        .expect("retry consumer task panicked")
+        .expect("retry consumer returned an error");
 
-    // Single, draining snapshot — taken only once the consumer has stopped, so
-    // nothing can emit into it while it is being read.
+    // Single, draining snapshot — taken only once both consumers have stopped,
+    // so nothing can emit into it while it is being read.
     let snapshot = snapshotter.snapshot().into_hashmap();
 
     // The handler-returned Reject is an independent failure — counted once, on
@@ -377,7 +426,7 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
          key must not be counted"
     );
     assert_eq!(
-        counters.reject_key_calls.load(Ordering::SeqCst),
+        reject_calls.load(Ordering::SeqCst),
         1,
         "cascaded redeliveries must skip the handler"
     );
@@ -391,7 +440,7 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         "expected exactly one `max_retries_exceeded` failure"
     );
     assert_eq!(
-        counters.retry_key_calls.load(Ordering::SeqCst),
+        retry_calls.load(Ordering::SeqCst),
         1,
         "the retry-key message is dead-lettered on its way back in, so the \
          handler must see it exactly once"
