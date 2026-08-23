@@ -535,6 +535,11 @@ async fn run_fifo_shard<T, H>(
                 Outcome::Retry => {
                     let retry_count = get_retry_count(&env.headers);
                     if retry_count >= options.max_retries {
+                        metrics::record_failed(
+                            topology.queue(),
+                            options.consumer_group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
+                        );
                         route_reject_sequenced(
                             &broker,
                             topology,
@@ -579,6 +584,16 @@ async fn run_fifo_shard<T, H>(
                     }
                 }
                 Outcome::Reject => {
+                    // `skip_handler` synthesises a `Reject` for a delivery whose
+                    // key was already poisoned by an earlier failure.
+                    // Cascade: intentionally not counted — see `metrics::FailReason`.
+                    if !skip_handler {
+                        metrics::record_failed(
+                            topology.queue(),
+                            options.consumer_group.as_deref(),
+                            metrics::FailReason::Rejected,
+                        );
+                    }
                     route_reject_sequenced(&broker, topology, env, &key, &mut poisoned, on_failure)
                         .await;
                 }
