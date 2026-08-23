@@ -12,10 +12,26 @@ on:
           - minor
           - major
           - none
+      # A rehearsal runs *every* step of the real release in the same job, so
+      # the path being exercised cannot drift from the path that ships. Only
+      # the three irreversible/outward-facing effects are withheld: the push of
+      # the release commit and tag, the crates.io upload (`--dry-run`
+      # substituted) and the GitHub release. Everything before them -- the
+      # version bump, the package.json/lockfile sync, the GPG-signed commit and
+      # tag, the changelog and the dirty-working-tree guard -- runs for real.
+      dry_run:
+        description: "Rehearse the release: run every step, publish nothing"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
   id-token: write
+  # Read-only, for the "Require a green ci.yml run" gate below: listing a
+  # commit's workflow runs and their jobs is the Actions API, not the checks
+  # API, so `contents: read` does not cover it.
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +43,66 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      # Resolve the rehearsal flag once, and fail closed: an unrecognised value
+      # must not quietly mean "real release". `type: boolean` makes this
+      # unreachable from the Actions UI, but a dispatch through the API can put
+      # anything in the field. Read through the environment rather than
+      # interpolating the input into the script.
+      - name: Resolve release mode
+        env:
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          case "$DRY_RUN_INPUT" in
+            true)  echo "Rehearsal: nothing will be pushed or published." ;;
+            false) echo "Real release." ;;
+            *)
+              echo "::error::dry_run must be 'true' or 'false', got '$DRY_RUN_INPUT'."
+              exit 1
+              ;;
+          esac
+          echo "DRY_RUN=$DRY_RUN_INPUT" >> "$GITHUB_ENV"
+
+      # Do not ship code CI never ran. v0.13.0 was published from b36dcff, a
+      # commit with zero ci.yml legs -- ci.yml's `paths:` filter skipped it --
+      # and it was sound only by luck. The gate resolves the ci.yml run for the
+      # commit being released and requires every leg by name; the details, and
+      # why "no run" must fail rather than skip, are in the script.
+      #
+      # Which SHA: `github.sha` is the commit this job checked out. On
+      # `bump: none` that is the commit that gets published. On `bump: <x>` the
+      # release commit does not exist yet and, by construction, can never have
+      # CI of its own -- so `github.sha` is its parent, the last commit that
+      # went through PR CI, and "Assert the release commit is a pure version
+      # bump" below closes the gap between that gated tree and the shipped one.
+      #
+      # Placed here so a commit that never ran CI costs seconds rather than a
+      # toolchain install, and so it stops the job long before anything has
+      # been pushed, signed or published.
+      - name: Require a green ci.yml run for the commit being released
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATED_SHA: ${{ github.sha }}
+        run: |
+          # A rehearsal downgrades this to a warning, exactly as the changelog
+          # step does, and for the same reason: a rehearsal is normally
+          # dispatched from the branch that changes publish.yml, and such a
+          # branch touches no path in ci.yml's filter, so it has no ci.yml run
+          # to be green. Hard-failing there would make the rehearsal useless
+          # for the one change it exists to validate -- and a rehearsal
+          # publishes nothing, so there is no untested release to prevent. The
+          # verdict is still resolved and printed in full either way.
+          if [ "$DRY_RUN" = "true" ]; then
+            export GATE_LEVEL=warning
+          fi
+          if .github/scripts/require-green-ci.sh "$GATED_SHA"; then
+            exit 0
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::warning::A real release would stop here. Continuing the rehearsal so the steps below still get exercised."
+            exit 0
+          fi
+          exit 1
 
       - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
 
@@ -83,6 +159,63 @@ jobs:
           git add Cargo.toml Cargo.lock package.json pnpm-lock.yaml
           git commit -m "release: v${{ steps.version.outputs.version }}"
           git tag -m "v${{ steps.version.outputs.version }}" "v${{ steps.version.outputs.version }}"
+
+      # The gate above vouched for `github.sha`, not for the commit created by
+      # the step before this one. This is what makes the two the same claim:
+      # the release commit must sit directly on the gated commit and differ
+      # from it only by the version bump. Anything else -- a different parent,
+      # or a file outside those four -- means the tree about to be published is
+      # not the tree CI tested, and the gate would be vouching for the wrong
+      # thing.
+      #
+      # `Commit and tag` only stages those four paths, so today this cannot
+      # fire; it is here so that a future edit loosening that `git add` fails
+      # loudly instead of quietly widening what ships untested. It runs on a
+      # rehearsal too -- the commit and tag are created for real there, only
+      # the push is withheld.
+      #
+      # It sits *between* creating the commit and pushing it, not after the
+      # push, so that a failure leaves the bad release commit local to the
+      # runner and the branch untouched. Same principle as generating the
+      # changelog before `cargo publish`: fail while the run is still cheap to
+      # throw away.
+      - name: Assert the release commit is a pure version bump
+        if: inputs.bump != 'none'
+        env:
+          GATED_SHA: ${{ github.sha }}
+        run: |
+          parent=$(git rev-parse HEAD^)
+          if [ "$parent" != "$GATED_SHA" ]; then
+            echo "::error::The release commit's parent is ${parent}, but the CI gate checked ${GATED_SHA}. The commit being published is not sitting on the commit that was tested."
+            exit 1
+          fi
+          changed=$(git diff --name-only HEAD^ HEAD)
+          if [ -z "$changed" ]; then
+            echo "::error::The release commit is empty -- no version bump was recorded."
+            exit 1
+          fi
+          unexpected=$(printf '%s\n' "$changed" \
+            | grep -vxE 'Cargo\.toml|Cargo\.lock|package\.json|pnpm-lock\.yaml' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::The release commit changes files beyond the version bump. CI never saw these, and this job does not test them:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          echo "Release commit is a pure version bump over the gated commit ${GATED_SHA}:"
+          printf '%s\n' "$changed"
+
+      - name: Push the release commit and tag
+        if: inputs.bump != 'none'
+        run: |
+          # The commit and tag were created for real even on a rehearsal --
+          # signing them is a step that can fail, so it has to be exercised.
+          # Only the push is withheld, leaving both objects local to the runner.
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "dry run: not pushing v${{ steps.version.outputs.version }} to ${{ github.ref_name }}"
+            git --no-pager log -1 --show-signature
+            git tag -v "v${{ steps.version.outputs.version }}"
+            exit 0
+          fi
           git push origin "HEAD:${{ github.ref_name }}" --follow-tags
 
       # Generate the notes *before* `cargo publish`, the one irreversible step
@@ -122,8 +255,20 @@ jobs:
           # release squashed into a single `release:` commit, which cliff.toml
           # skips -- so the weaker test would let empty notes through.
           if ! grep -q '[^[:space:]]' "$NOTES"; then
-            echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write ${NOTES} by hand and re-run, or re-cut the release with the individual commits intact."
-            exit 1
+            if [ "$DRY_RUN" = "true" ]; then
+              # Not a failure on a rehearsal. A rehearsal is dispatched from the
+              # branch that changes *this file*, so every commit in its range is
+              # a `ci:` one -- which cliff.toml skips. Stopping here would leave
+              # the four steps below (the working-tree guard, the packaging and
+              # the release) unexercised, which is the whole reason the rehearsal
+              # exists. Say what a real release would do, substitute a stand-in
+              # so those steps still have a file to read, and carry on.
+              echo "::warning::No release notes for ${PREV:-<root>}..HEAD -- every commit was filtered out. A real release would fail here."
+              echo "_Rehearsal stand-in: no releasable commits in ${PREV:-<root>}..HEAD._" > "$NOTES"
+            else
+              echo "::error::git-cliff produced no release notes for v${VERSION}. Every commit in the range was filtered out (cliff.toml skips 'ci:' and 'release:' subjects), which is what squashing a whole release into one 'release:' commit does. Write ${NOTES} by hand and re-run, or re-cut the release with the individual commits intact."
+              exit 1
+            fi
           fi
           cat "$NOTES"
 
@@ -137,19 +282,42 @@ jobs:
             exit 1
           fi
 
+      # Skipped on a rehearsal: `cargo publish --dry-run` never contacts the
+      # registry, so minting a publish token for it would hand out a credential
+      # no step uses.
       - name: Authenticate with crates.io (trusted publishing)
         id: crates-auth
+        if: env.DRY_RUN != 'true'
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish to crates.io
-        run: cargo publish -q --all-features
+        run: |
+          set -- cargo publish -q --all-features
+          if [ "$DRY_RUN" = "true" ]; then
+            set -- "$@" --dry-run
+          fi
+          "$@"
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
 
       - name: Create GitHub release
         run: |
-          gh release create "v${{ steps.version.outputs.version }}" \
+          set -- gh release create "v${{ steps.version.outputs.version }}" \
             -F "${RUNNER_TEMP}/RELEASE_NOTES.md" \
             --target "${{ github.sha }}"
+          if [ "$DRY_RUN" = "true" ]; then
+            # A rehearsal cannot create the release: `gh release create` would
+            # create the tag on the remote, which is the push we just withheld.
+            # Assert instead that the notes file `-F` reads is still there and
+            # non-blank at this point in the job -- the failure this guards
+            # against is a step in between moving or clobbering it.
+            if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/RELEASE_NOTES.md"; then
+              echo "::error::${RUNNER_TEMP}/RELEASE_NOTES.md is missing or blank at the release step; 'gh release create -F' would fail here."
+              exit 1
+            fi
+            echo "dry run: would run: $*"
+            exit 0
+          fi
+          "$@"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -68,6 +68,8 @@ shove::metrics::set_prefix("billing_shove");
 | `shove_message_publish_duration_seconds` | histogram | `topic`, `outcome` |
 | `shove_message_size_bytes` | histogram | `topic`, `consumer_group` |
 | `shove_messages_inflight` | gauge | `topic`, `consumer_group` |
+| `shove_queue_backlog` | gauge | `topic` |
+| `shove_queue_inflight` | gauge | `topic` |
 | `shove_autoscaler_decisions_total` | counter | `consumer_group`, `direction` |
 | `shove_autoscaler_messages_ready` | gauge | `consumer_group` |
 | `shove_autoscaler_messages_in_flight` | gauge | `consumer_group` |
@@ -101,7 +103,7 @@ shove::metrics::set_prefix("billing_shove");
   `malformed` is **Redis-only in practice**, which is why SQS is not listed against it. The SQS sequenced consumer carries the same guard for a message with no `MessageGroupId`, but `declare` creates sequenced shard queues as FIFO and SQS rejects a send with no group id outright, so the guard cannot fire on the supported topology. It is kept deliberately, against a future non-FIFO sequenced transport. Do not build an SQS alert on `malformed`.
 - `reason` on `messages_discarded_total`: the same values, minus the ones that cannot be terminal on the backend in question. This counter increments *in addition* to `messages_failed_total`, only when the message was actually retired with nowhere to go — the topic declares **no DLQ**, or a DLQ was declared and the publish to it failed. Any non-zero rate is data loss. It is not a strict subset of `messages_failed_total`: a `FailAll` cascade adds a discard without adding a failure. See [Alerting on silent discards](#alerting-on-silent-discards).
 - `direction` on `autoscaler_decisions_total`: `up`, `down`, `hold`.
-- `shove_autoscaler_messages_ready`, `shove_autoscaler_messages_in_flight`, and `shove_autoscaler_active_consumers` are emitted once per group on every autoscaler poll, carrying only the `consumer_group` label. They expose the raw signal the scaling decision is made from: backlog waiting, messages in flight, and the live consumer count. Watching `messages_ready` stay high while `active_consumers` is flat at `max` is the canonical "saturated / scaling commands not keeping up" signal.
+- `shove_autoscaler_messages_ready`, `shove_autoscaler_messages_in_flight`, and `shove_autoscaler_active_consumers` are emitted once per group on every autoscaler poll, carrying only the `consumer_group` label. They expose the raw signal the scaling decision is made from: backlog waiting, messages in flight, and the live consumer count. Watching `messages_ready` stay high while `active_consumers` is flat at `max` is the canonical "saturated / scaling commands not keeping up" signal. If you do **not** autoscale, these go silent — use `shove_queue_backlog` instead, see [Queue depth without the autoscaler](#queue-depth-without-the-autoscaler).
 - `backend` on `backend_errors_total`: `inmemory`, `rabbitmq`, `kafka`, `nats`, `sns_sqs`, `redis`.
 - `kind` on `backend_errors_total`: `connection`, `publish`, `consume`, `topology`, `ack`.
 - `topic`: the queue name from the topology (`QueueTopology::queue()`).
@@ -119,6 +121,37 @@ If you want *retired-without-ack*, the counter you want is `shove_messages_disca
 `shove_backend_errors_total` covers the most operationally-meaningful error sites (connection drops, topology conflicts, broker NACKs, consume-stream closures, ack failures); not every possible internal `Err` propagation produces a counter increment. Treat the counter as a "something is wrong with backend X" signal rather than an exhaustive error count.
 
 `shove_messages_published_total` increments once per message in a batch publish, matching what consumers see downstream. `shove_message_publish_duration_seconds` records one sample per batch (the user-observable call latency). Empty batches are no-ops and emit no events.
+
+### Queue depth without the autoscaler
+
+Backlog used to be a side effect of autoscaling: `shove_autoscaler_messages_ready` is set once per group on every scaling poll, so a service that runs a fixed consumer pool — or scales on something other than `shove` — had no backlog series at all.
+
+`Broker::queue_depth_sampler()` publishes it directly. Name the queues to watch and drive it alongside your consumers:
+
+```rust,no_run
+let sampler = broker
+    .queue_depth_sampler()
+    .watch_topic::<OrdersTopic>()
+    .watch_topic::<InvoicesTopic>()
+    .with_poll_interval(Duration::from_secs(15));
+tokio::spawn(sampler.run(shutdown.clone()));
+```
+
+That emits, once per queue per poll:
+
+| Series | Meaning | Source per backend |
+|---|---|---|
+| `shove_queue_backlog{topic}` | Messages waiting to be delivered | Kafka: committed-offset lag · RabbitMQ: `messages_ready` · SQS: `ApproximateNumberOfMessages` · NATS: `num_pending` · Redis: the group's `lag` · in-memory: queue length |
+| `shove_queue_inflight{topic}` | Delivered by the broker, not yet acked | RabbitMQ: `messages_unacknowledged` · SQS: `ApproximateNumberOfMessagesNotVisible` · NATS: `num_ack_pending` · Redis: PEL size · in-memory: in-flight count |
+
+Four things worth knowing before you build a dashboard on these:
+
+- **`shove_queue_inflight` is not `shove_messages_inflight`.** The queue gauge is what the *broker* has handed out and is waiting to have acked, across every consumer of that queue. `shove_messages_inflight` is what *this process* has inside a handler right now. On a healthy single-consumer service they track each other; a large gap means deliveries are sitting unacked somewhere else.
+- **`shove_queue_inflight` is absent on Kafka.** Committed-offset lag cannot separate "fetched and being processed" from "not fetched", and Kafka exposes no group-wide in-flight count, so `shove` publishes no series rather than a hard zero you might alert on. Backlog is unaffected.
+- **A failed poll publishes nothing.** The gauge keeps its last value rather than dropping to zero, so a broker outage does not render as "the backlog drained". Pair any backlog alert with `shove_backend_errors_total` and the sampler's `WARN` line so a flat gauge is distinguishable from a quiet queue.
+- **Every poll is a real round trip** (RabbitMQ Management HTTP, SQS `GetQueueAttributes`, Kafka watermark fetches). The default 5 s interval matches the autoscaler's; raise it if you watch many queues. The first poll fires after one interval rather than immediately, so a sampler spawned alongside `declare` does not race it — call `sample_once()` yourself first if you want a reading at t=0.
+
+Running both the sampler and the autoscaler is fine and they will agree — they read the same per-backend snapshot. The `shove_autoscaler_*` gauges stay the right ones for *why a scaling decision was made*, keyed by `consumer_group` and including `active_consumers`; `shove_queue_backlog` is the right one for *how deep the queue is*, keyed by `topic` so it joins the rest of the consumer metrics.
 
 ### Alerting on silent discards
 
