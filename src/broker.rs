@@ -8,6 +8,7 @@ use crate::consumer_group::ConsumerGroup;
 use crate::consumer_supervisor::ConsumerSupervisor;
 use crate::error::Result;
 use crate::publisher::Publisher;
+use crate::queue_depth::QueueDepthSampler;
 use crate::topology_declarer::TopologyDeclarer;
 
 /// Default deadline for `Broker::ping`. Matches the rest of shove's 5 s
@@ -94,6 +95,26 @@ impl<B: Backend> Broker<B> {
     /// reading queue depth from the underlying broker.
     pub fn queue_stats_provider(&self) -> B::QueueStatsImpl {
         B::make_stats_provider(&self.client)
+    }
+
+    /// Return a [`QueueDepthSampler`] that publishes backlog and broker-side
+    /// in-flight depth as gauges, whether or not this service autoscales.
+    ///
+    /// Name the queues to watch, then drive it — nothing is emitted until you
+    /// do:
+    ///
+    /// ```rust,no_run
+    /// # use tokio_util::sync::CancellationToken;
+    /// # async fn example<B: shove::Backend>(broker: &shove::Broker<B>, shutdown: CancellationToken) {
+    /// tokio::spawn(broker.queue_depth_sampler().watch("orders").run(shutdown));
+    /// # }
+    /// ```
+    ///
+    /// Reads the same per-backend snapshot the autoscaler reads, so the two
+    /// agree. See [`queue_depth`](crate::queue_depth) for how the resulting
+    /// series relate to the `shove_autoscaler_*` gauges.
+    pub fn queue_depth_sampler(&self) -> QueueDepthSampler<B> {
+        QueueDepthSampler::new(self.queue_stats_provider())
     }
 
     /// Return a [`Backend::AutoscalerImpl`](crate::backend::Backend::AutoscalerImpl)
