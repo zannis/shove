@@ -1005,6 +1005,89 @@ impl Topic for HeadersTopic {
     }
 }
 
+/// Retry through a hold queue, so the redelivered entry is the one the
+/// requeuer XADDs back from the hold set.
+struct HeaderHoldRetryTopic;
+impl Topic for HeaderHoldRetryTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-hdr-hold-retry")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+/// No hold queue — `Retry` takes the immediate `XADD`-back-to-the-stream path.
+struct HeaderNoHoldRetryTopic;
+impl Topic for HeaderNoHoldRetryTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-hdr-nohold-retry")
+                .dlq()
+                .build()
+        })
+    }
+}
+
+struct HeaderRejectTopic;
+impl Topic for HeaderRejectTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("redis-int-hdr-reject").dlq().build())
+    }
+}
+
+struct HeaderExhaustTopic;
+impl Topic for HeaderExhaustTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-hdr-exhaust")
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+}
+
+/// Sequenced `FailAll`, so a poisoned key is dead-lettered without ever
+/// reaching the handler — its own write-back path.
+struct HeaderFailAllTopic;
+impl Topic for HeaderFailAllTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-hdr-failall")
+                .sequenced(SequenceFailure::FailAll)
+                .routing_shards(1)
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+    const SEQUENCE_KEY_FN: Option<fn(&Self::Message) -> String> =
+        Some(HeaderFailAllTopic::sequence_key);
+}
+impl SequencedTopic for HeaderFailAllTopic {
+    fn sequence_key(msg: &Event) -> String {
+        msg.account.clone()
+    }
+}
+
 struct BatchTopic;
 impl Topic for BatchTopic {
     type Message = Order;
@@ -1140,6 +1223,440 @@ async fn publish_with_reserved_header_rejected() {
     assert!(
         matches!(err, shove::ShoveError::Validation(_)),
         "expected Validation error, got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// User headers must survive every non-Ack write-back path
+//
+// Regression coverage: the consumer splits an incoming entry into internal
+// fields and user headers, and the retry / requeue / DLQ write-backs used to
+// re-serialise only the internal half — silently dropping every user header
+// the moment a message took any path other than a straight `Ack`.
+// ---------------------------------------------------------------------------
+
+/// Read every entry of `stream` as a field map, oldest first.
+async fn read_stream_entries(stream: &str) -> Vec<std::collections::HashMap<String, String>> {
+    let url = redis_url().await;
+    let client = redis::Client::open(url).expect("redis client for stream read");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw redis conn");
+
+    let raw: redis::Value = redis::cmd("XREAD")
+        .arg("COUNT")
+        .arg(50i64)
+        .arg("STREAMS")
+        .arg(stream)
+        .arg("0-0")
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(redis::Value::Nil);
+
+    // Parse: [[stream_name, [[entry_id, [field, value, ...]], ...]]]
+    let mut out = Vec::new();
+    let redis::Value::Array(outer) = raw else {
+        return out;
+    };
+    for stream_item in outer {
+        let redis::Value::Array(stream_pair) = stream_item else {
+            continue;
+        };
+        let Some(redis::Value::Array(entries)) = stream_pair.get(1) else {
+            continue;
+        };
+        for entry in entries {
+            let redis::Value::Array(entry_pair) = entry else {
+                continue;
+            };
+            let Some(redis::Value::Array(field_list)) = entry_pair.get(1) else {
+                continue;
+            };
+            let mut map = std::collections::HashMap::new();
+            for pair in field_list.chunks_exact(2) {
+                let (Some(k), Some(v)) = (redis_string(&pair[0]), redis_string(&pair[1])) else {
+                    continue;
+                };
+                map.insert(k, v);
+            }
+            out.push(map);
+        }
+    }
+    out
+}
+
+fn redis_string(value: &redis::Value) -> Option<String> {
+    match value {
+        redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Handler that records the headers it saw on every delivery and retries once.
+#[derive(Clone)]
+struct RecordHeadersRetryOnce(
+    Arc<tokio::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+);
+
+macro_rules! impl_record_headers_retry_once {
+    ($topic:ty) => {
+        impl MessageHandler<$topic> for RecordHeadersRetryOnce {
+            type Context = ();
+            async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+                self.0.lock().await.push((*meta.headers).clone());
+                if meta.retry_count == 0 {
+                    Outcome::Retry
+                } else {
+                    Outcome::Ack
+                }
+            }
+        }
+    };
+}
+
+impl_record_headers_retry_once!(HeaderHoldRetryTopic);
+impl_record_headers_retry_once!(HeaderNoHoldRetryTopic);
+
+#[tokio::test]
+async fn user_headers_survive_retry_through_hold_queue() {
+    let broker = make_broker("redis-int-hdr-hold-retry-grp").await;
+    broker
+        .topology()
+        .declare::<HeaderHoldRetryTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-trace-id".to_string(), "trace-hold".to_string());
+    headers.insert("tenant".to_string(), "acme".to_string());
+    publisher
+        .publish_with_headers::<HeaderHoldRetryTopic>(&Order { id: 201 }, headers)
+        .await
+        .expect("publish_with_headers");
+
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<HeaderHoldRetryTopic, _>(
+            RecordHeadersRetryOnce(seen.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(5),
+        )
+        .expect("register");
+
+    let probe = seen.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.try_lock().map(|s| s.len() >= 2).unwrap_or(false),
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    let seen = seen.lock().await;
+    assert_eq!(
+        seen.len(),
+        2,
+        "expected an initial delivery and a redelivery"
+    );
+    for (attempt, hdrs) in seen.iter().enumerate() {
+        assert_eq!(
+            hdrs.get("x-trace-id").map(String::as_str),
+            Some("trace-hold"),
+            "x-trace-id missing on attempt {attempt}: {hdrs:?}"
+        );
+        assert_eq!(
+            hdrs.get("tenant").map(String::as_str),
+            Some("acme"),
+            "tenant missing on attempt {attempt}: {hdrs:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn user_headers_survive_immediate_requeue_without_hold_queue() {
+    let broker = make_broker("redis-int-hdr-nohold-retry-grp").await;
+    broker
+        .topology()
+        .declare::<HeaderNoHoldRetryTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-trace-id".to_string(), "trace-nohold".to_string());
+    publisher
+        .publish_with_headers::<HeaderNoHoldRetryTopic>(&Order { id: 202 }, headers)
+        .await
+        .expect("publish_with_headers");
+
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<HeaderNoHoldRetryTopic, _>(
+            RecordHeadersRetryOnce(seen.clone()),
+            ConsumerOptions::<Redis>::new().with_max_retries(5),
+        )
+        .expect("register");
+
+    let probe = seen.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.try_lock().map(|s| s.len() >= 2).unwrap_or(false),
+            Duration::from_secs(15),
+        )
+        .await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    let seen = seen.lock().await;
+    assert_eq!(
+        seen.len(),
+        2,
+        "expected an initial delivery and a redelivery"
+    );
+    assert_eq!(
+        seen[1].get("x-trace-id").map(String::as_str),
+        Some("trace-nohold"),
+        "x-trace-id must survive the no-hold-queue immediate requeue: {:?}",
+        seen[1]
+    );
+}
+
+#[tokio::test]
+async fn user_headers_present_on_dlq_entry_after_reject() {
+    let broker = make_broker("redis-int-hdr-reject-grp").await;
+    broker
+        .topology()
+        .declare::<HeaderRejectTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-trace-id".to_string(), "trace-reject".to_string());
+    publisher
+        .publish_with_headers::<HeaderRejectTopic>(&Order { id: 203 }, headers)
+        .await
+        .expect("publish_with_headers");
+
+    let handled = Arc::new(AtomicU32::new(0));
+
+    #[derive(Clone)]
+    struct RejectH(Arc<AtomicU32>);
+    impl MessageHandler<HeaderRejectTopic> for RejectH {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Reject
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<HeaderRejectTopic, _>(RejectH(handled.clone()), ConsumerOptions::<Redis>::new())
+        .expect("register");
+
+    let probe = handled.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 1,
+            Duration::from_secs(15),
+        )
+        .await;
+        // Give the DLQ XADD time to land before we read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    // Assert on the newest entry rather than the whole stream: a nextest retry
+    // of this test re-runs the whole scenario and appends a second dead letter.
+    let dlq = format!("{}-dlq", HeaderRejectTopic::topology().queue());
+    let entries = read_stream_entries(&dlq).await;
+    let entry = entries.last().expect("DLQ must contain an entry");
+    assert_eq!(
+        entry.get("x-trace-id").map(String::as_str),
+        Some("trace-reject"),
+        "user header must be preserved on the DLQ entry: {entry:?}"
+    );
+    assert_eq!(
+        entry.get("x-death-reason").map(String::as_str),
+        Some("rejected"),
+        "death reason must still be written: {entry:?}"
+    );
+}
+
+#[tokio::test]
+async fn user_headers_present_on_dlq_entry_after_retry_exhaustion() {
+    let broker = make_broker("redis-int-hdr-exhaust-grp").await;
+    broker
+        .topology()
+        .declare::<HeaderExhaustTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("x-trace-id".to_string(), "trace-exhaust".to_string());
+    publisher
+        .publish_with_headers::<HeaderExhaustTopic>(&Order { id: 204 }, headers)
+        .await
+        .expect("publish_with_headers");
+
+    let handled = Arc::new(AtomicU32::new(0));
+
+    #[derive(Clone)]
+    struct AlwaysRetryH(Arc<AtomicU32>);
+    impl MessageHandler<HeaderExhaustTopic> for AlwaysRetryH {
+        type Context = ();
+        async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Outcome::Retry
+        }
+    }
+
+    let mut supervisor = broker.consumer_supervisor();
+    supervisor
+        .register::<HeaderExhaustTopic, _>(
+            AlwaysRetryH(handled.clone()),
+            // 1 initial attempt + 1 retry, then the DLQ.
+            ConsumerOptions::<Redis>::new().with_max_retries(1),
+        )
+        .expect("register");
+
+    let probe = handled.clone();
+    let signal = async move {
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 2,
+            Duration::from_secs(20),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let outcome = supervisor
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    // Newest entry only — see the note in the reject test above.
+    let dlq = format!("{}-dlq", HeaderExhaustTopic::topology().queue());
+    let entries = read_stream_entries(&dlq).await;
+    let entry = entries.last().expect("DLQ must contain an entry");
+    assert_eq!(
+        entry.get("x-trace-id").map(String::as_str),
+        Some("trace-exhaust"),
+        "user header must survive the hold-queue round trip and reach the DLQ: {entry:?}"
+    );
+    assert_eq!(
+        entry.get("x-death-reason").map(String::as_str),
+        Some("max_retries_exceeded"),
+        "death reason must still be written: {entry:?}"
+    );
+}
+
+/// The `FailAll` poison-skip path dead-letters a message without invoking the
+/// handler, so it re-serialises the entry on its own. It must carry the user's
+/// headers too — a poisoned message is exactly one you need to triage.
+#[tokio::test]
+async fn user_headers_present_on_dlq_entry_after_failall_poison_skip() {
+    let broker = make_broker("redis-int-hdr-failall-grp").await;
+    broker
+        .topology()
+        .declare::<HeaderFailAllTopic>()
+        .await
+        .expect("declare");
+    let dlq = HeaderFailAllTopic::topology()
+        .dlq()
+        .expect("topic has a DLQ");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for seq in 0..2u64 {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-trace-id".to_string(), format!("trace-failall-{seq}"));
+        publisher
+            .publish_with_headers::<HeaderFailAllTopic>(
+                &Event {
+                    account: "acct-poison".into(),
+                    seq,
+                },
+                headers,
+            )
+            .await
+            .expect("publish_with_headers");
+    }
+
+    #[derive(Clone)]
+    struct RejectFirstH;
+    impl MessageHandler<HeaderFailAllTopic> for RejectFirstH {
+        type Context = ();
+        async fn handle(&self, _: Event, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Reject
+        }
+    }
+
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<HeaderFailAllTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::default().with_max_retries(0)),
+            move || RejectFirstH,
+        )
+        .await
+        .expect("register_fifo");
+
+    let mut raw = redis::Client::open(redis_url().await)
+        .expect("raw client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let dlq_len: i64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(0);
+            if dlq_len >= 2 || std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    // seq 0 is rejected by the handler; seq 1 is dead-lettered by the
+    // poison-skip path without the handler ever seeing it. Both must carry
+    // their header.
+    let entries = read_stream_entries(dlq).await;
+    let traces: Vec<Option<&str>> = entries
+        .iter()
+        .map(|e| e.get("x-trace-id").map(String::as_str))
+        .collect();
+    assert!(
+        traces.contains(&Some("trace-failall-0")) && traces.contains(&Some("trace-failall-1")),
+        "both the rejected and the poison-skipped dead letter must keep their header: {entries:?}"
     );
 }
 
