@@ -71,6 +71,40 @@ cargo publish --dry-run --all-features
 
 CI also runs `cargo audit --deny warnings`.
 
+## Rehearsing a release
+
+Releases run through the **Publish** workflow
+([`.github/workflows/publish.yml`](.github/workflows/publish.yml)), dispatched
+manually with a `bump` of `patch`/`minor`/`major` (or `none` to re-run a
+release whose version commit already landed).
+
+Because a crate version cannot be unpublished, the workflow takes a `dry_run`
+input that rehearses the whole job without shipping anything:
+
+```sh
+gh workflow run publish.yml --ref <branch> -f bump=patch -f dry_run=true
+```
+
+A rehearsal runs every step of the real release — the version bump, the
+`package.json`/`pnpm-lock.yaml` sync, the GPG-signed release commit and
+annotated tag, the changelog generation and the working-tree guard — and
+withholds only the three effects that cannot be taken back:
+
+| Step | Real release | `dry_run: true` |
+|---|---|---|
+| Commit and tag | pushed with `--follow-tags` | created and verified locally, not pushed |
+| Publish to crates.io | `cargo publish` | `cargo publish --dry-run` (no auth token minted) |
+| Create GitHub release | `gh release create` | asserts the notes file exists, prints the command |
+
+One more difference: empty release notes **fail** a real release and only
+**warn** on a rehearsal. A rehearsal is normally dispatched from the branch
+that changes `publish.yml`, so every commit in its range is a `ci:` one, which
+`cliff.toml` skips — stopping there would leave the steps after the changelog
+untested. The rehearsal substitutes a stand-in file and carries on.
+
+Run one on a branch after changing `publish.yml`; the `bump: <x>` path is
+otherwise only ever exercised by a real release.
+
 ## Conventions
 
 - **Commit messages** follow [Conventional Commits](https://www.conventionalcommits.org)
