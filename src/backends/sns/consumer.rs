@@ -1219,7 +1219,7 @@ where
                                 &receipt_handle,
                                 topology,
                                 group.as_deref(),
-                                metrics::FailReason::Rejected,
+                                metrics::FailReason::Malformed,
                             )
                             .await;
                             continue;

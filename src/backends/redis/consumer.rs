@@ -665,9 +665,26 @@ where
                                 continue;
                             }
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
-                            if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
-                                tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
-                                metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                            // Counted only once the XACK lands, and only when
+                            // it is *this* call that retired the entry. A
+                            // failed XACK leaves the entry in the PEL for a
+                            // reclaim to redeliver, and `Ok(false)` means a
+                            // reaper already retired it and a live copy
+                            // exists; this arm runs again in both cases, so
+                            // counting here too would double-count one entry.
+                            match xack(&mut conn, stream, &group, &entry_id).await {
+                                Ok(true) => metrics::record_failed(
+                                    topic_name,
+                                    consumer_group,
+                                    metrics::FailReason::Malformed,
+                                ),
+                                Ok(false) => {
+                                    tracing::debug!(entry_id, "corrupt entry was already retired by a reaper — not counting");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
+                                    metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                                }
                             }
                             continue;
                         }
@@ -1129,9 +1146,26 @@ where
                                 continue;
                             }
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
-                            if let Err(e) = xack(&mut conn, stream, &group, &entry_id).await {
-                                tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
-                                metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                            // Counted only once the XACK lands, and only when
+                            // it is *this* call that retired the entry. A
+                            // failed XACK leaves the entry in the PEL for a
+                            // reclaim to redeliver, and `Ok(false)` means a
+                            // reaper already retired it and a live copy
+                            // exists; this arm runs again in both cases, so
+                            // counting here too would double-count one entry.
+                            match xack(&mut conn, stream, &group, &entry_id).await {
+                                Ok(true) => metrics::record_failed(
+                                    topic_name,
+                                    consumer_group,
+                                    metrics::FailReason::Malformed,
+                                ),
+                                Ok(false) => {
+                                    tracing::debug!(entry_id, "corrupt entry was already retired by a reaper — not counting");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
+                                    metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+                                }
                             }
                             continue;
                         }

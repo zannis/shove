@@ -650,7 +650,18 @@ impl RabbitMqConsumer {
                         key_states.remove(&key);
                         if let Some(pending) = pending_deliveries.remove(&key) {
                             for pd in pending {
-                                router::route_reject(&pd.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::HoldQueueTimeout).await?;
+                                // Not a cascade: no already-counted failure
+                                // accounts for these, so `route_reject` counts
+                                // one failure per dead-lettered message. See
+                                // `metrics::FailReason::SequenceTimeout`.
+                                router::route_reject(
+                                    &pd.delivery,
+                                    topology,
+                                    &publisher,
+                                    group.as_deref(),
+                                    metrics::FailReason::SequenceTimeout,
+                                )
+                                .await?;
                             }
                         }
                     }
