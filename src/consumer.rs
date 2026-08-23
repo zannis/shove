@@ -15,6 +15,7 @@ use crate::markers::Nats;
 use crate::markers::RabbitMq;
 #[cfg(feature = "aws-sns-sqs")]
 use crate::markers::Sqs;
+use crate::outcome::Outcome;
 #[cfg(feature = "kafka-schema-registry")]
 use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 
@@ -22,6 +23,26 @@ use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Default handler timeout: 30 seconds.
+///
+/// Applied when [`ConsumerOptions::handler_timeout`] is left unset. This is the
+/// value downstream code should reference — not a hardcoded `30`— when it needs
+/// to keep its own internal deadline below shove's, which is the usual way to
+/// make a stalled handler resolve to a deliberate [`Outcome`] instead of being
+/// cancelled mid-flight:
+///
+/// ```
+/// use shove::DEFAULT_HANDLER_TIMEOUT;
+/// const SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// const _: () = assert!(SUBMIT_TIMEOUT.as_secs() < DEFAULT_HANDLER_TIMEOUT.as_secs());
+/// ```
+///
+/// Treat the constant as stable: it is part of the public API and a change to
+/// it is a breaking change, so an assertion like the one above will fail at
+/// compile time rather than silently invert the ordering.
+///
+/// If you are wrapping handlers in an internal timeout purely to avoid shove
+/// turning a slow handler into a budget-burning retry, prefer
+/// [`ConsumerOptions::with_handler_timeout_outcome`] instead.
 pub const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Two-state used by each backend's `ConsumerGroupConfig` so the
@@ -115,6 +136,10 @@ pub struct ConsumerOptions<B: Backend> {
     ///
     /// Default: [`DEFAULT_HANDLER_TIMEOUT`] (30 s). Set to `None` to disable.
     pub handler_timeout: Option<Duration>,
+    /// What a handler timeout resolves to. `None` keeps each backend's
+    /// historical default — see
+    /// [`with_handler_timeout_outcome`](Self::with_handler_timeout_outcome).
+    pub handler_timeout_outcome: Option<Outcome>,
     /// Maximum number of locally buffered messages per sequence key in
     /// concurrent-sequenced consumers. When the limit is reached, new
     /// deliveries for that key are rejected to the DLQ.
@@ -231,6 +256,7 @@ impl<B: Backend> ConsumerOptions<B> {
             prefetch_count: 10,
             concurrent_processing: true,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout_outcome: None,
             max_pending_per_key: Some(DEFAULT_MAX_PENDING_PER_KEY),
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             max_reconnect_attempts: None,
@@ -297,6 +323,102 @@ impl<B: Backend> ConsumerOptions<B> {
     pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = Some(timeout);
+        self
+    }
+
+    /// Choose what a handler timeout resolves to, instead of each backend's
+    /// default.
+    ///
+    /// A timeout is the library's verdict on a *slow consumer*, not evidence
+    /// that the message itself is bad, but the two are indistinguishable from
+    /// the outside — so the choice belongs to the caller:
+    ///
+    /// - [`Outcome::Retry`] — the historical default on every backend except
+    ///   Redis. Consumes retry budget, so a persistently slow handler
+    ///   eventually dead-letters (or, with no DLQ declared, is discarded).
+    /// - [`Outcome::Defer`] — redeliver via `hold_queues[0]` **without**
+    ///   consuming retry budget, so a slow handler never dead-letters a valid
+    ///   message. Note [`Outcome::Defer`]'s infinite-loop caveat: nothing
+    ///   bounds the redeliveries.
+    ///
+    ///   On a **sequenced** consumer this inherits `Defer`'s existing
+    ///   backend-specific handling, which is not uniform: Kafka, NATS,
+    ///   SNS/SQS and the in-memory backend downgrade `Defer` to
+    ///   [`Outcome::Retry`] with a warning, so a persistently slow handler
+    ///   still exhausts its budget there; RabbitMQ's sharded consumer and
+    ///   Redis Streams route it to a hold queue without incrementing the
+    ///   retry count, so it can defer indefinitely. Choose `Defer` for a
+    ///   sequenced consumer only if that split is acceptable — on the four
+    ///   backends that downgrade, this option buys you nothing.
+    /// - [`Outcome::Reject`] — treat a timeout as terminal and dead-letter on
+    ///   the first occurrence, consuming no retry budget.
+    /// - [`Outcome::Ack`] — drop the message. The handler is cancelled
+    ///   mid-flight, so any work it had not yet committed is lost.
+    ///
+    /// Leaving this unset preserves current behaviour exactly. On Redis
+    /// Streams the default is not an outcome at all: a timed-out entry is left
+    /// in the PEL and reclaimed by `XAUTOCLAIM` after the idle deadline, which
+    /// redelivers without consuming retry budget. Setting this option makes
+    /// Redis route the given outcome instead, which for [`Outcome::Defer`]
+    /// means the configured hold-queue delay rather than the idle deadline.
+    ///
+    /// Combined with [`without_handler_timeout`](Self::without_handler_timeout)
+    /// this setting has nothing to act on and is inert: no handler timeout ever
+    /// fires. It is deliberately *not* borrowed by the shutdown drain's own
+    /// backstop on RabbitMQ and SNS/SQS either (both backends bound the drain on
+    /// their standard *and* sequenced consumers) — that backstop bounds
+    /// shutdown, not the handler, and with deadlines disabled it can expire
+    /// while the handler is still running, so it stays [`Outcome::Retry`] and
+    /// lets the broker redeliver rather than retiring live work.
+    ///
+    /// # Redis: this narrows a race, it does not remove one
+    ///
+    /// With the option unset, a timed-out Redis entry has exactly one actor —
+    /// the reaper. Setting it makes the consumer act at that same deadline, so
+    /// the consumer and any `XAUTOCLAIM` sweep can both touch the entry.
+    ///
+    /// Two things keep them apart. Within a process, the maintenance registry
+    /// backs its sweep threshold off to twice the handler timeout, which is a
+    /// real guarantee because the registry sees every consumer there. Across
+    /// processes, the consumer holds a *lease* on the entry it is working on —
+    /// renewed at half the handler timeout, which keeps the entry's idle clock
+    /// below a foreign sweep threshold — and re-checks that lease before
+    /// applying any outcome, dropping the outcome if a reaper got there first.
+    ///
+    /// What that buys you, stated without varnish:
+    ///
+    /// - It requires handler timeouts configured **consistently** across every
+    ///   consumer of a stream and group — already the rule for
+    ///   [`with_handler_timeout`](Self::with_handler_timeout), and not relaxed
+    ///   here. A process sweeping at 30 s against a 60 s handler elsewhere is
+    ///   racing the renewal, not beaten by it.
+    /// - The re-check is check-then-act, and this backend does not currently
+    ///   serialize the two halves: applying an outcome takes further round
+    ///   trips (`XADD` then `XACK`) issued separately from the check, so a
+    ///   consumer stalled between them can still be overtaken. That is a
+    ///   present limitation rather than something Redis forbids — `Ack`, a
+    ///   no-DLQ `Reject` and an immediate `Retry`/`Defer` are single-key and
+    ///   would fit in the check's script, and DLQ/hold routing is scriptable
+    ///   too wherever the destination shares a hash slot with the queue. What
+    ///   has no single-script form is arbitrary cross-slot destinations on a
+    ///   clustered deployment, and the same at-least-once fallback is applied
+    ///   uniformly rather than only there.
+    /// - The renewal interval has a 100 ms floor, so below a 200 ms handler
+    ///   timeout the margin narrows from half the timeout to whatever is left
+    ///   over that floor — and at 100 ms or under there is none: the first
+    ///   renewal would fall due after the deadline has already passed.
+    ///
+    /// So the window shrinks from "every handler that reaches its deadline" to
+    /// "a consumer that loses its lease and does not notice in time", but a
+    /// reclaim-induced duplicate remains possible — as it already is for any
+    /// Redis Streams consumer group, which is at-least-once. Where ownership
+    /// cannot be established at all, the outcome is applied anyway rather than
+    /// leaving an entry that may have no reaper to recover it.
+    ///
+    /// Handler *panics* are unaffected and always resolve to
+    /// [`Outcome::Retry`] — a panic is a failed attempt, not a slow one.
+    pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
+        self.handler_timeout_outcome = Some(outcome);
         self
     }
 
@@ -385,6 +507,7 @@ impl<B: Backend> ConsumerOptions<B> {
             max_retries: self.max_retries,
             prefetch_count: effective_prefetch,
             handler_timeout: self.handler_timeout,
+            handler_timeout_outcome: self.handler_timeout_outcome,
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
             max_reconnect_attempts: self.max_reconnect_attempts,
@@ -426,6 +549,7 @@ impl<B: Backend> Clone for ConsumerOptions<B> {
             prefetch_count: self.prefetch_count,
             concurrent_processing: self.concurrent_processing,
             handler_timeout: self.handler_timeout,
+            handler_timeout_outcome: self.handler_timeout_outcome.clone(),
             max_pending_per_key: self.max_pending_per_key,
             max_message_size: self.max_message_size,
             max_reconnect_attempts: self.max_reconnect_attempts,

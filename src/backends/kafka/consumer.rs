@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -28,7 +28,9 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
+use crate::routing::{
+    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
+};
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
@@ -96,6 +98,17 @@ struct PartitionTracker {
     /// partition clear `dirty_since`, which a successful commit cannot do on
     /// its own because it is silent.
     quiet_drains: u32,
+    /// Terminal discards awaiting the commit that retires them, keyed by the
+    /// offset each depends on.
+    ///
+    /// `messages_discarded_total` promises every increment is a message that
+    /// no longer exists, so a discard cannot be counted while its offset is
+    /// merely queued for commit. Entries leave this map in exactly two ways:
+    /// covered by a landed commit (`confirm`), or dropped with the tracker
+    /// when the partition is revoked (`OffsetTracker::remove`), which means
+    /// the message is redelivered to whoever takes the partition over — an
+    /// undercount, the safe direction.
+    pending_discards: BTreeMap<i64, TerminalDiscard>,
 }
 
 impl PartitionTracker {
@@ -106,17 +119,26 @@ impl PartitionTracker {
             dirty: false,
             dirty_since: None,
             quiet_drains: 0,
+            pending_discards: BTreeMap::new(),
         }
     }
 
-    fn mark_complete(&mut self, offset: i64) {
+    fn mark_complete(&mut self, offset: i64, discard: Option<TerminalDiscard>) {
         // Completions below the seed are stale: after a partition is removed
         // on rebalance and re-seeded by the next delivery, completions of
         // messages in flight from the previous assignment epoch would
         // otherwise pile up in `completed` forever (never contiguous with
         // `next_to_commit`).
         if offset < self.next_to_commit {
+            // This epoch will never commit that offset, so any retirement
+            // riding on it is not ours to claim.
+            if let Some(discard) = discard {
+                discard.survived();
+            }
             return;
+        }
+        if let Some(discard) = discard {
+            self.pending_discards.insert(offset, discard);
         }
         self.completed.insert(offset);
     }
@@ -160,7 +182,11 @@ impl PartitionTracker {
     /// a false fence (a successful commit is silent, so it cannot clear the
     /// streak itself). A resolving rebalance also clears it, by dropping and
     /// recreating this tracker — see `OffsetTracker::remove`.
-    fn drain_committable(&mut self) -> Option<i64> {
+    /// The returned discards are the ones this commit position retires: their
+    /// offsets are strictly below the (exclusive) commit offset. They are
+    /// handed to the caller unsettled, because only the commit's result says
+    /// whether the retirement actually happened.
+    fn drain_committable(&mut self) -> Option<(i64, Vec<TerminalDiscard>)> {
         let mut next = self.next_to_commit;
         while self.completed.remove(&next) {
             next += 1;
@@ -180,7 +206,10 @@ impl PartitionTracker {
             self.next_to_commit = next;
         }
         if progressed || retry {
-            Some(next)
+            // `next` is exclusive, so everything strictly below it is covered.
+            let remainder = self.pending_discards.split_off(&next);
+            let covered = std::mem::replace(&mut self.pending_discards, remainder);
+            Some((next, covered.into_values().collect()))
         } else {
             None
         }
@@ -213,9 +242,22 @@ impl OffsetTracker {
             .or_insert_with(|| PartitionTracker::new(offset));
     }
 
-    fn mark_complete(&mut self, partition: i32, offset: i64) {
-        if let Some(tracker) = self.partitions.get_mut(&partition) {
-            tracker.mark_complete(offset);
+    fn mark_complete(&mut self, completion: Completion) {
+        let Completion {
+            partition,
+            offset,
+            discard,
+        } = completion;
+        match self.partitions.get_mut(&partition) {
+            Some(tracker) => tracker.mark_complete(offset, discard),
+            // The partition was revoked while this delivery was in flight, so
+            // this member will never commit the offset and whoever owns the
+            // partition now will redeliver the message.
+            None => {
+                if let Some(discard) = discard {
+                    discard.survived();
+                }
+            }
         }
     }
 
@@ -310,16 +352,24 @@ impl OffsetTracker {
     /// every receive-loop iteration even when no partition had progress to
     /// commit (the common case). Returning `Option` skips the C-heap (librdkafka
     /// FFI) allocation when there's nothing to do.
-    fn drain_committable(&mut self) -> Option<TopicPartitionList> {
+    ///
+    /// The second element carries the terminal discards this commit would
+    /// retire. A non-empty vec is what makes the caller commit with
+    /// `CommitMode::Sync`: the accounting needs a broker-confirmed commit, and
+    /// paying for one only when a terminal offset is in the batch keeps the
+    /// ordinary Ack-only path asynchronous.
+    fn drain_committable(&mut self) -> Option<(TopicPartitionList, Vec<TerminalDiscard>)> {
         let mut tpl: Option<TopicPartitionList> = None;
+        let mut discards = Vec::new();
         for (&partition, tracker) in &mut self.partitions {
-            if let Some(commit_offset) = tracker.drain_committable() {
+            if let Some((commit_offset, covered)) = tracker.drain_committable() {
+                discards.extend(covered);
                 tpl.get_or_insert_with(TopicPartitionList::new)
                     .add_partition_offset(&self.topic, partition, Offset::Offset(commit_offset))
                     .ok();
             }
         }
-        tpl
+        tpl.map(|tpl| (tpl, discards))
     }
 }
 
@@ -533,19 +583,149 @@ async fn publish_to_dlq(
 /// `None` selects the FIFO path: no async signaling, [`route_outcome`]
 /// instead awaits the republish inline and returns whether the caller may
 /// proceed with `consumer.commit_message`.
-type CompletionHandle = Option<(mpsc::Sender<(i32, i64)>, i32, i64)>;
+type CompletionHandle = Option<(mpsc::Sender<Completion>, i32, i64)>;
 
-fn signal_completion(handle: CompletionHandle, queue: &str) {
-    if let Some((tx, partition, offset)) = handle
-        && tx.try_send((partition, offset)).is_err()
-    {
+/// A finished delivery handed back to the offset tracker.
+struct Completion {
+    partition: i32,
+    offset: i64,
+    /// Discard accounting that must not be counted until this offset is
+    /// actually committed, so it rides along with the offset it depends on.
+    /// See [`PartitionTracker::pending_discards`].
+    discard: Option<TerminalDiscard>,
+}
+
+impl Completion {
+    /// A completion with no terminal accounting riding on it — an `Ack`, a
+    /// landed republish, or a pre-handler path that routed the message
+    /// somewhere it still exists.
+    fn plain(partition: i32, offset: i64) -> Self {
+        Self {
+            partition,
+            offset,
+            discard: None,
+        }
+    }
+}
+
+/// A terminal discard waiting on the commit that retires its message.
+///
+/// Which settle method applies is decided where the outcome is routed, not
+/// where the commit lands, so the choice travels with the pending record.
+enum TerminalDiscard {
+    /// Dead-lettered, or terminal on a topic with no DLQ. Counts only when no
+    /// DLQ exists — with one, the message is still in it.
+    Retired(metrics::PendingDiscard),
+    /// A DLQ was configured and the publish to it failed. Nothing holds a
+    /// copy, so this counts regardless of the topology.
+    Lost(metrics::PendingDiscard),
+}
+
+impl TerminalDiscard {
+    /// The commit landed: the message is genuinely gone.
+    fn confirm(self) {
+        match self {
+            Self::Retired(pending) => pending.confirm(),
+            Self::Lost(pending) => pending.confirm_lost(),
+        }
+    }
+
+    /// The commit did not land, so the message will be redelivered.
+    fn survived(self) {
+        match self {
+            Self::Retired(pending) | Self::Lost(pending) => pending.survived(),
+        }
+    }
+}
+
+/// How a terminally-rejected message's discard must be settled.
+///
+/// Shared by the single-message and batch reject paths so the two cannot drift:
+/// the decision depends only on whether the topology declares a DLQ and whether
+/// this message's publish to it landed, never on which path asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectSettlement {
+    /// It is in the DLQ, so it exists whatever the commit does. Settle now and
+    /// keep the ordinary dead-letter path off the commit round trip.
+    InDlq,
+    /// No DLQ declared: retiring this message drops it. Counts if the commit
+    /// lands.
+    Retired,
+    /// A DLQ was declared and did not receive it. Nothing holds a copy, so this
+    /// is data loss whatever the topology says. Counts if the commit lands.
+    Lost,
+}
+
+/// Classify a rejected message for [`RejectSettlement`].
+///
+/// `reached_dlq` is meaningful only when `has_dlq`; with no DLQ declared there
+/// was no publish to succeed or fail, and the message is simply dropped.
+fn reject_settlement(has_dlq: bool, reached_dlq: bool) -> RejectSettlement {
+    match (has_dlq, reached_dlq) {
+        (false, _) => RejectSettlement::Retired,
+        (true, true) => RejectSettlement::InDlq,
+        (true, false) => RejectSettlement::Lost,
+    }
+}
+
+/// Hand this delivery's offset to the tracker so it can be committed.
+///
+/// Returns whether the offset was actually handed over. A full channel means
+/// it is never committed, so the message is redelivered from the last
+/// committed position on the next rebalance or restart — callers about to
+/// assert the message is gone must not do so when this returns `false`.
+///
+/// **`true` is not a broker acknowledgement**, and terminal accounting is
+/// therefore *not* settled here. It says only that the offset entered the
+/// in-process tracker; the commit can still fail, or be dropped outright by
+/// librdkafka mid-rebalance without any callback (see
+/// `OffsetTracker::apply_rebalance_events`), and a redelivered message is one
+/// `messages_discarded_total` promised no longer exists.
+///
+/// So a `discard` handed in here travels with its offset into the tracker and
+/// is settled by the commit that covers it, which the receive loop issues with
+/// `CommitMode::Sync` precisely because a terminal offset is in the batch —
+/// rust-rdkafka's `Sync` waits for the broker to finish the commit, which is
+/// the positive signal hand-off cannot give. A commit that fails, or a
+/// partition revoked before one lands, settles as `survived`: undercounting an
+/// ambiguous retirement is safe, claiming one that did not happen is not.
+fn signal_completion(
+    handle: CompletionHandle,
+    queue: &str,
+    discard: Option<TerminalDiscard>,
+) -> bool {
+    // No tracker attached (the FIFO path commits inline): nothing to signal,
+    // and nothing holding the delivery back either. FIFO settles its own
+    // accounting on the synchronous commit, so it never hands one in here.
+    let Some((tx, partition, offset)) = handle else {
+        debug_assert!(
+            discard.is_none(),
+            "FIFO settles terminal accounting on its own commit"
+        );
+        if let Some(discard) = discard {
+            discard.survived();
+        }
+        return true;
+    };
+    if let Err(e) = tx.try_send(Completion {
+        partition,
+        offset,
+        discard,
+    }) {
         tracing::error!(
             queue,
             partition,
             offset,
             "completion channel full — logic bug in offset tracker"
         );
+        // The offset never reaches the tracker, so it is never committed and
+        // the message is redelivered — the opposite of retired.
+        if let Some(discard) = e.into_inner().discard {
+            discard.survived();
+        }
+        return false;
     }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -578,34 +758,82 @@ async fn route_outcome(
     // instead of stalling `acquire_many(prefetch)` until every delayed
     // permit-holder finishes naturally.
     shutdown: CancellationToken,
-) -> bool {
+) -> (bool, Option<metrics::PendingDiscard>) {
     match decide_retry(&outcome, retry_count, max_retries) {
         RetryDecision::Ack => {
-            signal_completion(completion, topic);
-            true
+            let _ = signal_completion(completion, topic, None);
+            (true, None)
         }
         RetryDecision::Dlq { reason } => {
-            // Emit before the DLQ publish so the metric fires regardless
-            // of DLQ outcome — silent loss on DLQ failure is what the
-            // counter has to surface to alerting.
             let fail_reason = match reason {
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_failed(topic, group, fail_reason);
+            let pending =
+                metrics::record_terminal(topic, group, fail_reason, topology.dlq().is_some());
+            // Neither path settles the accounting here. FIFO commits
+            // synchronously in the caller; the concurrent path hands the
+            // pending record to the tracker, which settles it on the
+            // `CommitMode::Sync` commit that covers the offset. Both wait for
+            // the only thing Kafka offers as a real acknowledgement that a
+            // message is retired.
+            let fifo = completion.is_none();
             let dlq_ok =
                 publish_to_dlq(client, topology, payload, key.as_deref(), headers, reason).await;
-            // Commit even if the DLQ publish failed: the message has
-            // exhausted retries (or was rejected) and looping it forever
-            // produces a poison hot-spot. The error trace + metric give
-            // operators what they need to investigate. Matches the existing
-            // pre-refactor semantic (the outer task committed regardless).
-            signal_completion(completion, topic);
             match dlq_ok {
-                Ok(()) => true,
+                Ok(()) => {
+                    // `publish_to_dlq` is `Ok(())` both when it dead-lettered
+                    // and when no DLQ is configured; `confirm` distinguishes
+                    // them from the topology.
+                    if fifo {
+                        return (true, Some(pending));
+                    }
+                    // Commit even though this is terminal: the message has
+                    // exhausted retries (or was rejected) and looping it
+                    // forever produces a poison hot-spot.
+                    match reject_settlement(topology.dlq().is_some(), true) {
+                        RejectSettlement::InDlq => {
+                            // Settling now keeps the ordinary dead-letter path
+                            // off the synchronous commit a pending record would
+                            // force.
+                            pending.survived();
+                            signal_completion(completion, topic, None);
+                        }
+                        settled => {
+                            debug_assert_eq!(settled, RejectSettlement::Retired);
+                            signal_completion(
+                                completion,
+                                topic,
+                                Some(TerminalDiscard::Retired(pending)),
+                            );
+                        }
+                    }
+                    (true, None)
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to publish to DLQ");
-                    false
+                    // A DLQ was configured and did not receive the message. If
+                    // the offset still advances, nothing holds a copy — that is
+                    // data loss even though the topology declares a DLQ, so it
+                    // is counted rather than excused by `has_dlq`. Whether the
+                    // offset advances is now decided by the commit, so the
+                    // distinction rides along as `Lost` rather than being
+                    // resolved here.
+                    //
+                    // FIFO returns `false`, so its caller skips the commit
+                    // entirely and the message stays put — no loss to record.
+                    if fifo {
+                        pending.survived();
+                    } else {
+                        // `publish_to_dlq` is `Ok(())` when no DLQ is declared,
+                        // so reaching this arm at all means one was.
+                        debug_assert_eq!(
+                            reject_settlement(topology.dlq().is_some(), false),
+                            RejectSettlement::Lost
+                        );
+                        signal_completion(completion, topic, Some(TerminalDiscard::Lost(pending)));
+                    }
+                    (false, None)
                 }
             }
         }
@@ -621,19 +849,22 @@ async fn route_outcome(
             let retry_headers =
                 headers_with_retry_count(headers, new_count, &format!("-r{new_count}"));
 
-            run_delayed_republish(
-                client.clone(),
-                topic.to_string(),
-                key,
-                retry_headers,
-                payload.to_vec(),
-                delay,
-                retry_permit,
-                completion,
-                shutdown,
-                "retry republish",
+            (
+                run_delayed_republish(
+                    client.clone(),
+                    topic.to_string(),
+                    key,
+                    retry_headers,
+                    payload.to_vec(),
+                    delay,
+                    retry_permit,
+                    completion,
+                    shutdown,
+                    "retry republish",
+                )
+                .await,
+                None,
             )
-            .await
         }
         RetryDecision::Hold { increment: false } => {
             let delay = if hold_queues.is_empty() {
@@ -649,19 +880,22 @@ async fn route_outcome(
                 &format!("-d{}", uuid::Uuid::new_v4()),
             );
 
-            run_delayed_republish(
-                client.clone(),
-                topic.to_string(),
-                key,
-                defer_headers,
-                payload.to_vec(),
-                delay,
-                retry_permit,
-                completion,
-                shutdown,
-                "defer republish",
+            (
+                run_delayed_republish(
+                    client.clone(),
+                    topic.to_string(),
+                    key,
+                    defer_headers,
+                    payload.to_vec(),
+                    delay,
+                    retry_permit,
+                    completion,
+                    shutdown,
+                    "defer republish",
+                )
+                .await,
+                None,
             )
-            .await
         }
     }
 }
@@ -722,7 +956,7 @@ async fn run_delayed_republish(
                     .await
                 {
                     Ok(()) => {
-                        signal_completion(completion, &topic);
+                        let _ = signal_completion(completion, &topic, None);
                     }
                     Err(e) => {
                         // Don't signal — leaving the offset uncommitted is the
@@ -805,6 +1039,7 @@ async fn run_delayed_republish(
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -825,9 +1060,10 @@ where
                 Outcome::Retry
             }
             Err(_) => {
-                tracing::warn!("handler timed out after {duration:?}, retrying");
+                let resolved = handler_timeout_outcome(timeout_outcome);
+                tracing::warn!(outcome = ?resolved, "handler timed out after {duration:?}");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                Outcome::Retry
+                resolved
             }
         },
         None => match safe_fut.await {
@@ -1268,6 +1504,7 @@ pub struct BatchConsumerOptions {
     max_reconnect_attempts: Option<u32>,
     max_message_size: Option<usize>,
     handler_timeout: Option<Duration>,
+    handler_timeout_outcome: Option<Outcome>,
     kafka_group_id: Option<Arc<str>>,
     kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
     shutdown: CancellationToken,
@@ -1292,6 +1529,7 @@ impl Default for BatchConsumerOptions {
             // flush legitimately takes longer should raise it deliberately
             // rather than discover the default by having batches retried.
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
+            handler_timeout_outcome: None,
             kafka_group_id: None,
             kafka_auto_offset_reset: None,
             shutdown: CancellationToken::new(),
@@ -1374,6 +1612,43 @@ impl BatchConsumerOptions {
         self
     }
 
+    /// What a batch handler timeout resolves to, instead of the default
+    /// [`Outcome::Retry`].
+    ///
+    /// The same motivation as
+    /// [`ConsumerOptions::with_handler_timeout_outcome`] — a slow flush is
+    /// usually backpressure, not a poison batch — but **not** the same
+    /// mechanics, because the outcome applies batch-wide and `run_batch` has
+    /// no per-message retry counter:
+    ///
+    /// | Outcome | Effect on the whole batch |
+    /// |---|---|
+    /// | `Retry` (default) | Seek back and redeliver after an escalating delay. Forever, if the handler keeps timing out. |
+    /// | `Defer` | **Identical to `Retry` here.** Same seek-back arm, same backoff. |
+    /// | `Ack` | Commit every offset in the batch. The messages are gone, unprocessed, with no DLQ copy. |
+    /// | `Reject` | Terminal: dead-letter every message (or discard it, with no DLQ declared) and commit. |
+    ///
+    /// The `Retry`/`Defer` distinction that matters on the single-message path
+    /// — spending the retry budget versus not — has no meaning here. There is
+    /// no budget to spend: a batch is never dead-lettered for exhausting one,
+    /// so a timeout can never turn into the silent budget-exhaustion discard
+    /// this option exists to avoid elsewhere. Setting `Defer` over the default
+    /// is therefore a no-op, kept legal only so the two option types read the
+    /// same.
+    ///
+    /// That leaves the real choice as *redeliver forever* (`Retry`/`Defer`)
+    /// versus *give up on this batch* (`Ack`/`Reject`). Both of the latter
+    /// retire messages the handler never finished, so reach for them only when
+    /// a stalled flush genuinely means the payloads are no longer worth
+    /// processing — and prefer `Reject` to `Ack` unless the topology has no
+    /// DLQ, since `Reject` at least preserves them.
+    ///
+    /// [`ConsumerOptions::with_handler_timeout_outcome`]: crate::ConsumerOptions::with_handler_timeout_outcome
+    pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
+        self.handler_timeout_outcome = Some(outcome);
+        self
+    }
+
     pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
         self.kafka_group_id = Some(group_id.into());
         self
@@ -1437,10 +1712,14 @@ struct BatchFlushCtx<'a> {
     /// Cuts the redelivery backoff short so a wedged handler cannot hold up
     /// shutdown for the whole (escalated) delay.
     shutdown: &'a CancellationToken,
-    /// How long one `handle_batch` call may run before it is abandoned as
-    /// `Outcome::Retry`. `None` waits forever — see
+    /// How long one `handle_batch` call may run before it is abandoned.
+    /// `None` waits forever — see
     /// [`BatchConsumerOptions::without_handler_timeout`].
     handler_timeout: Option<Duration>,
+    /// What that abandonment resolves to. `None` keeps the historical
+    /// `Outcome::Retry` — see
+    /// [`BatchConsumerOptions::with_handler_timeout_outcome`].
+    handler_timeout_outcome: Option<Outcome>,
 }
 
 /// Commits each partition's exclusive end offset in one batched sync commit.
@@ -1695,13 +1974,19 @@ impl<T: Topic> BatchBuffer<T> {
 /// A DLQ publish failure is not propagated: the offset span is committed either
 /// way, so failing the whole batch here would stall forward progress on a
 /// message that is by definition unprocessable (or explicitly rejected).
+///
+/// Returns whether the message reached the DLQ. Committing past a message the
+/// DLQ never received is data loss even on a topology that declares one, so the
+/// terminal-accounting caller needs the distinction — `false` is what makes it
+/// settle with [`metrics::PendingDiscard::confirm_lost`] rather than the
+/// topology-derived `confirm`.
 async fn dlq_batch_message(
     client: &KafkaClient,
     topology: &QueueTopology,
     queue: &str,
     raw: &RawMessage,
     reason: &str,
-) {
+) -> bool {
     if let Err(dlq_err) = publish_to_dlq(
         client,
         topology,
@@ -1718,14 +2003,20 @@ async fn dlq_batch_message(
             reason,
             "failed to publish bad batch message to DLQ"
         );
+        return false;
     }
+    true
 }
 
 /// Publishes everything parked for the DLQ during this batch, immediately
 /// before its offsets commit.
 async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) {
     for item in pending {
-        dlq_batch_message(
+        // The publish result is logged inside and deliberately not acted on
+        // here: pre-handler drops are not part of the terminal-accounting
+        // contract on this backend (they never reach `record_terminal`), so
+        // there is no pending discard to settle either way.
+        let _reached_dlq = dlq_batch_message(
             flush.client,
             flush.topology,
             flush.queue,
@@ -1774,22 +2065,33 @@ async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) 
 /// acked, so its offsets are not committed, and the caller seeks back and
 /// redelivers it. The messages themselves were moved into the abandoned
 /// future — they come back from the broker, not from memory.
-async fn invoke_batch_handler<F>(
-    fut: F,
+///
+/// The handler future is built by `make_fut` *inside* the guard rather than
+/// passed in ready-made. `BatchMessageHandler::handle_batch` is an ordinary
+/// `fn -> impl Future`, so an implementation may panic while assembling its
+/// future — before any of it is awaited. Constructing at the call site put
+/// that panic outside `catch_unwind`, where it unwound `flush_batch` and
+/// killed `run_batch` instead of resolving to `Retry` as the contract above
+/// promises. This mirrors the single-message path, which never materializes
+/// the handler future outside its own guard.
+async fn invoke_batch_handler<F, Fut>(
+    make_fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
     batch_size: u64,
 ) -> Outcome
 where
-    F: std::future::Future<Output = Outcome>,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Outcome>,
 {
     use futures_util::FutureExt;
     use std::panic::AssertUnwindSafe;
 
     let _inflight = metrics::InflightGuard::from_refs_n(topic, group, batch_size);
     let started = std::time::Instant::now();
-    let safe_fut = AssertUnwindSafe(fut).catch_unwind();
+    let safe_fut = AssertUnwindSafe(async move { make_fut().await }).catch_unwind();
     let outcome = match timeout {
         Some(duration) => match tokio::time::timeout(duration, safe_fut).await {
             Ok(Ok(o)) => o,
@@ -1803,13 +2105,15 @@ where
                 Outcome::Retry
             }
             Err(_) => {
+                let resolved = handler_timeout_outcome(timeout_outcome);
                 tracing::warn!(
                     topic,
                     batch_size,
-                    "batch handler timed out after {duration:?}, redelivering"
+                    outcome = ?resolved,
+                    "batch handler timed out after {duration:?}"
                 );
                 metrics::record_failed_n(topic, group, metrics::FailReason::Timeout, batch_size);
-                Outcome::Retry
+                resolved
             }
         },
         None => match safe_fut.await {
@@ -1845,6 +2149,9 @@ where
         group,
         shutdown,
         handler_timeout,
+        // Not `Copy` like the rest, so bind it by reference and leave the
+        // by-value destructure of the other fields intact.
+        ref handler_timeout_outcome,
     } = *flush;
     let batch_size = buffer.messages.len();
 
@@ -1872,8 +2179,11 @@ where
     // is achievable. The duration is one observation per *flush* (the whole
     // batch), not per message.
     let outcome = invoke_batch_handler(
-        handler.handle_batch(messages, ctx),
+        // Closure, not a ready-made future: `handle_batch` itself may panic
+        // while building it, and that has to happen inside the guard.
+        || handler.handle_batch(messages, ctx),
         handler_timeout,
+        handler_timeout_outcome.clone(),
         topic,
         group,
         batch_size as u64,
@@ -1892,16 +2202,52 @@ where
         // pins the partition forever (seek, sleep, redeliver, reject, …) with
         // the payloads never reaching a DLQ and the offsets never advancing.
         Outcome::Reject => {
-            metrics::record_failed_n(
-                topic,
-                group,
-                metrics::FailReason::Rejected,
-                batch_size as u64,
+            // Same terminal contract the single-message path applies in
+            // `route_outcome`, in batch units. The failure is counted now
+            // because it already happened; the *discard* is a claim that the
+            // message no longer exists, and nothing has retired these messages
+            // until the commit below lands. Recording it up front would fire a
+            // data-loss alert during the broker outage that made the commit
+            // fail — precisely when the batch is about to be redelivered.
+            let has_dlq = topology.dlq().is_some();
+            // Settled only by the commit's result, so they outlive this block.
+            let mut unsettled: Vec<TerminalDiscard> = Vec::new();
+            // Driven off `batch_size`, not `buffer.raw.len()`. With no DLQ the
+            // buffer keeps no wire bytes at all (`retain_raw` in the receive
+            // loop is the same `topology.dlq().is_some()`), so `raw` is empty
+            // — but there are still `batch_size` messages about to be dropped
+            // on the floor, which is exactly what the discard counter exists
+            // to report. Iterating `raw` would count none of them.
+            //
+            // With a DLQ, `push` supplies `Some(raw)` for every buffered
+            // message and is the only writer, so the two stay index-parallel.
+            // The `get` below is nevertheless a `match` rather than an index:
+            // if that invariant ever broke, the fallback is `reached_dlq =
+            // false`, which is *honest* — no bytes means no dead-letter
+            // publish happened, so the message really is gone with no copy,
+            // and `Lost` counts it. A panic or a silent `InDlq` would both be
+            // worse. The assert catches the programming error in tests without
+            // making release behaviour depend on it.
+            debug_assert!(
+                !has_dlq || buffer.raw.len() == batch_size,
+                "`raw` is index-parallel to `messages` whenever a DLQ is declared"
             );
-            if topology.dlq().is_some() {
-                for raw in &buffer.raw {
-                    dlq_batch_message(client, topology, queue, raw, "rejected").await;
+            for i in 0..batch_size {
+                let pending =
+                    metrics::record_terminal(topic, group, metrics::FailReason::Rejected, has_dlq);
+                let reached_dlq = match buffer.raw.get(i) {
+                    Some(raw) => dlq_batch_message(client, topology, queue, raw, "rejected").await,
+                    None => false,
+                };
+                match reject_settlement(has_dlq, reached_dlq) {
+                    RejectSettlement::InDlq => pending.survived(),
+                    RejectSettlement::Retired => {
+                        unsettled.push(TerminalDiscard::Retired(pending));
+                    }
+                    RejectSettlement::Lost => unsettled.push(TerminalDiscard::Lost(pending)),
                 }
+            }
+            if has_dlq {
                 tracing::warn!(queue, batch_size, "batch rejected, routed to the DLQ");
             } else {
                 tracing::warn!(
@@ -1911,7 +2257,15 @@ where
                 );
             }
             publish_pending_dlq(flush, &buffer.pending_dlq).await;
-            commit_batch_end(consumer, queue, &buffer.end).await?;
+            let committed = commit_batch_end(consumer, queue, &buffer.end).await;
+            match committed {
+                // The offsets advanced: these messages are genuinely gone.
+                Ok(()) => unsettled.into_iter().for_each(TerminalDiscard::confirm),
+                // The commit did not land, so the offsets did not advance and
+                // the whole batch is redelivered. Nothing was lost.
+                Err(_) => unsettled.into_iter().for_each(TerminalDiscard::survived),
+            }
+            committed?;
             *redelivery_backoff = batch_redelivery_backoff();
             buffer.clear();
         }
@@ -2260,6 +2614,7 @@ impl KafkaConsumer {
         let max_retries = options.max_retries;
         let prefetch_count = options.prefetch_count;
         let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
 
@@ -2300,6 +2655,7 @@ impl KafkaConsumer {
             let semaphore = semaphore.clone();
             let topic = topic.clone();
             let group = group.clone();
+            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
@@ -2335,7 +2691,7 @@ impl KafkaConsumer {
                 // logic bug (handler completing without holding a permit) and is
                 // surfaced immediately rather than silently accumulating (sec-K-4).
                 let (completion_tx, mut completion_rx) =
-                    mpsc::channel::<(i32, i64)>(prefetch_count as usize);
+                    mpsc::channel::<Completion>(prefetch_count as usize);
 
                 // Periodic wake so rebalance events and commit retries are
                 // drained even when no messages or completions arrive: the
@@ -2350,8 +2706,8 @@ impl KafkaConsumer {
                     // partition's tracker (and any completions queued for it)
                     // is dropped so this member never commits offsets for a
                     // partition it no longer owns.
-                    while let Ok((partition, offset)) = completion_rx.try_recv() {
-                        tracker.mark_complete(partition, offset);
+                    while let Ok(completion) = completion_rx.try_recv() {
+                        tracker.mark_complete(completion);
                     }
                     let now = Instant::now();
                     tracker.apply_rebalance_events(&rebalance_rx, now);
@@ -2374,10 +2730,34 @@ impl KafkaConsumer {
                              {COMMIT_FENCE_TIMEOUT:?} with no resolving rebalance"
                         )));
                     }
-                    if let Some(tpl) = tracker.drain_committable() {
-                        consumer
-                            .commit(&tpl, CommitMode::Async)
-                            .map_err(|e| map_kafka_error("commit failed", e))?;
+                    if let Some((tpl, discards)) = tracker.drain_committable() {
+                        if discards.is_empty() {
+                            consumer
+                                .commit(&tpl, CommitMode::Async)
+                                .map_err(|e| map_kafka_error("commit failed", e))?;
+                        } else {
+                            // This batch retires messages that a no-DLQ topic
+                            // will never see again, and `messages_discarded_total`
+                            // may only move once that is true. `Sync` waits for
+                            // the broker to finish the commit, which is the
+                            // positive signal the async path cannot give.
+                            let committed = consumer.commit(&tpl, CommitMode::Sync);
+                            match &committed {
+                                Ok(()) => {
+                                    for discard in discards {
+                                        discard.confirm();
+                                    }
+                                }
+                                Err(_) => {
+                                    // Ambiguous: the message may or may not be
+                                    // retired, so do not claim it was.
+                                    for discard in discards {
+                                        discard.survived();
+                                    }
+                                }
+                            }
+                            committed.map_err(|e| map_kafka_error("commit failed", e))?;
+                        }
                     }
 
                     tokio::select! {
@@ -2385,14 +2765,24 @@ impl KafkaConsumer {
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             // Final commit
-                            while let Ok((partition, offset)) = completion_rx.try_recv() {
-                                tracker.mark_complete(partition, offset);
+                            while let Ok(completion) = completion_rx.try_recv() {
+                                tracker.mark_complete(completion);
                             }
                             tracker.apply_rebalance_events(&rebalance_rx, Instant::now());
-                            if let Some(tpl) = tracker.drain_committable()
-                                && let Err(e) = consumer.commit(&tpl, CommitMode::Sync)
-                            {
-                                tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
+                            if let Some((tpl, discards)) = tracker.drain_committable() {
+                                match consumer.commit(&tpl, CommitMode::Sync) {
+                                    Ok(()) => {
+                                        for discard in discards {
+                                            discard.confirm();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(queue, error = %e, "final offset commit failed during shutdown; batch may be redelivered");
+                                        for discard in discards {
+                                            discard.survived();
+                                        }
+                                    }
+                                }
                             }
                             return Ok(());
                         }
@@ -2407,8 +2797,8 @@ impl KafkaConsumer {
                         // the top of the loop picks up any further completions and
                         // commits in one pass.
                         completion = completion_rx.recv() => {
-                            if let Some((partition, offset)) = completion {
-                                tracker.mark_complete(partition, offset);
+                            if let Some(completion) = completion {
+                                tracker.mark_complete(completion);
                             }
                         }
                         msg_result = consumer.recv() => {
@@ -2473,7 +2863,7 @@ impl KafkaConsumer {
                                         "failed to publish oversized message to DLQ"
                                     );
                                 }
-                                if completion_tx.try_send((partition, offset)).is_err() {
+                                if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
                                     tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
                                 }
                                 continue;
@@ -2522,7 +2912,7 @@ impl KafkaConsumer {
                                         ).await {
                                             tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
                                         }
-                                        if completion_tx.try_send((partition, offset)).is_err() {
+                                        if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
                                             tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
                                         }
                                         continue;
@@ -2548,7 +2938,7 @@ impl KafkaConsumer {
                                         ).await {
                                             tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
                                         }
-                                        if completion_tx.try_send((partition, offset)).is_err() {
+                                        if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
                                             tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
                                         }
                                         continue;
@@ -2578,7 +2968,7 @@ impl KafkaConsumer {
                                         ).await {
                                             tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
                                         }
-                                        if completion_tx.try_send((partition, offset)).is_err() {
+                                        if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
                                             tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
                                         }
                                         continue;
@@ -2617,7 +3007,7 @@ impl KafkaConsumer {
                                             "failed to publish bad message to DLQ"
                                         );
                                     }
-                                    if completion_tx.try_send((partition, offset)).is_err() {
+                                    if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
                                         tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
                                     }
                                     continue;
@@ -2645,6 +3035,7 @@ impl KafkaConsumer {
                             let task_ctx = ctx.clone();
                             let task_group = group.clone();
                             let task_shutdown = shutdown.clone();
+                            let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
 
                             // perf-K-7: single spawn per message (was three).
                             // invoke_handler awaits the handler with catch_unwind +
@@ -2660,6 +3051,7 @@ impl KafkaConsumer {
                                             .await
                                     },
                                     handler_timeout,
+                                    task_timeout_outcome,
                                     &task_topic,
                                     task_group.as_deref(),
                                 )
@@ -2676,7 +3068,7 @@ impl KafkaConsumer {
                                 // Without this gating the offset would commit before
                                 // the republish landed, silently dropping the message
                                 // on republish failure.
-                                route_outcome(
+                                let routed = route_outcome(
                                     &task_client,
                                     &task_topic,
                                     task_group.as_deref(),
@@ -2693,6 +3085,11 @@ impl KafkaConsumer {
                                     task_shutdown,
                                 )
                                 .await;
+                                // Concurrent path: the pending discard is
+                                // always settled inside `route_outcome` (see
+                                // `signal_completion`), so nothing is handed
+                                // back here.
+                                debug_assert!(routed.1.is_none());
 
                                 if task_semaphore.available_permits() == task_prefetch as usize {
                                     task_processing.store(false, Ordering::Release);
@@ -2745,14 +3142,23 @@ impl KafkaConsumer {
     ///
     /// # Handler failures
     ///
-    /// A flush that panics or outruns `options.handler_timeout` (default
-    /// [`DEFAULT_HANDLER_TIMEOUT`], 30 s) is treated as `Retry`: nothing is
-    /// committed and the whole batch is redelivered. Same containment the
-    /// single-message path gets, and it carries more weight here — the batch
-    /// loop is a single task, so a flush that never returns would otherwise
-    /// stop offset commits, rebalance handling and shutdown along with it.
-    /// [`BatchConsumerOptions::without_handler_timeout`] opts out, at the cost
-    /// of making a hung flush unrecoverable.
+    /// A flush that **panics** — including a panic raised while `handle_batch`
+    /// is still building its future, before any of it runs — is treated as
+    /// `Retry`: nothing is committed and the whole batch is redelivered. Same
+    /// containment the single-message path gets, and it carries more weight
+    /// here, because the batch loop is a single task: an unguarded panic would
+    /// kill offset commits, rebalance handling and shutdown along with it.
+    ///
+    /// A flush that outruns `options.handler_timeout` (default
+    /// [`DEFAULT_HANDLER_TIMEOUT`], 30 s) resolves to `Retry` too, but that is
+    /// a *default*, not a rule:
+    /// [`BatchConsumerOptions::with_handler_timeout_outcome`] can make it any
+    /// `Outcome`, and `Ack`/`Reject` commit or dead-letter the entire batch
+    /// rather than redelivering it. See that method for the batch-wide outcome
+    /// table — the mapping differs from the single-message path, and `Defer`
+    /// in particular is indistinguishable from `Retry` here.
+    /// [`BatchConsumerOptions::without_handler_timeout`] opts out of the
+    /// deadline entirely, at the cost of making a hung flush unrecoverable.
     ///
     /// # Metrics
     ///
@@ -2810,6 +3216,7 @@ impl KafkaConsumer {
         let max_batch_size = options.max_batch_size;
         let max_batch_age = options.max_batch_age;
         let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome = options.handler_timeout_outcome.clone();
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
@@ -2843,6 +3250,7 @@ impl KafkaConsumer {
             let group_id = group_id.clone();
             let topic = topic.clone();
             let group = group.clone();
+            let handler_timeout_outcome = handler_timeout_outcome.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
@@ -2873,6 +3281,7 @@ impl KafkaConsumer {
                     group: group.as_deref(),
                     shutdown: &shutdown,
                     handler_timeout,
+                    handler_timeout_outcome,
                 };
 
                 let decode_ctx = BatchDecodeCtx {
@@ -3128,6 +3537,7 @@ impl KafkaConsumer {
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
 
@@ -3177,6 +3587,7 @@ impl KafkaConsumer {
                 let queue = queue.clone();
                 let topic = topic.clone();
                 let group = group.clone();
+                let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
                 #[cfg(feature = "kafka-schema-registry")]
                 let schema_registry = schema_registry.clone();
                 #[cfg(feature = "kafka-schema-registry")]
@@ -3243,7 +3654,18 @@ impl KafkaConsumer {
                                         sequence_key = %seq_key,
                                         "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                                     );
-                                    // Cascade: intentionally not counted — see `metrics::FailReason`.
+                                    // Collateral of an already-counted failure,
+                                    // so the failure half is deliberately not
+                                    // counted again — see `metrics::FailReason`.
+                                    // The discard half still applies: a
+                                    // cascaded message dropped with no DLQ is
+                                    // just as gone as any other.
+                                    let pending = metrics::pending_discard(
+                                        &topic,
+                                        group.as_deref(),
+                                        metrics::FailReason::Rejected,
+                                        topology.dlq().is_some(),
+                                    );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
@@ -3261,9 +3683,46 @@ impl KafkaConsumer {
                                             error = %dlq_err,
                                             "failed to publish poisoned-key message to DLQ"
                                         );
+                                        pending.survived();
                                         continue;
                                     }
-                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                    if topology.dlq().is_some() {
+                                        // The message is in the DLQ, so it
+                                        // exists whatever the commit does and
+                                        // `confirm` could never count it.
+                                        // Settling now keeps the dead-lettered
+                                        // cascade off the synchronous commit a
+                                        // live pending record would force —
+                                        // the same short-circuit the routing
+                                        // path below takes, and it matters more
+                                        // here: a poisoned key drains its whole
+                                        // backlog through this branch, so a
+                                        // per-message round trip is a far
+                                        // heavier tax than on an ordinary
+                                        // terminal outcome.
+                                        pending.survived();
+                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        continue;
+                                    }
+                                    // No DLQ: this commit is what actually
+                                    // drops the message, so it decides the
+                                    // discard accounting. `Async` only queues
+                                    // the request and reports nothing, so
+                                    // commit synchronously and settle on the
+                                    // broker's answer.
+                                    match consumer.commit_message(&msg, CommitMode::Sync) {
+                                        Ok(()) => pending.confirm(),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                queue,
+                                                error = %e,
+                                                "offset commit failed after a poisoned-key \
+                                                 cascade; the message stays committed at its \
+                                                 previous offset and is redelivered"
+                                            );
+                                            pending.survived();
+                                        }
+                                    }
                                     continue;
                                 }
 
@@ -3454,13 +3913,14 @@ impl KafkaConsumer {
                                             .await
                                     },
                                     handler_timeout,
+                                    handler_timeout_outcome_cfg.clone(),
                                     &topic,
                                     group.as_deref(),
                                 )
                                 .await;
                                 let outcome = adjust_outcome_for_fifo(outcome);
 
-                                // FailAll: a DLQ-terminal outcome poisons the
+                                                                // FailAll: a DLQ-terminal outcome poisons the
                                 // key, so every later message for it is
                                 // dead-lettered instead of handled.
                                 if matches!(
@@ -3470,7 +3930,7 @@ impl KafkaConsumer {
                                     poison_key(&poisoned, &seq_key, &queue);
                                 }
 
-                                let route_ok = route_outcome(
+                                let (route_ok, pending) = route_outcome(
                                     &client,
                                     &queue,
                                     group.as_deref(),
@@ -3498,7 +3958,36 @@ impl KafkaConsumer {
                                 // shutdown is how at-least-once delivery survives
                                 // a missed delayed publish on the FIFO path.
                                 if route_ok {
-                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                    match pending {
+                                        // A terminal outcome: this commit is
+                                        // what actually drops the message, so
+                                        // it decides the discard accounting.
+                                        // `Async` only queues the request and
+                                        // reports nothing, so commit
+                                        // synchronously here and settle on the
+                                        // broker's answer. Terminal outcomes
+                                        // are rare (rejected, or retries
+                                        // exhausted), so the extra round trip
+                                        // stays off the hot path.
+                                        Some(pending) => {
+                                            match consumer.commit_message(&msg, CommitMode::Sync) {
+                                                Ok(()) => pending.confirm(),
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        queue,
+                                                        error = %e,
+                                                        "offset commit failed after a terminal \
+                                                         outcome; the message stays committed at \
+                                                         its previous offset and is redelivered"
+                                                    );
+                                                    pending.survived();
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        }
+                                    }
                                 }
                                 processing.store(false, Ordering::Release);
                             }
@@ -3828,6 +4317,19 @@ mod offset_tracker_tests {
             })
     }
 
+    /// `drain_committable` for the offset-sequencing tests, which attach no
+    /// terminal discards — asserting the side channel stays empty keeps them
+    /// honest about that.
+    fn drain_tpl(tracker: &mut OffsetTracker) -> Option<TopicPartitionList> {
+        tracker.drain_committable().map(|(tpl, discards)| {
+            assert!(
+                discards.is_empty(),
+                "no terminal discards were attached in this test"
+            );
+            tpl
+        })
+    }
+
     /// Regression: the normal contiguous drain still works — out-of-order
     /// completions commit only up to the first gap, then advance once the
     /// gap fills.
@@ -3835,16 +4337,14 @@ mod offset_tracker_tests {
     fn contiguous_drain_advances_past_gaps_only_when_filled() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
-        tracker.mark_complete(0, 2);
-        tracker.mark_complete(0, 0);
+        tracker.mark_complete(Completion::plain(0, 2));
+        tracker.mark_complete(Completion::plain(0, 0));
 
-        let tpl = tracker
-            .drain_committable()
-            .expect("offset 0 is committable");
+        let tpl = drain_tpl(&mut tracker).expect("offset 0 is committable");
         assert_eq!(committed_offset(&tpl, 0), Some(1), "gap at 1 blocks 2");
 
-        tracker.mark_complete(0, 1);
-        let tpl = tracker.drain_committable().expect("gap filled");
+        tracker.mark_complete(Completion::plain(0, 1));
+        let tpl = drain_tpl(&mut tracker).expect("gap filled");
         assert_eq!(committed_offset(&tpl, 0), Some(3));
     }
 
@@ -3855,16 +4355,15 @@ mod offset_tracker_tests {
     fn remove_then_track_reseeds_next_to_commit() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 5);
-        tracker.mark_complete(0, 5);
-        let tpl = tracker.drain_committable().expect("initial commit");
+        tracker.mark_complete(Completion::plain(0, 5));
+        let tpl = drain_tpl(&mut tracker).expect("initial commit");
         assert_eq!(committed_offset(&tpl, 0), Some(6));
 
         // Partition moves away (another member commits 6..99), then returns.
         tracker.remove(0);
         tracker.track_received(0, 100);
-        tracker.mark_complete(0, 100);
-        let tpl = tracker
-            .drain_committable()
+        tracker.mark_complete(Completion::plain(0, 100));
+        let tpl = drain_tpl(&mut tracker)
             .expect("re-seeded partition must commit without waiting for 6..100");
         assert_eq!(committed_offset(&tpl, 0), Some(101));
     }
@@ -3877,11 +4376,95 @@ mod offset_tracker_tests {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 5);
         tracker.remove(0);
-        tracker.mark_complete(0, 5);
+        tracker.mark_complete(Completion::plain(0, 5));
         assert!(
-            tracker.drain_committable().is_none(),
+            drain_tpl(&mut tracker).is_none(),
             "removed partition must not commit"
         );
+    }
+
+    // -- terminal discard accounting (CAF-35) --
+    //
+    // `messages_discarded_total` promises every increment is a message that
+    // no longer exists. On the concurrent path the offset is committed by
+    // this tracker, so the discard cannot be settled at hand-off — it has to
+    // ride the offset and surface only on the drain whose commit covers it.
+
+    fn terminal(offset: i64) -> Completion {
+        Completion {
+            partition: 0,
+            offset,
+            discard: Some(TerminalDiscard::Retired(metrics::record_terminal(
+                "q",
+                None,
+                metrics::FailReason::Rejected,
+                false,
+            ))),
+        }
+    }
+
+    /// The discard surfaces on the drain that commits past its offset, and
+    /// not before — a gap holding the commit back also holds the accounting.
+    #[test]
+    fn terminal_discard_surfaces_only_once_its_offset_is_committable() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.mark_complete(terminal(1));
+
+        assert!(
+            tracker.drain_committable().is_none(),
+            "offset 0 is still in flight, so nothing commits and nothing is counted"
+        );
+
+        tracker.mark_complete(Completion::plain(0, 0));
+        let (tpl, discards) = tracker
+            .drain_committable()
+            .expect("the gap filled, so 0 and 1 commit together");
+        assert_eq!(committed_offset(&tpl, 0), Some(2));
+        assert_eq!(
+            discards.len(),
+            1,
+            "the discard riding offset 1 is now covered by the commit"
+        );
+        for discard in discards {
+            discard.survived();
+        }
+    }
+
+    /// An Ack-only batch reports no discards, which is what lets the receive
+    /// loop keep committing asynchronously in the common case.
+    #[test]
+    fn a_batch_without_terminal_outcomes_reports_no_discards() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.mark_complete(Completion::plain(0, 0));
+        let (_, discards) = tracker.drain_committable().expect("offset 0 commits");
+        assert!(discards.is_empty());
+    }
+
+    /// A partition revoked before its commit lands takes the pending discard
+    /// with it: whoever owns the partition now will redeliver the message, so
+    /// claiming it was retired would be a lie. Undercounting is the safe
+    /// direction.
+    #[test]
+    fn revoking_a_partition_drops_its_uncommitted_discards() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.track_received(0, 0);
+        tracker.mark_complete(terminal(0));
+        tracker.remove(0);
+        assert!(
+            tracker.drain_committable().is_none(),
+            "a revoked partition neither commits nor counts"
+        );
+    }
+
+    /// A completion arriving for a partition this member no longer tracks is
+    /// likewise never counted.
+    #[test]
+    fn a_completion_for_an_untracked_partition_is_not_counted() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        tracker.mark_complete(terminal(0));
+        assert!(tracker.drain_committable().is_none());
     }
 
     /// A completion below the seed (stale offset from before reassignment)
@@ -3890,14 +4473,14 @@ mod offset_tracker_tests {
     fn mark_complete_below_seed_is_ignored() {
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 10);
-        tracker.mark_complete(0, 5);
+        tracker.mark_complete(Completion::plain(0, 5));
         assert!(
-            tracker.drain_committable().is_none(),
+            drain_tpl(&mut tracker).is_none(),
             "stale completion must not commit"
         );
 
-        tracker.mark_complete(0, 10);
-        let tpl = tracker.drain_committable().expect("seed offset completes");
+        tracker.mark_complete(Completion::plain(0, 10));
+        let tpl = drain_tpl(&mut tracker).expect("seed offset completes");
         assert_eq!(
             committed_offset(&tpl, 0),
             Some(11),
@@ -3913,20 +4496,19 @@ mod offset_tracker_tests {
         let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
-        tracker.mark_complete(0, 0);
-        let tpl = tracker.drain_committable().expect("initial commit");
+        tracker.mark_complete(Completion::plain(0, 0));
+        let tpl = drain_tpl(&mut tracker).expect("initial commit");
         assert_eq!(committed_offset(&tpl, 0), Some(1));
 
         // The async commit of offset 1 was rejected mid-rebalance.
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
         tracker.apply_rebalance_events(&rx, Instant::now());
-        let tpl = tracker
-            .drain_committable()
+        let tpl = drain_tpl(&mut tracker)
             .expect("failed commit must be re-offered without new completions");
         assert_eq!(committed_offset(&tpl, 0), Some(1));
 
         assert!(
-            tracker.drain_committable().is_none(),
+            drain_tpl(&mut tracker).is_none(),
             "retry flag must clear after one re-offer"
         );
     }
@@ -3940,21 +4522,19 @@ mod offset_tracker_tests {
         let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(4, 0);
-        tracker.mark_complete(4, 0);
-        let tpl = tracker.drain_committable().expect("initial commit");
+        tracker.mark_complete(Completion::plain(4, 0));
+        let tpl = drain_tpl(&mut tracker).expect("initial commit");
         assert_eq!(committed_offset(&tpl, 4), Some(1));
 
         // Another member joins: partitions 0-3 move away; the commit of
         // (4, 1) submitted during the rebalance may have been dropped.
         tx.send(RebalanceEvent::Revoke(vec![0, 1, 2, 3])).unwrap();
         tracker.apply_rebalance_events(&rx, Instant::now());
-        let tpl = tracker
-            .drain_committable()
-            .expect("retained partition must re-offer its position");
+        let tpl = drain_tpl(&mut tracker).expect("retained partition must re-offer its position");
         assert_eq!(committed_offset(&tpl, 4), Some(1));
 
         assert!(
-            tracker.drain_committable().is_none(),
+            drain_tpl(&mut tracker).is_none(),
             "re-offer happens once per rebalance event"
         );
     }
@@ -3967,14 +4547,14 @@ mod offset_tracker_tests {
         let (tx, rx) = std_mpsc::channel();
         let mut tracker = OffsetTracker::new("q".to_string());
         tracker.track_received(0, 0);
-        tracker.mark_complete(0, 0);
-        let _ = tracker.drain_committable().expect("initial commit");
+        tracker.mark_complete(Completion::plain(0, 0));
+        let _ = drain_tpl(&mut tracker).expect("initial commit");
 
         tx.send(RebalanceEvent::Revoke(vec![0])).unwrap();
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
         tracker.apply_rebalance_events(&rx, Instant::now());
         assert!(
-            tracker.drain_committable().is_none(),
+            drain_tpl(&mut tracker).is_none(),
             "no retry for a revoked partition"
         );
     }
@@ -3993,10 +4573,10 @@ mod offset_tracker_tests {
         tx.send(RebalanceEvent::Assign(vec![1])).unwrap();
         tracker.apply_rebalance_events(&rx, Instant::now());
 
-        tracker.mark_complete(0, 5);
-        tracker.mark_complete(1, 7);
-        tracker.mark_complete(2, 9);
-        let tpl = tracker.drain_committable().expect("partition 2 commits");
+        tracker.mark_complete(Completion::plain(0, 5));
+        tracker.mark_complete(Completion::plain(1, 7));
+        tracker.mark_complete(Completion::plain(2, 9));
+        let tpl = drain_tpl(&mut tracker).expect("partition 2 commits");
         assert_eq!(committed_offset(&tpl, 0), None, "revoked: removed");
         assert_eq!(committed_offset(&tpl, 1), None, "reassigned: removed");
         assert_eq!(committed_offset(&tpl, 2), Some(10), "untouched partition");
@@ -4050,7 +4630,7 @@ mod offset_tracker_tests {
         // Every re-offer fails again immediately — no gap wide enough to
         // resolve the streak, and no revoke/assign ever arrives.
         let t1 = t0 + Duration::from_secs(30);
-        let _ = tracker.drain_committable();
+        let _ = drain_tpl(&mut tracker);
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
         tracker.apply_rebalance_events(&rx, t1);
 
@@ -4076,8 +4656,8 @@ mod offset_tracker_tests {
 
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
         tracker.apply_rebalance_events(&rx, t0);
-        let _ = tracker.drain_committable(); // re-offers the failed commit
-        let _ = tracker.drain_committable(); // 1st quiet drain: not yet resolved
+        let _ = drain_tpl(&mut tracker); // re-offers the failed commit
+        let _ = drain_tpl(&mut tracker); // 1st quiet drain: not yet resolved
 
         assert_eq!(
             tracker.fenced(t0 + Duration::from_secs(61), Duration::from_secs(60)),
@@ -4105,11 +4685,11 @@ mod offset_tracker_tests {
 
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
         tracker.apply_rebalance_events(&rx, t0);
-        let _ = tracker.drain_committable(); // re-offers; this one succeeds
+        let _ = drain_tpl(&mut tracker); // re-offers; this one succeeds
 
         // Two consecutive quiet drains: the re-offer must have landed.
         for _ in 0..QUIET_DRAINS_TO_RESOLVE {
-            let _ = tracker.drain_committable();
+            let _ = drain_tpl(&mut tracker);
         }
 
         assert_eq!(
@@ -4137,9 +4717,9 @@ mod offset_tracker_tests {
 
         tx.send(RebalanceEvent::CommitFailed(vec![0])).unwrap();
         tracker.apply_rebalance_events(&rx, t0);
-        let _ = tracker.drain_committable();
+        let _ = drain_tpl(&mut tracker);
         for _ in 0..QUIET_DRAINS_TO_RESOLVE {
-            let _ = tracker.drain_committable();
+            let _ = drain_tpl(&mut tracker);
         }
 
         // An unrelated rejection an hour later.
@@ -4449,6 +5029,71 @@ mod batch_buffer_tests {
     }
 }
 
+/// [`reject_settlement`]: the terminal-discard decision for a rejected
+/// message.
+///
+/// `messages_discarded_total` promises every increment is a message that no
+/// longer exists, so getting this matrix wrong is either a false data-loss
+/// alert or the silent loss this PR exists to surface. Both the single-message
+/// `route_outcome` and the batch `flush_batch` reject arm route through it, so
+/// the two paths cannot drift the way earlier cross-backend fixes did.
+#[cfg(test)]
+mod reject_settlement_tests {
+    use super::*;
+
+    /// With no DLQ there is nothing to publish to, so a reject drops the
+    /// message. This is the bare-topology shape from CAF-35: the discard has to
+    /// be counted, which is precisely what the batch path used to skip.
+    #[test]
+    fn no_dlq_is_always_a_plain_discard() {
+        assert_eq!(
+            reject_settlement(false, false),
+            RejectSettlement::Retired,
+            "no DLQ declared: the message is dropped and must be counted"
+        );
+    }
+
+    /// `reached_dlq` is meaningless without a DLQ — there was no publish. A
+    /// caller that passes `true` anyway (a batch with no `raw` bytes buffered,
+    /// say) must still get a countable discard rather than a silent `InDlq`.
+    #[test]
+    fn no_dlq_ignores_the_publish_flag() {
+        assert_eq!(reject_settlement(false, true), RejectSettlement::Retired);
+    }
+
+    /// The message exists in the DLQ, so no discard is owed however the commit
+    /// resolves. Counting here would be a false data-loss alert on the
+    /// perfectly ordinary dead-letter path.
+    #[test]
+    fn a_landed_dlq_publish_owes_no_discard() {
+        assert_eq!(reject_settlement(true, true), RejectSettlement::InDlq);
+    }
+
+    /// The case `has_dlq` alone gets wrong: a DLQ was declared, the publish
+    /// failed, and the offsets commit anyway. Nothing holds a copy, so this is
+    /// data loss even though the topology says otherwise — it must settle with
+    /// `confirm_lost`, which counts regardless of `has_dlq`.
+    #[test]
+    fn a_failed_dlq_publish_is_loss_despite_the_topology() {
+        assert_eq!(reject_settlement(true, false), RejectSettlement::Lost);
+    }
+
+    /// Only `InDlq` may skip the commit round trip. The other two are claims
+    /// that a message is gone, and nothing has retired it until the offsets
+    /// actually advance — settling them early is the false-alert-during-an-
+    /// outage failure `PendingDiscard` was introduced to prevent.
+    #[test]
+    fn everything_but_in_dlq_waits_for_the_commit() {
+        for (has_dlq, reached_dlq) in [(false, false), (false, true), (true, false)] {
+            assert_ne!(
+                reject_settlement(has_dlq, reached_dlq),
+                RejectSettlement::InDlq,
+                "has_dlq={has_dlq} reached_dlq={reached_dlq} must wait for the commit"
+            );
+        }
+    }
+}
+
 /// [`invoke_batch_handler`]: a batch flush must not be able to take the
 /// consumer task down with it, and must not be able to hang it forever.
 #[cfg(test)]
@@ -4461,8 +5106,9 @@ mod batch_handler_isolation_tests {
     #[tokio::test]
     async fn a_panicking_batch_becomes_retry() {
         let outcome = invoke_batch_handler(
-            async { panic!("flush blew up") },
+            || async { panic!("flush blew up") },
             Some(Duration::from_secs(5)),
+            None,
             "topic",
             None,
             3,
@@ -4478,11 +5124,12 @@ mod batch_handler_isolation_tests {
     #[tokio::test(start_paused = true)]
     async fn a_hung_batch_times_out_into_retry() {
         let outcome = invoke_batch_handler(
-            async {
+            || async {
                 tokio::time::sleep(Duration::from_secs(600)).await;
                 Outcome::Ack
             },
             Some(Duration::from_secs(30)),
+            None,
             "topic",
             None,
             3,
@@ -4497,8 +5144,65 @@ mod batch_handler_isolation_tests {
     /// request to let a panic kill the consumer.
     #[tokio::test]
     async fn panics_are_caught_with_no_timeout_configured() {
-        let outcome =
-            invoke_batch_handler(async { panic!("flush blew up") }, None, "topic", None, 1).await;
+        let outcome = invoke_batch_handler(
+            || async { panic!("flush blew up") },
+            None,
+            None,
+            "topic",
+            None,
+            1,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    /// `BatchMessageHandler::handle_batch` is an ordinary `fn -> impl Future`,
+    /// so an implementation may panic while *building* its future — validating
+    /// an argument, indexing a config map — before returning anything to await.
+    ///
+    /// That panic used to escape containment: the call was evaluated at the
+    /// `flush_batch` call site, outside the `catch_unwind`, so it unwound the
+    /// batch task and killed `run_batch` instead of becoming a redelivery. The
+    /// closure is what moves construction inside the guard, and this test is
+    /// what stops the ready-made-future form coming back — with a plain
+    /// `Future` parameter it does not even compile.
+    #[tokio::test]
+    async fn a_panic_while_building_the_future_is_contained() {
+        fn build_future() -> impl std::future::Future<Output = Outcome> {
+            panic!("handle_batch blew up before returning a future");
+            #[allow(unreachable_code)]
+            async {
+                unreachable!()
+            }
+        }
+
+        let outcome = invoke_batch_handler(
+            build_future,
+            Some(Duration::from_secs(5)),
+            None,
+            "topic",
+            None,
+            3,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Retry));
+    }
+
+    /// The same, with the deadline disabled — the no-timeout arm has its own
+    /// `catch_unwind` and has to construct inside it too.
+    #[tokio::test]
+    async fn a_panic_while_building_the_future_is_contained_with_no_timeout() {
+        fn build_future() -> impl std::future::Future<Output = Outcome> {
+            panic!("handle_batch blew up before returning a future");
+            #[allow(unreachable_code)]
+            async {
+                unreachable!()
+            }
+        }
+
+        let outcome = invoke_batch_handler(build_future, None, None, "topic", None, 1).await;
 
         assert!(matches!(outcome, Outcome::Retry));
     }
@@ -4506,8 +5210,9 @@ mod batch_handler_isolation_tests {
     #[tokio::test]
     async fn a_normal_outcome_passes_through_untouched() {
         let ack = invoke_batch_handler(
-            async { Outcome::Ack },
+            || async { Outcome::Ack },
             Some(Duration::from_secs(5)),
+            None,
             "topic",
             None,
             2,
@@ -4516,14 +5221,37 @@ mod batch_handler_isolation_tests {
         assert!(matches!(ack, Outcome::Ack));
 
         let reject = invoke_batch_handler(
-            async { Outcome::Reject },
+            || async { Outcome::Reject },
             Some(Duration::from_secs(5)),
+            None,
             "topic",
             None,
             2,
         )
         .await;
         assert!(matches!(reject, Outcome::Reject));
+    }
+
+    /// The batch path has its own timeout arm, so it needs its own proof that
+    /// `handler_timeout_outcome` reaches it. Without this the setter would be
+    /// silently inert for `run_batch` — and a slow flush would keep burning the
+    /// retry budget of every message in the batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_batch_honours_the_configured_timeout_outcome() {
+        let outcome = invoke_batch_handler(
+            || async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                Outcome::Ack
+            },
+            Some(Duration::from_secs(30)),
+            Some(Outcome::Defer),
+            "topic",
+            None,
+            3,
+        )
+        .await;
+
+        assert!(matches!(outcome, Outcome::Defer));
     }
 }
 
@@ -4668,6 +5396,19 @@ mod batch_consumer_options_tests {
     fn without_handler_timeout_clears_it() {
         let opts = BatchConsumerOptions::new().without_handler_timeout();
         assert_eq!(opts.handler_timeout, None);
+    }
+
+    /// `None` by default so an existing batch sink keeps resolving a timeout to
+    /// `Retry`; opting in is what changes the behaviour.
+    #[test]
+    fn handler_timeout_outcome_is_opt_in() {
+        assert!(
+            BatchConsumerOptions::default()
+                .handler_timeout_outcome
+                .is_none()
+        );
+        let opts = BatchConsumerOptions::new().with_handler_timeout_outcome(Outcome::Defer);
+        assert!(matches!(opts.handler_timeout_outcome, Some(Outcome::Defer)));
     }
 
     #[test]

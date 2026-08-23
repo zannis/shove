@@ -19,11 +19,12 @@ use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
+use crate::routing::{drain_timeout_outcome, handler_timeout_outcome, shutdown_drain_timeout};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
-use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
 
 /// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
@@ -213,6 +214,7 @@ where
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -231,9 +233,10 @@ where
             }
             Err(_) => {
                 join.abort();
-                warn!("handler exceeded timeout ({duration:?}), retrying message");
+                let resolved = handler_timeout_outcome(timeout_outcome);
+                warn!(outcome = ?resolved, "handler exceeded timeout ({duration:?})");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                Outcome::Retry
+                resolved
             }
         },
         None => match join.await {
@@ -259,6 +262,7 @@ fn spawn_handler<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     notify: &Arc<Notify>,
     topic: Arc<str>,
     group: Option<Arc<str>>,
@@ -275,6 +279,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -460,7 +465,14 @@ where
                     router::route_requeue(sqs, queue_url, rh).await;
                 }
             }
-            let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
+            // When a `handler_timeout` is set the handler is already bounded by
+            // it and resolves its own timeout; this wait is only a backstop so
+            // shutdown cannot hang on a channel that never delivers. Hence the
+            // grace, and hence resolving to the *configured* timeout outcome
+            // rather than assuming Retry. With deadlines disabled the handler is
+            // still running when this fires, so `drain_timeout_outcome` keeps
+            // the backstop at Retry — see its docs.
+            let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
             // Collect Acks into a batch; non-Ack outcomes still need
             // per-message routing (Retry/Reject/Defer touch distinct queues).
             let mut drain_acks: Vec<String> = Vec::with_capacity(in_flight.len());
@@ -468,12 +480,19 @@ where
                 let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
                     .await
                     .unwrap_or_else(|_| {
+                        let resolved = drain_timeout_outcome(
+                            options.handler_timeout,
+                            options.handler_timeout_outcome.clone(),
+                        );
                         warn!(
                             queue_url,
-                            "handler timed out during shutdown drain, retrying"
+                            outcome = ?resolved,
+                            "handler outcome did not arrive within the shutdown drain"
                         );
-                        Ok(Outcome::Retry)
+                        Ok(resolved)
                     })
+                    // A closed channel means the handler task panicked or was
+                    // aborted: no outcome exists, so redeliver.
                     .unwrap_or(Outcome::Retry);
                 if matches!(outcome, Outcome::Ack) {
                     drain_acks.push(pending.receipt_handle);
@@ -522,12 +541,15 @@ where
                     max_retries = options.max_retries,
                     "message exceeded max retries, rejecting"
                 );
-                metrics::record_failed(
-                    &topic,
+                router::route_reject(
+                    sqs,
+                    queue_url,
+                    &receipt_handle,
+                    topology,
                     group.as_deref(),
                     metrics::FailReason::MaxRetriesExceeded,
-                );
-                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                )
+                .await;
                 continue;
             }
 
@@ -538,8 +560,15 @@ where
             // Reject oversized messages before deserialization
             if let Err(e) = options.validate_payload_message_size(body.len()) {
                 warn!(error = %e, queue_url, "rejecting oversized message");
-                metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
-                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                router::route_reject(
+                    sqs,
+                    queue_url,
+                    &receipt_handle,
+                    topology,
+                    group.as_deref(),
+                    metrics::FailReason::Oversize,
+                )
+                .await;
                 continue;
             }
 
@@ -549,12 +578,15 @@ where
                 Ok(m) => m,
                 Err(err) => {
                     error!(error = %err, queue_url, "failed to deserialize SQS message, rejecting");
-                    metrics::record_failed(
-                        &topic,
+                    router::route_reject(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        topology,
                         group.as_deref(),
                         metrics::FailReason::Deserialize,
-                    );
-                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -572,6 +604,7 @@ where
                 message,
                 metadata,
                 options.handler_timeout,
+                options.handler_timeout_outcome.clone(),
                 &notify,
                 Arc::clone(&topic),
                 group.clone(),
@@ -701,8 +734,15 @@ async fn route_outcome(
             .await;
         }
         Outcome::Reject => {
-            metrics::record_failed(topology.queue(), group, metrics::FailReason::Rejected);
-            router::route_reject(sqs, queue_url, receipt_handle, topology).await
+            router::route_reject(
+                sqs,
+                queue_url,
+                receipt_handle,
+                topology,
+                group,
+                metrics::FailReason::Rejected,
+            )
+            .await
         }
         Outcome::Defer => {
             let body = msg.body().unwrap_or_default();
@@ -758,6 +798,7 @@ fn spawn_handler_keyed<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key: String,
     topic: Arc<str>,
@@ -775,6 +816,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -971,8 +1013,15 @@ where
                         );
                         poisoned_keys.insert(key.clone());
                     }
-                    metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Rejected);
-                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                    router::route_reject(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        topology,
+                        group.as_deref(),
+                        metrics::FailReason::Rejected,
+                    )
+                    .await;
                     in_flight_count -= 1;
                     drain_pending_for_key::<T, H>(
                         sqs,
@@ -1039,10 +1088,28 @@ where
                     "shutdown signal, draining {} in-flight messages on {queue_url}",
                     in_flight_count
                 );
-                // Wait for all in-flight handlers to complete.
+                // Wait for all in-flight handlers to complete. Same backstop as
+                // the standard consumer's drain: the handler is already bounded
+                // by `handler_timeout` and resolves its own timeout, so this
+                // only stops shutdown hanging on a channel that never delivers.
+                // With deadlines disabled the handler is still running when it
+                // fires, so `drain_timeout_outcome` keeps it at Retry.
+                let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
                 for (key, state) in key_states.drain() {
                     if let KeyState::InFlight { receipt_handle, msg: _, retry_count, outcome_rx } = state {
-                        let outcome = outcome_rx.await.unwrap_or(Outcome::Retry);
+                        let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
+                            .await
+                            .unwrap_or_else(|_| {
+                                let resolved = drain_timeout_outcome(
+                                    options.handler_timeout,
+                                    options.handler_timeout_outcome.clone(),
+                                );
+                                warn!(queue_url, sequence_key = %key, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
+                                Ok(resolved)
+                            })
+                            // A closed channel means the handler task panicked
+                            // or was aborted: no outcome exists, so redeliver.
+                            .unwrap_or(Outcome::Retry);
                         debug!(
                             queue_url,
                             sequence_key = %key,
@@ -1054,12 +1121,15 @@ where
                                 router::route_ack(sqs, queue_url, &receipt_handle).await;
                             }
                             Outcome::Reject => {
-                                metrics::record_failed(
-                                    &topic,
+                                router::route_reject(
+                                    sqs,
+                                    queue_url,
+                                    &receipt_handle,
+                                    topology,
                                     group.as_deref(),
                                     metrics::FailReason::Rejected,
-                                );
-                                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                                )
+                                .await;
                             }
                             Outcome::Retry => {
                                 router::route_retry_fifo(
@@ -1089,10 +1159,9 @@ where
                         }
                     }
                 }
-                // Pending deliveries were received but never handed to a
-                // handler. Release them (visibility 0) so another consumer can
-                // pick them up — this is not a rejection, so it must not go
-                // through the DLQ-semantics path.
+                // Pending deliveries: change visibility to 0 so they are redelivered.
+                // These were buffered but never dispatched, so this is a requeue,
+                // not a rejection — matching the standard and concurrent loops.
                 for (_key, msgs) in pending_deliveries.drain() {
                     for msg in msgs {
                         let rh = msg.receipt_handle().unwrap_or_default();
@@ -1163,12 +1232,15 @@ where
                                 queue_url,
                                 "message missing MessageGroupId, rejecting"
                             );
-                            metrics::record_failed(
-                                &topic,
+                            router::route_reject(
+                                sqs,
+                                queue_url,
+                                &receipt_handle,
+                                topology,
                                 group.as_deref(),
                                 metrics::FailReason::Malformed,
-                            );
-                            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -1183,7 +1255,8 @@ where
                             "message with poisoned sequence key, rejecting"
                         );
                         // Cascade: intentionally not counted — see `metrics::FailReason`.
-                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                        router::route_reject_cascade(sqs, queue_url, &receipt_handle, topology)
+                            .await;
                         continue;
                     }
 
@@ -1207,16 +1280,20 @@ where
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
                                     let rh = pd.receipt_handle().unwrap_or_default();
-                                    router::route_reject(sqs, queue_url, rh, topology).await;
+                                    router::route_reject_cascade(sqs, queue_url, rh, topology)
+                                        .await;
                                 }
                             }
                         }
-                        metrics::record_failed(
-                            &topic,
+                        router::route_reject(
+                            sqs,
+                            queue_url,
+                            &receipt_handle,
+                            topology,
                             group.as_deref(),
                             metrics::FailReason::MaxRetriesExceeded,
-                        );
-                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                        )
+                        .await;
                         continue;
                     }
 
@@ -1235,12 +1312,15 @@ where
                                         limit,
                                         "per-key pending buffer full, rejecting"
                                     );
-                                    metrics::record_failed(
-                                        &topic,
+                                    router::route_reject(
+                                        sqs,
+                                        queue_url,
+                                        &receipt_handle,
+                                        topology,
                                         group.as_deref(),
                                         metrics::FailReason::PendingFull,
-                                    );
-                                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                                    )
+                                    .await;
                                     continue;
                                 }
                             }
@@ -1279,12 +1359,15 @@ where
                                             limit,
                                             "per-key pending buffer full, rejecting"
                                         );
-                                        metrics::record_failed(
-                                            &topic,
+                                        router::route_reject(
+                                            sqs,
+                                            queue_url,
+                                            &receipt_handle,
+                                            topology,
                                             group.as_deref(),
                                             metrics::FailReason::PendingFull,
-                                        );
-                                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                                        )
+                                        .await;
                                         continue;
                                     }
                                 }
@@ -1316,15 +1399,18 @@ where
                             sequence_key = %seq_key,
                             "rejecting oversized message"
                         );
-                        metrics::record_failed(
-                            &topic,
-                            group.as_deref(),
-                            metrics::FailReason::Oversize,
-                        );
                         if on_failure == SequenceFailure::FailAll {
                             poisoned_keys.insert(seq_key.clone());
                         }
-                        router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                        router::route_reject(
+                            sqs,
+                            queue_url,
+                            &receipt_handle,
+                            topology,
+                            group.as_deref(),
+                            metrics::FailReason::Oversize,
+                        )
+                        .await;
                         continue;
                     }
 
@@ -1339,15 +1425,18 @@ where
                                 sequence_key = %seq_key,
                                 "failed to deserialize SQS message, rejecting"
                             );
-                            metrics::record_failed(
-                                &topic,
-                                group.as_deref(),
-                                metrics::FailReason::Deserialize,
-                            );
                             if on_failure == SequenceFailure::FailAll {
                                 poisoned_keys.insert(seq_key.clone());
                             }
-                            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+                            router::route_reject(
+                                sqs,
+                                queue_url,
+                                &receipt_handle,
+                                topology,
+                                group.as_deref(),
+                                metrics::FailReason::Deserialize,
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -1366,6 +1455,7 @@ where
                         message,
                         metadata,
                         options.handler_timeout,
+                        options.handler_timeout_outcome.clone(),
                         &completed_tx,
                         seq_key.clone(),
                         Arc::clone(&topic),
@@ -1418,7 +1508,7 @@ async fn drain_pending_for_key<T, H>(
         if let Some(pending) = pending_deliveries.remove(key) {
             for pd in pending {
                 let rh = pd.receipt_handle().unwrap_or_default();
-                router::route_reject(sqs, queue_url, rh, topology).await;
+                router::route_reject_cascade(sqs, queue_url, rh, topology).await;
             }
         }
         return;
@@ -1441,24 +1531,35 @@ async fn drain_pending_for_key<T, H>(
                 retry_count,
                 "buffered message exceeded max retries, rejecting"
             );
-            metrics::record_failed(
-                topic,
-                group.as_deref(),
-                metrics::FailReason::MaxRetriesExceeded,
-            );
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
-                router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                 // Reject remaining pending for this key too.
+                router::route_reject(
+                    sqs,
+                    queue_url,
+                    &receipt_handle,
+                    topology,
+                    group.as_deref(),
+                    metrics::FailReason::MaxRetriesExceeded,
+                )
+                .await;
                 // Cascade: intentionally not counted — see `metrics::FailReason`.
                 while let Some(pd) = pending.pop_front() {
                     let rh = pd.receipt_handle().unwrap_or_default();
-                    router::route_reject(sqs, queue_url, rh, topology).await;
+                    router::route_reject_cascade(sqs, queue_url, rh, topology).await;
                 }
                 pending_deliveries.remove(key);
                 return;
             }
-            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
+            router::route_reject(
+                sqs,
+                queue_url,
+                &receipt_handle,
+                topology,
+                group.as_deref(),
+                metrics::FailReason::MaxRetriesExceeded,
+            )
+            .await;
             continue;
         }
 
@@ -1474,18 +1575,31 @@ async fn drain_pending_for_key<T, H>(
                 sequence_key = %key,
                 "rejecting oversized buffered message"
             );
-            metrics::record_failed(topic, group.as_deref(), metrics::FailReason::Oversize);
-            // Cascade: intentionally not counted — see `metrics::FailReason`.
+            // The offending delivery is rejected first, on both branches. The
+            // FailAll branch used to drain only the *rest* of the buffer and
+            // return, leaving this message invisible until its visibility
+            // timeout lapsed — at which point it redelivered, was still
+            // oversized, and looped. The max-retries branch above always got
+            // this right; this now matches it.
+            router::route_reject(
+                sqs,
+                queue_url,
+                &receipt_handle,
+                topology,
+                group.as_deref(),
+                metrics::FailReason::Oversize,
+            )
+            .await;
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
+                // Cascade: intentionally not counted — see `metrics::FailReason`.
                 while let Some(pd) = pending.pop_front() {
                     let rh = pd.receipt_handle().unwrap_or_default();
-                    router::route_reject(sqs, queue_url, rh, topology).await;
+                    router::route_reject_cascade(sqs, queue_url, rh, topology).await;
                 }
                 pending_deliveries.remove(key);
                 return;
             }
-            router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
             continue;
         }
 
@@ -1499,22 +1613,27 @@ async fn drain_pending_for_key<T, H>(
                         sequence_key = %key,
                         "failed to deserialize buffered SQS message, rejecting"
                     );
-                    metrics::record_failed(
-                        topic,
+                    // Rejected first on both branches — see the note on the
+                    // oversize check above.
+                    router::route_reject(
+                        sqs,
+                        queue_url,
+                        &receipt_handle,
+                        topology,
                         group.as_deref(),
                         metrics::FailReason::Deserialize,
-                    );
-                    // Cascade: intentionally not counted — see `metrics::FailReason`.
+                    )
+                    .await;
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
+                        // Cascade: intentionally not counted — see `metrics::FailReason`.
                         while let Some(pd) = pending.pop_front() {
                             let rh = pd.receipt_handle().unwrap_or_default();
-                            router::route_reject(sqs, queue_url, rh, topology).await;
+                            router::route_reject_cascade(sqs, queue_url, rh, topology).await;
                         }
                         pending_deliveries.remove(key);
                         return;
                     }
-                    router::route_reject(sqs, queue_url, &receipt_handle, topology).await;
                     continue;
                 }
             };
@@ -1527,6 +1646,7 @@ async fn drain_pending_for_key<T, H>(
             message,
             metadata,
             options.handler_timeout,
+            options.handler_timeout_outcome.clone(),
             completed_tx,
             key.to_string(),
             Arc::clone(topic),

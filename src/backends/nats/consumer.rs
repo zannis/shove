@@ -26,7 +26,9 @@ use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
+use crate::routing::{
+    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
+};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Nats, ShoveError};
@@ -360,15 +362,42 @@ async fn route_outcome(
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_failed(topology.queue(), group, fail_reason);
+            let pending = metrics::record_terminal(
+                topology.queue(),
+                group,
+                fail_reason,
+                topology.dlq().is_some(),
+            );
             match publish_to_dlq(client, topology, msg, reason).await {
                 Ok(()) => {
-                    if let Err(e) = msg.ack().await {
-                        tracing::error!(error = %e, "failed to ack after DLQ publish");
+                    // The ack is what retires the message; until it lands
+                    // JetStream still owns the delivery and will redeliver on
+                    // ack-wait expiry, so a failed ack is not a discard.
+                    //
+                    // `double_ack` rather than `ack` because this is the arm
+                    // that decides whether a discard actually happened. `ack`
+                    // only publishes `+ACK` to the client connection and
+                    // returns as soon as it is written; a connection lost
+                    // before JetStream applies it redelivers the message while
+                    // `confirm` has already counted it gone. `double_ack`
+                    // waits for the server's reply, so `Ok` means the stream
+                    // really did retire the delivery. The extra round trip is
+                    // paid only on terminal outcomes (rejected or retries
+                    // exhausted), not on the happy path above.
+                    match msg.double_ack().await {
+                        Ok(()) => pending.confirm(),
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to ack after DLQ publish");
+                            pending.survived();
+                        }
                     }
                     return;
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    // Not acked, so JetStream redelivers.
+                    pending.survived();
+                    Err(e)
+                }
             }
         }
         RetryDecision::Hold { increment: true } => {
@@ -424,6 +453,7 @@ async fn route_outcome(
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -442,9 +472,10 @@ where
             }
             Err(_) => {
                 join.abort();
-                tracing::warn!("handler timed out after {duration:?}, retrying");
+                let resolved = handler_timeout_outcome(timeout_outcome);
+                tracing::warn!(outcome = ?resolved, "handler timed out after {duration:?}");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                Outcome::Retry
+                resolved
             }
         },
         None => match join.await {
@@ -599,6 +630,7 @@ impl NatsConsumer {
         let max_retries = options.max_retries;
         let prefetch_count = options.prefetch_count;
         let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let hold_queues = topology.hold_queues();
 
         let max_message_size = options.max_message_size;
@@ -632,6 +664,7 @@ impl NatsConsumer {
             let semaphore = semaphore.clone();
             let topic = topic.clone();
             let group = group.clone();
+            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
             async move {
                 let stream = client
                     .jetstream()
@@ -811,6 +844,7 @@ impl NatsConsumer {
                             let task_topic = topic.clone();
                             let task_group = group.clone();
                             let task_shutdown = shutdown.clone();
+                            let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
 
                             tokio::spawn(async move {
                                 task_processing.store(true, Ordering::Release);
@@ -820,6 +854,7 @@ impl NatsConsumer {
                                         task_handler.handle(payload, metadata, task_ctx.as_ref()).await
                                     },
                                     handler_timeout,
+                                    task_timeout_outcome,
                                     &task_topic,
                                     task_group.as_deref(),
                                 )
@@ -971,6 +1006,7 @@ impl NatsConsumer {
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
         let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
         let hold_queues = topology.hold_queues();
         let topic: Arc<str> = Arc::from(queue);
@@ -1003,6 +1039,7 @@ impl NatsConsumer {
             let shard_processing = processing.clone();
             let shard_topic = topic.clone();
             let shard_group = group.clone();
+            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
             // One poison set per shard task, created outside the reconnect
             // wrapper so a broker blip cannot un-poison a failed key. A
             // sequence key always hashes to the same shard, so per-shard
@@ -1020,6 +1057,7 @@ impl NatsConsumer {
                     let shard_group = shard_group.clone();
                     let consumer_name = consumer_name.clone();
                     let filter_subject = filter_subject.clone();
+                    let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
                     let shard_poisoned = shard_poisoned.clone();
                     async move {
                         let stream = shard_client
@@ -1106,7 +1144,19 @@ impl NatsConsumer {
                                             sequence_key = %seq_key,
                                             "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                                         );
-                                        // Cascade: intentionally not counted — see `metrics::FailReason`.
+                                        // Collateral of an already-counted
+                                        // failure, so the failure half is
+                                        // deliberately not counted again — see
+                                        // `metrics::FailReason`. The discard
+                                        // half still applies: a cascaded
+                                        // message dropped with no DLQ is just
+                                        // as gone as any other.
+                                        let pending = metrics::pending_discard(
+                                            &shard_topic,
+                                            shard_group.as_deref(),
+                                            metrics::FailReason::Rejected,
+                                            topology.dlq().is_some(),
+                                        );
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &shard_client,
                                             topology,
@@ -1118,9 +1168,44 @@ impl NatsConsumer {
                                                 "failed to publish poisoned-key message to DLQ, nak-ing"
                                             );
                                             let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                            // Nak-ed, so JetStream redelivers.
+                                            pending.survived();
                                             continue;
                                         }
-                                        let _ = msg.ack().await;
+                                        if topology.dlq().is_some() {
+                                            // The message is in the DLQ, so it
+                                            // exists whatever the ack does and
+                                            // `confirm` could never count it.
+                                            // Settling now keeps the
+                                            // dead-lettered cascade off the
+                                            // `double_ack` round trip the live
+                                            // pending record below needs — and
+                                            // a poisoned key drains its whole
+                                            // backlog through this branch, so
+                                            // that tax is per message.
+                                            pending.survived();
+                                            let _ = msg.ack().await;
+                                            continue;
+                                        }
+                                        // No DLQ, so this ack is what drops the
+                                        // message and it decides the discard
+                                        // accounting. `double_ack` rather than
+                                        // `ack`: `ack` returns as soon as
+                                        // `+ACK` is written to the connection,
+                                        // so a connection lost before JetStream
+                                        // applies it would redeliver a message
+                                        // already counted gone. Same reasoning
+                                        // as `route_outcome`'s Dlq arm.
+                                        match msg.double_ack().await {
+                                            Ok(()) => pending.confirm(),
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    "failed to ack poisoned-key message after DLQ publish"
+                                                );
+                                                pending.survived();
+                                            }
+                                        }
                                         continue;
                                     }
 
@@ -1198,10 +1283,12 @@ impl NatsConsumer {
                                         let c = shard_ctx.clone();
                                         let spawn_topic = shard_topic.clone();
                                         let spawn_group = shard_group.clone();
+                                        let spawn_timeout_outcome = handler_timeout_outcome_cfg.clone();
                                         tokio::spawn(async move {
                                             let o = invoke_handler(
                                                 async move { h.handle(payload, metadata, c.as_ref()).await },
                                                 handler_timeout,
+                                                spawn_timeout_outcome,
                                                 &spawn_topic,
                                                 spawn_group.as_deref(),
                                             ).await;

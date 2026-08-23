@@ -93,7 +93,10 @@ kafka-schema-registry = [
 inmemory = ["dep:dashmap"]
 
 # Redis Streams pubsub
-redis-streams = ["dep:redis"]
+# futures-util: `FutureExt::catch_unwind`, to resolve a panicking handler to
+# `Outcome::Retry` (see `backends::redis::lease::catch_handler_panic`). The
+# `redis` crate already pulls it in, so this only wires up the feature edge.
+redis-streams = ["dep:redis", "dep:futures-util"]
 
 # Emit operational metrics via the `metrics` facade. Consumer services
 # install their own recorder (e.g. `metrics-exporter-prometheus`) and

@@ -65,7 +65,7 @@ If no hold queues are configured on the topic, `Defer` falls back to broker nack
 
 Two failure modes bypass the handler entirely:
 
-**Handler timeout.** Configured via `ConsumerOptions::with_handler_timeout`. If the handler future does not complete within the timeout, the consumer aborts it and treats the result as `Outcome::Retry`. The message will be retried according to normal retry math.
+**Handler timeout.** Configured via `ConsumerOptions::with_handler_timeout`. If the handler future does not complete within the timeout, the consumer aborts it and by default treats the result as `Outcome::Retry`, so the message is retried according to normal retry math. Which outcome a timeout resolves to is configurable via `with_handler_timeout_outcome` — see [Choosing what a timeout means](/concepts/handlers#choosing-what-a-timeout-means). Note that a timeout resolved to `Defer` is subject to the sequenced-consumer restriction above.
 
 **Deserialization failure.** A message whose bytes cannot be deserialized into `T::Message` is permanently broken — no amount of retrying will fix a corrupt payload. The consumer treats it as `Outcome::Reject` without invoking the handler at all. The message goes to the DLQ (or is discarded with a warning) and is never retried. This is by design: poison-pill messages should not burn through the retry budget indefinitely.
 

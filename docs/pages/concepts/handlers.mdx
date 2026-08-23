@@ -81,7 +81,9 @@ group.register::<Orders, _>(cfg, || Handler).await?;
 
 ## Handler timeouts
 
-Every handler call runs under a wall-clock deadline. If it does not return within the timeout, the future is dropped, `Outcome::Retry` is recorded, and `metrics::record_failed(..., FailReason::Timeout)` is emitted. The default is 30 seconds.
+Every handler call runs under a wall-clock deadline. If it does not return within the timeout, the future is dropped, `Outcome::Retry` is recorded by default, and `metrics::record_failed(..., FailReason::Timeout)` is emitted. The default is 30 seconds.
+
+The outcome a timeout resolves to is configurable — see [Choosing what a timeout means](#choosing-what-a-timeout-means) below.
 
 Three layers control the timeout, in priority order — the first one set wins:
 
@@ -108,6 +110,52 @@ group
 Per-supervisor consumers (`ConsumerSupervisor::register`) use `ConsumerOptions::<Backend>::new().with_handler_timeout(Duration)` instead — the same three-layer resolution applies, with the supervisor's registry default sitting between per-consumer overrides and the library default.
 
 The timeout enforces deadlines on the handler future itself. It does not cancel work that has escaped into a `spawn`ed task or a long-running blocking call; if you need to bound those, you must wire the cancellation yourself. The default is generous because the library cannot tell whether your handler is doing IO or compute — set a shorter one when you know the work is bounded.
+
+## Choosing what a timeout means
+
+A timeout is the library's verdict on a **slow consumer**, not evidence that the message itself is bad — but from the outside the two are indistinguishable, so the choice belongs to you. `with_handler_timeout_outcome` sets it, on `ConsumerOptions` or on a `<Backend>ConsumerGroupConfig`:
+
+```rust,no_run
+group
+    .register::<Orders, _>(
+        ConsumerGroupConfig::new(
+            KafkaConsumerGroupConfig::new(1..=4)
+                .with_handler_timeout(Duration::from_secs(60))
+                .with_handler_timeout_outcome(Outcome::Defer),
+        ),
+        || OrderHandler,
+    )
+    .await?;
+```
+
+| Outcome | What a timeout then does |
+|---|---|
+| `Retry` | **Default.** Redelivers and consumes retry budget, so a persistently slow handler eventually dead-letters — or, with no DLQ declared, is discarded once `max_retries` is exhausted. |
+| `Defer` | Redelivers via `hold_queues[0]` **without** consuming retry budget, so a slow handler never dead-letters a valid message. |
+| `Reject` | Treats the timeout as terminal: dead-letters on the first occurrence, consuming no retry budget. |
+| `Ack` | Drops the message. The handler is cancelled mid-flight, so any work it had not yet committed is lost. |
+
+Leaving it unset preserves the existing behaviour on every backend.
+
+**Pick `Defer` when a timeout means "too slow right now", not "poisoned".** That is the case a service hits when its handler stalls on a downstream dependency: under `Retry` the stall burns the whole retry budget and the message is dead-lettered — or discarded, if the topology declares no DLQ — even though nothing was ever wrong with it. `Defer` is the outcome that survives a slow dependency without losing valid data.
+
+That discard is no longer silent: it increments `shove_messages_discarded_total`, which is worth alerting on whichever outcome you pick here. See [Alerting on silent discards](/guides/observability#alerting-on-silent-discards).
+
+Three caveats before you reach for it, all inherited from [`Outcome::Defer`](/concepts/outcomes) itself:
+
+- **Nothing bounds the redeliveries.** `Defer` has no circuit breaker, so a handler that times out forever is redelivered forever. Pair it with your own attempt ceiling — or with monitoring on `FailReason::Timeout` — if the work can genuinely never succeed.
+- **On sequenced consumers, `Defer` is not uniform across backends.** Kafka, NATS, SNS/SQS and the in-memory backend refuse it — deferral would violate the ordering guarantee, so it is downgraded to `Retry` with a warning and the override does not spare the retry budget. RabbitMQ's sharded consumer and Redis Streams instead route it to a hold queue without incrementing the retry count, so it can defer indefinitely. Check which half your backend falls in before choosing `Defer` for an ordered topic.
+- **With no hold queues configured**, `Defer` falls back to requeue-without-delay, which turns a slow handler into a hot redelivery loop. Declare at least one hold queue on the topic before choosing `Defer`.
+
+**Redis Streams starts from a different default.** With no override, a timed-out entry is not mapped to an outcome at all: it is left in the PEL and reclaimed by `XAUTOCLAIM` after the idle deadline, which already redelivers without consuming retry budget. Setting this option makes Redis route the given outcome instead — so `Defer` there means the configured hold-queue delay rather than the idle deadline.
+
+That override also puts the consumer and the `XAUTOCLAIM` reaper on the same deadline: one wants to route an outcome at the handler timeout, the other wants to reclaim the entry and redeliver it. Redis consumers with the override set therefore hold a **lease** on the entry they are working on, re-asserted every half handler-timeout, which keeps the entry's idle clock away from any reaper's threshold — including a reaper in another process, which shove cannot otherwise see.
+
+This is the one place the timeout configuration has to be consistent to be correct. **Keep handler timeouts within 2× of each other across every consumer of a stream and group.** A consumer whose timeout is under half of another's reclaims inside the renewal gap and can take an entry its owner was about to resolve. Should that happen the owner does not route its outcome at all — the reclaiming consumer redelivers instead, exactly as it would have with the override unset, so the message is never both dead-lettered and redelivered.
+
+Handler **panics** are unaffected by this setting and always resolve to `Outcome::Retry` — a panic is a failed attempt, not a slow one.
+
+**With `without_handler_timeout()` the setting is inert**, because no timeout ever fires. That includes shutdown: RabbitMQ and SNS/SQS bound their shutdown drain with a backstop — on both their standard and their sequenced consumers — so a handler that never returns cannot hang the process. That backstop bounds *shutdown*, not the handler. With deadlines disabled the handler is still running when it expires, so the drain resolves to `Outcome::Retry` and lets the broker redeliver — it will not `Ack` away or dead-letter work that is still in flight.
 
 ## MessageMetadata
 

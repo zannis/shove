@@ -185,7 +185,8 @@ pub(crate) mod retry;
     feature = "rabbitmq",
     feature = "nats",
     feature = "kafka",
-    feature = "redis-streams"
+    feature = "redis-streams",
+    feature = "aws-sns-sqs"
 ))]
 pub(crate) mod routing;
 #[cfg(any(feature = "nats", feature = "kafka"))]

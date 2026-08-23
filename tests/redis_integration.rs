@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use redis::aio::MultiplexedConnection;
 use serde::{Deserialize, Serialize};
@@ -4340,5 +4340,684 @@ mod sbe_codec {
             shove::ShoveError::Codec { codec, .. } => assert_eq!(codec, "sbe"),
             other => panic!("expected Codec error, got {other:?}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PEL leases for consumers that resolve their own handler timeouts
+//
+// `with_handler_timeout_outcome` makes a consumer an actor at the very
+// deadline a reaper sweeps on. `maintenance` backs *this* process's reaper
+// off to twice the handler timeout, but that reconciliation cannot see a
+// second process consuming the same stream and group. These tests cover the
+// two halves of what closes that gap (see `backends::redis::lease`):
+//
+//   1. while the handler runs the consumer renews its PEL lease, so the
+//      entry's idle clock never reaches a foreign reaper's threshold;
+//   2. having lost the lease anyway, the consumer declines to route its
+//      timeout outcome rather than adding a second copy alongside the
+//      reaper's re-add.
+// ---------------------------------------------------------------------------
+
+mod lease_tests {
+    use super::*;
+    use redis::streams::StreamPendingCountReply;
+
+    /// Raw connection to the shared container for issuing the commands a
+    /// foreign reaper would issue (XPENDING / XCLAIM / XLEN).
+    async fn raw_conn() -> MultiplexedConnection {
+        let client = redis::Client::open(redis_url().await).expect("redis::Client::open");
+        for attempt in 0u32..5 {
+            match client.get_multiplexed_async_connection().await {
+                Ok(c) => return c,
+                Err(_) if attempt < 4 => {
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt + 1))).await;
+                }
+                Err(e) => panic!("multiplexed conn after retries: {e}"),
+            }
+        }
+        unreachable!()
+    }
+
+    async fn pending(
+        conn: &mut MultiplexedConnection,
+        stream: &str,
+        group: &str,
+    ) -> StreamPendingCountReply {
+        redis::cmd("XPENDING")
+            .arg(stream)
+            .arg(group)
+            .arg("-")
+            .arg("+")
+            .arg(10)
+            .query_async(conn)
+            .await
+            .expect("XPENDING")
+    }
+
+    // -----------------------------------------------------------------------
+    // A renewed lease keeps the idle clock away from a foreign reaper.
+    //
+    // The handler timeout is 8 s, so `lease::renew_interval` is 4 s and any
+    // reaper — in this process or another — sweeps at no less than 8 s. Read
+    // the entry's idle time 6 s into a handler that is still running: with
+    // renewal it reflects the 4 s tick and sits near 2 s; without it, it
+    // tracks wall time since delivery and would read ~6 s, most of the way to
+    // a threshold the owner needs to stay under.
+    //
+    // Every margin here is seconds wide on purpose. The first cut of this test
+    // put the probe 2.5 s into a 3 s handler and asserted against a 2 s tick,
+    // leaving a shared CI runner 500 ms to be scheduled in before the result
+    // flipped either way. Here the renewal has 2 s to land, the assertion
+    // clears its no-renewal value by 2 s, and the handler cannot finish early
+    // because it never returns at all — the 8 s timeout is what ends it.
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Leased {
+        id: u64,
+    }
+
+    struct LeaseRenewTopic;
+    impl Topic for LeaseRenewTopic {
+        type Message = Leased;
+        type Codec = JsonCodec;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("redis-int-lease-renew").dlq().build())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RenewCtx {
+        started: Arc<AtomicU32>,
+    }
+
+    struct SleepyHandler;
+    impl MessageHandler<LeaseRenewTopic> for SleepyHandler {
+        type Context = RenewCtx;
+        async fn handle(&self, _msg: Leased, _meta: MessageMetadata, ctx: &RenewCtx) -> Outcome {
+            ctx.started.fetch_add(1, Ordering::SeqCst);
+            // Never returns: the 8 s handler timeout is what resolves this
+            // message, so no scheduling hiccup can let the handler complete
+            // before the probe reads the PEL and turn a timing assertion into
+            // an "expected exactly one in-flight entry" failure instead.
+            std::future::pending::<()>().await;
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_keeps_pel_idle_below_a_foreign_reaper_threshold() {
+        let group_name = "lease-renew-group";
+        let broker = make_broker(group_name).await;
+        broker
+            .topology()
+            .declare::<LeaseRenewTopic>()
+            .await
+            .expect("declare");
+
+        let ctx = RenewCtx {
+            started: Arc::new(AtomicU32::new(0)),
+        };
+        let mut group = broker.consumer_group().with_context(ctx.clone());
+        group
+            .register::<LeaseRenewTopic, _>(
+                ConsumerGroupConfig::new(
+                    RedisConsumerGroupConfig::new(1..=1)
+                        .with_handler_timeout(Duration::from_secs(8))
+                        // Without an override the consumer does nothing at the
+                        // deadline and the reaper's reclaim *is* the intended
+                        // redelivery — no lease, and none wanted.
+                        .with_handler_timeout_outcome(Outcome::Ack),
+                ),
+                || SleepyHandler,
+            )
+            .await
+            .expect("register");
+
+        let publisher = broker.publisher().await.expect("publisher");
+        publisher
+            .publish::<LeaseRenewTopic>(&Leased { id: 1 })
+            .await
+            .expect("publish");
+
+        let token = group.cancellation_token();
+        let started_probe = ctx.started.clone();
+        let probe = tokio::spawn(async move {
+            let entered = poll_until(
+                move || started_probe.load(Ordering::SeqCst) >= 1,
+                Duration::from_secs(10),
+            )
+            .await;
+            assert!(entered, "handler was never invoked");
+
+            // Two seconds past the single renewal tick at 4 s, and two short
+            // of the 8 s deadline that ends the handler.
+            tokio::time::sleep(Duration::from_secs(6)).await;
+
+            let mut conn = raw_conn().await;
+            let reply = pending(&mut conn, LeaseRenewTopic::topology().queue(), group_name).await;
+            token.cancel();
+            reply
+        });
+
+        let outcome = group
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(30))
+            .await;
+        let reply = probe.await.expect("probe");
+        assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+        assert_eq!(reply.ids.len(), 1, "expected exactly one in-flight entry");
+        let idle_ms = reply.ids[0].last_delivered_ms;
+        assert!(
+            idle_ms < 4_000,
+            "PEL idle time was {idle_ms} ms 6 s into a leased handler; the \
+             lease was not renewed, so a reaper sweeping at the 8 s handler \
+             timeout can reclaim the entry its owner is about to resolve",
+        );
+        // Guard against the opposite failure: an idle time pinned at zero for
+        // some reason other than renewal would make the bound meaningless.
+        assert!(
+            reply.ids[0].times_delivered == 1,
+            "renewals must use XCLAIM JUSTID and leave the delivery counter \
+             alone, got times_delivered = {}",
+            reply.ids[0].times_delivered,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A lost lease means the timeout outcome is not routed.
+    //
+    // Stealing the entry with `XCLAIM ... 0` is what a foreign reaper's
+    // XAUTOCLAIM does once the idle threshold is crossed: the thief now owns
+    // redelivery. The owner's 2 s timeout then resolves to `Reject`, which
+    // routes to the DLQ. It must decline — routing anyway would leave the
+    // DLQ copy *and* the thief's redelivery, the double-routing this guard
+    // exists to prevent.
+    // -----------------------------------------------------------------------
+
+    struct LeaseLostTopic;
+    impl Topic for LeaseLostTopic {
+        type Message = Leased;
+        type Codec = JsonCodec;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| TopologyBuilder::new("redis-int-lease-lost").dlq().build())
+        }
+    }
+
+    struct BlockingHandler;
+    impl MessageHandler<LeaseLostTopic> for BlockingHandler {
+        type Context = RenewCtx;
+        async fn handle(&self, _msg: Leased, _meta: MessageMetadata, ctx: &RenewCtx) -> Outcome {
+            ctx.started.fetch_add(1, Ordering::SeqCst);
+            // Never completes inside the 2 s timeout.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_outcome_is_not_routed_after_the_lease_is_lost() {
+        let group_name = "lease-lost-group";
+        let broker = make_broker(group_name).await;
+        broker
+            .topology()
+            .declare::<LeaseLostTopic>()
+            .await
+            .expect("declare");
+
+        let dlq = LeaseLostTopic::topology().dlq().expect("topic has a DLQ");
+        let stream = LeaseLostTopic::topology().queue();
+
+        let ctx = RenewCtx {
+            started: Arc::new(AtomicU32::new(0)),
+        };
+        let mut group = broker.consumer_group().with_context(ctx.clone());
+        group
+            .register::<LeaseLostTopic, _>(
+                ConsumerGroupConfig::new(
+                    RedisConsumerGroupConfig::new(1..=1)
+                        .with_handler_timeout(Duration::from_secs(2))
+                        .with_handler_timeout_outcome(Outcome::Reject),
+                ),
+                || BlockingHandler,
+            )
+            .await
+            .expect("register");
+
+        let publisher = broker.publisher().await.expect("publisher");
+        publisher
+            .publish::<LeaseLostTopic>(&Leased { id: 1 })
+            .await
+            .expect("publish");
+
+        let token = group.cancellation_token();
+        let started_probe = ctx.started.clone();
+        let thief = tokio::spawn(async move {
+            let entered = poll_until(
+                move || started_probe.load(Ordering::SeqCst) >= 1,
+                Duration::from_secs(10),
+            )
+            .await;
+            assert!(entered, "handler was never invoked");
+
+            let mut conn = raw_conn().await;
+            let reply = pending(&mut conn, stream, group_name).await;
+            assert_eq!(reply.ids.len(), 1, "expected one in-flight entry to steal");
+            let entry_id = reply.ids[0].id.clone();
+
+            // `0` min-idle-time: claim regardless of how long the entry has
+            // been pending, which is what a reaper that already crossed its
+            // own threshold effectively does.
+            let _: redis::Value = redis::cmd("XCLAIM")
+                .arg(stream)
+                .arg(group_name)
+                .arg("foreign-reaper")
+                .arg(0)
+                .arg(&entry_id)
+                .query_async(&mut conn)
+                .await
+                .expect("XCLAIM");
+
+            // Past the 2 s handler timeout, with margin for the resolution
+            // round-trips the owner would make if it did not decline.
+            tokio::time::sleep(Duration::from_secs(4)).await;
+
+            let dlq_len: i64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut conn)
+                .await
+                .expect("XLEN");
+            let after = pending(&mut conn, stream, group_name).await;
+            token.cancel();
+            (dlq_len, after)
+        });
+
+        let outcome = group
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(15))
+            .await;
+        let (dlq_len, after) = thief.await.expect("thief");
+        assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+        assert_eq!(
+            dlq_len, 0,
+            "the owner dead-lettered an entry it no longer held; the thief \
+             still owns redelivery, so the message now exists twice",
+        );
+        assert_eq!(
+            after.ids.len(),
+            1,
+            "the stolen entry must stay in the thief's PEL for it to redeliver",
+        );
+        assert_eq!(
+            after.ids[0].consumer, "foreign-reaper",
+            "the owner's lease renewal must not steal the entry back from the \
+             reaper that claimed it",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A lost lease also stops a *normally completed* handler from routing.
+    //
+    // The timeout is not what makes an entry contested — losing the lease is,
+    // and that can happen to a handler that goes on to finish well inside its
+    // deadline. Guarding only the timeout path left the common case open: a
+    // handler whose renewal is beaten by a foreign sweep, then returns `Ack`
+    // or `Reject` and applies it on top of the reaper's redelivery.
+    //
+    // Here the handler never times out (15 s deadline, 4 s of work) and
+    // returns `Reject`. The entry is stolen while it works, so the outcome
+    // must be dropped exactly as a timeout outcome would be.
+    // -----------------------------------------------------------------------
+
+    struct CompletedLostTopic;
+    impl Topic for CompletedLostTopic {
+        type Message = Leased;
+        type Codec = JsonCodec;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("redis-int-lease-completed")
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    struct SlowRejectHandler;
+    impl MessageHandler<CompletedLostTopic> for SlowRejectHandler {
+        type Context = RenewCtx;
+        async fn handle(&self, _msg: Leased, _meta: MessageMetadata, ctx: &RenewCtx) -> Outcome {
+            ctx.started.fetch_add(1, Ordering::SeqCst);
+            // Long enough for the thief below to claim the entry, far short of
+            // the 15 s deadline — this handler completes, it does not time out.
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Outcome::Reject
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_outcome_is_not_routed_after_the_lease_is_lost() {
+        let group_name = "lease-completed-group";
+        let broker = make_broker(group_name).await;
+        broker
+            .topology()
+            .declare::<CompletedLostTopic>()
+            .await
+            .expect("declare");
+
+        let dlq = CompletedLostTopic::topology()
+            .dlq()
+            .expect("topic has a DLQ");
+        let stream = CompletedLostTopic::topology().queue();
+
+        let ctx = RenewCtx {
+            started: Arc::new(AtomicU32::new(0)),
+        };
+        let mut group = broker.consumer_group().with_context(ctx.clone());
+        group
+            .register::<CompletedLostTopic, _>(
+                ConsumerGroupConfig::new(
+                    RedisConsumerGroupConfig::new(1..=1)
+                        .with_handler_timeout(Duration::from_secs(15))
+                        .with_handler_timeout_outcome(Outcome::Reject),
+                ),
+                || SlowRejectHandler,
+            )
+            .await
+            .expect("register");
+
+        let publisher = broker.publisher().await.expect("publisher");
+        publisher
+            .publish::<CompletedLostTopic>(&Leased { id: 1 })
+            .await
+            .expect("publish");
+
+        let token = group.cancellation_token();
+        let started_probe = ctx.started.clone();
+        let thief = tokio::spawn(async move {
+            let entered = poll_until(
+                move || started_probe.load(Ordering::SeqCst) >= 1,
+                Duration::from_secs(10),
+            )
+            .await;
+            assert!(entered, "handler was never invoked");
+
+            let mut conn = raw_conn().await;
+            let reply = pending(&mut conn, stream, group_name).await;
+            assert_eq!(reply.ids.len(), 1, "expected one in-flight entry to steal");
+            let entry_id = reply.ids[0].id.clone();
+
+            let _: redis::Value = redis::cmd("XCLAIM")
+                .arg(stream)
+                .arg(group_name)
+                .arg("foreign-reaper")
+                .arg(0)
+                .arg(&entry_id)
+                .query_async(&mut conn)
+                .await
+                .expect("XCLAIM");
+
+            // Past the handler's 4 s of work, with margin for the DLQ publish
+            // it would make if the guard did not cover normal completion.
+            tokio::time::sleep(Duration::from_secs(8)).await;
+
+            let dlq_len: i64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut conn)
+                .await
+                .expect("XLEN");
+            let after = pending(&mut conn, stream, group_name).await;
+            token.cancel();
+            (dlq_len, after)
+        });
+
+        let outcome = group
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(30))
+            .await;
+        let (dlq_len, after) = thief.await.expect("thief");
+        assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+        assert_eq!(
+            dlq_len, 0,
+            "a handler that completed normally dead-lettered an entry it no \
+             longer held; the thief still owns redelivery, so the message now \
+             exists twice",
+        );
+        assert_eq!(
+            after.ids.len(),
+            1,
+            "the stolen entry must stay in the thief's PEL for it to redeliver",
+        );
+        assert_eq!(
+            after.ids[0].consumer, "foreign-reaper",
+            "the owner must not reclaim the entry on its way to routing a \
+             completed handler's outcome",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A pre-handler terminal outcome must respect the lease too.
+    //
+    // `XREADGROUP COUNT prefetch` admits a whole batch to this consumer's PEL
+    // in one call, but the entries are inspected one at a time. An entry near
+    // the end of a batch can therefore be reclaimed by a foreign reaper before
+    // the consumer has even looked at it — and the paths that reject an entry
+    // *without* running a handler (missing payload, oversize, undecodable)
+    // used to dead-letter it regardless, adding a second copy alongside the
+    // reaper's re-add.
+    //
+    // Producing that window takes some care, because the concurrent loop only
+    // parks mid-batch when it runs out of in-flight permits, and the permit is
+    // acquired *after* the decode. With `prefetch_count(2)`:
+    //
+    //   batch 1 = [slow, slow]  -> both dispatch, both permits held for 8 s
+    //   batch 2 = [slow, bad ]  -> the third slow entry decodes fine and then
+    //                              blocks acquiring a permit, leaving `bad`
+    //                              sitting in our PEL, read but not inspected
+    //
+    // That park is the window. The test steals `bad` during it, exactly as a
+    // reaper at its idle threshold would, and asserts the consumer declines to
+    // dead-letter an entry it no longer owns.
+    //
+    // Note `prefetch_count` is clamped to 1 unless `concurrent_processing` is
+    // on (see `RedisConsumerGroupConfig::with_prefetch_count`), so this has to
+    // be a concurrent group — a non-concurrent one never batches at all.
+    // -----------------------------------------------------------------------
+
+    struct PrefetchSkipTopic;
+    impl Topic for PrefetchSkipTopic {
+        type Message = Leased;
+        type Codec = JsonCodec;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("redis-int-prefetch-skip")
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    struct SlowAckHandler;
+    impl MessageHandler<PrefetchSkipTopic> for SlowAckHandler {
+        type Context = RenewCtx;
+        async fn handle(&self, _msg: Leased, _meta: MessageMetadata, ctx: &RenewCtx) -> Outcome {
+            ctx.started.fetch_add(1, Ordering::SeqCst);
+            // Holds an in-flight permit long enough for the test to steal the
+            // entry that is parked behind it.
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetched_undecodable_entry_is_not_dead_lettered_after_it_is_stolen() {
+        let group_name = "prefetch-skip-group";
+        let broker = make_broker(group_name).await;
+        broker
+            .topology()
+            .declare::<PrefetchSkipTopic>()
+            .await
+            .expect("declare");
+
+        let stream = PrefetchSkipTopic::topology().queue();
+        let dlq = PrefetchSkipTopic::topology()
+            .dlq()
+            .expect("topic has a DLQ");
+
+        // Three valid entries to occupy the permits, then one that cannot be
+        // decoded as `Leased` — it takes the pre-handler deserialize path with
+        // no handler run.
+        let publisher = broker.publisher().await.expect("publisher");
+        for id in 1..=3 {
+            publisher
+                .publish::<PrefetchSkipTopic>(&Leased { id })
+                .await
+                .expect("publish");
+        }
+
+        let mut seed = raw_conn().await;
+        let bad_id: String = redis::cmd("XADD")
+            .arg(stream)
+            .arg("*")
+            .arg("payload")
+            .arg("{not-json")
+            .query_async(&mut seed)
+            .await
+            .expect("XADD undecodable entry");
+
+        let ctx = RenewCtx {
+            started: Arc::new(AtomicU32::new(0)),
+        };
+        let mut group = broker.consumer_group().with_context(ctx.clone());
+        group
+            .register::<PrefetchSkipTopic, _>(
+                ConsumerGroupConfig::new(
+                    RedisConsumerGroupConfig::new(1..=1)
+                        // Two per XREADGROUP, and two in-flight permits.
+                        .with_concurrent_processing(true)
+                        .with_prefetch_count(2)
+                        .with_handler_timeout(Duration::from_secs(30))
+                        // Makes this consumer lease-holding: without an
+                        // outcome override there is no lease and nothing to
+                        // check.
+                        .with_handler_timeout_outcome(Outcome::Reject),
+                ),
+                || SlowAckHandler,
+            )
+            .await
+            .expect("register");
+
+        let token = group.cancellation_token();
+        let started_probe = ctx.started.clone();
+        let stolen_id = bad_id.clone();
+        let thief = tokio::spawn(async move {
+            // Both permits taken => the loop has moved on to batch 2.
+            let entered = poll_until(
+                move || started_probe.load(Ordering::SeqCst) >= 2,
+                Duration::from_secs(15),
+            )
+            .await;
+            assert!(entered, "the first two handlers never both started");
+
+            let mut conn = raw_conn().await;
+
+            // Wait for the precondition itself rather than guessing at a
+            // delay: batch 2's XREADGROUP has landed, and the undecodable
+            // entry is sitting in the *real* consumer's PEL, read but not yet
+            // inspected because the entry ahead of it is parked acquiring a
+            // permit. Polling this instead of sleeping is what keeps the test
+            // from silently de-staging itself if the loop's timing shifts.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let owner_before = loop {
+                let owner = pending(&mut conn, stream, group_name)
+                    .await
+                    .ids
+                    .into_iter()
+                    .find(|e| e.id == stolen_id)
+                    .map(|e| e.consumer);
+                if owner.is_some() {
+                    break owner;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "test setup: the undecodable entry never entered the \
+                     consumer's PEL, so there was nothing for the reaper to steal",
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            assert_ne!(
+                owner_before.as_deref(),
+                Some("foreign-reaper"),
+                "test setup: the entry must be owned by the real consumer \
+                 before the steal",
+            );
+
+            let _: redis::Value = redis::cmd("XCLAIM")
+                .arg(stream)
+                .arg(group_name)
+                .arg("foreign-reaper")
+                .arg(0)
+                .arg(&stolen_id)
+                .query_async(&mut conn)
+                .await
+                .expect("XCLAIM");
+
+            // The steal is the whole premise of this test: if the entry was
+            // not in a PEL yet, XCLAIM is a silent no-op and everything below
+            // would be testing nothing. Fail loudly here instead.
+            let claimed = pending(&mut conn, stream, group_name).await;
+            let owner = claimed
+                .ids
+                .iter()
+                .find(|e| e.id == stolen_id)
+                .map(|e| e.consumer.clone());
+            assert_eq!(
+                owner.as_deref(),
+                Some("foreign-reaper"),
+                "test setup: the undecodable entry was not pending when the \
+                 thief claimed it, so the reclaim race was never staged",
+            );
+
+            // Past the handlers' 8 s, with margin for the DLQ write the
+            // consumer would make if the pre-handler path were unguarded.
+            tokio::time::sleep(Duration::from_secs(14)).await;
+
+            let dlq_len: i64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut conn)
+                .await
+                .expect("XLEN");
+            let after = pending(&mut conn, stream, group_name).await;
+            token.cancel();
+            (dlq_len, after)
+        });
+
+        let outcome = group
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(60))
+            .await;
+        let (dlq_len, after) = thief.await.expect("thief");
+        assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+        assert_eq!(
+            dlq_len, 0,
+            "an undecodable entry was dead-lettered after a reaper had already \
+             reclaimed it; the reaper still owns redelivery, so the message now \
+             exists twice",
+        );
+        let stolen: Vec<_> = after.ids.iter().filter(|e| e.id == bad_id).collect();
+        assert_eq!(
+            stolen.len(),
+            1,
+            "the stolen entry must stay in the thief's PEL for it to redeliver",
+        );
+        assert_eq!(
+            stolen[0].consumer, "foreign-reaper",
+            "the owner must not reclaim the entry on its way to a pre-handler \
+             terminal outcome",
+        );
     }
 }

@@ -205,6 +205,7 @@ mod bounds_smoke {
             hold_queue_timeout: None,
             prefetch_count: 1,
             handler_timeout: None,
+            handler_timeout_outcome: None,
             max_pending_per_key: None,
             max_message_size: None,
             shutdown: CancellationToken::new(),
