@@ -555,6 +555,7 @@ async fn run_fifo_shard<T, H>(
 
                         let mut new_env = env;
                         set_retry_count(&mut new_env.headers, retry_count + 1);
+                        new_env.reset_delivery_count();
 
                         let cancelled = tokio::select! {
                             _ = tokio::time::sleep(delay) => false,
@@ -754,7 +755,15 @@ fn schedule_redelivery(
 
     let mut env = env;
     if increment {
+        // `Retry` is a republish on every real backend, which resets the
+        // broker's own attempt counter. Model that here so handlers written
+        // against the in-process broker behave the same in production.
         set_retry_count(&mut env.headers, retry_count + 1);
+        env.reset_delivery_count();
+    } else {
+        // `Defer` is a nak-in-place on JetStream — same message, one more
+        // attempt. This is the case `retry_count` deliberately cannot express.
+        env.mark_redelivery();
     }
 
     let broker_clone = broker.clone();
@@ -1025,6 +1034,7 @@ fn metadata_from(env: &Envelope) -> MessageMetadata {
         retry_count,
         delivery_id,
         redelivered: retry_count > 0,
+        delivery_count: Some(env.delivery_count),
         headers: Arc::new(env.headers.clone()),
     }
 }

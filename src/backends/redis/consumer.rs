@@ -694,6 +694,10 @@ where
                         retry_count,
                         delivery_id,
                         redelivered: retry_count > 0,
+                        // Redis tracks deliveries in the group's PEL, but
+                        // XREADGROUP does not return the counter — surfacing it
+                        // would cost an XPENDING round-trip per message.
+                        delivery_count: None,
                         headers: Arc::new(user_headers),
                     };
 
@@ -1005,6 +1009,10 @@ where
                         retry_count,
                         delivery_id,
                         redelivered: retry_count > 0,
+                        // Redis tracks deliveries in the group's PEL, but
+                        // XREADGROUP does not return the counter — surfacing it
+                        // would cost an XPENDING round-trip per message.
+                        delivery_count: None,
                         headers: Arc::new(user_headers),
                     };
 

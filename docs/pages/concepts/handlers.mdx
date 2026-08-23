@@ -116,9 +116,33 @@ Every `handle()` invocation receives a `MessageMetadata` describing the delivery
 - `retry_count: u32` — how many times this message has been retried; `0` on first delivery.
 - `delivery_id: String` — opaque delivery identifier (AMQP delivery tag, SQS receipt handle, etc.). Useful for logging.
 - `redelivered: bool` — whether the broker flagged this as a redelivery at the transport layer.
+- `delivery_count: Option<u32>` — how many times the *broker* has delivered this message, including the current delivery. `None` where the backend has no such counter.
 - `headers: HashMap<String, String>` — string-valued headers attached to the delivery.
 
 Most handlers ignore all of these fields. They become useful when you need to trace a message (`headers["x-trace-id"]`), implement idempotency checks (`headers["x-message-id"]` on RabbitMQ), or adjust behavior on redelivery. The `retry_count` in particular is more reliable than `redelivered` for detecting retries because `shove` increments it explicitly, whereas `redelivered` reflects the broker's view of the transport.
+
+### `retry_count` vs `delivery_count`
+
+The two counters answer different questions, and neither is a total-attempts-ever number.
+
+`retry_count` is `shove`'s retry budget. It advances only when `Outcome::Retry` routes a message through a hold queue, and it survives that hop because `shove` carries it in a header. It is the field `max_retries` and DLQ routing are measured against.
+
+`delivery_count` is the broker's own attempt counter, so it sees deliveries `shove` never initiated — a consumer crash, an ack that never landed, a visibility timeout expiring. It is reported where the backend supplies one:
+
+| Backend | Value | Source |
+|---|---|---|
+| NATS JetStream | `Some(n)` | `num_delivered` from the message's stream metadata |
+| AWS SQS | `Some(n)` | the `ApproximateReceiveCount` system attribute |
+| In-process | `Some(n)` | counted by the in-process broker |
+| RabbitMQ | `None` | AMQP 0-9-1 carries only the `redelivered` flag |
+| Apache Kafka | `None` | delivery is offset-based; brokers keep no per-message attempt counter |
+| Redis Streams | `None` | the count lives in the group's PEL; reading it would cost an `XPENDING` per message |
+
+Treat `None` as "unknown", never as zero. Where it is reported, a first delivery is `Some(1)`.
+
+Because the count belongs to a *broker-level* message, anything that creates a new one restarts it at 1. `Retry` publishes an incremented copy on every backend, so it always resets `delivery_count` — `retry_count` is the field that survives a retry. `Defer` resets it where deferring re-sends the message (SQS) and preserves it where deferring naks in place (NATS, and the in-process broker, which models NATS here).
+
+That last case is what `delivery_count` is for; see [Bounding a `Defer` loop](/guides/retries#defer-vs-retry).
 
 ## Dead-letter handling
 
