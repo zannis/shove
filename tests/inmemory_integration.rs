@@ -2142,3 +2142,248 @@ async fn autoscaling_scales_up_under_backlog_then_drains_clean() {
     // lifecycle: broker setup → topic declaration → consumer group registration
     // → autoscaling enabled → backlog published → signal → clean drain.
 }
+
+// ---------------------------------------------------------------------------
+// Handler timeout outcome override (uc14)
+// ---------------------------------------------------------------------------
+
+/// A handler that records the `retry_count` it was delivered with, then hangs
+/// past any sane handler timeout.
+#[derive(Clone)]
+struct HangingProbe {
+    invocations: Arc<AtomicUsize>,
+    max_retry_count_seen: Arc<AtomicU32>,
+}
+
+impl MessageHandler<OrdersTopic> for HangingProbe {
+    type Context = ();
+    async fn handle(&self, _: Order, meta: MessageMetadata, _: &()) -> Outcome {
+        self.invocations.fetch_add(1, Ordering::Relaxed);
+        self.max_retry_count_seen
+            .fetch_max(meta.retry_count, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Outcome::Ack
+    }
+}
+
+#[derive(Clone)]
+struct DlqCounter(Arc<AtomicUsize>);
+
+impl MessageHandler<OrdersTopic> for DlqCounter {
+    type Context = ();
+    async fn handle(&self, _: Order, _: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, _: Order, _: shove::DeadMessageMetadata, _: &()) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// With `handler_timeout_outcome = Defer`, a handler that keeps timing out is
+/// redelivered indefinitely without consuming retry budget, so it never
+/// reaches the DLQ. This is the semantic downstream services hand-roll today
+/// by wrapping their work in an internal timeout shorter than shove's.
+#[tokio::test]
+async fn handler_timeout_outcome_defer_does_not_burn_retry_budget() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<OrdersTopic>(&Order { id: 14 })
+        .await
+        .unwrap();
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let max_retry_count_seen = Arc::new(AtomicU32::new(0));
+    let dlq_hits = Arc::new(AtomicUsize::new(0));
+
+    let shutdown = CancellationToken::new();
+    let consumer_main = InMemoryConsumer::new(client.clone());
+    let handler = HangingProbe {
+        invocations: invocations.clone(),
+        max_retry_count_seen: max_retry_count_seen.clone(),
+    };
+    let shutdown_main = shutdown.clone();
+    let main_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::<InMemory>::new()
+            .with_shutdown(shutdown_main)
+            .with_prefetch_count(1)
+            .with_max_retries(1)
+            .with_handler_timeout(Duration::from_millis(50))
+            .with_handler_timeout_outcome(Outcome::Defer);
+        consumer_main.run::<OrdersTopic, _>(handler, (), opts).await
+    });
+
+    let dlq_handle = {
+        let consumer = InMemoryConsumer::new(client.clone());
+        let handler = DlqCounter(dlq_hits.clone());
+        tokio::spawn(async move { consumer.run_dlq::<OrdersTopic, _>(handler, ()).await })
+    };
+
+    // `max_retries(1)` would have dead-lettered after the second attempt; wait
+    // for well past that many redeliveries.
+    let probe = invocations.clone();
+    assert!(
+        poll_until(
+            move || probe.load(Ordering::Relaxed) >= 4,
+            Duration::from_secs(5),
+        )
+        .await,
+        "expected >= 4 redeliveries under Defer; got {}",
+        invocations.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        dlq_hits.load(Ordering::Relaxed),
+        0,
+        "Defer must never dead-letter on timeout"
+    );
+    assert_eq!(
+        max_retry_count_seen.load(Ordering::Relaxed),
+        0,
+        "Defer must not increment retry_count"
+    );
+
+    shutdown.cancel();
+    client.shutdown();
+    let _ = main_handle.await;
+    let _ = dlq_handle.await;
+}
+
+/// With `handler_timeout_outcome = Reject`, a timeout is terminal immediately:
+/// straight to the DLQ on the first attempt, no retry budget consumed.
+#[tokio::test]
+async fn handler_timeout_outcome_reject_dead_letters_immediately() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<OrdersTopic>(&Order { id: 15 })
+        .await
+        .unwrap();
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let max_retry_count_seen = Arc::new(AtomicU32::new(0));
+    let dlq_hits = Arc::new(AtomicUsize::new(0));
+
+    let shutdown = CancellationToken::new();
+    let consumer_main = InMemoryConsumer::new(client.clone());
+    let handler = HangingProbe {
+        invocations: invocations.clone(),
+        max_retry_count_seen: max_retry_count_seen.clone(),
+    };
+    let shutdown_main = shutdown.clone();
+    let main_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::<InMemory>::new()
+            .with_shutdown(shutdown_main)
+            .with_prefetch_count(1)
+            .with_max_retries(5)
+            .with_handler_timeout(Duration::from_millis(50))
+            .with_handler_timeout_outcome(Outcome::Reject);
+        consumer_main.run::<OrdersTopic, _>(handler, (), opts).await
+    });
+
+    let dlq_handle = {
+        let consumer = InMemoryConsumer::new(client.clone());
+        let handler = DlqCounter(dlq_hits.clone());
+        tokio::spawn(async move { consumer.run_dlq::<OrdersTopic, _>(handler, ()).await })
+    };
+
+    let probe = dlq_hits.clone();
+    assert!(
+        poll_until(
+            move || probe.load(Ordering::Relaxed) == 1,
+            Duration::from_secs(5),
+        )
+        .await,
+        "expected the timed-out message to be dead-lettered"
+    );
+    assert_eq!(
+        invocations.load(Ordering::Relaxed),
+        1,
+        "Reject must not redeliver"
+    );
+    assert_eq!(max_retry_count_seen.load(Ordering::Relaxed), 0);
+
+    shutdown.cancel();
+    client.shutdown();
+    let _ = main_handle.await;
+    let _ = dlq_handle.await;
+}
+
+/// The per-group setter must reach the consumers the group spawns, not just
+/// standalone `ConsumerOptions` — the reported production usage is entirely
+/// group-based.
+#[tokio::test]
+async fn group_handler_timeout_outcome_defer_does_not_burn_retry_budget() {
+    let client = InMemoryBroker::new();
+    let broker = Broker::<InMemory>::from_client(client.clone());
+    broker.topology().declare::<OrdersTopic>().await.unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    publisher
+        .publish::<OrdersTopic>(&Order { id: 16 })
+        .await
+        .unwrap();
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let max_retry_count_seen = Arc::new(AtomicU32::new(0));
+    let dlq_hits = Arc::new(AtomicUsize::new(0));
+
+    let dlq_handle = {
+        let consumer = InMemoryConsumer::new(client.clone());
+        let handler = DlqCounter(dlq_hits.clone());
+        tokio::spawn(async move { consumer.run_dlq::<OrdersTopic, _>(handler, ()).await })
+    };
+
+    let mut group = broker.consumer_group();
+    let probe_invocations = invocations.clone();
+    let probe_retry = max_retry_count_seen.clone();
+    group
+        .register::<OrdersTopic, _>(
+            ConsumerGroupConfig::new(
+                InMemoryConsumerGroupConfig::new(1..=1)
+                    .with_max_retries(1)
+                    .with_handler_timeout(Duration::from_millis(50))
+                    .with_handler_timeout_outcome(Outcome::Defer),
+            ),
+            move || HangingProbe {
+                invocations: probe_invocations.clone(),
+                max_retry_count_seen: probe_retry.clone(),
+            },
+        )
+        .await
+        .expect("register");
+
+    // `max_retries(1)` would have dead-lettered after the second attempt.
+    let token = group.cancellation_token();
+    let redelivery_probe = invocations.clone();
+    let canceller = tokio::spawn(async move {
+        let observed = poll_until(
+            move || redelivery_probe.load(Ordering::Relaxed) >= 4,
+            Duration::from_secs(5),
+        )
+        .await;
+        token.cancel();
+        observed
+    });
+
+    let outcome = group
+        .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(1))
+        .await;
+    let observed = canceller.await.expect("canceller");
+
+    assert!(
+        observed,
+        "expected >= 4 redeliveries under Defer; got {} (outcome: {outcome:?})",
+        invocations.load(Ordering::Relaxed)
+    );
+    assert_eq!(dlq_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(max_retry_count_seen.load(Ordering::Relaxed), 0);
+
+    client.shutdown();
+    let _ = dlq_handle.await;
+}

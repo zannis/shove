@@ -4,6 +4,7 @@ use aws_sdk_sqs::types::{
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
+use crate::metrics;
 use crate::metrics::{BackendErrorKind, BackendLabel, record_backend_error};
 use crate::topology::QueueTopology;
 
@@ -168,7 +169,73 @@ pub(crate) async fn route_retry_fifo(
 /// Reject a message. Sets visibility to 0 so SQS redelivers it immediately,
 /// incrementing ApproximateReceiveCount. Once maxReceiveCount is exceeded,
 /// SQS native redrive moves it to the DLQ.
+///
+/// ## Why SQS never records a discard
+///
+/// This is the terminal path on SQS, and it deletes nothing: the message stays
+/// on the queue and becomes visible again. Whether it eventually reaches a DLQ
+/// is decided by the queue's *AWS-side* redrive policy, which `shove` does not
+/// own and cannot read from `topology`. So neither branch here is a discard —
+/// with a redrive policy the message is dead-lettered by SQS, and without one
+/// it cycles until the retention period expires.
+///
+/// So this records `record_failed`, never `record_terminal`.
+/// `shove_messages_discarded_total` promises that every increment is a message
+/// that no longer exists, and incrementing it here would break that promise
+/// twice over: the message is still live, and because its receive count stays
+/// above the budget, every later receive would increment the counter again for
+/// the same message. The repeated `WARN` below is the intended signal.
+///
+/// ## Why `reason` is a required argument
+///
+/// Because SQS opts out of the discard counter, `messages_failed_total` is the
+/// only signal an SQS operator has — and it is what the observability guide now
+/// tells them to alert on. The metric is therefore recorded *here* rather than
+/// at the call sites: this consumer hand-rolls its retry-budget and validation
+/// checks in a dozen-odd places across the standard, concurrent, sequenced and
+/// buffered-pending loops, and instrumenting them individually is exactly how
+/// the sequenced and buffered paths came to record nothing at all. Every path
+/// that rejects a delivery ends here, so a new one cannot be added without
+/// naming its reason.
+///
+/// Releasing a message that was never dispatched — the graceful-shutdown drain
+/// — is not a failure and must use [`route_requeue`] instead.
 pub(crate) async fn route_reject(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+    topology: &QueueTopology,
+    group: Option<&str>,
+    reason: metrics::FailReason,
+) {
+    metrics::record_failed(topology.queue(), group, reason);
+    reject_visibility(sqs, queue_url, receipt_handle, topology).await;
+}
+
+/// [`route_reject`] for a delivery released as collateral of a failure that has
+/// already been counted — a [`SequenceFailure::FailAll`] cascade behind a
+/// poisoned key.
+///
+/// Identical routing; it simply does not increment `messages_failed_total`,
+/// because the cascade's size tracks queue depth rather than a count of things
+/// that went wrong. See [`metrics::FailReason`].
+///
+/// This is deliberately a second function rather than a flag, so that the
+/// "every reject path must name its reason" property above extends to the
+/// accounting choice: a cascade cannot be introduced by omitting an argument.
+///
+/// [`SequenceFailure::FailAll`]: crate::topology::SequenceFailure
+pub(crate) async fn route_reject_cascade(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+    topology: &QueueTopology,
+) {
+    reject_visibility(sqs, queue_url, receipt_handle, topology).await;
+}
+
+/// Shared visibility-reset mechanics behind both reject entry points.
+async fn reject_visibility(
     sqs: &aws_sdk_sqs::Client,
     queue_url: &str,
     receipt_handle: &str,

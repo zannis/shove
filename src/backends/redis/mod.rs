@@ -9,6 +9,7 @@ pub(super) mod client;
 pub(super) mod constants;
 mod consumer;
 mod consumer_group;
+mod lease;
 mod maintenance;
 mod publisher;
 mod reaper;

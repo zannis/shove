@@ -21,11 +21,32 @@
 //! leaving changes the effective policy, the sidecar is cancelled and
 //! respawned with the new one.
 //!
+//! A consumer that resolves its own timeouts
+//! (`ConsumerOptions::with_handler_timeout_outcome`) contributes a policy of
+//! twice its handler timeout, so the reaper never races the owner at the
+//! deadline — see [`reclaim_policy`].
+//!
 //! This reconciliation is per process. A separate process (or an
 //! independently connected client) consuming the same stream and group runs
 //! its own sidecar on its own policy, so handler timeouts should be
 //! configured consistently across every consumer of a stream and group —
 //! see `ConsumerOptions::with_handler_timeout`.
+//!
+//! Consistent timeouts alone would not save a consumer that resolves its own:
+//! a second process with the same timeout and no override still sweeps at the
+//! deadline its owner resolves on, and no policy visible here can stop it.
+//! Those consumers therefore defend the entry directly, by holding a renewed
+//! PEL lease on it — see [`super::lease`].
+//!
+//! The two mechanisms have different reach, and it matters not to conflate
+//! them. The `2x` backoff below is a **single-process** guarantee: within one
+//! process the registry sees every consumer on the key, so it can place the
+//! sidecar's threshold beyond every owner's deadline. The lease only
+//! *narrows* the same race across processes — narrowing is the whole claim.
+//! It does not make the owner the sole actor, and the ownership check it
+//! offers is not serialized against the writes that apply an outcome. See
+//! [`super::lease`] for the exact bound and its failure modes; the short
+//! version is that Redis Streams stays at-least-once here.
 //!
 //! The key includes the client identity so two clients pointed at different
 //! Redis servers never share a maintenance task; two distinct clients on the
@@ -144,16 +165,52 @@ fn sidecar_timing(handler_timeout: Option<Duration>) -> (Duration, Option<u64>) 
     }
 }
 
+/// This consumer's reclaim policy, given its handler timeout and whether it
+/// resolves a timeout to an outcome itself.
+///
+/// With no `handler_timeout_outcome` override the consumer does nothing when a
+/// handler times out — it deliberately leaves the entry in the PEL for the
+/// reaper to redeliver. Reclaiming at exactly `handler_timeout` is then the
+/// intended behaviour, and the reaper is the only actor on that entry.
+///
+/// With an override set the consumer becomes an actor at that same deadline:
+/// it XACKs, XADDs to a hold queue, or dead-letters the entry the moment the
+/// timeout fires. XACK is group-wide rather than owner-checked, so a reaper
+/// sweeping with an idle threshold of exactly `handler_timeout` can claim and
+/// redeliver the very entry its owner is concurrently resolving — leaving a
+/// duplicate on the stream after a timeout-to-`Ack`, or two redeliveries after
+/// a timeout-to-`Defer`. Backing the threshold off to twice the timeout keeps
+/// *this process's* sidecar clear of *this process's* owners: a live owner
+/// resolves first, and a genuinely dead one is still recovered, just one extra
+/// timeout later.
+///
+/// The margin is proportional rather than a fixed constant so it scales with
+/// whatever the caller considers "too slow", and so short timeouts don't
+/// inherit a multi-second crash-recovery delay.
+///
+/// It buys nothing against a sidecar in another process, which seeds its own
+/// threshold from its own consumers and may sweep at plain `handler_timeout`.
+/// That case is the [`super::lease`]'s to narrow, and narrowing is all it can
+/// do — see the module docs above.
+fn reclaim_policy(handler_timeout: Option<Duration>, resolves_own_timeout: bool) -> Policy {
+    match handler_timeout {
+        Some(timeout) if resolves_own_timeout => Some(timeout.saturating_mul(2)),
+        other => other,
+    }
+}
+
 /// Ensure a maintenance sidecar runs for `(client, stream, group)` and
 /// return a guard expressing this consumer's interest in it.
 ///
-/// `handler_timeout` is this consumer's reclaim policy; the sidecar runs
-/// with the conservative effective policy across all live guards on the key
-/// (see the module docs), with timing derived via [`sidecar_timing`].
+/// This consumer's reclaim policy is derived from `handler_timeout` and
+/// `resolves_own_timeout` (see [`reclaim_policy`]); the sidecar runs with the
+/// conservative effective policy across all live guards on the key (see the
+/// module docs), with timing derived via [`sidecar_timing`].
 pub(super) fn acquire(
     client: &RedisClient,
     stream: &str,
     handler_timeout: Option<Duration>,
+    resolves_own_timeout: bool,
 ) -> MaintenanceGuard {
     let key = (
         client.instance_id(),
@@ -173,7 +230,11 @@ pub(super) fn acquire(
             shutdown,
         );
     });
-    acquire_with(key, handler_timeout, spawner)
+    acquire_with(
+        key,
+        reclaim_policy(handler_timeout, resolves_own_timeout),
+        spawner,
+    )
 }
 
 /// Core refcount + effective-policy logic, generic over the spawner so the
@@ -239,6 +300,34 @@ mod tests {
             (Duration::from_secs(30), None),
             "no handler deadline means no XAUTOCLAIM deadline"
         );
+    }
+
+    #[test]
+    fn reclaim_policy_unchanged_without_a_timeout_outcome() {
+        // The consumer does nothing at the deadline, so the reaper is the only
+        // actor and reclaiming exactly at the timeout is the intended design.
+        assert_eq!(
+            reclaim_policy(Some(Duration::from_secs(30)), false),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(reclaim_policy(None, false), None);
+    }
+
+    #[test]
+    fn reclaim_policy_backs_off_when_the_consumer_resolves_its_own_timeout() {
+        // With an override the owner acts at the deadline; the reaper must not
+        // claim the same entry at the same instant.
+        assert_eq!(
+            reclaim_policy(Some(Duration::from_secs(30)), true),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn reclaim_policy_never_invents_a_deadline() {
+        // `without_handler_timeout()` disables reclaim; a timeout outcome is
+        // unreachable in that configuration and must not resurrect it.
+        assert_eq!(reclaim_policy(None, true), None);
     }
 
     use std::sync::Mutex as StdMutex;

@@ -20,7 +20,9 @@ use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
-use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
+use crate::routing::{
+    PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
+};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
@@ -167,9 +169,9 @@ where
     // surfaces panics as `JoinError` without killing the consumer loop. The
     // envelope lives in a sidecar map keyed by `tokio::task::Id` so we can
     // recover it (for retry routing) when a handler panics.
-    let mut inflight: JoinSet<(u64, Routed)> = JoinSet::new();
+    let mut inflight: JoinSet<(u64, Handled)> = JoinSet::new();
     let mut envelopes: HashMap<tokio::task::Id, (u64, Envelope)> = HashMap::new();
-    let mut pending: BTreeMap<u64, (Envelope, Routed)> = BTreeMap::new();
+    let mut pending: BTreeMap<u64, (Envelope, Handled)> = BTreeMap::new();
     let mut next_ticket: u64 = 0;
     let mut next_route: u64 = 0;
 
@@ -193,21 +195,23 @@ where
             let ctx_clone = Arc::clone(&ctx);
             let max_size = options.max_message_size;
             let timeout_opt = options.handler_timeout;
+            let timeout_outcome = options.handler_timeout_outcome.clone();
             let env_for_task = env.clone();
             let group = options.consumer_group.clone();
 
             let abort = inflight.spawn(async move {
-                let routed = invoke_handler::<T, H>(
+                let handled = invoke_handler::<T, H>(
                     handler_clone,
                     ctx_clone,
                     &env_for_task,
                     max_size,
                     timeout_opt,
+                    timeout_outcome,
                     T::topology().queue(),
                     group.as_deref(),
                 )
                 .await;
-                (ticket, routed)
+                (ticket, handled)
             });
             envelopes.insert(abort.id(), (ticket, env));
         }
@@ -225,9 +229,9 @@ where
             _ = broker_shutdown.cancelled() => break,
             join = inflight.join_next_with_id(), if !inflight.is_empty() => {
                 match join {
-                    Some(Ok((task_id, (ticket, routed)))) => {
+                    Some(Ok((task_id, (ticket, handled)))) => {
                         if let Some((_, env)) = envelopes.remove(&task_id) {
-                            pending.insert(ticket, (env, routed));
+                            pending.insert(ticket, (env, handled));
                             drain_pending(
                                 &broker,
                                 topology,
@@ -246,7 +250,7 @@ where
                         let task_id = join_err.id();
                         if let Some((ticket, env)) = envelopes.remove(&task_id) {
                             tracing::warn!(error = ?join_err, ticket, "handler task panicked — retrying message");
-                            pending.insert(ticket, (env, Routed::handled(Outcome::Retry)));
+                            pending.insert(ticket, (env, (Outcome::Retry, None)));
                             drain_pending(
                                 &broker,
                                 topology,
@@ -273,16 +277,16 @@ where
     // Graceful drain.
     while let Some(res) = inflight.join_next_with_id().await {
         match res {
-            Ok((task_id, (ticket, routed))) => {
+            Ok((task_id, (ticket, handled))) => {
                 if let Some((_, env)) = envelopes.remove(&task_id) {
-                    pending.insert(ticket, (env, routed));
+                    pending.insert(ticket, (env, handled));
                 }
             }
             Err(join_err) => {
                 let task_id = join_err.id();
                 if let Some((ticket, env)) = envelopes.remove(&task_id) {
                     tracing::warn!(error = ?join_err, ticket, "handler task panicked during drain — retrying message");
-                    pending.insert(ticket, (env, Routed::handled(Outcome::Retry)));
+                    pending.insert(ticket, (env, (Outcome::Retry, None)));
                 }
             }
         }
@@ -304,12 +308,12 @@ async fn drain_pending(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     queue: &QueueState,
-    pending: &mut BTreeMap<u64, (Envelope, Routed)>,
+    pending: &mut BTreeMap<u64, (Envelope, Handled)>,
     next_route: &mut u64,
     options: &ConsumerOptionsInner,
 ) {
-    while let Some((env, routed)) = pending.remove(next_route) {
-        route_outcome(broker, topology, env, routed, options).await;
+    while let Some((env, (outcome, pre_handler_reason))) = pending.remove(next_route) {
+        route_outcome(broker, topology, env, outcome, pre_handler_reason, options).await;
         queue.in_flight.fetch_sub(1, Ordering::Release);
         *next_route += 1;
     }
@@ -488,13 +492,13 @@ async fn run_fifo_shard<T, H>(
 
             let skip_handler = poisoned.is_poisoned(&key);
 
-            let routed = if skip_handler {
+            let outcome = if skip_handler {
                 tracing::debug!(
                     shard = %shard_name,
                     %key,
                     "sequence key poisoned — routing message to DLQ without invoking handler"
                 );
-                Routed::handled(Outcome::Reject)
+                (Outcome::Reject, None)
             } else {
                 let raw = invoke_handler_caught::<T, H>(
                     Arc::clone(&handler),
@@ -502,6 +506,7 @@ async fn run_fifo_shard<T, H>(
                     &env,
                     options.max_message_size,
                     options.handler_timeout,
+                    options.handler_timeout_outcome.clone(),
                     &shutdown,
                     &broker_shutdown,
                     T::topology().queue(),
@@ -521,32 +526,33 @@ async fn run_fifo_shard<T, H>(
                         finish(&shard, &busy, &options);
                         return;
                     }
-                    Some(Routed {
-                        outcome: Outcome::Defer,
-                        ..
-                    }) => {
+                    Some((Outcome::Defer, _)) => {
                         tracing::warn!(
                             shard = %shard_name,
                             "Defer is not supported on sequenced consumers — treating as Retry"
                         );
-                        Routed::handled(Outcome::Retry)
+                        (Outcome::Retry, None)
                     }
                     Some(other) => other,
                 }
             };
 
-            match routed.outcome {
+            let (outcome, pre_handler_reason) = outcome;
+            match outcome {
                 Outcome::Ack => {}
                 Outcome::Retry => {
                     let retry_count = get_retry_count(&env.headers);
                     if retry_count >= options.max_retries {
-                        record_dlq_failure(
-                            topology,
-                            &options,
-                            "max_retries_exceeded",
-                            routed.counted,
+                        // Burning the last retry is an independent failure: this
+                        // message reached the handler on its own merits.
+                        let pending = metrics::record_terminal(
+                            topology.queue(),
+                            options.consumer_group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
+                            topology.dlq().is_some(),
                         );
-                        route_reject_sequenced(&broker, topology, env, &key, &poisoned).await;
+                        route_reject_sequenced(&broker, topology, env, &key, &poisoned, pending)
+                            .await;
                     } else {
                         // Inline sleep (blocks this shard until republish completes).
                         let hold_queues = topology.hold_queues();
@@ -598,13 +604,22 @@ async fn run_fifo_shard<T, H>(
                     }
                 }
                 Outcome::Reject => {
-                    // `skip_handler` synthesises a `Reject` for a delivery whose
-                    // key was already poisoned by an earlier failure.
+                    // An oversize or undecodable message never reached the
+                    // handler, so it is not a handler reject; report what
+                    // actually happened to it.
+                    let reason = pre_handler_reason.unwrap_or(metrics::FailReason::Rejected);
+                    let queue = topology.queue();
+                    let group = options.consumer_group.as_deref();
+                    let has_dlq = topology.dlq().is_some();
+                    // `skip_handler` synthesises this `Reject` for a delivery
+                    // whose key an earlier failure already poisoned.
                     // Cascade: intentionally not counted — see `metrics::FailReason`.
-                    if !skip_handler {
-                        record_dlq_failure(topology, &options, "rejected", routed.counted);
-                    }
-                    route_reject_sequenced(&broker, topology, env, &key, &poisoned).await;
+                    let pending = if skip_handler {
+                        metrics::pending_discard(queue, group, reason, has_dlq)
+                    } else {
+                        metrics::record_terminal(queue, group, reason, has_dlq)
+                    };
+                    route_reject_sequenced(&broker, topology, env, &key, &poisoned, pending).await;
                 }
                 Outcome::Defer => unreachable!("Defer normalized to Retry above"),
             }
@@ -637,14 +652,23 @@ async fn pop_or_wait(
     }
 }
 
+/// Terminal routing for the sequenced loop. Every sequenced path that gives up
+/// on a message — retry-budget exhaustion, an explicit `Reject`, and the
+/// FailAll cascade onto a poisoned key — funnels through here. The unsequenced
+/// loop's equivalent is the `RetryDecision::Dlq` arm of `route_outcome`.
+///
+/// The caller supplies `pending` because only the caller knows whether this
+/// retirement is an independent failure ([`metrics::record_terminal`]) or a
+/// cascade that must not be counted as one ([`metrics::pending_discard`]).
 async fn route_reject_sequenced(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     env: Envelope,
     key: &str,
     poisoned: &PoisonedKeys,
+    pending: metrics::PendingDiscard,
 ) {
-    route_reject(broker, topology, env).await;
+    resolve_reject(route_reject(broker, topology, env).await, pending);
     poisoned.poison(key);
 }
 
@@ -713,84 +737,55 @@ where
 // Outcome routing
 // ---------------------------------------------------------------------------
 
-/// A handler outcome plus whether its `messages_failed_total` increment has
-/// already been emitted.
-///
-/// The pre-handler gates (oversize, deserialize) record the failure themselves
-/// with a precise `reason` label and then hand back `Outcome::Reject`. Every
-/// other backend routes such a message straight to the DLQ from the gate, so it
-/// never reaches terminal routing and is counted exactly once. In-memory
-/// instead funnels the reject back through [`route_outcome`] to preserve
-/// ordering, so it needs this flag to avoid counting the same message a second
-/// time as `reason="rejected"`.
-#[derive(Debug, Clone)]
-struct Routed {
-    outcome: Outcome,
-    /// `true` when a pre-handler gate already emitted `messages_failed_total`.
-    counted: bool,
-}
-
-impl Routed {
-    /// The handler ran and returned `outcome`; nothing counted yet.
-    fn handled(outcome: Outcome) -> Self {
-        Self {
-            outcome,
-            counted: false,
-        }
-    }
-
-    /// Rejected before the handler ran, with the failure already counted under
-    /// its precise reason.
-    fn pre_counted(outcome: Outcome) -> Self {
-        Self {
-            outcome,
-            counted: true,
-        }
-    }
-}
-
-/// Emit `messages_failed_total` for a message being retired to the DLQ, unless
-/// a pre-handler gate already counted it under a more precise reason.
-fn record_dlq_failure(
-    topology: &'static QueueTopology,
-    options: &ConsumerOptionsInner,
-    reason: &str,
-    already_counted: bool,
-) {
-    if already_counted {
-        return;
-    }
-    let fail_reason = match reason {
-        "rejected" => metrics::FailReason::Rejected,
-        _ => metrics::FailReason::MaxRetriesExceeded,
-    };
-    metrics::record_failed(
-        topology.queue(),
-        options.consumer_group.as_deref(),
-        fail_reason,
-    );
-}
-
 async fn route_outcome(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     env: Envelope,
-    routed: Routed,
+    outcome: Outcome,
+    // `Some` when the message was rejected before the handler ran; overrides
+    // the reason derived below, which cannot tell that case from a handler
+    // `Reject`. See [`prepare_message`].
+    pre_handler_reason: Option<metrics::FailReason>,
     options: &ConsumerOptionsInner,
 ) {
     let retry_count = get_retry_count(&env.headers);
-    match decide_retry(&routed.outcome, retry_count, options.max_retries) {
+    match decide_retry(&outcome, retry_count, options.max_retries) {
         RetryDecision::Ack => {}
         RetryDecision::Dlq { reason } => {
-            record_dlq_failure(topology, options, reason, routed.counted);
+            let fail_reason = pre_handler_reason.unwrap_or(match reason {
+                "rejected" => metrics::FailReason::Rejected,
+                _ => metrics::FailReason::MaxRetriesExceeded,
+            });
+            let pending = metrics::record_terminal(
+                topology.queue(),
+                options.consumer_group.as_deref(),
+                fail_reason,
+                topology.dlq().is_some(),
+            );
             // In-memory's DLQ enqueue path is `route_reject` for both
             // `Reject` and `max_retries_exceeded`; it does not differentiate
             // the reason beyond the metric recorded above.
-            route_reject(broker, topology, env).await;
+            resolve_reject(route_reject(broker, topology, env).await, pending);
         }
         RetryDecision::Hold { increment } => {
             schedule_redelivery(broker, topology, env, increment);
         }
+    }
+}
+
+/// Apply the pending discard given where [`route_reject`] actually put the
+/// message.
+///
+/// The in-memory backend owns the envelope outright, so a rejected message is
+/// retired the moment this returns — there is no broker ack that can fail
+/// afterwards. What can fail is the DLQ hand-off, and a message that was
+/// supposed to be dead-lettered but never arrived is data loss regardless of
+/// what the topology declares.
+fn resolve_reject(reached_dlq: bool, pending: metrics::PendingDiscard) {
+    if reached_dlq {
+        pending.confirm();
+    } else {
+        pending.confirm_lost();
     }
 }
 
@@ -889,21 +884,27 @@ fn schedule_redelivery(
     });
 }
 
+/// Dead-letter a rejected message, or drop it when there is nowhere to put it.
+///
+/// Returns whether the message reached the DLQ. `false` covers all three ways
+/// it can end up gone: no DLQ declared, a DLQ declared but absent from the
+/// broker, and an enqueue that failed. Callers use this to decide whether the
+/// message still exists somewhere before asserting a discard.
 async fn route_reject(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     mut env: Envelope,
-) {
+) -> bool {
     let Some(dlq_name) = topology.dlq() else {
         tracing::warn!(
             queue = topology.queue(),
             "message rejected but no DLQ configured — discarding"
         );
-        return;
+        return false;
     };
     let Ok(dlq) = broker.lookup(dlq_name) else {
         tracing::error!(queue = dlq_name, "DLQ declared but not found in broker");
-        return;
+        return false;
     };
 
     env.headers
@@ -921,28 +922,37 @@ async fn route_reject(
 
     if let Err(e) = broker.enqueue(&dlq, env).await {
         tracing::warn!(queue = dlq_name, error = %e, "DLQ enqueue failed — message lost");
+        return false;
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
 // Handler invocation
 // ---------------------------------------------------------------------------
 
-/// Prepare a message for handling: validate size and deserialize. Returns
-/// `Err(Outcome::Reject)` when the message should be rejected before the
-/// handler runs.
+/// Prepare a message for handling: validate size and deserialize.
+///
+/// Returns `Err(reason)` when the message must be rejected before the handler
+/// runs. The failure is deliberately *not* recorded here. Both rejections are
+/// terminal — a message that is too large or does not decode will be no
+/// smaller and no more decodable on redelivery — so they land in the same
+/// reject funnel as a handler `Reject`, and that funnel records the terminal
+/// metric. Recording here as well is how the same message came to increment
+/// `messages_failed_total` twice, once as `oversize`/`deserialize` and again
+/// as `rejected`, and to be discarded under `reason="rejected"` — which hides
+/// the actual cause from exactly the alert that needs it.
 fn prepare_message<T: Topic>(
     env: &Envelope,
     max_size: Option<usize>,
     topic: &str,
     group: Option<&str>,
-) -> std::result::Result<(T::Message, MessageMetadata), Outcome> {
+) -> std::result::Result<(T::Message, MessageMetadata), metrics::FailReason> {
     metrics::record_message_size(topic, group, env.payload.len());
 
     if let Err(e) = validate_message_size(env.payload.len(), max_size) {
         tracing::warn!(error = %e, "rejecting oversized message");
-        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
-        return Err(Outcome::Reject);
+        return Err(metrics::FailReason::Oversize);
     }
 
     let message: T::Message =
@@ -950,21 +960,31 @@ fn prepare_message<T: Topic>(
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to deserialize message — rejecting");
-                metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
-                return Err(Outcome::Reject);
+                return Err(metrics::FailReason::Deserialize);
             }
         };
 
     Ok((message, metadata_from(env)))
 }
 
-/// Await the handler with an optional timeout, mapping timeouts to `Retry`.
+/// A handler outcome plus, when the message never reached the handler, the
+/// reason it was rejected.
+///
+/// `Some(reason)` overrides the reason the terminal funnel would otherwise
+/// derive from [`decide_retry`], which only knows that the outcome was
+/// `Reject` and would label an oversize or undecodable message `rejected`.
+type Handled = (Outcome, Option<metrics::FailReason>);
+
+/// Await the handler with an optional timeout, resolving a timeout through
+/// [`handler_timeout_outcome`].
+#[allow(clippy::too_many_arguments)]
 async fn run_handler<T, H>(
     handler: Arc<H>,
     ctx: Arc<H::Context>,
     message: T::Message,
     metadata: MessageMetadata,
     timeout_opt: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -977,9 +997,10 @@ where
             match tokio::time::timeout(timeout_dur, handler.handle(message, metadata, &ctx)).await {
                 Ok(o) => o,
                 Err(_) => {
-                    tracing::warn!(timeout = ?timeout_dur, "handler timed out — retrying");
+                    let resolved = handler_timeout_outcome(timeout_outcome);
+                    tracing::warn!(timeout = ?timeout_dur, outcome = ?resolved, "handler timed out");
                     metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                    Outcome::Retry
+                    resolved
                 }
             }
         }
@@ -989,32 +1010,43 @@ where
 
 /// Direct handler invocation. The caller is responsible for catching panics
 /// (the concurrent path relies on `JoinSet::join_next_with_id` for this).
+#[allow(clippy::too_many_arguments)]
 async fn invoke_handler<T, H>(
     handler: Arc<H>,
     ctx: Arc<H::Context>,
     env: &Envelope,
     max_size: Option<usize>,
     timeout_opt: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
-) -> Routed
+) -> Handled
 where
     T: Topic,
     H: MessageHandler<T>,
 {
     let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
         Ok(pair) => pair,
-        Err(o) => return Routed::pre_counted(o),
+        Err(reason) => return (Outcome::Reject, Some(reason)),
     };
 
     let _inflight = metrics::InflightGuard::from_refs(topic, group);
     let start = std::time::Instant::now();
-    let outcome =
-        run_handler::<T, H>(handler, ctx, message, metadata, timeout_opt, topic, group).await;
+    let outcome = run_handler::<T, H>(
+        handler,
+        ctx,
+        message,
+        metadata,
+        timeout_opt,
+        timeout_outcome,
+        topic,
+        group,
+    )
+    .await;
     let elapsed = start.elapsed().as_secs_f64();
     metrics::record_consumed(topic, group, &outcome);
     metrics::record_processing_duration(topic, group, &outcome, elapsed);
-    Routed::handled(outcome)
+    (outcome, None)
 }
 
 /// Runs the handler with panic-catching and shutdown-awareness for paths
@@ -1027,11 +1059,12 @@ async fn invoke_handler_caught<T, H>(
     env: &Envelope,
     max_size: Option<usize>,
     timeout_opt: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     shutdown: &CancellationToken,
     broker_shutdown: &CancellationToken,
     topic: &str,
     group: Option<&str>,
-) -> Option<Routed>
+) -> Option<Handled>
 where
     T: Topic,
     H: MessageHandler<T>,
@@ -1041,7 +1074,7 @@ where
     // on every FIFO message.
     let (message, metadata) = match prepare_message::<T>(env, max_size, topic, group) {
         Ok(pair) => pair,
-        Err(o) => return Some(Routed::pre_counted(o)),
+        Err(reason) => return Some((Outcome::Reject, Some(reason))),
     };
 
     let topic_owned: std::sync::Arc<str> = std::sync::Arc::from(topic);
@@ -1059,6 +1092,7 @@ where
                 message,
                 metadata,
                 timeout_opt,
+                timeout_outcome,
                 &topic_owned,
                 group_owned.as_deref(),
             )
@@ -1081,7 +1115,7 @@ where
         metrics::record_consumed(&topic_owned, group_owned.as_deref(), o);
         metrics::record_processing_duration(&topic_owned, group_owned.as_deref(), o, elapsed);
     }
-    outcome_opt.map(Routed::handled)
+    outcome_opt.map(|o| (o, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,10 +1128,14 @@ fn message_id_of(headers: &HashMap<String, String>) -> &str {
 
 /// Log a message the in-process broker destroyed at shutdown.
 ///
-/// These drops are deliberately not counted in `messages_failed_total`; the
-/// reasoning is on `metrics::FailReason`. This is the only surface they have,
-/// so every field an operator would need to identify the lost message belongs
-/// here.
+/// These drops are deliberately not counted in `messages_failed_total` (see
+/// [`metrics::FailReason`]), so this log line is the *only* evidence they
+/// happened — which is why every arm that destroys the sole envelope has to
+/// call it, and has to carry the message id.
+///
+/// Takes the id as `&str` rather than the headers because the arm that needs
+/// it most fires *after* the envelope was moved into `enqueue`; the caller
+/// hoists the id before the move.
 fn warn_shutdown_drop(shard_name: &str, key: &str, message_id: &str, reason: &'static str) {
     tracing::warn!(
         shard = %shard_name,

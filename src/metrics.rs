@@ -50,6 +50,7 @@ fn prefix() -> &'static str {
 pub(crate) struct MetricNames {
     pub messages_consumed_total: String,
     pub messages_failed_total: String,
+    pub messages_discarded_total: String,
     pub messages_published_total: String,
     pub message_processing_duration_seconds: String,
     pub message_publish_duration_seconds: String,
@@ -69,6 +70,7 @@ pub(crate) fn names() -> &'static MetricNames {
         MetricNames {
             messages_consumed_total: format!("{p}_messages_consumed_total"),
             messages_failed_total: format!("{p}_messages_failed_total"),
+            messages_discarded_total: format!("{p}_messages_discarded_total"),
             messages_published_total: format!("{p}_messages_published_total"),
             message_processing_duration_seconds: format!("{p}_message_processing_duration_seconds"),
             message_publish_duration_seconds: format!("{p}_message_publish_duration_seconds"),
@@ -196,6 +198,14 @@ pub(crate) enum FailReason {
     /// *ordering* key — a topology/backoff problem — inside a handler-latency
     /// alert. Currently RabbitMQ-only; it is the only backend that implements
     /// hold-queue eviction.
+    ///
+    /// Counted once per dead-lettered message, so it does scale with the depth
+    /// behind the stuck key — deliberately, and not in conflict with the
+    /// cascade rule above. A cascade is excluded because the failure it
+    /// descends from was already counted; here nothing else counts these
+    /// messages at all, so skipping them would retire a whole key's backlog
+    /// with no failure metric anywhere. The number is the size of the loss,
+    /// which is what an operator alerting on this needs.
     SequenceTimeout,
 }
 
@@ -365,6 +375,174 @@ pub(crate) fn record_failed_n(topic: &str, group: Option<&str>, reason: FailReas
 #[cfg(not(feature = "metrics"))]
 #[allow(dead_code)] // Callers gated behind backend features.
 pub(crate) fn record_failed_n(_: &str, _: Option<&str>, _: FailReason, _: u64) {}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn record_discarded(topic: &str, group: Option<&str>, reason: FailReason) {
+    ::metrics::counter!(
+        names().messages_discarded_total.as_str(),
+        "topic" => topic.to_string(),
+        "consumer_group" => group_label(group).to_string(),
+        "reason" => reason.as_label(),
+    )
+    .increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
+
+/// Record a message being retired by a *terminal outcome* — retry-budget
+/// exhaustion or an explicit [`Outcome::Reject`] — and return the pending
+/// `messages_discarded_total` increment for the caller to [confirm] once the
+/// broker has actually retired the message.
+///
+/// Backends call this rather than [`record_failed`] directly, so the pairing
+/// cannot drift backend-to-backend: `messages_failed_total` counts everything
+/// that failed, `messages_discarded_total` counts the subset that was lost
+/// because there was nowhere to put it. A non-zero discard rate means data
+/// loss, and is the alerting signal that retry-budget exhaustion on a bare
+/// topology previously lacked entirely — it was visible only as a `WARN` line.
+///
+/// The failure is counted immediately because it already happened — the
+/// handler rejected the message or burned its last retry, and nothing the
+/// broker does next changes that. The *discard* is deliberately not, because
+/// it is a claim about the message no longer existing, and at this point the
+/// nack / delete / commit that retires it has not been issued yet. See
+/// [`PendingDiscard`].
+///
+/// Scope, in the two directions it is easy to get wrong:
+///
+/// - **Not everything that discards is counted.** Kafka counts the
+///   terminal-outcome path only; its pre-handler rejections (oversize,
+///   deserialize failure) route to the DLQ without passing through here.
+///   RabbitMQ and the in-memory backend fold every terminal path — pre-handler
+///   included — into one reject helper, so they are complete. Treat the counter
+///   as a lower bound on dropped messages, not a total.
+/// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never
+///   calls this: its reject path deletes nothing, it makes the message visible
+///   again for AWS-side redrive. See `backends::sns::router::route_reject`.
+///
+/// `has_dlq` is `topology.dlq().is_some()` at the call site.
+///
+/// [confirm]: PendingDiscard::confirm
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_terminal(
+    topic: &str,
+    group: Option<&str>,
+    reason: FailReason,
+    has_dlq: bool,
+) -> PendingDiscard {
+    record_failed(topic, group, reason);
+    pending_discard(topic, group, reason, has_dlq)
+}
+
+/// Track a pending discard *without* counting a failure.
+///
+/// For the one terminal path that retires a message it must not count as a
+/// failure: a [`SequenceFailure::FailAll`] cascade, where the message is
+/// dead-lettered as collateral of an already-counted failure rather than on
+/// its own merits. See [`FailReason`] for why that distinction matters.
+///
+/// The discard half still applies. `messages_failed_total` counts independent
+/// failures, but `messages_discarded_total` is a data-loss claim, and a
+/// cascaded message dropped with no DLQ is just as gone as any other.
+///
+/// [`SequenceFailure::FailAll`]: crate::topology::SequenceFailure
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn pending_discard(
+    topic: &str,
+    group: Option<&str>,
+    reason: FailReason,
+    has_dlq: bool,
+) -> PendingDiscard {
+    PendingDiscard {
+        topic: topic.to_string(),
+        group: group.map(str::to_string),
+        reason,
+        has_dlq,
+    }
+}
+
+/// A `messages_discarded_total` increment that has been *decided* but not yet
+/// *earned*.
+///
+/// `messages_discarded_total` carries a strong public guarantee: every
+/// increment is a message that no longer exists. Recording it at the moment a
+/// terminal outcome is decided breaks that guarantee, because the operation
+/// that retires the message can still fail — a `basic.nack` on a closing
+/// RabbitMQ channel, a transactional reject that never commits, a Redis `XACK`
+/// against a dropped connection. In each of those cases the delivery stays
+/// unacknowledged and the broker redelivers it, so a discard recorded up front
+/// is a false data-loss alert during exactly the backend outage an operator is
+/// already trying to read.
+///
+/// So the increment is held here and only applied when the caller confirms the
+/// retirement landed. The type is `#[must_use]`: a terminal path that neither
+/// confirms nor explicitly drops this is a compile-time warning, which is what
+/// keeps the accounting honest as new terminal paths are added.
+///
+/// Dropping it without confirming is the correct move when the message
+/// survived — the counter simply does not move, and `messages_failed_total`
+/// still records that processing failed.
+#[must_use = "a discard is not counted until `confirm`/`confirm_lost` is called; \
+              drop it explicitly when the message survived"]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) struct PendingDiscard {
+    topic: String,
+    group: Option<String>,
+    reason: FailReason,
+    has_dlq: bool,
+}
+
+#[allow(dead_code)] // Callers gated behind backend features.
+impl PendingDiscard {
+    /// The delivery is retired: the broker will not deliver it again.
+    ///
+    /// Records the discard when the topic declares no DLQ, so the message was
+    /// dropped rather than dead-lettered. With a DLQ configured the message
+    /// still exists — in the DLQ — so nothing is counted.
+    ///
+    /// Call this only against a broker-acknowledged retirement — a
+    /// server-confirmed ack (NATS `double_ack`), an `XACK` that reported
+    /// actually acknowledging the entry, or a synchronous commit that returned
+    /// `Ok`. Handing a message off to something that will retire it later does
+    /// not qualify: Kafka's concurrent consumer therefore carries the pending
+    /// record into its offset tracker rather than settling at hand-off, and
+    /// the tracker commits a batch containing a terminal offset with
+    /// `CommitMode::Sync` so there is a real acknowledgement to settle
+    /// against. See `backends::kafka::consumer::signal_completion`.
+    ///
+    /// Where a retirement is genuinely ambiguous — a commit that failed, a
+    /// partition revoked before its commit landed — settle with [`survived`]
+    /// instead. Undercounting a drop that did happen is acceptable;
+    /// counting one that did not defeats the purpose of the metric.
+    ///
+    /// [`survived`]: Self::survived
+    pub(crate) fn confirm(self) {
+        if !self.has_dlq {
+            record_discarded(&self.topic, self.group.as_deref(), self.reason);
+        }
+    }
+
+    /// The message is retired and the DLQ did not receive it.
+    ///
+    /// For backends that retire a delivery even when the dead-letter publish
+    /// failed, rather than looping a poison message forever. The message is
+    /// gone and nothing holds a copy, so this is data loss whether or not a
+    /// DLQ was configured — the case a plain [`confirm`] would miss, because
+    /// `has_dlq` describes the topology, not where the message ended up.
+    ///
+    /// [`confirm`]: Self::confirm
+    pub(crate) fn confirm_lost(self) {
+        record_discarded(&self.topic, self.group.as_deref(), self.reason);
+    }
+
+    /// The message survived — it was requeued, redelivered, or left pending.
+    ///
+    /// Records nothing. Exists so a call site can say so explicitly instead of
+    /// silencing the `must_use` with a `let _ =` that reads like an oversight.
+    pub(crate) fn survived(self) {}
+}
 
 #[cfg(feature = "metrics")]
 pub(crate) fn record_published(topic: &str, ok: bool) {
@@ -606,6 +784,10 @@ mod tests {
         assert_eq!(
             n.messages_failed_total.as_str(),
             "shove_messages_failed_total"
+        );
+        assert_eq!(
+            n.messages_discarded_total.as_str(),
+            "shove_messages_discarded_total"
         );
         assert_eq!(
             n.messages_published_total.as_str(),

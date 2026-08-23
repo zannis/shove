@@ -28,6 +28,7 @@ use super::constants::{
     BLOCK_MS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID, X_ORIGINAL_QUEUE,
     X_RETRY_COUNT, X_SEQUENCE_KEY,
 };
+use super::lease;
 use super::requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
 use super::topology::RedisTopologyDeclarer;
 
@@ -548,8 +549,14 @@ where
     // Hold a maintenance interest (reaper: XAUTOCLAIM recovery + acked-entry
     // trimming) for this stream while the consumer runs. The registry dedupes
     // per (client, stream, group), so N consumers still share one sidecar.
-    let _maintenance = (maintain == Maintain::Stream)
-        .then(|| super::maintenance::acquire(&client, stream, options.handler_timeout));
+    let _maintenance = (maintain == Maintain::Stream).then(|| {
+        super::maintenance::acquire(
+            &client,
+            stream,
+            options.handler_timeout,
+            options.handler_timeout_outcome.is_some(),
+        )
+    });
 
     // Pre-compute metric label arcs once — reused cheaply for every message.
     let topic_arc: Arc<str> = Arc::from(topic_name);
@@ -636,21 +643,48 @@ where
                     // headers alongside the internal fields.
                     let user_headers = Arc::new(user_headers);
 
+                    // Built before the pre-handler checks, not just around the
+                    // handler: every write below has to prove we still own the
+                    // entry first. With `prefetch > 1` the whole batch entered
+                    // our PEL on one XREADGROUP but is inspected serially, so a
+                    // late entry can already have been idle long enough for a
+                    // foreign reaper to reclaim and re-add it by the time we
+                    // look at it — and these paths dead-letter or ack without
+                    // any handler running, so nothing else would catch that.
+                    let pre_lease = lease::Lease {
+                        stream,
+                        group: &group,
+                        consumer: &consumer,
+                        entry_id: &entry_id,
+                    };
+                    let leased = options.handler_timeout_outcome.is_some();
+
                     // Extract payload — take ownership to avoid cloning on the hot path.
                     let payload_raw = match fields.remove(PAYLOAD_FIELD) {
                         Some(s) => s,
                         None => {
+                            if !may_act_on_entry(&mut conn, &pre_lease, leased, &"missing-payload")
+                                .await
+                            {
+                                continue;
+                            }
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
-                            // Counted only once the XACK lands. A failed XACK
-                            // leaves the entry in the PEL for a reclaim to
-                            // redeliver, and this arm will run again then —
+                            // Counted only once the XACK lands, and only when
+                            // it is *this* call that retired the entry. A
+                            // failed XACK leaves the entry in the PEL for a
+                            // reclaim to redeliver, and `Ok(false)` means a
+                            // reaper already retired it and a live copy
+                            // exists; this arm runs again in both cases, so
                             // counting here too would double-count one entry.
                             match xack(&mut conn, stream, &group, &entry_id).await {
-                                Ok(()) => metrics::record_failed(
+                                Ok(true) => metrics::record_failed(
                                     topic_name,
                                     consumer_group,
                                     metrics::FailReason::Malformed,
                                 ),
+                                Ok(false) => {
+                                    tracing::debug!(entry_id, "corrupt entry was already retired by a reaper — not counting");
+                                }
                                 Err(e) => {
                                     tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
                                     metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
@@ -676,9 +710,19 @@ where
                             sequence_key = %seq_key,
                             "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                         );
-                        // Cascade: intentionally not counted — see `metrics::FailReason`.
+                        // Collateral of an already-counted failure, so the
+                        // failure half is deliberately not counted again — see
+                        // `metrics::FailReason`. The discard half still
+                        // applies: a cascaded message dropped with no DLQ is
+                        // just as gone as any other.
+                        let pending = metrics::pending_discard(
+                            topic_name,
+                            consumer_group,
+                            metrics::FailReason::Rejected,
+                            topology.dlq().is_some(),
+                        );
                         fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
-                        route_to_dlq(
+                        let retired = match route_to_dlq(
                             &mut conn,
                             topology,
                             stream,
@@ -689,7 +733,25 @@ where
                             "rejected",
                             retry_count,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(retired) => retired,
+                            Err(e) => {
+                                // XADD to the DLQ failed; the entry stays in
+                                // the PEL for the reaper to redeliver, so
+                                // nothing was discarded.
+                                pending.survived();
+                                return Err(e);
+                            }
+                        };
+                        // `route_to_dlq` reports whether the XACK actually
+                        // acknowledged the entry — a lost lease means someone
+                        // else owns it and it is not retired here.
+                        if retired {
+                            pending.confirm();
+                        } else {
+                            pending.survived();
+                        }
                         continue;
                     }
 
@@ -697,6 +759,13 @@ where
                     if let Some(max) = options.max_message_size
                         && payload_raw.len() > max
                     {
+                        // Skip the whole entry, not just the DLQ write: a
+                        // reclaimed entry belongs to the reaper, and falling
+                        // through would hand an oversize payload to the
+                        // handler.
+                        if !may_act_on_entry(&mut conn, &pre_lease, leased, &"oversize").await {
+                            continue;
+                        }
                         tracing::warn!(
                             entry_id,
                             size = payload_raw.len(),
@@ -731,6 +800,11 @@ where
                     ) {
                         Ok(m) => m,
                         Err(e) => {
+                            if !may_act_on_entry(&mut conn, &pre_lease, leased, &"deserialize")
+                                .await
+                            {
+                                continue;
+                            }
                             tracing::warn!(
                                 error = %e,
                                 entry_id,
@@ -786,32 +860,73 @@ where
                         metrics::InflightGuard::new(topic_arc.clone(), group_arc.clone());
                     let start = std::time::Instant::now();
 
+                    // Resolving a timeout to an outcome makes this consumer an
+                    // actor at the deadline, racing any reaper — including one
+                    // in another process, which `maintenance` cannot reconcile
+                    // with — that sweeps at the same idle threshold. Hold the
+                    // entry's lease while the handler runs so no reaper reaches
+                    // that threshold, and re-check it before routing.
+                    let lease = lease::Lease {
+                        stream,
+                        group: &group,
+                        consumer: &consumer,
+                        entry_id: &entry_id,
+                    };
+                    let leased = options.handler_timeout_outcome.is_some();
+
                     let outcome_opt = match options.handler_timeout {
                         Some(timeout_dur) => {
-                            match tokio::time::timeout(
+                            match lease::run_under_lease(
+                                &mut conn,
+                                leased.then_some(&lease),
                                 timeout_dur,
                                 handler_clone.handle(msg, meta, &ctx_clone),
                             )
                             .await
                             {
-                                Ok(o) => Some(o),
+                                // A lease can be lost while the handler is
+                                // still running, so normal completion is
+                                // guarded exactly like a timeout: routing an
+                                // outcome onto an entry a reaper already
+                                // re-added is what produces the duplicate.
+                                Ok(o) => {
+                                    resolve_under_lease(&mut conn, &lease, leased, Some(o)).await
+                                }
                                 Err(_) => {
-                                    tracing::warn!(
-                                        entry_id,
-                                        timeout = ?timeout_dur,
-                                        "handler timed out — leaving in PEL for XAUTOCLAIM"
-                                    );
+                                    // With no override, do NOT ack: XAUTOCLAIM
+                                    // reclaims the entry after idle_ms, which
+                                    // redelivers without touching retry_count.
+                                    let resolved = options.handler_timeout_outcome.clone();
+                                    match resolved.as_ref() {
+                                        Some(o) => tracing::warn!(
+                                            entry_id,
+                                            timeout = ?timeout_dur,
+                                            outcome = ?o,
+                                            "handler timed out"
+                                        ),
+                                        None => tracing::warn!(
+                                            entry_id,
+                                            timeout = ?timeout_dur,
+                                            "handler timed out — leaving in PEL for XAUTOCLAIM"
+                                        ),
+                                    }
                                     metrics::record_failed(
                                         &topic_arc,
                                         group_arc.as_deref(),
                                         metrics::FailReason::Timeout,
                                     );
-                                    // Do NOT ack — XAUTOCLAIM will reclaim it after idle_ms.
-                                    None
+                                    resolve_under_lease(&mut conn, &lease, leased, resolved).await
                                 }
                             }
                         }
-                        None => Some(handler_clone.handle(msg, meta, &ctx_clone).await),
+                        None => Some(
+                            lease::catch_handler_panic(handler_clone.handle(
+                                msg,
+                                meta,
+                                &ctx_clone,
+                            ))
+                            .await,
+                        ),
                     };
 
                     let elapsed = start.elapsed().as_secs_f64();
@@ -913,7 +1028,12 @@ where
 
     // Same per-(client, stream, group) maintenance interest as the
     // sequential loop — see run_stream_loop_arc.
-    let _maintenance = super::maintenance::acquire(&client, stream, options.handler_timeout);
+    let _maintenance = super::maintenance::acquire(
+        &client,
+        stream,
+        options.handler_timeout,
+        options.handler_timeout_outcome.is_some(),
+    );
 
     let topic_arc: Arc<str> = Arc::from(topic_name);
     let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);
@@ -924,6 +1044,7 @@ where
     let max_retries = options.max_retries;
     let max_message_size = options.max_message_size;
     let handler_timeout = options.handler_timeout;
+    let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
     let processing = options.processing.clone();
 
     run_with_reconnect(&shutdown, stream, options.max_reconnect_attempts, || {
@@ -937,6 +1058,7 @@ where
         let semaphore = Arc::clone(&semaphore);
         let processing = Arc::clone(&processing);
         let group = group.clone();
+        let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
 
         async move {
             let mut conn = client.dedicated_conn().await?;
@@ -1010,21 +1132,48 @@ where
                     // headers alongside the internal fields.
                     let user_headers = Arc::new(user_headers);
 
+                    // Built before the pre-handler checks, not just around the
+                    // handler: every write below has to prove we still own the
+                    // entry first. With `prefetch > 1` the whole batch entered
+                    // our PEL on one XREADGROUP but is inspected serially, so a
+                    // late entry can already have been idle long enough for a
+                    // foreign reaper to reclaim and re-add it by the time we
+                    // look at it — and these paths dead-letter or ack without
+                    // any handler running, so nothing else would catch that.
+                    let pre_lease = lease::Lease {
+                        stream,
+                        group: &group,
+                        consumer: &consumer,
+                        entry_id: &entry_id,
+                    };
+                    let leased = handler_timeout_outcome_cfg.is_some();
+
                     // Extract payload — take ownership to avoid cloning on the hot path.
                     let payload_raw = match fields.remove(PAYLOAD_FIELD) {
                         Some(s) => s,
                         None => {
+                            if !may_act_on_entry(&mut conn, &pre_lease, leased, &"missing-payload")
+                                .await
+                            {
+                                continue;
+                            }
                             tracing::warn!(entry_id, "missing payload field — acking and skipping");
-                            // Counted only once the XACK lands. A failed XACK
-                            // leaves the entry in the PEL for a reclaim to
-                            // redeliver, and this arm will run again then —
+                            // Counted only once the XACK lands, and only when
+                            // it is *this* call that retired the entry. A
+                            // failed XACK leaves the entry in the PEL for a
+                            // reclaim to redeliver, and `Ok(false)` means a
+                            // reaper already retired it and a live copy
+                            // exists; this arm runs again in both cases, so
                             // counting here too would double-count one entry.
                             match xack(&mut conn, stream, &group, &entry_id).await {
-                                Ok(()) => metrics::record_failed(
+                                Ok(true) => metrics::record_failed(
                                     topic_name,
                                     consumer_group,
                                     metrics::FailReason::Malformed,
                                 ),
+                                Ok(false) => {
+                                    tracing::debug!(entry_id, "corrupt entry was already retired by a reaper — not counting");
+                                }
                                 Err(e) => {
                                     tracing::warn!(entry_id, error = %e, "XACK failed after skipping corrupt entry");
                                     metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
@@ -1042,6 +1191,13 @@ where
                     if let Some(max) = max_message_size
                         && payload_raw.len() > max
                     {
+                        // Skip the whole entry, not just the DLQ write: a
+                        // reclaimed entry belongs to the reaper, and falling
+                        // through would hand an oversize payload to the
+                        // handler.
+                        if !may_act_on_entry(&mut conn, &pre_lease, leased, &"oversize").await {
+                            continue;
+                        }
                         tracing::warn!(
                             entry_id,
                             size = payload_raw.len(),
@@ -1074,6 +1230,11 @@ where
                     ) {
                         Ok(m) => m,
                         Err(e) => {
+                            if !may_act_on_entry(&mut conn, &pre_lease, leased, &"deserialize")
+                                .await
+                            {
+                                continue;
+                            }
                             tracing::warn!(
                                 error = %e,
                                 entry_id,
@@ -1141,6 +1302,11 @@ where
                     let task_stream = stream.to_owned();
                     let task_processing = Arc::clone(&processing);
                     let task_semaphore = Arc::clone(&semaphore);
+                    let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
+                    // Every handler spawned in this reconnect cycle was read
+                    // under the same XREADGROUP identity, so that is the PEL
+                    // owner each task must renew its lease as.
+                    let task_consumer = consumer.clone();
 
                     fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     tokio::spawn(async move {
@@ -1148,31 +1314,80 @@ where
                             metrics::InflightGuard::new(task_topic.clone(), task_group_metric.clone());
                         let start = std::time::Instant::now();
 
+                        // See the non-concurrent path: an override makes this
+                        // task an actor at the deadline, so it must hold the
+                        // entry's lease against every reaper while it works.
+                        let lease = lease::Lease {
+                            stream: &task_stream,
+                            group: &task_group,
+                            consumer: &task_consumer,
+                            entry_id: &entry_id,
+                        };
+                        let leased = task_timeout_outcome.is_some();
+
                         let outcome_opt = match handler_timeout {
                             Some(timeout_dur) => {
-                                match tokio::time::timeout(
+                                match lease::run_under_lease(
+                                    &mut task_conn,
+                                    leased.then_some(&lease),
                                     timeout_dur,
                                     task_handler.handle(msg, meta, &task_ctx),
                                 )
                                 .await
                                 {
-                                    Ok(o) => Some(o),
+                                    // See the non-concurrent path: a lease lost
+                                    // mid-handler makes normal completion just
+                                    // as much of a race as a timeout.
+                                    Ok(o) => {
+                                        resolve_under_lease(
+                                            &mut task_conn,
+                                            &lease,
+                                            leased,
+                                            Some(o),
+                                        )
+                                        .await
+                                    }
                                     Err(_) => {
-                                        tracing::warn!(
-                                            entry_id,
-                                            timeout = ?timeout_dur,
-                                            "handler timed out — leaving in PEL for XAUTOCLAIM"
-                                        );
+                                        // See the non-concurrent path: `None`
+                                        // leaves the entry in the PEL for
+                                        // XAUTOCLAIM to reclaim.
+                                        let resolved = task_timeout_outcome.clone();
+                                        match resolved.as_ref() {
+                                            Some(o) => tracing::warn!(
+                                                entry_id,
+                                                timeout = ?timeout_dur,
+                                                outcome = ?o,
+                                                "handler timed out"
+                                            ),
+                                            None => tracing::warn!(
+                                                entry_id,
+                                                timeout = ?timeout_dur,
+                                                "handler timed out — leaving in PEL for XAUTOCLAIM"
+                                            ),
+                                        }
                                         metrics::record_failed(
                                             &task_topic,
                                             task_group_metric.as_deref(),
                                             metrics::FailReason::Timeout,
                                         );
-                                        None
+                                        resolve_under_lease(
+                                            &mut task_conn,
+                                            &lease,
+                                            leased,
+                                            resolved,
+                                        )
+                                        .await
                                     }
                                 }
                             }
-                            None => Some(task_handler.handle(msg, meta, &task_ctx).await),
+                            None => Some(
+                                lease::catch_handler_panic(task_handler.handle(
+                                    msg,
+                                    meta,
+                                    &task_ctx,
+                                ))
+                                .await,
+                            ),
                         };
 
                         let elapsed = start.elapsed().as_secs_f64();
@@ -1271,7 +1486,12 @@ async fn route_outcome(
                 "rejected" => metrics::FailReason::Rejected,
                 _ => metrics::FailReason::MaxRetriesExceeded,
             };
-            metrics::record_failed(topology.queue(), Some(group), fail_reason);
+            let pending = metrics::record_terminal(
+                topology.queue(),
+                Some(group),
+                fail_reason,
+                topology.dlq().is_some(),
+            );
             // Preserve the pre-refactor death counts: max-retries recorded
             // `retry_count + 1`, reject recorded `retry_count`.
             let death_count = if reason == "rejected" {
@@ -1279,7 +1499,7 @@ async fn route_outcome(
             } else {
                 retry_count.saturating_add(1)
             };
-            route_to_dlq(
+            let retired = match route_to_dlq(
                 conn,
                 topology,
                 stream,
@@ -1290,7 +1510,21 @@ async fn route_outcome(
                 reason,
                 death_count,
             )
-            .await?;
+            .await
+            {
+                Ok(retired) => retired,
+                Err(e) => {
+                    // XADD to the DLQ failed; the entry stays in the PEL for
+                    // the reaper to redeliver, so nothing was discarded.
+                    pending.survived();
+                    return Err(e);
+                }
+            };
+            if retired {
+                pending.confirm();
+            } else {
+                pending.survived();
+            }
         }
         RetryDecision::Hold { increment: true } => {
             let new_retry = retry_count.saturating_add(1);
@@ -1300,8 +1534,14 @@ async fn route_outcome(
                     entry_id,
                     "Retry but no hold queues — re-queueing immediately"
                 );
-                requeue_to_stream(conn, stream, fields, user_headers, new_retry).await;
-                if let Err(e) = xack(conn, stream, group, entry_id).await {
+                // Only ack once the replacement copy exists — see
+                // `requeue_to_stream`. On failure the entry stays in the PEL
+                // and the reaper redelivers it.
+                if requeue_to_stream(conn, stream, fields, user_headers, new_retry)
+                    .await
+                    .is_ok()
+                    && let Err(e) = xack(conn, stream, group, entry_id).await
+                {
                     tracing::warn!(stream, entry_id, error = %e, "XACK failed after immediate requeue");
                     metrics::record_backend_error(
                         metrics::BackendLabel::Redis,
@@ -1335,8 +1575,13 @@ async fn route_outcome(
                     entry_id,
                     "Defer but no hold queues — re-queueing immediately"
                 );
-                requeue_to_stream(conn, stream, fields, user_headers, retry_count).await;
-                if let Err(e) = xack(conn, stream, group, entry_id).await {
+                // Same ordering as the Retry arm above: the XADD is the copy,
+                // so a failed re-add must not be followed by an ack.
+                if requeue_to_stream(conn, stream, fields, user_headers, retry_count)
+                    .await
+                    .is_ok()
+                    && let Err(e) = xack(conn, stream, group, entry_id).await
+                {
                     tracing::warn!(stream, entry_id, error = %e, "XACK failed after defer requeue");
                     metrics::record_backend_error(
                         metrics::BackendLabel::Redis,
@@ -1398,6 +1643,12 @@ async fn route_to_hold(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Dead-letter `entry_id`, or drop it when the topology declares no DLQ.
+///
+/// Returns whether the entry was actually retired from the group — that is,
+/// whether the `XACK` landed. A failed `XACK` leaves the entry in the PEL, so
+/// the reaper reclaims and redelivers it and the message still exists; callers
+/// holding a [`metrics::PendingDiscard`] must not confirm it in that case.
 async fn route_to_dlq(
     conn: &mut RedisConnection,
     topology: &'static QueueTopology,
@@ -1408,19 +1659,35 @@ async fn route_to_dlq(
     user_headers: &HashMap<String, String>,
     reason: &str,
     death_count: u32,
-) -> Result<()> {
+) -> Result<bool> {
     let dlq = match topology.dlq() {
         Some(d) => d,
         None => {
             tracing::warn!(stream, entry_id, reason, "no DLQ configured — discarding");
-            if let Err(e) = xack(conn, stream, group, entry_id).await {
-                tracing::warn!(stream, entry_id, error = %e, "XACK failed while discarding (no DLQ)");
-                metrics::record_backend_error(
-                    metrics::BackendLabel::Redis,
-                    metrics::BackendErrorKind::Ack,
-                );
+            match xack(conn, stream, group, entry_id).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {
+                    // Nothing was acknowledged, so this call did not drop the
+                    // message — a reaper had already reclaimed the entry and
+                    // its re-added copy is live. Reporting a discard here
+                    // would count a message that still exists.
+                    tracing::warn!(
+                        stream,
+                        entry_id,
+                        "XACK acknowledged nothing while discarding (no DLQ) — \
+                         a reaper reclaimed the entry and owns its redelivery"
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::warn!(stream, entry_id, error = %e, "XACK failed while discarding (no DLQ)");
+                    metrics::record_backend_error(
+                        metrics::BackendLabel::Redis,
+                        metrics::BackendErrorKind::Ack,
+                    );
+                    return Ok(false);
+                }
             }
-            return Ok(());
         }
     };
 
@@ -1445,20 +1712,48 @@ async fn route_to_dlq(
         ShoveError::Connection(format!("XADD to DLQ failed: {e}"))
     })?;
 
-    if let Err(e) = xack(conn, stream, group, entry_id).await {
-        tracing::warn!(stream, entry_id, error = %e, "XACK failed after DLQ enqueue");
-        metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+    match xack(conn, stream, group, entry_id).await {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            // The DLQ copy is in place, but a reaper had already reclaimed and
+            // re-added the original, so its replacement is live too. The
+            // delivery was duplicated rather than retired by us.
+            tracing::warn!(
+                stream,
+                entry_id,
+                "XACK acknowledged nothing after DLQ enqueue — a reaper \
+                 reclaimed the entry, so a re-added copy survives alongside \
+                 the dead-lettered one"
+            );
+            Ok(false)
+        }
+        Err(e) => {
+            tracing::warn!(stream, entry_id, error = %e, "XACK failed after DLQ enqueue");
+            metrics::record_backend_error(
+                metrics::BackendLabel::Redis,
+                metrics::BackendErrorKind::Ack,
+            );
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
+/// Re-add the entry to its own stream, for a Retry/Defer with no hold queue.
+///
+/// Reports whether the replacement copy actually landed. The caller XACKs the
+/// original only on `Ok(())`: the XADD is what preserves the message, so
+/// acking after a failed XADD deletes the sole copy. That combination is
+/// reachable in practice — a Redis ACL that grants `XACK` but denies `XADD`
+/// (or a stream at `MAXLEN` with `NOMKSTREAM` semantics upstream) fails the
+/// re-add while the ack still succeeds — so the failure has to propagate
+/// instead of being logged and swallowed.
 async fn requeue_to_stream(
     conn: &mut RedisConnection,
     stream: &str,
     fields: &HashMap<String, String>,
     user_headers: &HashMap<String, String>,
     retry_count: u32,
-) {
+) -> Result<()> {
     // Pre-size: "XADD", stream, "*", all field pairs (internal + user headers,
     // one key filtered at runtime), 1 extra k/v pair.
     let arg_count = fields
@@ -1472,15 +1767,154 @@ async fn requeue_to_stream(
         cmd.arg(k).arg(v);
     }
     cmd.arg(X_RETRY_COUNT).arg(retry_count.to_string());
-    if let Err(e) = conn.query::<redis::Value>(&mut cmd).await {
-        tracing::warn!(error = %e, stream, "XADD on immediate requeue failed — message may be lost");
-    }
+    conn.query::<redis::Value>(&mut cmd).await.map(|_| ()).map_err(|e| {
+        tracing::warn!(error = %e, stream, "XADD on immediate requeue failed — leaving the entry in the PEL");
+        ShoveError::Connection(format!("XADD on immediate requeue failed: {e}"))
+    })
 }
 
-async fn xack(conn: &mut RedisConnection, stream: &str, group: &str, entry_id: &str) -> Result<()> {
+/// How many times a *failed* ownership check is retried before the outcome is
+/// routed anyway.
+///
+/// A check that answers "not yours" is believed immediately. A check that
+/// cannot answer at all is retried, because both readings of it are bad: see
+/// [`resolve_under_lease`].
+const OWNERSHIP_CHECK_ATTEMPTS: u32 = 3;
+
+/// Pause between [`OWNERSHIP_CHECK_ATTEMPTS`]. Short — the whole retry budget
+/// has to fit inside the margin the lease bought us, which is one renewal
+/// interval.
+const OWNERSHIP_CHECK_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Decide whether this consumer may apply `outcome` to the entry it holds.
+///
+/// Called on both paths that produce an outcome under a lease — a handler that
+/// returned normally and one that hit its deadline — because a lease can be
+/// lost either way. `leased` is false for consumers without
+/// `handler_timeout_outcome` set: they hold no lease, so there is nothing to
+/// check and `outcome` passes straight through (as does `None`, the "leave the
+/// timed-out entry to the reaper" case).
+///
+/// When a lease *is* held, the outcome is only returned if we still own the
+/// entry. Having lost it, a reaper already owns the entry's redelivery, and
+/// routing anyway would put our copy — a DLQ entry, a hold-queue entry, a
+/// requeue — on the stream *alongside* the reaper's re-add. Declining leaves
+/// exactly the reaper's copy, which is the behaviour this consumer would have
+/// had with no override at all.
+///
+/// ## Why an errored check is not treated as a loss
+///
+/// It used to be, on the reasoning that an entry left in the PEL is
+/// redelivered rather than dropped. That is only true when something is
+/// actually reclaiming: [`super::maintenance`] disables XAUTOCLAIM for the
+/// whole `(client, stream, group)` key as soon as one
+/// `without_handler_timeout()` consumer joins it, and a deployment may have no
+/// other process sweeping. Declining on an error can therefore strand the
+/// entry in the PEL indefinitely — a worse failure than the duplicate it
+/// avoids, and a silent one.
+///
+/// So the check is retried, and if it still cannot be answered the outcome is
+/// applied. Redis Streams delivery is at-least-once; a duplicate is within
+/// contract, a permanently stuck message is not.
+async fn resolve_under_lease(
+    conn: &mut RedisConnection,
+    lease: &lease::Lease<'_>,
+    leased: bool,
+    outcome: Option<Outcome>,
+) -> Option<Outcome> {
+    let outcome = outcome?;
+    may_act_on_entry(conn, lease, leased, &outcome)
+        .await
+        .then_some(outcome)
+}
+
+/// The ownership check behind [`resolve_under_lease`], as a plain predicate.
+///
+/// Split out because handler outcomes are not the only writes this consumer
+/// makes to an entry it may no longer own. A batch read with
+/// `XREADGROUP COUNT prefetch` puts every entry in our PEL at once, but they
+/// are inspected one at a time; an entry near the end of the batch can sit
+/// idle for most of the batch's processing time before it is even looked at.
+/// The pre-handler terminal paths — missing payload, oversize, undecodable —
+/// then dead-letter or ack it directly, without a handler ever running, so
+/// without this check they would write alongside a reaper's re-add exactly
+/// like an unguarded outcome would.
+///
+/// `action` is only used for logging; it is whatever the caller was about to
+/// do (an [`Outcome`], or a reason string on the pre-handler paths).
+async fn may_act_on_entry(
+    conn: &mut RedisConnection,
+    lease: &lease::Lease<'_>,
+    leased: bool,
+    // `+ Sync` so the `&dyn` stays `Send`: this is awaited inside the spawned
+    // per-key tasks of the sequenced path, whose futures must be `Send`.
+    action: &(dyn std::fmt::Debug + Sync),
+) -> bool {
+    if !leased {
+        return true;
+    }
+
+    let mut last_error = None;
+    for attempt in 0..OWNERSHIP_CHECK_ATTEMPTS {
+        match lease::touch(conn, lease).await {
+            Ok(true) => return true,
+            Ok(false) => {
+                tracing::warn!(
+                    stream = lease.stream,
+                    entry_id = lease.entry_id,
+                    ?action,
+                    "not routed — a reaper reclaimed the entry and now owns \
+                     its redelivery",
+                );
+                metrics::record_backend_error(
+                    metrics::BackendLabel::Redis,
+                    metrics::BackendErrorKind::Ack,
+                );
+                return false;
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt + 1 < OWNERSHIP_CHECK_ATTEMPTS {
+                    tokio::time::sleep(OWNERSHIP_CHECK_BACKOFF).await;
+                }
+            }
+        }
+    }
+
+    tracing::warn!(
+        stream = lease.stream,
+        entry_id = lease.entry_id,
+        ?action,
+        error = ?last_error.map(|e| e.to_string()),
+        attempts = OWNERSHIP_CHECK_ATTEMPTS,
+        "could not confirm entry ownership — acting anyway rather than risk \
+         stranding the entry; it may be delivered again",
+    );
+    metrics::record_backend_error(metrics::BackendLabel::Redis, metrics::BackendErrorKind::Ack);
+    true
+}
+
+/// Acknowledge `entry_id`, reporting whether **this** call is what retired it.
+///
+/// `XACK` replies with the number of entries it actually removed from the
+/// group's PEL, and Redis documents `0` as "nothing was acknowledged" — the
+/// entry was already gone. In this backend that is not a benign no-op: it is
+/// the signature of a reaper that reclaimed the entry, XADDed a replacement
+/// and XACKed the original while we were resolving an outcome for it. A live
+/// copy therefore still exists, so callers that treat an ack as "the message
+/// is gone" (the no-DLQ discard accounting) must not do so on `false`.
+///
+/// `Err` keeps its existing meaning: the command did not complete, so
+/// ownership is unknown and the entry is assumed to survive.
+async fn xack(
+    conn: &mut RedisConnection,
+    stream: &str,
+    group: &str,
+    entry_id: &str,
+) -> Result<bool> {
     conn.query::<i64>(redis::cmd("XACK").arg(stream).arg(group).arg(entry_id))
         .await
-        .map(|_| ())
+        .map(|acked| acked > 0)
         .map_err(|e| ShoveError::Connection(format!("XACK failed: {e}")))
 }
 

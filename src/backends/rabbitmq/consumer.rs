@@ -26,12 +26,15 @@ use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{hold_index, retries_exhausted};
+use crate::routing::{
+    drain_timeout_outcome, handler_timeout_outcome, hold_index, retries_exhausted,
+    shutdown_drain_timeout,
+};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
-use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
 use crate::{QueueTopology, RabbitMq};
 
 use super::map_lapin_error;
@@ -401,12 +404,14 @@ impl RabbitMqConsumer {
                                 );
                                 poisoned_keys.insert(key.clone());
                             }
-                            metrics::record_failed(
-                                &topic,
+                            router::route_reject(
+                                delivery,
+                                topology,
+                                &publisher,
                                 group.as_deref(),
                                 metrics::FailReason::Rejected,
-                            );
-                            router::route_reject(delivery, topology, &publisher).await?;
+                            )
+                            .await?;
                         }
                         in_flight_count -= 1;
 
@@ -507,15 +512,30 @@ impl RabbitMqConsumer {
                         in_flight_count
                     );
                     // Wait for all in-flight handlers to complete.
-                    let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
+                    // When a `handler_timeout` is set the handler is already
+                    // bounded by it and resolves its own timeout; this wait is
+                    // only a backstop so shutdown cannot hang on a channel that
+                    // never delivers. Hence the grace, and hence resolving to
+                    // the *configured* timeout outcome rather than assuming
+                    // Retry. With deadlines disabled the handler is still
+                    // running when this fires, so `drain_timeout_outcome` keeps
+                    // the backstop at Retry — see its docs.
+                    let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
                     for (key, state) in key_states.drain() {
                         if let KeyState::InFlight { received, outcome_rx } = state {
                             let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
                                 .await
                                 .unwrap_or_else(|_| {
-                                    warn!(queue, sequence_key = %key, "handler timed out during shutdown drain, retrying");
-                                    Ok(Outcome::Retry)
+                                    let resolved = drain_timeout_outcome(
+                                        options.handler_timeout,
+                                        options.handler_timeout_outcome.clone(),
+                                    );
+                                    warn!(queue, sequence_key = %key, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
+                                    Ok(resolved)
                                 })
+                                // A closed channel means the handler task
+                                // panicked or was aborted: no outcome exists,
+                                // so redeliver.
                                 .unwrap_or(Outcome::Retry);
                             let delivery = &received.delivery;
                             let retry_count = get_retry_count(delivery);
@@ -540,12 +560,15 @@ impl RabbitMqConsumer {
                                     .await;
                                 }
                                 Outcome::Reject => {
-                                    metrics::record_failed(
-                                        &topic,
+                                    router::route_reject(
+                                        delivery,
+                                        topology,
+                                        &publisher,
                                         group.as_deref(),
                                         metrics::FailReason::Rejected,
-                                    );
-                                    router::route_reject(delivery, topology, &publisher).await.ok();
+                                    )
+                                    .await
+                                    .ok();
                                 }
                                 Outcome::Defer => {
                                     if shard_hold_queues.is_empty() {
@@ -628,13 +651,17 @@ impl RabbitMqConsumer {
                         if let Some(pending) = pending_deliveries.remove(&key) {
                             for pd in pending {
                                 // Not a cascade: no already-counted failure
-                                // accounts for these. See `metrics::FailReason`.
-                                metrics::record_failed(
-                                    &topic,
+                                // accounts for these, so `route_reject` counts
+                                // one failure per dead-lettered message. See
+                                // `metrics::FailReason::SequenceTimeout`.
+                                router::route_reject(
+                                    &pd.delivery,
+                                    topology,
+                                    &publisher,
                                     group.as_deref(),
                                     metrics::FailReason::SequenceTimeout,
-                                );
-                                router::route_reject(&pd.delivery, topology, &publisher).await?;
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -656,7 +683,7 @@ impl RabbitMqConsumer {
                             "message with poisoned sequence key, sending to DLQ"
                         );
                         // Cascade: intentionally not counted — see `metrics::FailReason`.
-                        router::route_reject(delivery, topology, &publisher).await?;
+                        router::route_reject_cascade(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::Rejected).await?;
                         continue;
                     }
 
@@ -679,17 +706,12 @@ impl RabbitMqConsumer {
                             // Cascade: intentionally not counted — see `metrics::FailReason`.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
-                                    router::route_reject(&pd.delivery, topology, &publisher)
+                                    router::route_reject_cascade(&pd.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded)
                                         .await?;
                                 }
                             }
                         }
-                        metrics::record_failed(
-                            &topic,
-                            group.as_deref(),
-                            metrics::FailReason::MaxRetriesExceeded,
-                        );
-                        router::route_reject(delivery, topology, &publisher).await?;
+                        router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded).await?;
                         continue;
                     }
 
@@ -708,12 +730,7 @@ impl RabbitMqConsumer {
                                         limit,
                                         "per-key pending buffer full, rejecting to DLQ"
                                     );
-                                    metrics::record_failed(
-                                        &topic,
-                                        group.as_deref(),
-                                        metrics::FailReason::PendingFull,
-                                    );
-                                    router::route_reject(delivery, topology, &publisher).await?;
+                                    router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::PendingFull).await?;
                                     continue;
                                 }
                             }
@@ -754,12 +771,7 @@ impl RabbitMqConsumer {
                                             limit,
                                             "per-key pending buffer full, rejecting to DLQ"
                                         );
-                                        metrics::record_failed(
-                                            &topic,
-                                            group.as_deref(),
-                                            metrics::FailReason::PendingFull,
-                                        );
-                                        router::route_reject(delivery, topology, &publisher).await?;
+                                        router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::PendingFull).await?;
                                         continue;
                                     }
                                 }
@@ -805,6 +817,7 @@ impl RabbitMqConsumer {
                                 message,
                                 metadata,
                                 options.handler_timeout,
+                                options.handler_timeout_outcome.clone(),
                                 &completed_tx,
                                 seq_key.clone(),
                                 topic.clone(),
@@ -856,9 +869,15 @@ impl RabbitMqConsumer {
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
-                    router::route_reject(&pd.delivery, topology, publisher)
-                        .await
-                        .ok();
+                    router::route_reject_cascade(
+                        &pd.delivery,
+                        topology,
+                        publisher,
+                        group.as_deref(),
+                        metrics::FailReason::Rejected,
+                    )
+                    .await
+                    .ok();
                 }
             }
             return;
@@ -880,29 +899,42 @@ impl RabbitMqConsumer {
                     retry_count,
                     "buffered message exceeded max retries, sending to DLQ"
                 );
-                metrics::record_failed(
-                    topic,
-                    group.as_deref(),
-                    metrics::FailReason::MaxRetriesExceeded,
-                );
                 if on_failure == SequenceFailure::FailAll {
                     poisoned_keys.insert(key.to_string());
-                    router::route_reject(&received.delivery, topology, publisher)
-                        .await
-                        .ok();
                     // Reject remaining pending for this key too.
+                    router::route_reject(
+                        &received.delivery,
+                        topology,
+                        publisher,
+                        group.as_deref(),
+                        metrics::FailReason::MaxRetriesExceeded,
+                    )
+                    .await
+                    .ok();
                     // Cascade: intentionally not counted — see `metrics::FailReason`.
                     while let Some(pd) = pending.pop_front() {
-                        router::route_reject(&pd.delivery, topology, publisher)
-                            .await
-                            .ok();
+                        router::route_reject_cascade(
+                            &pd.delivery,
+                            topology,
+                            publisher,
+                            group.as_deref(),
+                            metrics::FailReason::MaxRetriesExceeded,
+                        )
+                        .await
+                        .ok();
                     }
                     pending_deliveries.remove(key);
                     return;
                 }
-                router::route_reject(&received.delivery, topology, publisher)
-                    .await
-                    .ok();
+                router::route_reject(
+                    &received.delivery,
+                    topology,
+                    publisher,
+                    group.as_deref(),
+                    metrics::FailReason::MaxRetriesExceeded,
+                )
+                .await
+                .ok();
                 continue;
             }
 
@@ -927,9 +959,15 @@ impl RabbitMqConsumer {
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {
-                            router::route_reject(&pd.delivery, topology, publisher)
-                                .await
-                                .ok();
+                            router::route_reject_cascade(
+                                &pd.delivery,
+                                topology,
+                                publisher,
+                                group.as_deref(),
+                                metrics::FailReason::Deserialize,
+                            )
+                            .await
+                            .ok();
                         }
                         pending_deliveries.remove(key);
                         return;
@@ -943,6 +981,7 @@ impl RabbitMqConsumer {
                         message,
                         metadata,
                         options.handler_timeout,
+                        options.handler_timeout_outcome.clone(),
                         completed_tx,
                         key.to_string(),
                         topic.clone(),
@@ -1087,8 +1126,27 @@ impl RabbitMqConsumer {
                         "shutdown signal, draining {} in-flight messages on {queue}",
                         in_flight.len()
                     );
+                    // Same backstop as the sharded consumer's drain: the handler
+                    // is already bounded by `handler_timeout` and resolves its
+                    // own timeout, so this only stops shutdown hanging on a
+                    // channel that never delivers. With deadlines disabled the
+                    // handler is still running when it fires, so
+                    // `drain_timeout_outcome` keeps it at Retry.
+                    let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
                     for pending in in_flight {
-                        let outcome = pending.outcome_rx.await.unwrap_or(Outcome::Retry);
+                        let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
+                            .await
+                            .unwrap_or_else(|_| {
+                                let resolved = drain_timeout_outcome(
+                                    options.handler_timeout,
+                                    options.handler_timeout_outcome.clone(),
+                                );
+                                warn!(queue, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
+                                Ok(resolved)
+                            })
+                            // A closed channel means the handler task panicked
+                            // or was aborted: no outcome exists, so redeliver.
+                            .unwrap_or(Outcome::Retry);
                         let retry_count = get_retry_count(&pending.received.delivery);
                         route_outcome(
                             &pending.received,
@@ -1118,12 +1176,7 @@ impl RabbitMqConsumer {
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
                         );
-                        metrics::record_failed(
-                            &topic,
-                            group.as_deref(),
-                            metrics::FailReason::MaxRetriesExceeded,
-                        );
-                        router::route_reject(&received.delivery, topology, &publisher).await?;
+                        router::route_reject(&received.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded).await?;
                         continue;
                     }
 
@@ -1147,6 +1200,7 @@ impl RabbitMqConsumer {
                             message,
                             metadata,
                             options.handler_timeout,
+                            options.handler_timeout_outcome.clone(),
                             &notify,
                             topic.clone(),
                             group.clone(),
@@ -1232,8 +1286,8 @@ async fn route_outcome(
     topology: &'static QueueTopology,
     publisher: &ChannelPublisher,
     retry_count: u32,
-    // Consumer-group label propagated to `metrics::record_failed` on
-    // `Outcome::Reject` — matches Kafka/NATS/Redis `route_outcome`.
+    // Consumer-group label propagated to the terminal metric that
+    // `router::route_reject` records — matches Kafka/NATS/Redis `route_outcome`.
     group: Option<&str>,
 ) -> Result<()> {
     let delivery = &received.delivery;
@@ -1250,8 +1304,14 @@ async fn route_outcome(
             .await
         }
         Outcome::Reject => {
-            metrics::record_failed(topology.queue(), group, metrics::FailReason::Rejected);
-            router::route_reject(delivery, topology, publisher).await
+            router::route_reject(
+                delivery,
+                topology,
+                publisher,
+                group,
+                metrics::FailReason::Rejected,
+            )
+            .await
         }
         Outcome::Defer => {
             router::route_defer(delivery, &received.payload, topology, publisher).await
@@ -1358,6 +1418,7 @@ async fn nack_requeue_all_pending(
 async fn invoke_handler<F>(
     fut: F,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     topic: &str,
     group: Option<&str>,
 ) -> Outcome
@@ -1376,9 +1437,10 @@ where
             }
             Err(_) => {
                 join.abort();
-                warn!("handler exceeded timeout ({duration:?}), retrying message");
+                let resolved = handler_timeout_outcome(timeout_outcome);
+                warn!(outcome = ?resolved, "handler exceeded timeout ({duration:?})");
                 metrics::record_failed(topic, group, metrics::FailReason::Timeout);
-                Outcome::Retry
+                resolved
             }
         },
         None => match join.await {
@@ -1404,6 +1466,7 @@ fn spawn_handler<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     notify: &Arc<Notify>,
     topic: Arc<str>,
     group: Option<Arc<str>>,
@@ -1420,6 +1483,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -1440,6 +1504,7 @@ fn spawn_handler_keyed<T, H>(
     message: T::Message,
     metadata: MessageMetadata,
     timeout: Option<Duration>,
+    timeout_outcome: Option<Outcome>,
     completed_tx: &mpsc::UnboundedSender<String>,
     key: String,
     topic: Arc<str>,
@@ -1457,6 +1522,7 @@ where
         let outcome = invoke_handler(
             async move { h.handle(message, metadata, c.as_ref()).await },
             timeout,
+            timeout_outcome,
             &topic,
             group.as_deref(),
         )
@@ -1490,10 +1556,15 @@ async fn try_deserialize_or_reject<T: Topic>(
             queue,
             "rejecting oversized message"
         );
-        metrics::record_failed(topic, group, metrics::FailReason::Oversize);
-        router::route_reject(&received.delivery, topology, publisher)
-            .await
-            .ok();
+        router::route_reject(
+            &received.delivery,
+            topology,
+            publisher,
+            group,
+            metrics::FailReason::Oversize,
+        )
+        .await
+        .ok();
         return None;
     }
     match <T::Codec as crate::Codec<T::Message>>::decode_owned(received.payload.clone()) {
@@ -1505,10 +1576,15 @@ async fn try_deserialize_or_reject<T: Topic>(
                 queue = %queue,
                 "failed to deserialize message"
             );
-            metrics::record_failed(topic, group, metrics::FailReason::Deserialize);
-            router::route_reject(&received.delivery, topology, publisher)
-                .await
-                .ok();
+            router::route_reject(
+                &received.delivery,
+                topology,
+                publisher,
+                group,
+                metrics::FailReason::Deserialize,
+            )
+            .await
+            .ok();
             None
         }
     }
@@ -1729,14 +1805,15 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_handler_returns_outcome_without_timeout() {
-        let outcome = invoke_handler(async { Outcome::Ack }, None, "test-topic", None).await;
+        let outcome = invoke_handler(async { Outcome::Ack }, None, None, "test-topic", None).await;
         assert!(matches!(outcome, Outcome::Ack));
     }
 
     #[tokio::test]
     async fn invoke_handler_returns_outcome_within_timeout() {
         let timeout = Some(Duration::from_secs(1));
-        let outcome = invoke_handler(async { Outcome::Reject }, timeout, "test-topic", None).await;
+        let outcome =
+            invoke_handler(async { Outcome::Reject }, timeout, None, "test-topic", None).await;
         assert!(matches!(outcome, Outcome::Reject));
     }
 
@@ -1749,6 +1826,7 @@ mod tests {
                 Outcome::Ack
             },
             timeout,
+            None,
             "test-topic",
             None,
         )
@@ -1764,6 +1842,7 @@ mod tests {
         // metrics are recorded for the requeued message.
         let outcome = invoke_handler::<std::pin::Pin<Box<dyn Future<Output = Outcome> + Send>>>(
             Box::pin(async { panic!("boom") }),
+            None,
             None,
             "test-topic",
             None,

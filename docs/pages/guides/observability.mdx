@@ -62,6 +62,7 @@ shove::metrics::set_prefix("billing_shove");
 |---|---|---|
 | `shove_messages_consumed_total` | counter | `topic`, `consumer_group`, `outcome` |
 | `shove_messages_failed_total` | counter | `topic`, `consumer_group`, `reason` |
+| `shove_messages_discarded_total` | counter | `topic`, `consumer_group`, `reason` |
 | `shove_messages_published_total` | counter | `topic`, `outcome` |
 | `shove_message_processing_duration_seconds` | histogram | `topic`, `consumer_group`, `outcome` |
 | `shove_message_publish_duration_seconds` | histogram | `topic`, `outcome` |
@@ -93,9 +94,12 @@ shove::metrics::set_prefix("billing_shove");
 
   Everything above `timeout` happens *before* the handler runs; `timeout`, `max_retries_exceeded` and `rejected` are emitted after it runs. `sequence_timeout` is the odd one out: those messages never reach the handler either, but they are retired by an ordering decision rather than by anything about the message itself.
 
-  Two discard classes are deliberately **not** counted. On a sequenced topic using `SequenceFailure::FailAll`, only the message that actually failed is counted — the messages dead-lettered behind its poisoned key are collateral of that one already-counted failure, and counting them would scale the counter by queue depth. And the in-process backend's shutdown drops are log-only, because it has no durability to begin with and counting only the drops visible to consumer code would under-report by an unbounded amount. Both classes warn with the queue (or shard), the message id, and the sequence key where there is one.
+  Two discard classes are deliberately **not** counted *as failures*. On a sequenced topic using `SequenceFailure::FailAll`, only the message that actually failed is counted — the messages dead-lettered behind its poisoned key are collateral of that one already-counted failure, and counting them would scale the counter by queue depth. And the in-process backend's shutdown drops are log-only, because it has no durability to begin with and counting only the drops visible to consumer code would under-report by an unbounded amount. Both classes warn with the queue (or shard), the message id, and the sequence key where there is one.
+
+  The cascade exclusion applies to `messages_failed_total` only. A cascaded message dropped with no DLQ is just as gone as any other, so it still increments `messages_discarded_total` — see below.
 
   `malformed` is **Redis-only in practice**, which is why SQS is not listed against it. The SQS sequenced consumer carries the same guard for a message with no `MessageGroupId`, but `declare` creates sequenced shard queues as FIFO and SQS rejects a send with no group id outright, so the guard cannot fire on the supported topology. It is kept deliberately, against a future non-FIFO sequenced transport. Do not build an SQS alert on `malformed`.
+- `reason` on `messages_discarded_total`: the same values, minus the ones that cannot be terminal on the backend in question. This counter increments *in addition* to `messages_failed_total`, only when the message was actually retired with nowhere to go — the topic declares **no DLQ**, or a DLQ was declared and the publish to it failed. Any non-zero rate is data loss. It is not a strict subset of `messages_failed_total`: a `FailAll` cascade adds a discard without adding a failure. See [Alerting on silent discards](#alerting-on-silent-discards).
 - `direction` on `autoscaler_decisions_total`: `up`, `down`, `hold`.
 - `shove_autoscaler_messages_ready`, `shove_autoscaler_messages_in_flight`, and `shove_autoscaler_active_consumers` are emitted once per group on every autoscaler poll, carrying only the `consumer_group` label. They expose the raw signal the scaling decision is made from: backlog waiting, messages in flight, and the live consumer count. Watching `messages_ready` stay high while `active_consumers` is flat at `max` is the canonical "saturated / scaling commands not keeping up" signal.
 - `backend` on `backend_errors_total`: `inmemory`, `rabbitmq`, `kafka`, `nats`, `sns_sqs`, `redis`.
@@ -103,11 +107,40 @@ shove::metrics::set_prefix("billing_shove");
 - `topic`: the queue name from the topology (`QueueTopology::queue()`).
 - `consumer_group`: the group name set by a coordinated group registry, or `"default"` when the consumer was registered through `ConsumerSupervisor` directly.
 
-A message increments `shove_messages_failed_total` **at most once**: the pre-handler reasons and the dead-letter reasons are mutually exclusive for any given delivery, so a payload rejected by the oversize gate is counted as `oversize` and *not* additionally as `rejected`. Together with the two uncounted discard classes above, that makes `sum(rate(shove_messages_failed_total[5m]))` a usable count of retired-without-ack messages rather than an inflated one.
+**A pre-handler rejection is counted once, under its precise reason.** A payload rejected by the oversize gate is counted as `oversize` and *not* additionally as `rejected` when it is retired; the same holds for `deserialize`, `malformed`, and the schema-registry reasons. That is what makes the `reason` label trustworthy: `oversize` means the gate fired, not "something failed somewhere upstream of the DLQ".
+
+`shove_messages_failed_total` counts **failed attempts, not retired messages** — do not read its rate as a count of messages lost or dead-lettered. Two cases make one message contribute more than one increment:
+
+- **A handler timeout is counted every time it happens.** `timeout` is recorded when the deadline fires, whatever the timeout resolves to. With the default `Retry` (or `Defer`) the message is redelivered and survives, so a handler that times out on five attempts contributes five increments and may still eventually `Ack`.
+- **A timeout that resolves to a terminal outcome is counted twice.** `with_handler_timeout_outcome(Outcome::Reject)` records `timeout` for the deadline and then `rejected` for the retirement — and on `run_batch` the second is recorded once per message in the batch.
+
+If you want *retired-without-ack*, the counter you want is `shove_messages_discarded_total` (messages that were dropped with nowhere to go) plus your DLQ's own depth or ingest rate — not a rate over `messages_failed_total`.
 
 `shove_backend_errors_total` covers the most operationally-meaningful error sites (connection drops, topology conflicts, broker NACKs, consume-stream closures, ack failures); not every possible internal `Err` propagation produces a counter increment. Treat the counter as a "something is wrong with backend X" signal rather than an exhaustive error count.
 
 `shove_messages_published_total` increments once per message in a batch publish, matching what consumers see downstream. `shove_message_publish_duration_seconds` records one sample per batch (the user-observable call latency). Empty batches are no-ops and emit no events.
+
+### Alerting on silent discards
+
+A topic declared with a bare `TopologyBuilder::new("...").build()` has no DLQ. When such a message exhausts its retry budget — or a handler returns `Outcome::Reject` — there is nowhere to route it, so `shove` drops it. This is the intended behaviour for a topology that opted out of a DLQ, but it is easy to arrive at by accident, and until `shove_messages_discarded_total` existed the only evidence was a `WARN` log line.
+
+Alert on any discard at all:
+
+```
+sum(rate(shove_messages_discarded_total[5m])) by (topic, reason) > 0
+```
+
+Every increment is a message that no longer exists anywhere. The fix is almost always to give the topic a DLQ:
+
+```rust,no_run
+TopologyBuilder::new("prices").with_dlq("prices.dlq").build()
+```
+
+Three limits worth knowing:
+
+- **Coverage is per backend.** RabbitMQ and the in-memory backend funnel every terminal path through a single reject helper, so they count all of them — retry-budget exhaustion, explicit rejects, poisoned sequence keys, and pre-handler oversize/deserialize rejections. Kafka, NATS and Redis Streams count the terminal-outcome path; their pre-handler rejections route to the DLQ separately and are **not** counted. Treat the counter as a lower bound on dropped messages.
+- **SNS/SQS never increments it, by design.** SQS's terminal path deletes nothing: it sets the message's visibility timeout to zero, which hands it back to the queue. Whether it then reaches a DLQ is decided by the queue's AWS-side redrive policy, which `shove` does not own — and with no redrive policy the message cycles until the retention period expires rather than being discarded. Counting that as a discard would be wrong twice: the message still exists, and its receive count stays above the budget, so every later receive would count the same message again. On SQS, alert on the `WARN` line and on `shove_messages_failed_total{reason="max_retries_exceeded"}` instead, and configure a redrive policy on the queue.
+- **A slow handler that keeps timing out** will burn retry budget and eventually land here. If that is the failure mode you are seeing, `ConsumerOptions::with_handler_timeout_outcome` lets a timeout resolve to something other than `Retry` so a slow consumer stops consuming budget — see [Handlers](/concepts/handlers).
 
 ### Histogram buckets
 
