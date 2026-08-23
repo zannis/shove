@@ -143,6 +143,15 @@ impl<B: Backend> QueueDepthSampler<B> {
     /// a shutdown that arrives mid-poll drops the in-flight request rather
     /// than waiting out a broker that has stopped answering.
     ///
+    /// **The first poll happens after one `poll_interval`, not immediately**,
+    /// matching [`Autoscaler::run`]. So the gauges are absent for one interval
+    /// after startup — which is deliberate: a sampler spawned alongside
+    /// `declare` would otherwise race it and warn about a queue that does not
+    /// exist yet. Call [`sample_once`](Self::sample_once) before `run` if you
+    /// want a reading immediately and know the topology is already declared.
+    ///
+    /// [`Autoscaler::run`]: crate::autoscaler::Autoscaler::run
+    ///
     /// Returns without emitting anything if the watch set is empty — that is a
     /// misconfiguration, so it is logged rather than spun on.
     pub async fn run(self, shutdown: CancellationToken) {
