@@ -209,6 +209,38 @@ pub(crate) async fn route_reject(
     reason: metrics::FailReason,
 ) {
     metrics::record_failed(topology.queue(), group, reason);
+    reject_visibility(sqs, queue_url, receipt_handle, topology).await;
+}
+
+/// [`route_reject`] for a delivery released as collateral of a failure that has
+/// already been counted — a [`SequenceFailure::FailAll`] cascade behind a
+/// poisoned key.
+///
+/// Identical routing; it simply does not increment `messages_failed_total`,
+/// because the cascade's size tracks queue depth rather than a count of things
+/// that went wrong. See [`metrics::FailReason`].
+///
+/// This is deliberately a second function rather than a flag, so that the
+/// "every reject path must name its reason" property above extends to the
+/// accounting choice: a cascade cannot be introduced by omitting an argument.
+///
+/// [`SequenceFailure::FailAll`]: crate::topology::SequenceFailure
+pub(crate) async fn route_reject_cascade(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+    topology: &QueueTopology,
+) {
+    reject_visibility(sqs, queue_url, receipt_handle, topology).await;
+}
+
+/// Shared visibility-reset mechanics behind both reject entry points.
+async fn reject_visibility(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handle: &str,
+    topology: &QueueTopology,
+) {
     if topology.dlq().is_none() {
         warn!(
             queue_url,

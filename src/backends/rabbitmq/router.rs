@@ -160,6 +160,42 @@ pub(crate) async fn route_reject(
 ) -> Result<()> {
     let pending =
         metrics::record_terminal(topology.queue(), group, reason, topology.dlq().is_some());
+    reject_with(delivery, topology, publisher, pending).await
+}
+
+/// [`route_reject`] for a delivery being dead-lettered as collateral of a
+/// failure that has already been counted — a [`SequenceFailure::FailAll`]
+/// cascade behind a poisoned key.
+///
+/// Identical routing; the only difference is that it does not increment
+/// `messages_failed_total`, because the cascade's size is queue depth rather
+/// than a count of things that went wrong. See [`metrics::FailReason`].
+///
+/// It is a distinct function rather than a flag on `route_reject` so the
+/// call-site choice stays explicit, in the same spirit as `reason` being
+/// mandatory: a cascade site cannot be added by forgetting an argument.
+///
+/// [`SequenceFailure::FailAll`]: crate::topology::SequenceFailure
+pub(crate) async fn route_reject_cascade(
+    delivery: &Delivery,
+    topology: &QueueTopology,
+    publisher: &ChannelPublisher,
+    group: Option<&str>,
+    reason: metrics::FailReason,
+) -> Result<()> {
+    let pending =
+        metrics::pending_discard(topology.queue(), group, reason, topology.dlq().is_some());
+    reject_with(delivery, topology, publisher, pending).await
+}
+
+/// Shared nack/commit mechanics for both reject entry points. Takes the
+/// already-decided discard so the accounting choice stays with the caller.
+async fn reject_with(
+    delivery: &Delivery,
+    topology: &QueueTopology,
+    publisher: &ChannelPublisher,
+    pending: metrics::PendingDiscard,
+) -> Result<()> {
     if topology.dlq().is_none() {
         warn!(
             queue = topology.queue(),

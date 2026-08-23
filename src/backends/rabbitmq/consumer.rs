@@ -664,7 +664,8 @@ impl RabbitMqConsumer {
                             queue = %queue,
                             "message with poisoned sequence key, sending to DLQ"
                         );
-                        router::route_reject(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::Rejected).await?;
+                        // Cascade: intentionally not counted — see `metrics::FailReason`.
+                        router::route_reject_cascade(delivery, topology, &publisher, group.as_deref(), metrics::FailReason::Rejected).await?;
                         continue;
                     }
 
@@ -687,7 +688,7 @@ impl RabbitMqConsumer {
                             // Cascade: intentionally not counted — see `metrics::FailReason`.
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
-                                    router::route_reject(&pd.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded)
+                                    router::route_reject_cascade(&pd.delivery, topology, &publisher, group.as_deref(), metrics::FailReason::MaxRetriesExceeded)
                                         .await?;
                                 }
                             }
@@ -850,7 +851,7 @@ impl RabbitMqConsumer {
         if on_failure == SequenceFailure::FailAll && poisoned_keys.contains(key) {
             if let Some(pending) = pending_deliveries.remove(key) {
                 for pd in pending {
-                    router::route_reject(
+                    router::route_reject_cascade(
                         &pd.delivery,
                         topology,
                         publisher,
@@ -892,8 +893,9 @@ impl RabbitMqConsumer {
                     )
                     .await
                     .ok();
+                    // Cascade: intentionally not counted — see `metrics::FailReason`.
                     while let Some(pd) = pending.pop_front() {
-                        router::route_reject(
+                        router::route_reject_cascade(
                             &pd.delivery,
                             topology,
                             publisher,
@@ -939,7 +941,7 @@ impl RabbitMqConsumer {
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
                         while let Some(pd) = pending.pop_front() {
-                            router::route_reject(
+                            router::route_reject_cascade(
                                 &pd.delivery,
                                 topology,
                                 publisher,

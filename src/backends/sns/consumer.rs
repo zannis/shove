@@ -1213,15 +1213,9 @@ where
                             queue_url,
                             "message with poisoned sequence key, rejecting"
                         );
-                        router::route_reject(
-                            sqs,
-                            queue_url,
-                            &receipt_handle,
-                            topology,
-                            group.as_deref(),
-                            metrics::FailReason::Rejected,
-                        )
-                        .await;
+                        // Cascade: intentionally not counted — see `metrics::FailReason`.
+                        router::route_reject_cascade(sqs, queue_url, &receipt_handle, topology)
+                            .await;
                         continue;
                     }
 
@@ -1245,15 +1239,8 @@ where
                             if let Some(pending) = pending_deliveries.remove(&seq_key) {
                                 for pd in pending {
                                     let rh = pd.receipt_handle().unwrap_or_default();
-                                    router::route_reject(
-                                        sqs,
-                                        queue_url,
-                                        rh,
-                                        topology,
-                                        group.as_deref(),
-                                        metrics::FailReason::Rejected,
-                                    )
-                                    .await;
+                                    router::route_reject_cascade(sqs, queue_url, rh, topology)
+                                        .await;
                                 }
                             }
                         }
@@ -1480,15 +1467,7 @@ async fn drain_pending_for_key<T, H>(
         if let Some(pending) = pending_deliveries.remove(key) {
             for pd in pending {
                 let rh = pd.receipt_handle().unwrap_or_default();
-                router::route_reject(
-                    sqs,
-                    queue_url,
-                    rh,
-                    topology,
-                    group.as_deref(),
-                    metrics::FailReason::Rejected,
-                )
-                .await;
+                router::route_reject_cascade(sqs, queue_url, rh, topology).await;
             }
         }
         return;
@@ -1523,17 +1502,10 @@ async fn drain_pending_for_key<T, H>(
                     metrics::FailReason::MaxRetriesExceeded,
                 )
                 .await;
+                // Cascade: intentionally not counted — see `metrics::FailReason`.
                 while let Some(pd) = pending.pop_front() {
                     let rh = pd.receipt_handle().unwrap_or_default();
-                    router::route_reject(
-                        sqs,
-                        queue_url,
-                        rh,
-                        topology,
-                        group.as_deref(),
-                        metrics::FailReason::Rejected,
-                    )
-                    .await;
+                    router::route_reject_cascade(sqs, queue_url, rh, topology).await;
                 }
                 pending_deliveries.remove(key);
                 return;
@@ -1579,17 +1551,10 @@ async fn drain_pending_for_key<T, H>(
             .await;
             if on_failure == SequenceFailure::FailAll {
                 poisoned_keys.insert(key.to_string());
+                // Cascade: intentionally not counted — see `metrics::FailReason`.
                 while let Some(pd) = pending.pop_front() {
                     let rh = pd.receipt_handle().unwrap_or_default();
-                    router::route_reject(
-                        sqs,
-                        queue_url,
-                        rh,
-                        topology,
-                        group.as_deref(),
-                        metrics::FailReason::Rejected,
-                    )
-                    .await;
+                    router::route_reject_cascade(sqs, queue_url, rh, topology).await;
                 }
                 pending_deliveries.remove(key);
                 return;
@@ -1620,17 +1585,10 @@ async fn drain_pending_for_key<T, H>(
                     .await;
                     if on_failure == SequenceFailure::FailAll {
                         poisoned_keys.insert(key.to_string());
+                        // Cascade: intentionally not counted — see `metrics::FailReason`.
                         while let Some(pd) = pending.pop_front() {
                             let rh = pd.receipt_handle().unwrap_or_default();
-                            router::route_reject(
-                                sqs,
-                                queue_url,
-                                rh,
-                                topology,
-                                group.as_deref(),
-                                metrics::FailReason::Rejected,
-                            )
-                            .await;
+                            router::route_reject_cascade(sqs, queue_url, rh, topology).await;
                         }
                         pending_deliveries.remove(key);
                         return;
