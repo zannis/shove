@@ -28,6 +28,7 @@ use super::constants::{
     BLOCK_MS, PAYLOAD_FIELD, X_DEATH_COUNT, X_DEATH_REASON, X_MESSAGE_ID, X_ORIGINAL_QUEUE,
     X_RETRY_COUNT, X_SEQUENCE_KEY,
 };
+use super::lease;
 use super::requeue::{HoldEntry, enqueue_hold, spawn_requeuer};
 use super::topology::RedisTopologyDeclarer;
 
@@ -714,9 +715,25 @@ where
                         metrics::InflightGuard::new(topic_arc.clone(), group_arc.clone());
                     let start = std::time::Instant::now();
 
+                    // Resolving a timeout to an outcome makes this consumer an
+                    // actor at the deadline, racing any reaper — including one
+                    // in another process, which `maintenance` cannot reconcile
+                    // with — that sweeps at the same idle threshold. Hold the
+                    // entry's lease while the handler runs so no reaper reaches
+                    // that threshold, and re-check it before routing.
+                    let lease = lease::Lease {
+                        stream,
+                        group: &group,
+                        consumer: &consumer,
+                        entry_id: &entry_id,
+                    };
+                    let leased = options.handler_timeout_outcome.is_some();
+
                     let outcome_opt = match options.handler_timeout {
                         Some(timeout_dur) => {
-                            match tokio::time::timeout(
+                            match lease::run_under_lease(
+                                &mut conn,
+                                leased.then_some(&lease),
                                 timeout_dur,
                                 handler_clone.handle(msg, meta, &ctx_clone),
                             )
@@ -746,7 +763,7 @@ where
                                         group_arc.as_deref(),
                                         metrics::FailReason::Timeout,
                                     );
-                                    resolved
+                                    resolve_timeout_outcome(&mut conn, &lease, resolved).await
                                 }
                             }
                         }
@@ -1057,6 +1074,10 @@ where
                     let task_processing = Arc::clone(&processing);
                     let task_semaphore = Arc::clone(&semaphore);
                     let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
+                    // Every handler spawned in this reconnect cycle was read
+                    // under the same XREADGROUP identity, so that is the PEL
+                    // owner each task must renew its lease as.
+                    let task_consumer = consumer.clone();
 
                     fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     tokio::spawn(async move {
@@ -1064,9 +1085,22 @@ where
                             metrics::InflightGuard::new(task_topic.clone(), task_group_metric.clone());
                         let start = std::time::Instant::now();
 
+                        // See the non-concurrent path: an override makes this
+                        // task an actor at the deadline, so it must hold the
+                        // entry's lease against every reaper while it works.
+                        let lease = lease::Lease {
+                            stream: &task_stream,
+                            group: &task_group,
+                            consumer: &task_consumer,
+                            entry_id: &entry_id,
+                        };
+                        let leased = task_timeout_outcome.is_some();
+
                         let outcome_opt = match handler_timeout {
                             Some(timeout_dur) => {
-                                match tokio::time::timeout(
+                                match lease::run_under_lease(
+                                    &mut task_conn,
+                                    leased.then_some(&lease),
                                     timeout_dur,
                                     task_handler.handle(msg, meta, &task_ctx),
                                 )
@@ -1096,7 +1130,12 @@ where
                                             task_group_metric.as_deref(),
                                             metrics::FailReason::Timeout,
                                         );
-                                        resolved
+                                        resolve_timeout_outcome(
+                                            &mut task_conn,
+                                            &lease,
+                                            resolved,
+                                        )
+                                        .await
                                     }
                                 }
                             }
@@ -1392,6 +1431,50 @@ async fn requeue_to_stream(
     cmd.arg(X_RETRY_COUNT).arg(retry_count.to_string());
     if let Err(e) = conn.query::<redis::Value>(&mut cmd).await {
         tracing::warn!(error = %e, stream, "XADD on immediate requeue failed — message may be lost");
+    }
+}
+
+/// Decide whether a timed-out handler's configured outcome may still be
+/// routed onto the entry it timed out on.
+///
+/// `resolved` is the consumer's `handler_timeout_outcome`; `None` means the
+/// consumer leaves timed-out entries to the reaper and there is nothing to
+/// guard. Otherwise the outcome is only returned if this consumer still holds
+/// the entry's lease. Having lost it, a reaper already owns the entry's
+/// redelivery, and routing anyway would put the owner's copy — a DLQ entry, a
+/// hold-queue entry, a requeue — on the stream *alongside* the reaper's
+/// re-add. Declining leaves exactly the reaper's copy, which is the behaviour
+/// this consumer would have had with no override at all.
+///
+/// A renewal that errors is treated as lost for the same reason: an entry left
+/// in the PEL is redelivered, never dropped.
+async fn resolve_timeout_outcome(
+    conn: &mut RedisConnection,
+    lease: &lease::Lease<'_>,
+    resolved: Option<Outcome>,
+) -> Option<Outcome> {
+    let outcome = resolved?;
+    match lease::touch(conn, lease).await {
+        Ok(true) => Some(outcome),
+        Ok(false) => {
+            tracing::warn!(
+                stream = lease.stream,
+                entry_id = lease.entry_id,
+                "handler-timeout outcome not routed — a reaper reclaimed the \
+                 entry and now owns its redelivery",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                stream = lease.stream,
+                entry_id = lease.entry_id,
+                error = %e,
+                "could not confirm entry ownership — leaving the timed-out \
+                 entry in the PEL for XAUTOCLAIM",
+            );
+            None
+        }
     }
 }
 
