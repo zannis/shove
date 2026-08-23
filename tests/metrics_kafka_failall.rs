@@ -13,9 +13,11 @@
 //! Nothing in CI could catch a violation of that rule here. #73 brought
 //! `FailAll` to Kafka with a `record_failed(.., Rejected)` on the poisoned-key
 //! arm, and it survived review and merge because the rule was pinned by exactly
-//! one in-memory test. #86 removed the call; the site now reads
-//! `// Cascade: intentionally not counted` (`src/backends/kafka/consumer.rs`).
-//! This test is what makes putting it back go red.
+//! one in-memory test. #86 removed the call, and the poisoned-key arm in
+//! `src/backends/kafka/consumer.rs` now takes a `metrics::pending_discard`
+//! record and nothing else — the discard half of the accounting, which stays
+//! inert while a DLQ exists, with no failure counted either way. This test is
+//! what makes putting a `record_failed` back go red.
 //!
 //! # Why the assertion is exact rather than incidental
 //!
