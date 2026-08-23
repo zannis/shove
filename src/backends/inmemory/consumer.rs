@@ -872,7 +872,9 @@ fn prepare_message<T: Topic>(
     Ok((message, metadata_from(env)))
 }
 
-/// Await the handler with an optional timeout, mapping timeouts to `Retry`.
+/// Await the handler with an optional timeout, resolving a timeout through
+/// [`handler_timeout_outcome`].
+#[allow(clippy::too_many_arguments)]
 async fn run_handler<T, H>(
     handler: Arc<H>,
     ctx: Arc<H::Context>,
@@ -905,6 +907,7 @@ where
 
 /// Direct handler invocation. The caller is responsible for catching panics
 /// (the concurrent path relies on `JoinSet::join_next_with_id` for this).
+#[allow(clippy::too_many_arguments)]
 async fn invoke_handler<T, H>(
     handler: Arc<H>,
     ctx: Arc<H::Context>,

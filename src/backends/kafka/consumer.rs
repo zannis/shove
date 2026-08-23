@@ -1264,6 +1264,7 @@ impl KafkaConsumer {
             let semaphore = semaphore.clone();
             let topic = topic.clone();
             let group = group.clone();
+            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
@@ -1609,6 +1610,7 @@ impl KafkaConsumer {
                             let task_ctx = ctx.clone();
                             let task_group = group.clone();
                             let task_shutdown = shutdown.clone();
+                            let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
 
                             // perf-K-7: single spawn per message (was three).
                             // invoke_handler awaits the handler with catch_unwind +
@@ -1624,7 +1626,7 @@ impl KafkaConsumer {
                                             .await
                                     },
                                     handler_timeout,
-                                    handler_timeout_outcome_cfg.clone(),
+                                    task_timeout_outcome,
                                     &task_topic,
                                     task_group.as_deref(),
                                 )
@@ -1791,6 +1793,7 @@ impl KafkaConsumer {
                 let queue = queue.clone();
                 let topic = topic.clone();
                 let group = group.clone();
+                let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
                 #[cfg(feature = "kafka-schema-registry")]
                 let schema_registry = schema_registry.clone();
                 #[cfg(feature = "kafka-schema-registry")]
