@@ -185,12 +185,12 @@ impl<B: Backend> QueueDepthSampler<B> {
     }
 }
 
-#[cfg(test)]
+// Every assertion below borrows the in-memory backend's provider type, so the
+// whole module is gated rather than each item.
+#[cfg(all(test, feature = "inmemory"))]
 mod tests {
     use super::*;
-    #[cfg(feature = "inmemory")]
     use crate::inmemory::InMemoryBroker;
-    #[cfg(feature = "inmemory")]
     use crate::markers::InMemory;
     use crate::topology::{QueueTopology, TopologyBuilder};
 
@@ -205,21 +205,18 @@ mod tests {
     }
 
     /// The builder is generic over `B` but none of these assertions need a
-    /// live broker, so borrow the in-memory backend's provider type.
-    #[cfg(feature = "inmemory")]
+    /// live broker.
     fn sampler() -> QueueDepthSampler<InMemory> {
         let client = InMemoryBroker::new();
         QueueDepthSampler::new(<InMemory as Backend>::make_stats_provider(&client))
     }
 
-    #[cfg(feature = "inmemory")]
     #[test]
     fn watch_dedupes_and_preserves_order() {
         let s = sampler().watch("b").watch("a").watch("b");
         assert_eq!(s.queues(), ["b", "a"]);
     }
 
-    #[cfg(feature = "inmemory")]
     #[test]
     fn watch_topic_takes_the_name_from_the_topology() {
         let s = sampler().watch_topic::<Orders>();
@@ -229,7 +226,6 @@ mod tests {
         assert_eq!(s.watch("orders").queues(), ["orders"]);
     }
 
-    #[cfg(feature = "inmemory")]
     #[test]
     fn poll_interval_defaults_and_overrides() {
         assert_eq!(sampler().poll_interval, DEFAULT_POLL_INTERVAL);
@@ -240,7 +236,6 @@ mod tests {
     /// An empty watch set must return, not spin: a sampler that never had a
     /// `watch` call is a misconfiguration, and a loop that wakes every 5 s to
     /// do nothing hides it.
-    #[cfg(feature = "inmemory")]
     #[tokio::test]
     async fn run_returns_immediately_with_no_queues() {
         let token = CancellationToken::new();
@@ -251,7 +246,6 @@ mod tests {
 
     /// A queue that does not exist makes `snapshot` fail. The sampler must
     /// swallow it and keep going rather than propagate or panic.
-    #[cfg(feature = "inmemory")]
     #[tokio::test]
     async fn sample_once_survives_a_failing_snapshot() {
         sampler().watch("no-such-queue").sample_once().await;
