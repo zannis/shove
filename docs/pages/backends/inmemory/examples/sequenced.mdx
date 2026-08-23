@@ -53,7 +53,7 @@ The main thread busy-loops on `acked.load(Ordering::Relaxed) < 15` (five sequenc
 
 ## What to try next
 
-- Change `SequenceFailure::FailAll` to `SequenceFailure::FailOne` — observe that only the individual failing message is retried; subsequent messages for the same account are not held back.
+- Change `SequenceFailure::FailAll` to `SequenceFailure::Skip` — observe that only the individual failing message is dead-lettered; subsequent messages for the same account are still processed.
 - Remove `.routing_shards(4)` — all keys collapse into a single shard; per-key parallelism disappears and throughput drops proportionally.
 - Add a second hold queue stage with `.hold_queue(Duration::from_secs(1))` — failed entries wait longer before redelivery.
 - Read [Guides: Sequenced](/guides/sequenced) for a deeper explanation of shard routing and failure modes.

@@ -306,6 +306,31 @@ impl SequencedTopic for LedgerTopic {
     }
 }
 
+/// CAF-84: a sequenced topic configured `FailAll`, with a DLQ so the poisoned
+/// messages have somewhere to land.
+struct FailAllTopic;
+impl Topic for FailAllTopic {
+    type Message = Event;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| {
+            TopologyBuilder::new("redis-int-failall")
+                .sequenced(SequenceFailure::FailAll)
+                .routing_shards(2)
+                .hold_queue(Duration::from_millis(100))
+                .dlq()
+                .build()
+        })
+    }
+    const SEQUENCE_KEY_FN: Option<fn(&Self::Message) -> String> = Some(FailAllTopic::sequence_key);
+}
+impl SequencedTopic for FailAllTopic {
+    fn sequence_key(msg: &Event) -> String {
+        msg.account.clone()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Publisher connection reuse
 // ---------------------------------------------------------------------------
@@ -827,6 +852,133 @@ async fn fifo_same_key_in_order() {
     assert_eq!(seqs.len(), 10, "expected 10 messages, got {}", seqs.len());
     let expected: Vec<u64> = (0..10).collect();
     assert_eq!(*seqs, expected, "messages must arrive in sequence order");
+}
+
+// ---------------------------------------------------------------------------
+// CAF-84: SequenceFailure::FailAll must poison the failing key on Redis
+// ---------------------------------------------------------------------------
+
+/// `FailAll` must halt the failing sequence key, not silently behave like
+/// `Skip`. Redis carries the key as the `x-sequence-key` stream field, so this
+/// needed no wire change — only that the consumer reads `on_failure()` at all.
+#[tokio::test]
+async fn fifo_failall_poisons_same_key_after_reject() {
+    let broker = make_broker("redis-int-failall-grp").await;
+    broker
+        .topology()
+        .declare::<FailAllTopic>()
+        .await
+        .expect("declare");
+    let dlq = FailAllTopic::topology().dlq().expect("topic has a DLQ");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    for seq in 0..5u64 {
+        publisher
+            .publish::<FailAllTopic>(&Event {
+                account: "acct-A".into(),
+                seq,
+            })
+            .await
+            .expect("publish");
+    }
+    for seq in 0..3u64 {
+        publisher
+            .publish::<FailAllTopic>(&Event {
+                account: "acct-B".into(),
+                seq,
+            })
+            .await
+            .expect("publish");
+    }
+
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::<(String, u64)>::new()));
+
+    #[derive(Clone)]
+    struct H(Arc<tokio::sync::Mutex<Vec<(String, u64)>>>);
+    impl MessageHandler<FailAllTopic> for H {
+        type Context = ();
+        async fn handle(&self, msg: Event, _: MessageMetadata, _: &()) -> Outcome {
+            self.0.lock().await.push((msg.account.clone(), msg.seq));
+            if msg.account == "acct-A" && msg.seq == 2 {
+                Outcome::Reject
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    let seen_c = seen.clone();
+    let mut group = broker.consumer_group();
+    group
+        .register_fifo::<FailAllTopic, _>(
+            ConsumerGroupConfig::new(RedisConsumerGroupConfig::default().with_max_retries(0)),
+            move || H(Arc::clone(&seen_c)),
+        )
+        .await
+        .expect("register_fifo");
+
+    // acct-A/2 is rejected, then acct-A/3 and acct-A/4 are dead-lettered
+    // without reaching the handler → exactly 3 entries in the DLQ. acct-B is
+    // on its own shard task and must be handled normally, so wait for both
+    // conditions rather than assuming an interleaving.
+    let mut raw = redis::Client::open(redis_url().await)
+        .expect("raw client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let probe = seen.clone();
+    let signal = async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let dlq_len: i64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut raw)
+                .await
+                .unwrap_or(0);
+            let acct_b = probe
+                .try_lock()
+                .map(|v| v.iter().filter(|(a, _)| a == "acct-B").count())
+                .unwrap_or(0);
+            if (dlq_len >= 3 && acct_b >= 3) || std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    let outcome = group
+        .run_until_timeout(signal, Duration::from_secs(2))
+        .await;
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+    let mut raw = redis::Client::open(redis_url().await)
+        .expect("raw client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw conn");
+    let dlq_len: i64 = redis::cmd("XLEN")
+        .arg(dlq)
+        .query_async(&mut raw)
+        .await
+        .expect("XLEN");
+    assert_eq!(
+        dlq_len, 3,
+        "expected acct-A/2 plus the two poisoned messages in the DLQ"
+    );
+
+    let seen = seen.lock().await.clone();
+    for seq in [3u64, 4] {
+        assert!(
+            !seen.contains(&("acct-A".to_string(), seq)),
+            "acct-A/{seq} reached the handler after the key was poisoned: {seen:?}"
+        );
+    }
+    for seq in 0..3u64 {
+        assert!(
+            seen.contains(&("acct-B".to_string(), seq)),
+            "acct-B/{seq} should have been handled normally: {seen:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

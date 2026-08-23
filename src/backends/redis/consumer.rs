@@ -19,7 +19,7 @@ use crate::metadata::MessageMetadata;
 use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{RetryDecision, decide_retry, hold_index};
+use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, QueueTopology};
 
@@ -322,6 +322,7 @@ impl ConsumerImpl for RedisConsumer {
             })?;
 
             let n_shards = seq.routing_shards();
+            let on_failure = seq.on_failure();
             let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> =
                 Vec::with_capacity(n_shards as usize);
 
@@ -357,6 +358,9 @@ impl ConsumerImpl for RedisConsumer {
                         None
                     };
 
+                    // One poison set per shard task. A sequence key always
+                    // hashes to the same shard, so per-shard tracking sees
+                    // every message the key will ever produce on this consumer.
                     let result = run_stream_loop_arc::<T, H>(
                         client,
                         handler,
@@ -366,6 +370,7 @@ impl ConsumerImpl for RedisConsumer {
                         &stream_name,
                         &shard_hold_queues,
                         Maintain::Stream,
+                        PoisonedKeys::new(on_failure),
                     )
                     .await;
 
@@ -490,6 +495,8 @@ where
         stream,
         hold_queues,
         maintain,
+        // Unsequenced path — no sequence keys, so an inert tracker.
+        PoisonedKeys::default(),
     )
     .await;
 
@@ -499,8 +506,24 @@ where
     result
 }
 
+/// Record a `FailAll` poisoning, logging only the first transition per key.
+/// A no-op under `SequenceFailure::Skip` and for unkeyed messages.
+fn poison_key(poisoned: &PoisonedKeys, key: &str, stream: &str) {
+    if poisoned.poison(key) {
+        tracing::info!(
+            stream,
+            sequence_key = %key,
+            "poisoning sequence key (FailAll)"
+        );
+    }
+}
+
 /// Core consumer loop that takes `Arc<H>` and `Arc<H::Context>` so it can be
 /// shared across shard tasks without requiring `H: Clone`.
+///
+/// `poisoned` carries `SequenceFailure::FailAll` state on the sequenced path
+/// and is inert everywhere else. It is passed in (rather than created here)
+/// because it must outlive the reconnect loop below.
 #[allow(clippy::too_many_arguments)]
 async fn run_stream_loop_arc<T, H>(
     client: RedisClient,
@@ -511,6 +534,7 @@ async fn run_stream_loop_arc<T, H>(
     stream: &str,
     hold_queues: &[HoldQueue],
     maintain: Maintain,
+    poisoned: PoisonedKeys,
 ) -> Result<()>
 where
     T: Topic,
@@ -548,6 +572,9 @@ where
         let topic_arc = Arc::clone(&topic_arc);
         let group_arc = group_arc.clone();
         let shutdown = shutdown.clone();
+        // Shares the set with the outer tracker: a reconnect must not
+        // un-poison keys that already failed.
+        let poisoned = poisoned.clone();
 
         async move {
             let mut conn = client.dedicated_conn().await?;
@@ -627,6 +654,37 @@ where
                         .and_then(|s| s.parse::<u32>().ok())
                         .unwrap_or(0);
 
+                    // ── FailAll: skip poisoned keys ──
+                    // Inert unless this is a sequenced consumer configured
+                    // `SequenceFailure::FailAll`.
+                    let seq_key = fields.get(X_SEQUENCE_KEY).cloned().unwrap_or_default();
+                    if poisoned.is_poisoned(&seq_key) {
+                        tracing::warn!(
+                            stream,
+                            entry_id,
+                            sequence_key = %seq_key,
+                            "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
+                        );
+                        metrics::record_failed(
+                            topic_name,
+                            consumer_group,
+                            metrics::FailReason::Rejected,
+                        );
+                        fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
+                        route_to_dlq(
+                            &mut conn,
+                            topology,
+                            stream,
+                            &group,
+                            &entry_id,
+                            &fields,
+                            "rejected",
+                            retry_count,
+                        )
+                        .await?;
+                        continue;
+                    }
+
                     // Size check.
                     if let Some(max) = options.max_message_size
                         && payload_raw.len() > max
@@ -642,6 +700,7 @@ where
                             consumer_group,
                             metrics::FailReason::Oversize,
                         );
+                        poison_key(&poisoned, &seq_key, stream);
                         fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                         route_to_dlq(
                             &mut conn,
@@ -674,6 +733,7 @@ where
                                 consumer_group,
                                 metrics::FailReason::Deserialize,
                             );
+                            poison_key(&poisoned, &seq_key, stream);
                             fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                             route_to_dlq(
                                 &mut conn,
@@ -765,6 +825,15 @@ where
                     options
                         .processing
                         .store(false, std::sync::atomic::Ordering::Release);
+
+                    // FailAll: a DLQ-terminal outcome poisons the key, so every
+                    // later message for it is dead-lettered instead of handled.
+                    if matches!(
+                        decide_retry(&outcome, retry_count, options.max_retries),
+                        RetryDecision::Dlq { .. }
+                    ) {
+                        poison_key(&poisoned, &seq_key, stream);
+                    }
 
                     fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                     route_outcome(

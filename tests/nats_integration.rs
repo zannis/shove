@@ -193,6 +193,18 @@ shove::define_sequenced_topic!(
         .build()
 );
 
+shove::define_sequenced_topic!(
+    SeqFailAllTopic,
+    OrderMessage,
+    |msg: &OrderMessage| msg.order_id.clone(),
+    TopologyBuilder::new("nats-seq-failall")
+        .sequenced(SequenceFailure::FailAll)
+        .routing_shards(2)
+        .hold_queue(Duration::from_millis(200))
+        .dlq()
+        .build()
+);
+
 // Sharded topic used to fault-inject a partial `publish_batch` failure: the
 // stream backing this topic is created manually (see
 // `publish_batch_drains_acks_after_partial_stream_failure`) with only shard 0
@@ -1702,6 +1714,146 @@ async fn sequenced_skip_continues_after_rejection() {
     shutdown.cancel();
     handle.await.unwrap().ok();
     broker.close().await;
+}
+
+/// CAF-84: `SequenceFailure::FailAll` must halt the failing sequence key on
+/// NATS, not silently behave like `Skip`.
+///
+/// Also covers the wire change this needed: NATS previously encoded only the
+/// shard (in the subject), so without `Shove-Sequence-Key` the consumer could
+/// not tell key-A from key-B inside one shard.
+#[tokio::test]
+async fn sequenced_failall_poisons_same_key_after_reject() {
+    #[derive(Clone)]
+    struct PoisonHandler {
+        seen: Arc<Mutex<Vec<(String, u64)>>>,
+        key_b_handled: WaitableCounter,
+    }
+
+    impl MessageHandler<SeqFailAllTopic> for PoisonHandler {
+        type Context = ();
+        async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+            self.seen
+                .lock()
+                .await
+                .push((msg.order_id.clone(), msg.amount));
+            if msg.order_id == "key-B" {
+                self.key_b_handled.increment();
+            }
+            if msg.order_id == "key-A" && msg.amount == 2 {
+                Outcome::Reject
+            } else {
+                Outcome::Ack
+            }
+        }
+    }
+
+    struct SeqDlqHandler(WaitableCounter);
+    impl MessageHandler<SeqFailAllTopic> for SeqDlqHandler {
+        type Context = ();
+        async fn handle(&self, _: OrderMessage, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Ack
+        }
+        async fn handle_dead(&self, _: OrderMessage, _: DeadMessageMetadata, _: &()) {
+            self.0.increment();
+        }
+    }
+
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    let client = tb.client();
+    broker
+        .topology()
+        .declare::<SeqFailAllTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    for amount in 0..5u64 {
+        publisher
+            .publish::<SeqFailAllTopic>(&OrderMessage {
+                order_id: "key-A".into(),
+                amount,
+            })
+            .await
+            .unwrap();
+    }
+    for amount in 0..3u64 {
+        publisher
+            .publish::<SeqFailAllTopic>(&OrderMessage {
+                order_id: "key-B".into(),
+                amount,
+            })
+            .await
+            .unwrap();
+    }
+
+    let seen: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let shutdown = CancellationToken::new();
+    let sc = shutdown.clone();
+    let consumer = NatsConsumer::new(client.clone());
+    let key_b_handled = WaitableCounter::new();
+    let handler = PoisonHandler {
+        seen: seen.clone(),
+        key_b_handled: key_b_handled.clone(),
+    };
+    let handle = tokio::spawn(async move {
+        consumer
+            .run_fifo::<SeqFailAllTopic, _>(
+                handler,
+                (),
+                ConsumerOptions::<Nats>::new()
+                    .with_shutdown(sc)
+                    .with_max_retries(0),
+            )
+            .await
+    });
+
+    // key-A/2 is rejected, then key-A/3 and key-A/4 are dead-lettered without
+    // ever reaching the handler → exactly 3 dead messages.
+    let dlq_counter = WaitableCounter::new();
+    let dlq_consumer = NatsConsumer::new(client.clone());
+    let dlq_handler = SeqDlqHandler(dlq_counter.clone());
+    let dlq_handle = tokio::spawn(async move {
+        dlq_consumer
+            .run_dlq::<SeqFailAllTopic, _>(dlq_handler, ())
+            .await
+    });
+
+    assert!(
+        dlq_counter.wait_for(3, Duration::from_secs(30)).await,
+        "expected key-A/2 plus the two poisoned messages in the DLQ, got {}",
+        dlq_counter.get()
+    );
+
+    // key-B shares the topic and, with 2 shards, lands on key-A's shard about
+    // half the time. In that case it is only handled *after* the three key-A
+    // dead-letters, so wait for it rather than reading `seen` off the back of
+    // the DLQ count.
+    assert!(
+        key_b_handled.wait_for(3, Duration::from_secs(30)).await,
+        "key-B must be unaffected by key-A's poisoning, but only {} of 3 were handled",
+        key_b_handled.get()
+    );
+
+    let seen = seen.lock().await.clone();
+    for amount in [3u64, 4] {
+        assert!(
+            !seen.contains(&("key-A".to_string(), amount)),
+            "key-A/{amount} reached the handler after the key was poisoned: {seen:?}"
+        );
+    }
+    for amount in 0..3u64 {
+        assert!(
+            seen.contains(&("key-B".to_string(), amount)),
+            "key-B/{amount} should have been handled normally: {seen:?}"
+        );
+    }
+
+    shutdown.cancel();
+    broker.close().await;
+    handle.await.unwrap().ok();
+    dlq_handle.await.unwrap().ok();
 }
 
 #[tokio::test]
