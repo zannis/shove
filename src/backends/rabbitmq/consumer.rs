@@ -1115,8 +1115,27 @@ impl RabbitMqConsumer {
                         "shutdown signal, draining {} in-flight messages on {queue}",
                         in_flight.len()
                     );
+                    // Same backstop as the sharded consumer's drain: the handler
+                    // is already bounded by `handler_timeout` and resolves its
+                    // own timeout, so this only stops shutdown hanging on a
+                    // channel that never delivers. With deadlines disabled the
+                    // handler is still running when it fires, so
+                    // `drain_timeout_outcome` keeps it at Retry.
+                    let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
                     for pending in in_flight {
-                        let outcome = pending.outcome_rx.await.unwrap_or(Outcome::Retry);
+                        let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
+                            .await
+                            .unwrap_or_else(|_| {
+                                let resolved = drain_timeout_outcome(
+                                    options.handler_timeout,
+                                    options.handler_timeout_outcome.clone(),
+                                );
+                                warn!(queue, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
+                                Ok(resolved)
+                            })
+                            // A closed channel means the handler task panicked
+                            // or was aborted: no outcome exists, so redeliver.
+                            .unwrap_or(Outcome::Retry);
                         let retry_count = get_retry_count(&pending.received.delivery);
                         route_outcome(
                             &pending.received,

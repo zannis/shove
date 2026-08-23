@@ -365,10 +365,11 @@ impl<B: Backend> ConsumerOptions<B> {
     /// Combined with [`without_handler_timeout`](Self::without_handler_timeout)
     /// this setting has nothing to act on and is inert: no handler timeout ever
     /// fires. It is deliberately *not* borrowed by the shutdown drain's own
-    /// backstop on RabbitMQ and SNS/SQS either — that backstop bounds shutdown,
-    /// not the handler, and with deadlines disabled it can expire while the
-    /// handler is still running, so it stays [`Outcome::Retry`] and lets the
-    /// broker redeliver rather than retiring live work.
+    /// backstop on RabbitMQ and SNS/SQS either (both backends bound the drain on
+    /// their standard *and* sequenced consumers) — that backstop bounds
+    /// shutdown, not the handler, and with deadlines disabled it can expire
+    /// while the handler is still running, so it stays [`Outcome::Retry`] and
+    /// lets the broker redeliver rather than retiring live work.
     ///
     /// # Redis: this narrows a race, it does not remove one
     ///

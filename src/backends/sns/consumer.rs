@@ -1088,10 +1088,28 @@ where
                     "shutdown signal, draining {} in-flight messages on {queue_url}",
                     in_flight_count
                 );
-                // Wait for all in-flight handlers to complete.
+                // Wait for all in-flight handlers to complete. Same backstop as
+                // the standard consumer's drain: the handler is already bounded
+                // by `handler_timeout` and resolves its own timeout, so this
+                // only stops shutdown hanging on a channel that never delivers.
+                // With deadlines disabled the handler is still running when it
+                // fires, so `drain_timeout_outcome` keeps it at Retry.
+                let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
                 for (key, state) in key_states.drain() {
                     if let KeyState::InFlight { receipt_handle, msg: _, retry_count, outcome_rx } = state {
-                        let outcome = outcome_rx.await.unwrap_or(Outcome::Retry);
+                        let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
+                            .await
+                            .unwrap_or_else(|_| {
+                                let resolved = drain_timeout_outcome(
+                                    options.handler_timeout,
+                                    options.handler_timeout_outcome.clone(),
+                                );
+                                warn!(queue_url, sequence_key = %key, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
+                                Ok(resolved)
+                            })
+                            // A closed channel means the handler task panicked
+                            // or was aborted: no outcome exists, so redeliver.
+                            .unwrap_or(Outcome::Retry);
                         debug!(
                             queue_url,
                             sequence_key = %key,
