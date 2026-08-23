@@ -120,8 +120,9 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
 /// cascade's size is an ordering-policy consequence, observable through the
 /// `warn!`/`info!` logs at each poisoning site, not a failure count.
 ///
-/// The rule applies to every backend that implements poisoned-key semantics
-/// (in-memory, RabbitMQ, SQS). Each cascade site is marked with a
+/// The rule applies to every backend that implements poisoned-key semantics —
+/// since `SequenceFailure::FailAll` reached parity, that is all six. Each
+/// cascade site is marked with a
 /// `// Cascade: intentionally not counted` comment pointing back here, so the
 /// backends do not drift apart the next time one of them is touched.
 ///

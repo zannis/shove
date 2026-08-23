@@ -661,11 +661,7 @@ where
                             sequence_key = %seq_key,
                             "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                         );
-                        metrics::record_failed(
-                            topic_name,
-                            consumer_group,
-                            metrics::FailReason::Rejected,
-                        );
+                        // Cascade: intentionally not counted — see `metrics::FailReason`.
                         fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
                         route_to_dlq(
                             &mut conn,
