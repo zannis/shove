@@ -220,11 +220,13 @@ async fn wait_for_handlers(ctx: &Counters, timeout: Duration) -> bool {
     false
 }
 
-/// Count distinct messages that have landed on the topic's DLQ.
+/// Count distinct messages that have landed on the topic's DLQ, stopping as
+/// soon as `target` of them have been seen.
 ///
-/// Messages are left on the queue (no delete), so results are deduplicated by
-/// message id; SQS's default 30s visibility timeout keeps a message hidden
-/// between polls, but a long enough wait could otherwise double-count.
+/// Each message is deleted once counted. The DLQ is FIFO, so leaving them
+/// in-flight would hold the rest of their message group behind them for a full
+/// visibility timeout — three of the four expected messages share the poisoned
+/// key's group. Ids are still deduplicated in case a delete does not land.
 async fn wait_for_dlq_count(
     sqs: &aws_sdk_sqs::Client,
     dlq_url: &str,
@@ -245,6 +247,14 @@ async fn wait_for_dlq_count(
         for msg in result.messages() {
             if let Some(id) = msg.message_id() {
                 seen.insert(id.to_string());
+            }
+            if let Some(receipt) = msg.receipt_handle() {
+                sqs.delete_message()
+                    .queue_url(dlq_url)
+                    .receipt_handle(receipt)
+                    .send()
+                    .await
+                    .expect("failed to delete DLQ message");
             }
         }
     }
@@ -334,7 +344,10 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         .await
         .expect("DLQ should be registered");
     let dlq_count = wait_for_dlq_count(&sqs, &dlq_url, 4, Duration::from_secs(90)).await;
-    assert_eq!(dlq_count, 4, "expected 4 dead-lettered messages");
+    assert_eq!(
+        dlq_count, 4,
+        "expected all 4 messages to be dead-lettered within 90s, saw {dlq_count}"
+    );
 
     shutdown.cancel();
     consume_handle
