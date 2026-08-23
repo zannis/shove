@@ -604,6 +604,10 @@ where
 
                 for (entry_id, fields_vec) in entries {
                     let (mut fields, user_headers) = partition_entry_fields(fields_vec);
+                    // Shared with `MessageMetadata::headers` rather than moved
+                    // into it: every write-back below must republish the user's
+                    // headers alongside the internal fields.
+                    let user_headers = Arc::new(user_headers);
 
                     // Extract payload — take ownership to avoid cloning on the hot path.
                     let payload_raw = match fields.remove(PAYLOAD_FIELD) {
@@ -646,6 +650,7 @@ where
                             &group,
                             &entry_id,
                             &fields,
+                            &user_headers,
                             "oversize",
                             retry_count,
                         )
@@ -677,6 +682,7 @@ where
                                 &group,
                                 &entry_id,
                                 &fields,
+                                &user_headers,
                                 "deserialize",
                                 retry_count,
                             )
@@ -698,7 +704,7 @@ where
                         // XREADGROUP does not return the counter — surfacing it
                         // would cost an XPENDING round-trip per message.
                         delivery_count: None,
-                        headers: Arc::new(user_headers),
+                        headers: Arc::clone(&user_headers),
                     };
 
                     options
@@ -768,6 +774,7 @@ where
                         &group,
                         &entry_id,
                         &fields,
+                        &user_headers,
                         outcome,
                         retry_count,
                         options.max_retries,
@@ -921,6 +928,10 @@ where
 
                 for (entry_id, fields_vec) in entries {
                     let (mut fields, user_headers) = partition_entry_fields(fields_vec);
+                    // Shared with `MessageMetadata::headers` rather than moved
+                    // into it: every write-back below must republish the user's
+                    // headers alongside the internal fields.
+                    let user_headers = Arc::new(user_headers);
 
                     // Extract payload — take ownership to avoid cloning on the hot path.
                     let payload_raw = match fields.remove(PAYLOAD_FIELD) {
@@ -962,6 +973,7 @@ where
                             &group,
                             &entry_id,
                             &fields,
+                            &user_headers,
                             "oversize",
                             retry_count,
                         )
@@ -992,6 +1004,7 @@ where
                                 &group,
                                 &entry_id,
                                 &fields,
+                                &user_headers,
                                 "deserialize",
                                 retry_count,
                             )
@@ -1013,7 +1026,7 @@ where
                         // XREADGROUP does not return the counter — surfacing it
                         // would cost an XPENDING round-trip per message.
                         delivery_count: None,
-                        headers: Arc::new(user_headers),
+                        headers: Arc::clone(&user_headers),
                     };
 
                     // Block here once `prefetch` handlers are in-flight; the
@@ -1098,6 +1111,7 @@ where
                                 &task_group,
                                 &entry_id,
                                 &fields,
+                                &user_headers,
                                 outcome,
                                 retry_count,
                                 max_retries,
@@ -1148,6 +1162,7 @@ async fn route_outcome(
     group: &str,
     entry_id: &str,
     fields: &HashMap<String, String>,
+    user_headers: &HashMap<String, String>,
     outcome: Outcome,
     retry_count: u32,
     max_retries: u32,
@@ -1174,7 +1189,7 @@ async fn route_outcome(
             let death_count = if reason == "rejected" {
                 retry_count
             } else {
-                retry_count + 1
+                retry_count.saturating_add(1)
             };
             route_to_dlq(
                 conn,
@@ -1183,20 +1198,21 @@ async fn route_outcome(
                 group,
                 entry_id,
                 fields,
+                user_headers,
                 reason,
                 death_count,
             )
             .await?;
         }
         RetryDecision::Hold { increment: true } => {
-            let new_retry = retry_count + 1;
+            let new_retry = retry_count.saturating_add(1);
             if hold_queues.is_empty() {
                 tracing::warn!(
                     stream,
                     entry_id,
                     "Retry but no hold queues — re-queueing immediately"
                 );
-                requeue_to_stream(conn, stream, fields, new_retry).await;
+                requeue_to_stream(conn, stream, fields, user_headers, new_retry).await;
                 if let Err(e) = xack(conn, stream, group, entry_id).await {
                     tracing::warn!(stream, entry_id, error = %e, "XACK failed after immediate requeue");
                     metrics::record_backend_error(
@@ -1216,6 +1232,7 @@ async fn route_outcome(
                     group,
                     entry_id,
                     fields,
+                    user_headers,
                     hq.name(),
                     hq.delay(),
                     new_retry,
@@ -1230,7 +1247,7 @@ async fn route_outcome(
                     entry_id,
                     "Defer but no hold queues — re-queueing immediately"
                 );
-                requeue_to_stream(conn, stream, fields, retry_count).await;
+                requeue_to_stream(conn, stream, fields, user_headers, retry_count).await;
                 if let Err(e) = xack(conn, stream, group, entry_id).await {
                     tracing::warn!(stream, entry_id, error = %e, "XACK failed after defer requeue");
                     metrics::record_backend_error(
@@ -1247,6 +1264,7 @@ async fn route_outcome(
                     group,
                     entry_id,
                     fields,
+                    user_headers,
                     hq.name(),
                     hq.delay(),
                     retry_count,
@@ -1265,15 +1283,15 @@ async fn route_to_hold(
     group: &str,
     entry_id: &str,
     fields: &HashMap<String, String>,
+    user_headers: &HashMap<String, String>,
     hold_name: &str,
     delay: Duration,
     new_retry_count: u32,
 ) {
-    let mut hold_fields: Vec<(String, String)> = fields
-        .iter()
-        .filter(|(k, _)| k.as_str() != X_RETRY_COUNT)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut hold_fields: Vec<(String, String)> =
+        merged_entry_fields(fields, user_headers, Some(X_RETRY_COUNT))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
     hold_fields.push((X_RETRY_COUNT.into(), new_retry_count.to_string()));
 
     let entry = HoldEntry {
@@ -1299,6 +1317,7 @@ async fn route_to_dlq(
     group: &str,
     entry_id: &str,
     fields: &HashMap<String, String>,
+    user_headers: &HashMap<String, String>,
     reason: &str,
     death_count: u32,
 ) -> Result<()> {
@@ -1317,12 +1336,17 @@ async fn route_to_dlq(
         }
     };
 
-    // Pre-size: "XADD", dlq, "*", all field pairs, 3 extra k/v pairs (reason, count, original).
-    let arg_count = fields.len() * 2 + 9;
-    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count * 16);
+    // Pre-size: "XADD", dlq, "*", all field pairs (internal + user headers),
+    // 3 extra k/v pairs (reason, count, original).
+    let arg_count = fields
+        .len()
+        .saturating_add(user_headers.len())
+        .saturating_mul(2)
+        .saturating_add(9);
+    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count.saturating_mul(16));
     cmd.arg("XADD").arg(dlq).arg("*");
-    for (k, v) in fields {
-        cmd.arg(k.as_str()).arg(v.as_str());
+    for (k, v) in merged_entry_fields(fields, user_headers, None) {
+        cmd.arg(k).arg(v);
     }
     cmd.arg(X_DEATH_REASON).arg(reason);
     cmd.arg(X_DEATH_COUNT).arg(death_count.to_string());
@@ -1344,16 +1368,20 @@ async fn requeue_to_stream(
     conn: &mut RedisConnection,
     stream: &str,
     fields: &HashMap<String, String>,
+    user_headers: &HashMap<String, String>,
     retry_count: u32,
 ) {
-    // Pre-size: "XADD", stream, "*", all field pairs (one key filtered at runtime), 1 extra k/v pair.
-    let arg_count = fields.len() * 2 + 4;
-    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count * 16);
+    // Pre-size: "XADD", stream, "*", all field pairs (internal + user headers,
+    // one key filtered at runtime), 1 extra k/v pair.
+    let arg_count = fields
+        .len()
+        .saturating_add(user_headers.len())
+        .saturating_mul(2)
+        .saturating_add(4);
+    let mut cmd = redis::Cmd::with_capacity(arg_count, arg_count.saturating_mul(16));
     cmd.arg("XADD").arg(stream).arg("*");
-    for (k, v) in fields {
-        if k.as_str() != X_RETRY_COUNT {
-            cmd.arg(k.as_str()).arg(v.as_str());
-        }
+    for (k, v) in merged_entry_fields(fields, user_headers, Some(X_RETRY_COUNT)) {
+        cmd.arg(k).arg(v);
     }
     cmd.arg(X_RETRY_COUNT).arg(retry_count.to_string());
     if let Err(e) = conn.query::<redis::Value>(&mut cmd).await {
@@ -1485,8 +1513,11 @@ const INTERNAL_KEYS: &[&str] = &[
 /// in a single pass, consuming `fields_vec` without cloning any values.
 ///
 /// `internal_fields` contains the shove-internal keys (routing, metadata);
-/// `user_headers` contains everything else and is moved directly into
+/// `user_headers` contains everything else and is shared into
 /// [`MessageMetadata::headers`].
+///
+/// The two maps are disjoint by construction, so [`merged_entry_fields`] can
+/// re-join them for a write-back without any key colliding.
 fn partition_entry_fields(
     fields_vec: Vec<(String, String)>,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
@@ -1500,6 +1531,26 @@ fn partition_entry_fields(
         }
     }
     (internal, user)
+}
+
+/// Re-join the two halves of a partitioned entry for a write-back (hold queue,
+/// immediate requeue, DLQ), optionally dropping one key the caller is about to
+/// rewrite.
+///
+/// Every path that re-publishes an entry must go through this: writing back
+/// only `internal_fields` silently strips the publisher's headers, so a handler
+/// sees them on the first delivery and not on the redelivery, and a dead letter
+/// arrives without the context needed to triage it.
+fn merged_entry_fields<'a>(
+    internal_fields: &'a HashMap<String, String>,
+    user_headers: &'a HashMap<String, String>,
+    exclude: Option<&'a str>,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    internal_fields
+        .iter()
+        .chain(user_headers.iter())
+        .filter(move |(k, _)| Some(k.as_str()) != exclude)
+        .map(|(k, v)| (k.as_str(), v.as_str()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1700,6 +1751,52 @@ mod tests {
         let (internal, user) = partition_entry_fields(vec![]);
         assert!(internal.is_empty());
         assert!(user.is_empty());
+    }
+
+    /// `partition_entry_fields` -> `merged_entry_fields` must round-trip every
+    /// field of the original entry. Losing the user half here is what stripped
+    /// headers from retried and dead-lettered messages.
+    #[test]
+    fn merged_entry_fields_round_trips_a_partitioned_entry() {
+        let fields_vec = vec![
+            (PAYLOAD_FIELD.to_string(), "data".to_string()),
+            (X_RETRY_COUNT.to_string(), "2".to_string()),
+            ("x-trace-id".to_string(), "trace-1".to_string()),
+            ("tenant".to_string(), "acme".to_string()),
+        ];
+        let (internal, user) = partition_entry_fields(fields_vec.clone());
+
+        let mut merged: Vec<(String, String)> = merged_entry_fields(&internal, &user, None)
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        merged.sort();
+        let mut expected = fields_vec;
+        expected.sort();
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn merged_entry_fields_drops_only_the_excluded_key() {
+        let (internal, user) = partition_entry_fields(vec![
+            (PAYLOAD_FIELD.to_string(), "data".to_string()),
+            (X_RETRY_COUNT.to_string(), "2".to_string()),
+            ("x-trace-id".to_string(), "trace-1".to_string()),
+        ]);
+
+        let merged: HashMap<&str, &str> =
+            merged_entry_fields(&internal, &user, Some(X_RETRY_COUNT)).collect();
+        assert_eq!(merged.len(), 2);
+        assert!(!merged.contains_key(X_RETRY_COUNT));
+        assert_eq!(merged.get(PAYLOAD_FIELD), Some(&"data"));
+        assert_eq!(merged.get("x-trace-id"), Some(&"trace-1"));
+    }
+
+    #[test]
+    fn merged_entry_fields_preserves_user_headers_when_internal_is_empty() {
+        let internal = HashMap::new();
+        let user = HashMap::from([("x-trace-id".to_string(), "trace-1".to_string())]);
+        let merged: Vec<(&str, &str)> = merged_entry_fields(&internal, &user, None).collect();
+        assert_eq!(merged, vec![("x-trace-id", "trace-1")]);
     }
 
     #[test]
