@@ -811,7 +811,14 @@ where
                                 }
                             }
                         }
-                        None => Some(handler_clone.handle(msg, meta, &ctx_clone).await),
+                        None => Some(
+                            lease::catch_handler_panic(handler_clone.handle(
+                                msg,
+                                meta,
+                                &ctx_clone,
+                            ))
+                            .await,
+                        ),
                     };
 
                     let elapsed = start.elapsed().as_secs_f64();
@@ -1232,7 +1239,14 @@ where
                                     }
                                 }
                             }
-                            None => Some(task_handler.handle(msg, meta, &task_ctx).await),
+                            None => Some(
+                                lease::catch_handler_panic(task_handler.handle(
+                                    msg,
+                                    meta,
+                                    &task_ctx,
+                                ))
+                                .await,
+                            ),
                         };
 
                         let elapsed = start.elapsed().as_secs_f64();

@@ -1,6 +1,8 @@
 //! Backend-agnostic retry/DLQ routing decisions, shared across consumer
 //! backends so the boundary logic lives (and is tested) in exactly one place.
 
+use std::time::Duration;
+
 use crate::Outcome;
 
 /// Hold-queue tier for a given retry count, clamped to the last tier.
@@ -41,6 +43,32 @@ pub(crate) enum RetryDecision {
 #[allow(dead_code)] // every consumer is feature-gated; dead under --no-default-features
 pub(crate) fn handler_timeout_outcome(configured: Option<Outcome>) -> Outcome {
     configured.unwrap_or(Outcome::Retry)
+}
+
+/// Extra time a shutdown drain waits on top of the handler's own deadline.
+///
+/// A drain waits on a channel fed by a handler that is *already* bounded by
+/// `handler_timeout`, so the two deadlines are racing over the same work. Give
+/// the inner one room to win: it knows the real outcome, including a
+/// configured `handler_timeout_outcome`, whereas the drain can only guess.
+///
+/// Without this grace the outer timer can fire first — the inner deadline does
+/// not start until the spawned task is first polled, so a shutdown that begins
+/// before that poll sets an *earlier* outer deadline, and even when the task
+/// did start, delivering the outcome through the channel can lose a photo
+/// finish on a saturated runtime at shutdown.
+#[allow(dead_code)] // only the backends with a spawned-handler drain use this
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a shutdown drain should wait for one in-flight handler's outcome.
+///
+/// Single source of truth so the backends that drain spawned handlers
+/// (RabbitMQ, SQS) cannot drift apart on the margin.
+#[allow(dead_code)] // only the backends with a spawned-handler drain use this
+pub(crate) fn shutdown_drain_timeout(handler_timeout: Option<Duration>) -> Duration {
+    handler_timeout
+        .unwrap_or(crate::DEFAULT_HANDLER_TIMEOUT)
+        .saturating_add(DRAIN_GRACE)
 }
 
 /// Whether the retry budget is exhausted. `max_retries = N` permits N retries,
@@ -184,5 +212,31 @@ mod tests {
             handler_timeout_outcome(Some(Outcome::Ack)),
             Outcome::Ack
         ));
+    }
+
+    #[test]
+    fn shutdown_drain_outlasts_the_handler_deadline() {
+        // The point of the grace: the handler's own bounded wait must be able
+        // to win the race and report the real outcome. An equal deadline —
+        // what both drains used to use — is what let the drain overwrite a
+        // configured timeout outcome with Retry.
+        let handler = Duration::from_secs(30);
+        assert!(shutdown_drain_timeout(Some(handler)) > handler);
+        assert_eq!(shutdown_drain_timeout(Some(handler)), handler + DRAIN_GRACE);
+    }
+
+    #[test]
+    fn shutdown_drain_falls_back_to_the_default_handler_timeout() {
+        assert_eq!(
+            shutdown_drain_timeout(None),
+            crate::DEFAULT_HANDLER_TIMEOUT + DRAIN_GRACE
+        );
+    }
+
+    #[test]
+    fn shutdown_drain_saturates_instead_of_overflowing() {
+        // A caller is free to pass Duration::MAX; adding the grace must not
+        // panic in a release build's debug-assert-free arithmetic.
+        assert_eq!(shutdown_drain_timeout(Some(Duration::MAX)), Duration::MAX);
     }
 }

@@ -26,12 +26,14 @@ use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::MessageMetadata;
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::{handler_timeout_outcome, hold_index, retries_exhausted};
+use crate::routing::{
+    handler_timeout_outcome, hold_index, retries_exhausted, shutdown_drain_timeout,
+};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{HoldQueue, SequenceFailure};
-use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
 use crate::{QueueTopology, RabbitMq};
 
 use super::map_lapin_error;
@@ -509,15 +511,24 @@ impl RabbitMqConsumer {
                         in_flight_count
                     );
                     // Wait for all in-flight handlers to complete.
-                    let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
+                    // The handler is already bounded by `handler_timeout` and
+                    // resolves its own timeout; this wait is only a backstop so
+                    // shutdown cannot hang on a channel that never delivers.
+                    // Hence the grace, and hence resolving to the *configured*
+                    // timeout outcome rather than assuming Retry.
+                    let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
                     for (key, state) in key_states.drain() {
                         if let KeyState::InFlight { received, outcome_rx } = state {
                             let outcome = tokio::time::timeout(drain_timeout, outcome_rx)
                                 .await
                                 .unwrap_or_else(|_| {
-                                    warn!(queue, sequence_key = %key, "handler timed out during shutdown drain, retrying");
-                                    Ok(Outcome::Retry)
+                                    let resolved = handler_timeout_outcome(options.handler_timeout_outcome.clone());
+                                    warn!(queue, sequence_key = %key, outcome = ?resolved, "handler outcome did not arrive within the shutdown drain");
+                                    Ok(resolved)
                                 })
+                                // A closed channel means the handler task
+                                // panicked or was aborted: no outcome exists,
+                                // so redeliver.
                                 .unwrap_or(Outcome::Retry);
                             let delivery = &received.delivery;
                             let retry_count = get_retry_count(delivery);

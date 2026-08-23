@@ -19,12 +19,12 @@ use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
+use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
-use crate::routing::handler_timeout_outcome;
+use crate::routing::{handler_timeout_outcome, shutdown_drain_timeout};
 use crate::topic::{SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
-use crate::{DEFAULT_HANDLER_TIMEOUT, metrics};
 use crate::{DEFAULT_MAX_MESSAGE_SIZE, Sqs};
 
 /// Maps an SQS `SdkError` to the appropriate `ShoveError` variant.
@@ -465,7 +465,12 @@ where
                     router::route_requeue(sqs, queue_url, rh).await;
                 }
             }
-            let drain_timeout = options.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
+            // The handler is already bounded by `handler_timeout` and resolves
+            // its own timeout; this wait is only a backstop so shutdown cannot
+            // hang on a channel that never delivers. Hence the grace, and hence
+            // resolving to the *configured* timeout outcome rather than
+            // assuming Retry.
+            let drain_timeout = shutdown_drain_timeout(options.handler_timeout);
             // Collect Acks into a batch; non-Ack outcomes still need
             // per-message routing (Retry/Reject/Defer touch distinct queues).
             let mut drain_acks: Vec<String> = Vec::with_capacity(in_flight.len());
@@ -473,12 +478,17 @@ where
                 let outcome = tokio::time::timeout(drain_timeout, pending.outcome_rx)
                     .await
                     .unwrap_or_else(|_| {
+                        let resolved =
+                            handler_timeout_outcome(options.handler_timeout_outcome.clone());
                         warn!(
                             queue_url,
-                            "handler timed out during shutdown drain, retrying"
+                            outcome = ?resolved,
+                            "handler outcome did not arrive within the shutdown drain"
                         );
-                        Ok(Outcome::Retry)
+                        Ok(resolved)
                     })
+                    // A closed channel means the handler task panicked or was
+                    // aborted: no outcome exists, so redeliver.
                     .unwrap_or(Outcome::Retry);
                 if matches!(outcome, Outcome::Ack) {
                     drain_acks.push(pending.receipt_handle);

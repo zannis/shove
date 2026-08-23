@@ -107,6 +107,7 @@ use std::time::Duration;
 
 use super::client::RedisConnection;
 use crate::error::{Result, ShoveError};
+use crate::outcome::Outcome;
 
 /// Floor on the renewal period.
 ///
@@ -179,6 +180,28 @@ pub(super) async fn touch(conn: &mut RedisConnection, lease: &Lease<'_>) -> Resu
     .map_err(|e| ShoveError::Connection(format!("lease renewal failed: {e}")))
 }
 
+/// Await a handler future, resolving a panic to [`Outcome::Retry`].
+///
+/// The Redis loops drive the handler inline rather than in a dedicated task,
+/// so there is no `JoinError` to inspect; `catch_unwind` provides the same
+/// isolation without the per-message task allocation. Used by both the timed
+/// path ([`run_under_lease`]) and the untimed one.
+pub(super) async fn catch_handler_panic<F>(fut: F) -> Outcome
+where
+    F: Future<Output = Outcome>,
+{
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(outcome) => outcome,
+        Err(_panic) => {
+            tracing::warn!("handler panicked, retrying message");
+            Outcome::Retry
+        }
+    }
+}
+
 /// Await `fut` under `handler_timeout`, renewing `lease` for as long as it
 /// runs.
 ///
@@ -190,13 +213,27 @@ pub(super) async fn touch(conn: &mut RedisConnection, lease: &Lease<'_>) -> Resu
 /// still be held (the failure can be transient), and [`touch`] is run again
 /// before the outcome is routed. Losing it only downgrades this consumer to
 /// the reaper-reclaim behaviour it would have had without the override.
-pub(super) async fn run_under_lease<F: Future>(
+///
+/// A panicking handler resolves to [`Outcome::Retry`], matching every other
+/// backend. Without the unwind boundary the panic would tear down the
+/// consumer loop (or the per-message task) with the entry still in the PEL:
+/// it would eventually redeliver via the reaper, but without burning retry
+/// budget, and with a timeout outcome configured `maintenance` also backs
+/// reclaim off. Resolving to `Retry` here keeps a panic on the same accounted
+/// path as any other failure.
+pub(super) async fn run_under_lease<F>(
     conn: &mut RedisConnection,
     lease: Option<&Lease<'_>>,
     handler_timeout: Duration,
     fut: F,
-) -> std::result::Result<F::Output, tokio::time::error::Elapsed> {
-    let mut fut = std::pin::pin!(tokio::time::timeout(handler_timeout, fut));
+) -> std::result::Result<Outcome, tokio::time::error::Elapsed>
+where
+    F: Future<Output = Outcome>,
+{
+    let mut fut = std::pin::pin!(tokio::time::timeout(
+        handler_timeout,
+        catch_handler_panic(fut)
+    ));
 
     let Some(lease) = lease else {
         return fut.await;
