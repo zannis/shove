@@ -35,8 +35,15 @@ The third arm matters as much as the second. A batch where **nothing** landed is
 | `to_republish()` | `failed ∪ unattempted`, ascending and deduplicated. **The one to act on** — re-publishing exactly these records is correct on every backend. |
 | `failed()` | Indices the backend attempted and explicitly rejected. |
 | `unattempted()` | Indices never submitted, or submitted without a resolution the backend could confirm. |
-| `succeeded()` | How many records the backend confirmed. Always `msgs.len() - to_republish().len()`. |
+| `succeeded()` | How many records the backend confirmed. Always `>= 1`. |
 | `source()` | The representative (first) backend error behind the failure. |
+
+`failed()` and `unattempted()` are disjoint, so both halves of the invariant hold and you can rely on either:
+
+```text
+succeeded() + failed().len() + unattempted().len() == msgs.len()
+succeeded() + to_republish().len()                 == msgs.len()
+```
 
 `ShoveError::is_retryable()` on a `PartialBatch` delegates to `source()`: re-publishing the outstanding records is worth attempting exactly when the underlying error was.
 
