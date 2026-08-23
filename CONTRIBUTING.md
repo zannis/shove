@@ -111,12 +111,13 @@ gh workflow run publish.yml --ref <branch> -f bump=patch -f dry_run=true
 
 A rehearsal runs every step of the real release — the version bump, the
 `package.json`/`pnpm-lock.yaml` sync, the GPG-signed release commit and
-annotated tag, the changelog generation and the working-tree guard — and
-withholds only the three effects that cannot be taken back:
+annotated tag, the pure-version-bump assertion, the changelog generation and
+the working-tree guard — and withholds only the three effects that cannot be
+taken back:
 
 | Step | Real release | `dry_run: true` |
 |---|---|---|
-| Commit and tag | pushed with `--follow-tags` | created and verified locally, not pushed |
+| Push the release commit and tag | pushed with `--follow-tags` | verified locally with `git log --show-signature` and `git tag -v`, not pushed |
 | Publish to crates.io | `cargo publish` | `cargo publish --dry-run` (no auth token minted) |
 | Create GitHub release | `gh release create` | asserts the notes file exists, prints the command |
 
