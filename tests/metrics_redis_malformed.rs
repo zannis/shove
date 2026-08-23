@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use redis::aio::MultiplexedConnection;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
@@ -141,7 +142,7 @@ fn failed_total(
 ///
 /// Reply is `[count, min-id, max-id, consumers]`; only the count is read.
 async fn wait_for_empty_pel(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut MultiplexedConnection,
     stream: &str,
     timeout: Duration,
 ) -> bool {
