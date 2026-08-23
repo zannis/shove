@@ -12,5 +12,8 @@ command = 'tests/scripts/rmq_setup.sh'
 slow-timeout = { period = "90s" }
 
 [[profile.default.scripts]]
-filter = 'binary_id(shove::rabbitmq_integration)'
+# `metrics_rabbitmq_sequenced` shares the container rather than starting its
+# own: it carves out a private vhost per run, so it cannot collide with the
+# main suite's queues.
+filter = 'binary_id(shove::rabbitmq_integration) + binary_id(shove::metrics_rabbitmq_sequenced)'
 setup = ['rabbitmq-setup']

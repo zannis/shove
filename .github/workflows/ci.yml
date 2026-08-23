@@ -106,9 +106,15 @@ jobs:
           - name: inmemory
             features: inmemory,metrics,sbe
           - name: rabbitmq
-            features: rabbitmq,audit,rabbitmq-transactional,sbe
+            # `metrics` so the discard counters this backend emits are actually
+            # executed: `metrics_rabbitmq_sequenced` asserts them against a real
+            # broker. Without the feature the emission sites are cfg-compiled
+            # out and the leg cannot observe them even in principle.
+            features: rabbitmq,audit,rabbitmq-transactional,metrics,sbe
           - name: aws-sns-sqs
-            features: pub-aws-sns,aws-sns-sqs,audit,sbe
+            # `metrics` — see the rabbitmq entry; asserted by
+            # `metrics_sqs_sequenced`.
+            features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
           - name: nats
             features: nats,audit,sbe
           - name: kafka
