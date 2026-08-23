@@ -11,6 +11,17 @@ retries = 1
 command = 'tests/scripts/rmq_setup.sh'
 slow-timeout = { period = "90s" }
 
+[[profile.default.overrides]]
+# `metrics_sqs_sequenced` asserts exact counter values and so cannot poll the
+# metric for progress; it waits on wall-clock deadlines instead. Give it every
+# test thread for its duration so it is never scheduled alongside the ~40 tests
+# in `sns_sqs_integration`, each of which boots its own LocalStack container.
+# Per-test exclusivity rather than a `[test-groups]` cap over all the LocalStack
+# binaries: a shared group would have to serialize those 40 as well, lengthening
+# the whole leg in order to protect one test.
+filter = 'binary_id(shove::metrics_sqs_sequenced)'
+threads-required = 'num-test-threads'
+
 [[profile.default.scripts]]
 # `metrics_rabbitmq_sequenced` shares the container rather than starting its
 # own: it carves out a private vhost per run, so it cannot collide with the
