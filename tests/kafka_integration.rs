@@ -1643,10 +1643,13 @@ async fn sequenced_failall_poisons_same_key_after_reject() {
         );
     }
 
+    // `run_dlq` takes no shutdown token — Kafka's DLQ loop stops on the
+    // *client's* token, which `broker.close()` cancels. Close before awaiting,
+    // or `dlq_handle` never resolves.
     shutdown.cancel();
+    broker.close().await;
     handle.await.unwrap().ok();
     dlq_handle.await.unwrap().ok();
-    broker.close().await;
 }
 
 #[tokio::test]
