@@ -213,7 +213,7 @@ pub use metadata::{
 pub use outcome::Outcome;
 #[cfg(any(feature = "rabbitmq", feature = "pub-aws-sns"))]
 use std::time::Duration;
-pub use topic::{SequencedTopic, Topic};
+pub use topic::{NotSequenced, SequencedTopic, Topic};
 #[cfg(feature = "kafka")]
 pub use topology::KafkaCleanupPolicy;
 pub use topology::{HoldQueue, QueueTopology, SequenceConfig, SequenceFailure, TopologyBuilder};
