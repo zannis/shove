@@ -678,6 +678,7 @@ where
                             &group,
                             &entry_id,
                             &fields,
+                            &user_headers,
                             "rejected",
                             retry_count,
                         )
