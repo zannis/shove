@@ -11,13 +11,21 @@
 //! importantly — asserts that a `SequenceFailure::FailAll` cascade is *not*
 //! counted. See `metrics::FailReason` for why the cascade is excluded.
 //!
-//! The cascade assertion has real teeth on SQS specifically. SQS retries by
-//! resetting the message's visibility rather than republishing, so a message
-//! that is rejected keeps coming back until native redrive retires it at
-//! `maxReceiveCount`. Every one of those redeliveries re-enters the same
-//! `retry_count >= max_retries` branch that counts `max_retries_exceeded` — it
-//! is only the poisoned-key check *ahead* of that branch that keeps the counter
-//! at 1. Drop the check and this test reads 2, 3, 4, ... instead.
+//! The cascade assertion has real teeth on SQS specifically, and gets it from
+//! redelivery rather than from queueing messages behind the poisoned key. SQS
+//! retries by resetting the message's visibility rather than republishing, so a
+//! rejected message keeps coming back until native redrive retires it at
+//! `maxReceiveCount = 10`. Receive 1 goes to the handler; receives 2..10 all hit
+//! the poisoned-key skip, the very site marked `// Cascade: intentionally not
+//! counted` — and they would *also* satisfy `retry_count >= max_retries`, since
+//! `retry_count` is derived from `ApproximateReceiveCount`. So arrival on the
+//! DLQ proves nine cascade discards happened, and both counters reading 1 proves
+//! none of them were counted. Count either site and this test reads ~9, not 2.
+//!
+//! Which is why one message per key is enough — and better than several. Extra
+//! messages behind a poisoned key are only *received* once the one ahead of them
+//! is retired, so each one costs another ten redelivery rounds of wall clock
+//! while adding no assertion the redeliveries do not already make.
 //!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the global
 //! recorder slot, and whose `snapshot()` *drains* every counter it reads. So:
@@ -156,10 +164,12 @@ define_sequenced_topic!(
 #[derive(Clone)]
 struct Counters {
     /// Handler invocations for the key that gets poisoned. Must stay at 1: the
-    /// two deliveries buffered behind it are dead-lettered without ever
-    /// reaching the handler — that is the cascade.
+    /// message is redelivered until redrive retires it, and every redelivery
+    /// after the first is skipped without reaching the handler — that is the
+    /// cascade.
     reject_key_calls: Arc<AtomicU32>,
-    /// Handler invocations for the key that exhausts its retry budget.
+    /// Handler invocations for the key that exhausts its retry budget. Likewise
+    /// 1: after the budget is spent its key is poisoned too.
     retry_key_calls: Arc<AtomicU32>,
 }
 
@@ -282,26 +292,23 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         .await
         .expect("declare topology");
 
-    // Publish before the consumer starts so all three `acct-reject` deliveries
-    // are already on the shard queue when the first one is dispatched: with
-    // `prefetch_count(10)` they arrive in a single receive, the other two
-    // buffer behind the in-flight key, and get dead-lettered as a cascade the
-    // moment the handler poisons it.
+    // One message per key, published before the consumer starts. The retry key
+    // goes first: a FIFO queue hands out the oldest message first, and the
+    // reject key is about to start a redelivery loop that would otherwise
+    // compete with it for the receive batch.
     let publisher: Publisher<Sqs> = broker.publisher().await.expect("publisher");
-    for _ in 0..3 {
-        publisher
-            .publish::<Ledger>(&LedgerEntry {
-                account: "acct-reject".into(),
-            })
-            .await
-            .expect("publish reject-key message");
-    }
     publisher
         .publish::<Ledger>(&LedgerEntry {
             account: "acct-retry".into(),
         })
         .await
         .expect("publish retry-key message");
+    publisher
+        .publish::<Ledger>(&LedgerEntry {
+            account: "acct-reject".into(),
+        })
+        .await
+        .expect("publish reject-key message");
 
     let counters = Counters {
         reject_key_calls: Arc::new(AtomicU32::new(0)),
@@ -326,27 +333,27 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     });
 
     assert!(
-        wait_for_handlers(&counters, Duration::from_secs(60)).await,
+        wait_for_handlers(&counters, Duration::from_secs(90)).await,
         "timed out waiting for both handlers: reject={} retry={}",
         counters.reject_key_calls.load(Ordering::SeqCst),
         counters.retry_key_calls.load(Ordering::SeqCst),
     );
 
-    // All four messages must reach the DLQ: the rejected one, the two cascaded
-    // behind its poisoned key, and the retry-exhausted one. SQS retires them
-    // through native redrive at `maxReceiveCount`, so this also guarantees the
-    // redelivery loop ran — which is exactly what would double-count if the
-    // poisoned-key check stopped short-circuiting.
+    // Both messages must reach the DLQ, which on SQS only happens through
+    // native redrive at `maxReceiveCount = 10`. That is what makes the counter
+    // assertions below exact rather than incidental: reaching the DLQ means
+    // each message was received ten times, so nine of those receives took a
+    // cascade path that must not have counted.
     let sqs = test_broker.sqs_client().await;
     let dlq_url = sns_client
         .queue_registry()
         .get("metrics-sqs-seq-dlq")
         .await
         .expect("DLQ should be registered");
-    let dlq_count = wait_for_dlq_count(&sqs, &dlq_url, 4, Duration::from_secs(90)).await;
+    let dlq_count = wait_for_dlq_count(&sqs, &dlq_url, 2, Duration::from_secs(150)).await;
     assert_eq!(
-        dlq_count, 4,
-        "expected all 4 messages to be dead-lettered within 90s, saw {dlq_count}"
+        dlq_count, 2,
+        "expected both messages to be dead-lettered within 150s, saw {dlq_count}"
     );
 
     shutdown.cancel();
@@ -359,25 +366,25 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     // nothing can emit into it while it is being read.
     let snapshot = snapshotter.snapshot().into_hashmap();
 
-    // The handler-returned Reject is an independent failure — counted once.
+    // The handler-returned Reject is an independent failure — counted once, on
+    // the receive that reached the handler. The nine redeliveries that followed
+    // it were skipped as cascade of that same failure and must not be counted.
     assert_eq!(
         failed_total(&snapshot, "rejected"),
         1,
-        "expected exactly one `rejected` failure (the message that actually \
-         failed); the two cascaded deliveries behind the poisoned key must \
-         not be counted"
+        "expected exactly one `rejected` failure (the delivery that actually \
+         reached the handler); the redeliveries skipped behind the poisoned \
+         key must not be counted"
     );
-
-    // ...and the cascade really happened: three messages for that key were
-    // dead-lettered while the handler saw exactly one of them.
     assert_eq!(
         counters.reject_key_calls.load(Ordering::SeqCst),
         1,
-        "cascaded deliveries must skip the handler"
+        "cascaded redeliveries must skip the handler"
     );
 
-    // Retry budget exhausted is likewise an independent failure — counted once
-    // even though the rejected message is redelivered until redrive retires it.
+    // Retry budget exhausted is likewise an independent failure. Its
+    // redeliveries satisfy `retry_count >= max_retries` too — only the
+    // poisoned-key check ahead of that branch keeps this at 1.
     assert_eq!(
         failed_total(&snapshot, "max_retries_exceeded"),
         1,

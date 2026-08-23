@@ -311,10 +311,12 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         .await
         .expect("declare topology");
 
-    // Publish before the consumer starts so the ordering is deterministic: all
-    // three `acct-reject` deliveries are in the shard queue when the first one
-    // is dispatched, which is what makes the other two buffer behind the key
-    // and cascade once it is poisoned.
+    // Publish before the consumer starts, so all three `acct-reject` deliveries
+    // are already on the shard queue when the first one is dispatched and the
+    // other two are guaranteed to cascade. Which cascade site they take depends
+    // on whether the handler's Reject lands first — buffered-behind-an-in-flight
+    // key, or the poisoned-key skip on arrival. Both are uncounted by design,
+    // and the assertions below hold either way.
     let publisher = broker.publisher().await.expect("publisher");
     for _ in 0..3 {
         publisher
