@@ -1,0 +1,66 @@
+# Batch Publishing & Partial Failures
+
+`publisher.publish_batch::<T>(&msgs)` sends many messages in one operation. On the happy path it returns `Ok(())` and there is nothing more to think about. The interesting case is the one in the middle: the broker accepted **some** of the batch and not the rest.
+
+`shove` reports that case as `ShoveError::PartialBatch`, which carries the indices into your own `msgs` slice that still need publishing — so you re-send those records, not the whole batch.
+
+## The three outcomes
+
+```rust
+match publisher.publish_batch::<Orders>(&records).await {
+    // Every record confirmed.
+    Ok(()) => {}
+
+    // Some confirmed, some not. `to_republish()` names the rest.
+    Err(ShoveError::PartialBatch(f)) => {
+        let retry: Vec<OrderEvent> = f
+            .to_republish()
+            .iter()
+            .filter_map(|&i| records.get(i).cloned())
+            .collect();
+        publisher.publish_batch::<Orders>(&retry).await?;
+    }
+
+    // The batch failed as a whole — encoding, topology, an unreachable broker.
+    Err(e) => return Err(e),
+}
+```
+
+The third arm matters as much as the second. A batch where **nothing** landed is not partial, so it keeps returning exactly the error it always did: `ShoveError::Topology`, `ShoveError::Serialization`, `ShoveError::Connection`. Existing `match` arms do not need to change, and code that never looks at `PartialBatch` behaves as it did before.
+
+## What `BatchFailure` tells you
+
+| Method | Meaning |
+| --- | --- |
+| `to_republish()` | `failed ∪ unattempted`, ascending and deduplicated. **The one to act on** — re-publishing exactly these records is correct on every backend. |
+| `failed()` | Indices the backend attempted and explicitly rejected. |
+| `unattempted()` | Indices never submitted, or submitted without a resolution the backend could confirm. |
+| `succeeded()` | How many records the backend confirmed. Always `msgs.len() - to_republish().len()`. |
+| `source()` | The representative (first) backend error behind the failure. |
+
+`ShoveError::is_retryable()` on a `PartialBatch` delegates to `source()`: re-publishing the outstanding records is worth attempting exactly when the underlying error was.
+
+## Index fidelity per backend
+
+Brokers fail differently, and `shove` reports what each one actually knows rather than flattening it to a lowest common denominator. Both shapes are safe to feed straight into a re-publish; the difference is how *tight* the set is.
+
+| Backend | Shape | What that means |
+| --- | --- | --- |
+| Kafka | **sparse** | Every record is submitted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty. |
+| SNS | **sparse** | Rejected entries are named per 10-entry chunk. A chunk that errors as a whole, and every later chunk, becomes `unattempted()`. |
+| NATS | **sparse + tail** | Ack failures are exact over the submitted prefix; if submission breaks partway, the rest of the batch is `unattempted()`. |
+| RabbitMQ | **prefix** | Confirms are awaited in order and the call stops at the first nack: `failed()` is that one index, `unattempted()` is everything after it. |
+| Redis | **prefix** | Sequential; stops at the first error. |
+| InMemory | **prefix** | Sequential; stops at the first error. |
+
+This is why the payload is a **set of indices** rather than "the index of the first failure". On the sparse backends a record *after* a failure has usually already succeeded, so "re-publish everything from the first failure onwards" re-sends records that were fine. Its inverse — "skip the first `succeeded` records" — is worse: it loses data, because `succeeded` is a count, not a prefix length.
+
+## Duplicates over loss
+
+A record whose fate is genuinely unknown — submitted to the broker but never confirmed — is reported as `unattempted`, never as succeeded. RabbitMQ hits this when a `basic_publish` fails partway through a batch: earlier messages are on the channel, but nothing has confirmed them, and the client cannot tell whether the broker received them.
+
+`shove` always resolves that ambiguity toward re-publishing. If your consumers are not already idempotent, make them so — see [Exactly-Once (RabbitMQ)](/guides/exactly-once) and the `x-message-id` header that every backend stamps.
+
+## Metrics
+
+`publish_batch` splits `shove_messages_published_total` by what the backend confirmed: `outcome="success"` for `succeeded()` records and `outcome="error"` for the rest. A partial batch therefore increments both, and the two always sum to the batch size. `shove_message_publish_duration_seconds` records one sample for the whole call — the user-observable latency — regardless of how many messages were inside. See [Observability](/guides/observability) for the full schema.

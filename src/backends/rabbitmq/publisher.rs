@@ -283,9 +283,7 @@ impl RabbitMqPublisher {
                         return BatchReport::prefix(
                             i,
                             total,
-                            ShoveError::Connection(
-                                "broker NACKed a batch message".to_string(),
-                            ),
+                            ShoveError::Connection("broker NACKed a batch message".to_string()),
                         );
                     }
                 }

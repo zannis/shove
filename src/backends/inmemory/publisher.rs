@@ -148,8 +148,8 @@ mod tests {
 
     use serde::{Deserialize, Serialize};
 
-    use super::*;
     use super::super::client::InMemoryConfig;
+    use super::*;
     use crate::topic::{SequencedTopic, Topic as TopicTrait};
     use crate::topology::{QueueTopology, SequenceFailure, TopologyBuilder};
 

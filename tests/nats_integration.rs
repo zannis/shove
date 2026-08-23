@@ -869,6 +869,7 @@ async fn publish_batch_happy_path_reports_accurate_count() {
     let client = tb.client();
     broker.topology().declare::<WorkTopic>().await.unwrap();
 
+    let client_for_assert = client.clone();
     let publisher = NatsPublisher::new(client).await.unwrap();
     let messages: Vec<SimpleMessage> = (1..=5)
         .map(|i| SimpleMessage {
@@ -877,9 +878,21 @@ async fn publish_batch_happy_path_reports_accurate_count() {
         })
         .collect();
 
-    let (succeeded, result) = publisher.publish_batch::<WorkTopic>(&messages).await;
+    let result = publisher.publish_batch::<WorkTopic>(&messages).await;
     assert!(result.is_ok(), "expected success, got {result:?}");
-    assert_eq!(succeeded, 5, "all 5 messages should be reported as stored");
+
+    // "All 5 stored" is now asserted against the broker rather than against a
+    // self-reported count: `Ok(())` means nothing is outstanding.
+    let mut stream = client_for_assert
+        .jetstream()
+        .get_stream(<WorkTopic as shove::Topic>::topology().queue())
+        .await
+        .expect("work stream should exist");
+    let info = stream.info().await.expect("should get stream info");
+    assert_eq!(
+        info.state.messages, 5,
+        "all 5 messages should be stored on a fully successful batch"
+    );
 
     broker.close().await;
 }
@@ -915,16 +928,51 @@ async fn publish_batch_drains_acks_after_partial_stream_failure() {
         })
         .collect();
 
-    let (succeeded, result) = publisher.publish_batch::<SeqPartialTopic>(&messages).await;
+    let err = publisher
+        .publish_batch::<SeqPartialTopic>(&messages)
+        .await
+        .expect_err("expected a partial failure from the shard-1 messages with no stream");
 
+    let shove::ShoveError::PartialBatch(f) = err else {
+        panic!("expected ShoveError::PartialBatch, got {err:?}");
+    };
+
+    assert!(f.succeeded() > 0, "shard-0 acks must not be abandoned");
     assert!(
-        result.is_err(),
-        "expected a partial failure from the shard-1 messages with no stream"
-    );
-    assert!(succeeded > 0, "shard-0 acks must not be abandoned");
-    assert!(
-        succeeded < messages.len() as u64,
+        f.succeeded() < messages.len(),
         "shard-1 messages have no stream and must not be counted as stored"
+    );
+
+    // Every record was submitted — only the acks failed — so nothing is
+    // unattempted and the failed set is exact.
+    assert!(
+        f.unattempted().is_empty(),
+        "submission succeeded for the whole batch; only acks failed: {:?}",
+        f.unattempted()
+    );
+    assert_eq!(f.failed(), f.to_republish());
+
+    // The invariant, asserted for this backend.
+    assert_eq!(f.succeeded() + f.to_republish().len(), messages.len());
+    assert!(
+        f.to_republish().windows(2).all(|w| w[0] < w[1]),
+        "to_republish must be ascending with no duplicates: {:?}",
+        f.to_republish()
+    );
+
+    // The point of exact indices: shard assignment interleaves, so records
+    // *after* the first failure were stored fine. A prefix-shaped retry would
+    // re-produce them; this set does not. (Deterministic — the same 20 keys
+    // hash to the same shards on every run.)
+    let first_failed = *f.failed().first().expect("at least one shard-1 message");
+    let last_succeeded = (0..messages.len())
+        .filter(|i| !f.to_republish().contains(i))
+        .next_back()
+        .expect("at least one shard-0 message");
+    assert!(
+        last_succeeded > first_failed,
+        "expected sparse indices, got a prefix: failed={:?}",
+        f.failed()
     );
 
     let mut stream = client
@@ -934,7 +982,8 @@ async fn publish_batch_drains_acks_after_partial_stream_failure() {
         .expect("stream should exist");
     let info = stream.info().await.expect("should get stream info");
     assert_eq!(
-        info.state.messages, succeeded,
+        info.state.messages as usize,
+        f.succeeded(),
         "reported success count must match what NATS actually stored"
     );
 }

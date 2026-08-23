@@ -348,7 +348,8 @@ mod tests {
 
     #[test]
     fn wholly_unattempted_returns_the_bare_error() {
-        let out = BatchReport::wholly_unattempted(4, ShoveError::Topology("nope".into())).resolve(4);
+        let out =
+            BatchReport::wholly_unattempted(4, ShoveError::Topology("nope".into())).resolve(4);
         assert!(matches!(out.result, Err(ShoveError::Topology(_))));
         assert_eq!(out.succeeded, 0);
         assert_eq!(out.failed, 4);
@@ -384,8 +385,7 @@ mod tests {
 
     #[test]
     fn to_republish_is_sorted_deduped_and_merged() {
-        let out =
-            BatchReport::sparse(vec![4, 1], vec![4, 2, 5], Some(conn("boom"))).resolve(7);
+        let out = BatchReport::sparse(vec![4, 1], vec![4, 2, 5], Some(conn("boom"))).resolve(7);
         let f = partial(&out);
         assert_eq!(f.to_republish(), &[1, 2, 4, 5]);
         assert_eq!(f.failed(), &[1, 4]);

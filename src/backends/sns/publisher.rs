@@ -519,6 +519,48 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // publish_batch index mapping
+    // ---------------------------------------------------------------------
+
+    /// Batch entries are stamped `.id(i.to_string())` with the *global* index
+    /// into `messages`, not the per-chunk offset, so a failed entry id maps
+    /// straight back to the caller's record.
+    #[test]
+    fn failed_entry_ids_map_back_to_global_indices() {
+        // Second chunk of a 25-record batch: ids 10..20.
+        let idx = parse_failed_indices(["12", "17"].into_iter(), &(10..20));
+        assert_eq!(idx, Some(vec![12, 17]));
+    }
+
+    #[test]
+    fn failed_entry_ids_are_returned_ascending() {
+        let idx = parse_failed_indices(["7", "2", "5"].into_iter(), &(0..10));
+        assert_eq!(idx, Some(vec![2, 5, 7]));
+    }
+
+    /// An id SNS could not have produced means the mapping is untrustworthy.
+    /// The caller then re-publishes the whole chunk rather than guessing which
+    /// records survived — duplicates over loss.
+    #[test]
+    fn unmappable_failed_entry_ids_reject_the_whole_mapping() {
+        assert_eq!(
+            parse_failed_indices(["not-a-number"].into_iter(), &(0..10)),
+            None
+        );
+        // In range for the batch, but not for the chunk that reported it.
+        assert_eq!(parse_failed_indices(["3"].into_iter(), &(10..20)), None);
+        assert_eq!(parse_failed_indices(["-1"].into_iter(), &(0..10)), None);
+    }
+
+    #[test]
+    fn no_failed_entries_maps_to_an_empty_set() {
+        assert_eq!(
+            parse_failed_indices(std::iter::empty(), &(0..10)),
+            Some(Vec::new())
+        );
+    }
+
     #[test]
     fn permanent_sns_codes_are_not_retryable() {
         for code in [

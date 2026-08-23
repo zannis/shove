@@ -129,22 +129,19 @@ mod tests {
     /// topology error is not, no matter how many records got through.
     #[test]
     fn partial_batch_delegates_retryability_to_its_source() {
-        let retryable = crate::batch::BatchReport::prefix(
-            1,
-            3,
-            ShoveError::Connection("channel closed".into()),
-        )
-        .resolve(3)
-        .result
-        .unwrap_err();
+        use crate::batch::BatchReport;
+
+        let retryable = BatchReport::prefix(1, 3, ShoveError::Connection("channel closed".into()))
+            .resolve(3)
+            .result
+            .unwrap_err();
         assert!(matches!(retryable, ShoveError::PartialBatch(_)));
         assert!(retryable.is_retryable());
 
-        let permanent =
-            crate::batch::BatchReport::prefix(1, 3, ShoveError::Topology("missing queue".into()))
-                .resolve(3)
-                .result
-                .unwrap_err();
+        let permanent = BatchReport::prefix(1, 3, ShoveError::Topology("missing queue".into()))
+            .resolve(3)
+            .result
+            .unwrap_err();
         assert!(matches!(permanent, ShoveError::PartialBatch(_)));
         assert!(!permanent.is_retryable());
     }
