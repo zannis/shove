@@ -524,8 +524,14 @@ where
     // Hold a maintenance interest (reaper: XAUTOCLAIM recovery + acked-entry
     // trimming) for this stream while the consumer runs. The registry dedupes
     // per (client, stream, group), so N consumers still share one sidecar.
-    let _maintenance = (maintain == Maintain::Stream)
-        .then(|| super::maintenance::acquire(&client, stream, options.handler_timeout));
+    let _maintenance = (maintain == Maintain::Stream).then(|| {
+        super::maintenance::acquire(
+            &client,
+            stream,
+            options.handler_timeout,
+            options.handler_timeout_outcome.is_some(),
+        )
+    });
 
     // Pre-compute metric label arcs once — reused cheaply for every message.
     let topic_arc: Arc<str> = Arc::from(topic_name);
@@ -836,7 +842,12 @@ where
 
     // Same per-(client, stream, group) maintenance interest as the
     // sequential loop — see run_stream_loop_arc.
-    let _maintenance = super::maintenance::acquire(&client, stream, options.handler_timeout);
+    let _maintenance = super::maintenance::acquire(
+        &client,
+        stream,
+        options.handler_timeout,
+        options.handler_timeout_outcome.is_some(),
+    );
 
     let topic_arc: Arc<str> = Arc::from(topic_name);
     let group_arc: Option<Arc<str>> = consumer_group.map(Arc::from);
