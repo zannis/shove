@@ -97,7 +97,26 @@ jobs:
       - name: Generate changelog
         run: |
           cargo install -q git-cliff --locked
-          git-cliff --latest --strip header -o RELEASE_NOTES.md
+          VERSION="${{ steps.version.outputs.version }}"
+          # Do not use `--latest`: on the `bump: none` path the "Commit and tag"
+          # step is skipped, so the tag does not exist yet and the newest tag is
+          # still the *previous* release -- `--latest` then re-emits that
+          # release's notes. Resolve the range explicitly instead, and pass
+          # --tag so untagged commits are attributed to the version being cut.
+          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' \
+                   --exclude "v${VERSION}" HEAD 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            echo "Generating notes for ${PREV}..HEAD"
+            git-cliff --strip header --tag "v${VERSION}" "${PREV}..HEAD" -o RELEASE_NOTES.md
+          else
+            echo "No previous tag found; generating notes over full history"
+            git-cliff --strip header --tag "v${VERSION}" -o RELEASE_NOTES.md
+          fi
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::error::Generated release notes for v${VERSION} are empty" >&2
+            exit 1
+          fi
+          cat RELEASE_NOTES.md
 
       - name: Create GitHub release
         run: |

@@ -12,7 +12,11 @@ trim = true
 
 [git]
 conventional_commits = true
-filter_unconventional = true
+# Keep unconventional subjects rather than dropping them. Squash-merged PRs
+# whose title is prose instead of `type: subject` used to vanish from the notes
+# entirely -- v0.11.2 shipped with an empty body for exactly this reason. The
+# catch-all parser below files them under "Miscellaneous".
+filter_unconventional = false
 split_commits = false
 commit_parsers = [
     { message = "^feat(\\(.+\\))?!?:", group = "Features" },
@@ -24,6 +28,7 @@ commit_parsers = [
     { message = "^chore(\\(.+\\))?!?:", group = "Miscellaneous" },
     { message = "^ci(\\(.+\\))?!?:", skip = true },
     { message = "^release", skip = true },
+    { message = ".*", group = "Miscellaneous" },
 ]
 filter_commits = false
 tag_pattern = "v[0-9].*"
