@@ -1137,6 +1137,25 @@ where
                 for msg in messages {
                     let receipt_handle = msg.receipt_handle().unwrap_or_default().to_string();
                     let retry_count = router::get_retry_count(&msg);
+                    // Unreachable on the supported topology, and deliberately kept.
+                    // `declare` creates every sequenced shard queue as FIFO
+                    // (`topology.rs`, `create_sqs_queue(.., fifo = true, ..)`), and SQS
+                    // itself rejects a `SendMessage` to a FIFO queue that carries no
+                    // `MessageGroupId` — so a message in this shape cannot reach the
+                    // queue. The fan-in topic is FIFO too, and `run_fifo` is bound
+                    // `T: SequencedTopic` with shard URLs resolved from the registry
+                    // `declare` populates, so there is no way to aim it at a non-FIFO
+                    // queue. It is not a "we forgot to request the attribute" bug
+                    // either: the receive call above asks for `MessageGroupId`
+                    // explicitly.
+                    //
+                    // This arm would start firing if sequenced topics ever ran over a
+                    // non-FIFO transport (standard queues plus an application-level
+                    // ordering key), which is why the guard is worth its ten lines.
+                    // Until then `messages_failed_total{reason="malformed"}` is
+                    // Redis-only — see `docs/pages/guides/observability.mdx`. Do not
+                    // write a test that "covers" it by synthesising a `Message`
+                    // in-crate; that asserts the harness, not the backend.
                     let seq_key = match extract_sequence_key(&msg) {
                         Some(k) => k,
                         None => {
