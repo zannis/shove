@@ -169,6 +169,7 @@ pub mod metrics;
 pub mod outcome;
 pub mod publisher;
 pub(crate) mod publisher_internal;
+pub mod queue_depth;
 #[cfg(feature = "kafka-schema-registry")]
 #[cfg_attr(docsrs, doc(cfg(feature = "kafka-schema-registry")))]
 pub mod schema_registry;
@@ -231,6 +232,7 @@ pub use autoscaler::{
     Autoscaler, AutoscalerBackend, AutoscalerConfig, ScalingDecision, ScalingMetrics,
     ScalingStrategy, Stabilized, ThresholdStrategy,
 };
+pub use queue_depth::QueueDepthSampler;
 
 // --- v2 generic wrappers (Phase 5) ---
 pub use broker::Broker;

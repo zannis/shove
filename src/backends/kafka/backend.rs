@@ -200,7 +200,19 @@ impl QueueStatsProviderImpl for KafkaLagStatsProvider {
             .await?;
         Ok(AutoscaleMetrics {
             backlog: Some(stats.messages_pending),
-            inflight: Some(stats.messages_in_flight),
+            // `KafkaQueueStats::messages_in_flight` is a hardcoded 0 —
+            // committed-offset lag cannot distinguish "fetched, being
+            // processed" from "not fetched", and Kafka exposes no
+            // group-wide in-flight count to ask for it. `None` is what the
+            // `Option` on every `AutoscaleMetrics` field is for: report the
+            // field as unknown rather than as empty, so
+            // `shove_queue_inflight` is simply absent for Kafka instead of
+            // pinned at a zero an operator would read as "nothing in
+            // flight". `fetch_metrics` still passes the 0 through to
+            // `ScalingMetrics`, whose field is not optional — no scaling
+            // policy reads it, and changing that shape is a separate,
+            // breaking change.
+            inflight: None,
             throughput_per_sec: None,
             processing_latency: None,
         })

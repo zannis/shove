@@ -56,6 +56,8 @@ pub(crate) struct MetricNames {
     pub message_publish_duration_seconds: String,
     pub message_size_bytes: String,
     pub messages_inflight: String,
+    pub queue_backlog: String,
+    pub queue_inflight: String,
     pub autoscaler_decisions_total: String,
     pub autoscaler_messages_ready: String,
     pub autoscaler_messages_in_flight: String,
@@ -76,6 +78,8 @@ pub(crate) fn names() -> &'static MetricNames {
             message_publish_duration_seconds: format!("{p}_message_publish_duration_seconds"),
             message_size_bytes: format!("{p}_message_size_bytes"),
             messages_inflight: format!("{p}_messages_inflight"),
+            queue_backlog: format!("{p}_queue_backlog"),
+            queue_inflight: format!("{p}_queue_inflight"),
             autoscaler_decisions_total: format!("{p}_autoscaler_decisions_total"),
             autoscaler_messages_ready: format!("{p}_autoscaler_messages_ready"),
             autoscaler_messages_in_flight: format!("{p}_autoscaler_messages_in_flight"),
@@ -705,6 +709,46 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Publish one queue-depth sample as gauges.
+///
+/// Emitted by [`QueueDepthSampler`](crate::queue_depth::QueueDepthSampler),
+/// which is independent of the autoscaler: an operator who runs a fixed
+/// consumer pool still gets backlog and broker-side in-flight depth, instead
+/// of losing the signal along with the `shove_autoscaler_*` gauges.
+///
+/// A `None` field emits **nothing**. Every backend fills what it can and
+/// leaves the rest unset (see [`AutoscaleMetrics`]), and setting an unknown
+/// depth to `0` would publish "the queue is empty" — the exact reading an
+/// operator would alert on. An absent series is honest; a zero is not.
+///
+/// Only `backlog` and `inflight` are published. [`AutoscaleMetrics`]'s other
+/// two fields are reserved for strategies that compute them locally; no
+/// backend's `snapshot` fills either, so a series for them would be
+/// permanently empty.
+///
+/// [`AutoscaleMetrics`]: crate::autoscale_metrics::AutoscaleMetrics
+#[cfg(feature = "metrics")]
+pub(crate) fn record_queue_depth(queue: &str, sample: &crate::AutoscaleMetrics) {
+    if let Some(backlog) = sample.backlog {
+        ::metrics::gauge!(
+            names().queue_backlog.as_str(),
+            "topic" => queue.to_string(),
+        )
+        .set(backlog as f64);
+    }
+    if let Some(inflight) = sample.inflight {
+        ::metrics::gauge!(
+            names().queue_inflight.as_str(),
+            "topic" => queue.to_string(),
+        )
+        .set(inflight as f64);
+    }
+}
+
+#[cfg(not(feature = "metrics"))]
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn record_queue_depth(_: &str, _: &crate::AutoscaleMetrics) {}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn record_autoscaler_decision(group: &str, direction: &'static str) {
     ::metrics::counter!(
@@ -836,6 +880,27 @@ mod tests {
         assert_eq!(BackendErrorKind::Consume.as_label(), "consume");
         assert_eq!(BackendErrorKind::Topology.as_label(), "topology");
         assert_eq!(BackendErrorKind::Ack.as_label(), "ack");
+    }
+
+    /// The queue-depth gauges are the series the sampler exists to publish,
+    /// so operators alert on these exact names. Pin them, and pin that they
+    /// are *not* under the `autoscaler_` namespace — the whole point is that
+    /// they survive autoscaling being turned off.
+    #[test]
+    fn queue_depth_gauge_names_use_default_prefix() {
+        let n = names();
+        assert_eq!(n.queue_backlog.as_str(), "shove_queue_backlog");
+        assert_eq!(n.queue_inflight.as_str(), "shove_queue_inflight");
+        for name in [n.queue_backlog.as_str(), n.queue_inflight.as_str()] {
+            assert!(
+                !name.contains("autoscaler"),
+                "{name} must not live in the autoscaler namespace",
+            );
+        }
+        // …and must not collide with the process-side in-flight gauge, which
+        // counts messages inside a handler right now rather than messages the
+        // broker has delivered and is waiting to have acked.
+        assert_ne!(n.queue_inflight.as_str(), n.messages_inflight.as_str());
     }
 
     #[test]
