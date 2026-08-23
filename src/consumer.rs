@@ -339,8 +339,17 @@ impl<B: Backend> ConsumerOptions<B> {
     /// - [`Outcome::Defer`] — redeliver via `hold_queues[0]` **without**
     ///   consuming retry budget, so a slow handler never dead-letters a valid
     ///   message. Note [`Outcome::Defer`]'s infinite-loop caveat: nothing
-    ///   bounds the redeliveries, and sequenced consumers downgrade it back to
-    ///   [`Outcome::Retry`] because it violates ordering.
+    ///   bounds the redeliveries.
+    ///
+    ///   On a **sequenced** consumer this inherits `Defer`'s existing
+    ///   backend-specific handling, which is not uniform: Kafka, NATS,
+    ///   SNS/SQS and the in-memory backend downgrade `Defer` to
+    ///   [`Outcome::Retry`] with a warning, so a persistently slow handler
+    ///   still exhausts its budget there; RabbitMQ's sharded consumer and
+    ///   Redis Streams route it to a hold queue without incrementing the
+    ///   retry count, so it can defer indefinitely. Choose `Defer` for a
+    ///   sequenced consumer only if that split is acceptable — on the four
+    ///   backends that downgrade, this option buys you nothing.
     /// - [`Outcome::Reject`] — treat a timeout as terminal and dead-letter on
     ///   the first occurrence, consuming no retry budget.
     /// - [`Outcome::Ack`] — drop the message. The handler is cancelled
