@@ -68,12 +68,31 @@
 //! reaper's re-add.
 //!
 //! That guard is check-then-act, and the two halves are *not* serialized
-//! against each other. `touch` returning true is a statement about the past.
-//! Applying an outcome is a separate round trip — often two, an `XADD` to a
-//! DLQ or hold queue followed by an `XACK` — and cannot be folded into the
-//! same script, because those destinations are different keys and would
-//! `CROSSSLOT`-fail on Redis Cluster. An owner descheduled between the check
-//! and the write can still be overtaken by a reaper, leaving a duplicate.
+//! against each other. `touch` returning true is a statement about the past;
+//! applying an outcome is a separate round trip — often two, an `XADD` to a
+//! DLQ or hold queue followed by an `XACK`. An owner descheduled between the
+//! check and the write can still be overtaken by a reaper, leaving a
+//! duplicate.
+//!
+//! That gap is a **choice this backend makes, not a Redis limitation**. Two
+//! things could close it and neither is ruled out:
+//!
+//! - `Ack` and a no-DLQ `Reject` touch only the source stream, and an
+//!   immediate `Retry`/`Defer` with no hold queue does `XADD` + `XACK` on that
+//!   same stream. All three are single-key, so the check and the action fit in
+//!   one script on any deployment, cluster or not.
+//! - DLQ and hold-queue routing does span keys, but Redis Cluster runs
+//!   multi-key scripts fine when the keys share a hash slot, which is what
+//!   hash tags are for. shove's derived `"{queue}-dlq"` and hold-queue names
+//!   append to the queue name, so a queue already carrying a tag keeps it and
+//!   the derived keys land in the same slot.
+//!
+//! What is genuinely not available is a formulation that works for *arbitrary*
+//! user-supplied destination names on a clustered deployment, where the source
+//! and destination can fall in different slots. Rather than serialize some
+//! outcomes and not others, this backend currently takes the at-least-once
+//! fallback uniformly for all of them. Folding the single-key cases into
+//! `TOUCH_LEASE` is open work, not a dead end.
 //!
 //! So the honest guarantee is: the lease **narrows** the window in which a
 //! foreign reaper and a resolving owner both act on one entry, from "every

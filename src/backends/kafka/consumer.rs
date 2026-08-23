@@ -503,6 +503,18 @@ type CompletionHandle = Option<(mpsc::Sender<(i32, i64)>, i32, i64)>;
 /// it is never committed, so the message is redelivered from the last
 /// committed position on the next rebalance or restart — callers about to
 /// assert the message is gone must not do so when this returns `false`.
+///
+/// **`true` is not a broker acknowledgement.** It says the offset entered the
+/// in-process tracker, which commits asynchronously later; the commit can
+/// still fail, or be dropped outright by librdkafka mid-rebalance without any
+/// callback (see `OffsetTracker::apply_rebalance_events`). Kafka offers no
+/// reliable positive signal that a specific offset was committed, so the
+/// concurrent path's discard accounting is settled here, at hand-off, and is
+/// exact only up to a lost commit. A lost commit redelivers the message, which
+/// reaches its terminal outcome again and is counted again — the error is a
+/// duplicate count, never a missed one, which is the safe direction for a
+/// metric whose whole purpose is to make silent drops visible. The FIFO path
+/// does not settle here: it commits synchronously and settles on that result.
 fn signal_completion(handle: CompletionHandle, queue: &str) -> bool {
     // No tracker attached (the FIFO path commits inline): nothing to signal,
     // and nothing holding the delivery back either.
@@ -551,11 +563,11 @@ async fn route_outcome(
     // instead of stalling `acquire_many(prefetch)` until every delayed
     // permit-holder finishes naturally.
     shutdown: CancellationToken,
-) -> bool {
+) -> (bool, Option<metrics::PendingDiscard>) {
     match decide_retry(&outcome, retry_count, max_retries) {
         RetryDecision::Ack => {
             let _ = signal_completion(completion, topic);
-            true
+            (true, None)
         }
         RetryDecision::Dlq { reason } => {
             let fail_reason = match reason {
@@ -564,6 +576,10 @@ async fn route_outcome(
             };
             let pending =
                 metrics::record_terminal(topic, group, fail_reason, topology.dlq().is_some());
+            // FIFO commits synchronously in the caller, which is the only
+            // place Kafka gives a real broker acknowledgement of an offset.
+            // Hand the accounting there rather than settling it here.
+            let fifo = completion.is_none();
             let dlq_ok =
                 publish_to_dlq(client, topology, payload, key.as_deref(), headers, reason).await;
             // Commit even if the DLQ publish failed: the message has
@@ -577,12 +593,17 @@ async fn route_outcome(
                     // `publish_to_dlq` is `Ok(())` both when it dead-lettered
                     // and when no DLQ is configured; `confirm` distinguishes
                     // them from the topology.
+                    if fifo {
+                        // `retired` is vacuously true on this path — nothing
+                        // was signalled — so the commit decides it.
+                        return (true, Some(pending));
+                    }
                     if retired {
                         pending.confirm();
                     } else {
                         pending.survived();
                     }
-                    true
+                    (true, None)
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to publish to DLQ");
@@ -590,12 +611,15 @@ async fn route_outcome(
                     // the offset still advanced, nothing holds a copy — that is
                     // data loss even though the topology declares a DLQ, so it
                     // is counted rather than excused by `has_dlq`.
-                    if retired {
+                    //
+                    // FIFO returns `false`, so its caller skips the commit
+                    // entirely and the message stays put — no loss to record.
+                    if retired && !fifo {
                         pending.confirm_lost();
                     } else {
                         pending.survived();
                     }
-                    false
+                    (false, None)
                 }
             }
         }
@@ -611,19 +635,22 @@ async fn route_outcome(
             let retry_headers =
                 headers_with_retry_count(headers, new_count, &format!("-r{new_count}"));
 
-            run_delayed_republish(
-                client.clone(),
-                topic.to_string(),
-                key,
-                retry_headers,
-                payload.to_vec(),
-                delay,
-                retry_permit,
-                completion,
-                shutdown,
-                "retry republish",
+            (
+                run_delayed_republish(
+                    client.clone(),
+                    topic.to_string(),
+                    key,
+                    retry_headers,
+                    payload.to_vec(),
+                    delay,
+                    retry_permit,
+                    completion,
+                    shutdown,
+                    "retry republish",
+                )
+                .await,
+                None,
             )
-            .await
         }
         RetryDecision::Hold { increment: false } => {
             let delay = if hold_queues.is_empty() {
@@ -639,19 +666,22 @@ async fn route_outcome(
                 &format!("-d{}", uuid::Uuid::new_v4()),
             );
 
-            run_delayed_republish(
-                client.clone(),
-                topic.to_string(),
-                key,
-                defer_headers,
-                payload.to_vec(),
-                delay,
-                retry_permit,
-                completion,
-                shutdown,
-                "defer republish",
+            (
+                run_delayed_republish(
+                    client.clone(),
+                    topic.to_string(),
+                    key,
+                    defer_headers,
+                    payload.to_vec(),
+                    delay,
+                    retry_permit,
+                    completion,
+                    shutdown,
+                    "defer republish",
+                )
+                .await,
+                None,
             )
-            .await
         }
     }
 }
@@ -1671,7 +1701,7 @@ impl KafkaConsumer {
                                 // Without this gating the offset would commit before
                                 // the republish landed, silently dropping the message
                                 // on republish failure.
-                                route_outcome(
+                                let routed = route_outcome(
                                     &task_client,
                                     &task_topic,
                                     task_group.as_deref(),
@@ -1688,6 +1718,11 @@ impl KafkaConsumer {
                                     task_shutdown,
                                 )
                                 .await;
+                                // Concurrent path: the pending discard is
+                                // always settled inside `route_outcome` (see
+                                // `signal_completion`), so nothing is handed
+                                // back here.
+                                debug_assert!(routed.1.is_none());
 
                                 if task_semaphore.available_permits() == task_prefetch as usize {
                                     task_processing.store(false, Ordering::Release);
@@ -2061,7 +2096,7 @@ impl KafkaConsumer {
                                 .await;
                                 let outcome = adjust_outcome_for_fifo(outcome);
 
-                                let route_ok = route_outcome(
+                                let (route_ok, pending) = route_outcome(
                                     &client,
                                     &queue,
                                     group.as_deref(),
@@ -2089,7 +2124,36 @@ impl KafkaConsumer {
                                 // shutdown is how at-least-once delivery survives
                                 // a missed delayed publish on the FIFO path.
                                 if route_ok {
-                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                    match pending {
+                                        // A terminal outcome: this commit is
+                                        // what actually drops the message, so
+                                        // it decides the discard accounting.
+                                        // `Async` only queues the request and
+                                        // reports nothing, so commit
+                                        // synchronously here and settle on the
+                                        // broker's answer. Terminal outcomes
+                                        // are rare (rejected, or retries
+                                        // exhausted), so the extra round trip
+                                        // stays off the hot path.
+                                        Some(pending) => {
+                                            match consumer.commit_message(&msg, CommitMode::Sync) {
+                                                Ok(()) => pending.confirm(),
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        queue,
+                                                        error = %e,
+                                                        "offset commit failed after a terminal \
+                                                         outcome; the message stays committed at \
+                                                         its previous offset and is redelivered"
+                                                    );
+                                                    pending.survived();
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        }
+                                    }
                                 }
                                 processing.store(false, Ordering::Release);
                             }

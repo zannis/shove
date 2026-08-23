@@ -383,11 +383,17 @@ impl<B: Backend> ConsumerOptions<B> {
     ///   [`with_handler_timeout`](Self::with_handler_timeout), and not relaxed
     ///   here. A process sweeping at 30 s against a 60 s handler elsewhere is
     ///   racing the renewal, not beaten by it.
-    /// - The re-check is check-then-act. Applying an outcome takes further
-    ///   round trips (`XADD` then `XACK`) that cannot join the check's script,
-    ///   because a DLQ or hold queue is a different key and would
-    ///   `CROSSSLOT`-fail on Redis Cluster. A consumer stalled between the two
-    ///   can still be overtaken.
+    /// - The re-check is check-then-act, and this backend does not currently
+    ///   serialize the two halves: applying an outcome takes further round
+    ///   trips (`XADD` then `XACK`) issued separately from the check, so a
+    ///   consumer stalled between them can still be overtaken. That is a
+    ///   present limitation rather than something Redis forbids — `Ack`, a
+    ///   no-DLQ `Reject` and an immediate `Retry`/`Defer` are single-key and
+    ///   would fit in the check's script, and DLQ/hold routing is scriptable
+    ///   too wherever the destination shares a hash slot with the queue. What
+    ///   has no single-script form is arbitrary cross-slot destinations on a
+    ///   clustered deployment, and the same at-least-once fallback is applied
+    ///   uniformly rather than only there.
     /// - The renewal interval has a 100 ms floor, so below a 200 ms handler
     ///   timeout the margin narrows from half the timeout to whatever is left
     ///   over that floor — and at 100 ms or under there is none: the first

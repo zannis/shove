@@ -4128,4 +4128,165 @@ mod lease_tests {
              completed handler's outcome",
         );
     }
+
+    // -----------------------------------------------------------------------
+    // A pre-handler terminal outcome must respect the lease too.
+    //
+    // `XREADGROUP COUNT prefetch` admits the whole batch to this consumer's
+    // PEL in one call, but the entries are inspected one at a time. An entry
+    // near the end of the batch can therefore be reclaimed by a foreign reaper
+    // before the consumer has even looked at it — and the paths that reject an
+    // entry *without* running a handler (missing payload, oversize,
+    // undecodable) used to dead-letter it regardless, adding a second copy
+    // alongside the reaper's re-add.
+    //
+    // Setup: prefetch 2, so one XREADGROUP takes both entries. The first is
+    // valid and its handler blocks; while it blocks, the test steals the
+    // second — an undecodable payload — exactly as a reaper at its idle
+    // threshold would. When the handler finishes and the loop reaches the
+    // stolen entry, it must decline to dead-letter it.
+    // -----------------------------------------------------------------------
+
+    struct PrefetchSkipTopic;
+    impl Topic for PrefetchSkipTopic {
+        type Message = Leased;
+        type Codec = JsonCodec;
+        fn topology() -> &'static shove::QueueTopology {
+            static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+            T.get_or_init(|| {
+                TopologyBuilder::new("redis-int-prefetch-skip")
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+
+    struct BlockUntilStolenHandler;
+    impl MessageHandler<PrefetchSkipTopic> for BlockUntilStolenHandler {
+        type Context = RenewCtx;
+        async fn handle(&self, _msg: Leased, _meta: MessageMetadata, ctx: &RenewCtx) -> Outcome {
+            ctx.started.fetch_add(1, Ordering::SeqCst);
+            // Long enough for the test to steal the *other* prefetched entry
+            // before this returns and the loop advances to it.
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetched_undecodable_entry_is_not_dead_lettered_after_it_is_stolen() {
+        let group_name = "prefetch-skip-group";
+        let broker = make_broker(group_name).await;
+        broker
+            .topology()
+            .declare::<PrefetchSkipTopic>()
+            .await
+            .expect("declare");
+
+        let stream = PrefetchSkipTopic::topology().queue();
+        let dlq = PrefetchSkipTopic::topology()
+            .dlq()
+            .expect("topic has a DLQ");
+
+        // Entry 1: valid, handled slowly. Entry 2: not decodable as `Leased`,
+        // so it takes the pre-handler deserialize path with no handler run.
+        let publisher = broker.publisher().await.expect("publisher");
+        publisher
+            .publish::<PrefetchSkipTopic>(&Leased { id: 1 })
+            .await
+            .expect("publish");
+
+        let mut seed = raw_conn().await;
+        let bad_id: String = redis::cmd("XADD")
+            .arg(stream)
+            .arg("*")
+            .arg("payload")
+            .arg("{not-json")
+            .query_async(&mut seed)
+            .await
+            .expect("XADD undecodable entry");
+
+        let ctx = RenewCtx {
+            started: Arc::new(AtomicU32::new(0)),
+        };
+        let mut group = broker.consumer_group().with_context(ctx.clone());
+        group
+            .register::<PrefetchSkipTopic, _>(
+                ConsumerGroupConfig::new(
+                    RedisConsumerGroupConfig::new(1..=1)
+                        // Both entries arrive in one XREADGROUP.
+                        .with_prefetch_count(2)
+                        .with_handler_timeout(Duration::from_secs(30))
+                        // Makes this consumer lease-holding: without an
+                        // outcome override there is no lease and nothing to
+                        // check.
+                        .with_handler_timeout_outcome(Outcome::Reject),
+                ),
+                || BlockUntilStolenHandler,
+            )
+            .await
+            .expect("register");
+
+        let token = group.cancellation_token();
+        let started_probe = ctx.started.clone();
+        let stolen_id = bad_id.clone();
+        let thief = tokio::spawn(async move {
+            let entered = poll_until(
+                move || started_probe.load(Ordering::SeqCst) >= 1,
+                Duration::from_secs(10),
+            )
+            .await;
+            assert!(entered, "handler was never invoked");
+
+            // The handler is running on entry 1, so entry 2 is sitting in this
+            // consumer's PEL untouched. Steal it.
+            let mut conn = raw_conn().await;
+            let _: redis::Value = redis::cmd("XCLAIM")
+                .arg(stream)
+                .arg(group_name)
+                .arg("foreign-reaper")
+                .arg(0)
+                .arg(&stolen_id)
+                .query_async(&mut conn)
+                .await
+                .expect("XCLAIM");
+
+            // Past the handler's 6 s, with margin for the DLQ write it would
+            // make if the pre-handler path were unguarded.
+            tokio::time::sleep(Duration::from_secs(11)).await;
+
+            let dlq_len: i64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut conn)
+                .await
+                .expect("XLEN");
+            let after = pending(&mut conn, stream, group_name).await;
+            token.cancel();
+            (dlq_len, after)
+        });
+
+        let outcome = group
+            .run_until_timeout(std::future::pending::<()>(), Duration::from_secs(40))
+            .await;
+        let (dlq_len, after) = thief.await.expect("thief");
+        assert!(outcome.is_clean(), "outcome: {outcome:?}");
+
+        assert_eq!(
+            dlq_len, 0,
+            "an undecodable entry was dead-lettered after a reaper had already \
+             reclaimed it; the reaper still owns redelivery, so the message now \
+             exists twice",
+        );
+        let stolen: Vec<_> = after.ids.iter().filter(|e| e.id == bad_id).collect();
+        assert_eq!(
+            stolen.len(),
+            1,
+            "the stolen entry must stay in the thief's PEL for it to redeliver",
+        );
+        assert_eq!(
+            stolen[0].consumer, "foreign-reaper",
+            "the owner must not reclaim the entry on its way to a pre-handler \
+             terminal outcome",
+        );
+    }
 }

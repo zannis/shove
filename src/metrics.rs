@@ -342,11 +342,23 @@ pub(crate) struct PendingDiscard {
 
 #[allow(dead_code)] // Callers gated behind backend features.
 impl PendingDiscard {
-    /// The broker confirmed the message is retired.
+    /// The delivery is retired: the broker will not deliver it again.
     ///
     /// Records the discard when the topic declares no DLQ, so the message was
     /// dropped rather than dead-lettered. With a DLQ configured the message
     /// still exists — in the DLQ — so nothing is counted.
+    ///
+    /// Call this only against a broker-acknowledged retirement — a
+    /// server-confirmed ack (NATS `double_ack`), an `XACK` that reported
+    /// actually acknowledging the entry, or a synchronous commit that returned
+    /// `Ok`. The one path that cannot supply such an acknowledgement is
+    /// Kafka's concurrent consumer, whose offsets are committed asynchronously
+    /// by a shared tracker and can be dropped mid-rebalance with no callback
+    /// at all; it settles at offset hand-off instead, and
+    /// `backends::kafka::consumer::signal_completion` documents exactly what
+    /// that is worth. That error direction double-counts a redelivered message
+    /// rather than missing a real drop — the failure this metric exists to
+    /// prevent.
     pub(crate) fn confirm(self) {
         if !self.has_dlq {
             record_discarded(&self.topic, self.group.as_deref(), self.reason);
