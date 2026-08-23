@@ -107,6 +107,13 @@ metrics = ["dep:metrics"]
 # `M: prost::Message + Default`.
 protobuf = ["dep:prost"]
 
+# Optional `from_env()` constructors for shove's tuning knobs (consumer range,
+# prefetch, Kafka replication, NATS stream config) plus the prefix-scoped
+# `EnvVars` reader they are built on. Opt-in and std-only: services that
+# configure shove in code pay nothing, and shove never claims an unprefixed
+# variable name. See `shove::env`.
+env-config = []
+
 # Simple Binary Encoding (SBE) codec. Zero-copy: topics carry `SbeFrame<T>`
 # wire frames that publish and decode without re-encoding or copying, so
 # handlers wrap sbe-tool-generated flyweight decoders directly over the

@@ -1,5 +1,10 @@
 use std::time::Duration;
 
+#[cfg(all(feature = "nats", feature = "env-config"))]
+use crate::env::EnvVars;
+#[cfg(all(feature = "nats", feature = "env-config"))]
+use crate::error::Result;
+
 // ---------------------------------------------------------------------------
 // NATS stream config
 // ---------------------------------------------------------------------------
@@ -53,6 +58,60 @@ impl Default for NatsStreamConfig {
             max_messages: None,
             num_replicas: 1,
         }
+    }
+}
+
+#[cfg(all(feature = "nats", feature = "env-config"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "nats", feature = "env-config"))))]
+impl NatsStreamConfig {
+    /// Read the stream knobs from the environment under `prefix`.
+    ///
+    /// | Variable | Type | Default |
+    /// |---|---|---|
+    /// | `{PREFIX}_RETENTION` | `work_queue` \| `limits` \| `interest` | `work_queue` |
+    /// | `{PREFIX}_MAX_AGE_SECS` | `u64`, `>= 1` | unlimited |
+    /// | `{PREFIX}_MAX_BYTES` | `i64`, `>= 1` | unlimited |
+    /// | `{PREFIX}_MAX_MESSAGES` | `i64`, `>= 1` | unlimited |
+    /// | `{PREFIX}_NUM_REPLICAS` | `usize`, `1..=5` | `1` |
+    ///
+    /// `RETENTION` matching ignores case and treats `-` and `_` alike, so
+    /// `work_queue`, `work-queue`, and `WorkQueue` all resolve to
+    /// [`NatsRetention::WorkQueue`].
+    ///
+    /// ```
+    /// use shove::NatsStreamConfig;
+    ///
+    /// let config = NatsStreamConfig::from_env("EVENTS")?;
+    /// # let _ = config.num_replicas;
+    /// # Ok::<_, shove::ShoveError>(())
+    /// ```
+    pub fn from_env(prefix: impl Into<String>) -> Result<Self> {
+        Self::from_vars(&EnvVars::with_prefix(prefix))
+    }
+
+    /// Read from an existing [`EnvVars`], so one reader can populate several
+    /// config structs.
+    pub fn from_vars(vars: &EnvVars) -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            retention: vars.choice(
+                "RETENTION",
+                defaults.retention,
+                &[
+                    ("work_queue", NatsRetention::WorkQueue),
+                    ("limits", NatsRetention::Limits),
+                    ("interest", NatsRetention::Interest),
+                ],
+            )?,
+            max_age: vars
+                .opt_parse_in("MAX_AGE_SECS", 1..=u64::MAX)?
+                .map(Duration::from_secs),
+            max_bytes: vars.opt_parse_in("MAX_BYTES", 1..=i64::MAX)?,
+            max_messages: vars.opt_parse_in("MAX_MESSAGES", 1..=i64::MAX)?,
+            // 5 is JetStream's own ceiling: reject a typo at startup rather
+            // than at stream-creation time.
+            num_replicas: vars.parse_in("NUM_REPLICAS", defaults.num_replicas, 1..=5)?,
+        })
     }
 }
 
@@ -714,6 +773,77 @@ impl TopologyBuilder {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "nats", feature = "env-config"))]
+mod nats_env_config_tests {
+    use super::{NatsRetention, NatsStreamConfig};
+    use crate::env::EnvVars;
+    use std::time::Duration;
+
+    fn vars(pairs: &[(&str, &str)]) -> EnvVars {
+        EnvVars::from_pairs("EVENTS", pairs.to_vec())
+    }
+
+    #[test]
+    fn all_unset_matches_default() {
+        assert_eq!(
+            NatsStreamConfig::from_vars(&vars(&[])).unwrap(),
+            NatsStreamConfig::default()
+        );
+    }
+
+    #[test]
+    fn reads_every_knob() {
+        let config = NatsStreamConfig::from_vars(&vars(&[
+            ("EVENTS_RETENTION", "limits"),
+            ("EVENTS_MAX_AGE_SECS", "3600"),
+            ("EVENTS_MAX_BYTES", "1048576"),
+            ("EVENTS_MAX_MESSAGES", "1000"),
+            ("EVENTS_NUM_REPLICAS", "3"),
+        ]))
+        .unwrap();
+        assert_eq!(config.retention, NatsRetention::Limits);
+        assert_eq!(config.max_age, Some(Duration::from_secs(3600)));
+        assert_eq!(config.max_bytes, Some(1_048_576));
+        assert_eq!(config.max_messages, Some(1000));
+        assert_eq!(config.num_replicas, 3);
+    }
+
+    #[test]
+    fn retention_spelling_is_forgiving() {
+        for spelling in ["work_queue", "work-queue", "WorkQueue"] {
+            let config = NatsStreamConfig::from_vars(&vars(&[("EVENTS_RETENTION", spelling)]))
+                .unwrap_or_else(|e| panic!("rejected {spelling}: {e}"));
+            assert_eq!(config.retention, NatsRetention::WorkQueue);
+        }
+        let err =
+            NatsStreamConfig::from_vars(&vars(&[("EVENTS_RETENTION", "forever")])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("EVENTS_RETENTION"), "got: {msg}");
+        assert!(msg.contains("work_queue"), "got: {msg}");
+    }
+
+    #[test]
+    fn replicas_are_capped_at_jetstreams_own_maximum() {
+        assert!(NatsStreamConfig::from_vars(&vars(&[("EVENTS_NUM_REPLICAS", "6")])).is_err());
+        assert!(NatsStreamConfig::from_vars(&vars(&[("EVENTS_NUM_REPLICAS", "0")])).is_err());
+        assert_eq!(
+            NatsStreamConfig::from_vars(&vars(&[("EVENTS_NUM_REPLICAS", "5")]))
+                .unwrap()
+                .num_replicas,
+            5
+        );
+    }
+
+    #[test]
+    fn zero_bounds_are_rejected_rather_than_read_as_unlimited() {
+        // `max_bytes: 0` would mean "unlimited" to JetStream, which is the
+        // opposite of what an operator writing `0` intends.
+        assert!(NatsStreamConfig::from_vars(&vars(&[("EVENTS_MAX_BYTES", "0")])).is_err());
+        assert!(NatsStreamConfig::from_vars(&vars(&[("EVENTS_MAX_MESSAGES", "0")])).is_err());
+        assert!(NatsStreamConfig::from_vars(&vars(&[("EVENTS_MAX_AGE_SECS", "0")])).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

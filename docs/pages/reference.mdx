@@ -21,6 +21,7 @@ The full API reference for `shove` is auto-generated rustdoc on **[docs.rs/shove
 - [`ConsumerOptions`](https://docs.rs/shove/latest/shove/struct.ConsumerOptions.html) — per-consumer tuning
 - [`Codec`](https://docs.rs/shove/latest/shove/trait.Codec.html) — per-topic wire encoding (`JsonCodec`, `ProtobufCodec`, `SbeCodec`, `RawBytesCodec`)
 - [`SbeFrame`](https://docs.rs/shove/latest/shove/struct.SbeFrame.html), [`SbeMessage`](https://docs.rs/shove/latest/shove/trait.SbeMessage.html) — zero-copy SBE wire frames (`sbe` feature)
+- [`shove::env`](https://docs.rs/shove/latest/shove/env/) — prefix-scoped `from_env()` constructors for the tuning knobs (`env-config` feature)
 
 ## Per-backend modules
 

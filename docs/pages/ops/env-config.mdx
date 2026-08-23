@@ -1,0 +1,170 @@
+# Environment Configuration
+
+Every service that runs `shove` in production ends up writing the same small
+parser: read `ORDERS_MAX_CONSUMERS`, trim it, treat an empty string as unset,
+fall back to a default, range-check the result, and produce an error that
+actually names the variable when someone typos a deployment manifest.
+
+The optional `env-config` feature owns that shape so your service doesn't have
+to.
+
+```toml
+[dependencies]
+shove = { version = "0.13", features = ["env-config"] }
+```
+
+It is std-only and adds no dependencies. Services that configure `shove` in
+code pay nothing for it.
+
+## Two rules that hold everywhere
+
+**Variables are prefix-scoped.** `shove` never claims a bare name like
+`MAX_CONSUMERS`. One process routinely runs several consumer groups that need to
+be tuned independently, so every reader takes a prefix and looks up
+`{PREFIX}_{KEY}`.
+
+**Unset means "keep the default"; invalid means "fail".** A missing, empty, or
+whitespace-only value falls back to the documented default. A value that is set
+but unparseable or out of range is an error — a typo should fail the process at
+startup, not quietly run at a default nobody asked for.
+
+## Consumer sizing
+
+`ConsumerTuning` covers the three knobs every backend's consumer-group config
+takes.
+
+| Variable | Type | Default |
+|---|---|---|
+| `{PREFIX}_MIN_CONSUMERS` | `u16`, `>= 1` | `1` |
+| `{PREFIX}_MAX_CONSUMERS` | `u16`, `>= 1` | same as min (fixed-size group) |
+| `{PREFIX}_PREFETCH_COUNT` | `u16`, `>= 1` | unset — keep the backend default |
+
+Setting only `MAX_CONSUMERS` gives an autoscaling group starting from 1; setting
+only `MIN_CONSUMERS` pins a fixed-size group. `MIN > MAX` is an error that names
+both variables.
+
+```rust
+use shove::env::ConsumerTuning;
+use shove::rabbitmq::RabbitMqConsumerGroupConfig;
+
+let tuning = ConsumerTuning::from_env("ORDERS")?;
+
+let config = RabbitMqConsumerGroupConfig::new("orders", tuning.range())
+    .with_prefetch_count(tuning.prefetch_count_or(10));
+```
+
+`prefetch_count_or` keeps the call site a single unconditional call: it returns
+the configured value when the variable is set and your own default when it
+isn't. Every backend's group config takes the same
+`new(name, range)` + `.with_prefetch_count(n)` shape, so the same `tuning`
+feeds all six.
+
+## Autoscaler
+
+| Variable | Type | Default |
+|---|---|---|
+| `{PREFIX}_POLL_INTERVAL_SECS` | `u64`, `>= 1` | `5` |
+| `{PREFIX}_SCALE_UP_MULTIPLIER` | `f64`, `> 0` | `2.0` |
+| `{PREFIX}_SCALE_DOWN_MULTIPLIER` | `f64`, `> 0` | `0.5` |
+| `{PREFIX}_HYSTERESIS_SECS` | `u64` | `10` |
+| `{PREFIX}_COOLDOWN_SECS` | `u64` | `30` |
+
+```rust
+use shove::autoscaler::AutoscalerConfig;
+
+let autoscaler = AutoscalerConfig::from_env("ORDERS")?;
+```
+
+`SCALE_DOWN_MULTIPLIER` must be strictly below `SCALE_UP_MULTIPLIER`. At or
+above it, both scaling conditions can hold at the same queue depth and the group
+flaps — so that combination is rejected at startup rather than discovered in
+production. See [Performance Tuning](/ops/performance) for how to pick the
+multipliers themselves.
+
+## NATS JetStream streams
+
+| Variable | Type | Default |
+|---|---|---|
+| `{PREFIX}_RETENTION` | `work_queue` \| `limits` \| `interest` | `work_queue` |
+| `{PREFIX}_MAX_AGE_SECS` | `u64`, `>= 1` | unlimited |
+| `{PREFIX}_MAX_BYTES` | `i64`, `>= 1` | unlimited |
+| `{PREFIX}_MAX_MESSAGES` | `i64`, `>= 1` | unlimited |
+| `{PREFIX}_NUM_REPLICAS` | `usize`, `1..=5` | `1` |
+
+```rust
+use shove::NatsStreamConfig;
+
+let stream = NatsStreamConfig::from_env("EVENTS")?;
+```
+
+`RETENTION` matching ignores case and treats `-` and `_` alike, so `work_queue`,
+`work-queue`, and `WorkQueue` all resolve to the same policy. `NUM_REPLICAS` is
+capped at 5 because that is JetStream's own maximum. The size bounds reject `0`
+rather than reading it as JetStream's "unlimited" — an operator writing `0`
+means the opposite.
+
+## Kafka topic durability
+
+| Variable | Type | Default |
+|---|---|---|
+| `{PREFIX}_REPLICATION_FACTOR` | `i32`, `1..=32767` | unset |
+| `{PREFIX}_MIN_PARTITIONS` | `i32`, `>= 1` | unset |
+
+Both stay `Option` because "unset" has to remain distinguishable from `1`: a
+single-broker dev cluster and a production R3 cluster run the same binary, and
+`shove`'s own defaults should apply when the operator says nothing.
+
+```rust
+use shove::env::KafkaTopicTuning;
+
+let tuning = KafkaTopicTuning::from_env("INGEST")?;
+
+let mut declarer = broker.topology();
+if let Some(rf) = tuning.replication_factor() {
+    declarer = declarer.with_replication_factor(rf);
+}
+if let Some(n) = tuning.min_partitions() {
+    declarer = declarer.with_min_partitions(n);
+}
+declarer.declare::<IngestionTopic>().await?;
+```
+
+## Knobs shove doesn't model
+
+`EnvVars` is the primitive the constructors above are built on, and it is
+public. Use it for your own service's knobs so they parse, range-check, and
+report errors the same way:
+
+```rust
+use shove::env::EnvVars;
+
+let vars = EnvVars::with_prefix("ORDERS");
+
+let batch_size: usize = vars.parse_in("BATCH_SIZE", 100, 1..=10_000)?;
+let flush_interval = vars.secs("FLUSH_INTERVAL_SECS", Duration::from_secs(5))?;
+let dry_run = vars.flag("DRY_RUN", false)?;
+```
+
+Available readers: `get`, `parse`, `parse_in`, `opt_parse`, `opt_parse_in`,
+`flag`, `secs`, `opt_secs`, `choice`, and `invalid` (for cross-field rules the
+typed readers can't express — it produces an error that names the variable).
+
+## Testing your wiring
+
+`std::env::set_var` is `unsafe` in edition 2024 and racy across test threads, so
+every reader has a `from_pairs` / `from_vars` twin that reads an explicit map
+instead of the process environment:
+
+```rust
+use shove::env::ConsumerTuning;
+
+let tuning = ConsumerTuning::from_pairs(
+    "ORDERS",
+    [("ORDERS_MIN_CONSUMERS", "2"), ("ORDERS_MAX_CONSUMERS", "16")],
+)?;
+assert_eq!(tuning.range(), 2..=16);
+```
+
+`AutoscalerConfig::from_vars`, `NatsStreamConfig::from_vars`, and
+`KafkaTopicTuning::from_vars` all take an `EnvVars`, so one reader can populate
+several config structs from the same source.
