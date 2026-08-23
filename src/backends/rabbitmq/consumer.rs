@@ -629,11 +629,6 @@ impl RabbitMqConsumer {
                             for pd in pending {
                                 // Not a cascade: no already-counted failure
                                 // accounts for these. See `metrics::FailReason`.
-                                metrics::record_failed(
-                                    &topic,
-                                    group.as_deref(),
-                                    metrics::FailReason::SequenceTimeout,
-                                );
                                 router::route_reject(&pd.delivery, topology, &publisher).await?;
                             }
                         }
