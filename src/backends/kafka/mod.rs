@@ -17,7 +17,7 @@ pub use client::prime_admin_oauth_token_for_test;
 pub use client::{KafkaClient, KafkaCompression, KafkaConfig};
 #[cfg(feature = "kafka-ssl")]
 pub use client::{KafkaSasl, KafkaTls};
-pub use consumer::KafkaConsumer;
+pub use consumer::{BatchConsumerOptions, KafkaConsumer};
 pub use consumer_group::{
     KafkaAutoOffsetReset, KafkaConsumerGroup, KafkaConsumerGroupConfig, KafkaConsumerGroupRegistry,
 };
