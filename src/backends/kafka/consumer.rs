@@ -2115,10 +2115,17 @@ impl KafkaConsumer {
                                         sequence_key = %seq_key,
                                         "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                                     );
-                                    metrics::record_failed(
+                                    // Collateral of an already-counted failure,
+                                    // so the failure half is deliberately not
+                                    // counted again — see `metrics::FailReason`.
+                                    // The discard half still applies: a
+                                    // cascaded message dropped with no DLQ is
+                                    // just as gone as any other.
+                                    let pending = metrics::pending_discard(
                                         &topic,
                                         group.as_deref(),
                                         metrics::FailReason::Rejected,
+                                        topology.dlq().is_some(),
                                     );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
@@ -2137,9 +2144,29 @@ impl KafkaConsumer {
                                             error = %dlq_err,
                                             "failed to publish poisoned-key message to DLQ"
                                         );
+                                        pending.survived();
                                         continue;
                                     }
-                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                    // Terminal: this commit is what actually
+                                    // drops the message, so it decides the
+                                    // discard accounting. `Async` only queues
+                                    // the request and reports nothing, so
+                                    // commit synchronously and settle on the
+                                    // broker's answer — the same rule the
+                                    // routing path below follows.
+                                    match consumer.commit_message(&msg, CommitMode::Sync) {
+                                        Ok(()) => pending.confirm(),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                queue,
+                                                error = %e,
+                                                "offset commit failed after a poisoned-key \
+                                                 cascade; the message stays committed at its \
+                                                 previous offset and is redelivered"
+                                            );
+                                            pending.survived();
+                                        }
+                                    }
                                     continue;
                                 }
 

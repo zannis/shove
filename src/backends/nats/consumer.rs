@@ -1144,10 +1144,18 @@ impl NatsConsumer {
                                             sequence_key = %seq_key,
                                             "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                                         );
-                                        metrics::record_failed(
+                                        // Collateral of an already-counted
+                                        // failure, so the failure half is
+                                        // deliberately not counted again — see
+                                        // `metrics::FailReason`. The discard
+                                        // half still applies: a cascaded
+                                        // message dropped with no DLQ is just
+                                        // as gone as any other.
+                                        let pending = metrics::pending_discard(
                                             &shard_topic,
                                             shard_group.as_deref(),
                                             metrics::FailReason::Rejected,
+                                            topology.dlq().is_some(),
                                         );
                                         if let Err(dlq_err) = publish_to_dlq(
                                             &shard_client,
@@ -1160,9 +1168,26 @@ impl NatsConsumer {
                                                 "failed to publish poisoned-key message to DLQ, nak-ing"
                                             );
                                             let _ = msg.ack_with(AckKind::Nak(None)).await;
+                                            // Nak-ed, so JetStream redelivers.
+                                            pending.survived();
                                             continue;
                                         }
-                                        let _ = msg.ack().await;
+                                        // `double_ack` rather than `ack`: this
+                                        // is the arm that decides whether a
+                                        // discard happened, and `ack` returns
+                                        // as soon as `+ACK` is written to the
+                                        // connection. Same reasoning as
+                                        // `route_outcome`'s Dlq arm.
+                                        match msg.double_ack().await {
+                                            Ok(()) => pending.confirm(),
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    error = %e,
+                                                    "failed to ack poisoned-key message after DLQ publish"
+                                                );
+                                                pending.survived();
+                                            }
+                                        }
                                         continue;
                                     }
 

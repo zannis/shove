@@ -689,13 +689,19 @@ where
                             sequence_key = %seq_key,
                             "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                         );
-                        metrics::record_failed(
+                        // Collateral of an already-counted failure, so the
+                        // failure half is deliberately not counted again — see
+                        // `metrics::FailReason`. The discard half still
+                        // applies: a cascaded message dropped with no DLQ is
+                        // just as gone as any other.
+                        let pending = metrics::pending_discard(
                             topic_name,
                             consumer_group,
                             metrics::FailReason::Rejected,
+                            topology.dlq().is_some(),
                         );
                         fields.insert(PAYLOAD_FIELD.to_owned(), payload_raw);
-                        route_to_dlq(
+                        let retired = match route_to_dlq(
                             &mut conn,
                             topology,
                             stream,
@@ -705,7 +711,25 @@ where
                             "rejected",
                             retry_count,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(retired) => retired,
+                            Err(e) => {
+                                // XADD to the DLQ failed; the entry stays in
+                                // the PEL for the reaper to redeliver, so
+                                // nothing was discarded.
+                                pending.survived();
+                                return Err(e);
+                            }
+                        };
+                        // `route_to_dlq` reports whether the XACK actually
+                        // acknowledged the entry — a lost lease means someone
+                        // else owns it and it is not retired here.
+                        if retired {
+                            pending.confirm();
+                        } else {
+                            pending.survived();
+                        }
                         continue;
                     }
 
