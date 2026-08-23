@@ -29,7 +29,7 @@ use crate::metrics;
 use crate::outcome::Outcome;
 use crate::retry::Backoff;
 use crate::routing::{PoisonedKeys, RetryDecision, decide_retry, hold_index};
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
 
@@ -2771,7 +2771,10 @@ impl KafkaConsumer {
     ///   duplicates across a rebalance, never loss. If a partition this member
     ///   still holds cannot be rewound, the consumer reconnects rather than
     ///   poll on past its uncommitted messages.
-    /// - No FIFO/sequenced variant.
+    /// - No FIFO/sequenced variant, by design. `T` is bound by
+    ///   [`NotSequenced`], so a topic from `define_sequenced_topic!` is a
+    ///   compile error here — use [`run_fifo`](Self::run_fifo) instead. See
+    ///   `docs/design/batch-and-sequencing.md`.
     pub async fn run_batch<T, H>(
         &self,
         handler: H,
@@ -2779,11 +2782,21 @@ impl KafkaConsumer {
         options: BatchConsumerOptions,
     ) -> Result<()>
     where
-        T: Topic,
+        T: NotSequenced,
         H: BatchMessageHandler<T>,
     {
         let topology = T::topology();
         let queue = topology.queue();
+        // Mirror of the `run_fifo` guard. `NotSequenced` is the primary gate,
+        // but it is a hand-implementable marker: a topic can claim it while
+        // still carrying sequencing config in its topology. Consuming that in
+        // batches would bypass ordering silently, so fail closed instead.
+        if topology.sequencing().is_some() {
+            return Err(ShoveError::Topology(format!(
+                "run_batch called on {queue}, which declares sequencing config; \
+                 batching and sequencing are mutually exclusive — use run_fifo"
+            )));
+        }
         let group_id = options
             .kafka_group_id
             .as_deref()
@@ -4541,6 +4554,85 @@ mod seek_error_tests {
     #[test]
     fn an_empty_seek_result_reports_no_errors() {
         assert!(seek_errors(&TopicPartitionList::new()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod batch_sequencing_guard_tests {
+    use super::*;
+    use crate::topology::{SequenceFailure, TopologyBuilder};
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct Entry {
+        account: String,
+    }
+
+    /// The case the `NotSequenced` bound cannot catch. The marker is
+    /// hand-implementable, so a topic can claim it while its topology still
+    /// declares sequencing — as this one deliberately does. Without the
+    /// runtime guard, `run_batch` would consume the unsharded main queue with
+    /// no shard permits and no `FailAll` poison set, and the caller would
+    /// still believe ordering held.
+    struct LiesAboutSequencing;
+    impl Topic for LiesAboutSequencing {
+        type Message = Entry;
+        type Codec = crate::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            static TOPOLOGY: std::sync::OnceLock<QueueTopology> = std::sync::OnceLock::new();
+            TOPOLOGY.get_or_init(|| {
+                TopologyBuilder::new("guard-test-ledger")
+                    .sequenced(SequenceFailure::FailAll)
+                    .hold_queue(Duration::from_secs(5))
+                    .dlq()
+                    .build()
+            })
+        }
+    }
+    impl NotSequenced for LiesAboutSequencing {}
+
+    struct NoopHandler;
+    impl BatchMessageHandler<LiesAboutSequencing> for NoopHandler {
+        type Context = ();
+        async fn handle_batch(
+            &self,
+            _messages: Vec<(Entry, MessageMetadata)>,
+            _ctx: &(),
+        ) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    #[tokio::test]
+    async fn run_batch_rejects_a_topic_that_declares_sequencing() {
+        // Port 1 is never listening; the guard returns before any I/O, so the
+        // test neither connects nor blocks.
+        let client = KafkaClient::connect(&super::super::client::KafkaConfig::new("127.0.0.1:1"))
+            .await
+            .expect("client construction is lazy");
+        let consumer = KafkaConsumer::new(client);
+
+        let err = consumer
+            .run_batch::<LiesAboutSequencing, _>(
+                NoopHandler,
+                (),
+                BatchConsumerOptions::new().with_shutdown(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a sequenced topology must be refused");
+
+        match err {
+            ShoveError::Topology(msg) => {
+                assert!(
+                    msg.contains("guard-test-ledger"),
+                    "the error must name the offending topic, got: {msg}"
+                );
+                assert!(
+                    msg.contains("run_fifo"),
+                    "the error must point at the supported alternative, got: {msg}"
+                );
+            }
+            other => panic!("expected ShoveError::Topology, got {other:?}"),
+        }
     }
 }
 
