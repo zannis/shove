@@ -1236,6 +1236,9 @@ where
 
     info!("DLQ consumer started on queue {dlq}");
 
+    // Hoisted out of the loop the way the main consumer hoists its own labels.
+    let topic = T::topology().queue();
+
     loop {
         tokio::select! {
             _ = options.shutdown.cancelled() => {
@@ -1258,7 +1261,7 @@ where
                 // different things depending on the backend and would stop a
                 // per-topic size profile summing across the main and DLQ paths.
                 metrics::record_message_size(
-                    T::topology().queue(),
+                    topic,
                     options.consumer_group.as_deref(),
                     received.payload.len(),
                 );
