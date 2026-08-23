@@ -3243,7 +3243,11 @@ impl KafkaConsumer {
                                         sequence_key = %seq_key,
                                         "sequence key poisoned (FailAll) — sending to DLQ without invoking handler"
                                     );
-                                    // Cascade: intentionally not counted — see `metrics::FailReason`.
+                                    metrics::record_failed(
+                                        &topic,
+                                        group.as_deref(),
+                                        metrics::FailReason::Rejected,
+                                    );
                                     if let Err(dlq_err) = publish_to_dlq(
                                         &client,
                                         topology,
