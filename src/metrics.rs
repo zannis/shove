@@ -325,6 +325,28 @@ pub(crate) fn record_terminal(
     has_dlq: bool,
 ) -> PendingDiscard {
     record_failed(topic, group, reason);
+    pending_discard(topic, group, reason, has_dlq)
+}
+
+/// Track a pending discard *without* counting a failure.
+///
+/// For the one terminal path that retires a message it must not count as a
+/// failure: a [`SequenceFailure::FailAll`] cascade, where the message is
+/// dead-lettered as collateral of an already-counted failure rather than on
+/// its own merits. See [`FailReason`] for why that distinction matters.
+///
+/// The discard half still applies. `messages_failed_total` counts independent
+/// failures, but `messages_discarded_total` is a data-loss claim, and a
+/// cascaded message dropped with no DLQ is just as gone as any other.
+///
+/// [`SequenceFailure::FailAll`]: crate::topology::SequenceFailure
+#[allow(dead_code)] // Callers gated behind backend features.
+pub(crate) fn pending_discard(
+    topic: &str,
+    group: Option<&str>,
+    reason: FailReason,
+    has_dlq: bool,
+) -> PendingDiscard {
     PendingDiscard {
         topic: topic.to_string(),
         group: group.map(str::to_string),

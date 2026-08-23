@@ -539,10 +539,13 @@ async fn run_fifo_shard<T, H>(
                 Outcome::Retry => {
                     let retry_count = get_retry_count(&env.headers);
                     if retry_count >= options.max_retries {
-                        metrics::record_failed(
+                        // Burning the last retry is an independent failure: this
+                        // message reached the handler on its own merits.
+                        let pending = metrics::record_terminal(
                             topology.queue(),
                             options.consumer_group.as_deref(),
                             metrics::FailReason::MaxRetriesExceeded,
+                            topology.dlq().is_some(),
                         );
                         route_reject_sequenced(
                             &broker,
@@ -551,8 +554,7 @@ async fn run_fifo_shard<T, H>(
                             &key,
                             &mut poisoned,
                             on_failure,
-                            &options,
-                            metrics::FailReason::MaxRetriesExceeded,
+                            pending,
                         )
                         .await;
                     } else {
@@ -591,6 +593,21 @@ async fn run_fifo_shard<T, H>(
                     }
                 }
                 Outcome::Reject => {
+                    // An oversize or undecodable message never reached the
+                    // handler, so it is not a handler reject; report what
+                    // actually happened to it.
+                    let reason = pre_handler_reason.unwrap_or(metrics::FailReason::Rejected);
+                    let queue = topology.queue();
+                    let group = options.consumer_group.as_deref();
+                    let has_dlq = topology.dlq().is_some();
+                    // `skip_handler` synthesises this `Reject` for a delivery
+                    // whose key an earlier failure already poisoned.
+                    // Cascade: intentionally not counted — see `metrics::FailReason`.
+                    let pending = if skip_handler {
+                        metrics::pending_discard(queue, group, reason, has_dlq)
+                    } else {
+                        metrics::record_terminal(queue, group, reason, has_dlq)
+                    };
                     route_reject_sequenced(
                         &broker,
                         topology,
@@ -598,11 +615,7 @@ async fn run_fifo_shard<T, H>(
                         &key,
                         &mut poisoned,
                         on_failure,
-                        &options,
-                        // An oversize or undecodable message never reached the
-                        // handler, so it is not a handler reject; report what
-                        // actually happened to it.
-                        pre_handler_reason.unwrap_or(metrics::FailReason::Rejected),
+                        pending,
                     )
                     .await;
                 }
@@ -646,12 +659,12 @@ async fn pop_or_wait(
 
 /// Terminal routing for the sequenced loop. Every sequenced path that gives up
 /// on a message — retry-budget exhaustion, an explicit `Reject`, and the
-/// FailAll cascade onto a poisoned key — funnels through here, so the terminal
-/// metric lives here rather than at each call site. The unsequenced loop's
-/// equivalent is the `RetryDecision::Dlq` arm of `route_outcome`.
-// Same shape as the sequenced loop's other helpers: the FailAll bookkeeping
-// (key, poisoned set, failure mode) and the routing target travel together.
-#[allow(clippy::too_many_arguments)]
+/// FailAll cascade onto a poisoned key — funnels through here. The unsequenced
+/// loop's equivalent is the `RetryDecision::Dlq` arm of `route_outcome`.
+///
+/// The caller supplies `pending` because only the caller knows whether this
+/// retirement is an independent failure ([`metrics::record_terminal`]) or a
+/// cascade that must not be counted as one ([`metrics::pending_discard`]).
 async fn route_reject_sequenced(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
@@ -659,15 +672,8 @@ async fn route_reject_sequenced(
     key: &str,
     poisoned: &mut HashSet<String>,
     on_failure: SequenceFailure,
-    options: &ConsumerOptionsInner,
-    reason: metrics::FailReason,
+    pending: metrics::PendingDiscard,
 ) {
-    let pending = metrics::record_terminal(
-        topology.queue(),
-        options.consumer_group.as_deref(),
-        reason,
-        topology.dlq().is_some(),
-    );
     resolve_reject(route_reject(broker, topology, env).await, pending);
     if on_failure == SequenceFailure::FailAll && !key.is_empty() {
         poisoned.insert(key.to_string());
