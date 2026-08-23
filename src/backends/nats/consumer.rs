@@ -339,7 +339,18 @@ async fn route_outcome(
                     // The ack is what retires the message; until it lands
                     // JetStream still owns the delivery and will redeliver on
                     // ack-wait expiry, so a failed ack is not a discard.
-                    match msg.ack().await {
+                    //
+                    // `double_ack` rather than `ack` because this is the arm
+                    // that decides whether a discard actually happened. `ack`
+                    // only publishes `+ACK` to the client connection and
+                    // returns as soon as it is written; a connection lost
+                    // before JetStream applies it redelivers the message while
+                    // `confirm` has already counted it gone. `double_ack`
+                    // waits for the server's reply, so `Ok` means the stream
+                    // really did retire the delivery. The extra round trip is
+                    // paid only on terminal outcomes (rejected or retries
+                    // exhausted), not on the happy path above.
+                    match msg.double_ack().await {
                         Ok(()) => pending.confirm(),
                         Err(e) => {
                             tracing::error!(error = %e, "failed to ack after DLQ publish");
