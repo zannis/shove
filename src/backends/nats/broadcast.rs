@@ -340,7 +340,7 @@ where
             },
         };
 
-        metrics::record_message_size(&topic, None, msg.payload.len());
+        metrics::record_message_size(&topic, options.consumer_group.as_deref(), msg.payload.len());
 
         // No DLQ to route a malformed message to — `build()` rejects
         // `.broadcast()` with `.dlq()`. So the pre-handler rejections discard
@@ -352,7 +352,13 @@ where
                 error = %e,
                 "oversized message on a broadcast subscription — discarding (no DLQ)"
             );
-            metrics::record_terminal(&topic, None, metrics::FailReason::Oversize, false).confirm();
+            metrics::record_terminal(
+                &topic,
+                options.consumer_group.as_deref(),
+                metrics::FailReason::Oversize,
+                false,
+            )
+            .confirm();
             continue;
         }
 
@@ -394,8 +400,13 @@ async fn deliver_until_settled<T, H>(
                         error = %e,
                         "undeserializable message on a broadcast subscription — discarding (no DLQ)"
                     );
-                    metrics::record_terminal(topic, None, metrics::FailReason::Deserialize, false)
-                        .confirm();
+                    metrics::record_terminal(
+                        topic,
+                        options.consumer_group.as_deref(),
+                        metrics::FailReason::Deserialize,
+                        false,
+                    )
+                    .confirm();
                     return;
                 }
             };
@@ -441,7 +452,7 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
-    let _inflight = metrics::InflightGuard::new(topic.clone(), None);
+    let _inflight = metrics::InflightGuard::new(topic.clone(), options.consumer_group.clone());
     let start = std::time::Instant::now();
     // Spawned so a panicking handler surfaces as a `JoinError` here instead of
     // taking the delivery loop down with it.
@@ -459,7 +470,11 @@ where
                 join.abort();
                 let resolved = handler_timeout_outcome(options.handler_timeout_outcome.clone());
                 tracing::warn!(outcome = ?resolved, "broadcast handler timed out after {duration:?}");
-                metrics::record_failed(topic, None, metrics::FailReason::Timeout);
+                metrics::record_failed(
+                    topic,
+                    options.consumer_group.as_deref(),
+                    metrics::FailReason::Timeout,
+                );
                 resolved
             }
         },
@@ -473,7 +488,12 @@ where
     };
 
     let elapsed = start.elapsed().as_secs_f64();
-    metrics::record_consumed(topic, None, &outcome);
-    metrics::record_processing_duration(topic, None, &outcome, elapsed);
+    metrics::record_consumed(topic, options.consumer_group.as_deref(), &outcome);
+    metrics::record_processing_duration(
+        topic,
+        options.consumer_group.as_deref(),
+        &outcome,
+        elapsed,
+    );
     outcome
 }
