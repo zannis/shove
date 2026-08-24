@@ -146,14 +146,15 @@ That emits, once per queue per poll:
 | `shove_queue_backlog{topic}` | Messages waiting to be delivered | Kafka: committed-offset lag · RabbitMQ: `messages_ready` · SQS: `ApproximateNumberOfMessages` · NATS: `num_pending` · Redis: the group's `lag` · in-memory: queue length |
 | `shove_queue_inflight{topic}` | Delivered by the broker, not yet acked | RabbitMQ: `messages_unacknowledged` · SQS: `ApproximateNumberOfMessagesNotVisible` · NATS: `num_ack_pending` · Redis: PEL size · in-memory: in-flight count |
 
-Four things worth knowing before you build a dashboard on these:
+Five things worth knowing before you build a dashboard on these:
 
 - **`shove_queue_inflight` is not `shove_messages_inflight`.** The queue gauge is what the *broker* has handed out and is waiting to have acked, across every consumer of that queue. `shove_messages_inflight` is what *this process* has inside a handler right now. On a healthy single-consumer service they track each other; a large gap means deliveries are sitting unacked somewhere else.
 - **`shove_queue_inflight` is absent on Kafka.** Committed-offset lag cannot separate "fetched and being processed" from "not fetched", and Kafka exposes no group-wide in-flight count, so `shove` publishes no series rather than a hard zero you might alert on. Backlog is unaffected.
 - **A failed poll publishes nothing.** The gauge keeps its last value rather than dropping to zero, so a broker outage does not render as "the backlog drained". Pair any backlog alert with `shove_backend_errors_total` and the sampler's `WARN` line so a flat gauge is distinguishable from a quiet queue.
+- **On Kafka the sampler reads the default group.** Backlog is committed-offset lag, and lag is a property of a consumer group, so the sampler has to name one. It always names `{queue}-consumer` with `auto.offset.reset=earliest`. A group reached any other way reports its own lag through `shove_autoscaler_messages_ready` but not through `shove_queue_backlog`: a `with_group_id` override, a `for_consumer_group` fan-out group (`{queue}-{group}-consumer`), and a sequenced topic's FIFO group (`{queue}-fifo`) all fall outside it. Where the two disagree, the autoscaler gauge is the one describing the group you are actually running.
 - **Every poll is a real round trip** (RabbitMQ Management HTTP, SQS `GetQueueAttributes`, Kafka watermark fetches). The default 5 s interval matches the autoscaler's; raise it if you watch many queues. The first poll fires after one interval rather than immediately, so a sampler spawned alongside `declare` does not race it — call `sample_once()` yourself first if you want a reading at t=0.
 
-Running both the sampler and the autoscaler is fine and they will agree — they read the same per-backend snapshot. The `shove_autoscaler_*` gauges stay the right ones for *why a scaling decision was made*, keyed by `consumer_group` and including `active_consumers`; `shove_queue_backlog` is the right one for *how deep the queue is*, keyed by `topic` so it joins the rest of the consumer metrics.
+Running both the sampler and the autoscaler is fine: they read the same per-backend snapshot, and on every backend but Kafka they report the same number for the same queue. The `shove_autoscaler_*` gauges stay the right ones for *why a scaling decision was made*, keyed by `consumer_group` and including `active_consumers`; `shove_queue_backlog` is the right one for *how deep the queue is*, keyed by `topic` so it joins the rest of the consumer metrics.
 
 ### Alerting on silent discards
 
@@ -168,7 +169,7 @@ sum(rate(shove_messages_discarded_total[5m])) by (topic, reason) > 0
 Every increment is a message that no longer exists anywhere. The fix is almost always to give the topic a DLQ:
 
 ```rust,no_run
-TopologyBuilder::new("prices").with_dlq("prices.dlq").build()
+TopologyBuilder::new("prices").dlq_named("prices-dlq").build()
 ```
 
 Three limits worth knowing:

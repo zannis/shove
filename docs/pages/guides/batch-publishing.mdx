@@ -72,6 +72,34 @@ Deduplicate on a key from **your own payload**, not on `shove`'s message id. The
 
 See [Exactly-Once (RabbitMQ)](/guides/exactly-once) for the strongest available guarantee.
 
+## Upgrading from 0.12
+
+The generic `Publisher<B>::publish_batch` has always returned `Result<()>` and is unchanged. The six **concrete** publishers — `RabbitMqPublisher`, `KafkaPublisher`, `NatsPublisher`, `RedisPublisher`, `SnsPublisher`, `InMemoryPublisher` — used to return `(u64, Result<()>)`, where the `u64` was a count of confirmed records. They now return `Result<()>` like the generic one.
+
+```rust
+// 0.12
+let (confirmed, result) = publisher.publish_batch::<Orders>(&records).await;
+
+// 0.14
+let result = publisher.publish_batch::<Orders>(&records).await;
+```
+
+The count is not lost, and it is no longer a bare number you have to interpret:
+
+```rust
+match publisher.publish_batch::<Orders>(&records).await {
+    Ok(()) => { /* confirmed == records.len() */ }
+    Err(ShoveError::PartialBatch(f)) => {
+        let confirmed = f.succeeded();
+        let outstanding = f.to_republish();
+        // ...
+    }
+    Err(_) => { /* confirmed == 0 */ }
+}
+```
+
+A count alone could never say *which* records were confirmed, which is the question a retry actually has to answer. On the sparse backends it was actively misleading: `succeeded` is a count, not a prefix length, so "skip the first `succeeded` records" loses data.
+
 ## Metrics
 
 `publish_batch` splits `shove_messages_published_total` by what the backend confirmed: `outcome="success"` for `succeeded()` records and `outcome="error"` for the rest. A partial batch therefore increments both, and the two always sum to the batch size. `shove_message_publish_duration_seconds` records one sample for the whole call — the user-observable latency — regardless of how many messages were inside. See [Observability](/guides/observability) for the full schema.

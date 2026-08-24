@@ -60,6 +60,13 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 ///   [`watch_topic`](Self::watch_topic) to take the name off the topology.
 /// - **A failed poll leaves the previous value in place.** See
 ///   [`sample_once`](Self::sample_once).
+/// - **On Kafka the sample is taken against the default group.** Backlog there
+///   is committed-offset lag, which belongs to a consumer group, and the
+///   sampler always reads `{queue}-consumer`. A `with_group_id` override, a
+///   [`for_consumer_group`] fan-out group and a sequenced topic's FIFO group
+///   are outside it; those report through the autoscaler's own gauges instead.
+///
+/// [`for_consumer_group`]: crate::topology::TopologyBuilder::for_consumer_group
 ///
 /// [`Broker::queue_depth_sampler`]: crate::broker::Broker::queue_depth_sampler
 pub struct QueueDepthSampler<B: Backend> {
