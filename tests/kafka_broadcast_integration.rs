@@ -383,7 +383,19 @@ async fn broadcast_fans_out_to_every_instance_from_the_tail() {
 
     let expected: HashSet<String> = keys.iter().map(|k| k.key.clone()).collect();
     for (i, recorder) in recorders.iter().enumerate() {
-        let seen: HashSet<String> = recorder.keys().await.into_iter().collect();
+        let delivered = recorder.keys().await;
+        // Length before set, and from the raw vector: collapsing into a
+        // `HashSet` first would swallow a duplicate delivery, and broadcast is
+        // documented as lossy *at-most-once*. A second copy of one key is as
+        // much a contract break as a missing one.
+        assert_eq!(
+            delivered.len(),
+            expected.len(),
+            "subscriber {i} received {} deliveries for {} messages: {delivered:?}",
+            delivered.len(),
+            expected.len()
+        );
+        let seen: HashSet<String> = delivered.into_iter().collect();
         assert_eq!(
             seen, expected,
             "subscriber {i} saw the wrong set — a fan-out delivers every message to \
