@@ -125,7 +125,7 @@ impl Drop for EphemeralConsumerGuard {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    delete_ephemeral(&client, &stream, &consumer).await;
+                    let _ = delete_ephemeral(&client, &stream, &consumer).await;
                 });
             }
             Err(_) => {
@@ -141,10 +141,11 @@ impl Drop for EphemeralConsumerGuard {
     }
 }
 
-/// Best-effort delete of an ephemeral consumer. Failure is logged, never
-/// propagated: the subscription is already over, and the server's
-/// `inactive_threshold` removes the consumer regardless.
-async fn delete_ephemeral(client: &NatsClient, stream: &str, consumer: &str) {
+/// Delete an ephemeral consumer. Returns whether the consumer is confirmed
+/// gone, so the caller can keep its `Drop` guard armed for another attempt
+/// instead of leaving the consumer to `inactive_threshold`. Failure is logged,
+/// never propagated: the subscription is already over either way.
+async fn delete_ephemeral(client: &NatsClient, stream: &str, consumer: &str) -> bool {
     let js_stream = match client.jetstream().get_stream(stream).await {
         Ok(s) => s,
         Err(e) => {
@@ -155,18 +156,24 @@ async fn delete_ephemeral(client: &NatsClient, stream: &str, consumer: &str) {
                 "could not reach the stream to delete the ephemeral broadcast consumer; \
                  the server's inactive_threshold will reap it"
             );
-            return;
+            return false;
         }
     };
     match js_stream.delete_consumer(consumer).await {
-        Ok(_) => tracing::debug!(stream, consumer, "ephemeral broadcast consumer deleted"),
-        Err(e) => tracing::warn!(
-            stream,
-            consumer,
-            error = %e,
-            "failed to delete the ephemeral broadcast consumer; the server's \
-             inactive_threshold will reap it"
-        ),
+        Ok(_) => {
+            tracing::debug!(stream, consumer, "ephemeral broadcast consumer deleted");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                stream,
+                consumer,
+                error = %e,
+                "failed to delete the ephemeral broadcast consumer; the server's \
+                 inactive_threshold will reap it"
+            );
+            false
+        }
     }
 }
 
@@ -279,8 +286,13 @@ where
             // true on this path rather than merely scheduled — and it runs per
             // attempt, so a reconnect does not accumulate consumers. The guard
             // covers the abort path, where nothing below this line runs at all.
-            guard.disarm();
-            delete_ephemeral(&client, queue, &consumer_name).await;
+            //
+            // Disarmed only once the delete is confirmed: disarming first would
+            // drop the guard's second chance if this await were cancelled
+            // mid-delete, or if the delete simply failed.
+            if delete_ephemeral(&client, queue, &consumer_name).await {
+                guard.disarm();
+            }
 
             result
         }
