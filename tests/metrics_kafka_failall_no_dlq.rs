@@ -1,51 +1,55 @@
 #![cfg(all(feature = "kafka", feature = "metrics"))]
 #![allow(clippy::mutable_key_type)] // metrics-util's CompositeKey has interior mutability
 
-//! Integration test: a `SequenceFailure::FailAll` cascade on Kafka must move
-//! `shove_messages_failed_total` **once**, not once per dead-lettered message.
+//! Integration test: a `SequenceFailure::FailAll` cascade on a Kafka topic that
+//! declares **no DLQ** must move `shove_messages_discarded_total` once per
+//! message that is gone — including the cascaded ones — while still counting
+//! exactly **one** failure.
 //!
-//! `metrics::FailReason` states the rule: only the delivery that actually
-//! failed is counted. The messages dead-lettered behind a poisoned sequence key
-//! are collateral of that one already-counted failure, so counting them scales
-//! the counter by the queue depth behind the key and makes it useless for the
-//! alerting it exists to support.
+//! This is the other half of `metrics_kafka_failall.rs`. Both drive the same
+//! poisoned-key arm in `src/backends/kafka/consumer.rs`, whose accounting hangs
+//! off one flag:
 //!
-//! Nothing in CI could catch a violation of that rule here. #73 brought
-//! `FailAll` to Kafka with a `record_failed(.., Rejected)` on the poisoned-key
-//! arm, and it survived review and merge because the rule was pinned by exactly
-//! one in-memory test. #86 removed the call, and the poisoned-key arm in
-//! `src/backends/kafka/consumer.rs` now takes a `metrics::pending_discard`
-//! record and nothing else — the discard half of the accounting, which stays
-//! inert while a DLQ exists, with no failure counted either way. This test is
-//! what makes putting a `record_failed` back go red.
+//! ```ignore
+//! let pending = metrics::pending_discard(.., topology.dlq().is_some());
+//! ```
+//!
+//! `metrics_kafka_failall.rs` declares a DLQ, so it only ever exercises the
+//! `true` arm — where the pending discard settles against a DLQ retirement and
+//! `shove_messages_discarded_total` correctly stays at zero. The `false` arm,
+//! where the `CommitMode::Sync` commit that retires a cascaded message is the
+//! thing that loses it, had no end-to-end coverage on this backend at all.
+//!
+//! That arm is the quietest possible regression: messages vanish and no counter
+//! moves. The `FailAll` cascade here has already drifted three times (#73
+//! introduced it, #86 fixed the count, #90 pinned the DLQ-settled half), and
+//! each time the drift went unnoticed because nothing in CI could catch it.
 //!
 //! # Why the assertion is exact rather than incidental
 //!
-//! The fixture is the one `sequenced_failall_poisons_same_key_after_reject` in
-//! `kafka_integration.rs` already uses, because its shape is precisely the
-//! scenario the rule is about: five messages on `key-A`, the third rejected,
-//! so `key-A/3` and `key-A/4` are dead-lettered without ever reaching the
-//! handler. Waiting for **three** messages on the DLQ is what gives the counter
-//! assertion teeth — it proves two cascade discards actually happened, so a
-//! counter still reading 1 proves neither was counted. Count the cascade site
-//! and this reads 3.
+//! With no DLQ there is nothing to wait *on*: a cascaded message reaches
+//! neither the handler nor any queue, and `Snapshotter::snapshot()` *drains*
+//! every counter it reads, so the metric cannot be polled for progress either.
+//! Asserting the counters without a barrier would make a regression that stopped
+//! counting indistinguishable from a consumer that had not finished yet.
 //!
-//! `key-B` rides along for the same reason it does in the original: it proves
-//! the consumer kept running past the poisoning, so `rejected == 1` cannot be
-//! satisfied by a consumer that simply stopped.
+//! So the fixture buys a barrier with `routing_shards(1)`: one partition, and
+//! `run_fifo` runs one sequential loop over it, so consume order == publish
+//! order. `key-A/0` is rejected and poisons `key-A`, `key-A/1` and `key-A/2` are
+//! cascade-discarded behind it, and `key-B/0` is published last. `key-B/0`
+//! reaching the handler therefore *proves* all three `key-A` deliveries were
+//! already settled — the same teeth the DLQ wait gives
+//! `metrics_kafka_failall.rs`, and the liveness assertion at the same time: the
+//! counters cannot be satisfied by a consumer that stopped at the poisoning.
 //!
-//! It also pins the discard half of that accounting:
-//! `shove_messages_discarded_total` stays at zero, because every pending discard
-//! this fixture decides settles against a DLQ that was observed receiving all
-//! three messages. `metrics_kafka_failall_no_dlq.rs` is the opposite arm of the
-//! same `pending_discard(.., topology.dlq().is_some())` call site, where the
-//! count must be 3.
+//! The deviation from that file's `routing_shards(2)` is deliberate and load
+//! bearing: with two partitions rdkafka interleaves them in an unspecified
+//! order, so `key-B` could be handled before `key-A` was ever poisoned and the
+//! barrier would prove nothing. Raising it re-introduces the race.
 //!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the *global*
-//! recorder slot and whose `snapshot()` *drains* every counter it reads. Hence
-//! its own integration binary, a single `#[test]`, and exactly one snapshot
-//! taken after both consumers have stopped — progress is waited on through the
-//! DLQ and handler counters, never by peeking at the metrics.
+//! recorder slot. Hence its own integration binary, a single `#[test]`, and
+//! exactly one snapshot taken after the consumer has stopped.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -65,8 +69,9 @@ use shove::consumer::ConsumerOptions;
 use shove::handler::MessageHandler;
 use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer};
 use shove::markers::Kafka;
-use shove::metadata::{DeadMessageMetadata, MessageMetadata};
+use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
+use shove::topic::Topic as _;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 
 // ---------------------------------------------------------------------------
@@ -150,7 +155,7 @@ impl TestBroker {
 }
 
 // ---------------------------------------------------------------------------
-// Topic and handlers
+// Topic and handler
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -159,21 +164,27 @@ struct OrderMessage {
     amount: u64,
 }
 
+// Bare topology: no DLQ, no hold queues. `routing_shards(1)` is what makes the
+// consume order deterministic — see the module doc.
+//
+// `allow_message_loss()` is not decoration: `TopologyBuilder::build()` panics on
+// a sequenced topic with no DLQ and no hold queues without it. That guard is why
+// this arm is worth pinning at all — it is the one shape where shove has been
+// *told* rejected messages may vanish, so `shove_messages_discarded_total` is
+// the only signal an operator has left that they did.
 shove::define_sequenced_topic!(
-    SeqFailAllTopic,
+    SeqFailAllNoDlqTopic,
     OrderMessage,
     |msg: &OrderMessage| msg.order_id.clone(),
-    TopologyBuilder::new("kafka-metrics-failall")
+    TopologyBuilder::new("kafka-metrics-failall-no-dlq")
         .sequenced(SequenceFailure::FailAll)
-        .routing_shards(2)
-        .hold_queue(Duration::from_millis(200))
-        .dlq()
+        .routing_shards(1)
+        .allow_message_loss()
         .build()
 );
 
-/// Rejects `key-A/2`, poisoning `key-A`. Every later `key-A` delivery is
-/// dead-lettered without reaching here, so `key_a_handled` must stay at 3
-/// (amounts 0, 1 and the rejected 2).
+/// Rejects `key-A/0`, poisoning `key-A`. `key-A/1` and `key-A/2` are discarded
+/// without reaching here, so `key_a_handled` must stay at 1.
 #[derive(Clone)]
 struct PoisonHandler {
     key_a_handled: WaitableCounter,
@@ -181,7 +192,7 @@ struct PoisonHandler {
     seen: Arc<Mutex<Vec<(String, u64)>>>,
 }
 
-impl MessageHandler<SeqFailAllTopic> for PoisonHandler {
+impl MessageHandler<SeqFailAllNoDlqTopic> for PoisonHandler {
     type Context = ();
     async fn handle(&self, msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         self.seen
@@ -193,7 +204,7 @@ impl MessageHandler<SeqFailAllTopic> for PoisonHandler {
         } else {
             self.key_a_handled.increment();
         }
-        if msg.order_id == "key-A" && msg.amount == 2 {
+        if msg.order_id == "key-A" && msg.amount == 0 {
             Outcome::Reject
         } else {
             Outcome::Ack
@@ -201,19 +212,8 @@ impl MessageHandler<SeqFailAllTopic> for PoisonHandler {
     }
 }
 
-struct SeqDlqHandler(WaitableCounter);
-impl MessageHandler<SeqFailAllTopic> for SeqDlqHandler {
-    type Context = ();
-    async fn handle(&self, _: OrderMessage, _: MessageMetadata, _: &()) -> Outcome {
-        Outcome::Ack
-    }
-    async fn handle_dead(&self, _: OrderMessage, _: DeadMessageMetadata, _: &()) {
-        self.0.increment();
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Snapshot helper
+// Snapshot helpers
 // ---------------------------------------------------------------------------
 
 type Snapshot = std::collections::HashMap<
@@ -246,9 +246,8 @@ fn failed_total(snapshot: &Snapshot, reason: &str) -> u64 {
 /// Every `shove_messages_discarded_total` series in the snapshot, as
 /// `(reason, count)` pairs.
 ///
-/// Returned rather than summed because the assertion on it is "none at all":
-/// a failure that names the reason label points straight at the call site that
-/// recorded it, where a bare `0 != 1` would not.
+/// Kept as pairs rather than a bare sum so a wrong total names the reason label
+/// that produced it, which points straight at the call site.
 fn discarded_series(snapshot: &Snapshot) -> Vec<(String, u64)> {
     snapshot
         .iter()
@@ -272,7 +271,7 @@ fn discarded_series(snapshot: &Snapshot) -> Vec<(String, u64)> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn failall_cascade_is_counted_once_not_once_per_dead_letter() {
+async fn failall_cascade_with_no_dlq_counts_every_message_as_discarded() {
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();
     recorder.install().expect("install debugging recorder");
@@ -282,29 +281,34 @@ async fn failall_cascade_is_counted_once_not_once_per_dead_letter() {
     let client = tb.client();
     broker
         .topology()
-        .declare::<SeqFailAllTopic>()
+        .declare::<SeqFailAllNoDlqTopic>()
         .await
         .expect("declare");
+    assert!(
+        SeqFailAllNoDlqTopic::topology().dlq().is_none(),
+        "this fixture is the no-DLQ arm; adding a DLQ to the topology above turns \
+         every assertion below into the one `metrics_kafka_failall.rs` already makes"
+    );
 
     let publisher = broker.publisher().await.expect("publisher");
-    for amount in 0..5u64 {
+    // Publish order is consume order (one partition). key-A/0 poisons the key,
+    // key-A/1 and key-A/2 cascade behind it, and key-B/0 is the barrier.
+    for amount in 0..3u64 {
         publisher
-            .publish::<SeqFailAllTopic>(&OrderMessage {
+            .publish::<SeqFailAllNoDlqTopic>(&OrderMessage {
                 order_id: "key-A".into(),
                 amount,
             })
             .await
             .expect("publish key-A");
     }
-    for amount in 0..3u64 {
-        publisher
-            .publish::<SeqFailAllTopic>(&OrderMessage {
-                order_id: "key-B".into(),
-                amount,
-            })
-            .await
-            .expect("publish key-B");
-    }
+    publisher
+        .publish::<SeqFailAllNoDlqTopic>(&OrderMessage {
+            order_id: "key-B".into(),
+            amount: 0,
+        })
+        .await
+        .expect("publish key-B");
 
     let key_a_handled = WaitableCounter::new();
     let key_b_handled = WaitableCounter::new();
@@ -320,7 +324,7 @@ async fn failall_cascade_is_counted_once_not_once_per_dead_letter() {
     let sc = shutdown.clone();
     let handle = tokio::spawn(async move {
         consumer
-            .run_fifo::<SeqFailAllTopic, _>(
+            .run_fifo::<SeqFailAllNoDlqTopic, _>(
                 handler,
                 (),
                 ConsumerOptions::<Kafka>::new()
@@ -330,44 +334,21 @@ async fn failall_cascade_is_counted_once_not_once_per_dead_letter() {
             .await
     });
 
-    // key-A/2 is rejected, then key-A/3 and key-A/4 are dead-lettered without
-    // ever reaching the handler → exactly 3 dead messages. Reaching 3 is the
-    // proof that two cascade discards happened, which is what makes the
-    // counter assertion below exact.
-    let dlq_counter = WaitableCounter::new();
-    let dlq_consumer = KafkaConsumer::new(client.clone());
-    let dlq_handler = SeqDlqHandler(dlq_counter.clone());
-    let dlq_handle = tokio::spawn(async move {
-        dlq_consumer
-            .run_dlq::<SeqFailAllTopic, _>(dlq_handler, ())
-            .await
-    });
-
+    // The barrier. `key-B/0` is last on a single partition consumed by one
+    // sequential loop, so its handler call proves key-A/0's reject and both
+    // cascade discards have already been settled — and that the consumer
+    // survived the poisoning.
     assert!(
-        dlq_counter.wait_for(3, Duration::from_secs(60)).await,
-        "expected key-A/2 plus the two poisoned messages in the DLQ, got {}",
-        dlq_counter.get()
+        key_b_handled.wait_for(1, Duration::from_secs(60)).await,
+        "key-B must be handled after the poisoned key-A backlog drains; the \
+         consumer either stopped at the poisoning or never got there"
     );
 
-    // Kafka runs one FIFO task over the whole assignment, so key-B is strictly
-    // behind key-A's dead-letters in the consume order. Waiting for it proves
-    // the consumer ran on past the poisoning rather than stopping — without
-    // this, `rejected == 1` could be satisfied by a dead consumer.
-    assert!(
-        key_b_handled.wait_for(3, Duration::from_secs(60)).await,
-        "key-B must be unaffected by key-A's poisoning, but only {} of 3 were handled",
-        key_b_handled.get()
-    );
-
-    // `run_dlq` takes no shutdown token — Kafka's DLQ loop stops on the
-    // *client's* token, which `broker.close()` cancels. Close before awaiting,
-    // or `dlq_handle` never resolves.
     shutdown.cancel();
     broker.close().await;
     handle.await.expect("consumer task panicked").ok();
-    dlq_handle.await.expect("dlq task panicked").ok();
 
-    // Single, draining snapshot, taken only once both consumers have stopped so
+    // Single, draining snapshot, taken only once the consumer has stopped so
     // nothing can emit into it while it is being read.
     let snapshot = snapshotter.snapshot().into_hashmap();
 
@@ -375,19 +356,37 @@ async fn failall_cascade_is_counted_once_not_once_per_dead_letter() {
     assert!(
         !seen
             .iter()
-            .any(|(k, a)| k == "key-A" && (*a == 3 || *a == 4)),
-        "key-A/3 and key-A/4 must not reach the handler once the key is poisoned: {seen:?}"
+            .any(|(k, a)| k == "key-A" && (*a == 1 || *a == 2)),
+        "key-A/1 and key-A/2 must not reach the handler once the key is poisoned: {seen:?}"
+    );
+    assert_eq!(
+        key_a_handled.get(),
+        1,
+        "only the rejected key-A/0 reaches the handler; the cascaded deliveries \
+         must not"
+    );
+
+    // All three key-A messages are gone and the topology declares nowhere for
+    // them to go, so every one of them is data loss: the rejected delivery
+    // through `record_terminal` and the two cascaded ones through
+    // `pending_discard`, each settled by the synchronous commit that dropped it.
+    let discarded = discarded_series(&snapshot);
+    let discarded_total: u64 = discarded.iter().map(|(_, n)| *n).sum();
+    assert_eq!(
+        discarded_total, 3,
+        "a no-DLQ FailAll cascade loses the rejected message and everything \
+         behind its key — all 3 must be counted as discarded; got {discarded:?}"
     );
 
     // The rejected delivery is an independent failure — counted once. The two
-    // dead-lettered behind the poisoned key are collateral of that same
-    // failure. Counting them would read 3.
+    // discarded behind the poisoned key are collateral of that same failure.
+    // Counting them would read 3.
     assert_eq!(
         failed_total(&snapshot, "rejected"),
         1,
-        "expected exactly one `rejected` failure (key-A/2, the delivery that \
-         actually reached the handler and failed); key-A/3 and key-A/4 were \
-         dead-lettered as a FailAll cascade and must not be counted"
+        "expected exactly one `rejected` failure (key-A/0, the delivery that \
+         actually reached the handler and failed); key-A/1 and key-A/2 were \
+         discarded as a FailAll cascade and must not be counted"
     );
 
     // Nothing in this fixture exhausts a retry budget (`max_retries(0)`, and
@@ -397,30 +396,5 @@ async fn failall_cascade_is_counted_once_not_once_per_dead_letter() {
         failed_total(&snapshot, "max_retries_exceeded"),
         0,
         "no delivery in this fixture exhausts a retry budget"
-    );
-
-    assert_eq!(
-        key_a_handled.get(),
-        3,
-        "key-A/0, key-A/1 and the rejected key-A/2 reach the handler; the \
-         cascaded deliveries must not"
-    );
-
-    // The other half of the accounting: nothing here claims data loss.
-    //
-    // The poisoned-key arm decides a `metrics::pending_discard` for every
-    // cascaded delivery — the cascade is excluded from `messages_failed_total`,
-    // not from the discard bookkeeping. But this topic declares a DLQ and all
-    // three messages were observed arriving on it above, so every pending
-    // discard settles with `has_dlq = true` and records nothing: the messages
-    // still exist. A count here is a false data-loss alert.
-    //
-    // The same call site *is* meant to move this counter when there is nowhere
-    // for the messages to go — that arm is
-    // `metrics_kafka_failall_no_dlq.rs`, which asserts 3.
-    let discarded = discarded_series(&snapshot);
-    assert!(
-        discarded.is_empty(),
-        "a cascade that reached the DLQ must not claim data loss; got {discarded:?}"
     );
 }
