@@ -990,11 +990,25 @@ async fn route_broadcast_outcome(
                     return;
                 }
             }
-            if defer_tx.send(delivery).await.is_err() {
-                tracing::debug!(
-                    topic,
-                    "broadcast subscription closed before a deferred redelivery landed"
-                );
+            // Raced against shutdown as well as the sleep. The channel has one
+            // slot per prefetch permit and this task holds one, so a send can
+            // only queue behind deferrals the loop has not read yet — and once
+            // the loop is draining for shutdown it never reads again. Without
+            // this arm that send would park forever, holding the permit
+            // `acquire_many` is waiting on and turning a clean drain into a
+            // timeout.
+            tokio::select! {
+                sent = defer_tx.send(delivery) => {
+                    if sent.is_err() {
+                        tracing::debug!(
+                            topic,
+                            "broadcast subscription closed before a deferred redelivery landed"
+                        );
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(topic, "shutdown cancelled a deferred broadcast redelivery");
+                }
             }
         }
     }
@@ -4383,13 +4397,14 @@ impl KafkaConsumer {
                     "broadcast subscription assigned at the tail"
                 );
 
-                // Redelivery for `Defer`, private to this subscription. Bounded
-                // by the prefetch count for the same reason the completion
-                // channel is on the shared path: a deferring handler holds its
-                // permit across the delay, so the queue can never grow past the
-                // in-flight cap.
+                // Redelivery for `Defer`, private to this subscription. One slot
+                // per prefetch permit: a deferring handler holds its permit
+                // until the redelivery is handed over, so no more than
+                // `prefetch_count` deferrals can be in flight at once. The
+                // `max(1)` is not decoration — `mpsc::channel(0)` panics, and
+                // `prefetch_count` is a plain `u16` a caller can set to zero.
                 let (defer_tx, mut defer_rx) =
-                    mpsc::channel::<DeferredDelivery>(prefetch_count as usize);
+                    mpsc::channel::<DeferredDelivery>((prefetch_count as usize).max(1));
 
                 loop {
                     let delivery = tokio::select! {
