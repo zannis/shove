@@ -1670,6 +1670,7 @@ pub struct BatchConsumerOptions {
     max_message_size: Option<usize>,
     handler_timeout: Option<Duration>,
     handler_timeout_outcome: Option<Outcome>,
+    consumer_group: Option<Arc<str>>,
     kafka_group_id: Option<Arc<str>>,
     kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
     shutdown: CancellationToken,
@@ -1695,6 +1696,7 @@ impl Default for BatchConsumerOptions {
             // rather than discover the default by having batches retried.
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
             handler_timeout_outcome: None,
+            consumer_group: None,
             kafka_group_id: None,
             kafka_auto_offset_reset: None,
             shutdown: CancellationToken::new(),
@@ -1811,6 +1813,24 @@ impl BatchConsumerOptions {
     /// [`ConsumerOptions::with_handler_timeout_outcome`]: crate::ConsumerOptions::with_handler_timeout_outcome
     pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
         self.handler_timeout_outcome = Some(outcome);
+        self
+    }
+
+    /// Tag this consumer with a group name for metrics labelling, exactly as
+    /// [`ConsumerOptions::with_consumer_group`] does on the single-message
+    /// path. Left unset it surfaces as `consumer_group="default"`.
+    ///
+    /// This is **not** [`with_group_id`](Self::with_group_id). The two are
+    /// deliberately independent: `group_id` is the Kafka `group.id` the broker
+    /// coordinates partition assignment with, while this is the logical group
+    /// name the `consumer_group` metric label reports — the same value every
+    /// other backend reports, so one dashboard query spans all of them. Setting
+    /// only `with_group_id` moves the partitions without moving the label, and
+    /// setting only this one moves the label without moving the partitions.
+    ///
+    /// [`ConsumerOptions::with_consumer_group`]: crate::ConsumerOptions::with_consumer_group
+    pub fn with_consumer_group(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.consumer_group = Some(name.into());
         self
     }
 
@@ -3394,7 +3414,13 @@ impl KafkaConsumer {
         let ctx = Arc::new(ctx);
         let client = self.client.clone();
         let topic: Arc<str> = Arc::from(queue);
-        let group: Option<Arc<str>> = Some(Arc::from(group_id.as_str()));
+        // The `consumer_group` metric label is the shove group name, never
+        // `group_id` — same as `run`/`run_fifo` above and as every other
+        // backend, so one `sum by (consumer_group)` covers a topic however it
+        // is consumed. The Kafka `group.id` is a backend detail; it stays in
+        // the `Kafka batch consumer started` line below and in the broker's own
+        // tooling.
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         #[cfg(feature = "kafka-schema-registry")]
         let schema_registry = options.schema_registry.clone();
@@ -5999,6 +6025,44 @@ mod batch_consumer_options_tests {
     fn with_group_id_sets_value() {
         let opts = BatchConsumerOptions::new().with_group_id("custom-group");
         assert_eq!(opts.kafka_group_id.as_deref(), Some("custom-group"));
+    }
+
+    #[test]
+    fn with_consumer_group_sets_value() {
+        let opts = BatchConsumerOptions::new().with_consumer_group("orders-workers");
+        assert_eq!(opts.consumer_group.as_deref(), Some("orders-workers"));
+    }
+
+    /// The metrics group name and the Kafka `group.id` are separate knobs, and
+    /// setting one must never imply the other. That conflation is what the
+    /// batch path shipped with: it labelled metrics from the derived
+    /// `group.id`, so `with_group_id` silently renamed the consumer group on
+    /// every dashboard. `metrics_kafka_consumer_group_label` pins the emitted
+    /// label end to end; this pins the options that feed it.
+    #[test]
+    fn group_id_and_consumer_group_are_independent() {
+        let neither = BatchConsumerOptions::new();
+        assert_eq!(neither.consumer_group, None);
+        assert_eq!(neither.kafka_group_id, None);
+
+        let only_gid = BatchConsumerOptions::new().with_group_id("orders-consumer-v2");
+        assert_eq!(
+            only_gid.consumer_group, None,
+            "a `group.id` override must not become the metrics group name — \
+             unset still means `consumer_group=\"default\"`"
+        );
+
+        let only_name = BatchConsumerOptions::new().with_consumer_group("orders-workers");
+        assert_eq!(
+            only_name.kafka_group_id, None,
+            "naming the group for metrics must not repartition the consumer"
+        );
+
+        let both = BatchConsumerOptions::new()
+            .with_consumer_group("orders-workers")
+            .with_group_id("orders-consumer-v2");
+        assert_eq!(both.consumer_group.as_deref(), Some("orders-workers"));
+        assert_eq!(both.kafka_group_id.as_deref(), Some("orders-consumer-v2"));
     }
 
     #[test]
