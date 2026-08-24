@@ -103,7 +103,7 @@ macro_rules! recorder_for {
     )+};
 }
 
-recorder_for!(CacheInvalidations, ControlTopic);
+recorder_for!(CacheInvalidations, ControlTopic, DeferTopic);
 
 /// Defers the first delivery of each key and acks the redelivery.
 #[derive(Clone, Default)]
@@ -136,12 +136,18 @@ impl MessageHandler<DeferTopic> for DeferOnce {
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
-    _container: testcontainers::ContainerAsync<KafkaContainer>,
-    port: u16,
+    _container: Option<testcontainers::ContainerAsync<KafkaContainer>>,
+    brokers: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
+        if let Ok(b) = std::env::var("SHOVE_LOCAL_KAFKA") {
+            return Self {
+                _container: None,
+                brokers: b,
+            };
+        }
         let container = KafkaContainer::default()
             .start()
             .await
@@ -151,13 +157,13 @@ impl TestBroker {
             .await
             .expect("failed to get Kafka port");
         Self {
-            _container: container,
-            port,
+            brokers: format!("127.0.0.1:{port}"),
+            _container: Some(container),
         }
     }
 
     fn brokers(&self) -> String {
-        format!("127.0.0.1:{}", self.port)
+        self.brokers.clone()
     }
 
     /// A broker on its **own** client, against the same container.
@@ -401,8 +407,12 @@ async fn defer_redelivers_only_to_the_subscriber_that_deferred() {
         .subscribe::<DeferTopic, _>(deferring.clone(), ConsumerOptions::new())
         .expect("failed to subscribe");
 
+    // A plain acking handler on purpose: a second `DeferOnce` would defer its
+    // own copy and see two calls by its own doing, which is exactly the shape
+    // this test is trying to rule out — the assertion would pass or fail for
+    // the wrong reason.
     let bystander_broker = tb.broker().await;
-    let bystander = DeferOnce::default();
+    let bystander = Recorder::default();
     let mut bystander_sub = bystander_broker.broadcast_subscriber();
     bystander_sub
         .subscribe::<DeferTopic, _>(bystander.clone(), ConsumerOptions::new())
@@ -434,7 +444,7 @@ async fn defer_redelivers_only_to_the_subscriber_that_deferred() {
         "the deferring subscriber must see the message again"
     );
     assert_eq!(
-        bystander.calls().await,
+        bystander.keys().await,
         vec!["deferred".to_string()],
         "a deferral must not be republished to the rest of the fan-out"
     );

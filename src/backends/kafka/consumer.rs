@@ -1445,15 +1445,27 @@ impl KafkaStreamConsumer {
         let metadata = self
             .fetch_metadata(Some(topic), timeout)
             .map_err(|e| map_kafka_error(&format!("failed to fetch metadata for {topic}"), e))?;
-        let meta_topic = metadata
+        // `Connection`, not `Topology`, and deliberately: both of these mean
+        // "the topic is not there *yet*", which for a subscriber is a wait, not
+        // a misconfiguration. A `subscribe()`-based consumer gets that for free
+        // — librdkafka keeps refreshing metadata until the topic appears — and
+        // an assign-based one has to ask for it, because `Topology` is not
+        // retryable and would kill a subscriber that merely started before the
+        // publisher declared the topic. The reconnect loop bounds the wait via
+        // `max_reconnect_attempts`, so a genuinely absent topic still gives up.
+        let partitions: Vec<i32> = metadata
             .topics()
             .first()
-            .ok_or_else(|| ShoveError::Topology(format!("no metadata for topic {topic}")))?;
-        let mut partitions: Vec<i32> = meta_topic.partitions().iter().map(|p| p.id()).collect();
-        partitions.sort_unstable();
+            .map(|t| {
+                let mut ids: Vec<i32> = t.partitions().iter().map(|p| p.id()).collect();
+                ids.sort_unstable();
+                ids
+            })
+            .unwrap_or_default();
         if partitions.is_empty() {
-            return Err(ShoveError::Topology(format!(
-                "cannot subscribe: topic '{topic}' has no partitions (does it exist?)"
+            return Err(ShoveError::Connection(format!(
+                "topic '{topic}' has no partitions yet — a broadcast subscription cannot \
+                 assign until it exists; waiting for it to be declared"
             )));
         }
 
