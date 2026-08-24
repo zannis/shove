@@ -26,6 +26,9 @@ on:
         type: boolean
 
 permissions:
+  # Also covers the gate's commit lookup: it resolves its argument to a full
+  # SHA before querying runs, which is the contents API. Do not trim this
+  # below `read`.
   contents: write
   id-token: write
   # Read-only, for the "Require a green ci.yml run" gate below: listing a

@@ -787,6 +787,20 @@ where
 
         dlq.in_flight.fetch_add(1, Ordering::Release);
 
+        // Before the size gate, exactly as `prepare_message` places it on the
+        // main loop. Labelled with the SOURCE topic rather than the DLQ name,
+        // and with no consumer group (the DLQ loop builds default options):
+        // Redis already drains its DLQ through `run_stream_loop`, which labels
+        // every metric `topology.queue()` whichever stream it reads, so a DLQ
+        // name here would make `topic` mean two different things depending on
+        // the backend and would stop a per-topic size profile summing across
+        // the main and DLQ paths.
+        metrics::record_message_size(
+            topology.queue(),
+            options.consumer_group.as_deref(),
+            env.payload.len(),
+        );
+
         if let Err(e) = options.validate_payload_message_size(env.payload.len()) {
             tracing::warn!(
                 error = %e,

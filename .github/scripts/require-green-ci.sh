@@ -14,11 +14,15 @@
 #   2. Treat an absent run as a failure. "No run" is not "nothing to check";
 #      it is precisely the v0.13.0 case.
 #
-# Usage: require-green-ci.sh <sha>
+# Usage: require-green-ci.sh <commit-ish>
+#
+# The argument is resolved to a full SHA before anything is looked up, so an
+# abbreviated SHA, a tag or a branch all work from a terminal.
 #
 # Env:
 #   GITHUB_REPOSITORY  owner/repo (set for free inside Actions).
-#   GH_TOKEN           token with `actions: read` on that repo.
+#   GH_TOKEN           token with `actions: read` and `contents: read` on that
+#                      repo -- the latter only for resolving the argument.
 #   GATE_LEVEL         `error` (default) or `warning` -- the Actions annotation
 #                      level used to report a bad verdict. The exit status is
 #                      the same either way; only the annotation changes, so a
@@ -27,9 +31,9 @@
 
 set -euo pipefail
 
-SHA="${1:-}"
-if [ -z "$SHA" ]; then
-  echo "usage: $0 <sha>" >&2
+SHA_ARG="${1:-}"
+if [ -z "$SHA_ARG" ]; then
+  echo "usage: $0 <commit-ish>" >&2
   exit 2
 fi
 
@@ -62,6 +66,28 @@ annotate() {
     printf '%s: %s\n' "$GATE_LEVEL" "$1" >&2
   fi
 }
+
+# `head_sha=` on the runs API matches the full 40-character SHA and nothing
+# else. An abbreviated SHA matches no run and comes back empty -- which at this
+# point in the script is indistinguishable from a commit CI genuinely never
+# ran, so the gate would report a well-tested commit as "never tested". Resolve
+# first and use the resolved value everywhere, and that whole class of wrong
+# verdict goes away; accepting tags and branch names is a free side effect.
+#
+# This costs the release path nothing: publish.yml passes `github.sha`, already
+# full-length, which resolves to itself. A resolution that fails exits 2 rather
+# than 1, keeping "you gave me something that is not a commit" distinct from
+# "this commit did not pass CI" -- publish.yml treats both as failure, so the
+# gate still fails closed either way.
+echo "Resolving ${SHA_ARG} to a commit in ${REPO}..."
+if ! SHA=$(gh api "repos/${REPO}/commits/${SHA_ARG}" --jq '.sha') || [ -z "$SHA" ]; then
+  annotate "Could not resolve '${SHA_ARG}' to a commit in ${REPO} (the API error is above). This is not a verdict about CI: the argument never named a commit, so there was nothing to look up a run for. Pass a commit SHA, tag or branch that exists in ${REPO}."
+  exit 2
+fi
+
+if [ "$SHA" != "$SHA_ARG" ]; then
+  echo "  ${SHA_ARG} -> ${SHA}"
+fi
 
 echo "Resolving ci.yml runs for ${SHA} in ${REPO}..."
 

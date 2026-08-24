@@ -1724,6 +1724,18 @@ where
                     let body = extract_payload(msg.body().unwrap_or_default());
                     let metadata = extract_dead_metadata(&msg, original_queue);
 
+                    // Before the size gate, exactly as the main loop places it
+                    // after its own `extract_payload`. `original_queue` is
+                    // `topology.queue()` — the SOURCE topic, not the DLQ queue
+                    // name — and there is no consumer group, since `run_dlq`
+                    // takes no `ConsumerOptions`. Redis already drains its DLQ
+                    // through `run_stream_loop`, which labels every metric
+                    // `topology.queue()` whichever stream it reads, so a DLQ
+                    // name here would make `topic` mean two different things
+                    // depending on the backend and would stop a per-topic size
+                    // profile summing across the main and DLQ paths.
+                    metrics::record_message_size(original_queue, None, body.len());
+
                     if body.len() > DEFAULT_MAX_MESSAGE_SIZE {
                         warn!(
                             bytes = body.len(),

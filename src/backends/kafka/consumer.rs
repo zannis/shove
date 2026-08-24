@@ -4635,6 +4635,20 @@ impl KafkaConsumer {
         // sec-K-7: respect the same max_message_size the main consumer uses
         // rather than the DEFAULT_MAX_MESSAGE_SIZE constant.
         let max_message_size = options.max_message_size;
+        // `shove_message_size_bytes` labels a DLQ drain with the SOURCE topic,
+        // not the DLQ name, and with whatever `consumer_group` the main loop
+        // for this topic would carry — never the internal `{dlq}-consumer`
+        // group id below. Two reasons the label must not switch to `dlq`:
+        // Redis already drains its DLQ through `run_stream_loop`, which
+        // labels every metric `topology.queue()` whichever stream it is
+        // reading, so a DLQ name here would make `topic` mean two different
+        // things depending on the backend; and a per-topic size profile is
+        // only summable across the main and DLQ paths if both carry the same
+        // label. The DLQ drain stays distinguishable through the metrics that
+        // exist to name it (`shove_messages_discarded_total`, the DLQ backlog
+        // gauge) rather than by overloading `topic` here.
+        let topic: Arc<str> = Arc::from(topology.queue());
+        let group: Option<Arc<str>> = options.consumer_group.clone();
 
         #[cfg(feature = "kafka-schema-registry")]
         let schema_registry = options.schema_registry.clone();
@@ -4655,6 +4669,8 @@ impl KafkaConsumer {
             let client_clone = client.clone();
             let shutdown = shutdown.clone();
             let dlq_group_id = dlq_group_id.clone();
+            let topic = topic.clone();
+            let group = group.clone();
             #[cfg(feature = "kafka-schema-registry")]
             let schema_registry = schema_registry.clone();
             #[cfg(feature = "kafka-schema-registry")]
@@ -4706,6 +4722,12 @@ impl KafkaConsumer {
                             // instead of allocating a Vec<u8> copy.
                             let payload_bytes = msg.payload().unwrap_or_default();
                             let headers = extract_string_headers(&msg);
+
+                            // Before the size gate, exactly as on the main loop: the
+                            // histogram describes what arrived on the wire, so the
+                            // payload the gate is about to discard is precisely the
+                            // sample an operator sizing `max_message_size` needs.
+                            metrics::record_message_size(&topic, group.as_deref(), payload_bytes.len());
 
                             // sec-K-7: honor options.max_message_size (same as the main
                             // consumer) instead of the DEFAULT_MAX_MESSAGE_SIZE constant.
