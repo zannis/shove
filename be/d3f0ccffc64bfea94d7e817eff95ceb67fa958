@@ -1,0 +1,26 @@
+docs/pages/guides/observability.mdx
+  s_420023e1d44cb7::t_e53b07b5228b48 157,172
+  s_420023e1d44cb7::t_78a375d2ca2cc5 149,154
+src/queue_depth.rs
+  s_420023e1d44cb7::t_98297523fc3376 63-69
+src/topology.rs
+  s_420023e1d44cb7::t_318cbb5f37aa10 538-540
+docs/pages/guides/batch-publishing.mdx
+  s_420023e1d44cb7::t_33c64120244a64 75-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "bed3f0ccffc64bfea94d7e817eff95ceb67fa958",
+  "prompts": {},
+  "sessions": {
+    "s_420023e1d44cb7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f98600ff-3364-47d7-bbdd-79f1d6c5a993",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
