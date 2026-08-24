@@ -159,18 +159,12 @@ impl MessageHandler<DeferTopic> for DeferOnce {
 // ---------------------------------------------------------------------------
 
 struct TestBroker {
-    _container: Option<testcontainers::ContainerAsync<KafkaContainer>>,
+    _container: testcontainers::ContainerAsync<KafkaContainer>,
     brokers: String,
 }
 
 impl TestBroker {
     async fn start() -> Self {
-        if let Ok(b) = std::env::var("SHOVE_LOCAL_KAFKA") {
-            return Self {
-                _container: None,
-                brokers: b,
-            };
-        }
         let container = KafkaContainer::default()
             .start()
             .await
@@ -181,7 +175,7 @@ impl TestBroker {
             .expect("failed to get Kafka port");
         Self {
             brokers: format!("127.0.0.1:{port}"),
-            _container: Some(container),
+            _container: container,
         }
     }
 
