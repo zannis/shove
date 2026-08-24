@@ -80,11 +80,17 @@ Clippy is also gated per backend, because `--all-features` and
 `--no-default-features` can both be clean while a single-backend build is not:
 an item whose only callers sit behind a feature gate that set does not enable
 is dead code there and nowhere else. The `feature-lint` job runs this over each
-row of the table above, plus `pub-aws-sns` on its own:
+row of the table above, plus the two publisher-only SNS builds (`pub-aws-sns`
+and `pub-aws-sns,metrics`) that no coverage entry compiles on their own:
 
 ```sh
 cargo clippy --lib --no-default-features --features <backend-feature-set> -- -D warnings
 ```
+
+`--lib` rather than `--all-targets`: the `coverage` matrix already builds every
+other target for these same feature sets, so a test that fails to compile under
+one of them fails there. What this job adds is the lint pass over the library,
+which is where a feature-gated item goes dead.
 
 CI also runs `cargo audit --deny warnings`.
 

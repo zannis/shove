@@ -77,9 +77,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The coverage matrix's sets, plus the publisher-only SNS build, which no
-      # coverage entry compiles on its own -- it is the set that decides whether
-      # `record_message_size` needs its `dead_code` allow.
+      # The coverage matrix's sets, plus the two publisher-only SNS builds, which
+      # no coverage entry compiles on its own -- they are the sets that decide
+      # whether `record_message_size` needs its `dead_code` allow.
+      #
+      # `--lib`, not `--all-targets`: the coverage matrix already builds every
+      # other target for these same feature sets, so a test that does not
+      # compile under one of them fails there. This job adds the lint pass over
+      # the library, which is where a feature-gated item goes dead.
       - name: clippy --lib for every single-backend feature set
         run: |
           set -euo pipefail
