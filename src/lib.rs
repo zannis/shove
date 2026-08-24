@@ -16,7 +16,8 @@
 //!    ├─ .publisher().await      → Publisher<B>
 //!    ├─ .consumer_supervisor()  → ConsumerSupervisor<B>   (all backends)
 //!    ├─ .autoscaler()           → B::AutoscalerImpl       (all backends)
-//!    └─ .consumer_group()       → ConsumerGroup<B>        (B: HasCoordinatedGroups)
+//!    ├─ .consumer_group()       → ConsumerGroup<B>        (B: HasCoordinatedGroups)
+//!    └─ .broadcast_subscriber() → BroadcastSubscriber<B>  (B: HasBroadcast)
 //! ```
 //!
 //! # Capability gating
@@ -29,6 +30,12 @@
 //!   pollers on one queue, which maps to [`ConsumerSupervisor`] (the
 //!   backend-agnostic path available on every `Broker<B>`). Calling
 //!   `consumer_group()` on `Broker<Sqs>` is a compile error.
+//! - [`HasBroadcast`] separately gates [`Broker::broadcast_subscriber`], for
+//!   ephemeral per-instance fan-out where every instance receives every
+//!   message. It is a **narrower** set than `HasCoordinatedGroups` — see that
+//!   trait for which backends implement it today. SQS is excluded permanently;
+//!   the rest are excluded by the same compile-time gate until their
+//!   implementation lands.
 //!
 //! # Feature flags
 //!

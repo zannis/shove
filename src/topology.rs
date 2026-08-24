@@ -594,10 +594,13 @@ impl TopologyBuilder {
     ///
     /// # Backend support
     ///
-    /// Gated on [`HasBroadcast`](crate::backend::capability::HasBroadcast):
-    /// `Broker<Sqs>` has no broadcast entry point and fails to compile, because
-    /// per-instance SQS fan-out needs per-pod queue and subscription lifecycle
-    /// management — and a leaked queue costs real money.
+    /// Declaring a broadcast topology is backend-independent; *consuming* one
+    /// is gated on [`HasBroadcast`](crate::backend::capability::HasBroadcast),
+    /// which carries the authoritative list of backends that implement it.
+    /// Not every backend does yet, and `Broker<Sqs>` never will — per-instance
+    /// SQS fan-out needs per-pod queue and subscription lifecycle management,
+    /// and a leaked queue costs real money. A backend without the impl fails to
+    /// compile at `broadcast_subscriber()` rather than silently degrading.
     ///
     /// # Panics
     ///

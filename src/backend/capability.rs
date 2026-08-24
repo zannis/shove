@@ -61,18 +61,35 @@ pub trait HasCoordinatedGroups: Backend {
 /// [`TopologyBuilder::broadcast`](crate::topology::TopologyBuilder::broadcast)).
 ///
 /// The bar is deliberately higher than "can fan out at all": the subscription
-/// must leave *nothing* behind when the process goes away. Kafka, RabbitMQ,
-/// NATS, InMemory and Redis each have a primitive that satisfies that — a
-/// groupless `assign()`, an exclusive auto-delete queue, an ephemeral pull
-/// consumer, a per-subscriber buffer, a plain `XREAD`. SQS does not: per-pod
-/// fan-out there means creating and deleting a real queue plus an SNS
-/// subscription per process, and a leaked queue costs money forever. So SQS is
-/// gated out rather than given a lossy approximation.
+/// must leave *nothing* behind when the process goes away.
+///
+/// # Which backends implement this
+///
+/// This is the authoritative list; the `.broadcast()` and
+/// `broadcast_subscriber()` docs defer to it.
+///
+/// | Backend | Implements `HasBroadcast` | Ephemeral primitive |
+/// |---|---|---|
+/// | **InMemory** | **yes** | a per-subscriber buffer |
+/// | NATS | not yet | ephemeral pull consumer |
+/// | Redis (`redis-streams`) | not yet | plain `XREAD` from `$`, no `XGROUP` |
+/// | Kafka | not yet | groupless `assign()` at the latest offset |
+/// | RabbitMQ | not yet | exclusive auto-delete queue on a fanout exchange |
+/// | **SQS** | **never** | — |
+///
+/// A backend in the *not yet* rows has a primitive that satisfies the contract,
+/// but no implementation on this version — `broadcast_subscriber()` does not
+/// compile for it, by the same gate that excludes SQS.
+///
+/// SQS is different in kind, not in schedule: per-pod fan-out there means
+/// creating and deleting a real queue plus an SNS subscription per process, and
+/// a leaked queue costs money forever. So SQS is gated out permanently rather
+/// than given a lossy approximation.
 ///
 /// Sealed via `Backend`.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` has no ephemeral per-instance subscription primitive; `.broadcast()` topologies are not supported on it.",
-    note = "Kafka, RabbitMQ, NATS, InMemory, and Redis (redis-streams) implement `HasBroadcast`. SQS would need a per-process queue plus SNS subscription, whose lifecycle shove does not manage — publish to an SNS topic each instance subscribes to itself instead."
+    message = "`{Self}` does not implement `HasBroadcast`, so `.broadcast()` topologies cannot be consumed on it.",
+    note = "InMemory is the only backend implementing `HasBroadcast` on this version. NATS, Redis, Kafka and RabbitMQ each have a suitable ephemeral primitive and are planned. SQS is excluded permanently: per-process fan-out there needs a real queue plus an SNS subscription whose lifecycle shove does not manage — publish to an SNS topic each instance subscribes to itself instead."
 )]
 #[allow(private_interfaces, private_bounds)]
 pub trait HasBroadcast: Backend {
