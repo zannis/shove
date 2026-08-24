@@ -14,12 +14,14 @@ use rdkafka::consumer::{
 };
 use rdkafka::error::{KafkaError, KafkaResult};
 use rdkafka::message::{BorrowedMessage, Header, Headers, Message, OwnedHeaders};
+use rdkafka::metadata::Metadata;
 use rdkafka::{ClientConfig, ClientContext, Offset, Statistics, TopicPartitionList};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
@@ -900,6 +902,97 @@ async fn route_outcome(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Broadcast — one groupless, assign-only subscription per call
+// ---------------------------------------------------------------------------
+
+/// How long `assign_all_partitions_at_end`'s metadata fetch may block.
+///
+/// Matches the timeout the topology declarer and the offset-reset path already
+/// use for their own metadata round trips.
+const BROADCAST_ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A message travelling through a broadcast subscription: the raw payload and
+/// its headers, owned, so the same value can come off the wire or off this
+/// subscription's own defer channel.
+struct DeferredDelivery {
+    payload: Vec<u8>,
+    headers: Arc<HashMap<String, String>>,
+}
+
+/// Count a broadcast message that is being dropped before or instead of
+/// handling.
+///
+/// `record_terminal` with `has_dlq: false` — a broadcast topology cannot
+/// declare one — which resolves straight to `messages_discarded_total`. There
+/// is no commit to wait on: nothing was ever going to hold a copy, so the
+/// discard is true the moment it is decided.
+fn discard_broadcast(topic: &str, group: Option<&str>, reason: metrics::FailReason) {
+    metrics::record_terminal(topic, group, reason, false).confirm();
+}
+
+/// Outcome routing for a Kafka broadcast subscription.
+///
+/// The decision itself is
+/// [`settle_broadcast_outcome`](crate::backend::broadcast::settle_broadcast_outcome),
+/// shared with NATS and Redis so the terminal accounting cannot drift between
+/// the three loops that settle in-process: `Ack` retires the message by doing
+/// nothing (there is no offset to advance), and `Retry` and `Reject` are both
+/// terminal discards counted under the two reasons `decide_retry` produces at
+/// `max_retries = 0`, which is what `BroadcastSubscriber` pins the budget to.
+///
+/// The `Redeliver` half is what stays here, because it is the one part that is
+/// Kafka-specific. Kafka's ordinary defer republishes to the topic, and on a
+/// broadcast topic that would fan the message back out to *every* subscriber
+/// instead of redelivering it to the one that deferred. So it goes back into
+/// this subscription's own loop, which is the only place a redelivery can go
+/// without reaching the rest of the fan-out.
+async fn route_broadcast_outcome(
+    outcome: Outcome,
+    topic: &str,
+    group: Option<&str>,
+    delivery: DeferredDelivery,
+    defer_tx: &mpsc::Sender<DeferredDelivery>,
+    shutdown: &CancellationToken,
+) {
+    match settle_broadcast_outcome(&outcome, topic, group) {
+        BroadcastAction::Done => {}
+        BroadcastAction::Redeliver => {
+            tokio::select! {
+                _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
+                // A deferral outliving shutdown would hold the drain open for
+                // the length of the delay to redeliver a message the loop is
+                // about to stop reading. Drop it instead; broadcast is
+                // best-effort and the process is going away.
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(topic, "shutdown cancelled a deferred broadcast redelivery");
+                    return;
+                }
+            }
+            // Raced against shutdown as well as the sleep. The channel has one
+            // slot per prefetch permit and this task holds one, so a send can
+            // only queue behind deferrals the loop has not read yet — and once
+            // the loop is draining for shutdown it never reads again. Without
+            // this arm that send would park forever, holding the permit
+            // `acquire_many` is waiting on and turning a clean drain into a
+            // timeout.
+            tokio::select! {
+                sent = defer_tx.send(delivery) => {
+                    if sent.is_err() {
+                        tracing::debug!(
+                            topic,
+                            "broadcast subscription closed before a deferred redelivery landed"
+                        );
+                    }
+                }
+                _ = shutdown.cancelled() => {
+                    tracing::debug!(topic, "shutdown cancelled a deferred broadcast redelivery");
+                }
+            }
+        }
+    }
+}
+
 /// Drive the Retry/Defer delayed republish.
 ///
 /// **Concurrent path** (`completion: Some`): spawns the work and returns
@@ -1322,6 +1415,78 @@ impl KafkaStreamConsumer {
             Self::Default(c) => c.assignment(),
             #[cfg(feature = "kafka-msk-iam")]
             Self::MskIam(c) => c.assignment(),
+        }
+    }
+
+    /// Assign every partition of `topic` at its current end offset.
+    ///
+    /// The groupless half of a broadcast subscription. `assign()` instead of
+    /// `subscribe()` means librdkafka never sends JoinGroup, so no group is
+    /// created broker-side and no rebalance is paid at boot; `Offset::End`
+    /// means the subscription starts at the tail, so deliver-new falls out of
+    /// the assignment rather than out of a stored offset.
+    ///
+    /// **Blocking** — `fetch_metadata` is a synchronous librdkafka call. Callers
+    /// on an async runtime must wrap this in `spawn_blocking`.
+    ///
+    /// Returns the number of partitions assigned.
+    pub(super) fn assign_all_partitions_at_end(
+        &self,
+        topic: &str,
+        timeout: Duration,
+    ) -> Result<usize> {
+        let metadata = self
+            .fetch_metadata(Some(topic), timeout)
+            .map_err(|e| map_kafka_error(&format!("failed to fetch metadata for {topic}"), e))?;
+        // `Connection`, not `Topology`, and deliberately: both of these mean
+        // "the topic is not there *yet*", which for a subscriber is a wait, not
+        // a misconfiguration. A `subscribe()`-based consumer gets that for free
+        // — librdkafka keeps refreshing metadata until the topic appears — and
+        // an assign-based one has to ask for it, because `Topology` is not
+        // retryable and would kill a subscriber that merely started before the
+        // publisher declared the topic. The reconnect loop bounds the wait via
+        // `max_reconnect_attempts`, so a genuinely absent topic still gives up.
+        let partitions: Vec<i32> = metadata
+            .topics()
+            .first()
+            .map(|t| {
+                let mut ids: Vec<i32> = t.partitions().iter().map(|p| p.id()).collect();
+                ids.sort_unstable();
+                ids
+            })
+            .unwrap_or_default();
+        if partitions.is_empty() {
+            return Err(ShoveError::Connection(format!(
+                "topic '{topic}' has no partitions yet — a broadcast subscription cannot \
+                 assign until it exists; waiting for it to be declared"
+            )));
+        }
+
+        let mut tpl = TopicPartitionList::new();
+        for pid in &partitions {
+            tpl.add_partition_offset(topic, *pid, Offset::End)
+                .map_err(|e| {
+                    map_kafka_error(&format!("failed to target the tail of {topic}[{pid}]"), e)
+                })?;
+        }
+        self.assign(&tpl)
+            .map_err(|e| map_kafka_error(&format!("failed to assign partitions of {topic}"), e))?;
+        Ok(partitions.len())
+    }
+
+    fn fetch_metadata(&self, topic: Option<&str>, timeout: Duration) -> KafkaResult<Metadata> {
+        match self {
+            Self::Default(c) => c.fetch_metadata(topic, timeout),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.fetch_metadata(topic, timeout),
+        }
+    }
+
+    fn assign(&self, tpl: &TopicPartitionList) -> KafkaResult<()> {
+        match self {
+            Self::Default(c) => c.assign(tpl),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.assign(tpl),
         }
     }
 }
@@ -4069,6 +4234,341 @@ impl KafkaConsumer {
             }
         };
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
+    }
+
+    /// Run this process's own groupless subscription to `T` until shutdown.
+    ///
+    /// Reached only through
+    /// [`BroadcastSubscriber`](crate::broadcast::BroadcastSubscriber), which
+    /// already refuses a non-broadcast topology; the guard here is the
+    /// backend-side half of that check.
+    ///
+    /// # What makes it ephemeral
+    ///
+    /// The subscription is `assign()` of every partition at the tail, with no
+    /// `subscribe()` and no commit anywhere in the loop. Nothing is written to
+    /// the broker at any point in its life, so there is nothing to tear down
+    /// when it ends and nothing to reap when the process dies without ending it
+    /// — which is why the teardown here is "drop the consumer handle" and not a
+    /// cleanup path that has to be reached. See
+    /// [`broadcast_group_id`](super::constants::broadcast_group_id) for why a
+    /// `group.id` string is nonetheless configured, and why it is a fixed one.
+    ///
+    /// A reconnect re-assigns at the *then*-current tail. Messages published
+    /// while the connection was down are not replayed — deliver-new applied to
+    /// the reconnect window, the same best-effort contract the subscription has
+    /// everywhere else.
+    pub(crate) async fn run_broadcast_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        let topology = T::topology();
+        if !topology.broadcast() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{}' is not a broadcast topology; a groupless subscription to it \
+                 would compete with the topic's consumer group rather than fan out",
+                topology.queue()
+            )));
+        }
+        let queue = topology.queue();
+        let group_id = super::constants::broadcast_group_id(queue);
+
+        let shutdown = options.shutdown.clone();
+        let processing = options.processing.clone();
+        let prefetch_count = options.prefetch_count;
+        let handler_timeout = options.handler_timeout;
+        let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
+        let max_message_size = options.max_message_size;
+
+        let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
+        let client = self.client.clone();
+        let semaphore = Arc::new(Semaphore::new(prefetch_count as usize));
+        let topic: Arc<str> = Arc::from(queue);
+        // Always `None`: `BroadcastSubscriber` sets no consumer-group label,
+        // because there is no group to label. Threaded through anyway so the
+        // metric call sites are identical to the shared path's.
+        let group: Option<Arc<str>> = options.consumer_group.clone();
+
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_registry = options.schema_registry.clone();
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_enforcement = options.schema_enforcement;
+        #[cfg(feature = "kafka-schema-registry")]
+        let schema_accepted: Arc<[Arc<str>]> = options
+            .schema_accepted_subjects
+            .clone()
+            .map(Arc::from)
+            .unwrap_or_else(|| Arc::from(vec![default_subject(queue)]));
+
+        tracing::info!(
+            queue,
+            group_id,
+            prefetch_count,
+            "Kafka broadcast subscription starting"
+        );
+
+        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
+            let handler = handler.clone();
+            let ctx = ctx.clone();
+            let client = client.clone();
+            let processing = processing.clone();
+            let shutdown = shutdown.clone();
+            let group_id = group_id.clone();
+            let semaphore = semaphore.clone();
+            let topic = topic.clone();
+            let group = group.clone();
+            let handler_timeout_outcome_cfg = handler_timeout_outcome_cfg.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_registry = schema_registry.clone();
+            #[cfg(feature = "kafka-schema-registry")]
+            let schema_accepted = schema_accepted.clone();
+            async move {
+                // A groupless consumer never joins, so the rebalance callbacks
+                // wired into the shared context never fire; the receiver is
+                // dropped deliberately, as in the DLQ loop.
+                let (rebalance_tx, _) = std_mpsc::channel::<RebalanceEvent>();
+                let consumer = Arc::new(create_stream_consumer(
+                    client.base_config(),
+                    &group_id,
+                    // Inert: every partition is assigned at an explicit offset
+                    // below, so librdkafka never consults the reset policy.
+                    // `Latest` states the intent anyway.
+                    KafkaAutoOffsetReset::Latest,
+                    queue,
+                    rebalance_tx,
+                    #[cfg(feature = "kafka-msk-iam")]
+                    client.msk_context(),
+                )?);
+
+                // `fetch_metadata` blocks the calling thread, so the assignment
+                // runs off the runtime's worker threads. `create_stream_consumer`
+                // configures `cooperative-sticky`, which would refuse a
+                // non-incremental `assign()` — but only once an assignor has
+                // been selected, which happens during JoinGroup. This consumer
+                // never subscribes, so it has no assignor and librdkafka reports
+                // rebalance protocol NONE, under which the eager `assign()` is
+                // accepted. Pinned by `kafka_broadcast_leaves_no_consumer_group`.
+                let assign_consumer = consumer.clone();
+                let assign_topic = queue.to_string();
+                let partitions = tokio::task::spawn_blocking(move || {
+                    assign_consumer
+                        .assign_all_partitions_at_end(&assign_topic, BROADCAST_ASSIGN_TIMEOUT)
+                })
+                .await
+                .map_err(|e| {
+                    ShoveError::Connection(format!("broadcast assign task panicked: {e}"))
+                })??;
+
+                tracing::info!(
+                    queue,
+                    partitions,
+                    "broadcast subscription assigned at the tail"
+                );
+
+                // Redelivery for `Defer`, private to this subscription. One slot
+                // per prefetch permit: a deferring handler holds its permit
+                // until the redelivery is handed over, so no more than
+                // `prefetch_count` deferrals can be in flight at once. The
+                // `max(1)` is not decoration — `mpsc::channel(0)` panics, and
+                // `prefetch_count` is a plain `u16` a caller can set to zero.
+                let (defer_tx, mut defer_rx) =
+                    mpsc::channel::<DeferredDelivery>((prefetch_count as usize).max(1));
+
+                loop {
+                    let delivery = tokio::select! {
+                        biased;
+
+                        _ = shutdown.cancelled() => {
+                            tracing::info!(queue, "shutdown signal received, draining in-flight handlers");
+                            // Nothing to commit and nothing to delete: the
+                            // subscription exists only in this consumer handle,
+                            // which is dropped when this future resolves.
+                            let _ = semaphore.acquire_many(prefetch_count as u32).await;
+                            return Ok(());
+                        }
+
+                        deferred = defer_rx.recv() => {
+                            match deferred {
+                                Some(d) => d,
+                                // Every sender is a spawned handler task and one
+                                // clone is held right here, so this is
+                                // unreachable; treat it as a spurious wake
+                                // rather than ending the subscription.
+                                None => continue,
+                            }
+                        }
+
+                        msg_result = consumer.recv() => {
+                            let msg = match msg_result {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    tracing::error!(error = %e, queue, "broadcast consumer recv error");
+                                    return Err(map_kafka_error(
+                                        &format!("broadcast consumer recv error on {queue}"),
+                                        e,
+                                    ));
+                                }
+                            };
+                            // Unlike the shared loop this copies before decoding
+                            // rather than after. There is no DLQ arm to feed
+                            // from the borrowed payload, and a deferred
+                            // redelivery re-enters the same code path holding
+                            // owned bytes, so one representation is worth more
+                            // here than one saved allocation on the reject path.
+                            DeferredDelivery {
+                                payload: msg.payload().unwrap_or_default().to_vec(),
+                                headers: extract_string_headers(&msg),
+                            }
+                        }
+                    };
+
+                    let DeferredDelivery { payload, headers } = delivery;
+                    metrics::record_message_size(&topic, group.as_deref(), payload.len());
+
+                    if let Err(e) = validate_message_size(payload.len(), max_message_size) {
+                        tracing::warn!(
+                            error = %e,
+                            queue,
+                            "oversized message on a broadcast subscription — discarding"
+                        );
+                        discard_broadcast(&topic, group.as_deref(), metrics::FailReason::Oversize);
+                        continue;
+                    }
+
+                    #[cfg(feature = "kafka-schema-registry")]
+                    let message: T::Message = {
+                        let decoded = if let Some(registry) = schema_registry.as_ref() {
+                            let codec_name = <T::Codec as crate::Codec<T::Message>>::NAME;
+                            match WireFormat::from_codec_name(codec_name) {
+                                Some(fmt) => registry_decode::<T::Message, T::Codec>(
+                                    registry,
+                                    fmt,
+                                    schema_enforcement,
+                                    &schema_accepted,
+                                    &payload,
+                                )
+                                .await
+                                .map(|d| match d {
+                                    RegistryDecode::Decoded(m) => Ok(m),
+                                    RegistryDecode::Dlq(reason) => Err(
+                                        metrics::FailReason::for_schema_reason(reason),
+                                    ),
+                                }),
+                                None => {
+                                    tracing::error!(
+                                        codec = codec_name,
+                                        queue,
+                                        "codec has no Confluent wire format; discarding"
+                                    );
+                                    Ok(Err(metrics::FailReason::for_schema_reason(
+                                        "schema_unsupported_codec",
+                                    )))
+                                }
+                            }
+                        } else {
+                            Ok(<T::Codec as crate::Codec<T::Message>>::decode(&payload)
+                                .map_err(|e| {
+                                    tracing::error!(error = %e, queue, "failed to deserialize broadcast message — discarding");
+                                    metrics::FailReason::Deserialize
+                                }))
+                        };
+                        match decoded {
+                            Ok(Ok(m)) => m,
+                            Ok(Err(reason)) => {
+                                discard_broadcast(&topic, group.as_deref(), reason);
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, queue, "schema registry decode failed — discarding");
+                                discard_broadcast(
+                                    &topic,
+                                    group.as_deref(),
+                                    metrics::FailReason::Deserialize,
+                                );
+                                continue;
+                            }
+                        }
+                    };
+
+                    #[cfg(not(feature = "kafka-schema-registry"))]
+                    let message: T::Message =
+                        match <T::Codec as crate::Codec<T::Message>>::decode(&payload) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    queue,
+                                    "failed to deserialize broadcast message — discarding"
+                                );
+                                discard_broadcast(
+                                    &topic,
+                                    group.as_deref(),
+                                    metrics::FailReason::Deserialize,
+                                );
+                                continue;
+                            }
+                        };
+
+                    let metadata = build_message_metadata(&headers, false);
+
+                    let permit = semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ShoveError::Connection("semaphore closed".to_string()))?;
+
+                    let task_processing = processing.clone();
+                    let task_topic = topic.clone();
+                    let task_group = group.clone();
+                    let task_handler = handler.clone();
+                    let task_ctx = ctx.clone();
+                    let task_timeout_outcome = handler_timeout_outcome_cfg.clone();
+                    let task_shutdown = shutdown.clone();
+                    let task_defer_tx = defer_tx.clone();
+
+                    tokio::spawn(async move {
+                        task_processing.store(true, Ordering::Release);
+
+                        let outcome = invoke_handler(
+                            async move {
+                                task_handler
+                                    .handle(message, metadata, task_ctx.as_ref())
+                                    .await
+                            },
+                            handler_timeout,
+                            task_timeout_outcome,
+                            &task_topic,
+                            task_group.as_deref(),
+                        )
+                        .await;
+
+                        route_broadcast_outcome(
+                            outcome,
+                            &task_topic,
+                            task_group.as_deref(),
+                            DeferredDelivery { payload, headers },
+                            &task_defer_tx,
+                            &task_shutdown,
+                        )
+                        .await;
+
+                        task_processing.store(false, Ordering::Release);
+                        // Held until the outcome — including a `Defer`'s delay —
+                        // is fully resolved, so deferrals stay inside the
+                        // prefetch cap instead of running beside it.
+                        drop(permit);
+                    });
+                }
+            }
+        })
+        .await
     }
 
     /// Public DLQ entrypoint with default options. Equivalent to

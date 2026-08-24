@@ -18,8 +18,10 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
+    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
+    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBroadcast, HasCoordinatedGroups},
+    sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
@@ -113,6 +115,32 @@ impl HasCoordinatedGroups for Kafka {
 // ---------------------------------------------------------------------------
 // ConsumerImpl — delegate through the existing `Consumer` trait (Context = ())
 // ---------------------------------------------------------------------------
+
+impl HasBroadcast for Kafka {
+    // Same consumer type as the shared path. The two loops share nothing but
+    // the type: a broadcast subscription assigns rather than subscribes, and
+    // commits nothing, so none of the offset-tracking machinery applies.
+    type BroadcastImpl = KafkaConsumer;
+
+    fn make_broadcast(client: &Self::Client) -> Self::BroadcastImpl {
+        KafkaConsumer::new(client.clone())
+    }
+}
+
+impl BroadcastImpl for KafkaConsumer {
+    async fn run_broadcast<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        KafkaConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+}
 
 impl ConsumerImpl for KafkaConsumer {
     async fn run<T, H>(

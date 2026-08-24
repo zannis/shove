@@ -18,8 +18,10 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
+    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
+    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBroadcast, HasCoordinatedGroups},
+    sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::{Result, ShoveError};
@@ -196,6 +198,32 @@ impl HasCoordinatedGroups for RabbitMq {
         );
         let mut autoscaler = Autoscaler::new(backend, strategy, config.poll_interval);
         tokio::spawn(async move { autoscaler.run(shutdown).await })
+    }
+}
+
+impl HasBroadcast for RabbitMq {
+    // Same consumer type as the shared path: a broadcast subscription is the
+    // ordinary concurrent delivery loop, attached to this process's own
+    // exclusive auto-delete queue instead of the declared one.
+    type BroadcastImpl = RabbitMqConsumer;
+
+    fn make_broadcast(client: &Self::Client) -> Self::BroadcastImpl {
+        RabbitMqConsumer::new(client.clone())
+    }
+}
+
+impl BroadcastImpl for RabbitMqConsumer {
+    async fn run_broadcast<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        RabbitMqConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

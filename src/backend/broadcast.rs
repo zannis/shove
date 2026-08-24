@@ -48,12 +48,16 @@ pub(crate) trait BroadcastImpl: Send + Sync {
 
 // Gated to the backends that actually call it, for two reasons. `routing` is
 // itself compiled only when some backend is, so an ungated body fails to
-// resolve `crate::routing` under `--no-default-features`. And InMemory is
-// deliberately *not* in the list: its broadcast path reuses its own
-// `route_outcome` over a private buffer, so including it would leave this
-// re-export unused under `--features inmemory` alone — which `-D warnings`
-// rejects, and which CI's per-feature clippy legs would catch.
-#[cfg(any(feature = "nats", feature = "redis-streams"))]
+// resolve `crate::routing` under `--no-default-features`. And InMemory and
+// RabbitMQ are deliberately *not* in the list: InMemory's broadcast path reuses
+// its own `route_outcome` over a private buffer, and RabbitMQ settles through
+// `router::route_reject` / `nack_requeue` because an AMQP delivery has to be
+// nacked on the channel it arrived on — the router already records the terminal
+// metric there, so going through this helper too would count it twice.
+// Including either would leave this re-export unused under that backend's
+// feature alone — which `-D warnings` rejects, and which CI's per-feature
+// clippy legs would catch.
+#[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
 mod settling {
     use std::time::Duration;
 
@@ -84,9 +88,12 @@ mod settling {
 
     /// Settle a handler outcome on an ephemeral broadcast subscription.
     ///
-    /// Shared by every backend's broadcast loop so the terminal accounting cannot
-    /// drift between them — the recurring cross-backend defect this crate keeps
-    /// paying for when each `route_outcome` restates the same rule.
+    /// Shared by every broadcast loop that settles in-process — Kafka, NATS and
+    /// Redis — so the terminal accounting cannot drift between them, the
+    /// recurring cross-backend defect this crate keeps paying for when each
+    /// `route_outcome` restates the same rule. RabbitMQ is the exception, and
+    /// only because its terminal arm has to nack a live AMQP delivery: see the
+    /// gate above.
     ///
     /// The decision itself still goes through [`decide_retry`], with the retry
     /// budget pinned to zero exactly as
@@ -116,9 +123,10 @@ mod settling {
                 // Confirmed immediately, unlike every other backend's terminal
                 // path, and that is correct rather than sloppy: an ephemeral
                 // broadcast subscription has no retirement operation that can fail.
-                // NATS reads it with `AckPolicy::None` and Redis with a bare
-                // `XREAD` (no group, so no PEL and no `XACK`), so nothing on either
-                // broker is still holding the delivery and no redelivery can
+                // NATS reads it with `AckPolicy::None`, Redis with a bare `XREAD`
+                // (no group, so no PEL and no `XACK`), and Kafka with an
+                // assign-only handle that never commits — so nothing on any of the
+                // three brokers is still holding the delivery and no redelivery can
                 // resurrect it. The message is already gone at this point.
                 metrics::record_terminal(topic, group, fail_reason, false).confirm();
                 BroadcastAction::Done
@@ -200,5 +208,5 @@ mod settling {
     }
 }
 
-#[cfg(any(feature = "nats", feature = "redis-streams"))]
+#[cfg(any(feature = "kafka", feature = "nats", feature = "redis-streams"))]
 pub(crate) use settling::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};

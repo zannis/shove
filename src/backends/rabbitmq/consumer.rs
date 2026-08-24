@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_lite::StreamExt;
 use lapin::message::Delivery;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions};
+use lapin::options::{
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicQosOptions, QueueBindOptions,
+    QueueDeclareOptions,
+};
 use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, Error as LapinError};
 use tokio::sync::oneshot::error::TryRecvError;
@@ -95,6 +98,138 @@ async fn open_consumer(
         .await
         .map_err(|e| map_lapin_error(&format!("failed to start consumer on {queue}"), e))?;
     Ok((channel, consumer))
+}
+
+/// How a concurrent consumer attaches to the broker.
+///
+/// The two variants share the whole delivery loop — concurrency, handler
+/// timeouts, deserialization rejects, the shutdown drain — and differ in
+/// exactly three places: how the stream is opened, whether the retry-budget
+/// gate runs before the handler, and where a non-`Ack` outcome goes. That is
+/// why this is a parameter rather than a second loop: the parts that are the
+/// same are the parts that drift apart when they are copied.
+#[derive(Clone, Copy)]
+enum Attachment<'a> {
+    /// The topology's shared, declared queue. The full retry chain applies:
+    /// budget gate, hold queues, DLQ.
+    Shared(&'a str),
+    /// This process's own exclusive, auto-delete queue bound to `exchange`.
+    /// There is no retry chain to apply — `.broadcast()` rejects a DLQ, hold
+    /// queues and sequencing at build time.
+    Broadcast { exchange: &'a str },
+}
+
+impl Attachment<'_> {
+    fn is_broadcast(&self) -> bool {
+        matches!(self, Self::Broadcast { .. })
+    }
+}
+
+/// Open a consumer for `attachment`, returning the channel, the delivery
+/// stream, and the name of the queue actually being consumed — which for a
+/// broadcast subscription is the server-generated one, known only now.
+async fn open_attached_consumer(
+    client: &RabbitMqClient,
+    attachment: Attachment<'_>,
+    prefetch_count: u16,
+    exactly_once: bool,
+) -> Result<(Channel, lapin::Consumer, String)> {
+    match attachment {
+        Attachment::Shared(queue) => {
+            let (channel, stream) =
+                open_consumer(client, queue, prefetch_count, exactly_once).await?;
+            Ok((channel, stream, queue.to_string()))
+        }
+        Attachment::Broadcast { exchange } => {
+            open_broadcast_consumer(client, exchange, prefetch_count).await
+        }
+    }
+}
+
+/// Declare this process's own ephemeral subscription and start consuming it.
+///
+/// The queue is server-named, `exclusive`, `auto_delete` and non-durable:
+/// nothing else can bind to it or consume from it, and the broker deletes it as
+/// soon as this consumer goes away. That covers the abort path as well as the
+/// drain path — lapin cancels the consumer and closes the channel from their
+/// `Drop` impls, so a task that is aborted mid-run still leaves the broker with
+/// nothing (AC5). "Nothing survives" is a property of how the queue is
+/// declared, not of the teardown code being reached.
+///
+/// Never transactional. A broadcast subscription publishes nothing, so there is
+/// no publish/ack pair for an AMQP transaction to make atomic.
+async fn open_broadcast_consumer(
+    client: &RabbitMqClient,
+    exchange: &str,
+    prefetch_count: u16,
+) -> Result<(Channel, lapin::Consumer, String)> {
+    let channel = client.create_confirm_channel().await?;
+    channel
+        .basic_qos(prefetch_count, BasicQosOptions::default())
+        .await
+        .map_err(|e| map_lapin_error("failed to set QoS", e))?;
+    // Declared here as well as by the topology declarer so a subscriber-only
+    // process does not depend on someone else having declared the topology
+    // first — `queue_bind` to a missing exchange is a 404 that kills the
+    // channel.
+    super::topology::declare_broadcast_exchange(&channel, exchange).await?;
+
+    let queue = channel
+        .queue_declare(
+            ShortString::from(""),
+            QueueDeclareOptions {
+                durable: false,
+                exclusive: true,
+                auto_delete: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| {
+            map_lapin_error(
+                &format!("failed to declare broadcast queue on '{exchange}'"),
+                e,
+            )
+        })?;
+    let name = queue.name().as_str().to_string();
+
+    channel
+        .queue_bind(
+            ShortString::from(name.as_str()),
+            ShortString::from(exchange),
+            ShortString::from(""),
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| {
+            map_lapin_error(
+                &format!("failed to bind broadcast queue '{name}' to '{exchange}'"),
+                e,
+            )
+        })?;
+
+    let stream = channel
+        .basic_consume(
+            ShortString::from(name.as_str()),
+            ShortString::from(""),
+            BasicConsumeOptions {
+                no_ack: false,
+                ..BasicConsumeOptions::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| {
+            map_lapin_error(
+                &format!("failed to start broadcast consumer on '{name}'"),
+                e,
+            )
+        })?;
+
+    info!(exchange, queue = %name, "broadcast subscription established");
+    Ok((channel, stream, name))
 }
 
 /// Unwrap a delivery from the consumer stream.
@@ -1014,7 +1149,7 @@ impl RabbitMqConsumer {
         &self,
         handler: Arc<H>,
         ctx: Arc<H::Context>,
-        queue: &str,
+        attachment: Attachment<'_>,
         topology: &'static QueueTopology,
         options: ConsumerOptions,
     ) -> Result<()>
@@ -1023,15 +1158,23 @@ impl RabbitMqConsumer {
         H: MessageHandler<T>,
     {
         let shutdown = options.shutdown.clone();
-        run_with_reconnect(&shutdown, queue, options.max_reconnect_attempts, || {
-            self.consume_loop_concurrent::<T, H>(
-                handler.clone(),
-                ctx.clone(),
-                queue,
-                topology,
-                &options,
-            )
-        })
+        // The reconnect label is the topic, not the queue: a broadcast
+        // reconnect declares a *different* server-named queue each time, so
+        // logging that name would make consecutive attempts look unrelated.
+        run_with_reconnect(
+            &shutdown,
+            topology.queue(),
+            options.max_reconnect_attempts,
+            || {
+                self.consume_loop_concurrent::<T, H>(
+                    handler.clone(),
+                    ctx.clone(),
+                    attachment,
+                    topology,
+                    &options,
+                )
+            },
+        )
         .await
     }
 
@@ -1039,7 +1182,7 @@ impl RabbitMqConsumer {
         &self,
         handler: Arc<H>,
         ctx: Arc<H::Context>,
-        queue: &str,
+        attachment: Attachment<'_>,
         topology: &'static QueueTopology,
         options: &ConsumerOptions,
     ) -> Result<()>
@@ -1051,8 +1194,14 @@ impl RabbitMqConsumer {
         let exactly_once = options.exactly_once;
         #[cfg(not(feature = "rabbitmq-transactional"))]
         let exactly_once = false;
-        let (channel, mut stream) =
-            open_consumer(&self.client, queue, options.prefetch_count, exactly_once).await?;
+        let (channel, mut stream, queue_name) = open_attached_consumer(
+            &self.client,
+            attachment,
+            options.prefetch_count,
+            exactly_once,
+        )
+        .await?;
+        let queue = queue_name.as_str();
         #[cfg(feature = "rabbitmq-transactional")]
         let publisher = if exactly_once {
             ChannelPublisher::new_tx(channel)
@@ -1083,7 +1232,8 @@ impl RabbitMqConsumer {
                         let msg = in_flight.pop_front().unwrap();
                         let retry_count = get_retry_count(&msg.received.delivery);
                         debug!(queue, ?outcome, "message handled (concurrent)");
-                        route_outcome(
+                        route_outcome_for(
+                            attachment,
                             &msg.received,
                             outcome,
                             topology,
@@ -1099,7 +1249,8 @@ impl RabbitMqConsumer {
                         let msg = in_flight.pop_front().unwrap();
                         let retry_count = get_retry_count(&msg.received.delivery);
                         warn!(queue, "handler task panicked, retrying message");
-                        route_outcome(
+                        route_outcome_for(
+                            attachment,
                             &msg.received,
                             Outcome::Retry,
                             topology,
@@ -1148,7 +1299,8 @@ impl RabbitMqConsumer {
                             // or was aborted: no outcome exists, so redeliver.
                             .unwrap_or(Outcome::Retry);
                         let retry_count = get_retry_count(&pending.received.delivery);
-                        route_outcome(
+                        route_outcome_for(
+                            attachment,
                             &pending.received,
                             outcome,
                             topology,
@@ -1171,7 +1323,18 @@ impl RabbitMqConsumer {
                     let received = ReceivedDelivery::new(unwrap_delivery(item, queue)?);
                     let retry_count = get_retry_count(&received.delivery);
 
-                    if retries_exhausted(retry_count, options.max_retries) {
+                    // The budget gate belongs to the retry chain, and a
+                    // broadcast subscription has none. `BroadcastSubscriber`
+                    // pins `max_retries` to 0, and `retries_exhausted(0, 0)` is
+                    // true — so running this gate would dead-letter every
+                    // message before its handler ever saw it. There is nothing
+                    // to exhaust either: no path republishes a broadcast
+                    // delivery with an incremented count, so `retry_count`
+                    // stays 0 for the life of the subscription. Skipped
+                    // outright rather than tuned.
+                    if !attachment.is_broadcast()
+                        && retries_exhausted(retry_count, options.max_retries)
+                    {
                         warn!(
                             "message on {queue} exceeded max retries ({}/{}), sending to DLQ",
                             retry_count, options.max_retries
@@ -1334,6 +1497,84 @@ async fn route_outcome(
         Outcome::Defer => {
             router::route_defer(delivery, &received.payload, topology, publisher).await
         }
+    }
+}
+
+/// Route `outcome` according to how this consumer is attached.
+///
+/// The split exists because broadcast has no retry chain to route into, not
+/// because the two want different mechanics: both end at the same `router`
+/// primitives, and both record the same terminal metric.
+#[allow(clippy::too_many_arguments)]
+async fn route_outcome_for(
+    attachment: Attachment<'_>,
+    received: &ReceivedDelivery,
+    outcome: Outcome,
+    topology: &'static QueueTopology,
+    publisher: &ChannelPublisher,
+    retry_count: u32,
+    group: Option<&str>,
+) -> Result<()> {
+    match attachment {
+        Attachment::Shared(_) => {
+            route_outcome(received, outcome, topology, publisher, retry_count, group).await
+        }
+        Attachment::Broadcast { .. } => {
+            route_broadcast_outcome(received, outcome, topology, publisher, group).await
+        }
+    }
+}
+
+/// Terminal routing for a broadcast subscription.
+///
+/// `.broadcast()` rejects a DLQ and hold queues at build time, so there is
+/// nowhere for a failed message to go: `Retry` and `Reject` both discard, with
+/// the warning and the `messages_discarded_total` increment that
+/// `router::route_reject` already produces for a no-DLQ topology. The reasons
+/// stay distinct — `max_retries_exceeded` for `Retry`, `rejected` for `Reject`
+/// — matching what `decide_retry` yields on the InMemory path at
+/// `max_retries = 0`, so one dashboard reads both backends.
+///
+/// `Defer` nack-requeues. That is redelivery to *this subscriber only*, which
+/// is the contract rather than an approximation of it: the queue is exclusive,
+/// so it has exactly one consumer and a requeued message can reach no other
+/// instance's copy of the fan-out.
+async fn route_broadcast_outcome(
+    received: &ReceivedDelivery,
+    outcome: Outcome,
+    topology: &'static QueueTopology,
+    publisher: &ChannelPublisher,
+    group: Option<&str>,
+) -> Result<()> {
+    let delivery = &received.delivery;
+    match outcome {
+        Outcome::Ack => router::route_ack(delivery, publisher).await,
+        Outcome::Retry => {
+            warn!(
+                queue = topology.queue(),
+                "handler returned Retry on a broadcast subscription, which has no retry \
+                 chain — discarding"
+            );
+            router::route_reject(
+                delivery,
+                topology,
+                publisher,
+                group,
+                metrics::FailReason::MaxRetriesExceeded,
+            )
+            .await
+        }
+        Outcome::Reject => {
+            router::route_reject(
+                delivery,
+                topology,
+                publisher,
+                group,
+                metrics::FailReason::Rejected,
+            )
+            .await
+        }
+        Outcome::Defer => router::nack_requeue(delivery, publisher).await,
     }
 }
 
@@ -1638,7 +1879,61 @@ impl RabbitMqConsumer {
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
         consumer
-            .run_internal_concurrent::<T, H>(handler, ctx, topology.queue(), topology, options)
+            .run_internal_concurrent::<T, H>(
+                handler,
+                ctx,
+                Attachment::Shared(topology.queue()),
+                topology,
+                options,
+            )
+            .await
+    }
+
+    /// Run this process's own ephemeral subscription to `T` until shutdown.
+    ///
+    /// Reached only through
+    /// [`BroadcastSubscriber`](crate::broadcast::BroadcastSubscriber), which
+    /// already refuses a non-broadcast topology; the guard here is the
+    /// backend-side half of that check, so a direct caller cannot attach a
+    /// fanout subscription to a topic whose publishes go to the shared queue
+    /// and then wonder why nothing arrives.
+    ///
+    /// A reconnect declares a *new* ephemeral queue. Messages published while
+    /// the connection was down reach no queue and are gone — deliver-new
+    /// applied to the reconnect window, and the same best-effort contract the
+    /// subscription has everywhere else.
+    pub(crate) async fn run_broadcast_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptions,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        let topology = T::topology();
+        if !topology.broadcast() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{}' is not a broadcast topology; a fanout subscription to it would \
+                 receive nothing, because publishes go to the shared queue",
+                topology.queue()
+            )));
+        }
+        let exchange = super::topology::broadcast_exchange(topology.queue());
+        let consumer = RabbitMqConsumer::new(self.client.clone());
+        let handler = Arc::new(handler);
+        let ctx = Arc::new(ctx);
+        consumer
+            .run_internal_concurrent::<T, H>(
+                handler,
+                ctx,
+                Attachment::Broadcast {
+                    exchange: &exchange,
+                },
+                topology,
+                options,
+            )
             .await
     }
 
