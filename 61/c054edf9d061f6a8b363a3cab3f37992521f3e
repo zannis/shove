@@ -1,0 +1,22 @@
+tests/metrics_redis_broadcast_group_label.rs
+  s_420023e1d44cb7::t_1e379e0c0056c5 222,225-228
+  s_420023e1d44cb7::t_45c2ff8fb1aa42 124-125
+  s_420023e1d44cb7::t_eb08a8abb32b3e 33,38-39,110-111,115
+  s_420023e1d44cb7::t_baf7903d5d419b 1-32,34-37,40-109,112-114,116-123,126-221,223-224,229-256
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "61c054edf9d061f6a8b363a3cab3f37992521f3e",
+  "prompts": {},
+  "sessions": {
+    "s_420023e1d44cb7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f98600ff-3364-47d7-bbdd-79f1d6c5a993",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
