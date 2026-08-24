@@ -610,7 +610,12 @@ pub(crate) fn record_publish_duration(topic: &str, ok: bool, elapsed_secs: f64) 
 pub(crate) fn record_publish_duration(_: &str, _: bool, _: f64) {}
 
 #[cfg(feature = "metrics")]
-#[allow(dead_code)] // Callers gated behind backend features.
+// Every *consumer* backend calls this. The allow is still load-bearing for
+// exactly one feature set — `pub-aws-sns` without `aws-sns-sqs`, which
+// compiles the SNS publisher and no consumer at all — so it cannot be dropped.
+// That also means the lint cannot be relied on to catch a backend that forgets
+// the call; `tests/metrics_redis_message_size.rs` exists because Redis did.
+#[allow(dead_code)]
 pub(crate) fn record_message_size(topic: &str, group: Option<&str>, bytes: usize) {
     ::metrics::histogram!(
         names().message_size_bytes.as_str(),

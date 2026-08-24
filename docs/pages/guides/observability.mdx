@@ -111,6 +111,8 @@ shove::metrics::set_prefix("billing_shove");
 
 **A pre-handler rejection is counted once, under its precise reason.** A payload rejected by the oversize gate is counted as `oversize` and *not* additionally as `rejected` when it is retired; the same holds for `deserialize`, `malformed`, and the schema-registry reasons. That is what makes the `reason` label trustworthy: `oversize` means the gate fired, not "something failed somewhere upstream of the DLQ".
 
+**`shove_message_size_bytes` is recorded on receipt, before the `max_message_size` gate**, on every consumer backend. A payload rejected as oversize therefore still contributes a sample — deliberately, because this histogram is what you size `max_message_size` against, and one showing only the messages already under the limit could never tell you the limit was too low. The rejection itself is counted separately, as `shove_messages_failed_total{reason="oversize"}`. Like that counter, this histogram measures **deliveries, not distinct messages**: a message that is retried contributes one sample per delivery.
+
 `shove_messages_failed_total` counts **failed attempts, not retired messages** — do not read its rate as a count of messages lost or dead-lettered. Two cases make one message contribute more than one increment:
 
 - **A handler timeout is counted every time it happens.** `timeout` is recorded when the deadline fires, whatever the timeout resolves to. With the default `Retry` (or `Defer`) the message is redelivered and survives, so a handler that times out on five attempts contributes five increments and may still eventually `Ack`.
