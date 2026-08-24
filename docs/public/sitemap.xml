@@ -50,6 +50,7 @@
   <url><loc>https://shove.rs/concepts/topics</loc></url>
   <url><loc>https://shove.rs/getting-started</loc></url>
   <url><loc>https://shove.rs/guides/audit</loc></url>
+  <url><loc>https://shove.rs/guides/batch-publishing</loc></url>
   <url><loc>https://shove.rs/guides/exactly-once</loc></url>
   <url><loc>https://shove.rs/guides/groups</loc></url>
   <url><loc>https://shove.rs/guides/liveness</loc></url>

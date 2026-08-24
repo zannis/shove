@@ -3308,6 +3308,124 @@ async fn broker_consumer_group_exposes_default_replication_factor() {
 }
 
 // ===========================================================================
+// publish_batch — sparse per-record failure reporting
+// ===========================================================================
+
+shove::define_topic!(
+    BatchSparseTopic,
+    SimpleMessage,
+    TopologyBuilder::new("kafka-batch-sparse").dlq().build()
+);
+
+/// Kafka submits every record in a batch independently, so a strict subset can
+/// fail while the records *after* it succeed. That is exactly the case where
+/// "re-publish from the first failure" is wrong, and where `to_republish()`
+/// has to name a sparse set rather than a suffix.
+///
+/// Record 1 is driven over librdkafka's producer-side `message.max.bytes`
+/// (1 MB by default), so it is rejected locally with `MessageSizeTooLarge`
+/// while records 0, 2 and 3 are produced normally. No broker-side config is
+/// involved and nothing has to time out — the rejection is synchronous.
+#[tokio::test]
+async fn publish_batch_reports_sparse_indices_when_a_subset_fails() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<BatchSparseTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+
+    // Comfortably past the 1 MB producer limit, and past it on its own — the
+    // other three records are tiny, so only this one can be rejected for size.
+    let oversized = "x".repeat(2 * 1024 * 1024);
+    let messages: Vec<SimpleMessage> = (0..4)
+        .map(|i| SimpleMessage {
+            id: format!("sparse-{i}"),
+            content: if i == 1 {
+                oversized.clone()
+            } else {
+                format!("message {i}")
+            },
+        })
+        .collect();
+
+    let err = publisher
+        .publish_batch::<BatchSparseTopic>(&messages)
+        .await
+        .expect_err("a batch containing an oversized record must not report success");
+
+    let shove::ShoveError::PartialBatch(f) = err else {
+        panic!("expected ShoveError::PartialBatch, got {err:?}");
+    };
+
+    assert_eq!(
+        f.failed(),
+        &[1],
+        "Kafka must name the exact rejected index, not a prefix"
+    );
+    assert!(
+        f.unattempted().is_empty(),
+        "Kafka attempts every record, so nothing is unattempted: {:?}",
+        f.unattempted()
+    );
+    assert_eq!(f.to_republish(), &[1]);
+    assert_eq!(f.succeeded(), 3);
+
+    // The invariant, asserted for this backend.
+    assert_eq!(f.succeeded() + f.to_republish().len(), messages.len());
+    assert!(f.to_republish().windows(2).all(|w| w[0] < w[1]));
+
+    // Records 2 and 3 sit *after* the failure and were published fine. A
+    // suffix-shaped retry would have re-produced them; the sparse set does not.
+    let outstanding: Vec<&str> = f
+        .to_republish()
+        .iter()
+        .filter_map(|&i| messages.get(i).map(|m| m.id.as_str()))
+        .collect();
+    assert_eq!(outstanding, vec!["sparse-1"]);
+
+    broker.close().await;
+}
+
+/// A Kafka batch whose *every* record is oversized is not partial, so it keeps
+/// returning the bare error. Guards the compatibility rule on the backend with
+/// the sparsest failure shape.
+#[tokio::test]
+async fn publish_batch_wholly_failed_returns_the_bare_error() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker();
+    broker
+        .topology()
+        .declare::<BatchSparseTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+
+    let oversized = "x".repeat(2 * 1024 * 1024);
+    let messages: Vec<SimpleMessage> = (0..3)
+        .map(|i| SimpleMessage {
+            id: format!("all-oversized-{i}"),
+            content: oversized.clone(),
+        })
+        .collect();
+
+    let err = publisher
+        .publish_batch::<BatchSparseTopic>(&messages)
+        .await
+        .expect_err("an all-oversized batch must fail");
+
+    assert!(
+        !matches!(err, shove::ShoveError::PartialBatch(_)),
+        "nothing succeeded, so this is not a partial batch; got {err:?}"
+    );
+    assert!(matches!(err, shove::ShoveError::Connection(_)));
+
+    broker.close().await;
+}
+
+// ===========================================================================
 // SBE codec — binary frames over a real broker
 // ===========================================================================
 

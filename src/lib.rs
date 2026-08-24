@@ -150,6 +150,7 @@ pub mod audit;
 pub mod autoscale_metrics;
 pub mod autoscaler;
 pub mod backend;
+pub mod batch;
 pub mod broadcast;
 pub mod broker;
 pub mod codec;
@@ -203,6 +204,7 @@ pub(crate) mod supervision;
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;
 pub use backend::{Backend, capability::HasBroadcast, capability::HasCoordinatedGroups};
+pub use batch::BatchFailure;
 pub use codec::{Codec, JsonCodec, RawBytesCodec};
 #[cfg(feature = "protobuf")]
 #[cfg_attr(docsrs, doc(cfg(feature = "protobuf")))]

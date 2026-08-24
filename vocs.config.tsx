@@ -179,6 +179,7 @@ export default defineConfig({
       collapsed: false,
       items: [
         { text: 'Sequenced Topics', link: '/guides/sequenced' },
+        { text: 'Batch Publishing & Partial Failures', link: '/guides/batch-publishing' },
         { text: 'Retries, Hold Queues & DLQs', link: '/guides/retries' },
         { text: 'Audit Logging', link: '/guides/audit' },
         { text: 'Consumer Groups & Autoscaling', link: '/guides/groups' },

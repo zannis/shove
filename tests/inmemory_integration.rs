@@ -2387,3 +2387,121 @@ async fn group_handler_timeout_outcome_defer_does_not_burn_retry_budget() {
     client.shutdown();
     let _ = dlq_handle.await;
 }
+
+// ---------------------------------------------------------------------------
+// publish_batch — partial failure reporting
+// ---------------------------------------------------------------------------
+
+/// Topic used only by the partial-batch tests, so the capacity-1 queue they
+/// need can't disturb any other test's broker.
+struct BatchTopic;
+impl Topic for BatchTopic {
+    type Message = Order;
+    type Codec = JsonCodec;
+    fn topology() -> &'static shove::QueueTopology {
+        static T: OnceLock<shove::QueueTopology> = OnceLock::new();
+        T.get_or_init(|| TopologyBuilder::new("batch-partial-int").dlq().build())
+    }
+}
+
+/// A batch that stops partway reports which records still need publishing —
+/// end to end, through the public `Publisher<InMemory>` and the metrics
+/// wrapper that mints the error.
+///
+/// Deterministic without any timing: the broker is closed *first* and the
+/// queue capacity is 2, so records 0 and 1 take `enqueue`'s fast path (space
+/// available, shutdown not consulted) while record 2 finds the buffer full and
+/// the already-cancelled shutdown token resolves immediately.
+#[tokio::test]
+async fn publish_batch_partial_failure_names_the_records_to_republish() {
+    let config = InMemoryConfig::default()
+        .with_default_capacity(std::num::NonZeroUsize::new(2).expect("2 is non-zero"));
+    let broker = Broker::<InMemory>::new(config).await.expect("broker");
+    broker
+        .topology()
+        .declare::<BatchTopic>()
+        .await
+        .expect("declare");
+    let publisher = broker.publisher().await.expect("publisher");
+
+    broker.close().await;
+
+    let messages: Vec<Order> = (0..5).map(|id| Order { id }).collect();
+    let err = publisher
+        .publish_batch::<BatchTopic>(&messages)
+        .await
+        .expect_err("a 2-of-5 batch must not report success");
+
+    let shove::ShoveError::PartialBatch(f) = err else {
+        panic!("expected ShoveError::PartialBatch, got {err:?}");
+    };
+    assert_eq!(f.succeeded(), 2);
+    assert_eq!(f.failed(), &[2], "InMemory has prefix semantics");
+    assert_eq!(f.unattempted(), &[3, 4]);
+    assert_eq!(f.to_republish(), &[2, 3, 4]);
+
+    // The invariant, asserted for this backend.
+    assert_eq!(f.succeeded() + f.to_republish().len(), messages.len());
+    // ... and `to_republish` really is ascending with no duplicates.
+    assert!(f.to_republish().windows(2).all(|w| w[0] < w[1]));
+
+    // The outstanding indices index back into the caller's own slice.
+    let outstanding: Vec<u64> = f
+        .to_republish()
+        .iter()
+        .filter_map(|&i| messages.get(i).map(|m| m.id))
+        .collect();
+    assert_eq!(outstanding, vec![2, 3, 4]);
+
+    // A connection blip is worth retrying, and the wrapper says so.
+    assert!(matches!(f.source(), shove::ShoveError::Connection(_)));
+    assert!(shove::ShoveError::PartialBatch(f).is_retryable());
+}
+
+/// A batch where nothing landed is not *partial*, so it keeps returning the
+/// bare error it returned before `PartialBatch` existed. This is the
+/// compatibility guard: existing `matches!(e, ShoveError::Topology(_))` arms
+/// must not start missing.
+#[tokio::test]
+async fn publish_batch_wholly_failed_still_returns_the_bare_error() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("broker");
+    // Deliberately no `declare` — every record fails the queue lookup.
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let messages: Vec<Order> = (0..4).map(|id| Order { id }).collect();
+    let err = publisher
+        .publish_batch::<BatchTopic>(&messages)
+        .await
+        .expect_err("an undeclared queue must fail");
+
+    assert!(
+        matches!(err, shove::ShoveError::Topology(_)),
+        "wholly-failed batches must not be reshaped into PartialBatch; got {err:?}"
+    );
+    assert!(!err.is_retryable());
+}
+
+/// A batch that fully succeeds is still `Ok(())` — no error type churn on the
+/// happy path.
+#[tokio::test]
+async fn publish_batch_full_success_is_unchanged() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("broker");
+    broker
+        .topology()
+        .declare::<BatchTopic>()
+        .await
+        .expect("declare");
+    let publisher = broker.publisher().await.expect("publisher");
+
+    let messages: Vec<Order> = (0..5).map(|id| Order { id }).collect();
+    publisher
+        .publish_batch::<BatchTopic>(&messages)
+        .await
+        .expect("full batch must succeed");
+
+    broker.close().await;
+}
