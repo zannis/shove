@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -1994,7 +1994,6 @@ impl RabbitMqConsumer {
         let on_failure = seq.on_failure();
         let handler = Arc::new(handler);
         let ctx = Arc::new(ctx);
-        let shutdown = options.shutdown.clone();
         let prefetch = options.prefetch_count;
         let client = self.client.clone();
         let mut handles = Vec::with_capacity(seq.routing_shards() as usize);
@@ -2005,14 +2004,16 @@ impl RabbitMqConsumer {
             let h = handler.clone();
             let c = ctx.clone();
             let inner_client = client.clone();
-            let mut opts = ConsumerOptions::defaults_with_shutdown(shutdown.clone());
-            opts.max_retries = options.max_retries;
+            // Cloned, not rebuilt from defaults: a hand-copied allowlist silently
+            // drops every knob added to `ConsumerOptionsInner` after it was
+            // written, which is how the shards lost `handler_timeout_outcome`
+            // and the `consumer_group` metrics label.
+            let mut opts = options.clone();
             opts.prefetch_count = prefetch;
-            opts.handler_timeout = options.handler_timeout;
-            opts.max_pending_per_key = options.max_pending_per_key;
-            opts.max_message_size = options.max_message_size;
-            opts.max_reconnect_attempts = options.max_reconnect_attempts;
-            opts.hold_queue_timeout = options.hold_queue_timeout;
+            // Per shard: each tracks its own in-flight count and stores
+            // `in_flight_count > 0`, so one shared flag would let an idle shard
+            // clear a busy shard's mark.
+            opts.processing = Arc::new(AtomicBool::new(false));
             handles.push(tokio::spawn(async move {
                 let consumer = RabbitMqConsumer::new(inner_client);
                 consumer
