@@ -126,14 +126,16 @@ jobs:
             # Asserted by `metrics_sqs_sequenced`.
             features: pub-aws-sns,aws-sns-sqs,audit,metrics,sbe
           - name: nats
-            # Asserted by `metrics_nats_failall`. `env-config` runs
+            # Asserted by `metrics_nats_failall` and
+            # `metrics_nats_failall_no_dlq`. `env-config` runs
             # `topology::nats_env_config_tests` (NatsStreamConfig::from_env).
             features: nats,audit,metrics,sbe,env-config
           - name: kafka
             # kafka-msk-iam + test-support compile and run the MSK IAM tests,
             # including the OAUTHBEARER admin integration test (local Kafka
             # container + unsecured JWT; no AWS/LocalStack needed).
-            # `metrics` asserted by `metrics_kafka_failall`.
+            # `metrics` asserted by `metrics_kafka_failall` and
+            # `metrics_kafka_failall_no_dlq`.
             # `env-config` runs the `KafkaTopicTuning` tests.
             features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config
           - name: kafka-schema-registry
@@ -149,8 +151,8 @@ jobs:
             # already covers. Restrict it to the three schema-registry binaries.
             filter: -E 'binary(/^kafka_schema_registry/)'
           - name: redis-streams
-            # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`
-            # and `metrics_redis_failall`.
+            # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`,
+            # `metrics_redis_failall` and `metrics_redis_failall_no_dlq`.
             features: redis-streams,metrics,sbe
     steps:
       - uses: actions/checkout@v6
