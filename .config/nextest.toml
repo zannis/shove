@@ -26,5 +26,5 @@ threads-required = 'num-test-threads'
 # The `metrics_rabbitmq_*` binaries share the container rather than starting
 # their own: each carves out a private vhost per run, so they cannot collide
 # with the main suite's queues or with each other.
-filter = 'binary_id(shove::rabbitmq_integration) + binary_id(shove::metrics_rabbitmq_sequenced) + binary_id(shove::metrics_rabbitmq_sequence_timeout)'
+filter = 'binary_id(shove::rabbitmq_integration) + binary_id(shove::rabbitmq_broadcast_integration) + binary_id(shove::metrics_rabbitmq_sequenced) + binary_id(shove::metrics_rabbitmq_sequence_timeout)'
 setup = ['rabbitmq-setup']
