@@ -200,7 +200,8 @@ impl NatsPublisher {
         // a sparse ack failure is reported at the record it belongs to rather
         // than collapsed into a count.
         let mut ack_futures = Vec::with_capacity(total);
-        let mut failed: Vec<usize> = Vec::new();
+        // No `failed` counterpart: nothing on the submission side can produce an
+        // explicit rejection, because the record has not reached the server yet.
         let mut unattempted: Vec<usize> = Vec::new();
         let mut first_err: Option<ShoveError> = None;
         for (i, (subject, headers, payload)) in prepared.into_iter().enumerate() {
@@ -217,10 +218,13 @@ impl NatsPublisher {
                         metrics::BackendErrorKind::Publish,
                     );
                     first_err = Some(ShoveError::Connection(format!("batch publish failed: {e}")));
-                    // This record was attempted and rejected; everything after
-                    // it never left the process.
-                    failed.push(i);
-                    unattempted.extend(i.saturating_add(1)..total);
+                    // `publish_with_headers` returns before the record is on
+                    // the wire: it fails on subject validation, the payload-size
+                    // check, ack-permit acquisition, or the command channel. So
+                    // index `i` never reached the broker either, and belongs
+                    // with the tail behind it rather than in `failed`, which is
+                    // reserved for records the server explicitly rejected.
+                    unattempted.extend(i..total);
                     break;
                 }
             }
@@ -238,7 +242,7 @@ impl NatsPublisher {
                     metrics::BackendLabel::Nats,
                     metrics::BackendErrorKind::Publish,
                 );
-                if ack_error_is_explicit_rejection(e.kind()) {
+                if ack_error_is_explicit_rejection(&e) {
                     ack_rejected.push(i);
                 } else {
                     ack_unconfirmed.push(i);
@@ -254,8 +258,7 @@ impl NatsPublisher {
             return BatchReport::all_succeeded();
         }
         // Ack results all sit below the submission break, so prepending them
-        // keeps each set ascending.
-        ack_rejected.extend(failed);
+        // keeps the set ascending.
         ack_unconfirmed.extend(unattempted);
         BatchReport::sparse(ack_rejected, ack_unconfirmed, first_err)
     }
@@ -269,17 +272,26 @@ impl NatsPublisher {
 /// the connection is the second kind — the server may well have stored the
 /// message — so reporting it as an explicit rejection overstates what is known.
 /// Both sets are re-published either way; only the diagnosis differs.
-fn ack_error_is_explicit_rejection(kind: jetstream::context::PublishErrorKind) -> bool {
+///
+/// Takes the whole error rather than its kind, because the kind alone cannot
+/// answer the question for `Other`.
+fn ack_error_is_explicit_rejection(err: &jetstream::context::PublishError) -> bool {
     use jetstream::context::PublishErrorKind as K;
-    match kind {
-        K::StreamNotFound
-        | K::WrongLastMessageId
-        | K::WrongLastSequence
-        | K::MaxPayloadExceeded
-        | K::MaxAckPending => true,
-        // `Other` covers client-side and unclassified server conditions alike,
-        // so it takes the ambiguous side with the rest.
-        K::TimedOut | K::BrokenPipe | K::Other => false,
+    match err.kind() {
+        // `StreamNotFound` is a `NO_RESPONDERS` status: nothing was listening
+        // on the subject, so the record was certainly not stored.
+        K::StreamNotFound | K::WrongLastMessageId | K::WrongLastSequence => true,
+        K::TimedOut | K::BrokenPipe => false,
+        // Raised before the record is submitted, so neither can reach an ack.
+        // Classified anyway, and as refusals, because that is what they are.
+        K::MaxPayloadExceeded | K::MaxAckPending => true,
+        // `Other` is two different answers wearing one kind: a JetStream error
+        // response whose code async-nats does not model — the server saying no,
+        // in full — and a reply that could not be deserialized, which says
+        // nothing at all. The server's own error object is what separates them.
+        K::Other => {
+            std::error::Error::source(err).is_some_and(|source| source.is::<jetstream::Error>())
+        }
     }
 }
 
@@ -307,7 +319,17 @@ impl PublisherImpl for NatsPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jetstream::context::PublishErrorKind as K;
+    use jetstream::context::{PublishError, PublishErrorKind as K};
+
+    /// A JetStream error response, as async-nats deserializes one off the wire.
+    fn server_error() -> jetstream::Error {
+        serde_json::from_value(serde_json::json!({
+            "code": 400,
+            "err_code": 10071,
+            "description": "maximum messages exceeded"
+        }))
+        .expect("a JetStream error response deserializes")
+    }
 
     /// An ack that never arrived says nothing about whether the server stored
     /// the record, so it belongs in `unattempted` ("submitted without a
@@ -315,12 +337,36 @@ mod tests {
     /// explicitly reported as rejected").
     #[test]
     fn unconfirmed_acks_are_not_explicit_rejections() {
-        for kind in [K::TimedOut, K::BrokenPipe, K::Other] {
+        for kind in [K::TimedOut, K::BrokenPipe] {
             assert!(
-                !ack_error_is_explicit_rejection(kind),
+                !ack_error_is_explicit_rejection(&PublishError::new(kind)),
                 "{kind:?} is ambiguous, not an explicit rejection"
             );
         }
+    }
+
+    /// `Other` is the kind async-nats gives both to a JetStream error response
+    /// whose code it does not model and to a reply it could not deserialize.
+    /// The first is the server rejecting the record in as many words; the
+    /// second says nothing. Only the error's source separates them, so the kind
+    /// alone cannot classify it.
+    #[test]
+    fn other_is_split_by_whether_the_server_answered() {
+        assert!(
+            ack_error_is_explicit_rejection(&PublishError::with_source(K::Other, server_error())),
+            "a JetStream error response is the server saying no"
+        );
+        assert!(
+            !ack_error_is_explicit_rejection(&PublishError::with_source(
+                K::Other,
+                std::io::Error::other("truncated reply"),
+            )),
+            "a reply that could not be read is not a rejection"
+        );
+        assert!(
+            !ack_error_is_explicit_rejection(&PublishError::new(K::Other)),
+            "`Other` with no source at all resolves nothing"
+        );
     }
 
     /// The classifier only decides which set an index lands in; this pins what
@@ -373,9 +419,38 @@ mod tests {
             K::MaxAckPending,
         ] {
             assert!(
-                ack_error_is_explicit_rejection(kind),
+                ack_error_is_explicit_rejection(&PublishError::new(kind)),
                 "{kind:?} is the server saying no"
             );
         }
+    }
+
+    /// Nothing on the submission side can be an explicit rejection:
+    /// `publish_with_headers` returns before the record is on the wire, failing
+    /// on subject validation, the payload-size check, the ack permit or the
+    /// command channel. So the record it broke on joins the tail behind it.
+    #[test]
+    fn a_submission_break_leaves_its_own_record_unattempted() {
+        let total = 5;
+        // Submission broke at index 2; indices 0 and 1 were submitted and their
+        // acks came back clean.
+        let out = BatchReport::sparse(
+            Vec::new(),
+            (2..total).collect(),
+            Some(ShoveError::Connection("channel closed".into())),
+        )
+        .resolve(total);
+
+        let Err(ShoveError::PartialBatch(f)) = out.result else {
+            panic!("two confirmed and three unresolved records is a partial batch");
+        };
+        assert!(
+            f.failed().is_empty(),
+            "a record that never left the process was not rejected by anyone"
+        );
+        assert_eq!(f.unattempted(), &[2, 3, 4]);
+        assert_eq!(f.to_republish(), &[2, 3, 4]);
+        assert_eq!(f.succeeded(), 2);
+        assert_eq!(f.succeeded() + f.to_republish().len(), total);
     }
 }
