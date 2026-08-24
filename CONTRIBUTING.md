@@ -100,6 +100,16 @@ by the job and has no CI of its own by construction, so the gate checks its
 parent and a follow-up step asserts the release commit differs from that parent
 by nothing but the version bump.
 
+The gate is an ordinary script, so you can ask it for the same verdict from a
+terminal — the quickest way to find out why a release stopped:
+
+```sh
+GITHUB_REPOSITORY=<owner>/<repo> .github/scripts/require-green-ci.sh <commit-ish>
+```
+
+The argument is resolved to a full SHA first, so an abbreviated SHA, a tag or a
+branch name all work.
+
 ### Rehearsing with `dry_run`
 
 Because a crate version cannot be unpublished, the workflow takes a `dry_run`
