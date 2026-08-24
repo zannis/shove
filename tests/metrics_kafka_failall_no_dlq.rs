@@ -165,6 +165,12 @@ struct OrderMessage {
 
 // Bare topology: no DLQ, no hold queues. `routing_shards(1)` is what makes the
 // consume order deterministic — see the module doc.
+//
+// `allow_message_loss()` is not decoration: `TopologyBuilder::build()` panics on
+// a sequenced topic with no DLQ and no hold queues without it. That guard is why
+// this arm is worth pinning at all — it is the one shape where shove has been
+// *told* rejected messages may vanish, so `shove_messages_discarded_total` is
+// the only signal an operator has left that they did.
 shove::define_sequenced_topic!(
     SeqFailAllNoDlqTopic,
     OrderMessage,
@@ -172,6 +178,7 @@ shove::define_sequenced_topic!(
     TopologyBuilder::new("kafka-metrics-failall-no-dlq")
         .sequenced(SequenceFailure::FailAll)
         .routing_shards(1)
+        .allow_message_loss()
         .build()
 );
 
