@@ -127,17 +127,34 @@ impl EnvVars {
 
     /// The trimmed value of `{PREFIX}_{KEY}`, or `None` when unset, empty, or
     /// whitespace-only.
-    pub fn get(&self, key: &str) -> Option<String> {
+    ///
+    /// A value that is set but not valid Unicode is an **error**, not an unset:
+    /// `std::env::var` reports it as `VarError::NotUnicode`, and treating that
+    /// as absent would silently run at a default the operator did not ask for —
+    /// exactly the failure this module exists to prevent.
+    pub fn get(&self, key: &str) -> Result<Option<String>> {
         let name = self.var_name(key);
         let raw = match &self.source {
-            Source::Process => env::var(&name).ok(),
+            Source::Process => match env::var(&name) {
+                Ok(v) => Some(v),
+                Err(env::VarError::NotPresent) => None,
+                Err(env::VarError::NotUnicode(raw)) => {
+                    return Err(ShoveError::Validation(format!(
+                        "{name}: value is not valid Unicode ({})",
+                        raw.to_string_lossy()
+                    )));
+                }
+            },
             Source::Explicit(map) => map.get(&name).cloned(),
-        }?;
+        };
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(trimmed.to_string())
+            Ok(Some(trimmed.to_string()))
         }
     }
 
@@ -156,7 +173,7 @@ impl EnvVars {
         T: FromStr,
         T::Err: Display,
     {
-        let Some(raw) = self.get(key) else {
+        let Some(raw) = self.get(key)? else {
             return Ok(None);
         };
         raw.parse::<T>()
@@ -185,7 +202,7 @@ impl EnvVars {
             return Ok(None);
         };
         if !range.contains(&value) {
-            let raw = self.get(key).unwrap_or_default();
+            let raw = self.get(key)?.unwrap_or_default();
             return Err(self.invalid(
                 key,
                 &raw,
@@ -198,7 +215,7 @@ impl EnvVars {
     /// Parse a boolean. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`,
     /// case-insensitively.
     pub fn flag(&self, key: &str, default: bool) -> Result<bool> {
-        let Some(raw) = self.get(key) else {
+        let Some(raw) = self.get(key)? else {
             return Ok(default);
         };
         match raw.to_ascii_lowercase().as_str() {
@@ -231,7 +248,7 @@ impl EnvVars {
     /// The error lists every accepted name, so an operator typo is
     /// self-correcting.
     pub fn choice<T: Copy>(&self, key: &str, default: T, choices: &[(&str, T)]) -> Result<T> {
-        let Some(raw) = self.get(key) else {
+        let Some(raw) = self.get(key)? else {
             return Ok(default);
         };
         let normalized = normalize_choice(&raw);
@@ -473,6 +490,38 @@ mod tests {
 
     fn vars(pairs: &[(&str, &str)]) -> EnvVars {
         EnvVars::from_pairs("SVC", pairs.to_vec())
+    }
+
+    /// A value set to bytes that are not valid UTF-8 must fail, not fall back.
+    /// `std::env::var` reports it as `VarError::NotUnicode`, and the historical
+    /// `.ok()` turned that into "unset" — a typo'd manifest would then run at a
+    /// default nobody asked for, which is precisely what this module promises
+    /// never to do.
+    ///
+    /// Process-scoped, so it has to read the real environment; nextest runs
+    /// every test in its own process, so the mutation cannot reach another test.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_process_value_is_an_error_not_a_default() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = "SHOVE_ENV_TEST_NOT_UNICODE_MAX_CONSUMERS";
+        // SAFETY: nextest gives this test its own process, so no other thread
+        // in it is reading the environment concurrently.
+        unsafe { env::set_var(name, OsStr::from_bytes(&[0x66, 0xff, 0x6f])) };
+
+        let vars = EnvVars::with_prefix("SHOVE_ENV_TEST_NOT_UNICODE");
+        let err = vars
+            .parse("MAX_CONSUMERS", 4u16)
+            .expect_err("a non-Unicode value must not resolve to the default");
+        assert!(
+            matches!(&err, ShoveError::Validation(m) if m.contains(name)),
+            "error must name the variable, got: {err}"
+        );
+
+        // SAFETY: same as above.
+        unsafe { env::remove_var(name) };
     }
 
     #[test]
