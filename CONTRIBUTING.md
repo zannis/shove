@@ -43,12 +43,19 @@ Per-backend feature sets (matching the CI matrix):
 
 | Backend | Feature set |
 |---|---|
-| inmemory | `inmemory,metrics` |
-| rabbitmq | `rabbitmq,audit,rabbitmq-transactional` |
-| aws-sns-sqs | `pub-aws-sns,aws-sns-sqs,audit` |
-| nats | `nats,audit` |
-| kafka | `kafka,kafka-ssl,audit` |
-| redis-streams | `redis-streams` |
+| inmemory | `inmemory,metrics,sbe,env-config` |
+| rabbitmq | `rabbitmq,audit,rabbitmq-transactional,metrics,sbe` |
+| aws-sns-sqs | `pub-aws-sns,aws-sns-sqs,audit,metrics,sbe` |
+| nats | `nats,audit,metrics,sbe,env-config` |
+| kafka | `kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config` |
+| kafka (schema registry) | `kafka,kafka-schema-registry,protobuf` |
+| redis-streams | `redis-streams,metrics,sbe` |
+
+Take these verbatim. `metrics` in particular is load-bearing: the
+`tests/metrics_*.rs` binaries are gated on it, so a set that leaves it out
+compiles them to zero tests and reports green without having run any of them.
+The authoritative copy is the `coverage` matrix in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 The Kafka feature set also needs system libraries on Linux:
 `librdkafka-dev` and `libsasl2-dev`.

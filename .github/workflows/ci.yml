@@ -61,6 +61,44 @@ jobs:
       - run: cargo test --all-features --test kafka_schema_registry
       - run: cargo publish --dry-run --all-features
 
+  # `check` gates `--all-features` and `--no-default-features` only, and both
+  # were already clean when four `dead_code` errors were sitting in the
+  # single-backend sets: each item's only callers are behind a backend feature
+  # the set does not enable. Nothing in CI could see that, so the fix could
+  # regress silently and leave contributors trained to ignore clippy output on
+  # the one build they actually work in. `--lib` is the scope those errors live
+  # in, and keeps this to a lint rather than a second integration build.
+  feature-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
+      - uses: dtolnay/rust-toolchain@1.91
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The coverage matrix's sets, plus the publisher-only SNS build, which no
+      # coverage entry compiles on its own -- it is the set that decides whether
+      # `record_message_size` needs its `dead_code` allow.
+      - name: clippy --lib for every single-backend feature set
+        run: |
+          set -euo pipefail
+          for features in \
+            inmemory,metrics,sbe,env-config \
+            rabbitmq,audit,rabbitmq-transactional,metrics,sbe \
+            pub-aws-sns \
+            pub-aws-sns,metrics \
+            pub-aws-sns,aws-sns-sqs,audit,metrics,sbe \
+            nats,audit,metrics,sbe,env-config \
+            kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config \
+            kafka,kafka-schema-registry,protobuf \
+            redis-streams,metrics,sbe \
+          ; do
+            echo "::group::clippy --lib --features $features"
+            cargo clippy -q --lib --no-default-features --features "$features" -- -D warnings
+            echo "::endgroup::"
+          done
+
   msrv:
     runs-on: ubuntu-latest
     steps:
