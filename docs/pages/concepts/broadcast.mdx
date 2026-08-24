@@ -1,0 +1,99 @@
+# Broadcast — per-instance fan-out
+
+A consumer group splits a topic across the instances of a service: three replicas, and each message goes to exactly one of them. That is the right shape for work.
+
+It is the wrong shape for a *signal*. When a cache entry goes stale, every replica holds its own copy and every replica has to hear about it. Delivering the invalidation to one of three replicas leaves two serving stale data.
+
+`.broadcast()` is the other shape. Every instance subscribes as itself, and every instance receives every message.
+
+```rust
+use shove::{TopologyBuilder, define_topic};
+
+define_topic!(pub CacheInvalidations, InvalidateKey,
+    TopologyBuilder::new("cache-invalidations")
+        .broadcast()
+        .build()
+);
+```
+
+Consume it through `broadcast_subscriber()` rather than `consumer_group()`:
+
+```rust
+let broker = Broker::<InMemory>::new(config).await?;
+let mut subscriber = broker.broadcast_subscriber();
+
+subscriber.subscribe::<CacheInvalidations, _>(EvictHandler, ConsumerOptions::new())?;
+subscriber.run_until_timeout(shutdown_signal(), Duration::from_secs(5)).await;
+```
+
+## Best-effort is the contract, not a limitation
+
+Broadcast is deliberately lossy. Each constraint below exists because the alternative is a durable per-instance group — which is just N consumer groups plus a lifecycle problem, and which `shove` already supports if that is what you need.
+
+**Deliver-new only.** An instance receives what is published while it is subscribed. Nothing is replayed for an instance that was down, and nothing accumulates for one that has not started. This is correct for invalidation — a process that just booted has an empty cache, so there is nothing stale to invalidate — and it is what removes the need to store a per-instance offset anywhere.
+
+**No retry chain.** `.dlq()`, `.dlq_named()`, `.hold_queue()` and `.sequenced()` each panic in `build()` when combined with `.broadcast()`. This is not an oversight to be filled in later. Redelivery to *one* subscriber of a fan-out is not expressible on most of these brokers, and a shared DLQ would collect one copy of every failure per subscriber — the failure of a single message would look like N failures.
+
+So `.broadcast()` implies `allow_message_loss`, and the retry budget is pinned to zero no matter what `ConsumerOptions::with_max_retries` says:
+
+| Handler returns | What happens |
+| --- | --- |
+| `Ack` | Message retired. |
+| `Retry` | Discarded with a `WARN`, and `shove_messages_discarded_total{reason="max_retries_exceeded"}` increments. |
+| `Reject` | Discarded with a `WARN`, same counters. |
+| `Defer` | Redelivered **within this subscription only** — never to the other subscribers. |
+
+That is the same terminal path a topology with no DLQ already takes, so an existing data-loss alert on `shove_messages_discarded_total` covers broadcast without changes. If losing a message on handler failure is unacceptable for your use case, broadcast is the wrong primitive — use a consumer group per reader with `for_consumer_group`.
+
+**One consumer per instance.** There is no autoscaling knob on `BroadcastSubscriber`, because a second consumer inside the same process would *split* the fan-out rather than duplicate it — competing consumption sneaking back in through the wrong door. Registering a `.broadcast()` topology on `consumer_group()` or `consumer_supervisor()` returns a `ShoveError::Topology` for the same reason.
+
+**Ephemeral identity.** The subscription is created when the delivery loop starts and destroyed when it ends, including when the process dies without draining. Nothing accumulates per pod restart. This is the property that the obvious workarounds — a per-pod UUID consumer group on Kafka or Redis — fail: each of those leaves broker-side state behind on every restart, and nothing reaps it.
+
+## Per-backend semantics
+
+The contract above is backend-independent. How each backend delivers it is not, and one of them changes the publisher's behaviour as well.
+
+| Backend | Status | Mechanism | Notes |
+| --- | --- | --- | --- |
+| **InMemory** | Available | A private buffer per subscriber; publishes clone into each. | The test substrate for broadcast semantics. |
+| **NATS** | Planned | Ephemeral pull consumer — `durable_name: None`, `DeliverPolicy::New`, `AckPolicy::None`. | The server garbage-collects the consumer on inactivity. |
+| **Redis** | Planned | Plain `XREAD` from `$` — **not** `XREADGROUP`. | No `XGROUP` means no PEL, no consumer registry, and nothing to reap. See the caveat below. |
+| **Kafka** | Planned | Manual `assign()` of every partition at the latest offset; no `group.id`, no commits. | Truly groupless, so no `__consumer_offsets` churn and no rebalance on boot. |
+| **RabbitMQ** | Planned | A `fanout` exchange `{queue}-fanout`; each instance declares an exclusive, auto-delete, server-named queue bound to it. | The publisher route changes — see the caveat below. |
+| **SQS** | Not supported | — | A compile error, not a runtime one. |
+
+A backend marked *planned* has no `HasBroadcast` implementation yet, so `broadcast_subscriber()` does not compile for it — the same gate that keeps SQS out, applied while the implementation lands. The rows are documented now because they are the agreed semantics, and because the Redis and RabbitMQ caveats below affect how you should design around them.
+
+### SQS is a compile error
+
+`Broker<Sqs>` has no `broadcast_subscriber()` method at all:
+
+```rust
+let broker = Broker::<Sqs>::new(config).await?;
+let _ = broker.broadcast_subscriber();
+// error: no method named `broadcast_subscriber` found for struct `Broker<Sqs>`
+// note: `Sqs` has no ephemeral per-instance subscription primitive
+```
+
+The gate is the `HasBroadcast` capability trait, which `Sqs` does not implement — the same mechanism that keeps `consumer_group()` off `Broker<Sqs>`. Per-instance fan-out on SQS would mean creating and deleting a real queue plus an SNS subscription for every process, and a queue leaked by a pod that died badly costs money for as long as nobody notices. If you need fan-out on AWS, publish to an SNS topic and have each instance manage its own subscription — that lifecycle is yours to own, and `shove` does not pretend otherwise.
+
+### Redis: bound the stream (once available)
+
+Broadcast reads with `XREAD`, which never acknowledges and never trims. Nothing about a broadcast subscriber causes the stream to shrink. Declare the stream with a `MAXLEN` bound, or publish with `XADD ... MAXLEN ~ N`; otherwise it grows without limit and the memory cost is eventually the whole retention.
+
+### RabbitMQ: the publisher route changes (once available)
+
+RabbitMQ is the one backend where broadcast changes the *publish* side as well as the consume side. A normal topology publishes to the default exchange with the queue name as routing key. A broadcast topology publishes to the `{queue}-fanout` exchange instead, and each instance binds its own exclusive auto-delete queue to it.
+
+The consequence: **a publisher and its subscribers must agree on the topology.** Publishing a `.broadcast()` topic from a service still running an older build sends the message to the plain queue, where no broadcast subscriber is listening, and it is silently never delivered. Deploy the publisher and the subscribers together, or accept a gap.
+
+## Choosing between broadcast and a consumer group
+
+| You want | Use |
+| --- | --- |
+| Each message handled once, by whichever instance is free | `consumer_group()` |
+| Two independent *services* reading one topic, each with its own retry chain | `for_consumer_group("name")` |
+| Every *instance* to act on every message | `.broadcast()` |
+| Every instance to act on every message, with no loss on failure | Neither — a durable group per instance, declared explicitly |
+
+The last row is deliberately not automated. It needs a stable per-instance identity and something to clean up the group when an instance is retired for good, and both of those are deployment decisions `shove` cannot make for you.

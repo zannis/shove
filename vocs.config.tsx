@@ -87,6 +87,7 @@ export default defineConfig({
         { text: 'Codecs', link: '/concepts/codecs' },
         { text: 'Outcomes & Delivery', link: '/concepts/outcomes' },
         { text: 'Handlers & Context', link: '/concepts/handlers' },
+        { text: 'Broadcast — per-instance fan-out', link: '/concepts/broadcast' },
         { text: 'The Broker<B> Pattern', link: '/concepts/broker' },
       ],
     },

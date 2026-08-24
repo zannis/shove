@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use crate::backend::Backend;
-use crate::backend::capability::HasCoordinatedGroups;
+use crate::backend::capability::{HasBroadcast, HasCoordinatedGroups};
+use crate::broadcast::BroadcastSubscriber;
 use crate::consumer_group::ConsumerGroup;
 use crate::consumer_supervisor::ConsumerSupervisor;
 use crate::error::Result;
@@ -142,6 +143,24 @@ impl<B: Backend> Broker<B> {
 impl<B: HasCoordinatedGroups> Broker<B> {
     pub fn consumer_group(&self) -> ConsumerGroup<B> {
         ConsumerGroup::new(B::make_registry(&self.client), self.client.clone())
+    }
+}
+
+impl<B: HasBroadcast> Broker<B> {
+    /// Return a [`BroadcastSubscriber`] for ephemeral per-instance fan-out:
+    /// every instance of the service receives every message, as its own
+    /// short-lived subscriber.
+    ///
+    /// The counterpart to [`consumer_group`](Self::consumer_group), which
+    /// splits a topic across instances. Only topologies declaring
+    /// [`.broadcast()`](crate::topology::TopologyBuilder::broadcast) can be
+    /// subscribed through it.
+    ///
+    /// Not available on `Broker<Sqs>` — SQS has no subscription shove can
+    /// create and destroy per process without leaking a queue. See
+    /// [`HasBroadcast`].
+    pub fn broadcast_subscriber(&self) -> BroadcastSubscriber<B> {
+        BroadcastSubscriber::new(&self.client)
     }
 }
 
