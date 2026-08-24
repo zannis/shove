@@ -71,6 +71,7 @@ use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumer};
 use shove::markers::Kafka;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
+use shove::topic::Topic as _;
 use shove::topology::{SequenceFailure, TopologyBuilder};
 
 // ---------------------------------------------------------------------------
@@ -283,6 +284,11 @@ async fn failall_cascade_with_no_dlq_counts_every_message_as_discarded() {
         .declare::<SeqFailAllNoDlqTopic>()
         .await
         .expect("declare");
+    assert!(
+        SeqFailAllNoDlqTopic::topology().dlq().is_none(),
+        "this fixture is the no-DLQ arm; adding a DLQ to the topology above turns \
+         every assertion below into the one `metrics_kafka_failall.rs` already makes"
+    );
 
     let publisher = broker.publisher().await.expect("publisher");
     // Publish order is consume order (one partition). key-A/0 poisons the key,
