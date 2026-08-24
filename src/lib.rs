@@ -150,6 +150,7 @@ pub mod audit;
 pub mod autoscale_metrics;
 pub mod autoscaler;
 pub mod backend;
+pub mod broadcast;
 pub mod broker;
 pub mod codec;
 pub mod codecs;
@@ -201,7 +202,7 @@ pub(crate) mod supervision;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;
-pub use backend::{Backend, capability::HasCoordinatedGroups};
+pub use backend::{Backend, capability::HasBroadcast, capability::HasCoordinatedGroups};
 pub use codec::{Codec, JsonCodec, RawBytesCodec};
 #[cfg(feature = "protobuf")]
 #[cfg_attr(docsrs, doc(cfg(feature = "protobuf")))]
@@ -235,6 +236,7 @@ pub use autoscaler::{
 pub use queue_depth::QueueDepthSampler;
 
 // --- v2 generic wrappers (Phase 5) ---
+pub use broadcast::BroadcastSubscriber;
 pub use broker::Broker;
 pub use consumer_group::{ConsumerGroup, ConsumerGroupConfig};
 pub use publisher::Publisher;

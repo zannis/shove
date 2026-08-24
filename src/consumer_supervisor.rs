@@ -6,6 +6,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, ConsumerImpl};
+use crate::broadcast::reject_broadcast;
 use crate::consumer::ConsumerOptions;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -265,6 +266,7 @@ impl<B: Backend, Ctx: Clone + Send + Sync + 'static> ConsumerSupervisor<B, Ctx> 
         H: MessageHandler<T, Context = Ctx>,
     {
         let queue = T::topology().queue();
+        reject_broadcast::<T>("ConsumerSupervisor::register")?;
         if T::topology().sequencing().is_some() {
             return Err(ShoveError::Topology(format!(
                 "topic '{queue}' has a sequencing config; `ConsumerSupervisor::register` \

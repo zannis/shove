@@ -15,8 +15,10 @@ use tokio::sync::Mutex;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
+    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
+    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBroadcast, HasCoordinatedGroups},
+    sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
@@ -117,6 +119,32 @@ impl HasCoordinatedGroups for InMemory {
         let mut autoscaler =
             InMemoryAutoscalerBackend::autoscaler(client.clone(), registry, config);
         tokio::spawn(async move { autoscaler.run(shutdown).await })
+    }
+}
+
+impl HasBroadcast for InMemory {
+    // The in-process broadcast substrate lives on the same consumer type: a
+    // subscription is just another delivery loop, over a private buffer
+    // instead of the shared queue.
+    type BroadcastImpl = InMemoryConsumer;
+
+    fn make_broadcast(client: &Self::Client) -> Self::BroadcastImpl {
+        InMemoryConsumer::new(client.clone())
+    }
+}
+
+impl BroadcastImpl for InMemoryConsumer {
+    async fn run_broadcast<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        InMemoryConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

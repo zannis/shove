@@ -279,6 +279,10 @@ pub struct QueueTopology {
     /// [`TopologyBuilder::for_consumer_group`]). `None` is the historical
     /// single-reader shape, where every derived name is topic-derived only.
     pub(crate) consumer_group: Option<String>,
+    /// Ephemeral per-instance fan-out (see [`TopologyBuilder::broadcast`]).
+    /// Mutually exclusive with every retry-chain option, so when this is true
+    /// `dlq`, `hold_queues` and `sequencing` are all guaranteed empty.
+    pub(crate) broadcast: bool,
     pub(crate) dlq: Option<String>,
     pub(crate) hold_queues: Vec<HoldQueue>,
     pub(crate) sequencing: Option<SequenceConfig>,
@@ -312,6 +316,16 @@ impl QueueTopology {
     /// name alone, so two readers of the same topic would share them.
     pub fn consumer_group(&self) -> Option<&str> {
         self.consumer_group.as_deref()
+    }
+
+    /// Whether this topology is an ephemeral per-instance broadcast
+    /// subscription (see [`TopologyBuilder::broadcast`]).
+    ///
+    /// A broadcast topology has no DLQ, no hold queues and no sequencing —
+    /// `build()` rejects those combinations — so consumers can treat it as
+    /// best-effort delivery with no retry chain.
+    pub fn broadcast(&self) -> bool {
+        self.broadcast
     }
 
     pub fn dlq(&self) -> Option<&str> {
@@ -430,6 +444,7 @@ enum DlqName {
 pub struct TopologyBuilder {
     queue: String,
     consumer_group: Option<String>,
+    broadcast: bool,
     dlq: Option<DlqName>,
     hold_queues: Vec<Duration>,
     sequencing: Option<SequenceConfig>,
@@ -453,6 +468,7 @@ impl TopologyBuilder {
         Self {
             queue: queue.into(),
             consumer_group: None,
+            broadcast: false,
             dlq: None,
             hold_queues: Vec::new(),
             sequencing: None,
@@ -537,6 +553,58 @@ impl TopologyBuilder {
     /// `build()` panics if the group name is empty or blank.
     pub fn for_consumer_group(mut self, group: impl Into<String>) -> Self {
         self.consumer_group = Some(group.into());
+        self
+    }
+
+    /// Subscribe **every instance** of a service to every message, rather than
+    /// competing for one shared queue.
+    ///
+    /// Where [`for_consumer_group`](Self::for_consumer_group) gives a second
+    /// *service* its own retry chain, `broadcast()` gives every *process* its
+    /// own ephemeral subscription. It is the same group notion taken to its
+    /// limit: the group is per-process identity, created at start and gone the
+    /// moment the process is. Written for cache invalidation and similar
+    /// fan-out signals, where each replica must act on the message itself.
+    ///
+    /// ```rust
+    /// # use shove::topology::TopologyBuilder;
+    /// let topology = TopologyBuilder::new("cache-invalidations").broadcast().build();
+    /// assert!(topology.broadcast());
+    /// ```
+    ///
+    /// # Best-effort by construction
+    ///
+    /// Broadcast is deliberately lossy, and the type system says so:
+    ///
+    /// - **Deliver-new only.** A subscriber receives what is published while it
+    ///   is subscribed. Nothing is replayed for an instance that was down —
+    ///   which is correct for invalidation, because a cold process has a cold
+    ///   cache.
+    /// - **No retry chain.** [`dlq`](Self::dlq), [`dlq_named`](Self::dlq_named),
+    ///   [`hold_queue`](Self::hold_queue) and [`sequenced`](Self::sequenced)
+    ///   each panic in `build()` when combined with this. Redelivery to *one*
+    ///   subscriber of a fan-out is not expressible on most brokers, and a
+    ///   shared DLQ would collect N copies of every failure. `broadcast()`
+    ///   therefore implies [`allow_message_loss`](Self::allow_message_loss):
+    ///   [`Outcome::Retry`](crate::Outcome::Retry) and
+    ///   [`Outcome::Reject`](crate::Outcome::Reject) discard with a warning.
+    /// - **One consumer per instance.** A second consumer in the same process
+    ///   would *split* the broadcast rather than duplicate it, so the broadcast
+    ///   entry point has no autoscaling knob at all.
+    ///
+    /// # Backend support
+    ///
+    /// Gated on [`HasBroadcast`](crate::backend::capability::HasBroadcast):
+    /// `Broker<Sqs>` has no broadcast entry point and fails to compile, because
+    /// per-instance SQS fan-out needs per-pod queue and subscription lifecycle
+    /// management — and a leaked queue costs real money.
+    ///
+    /// # Panics
+    ///
+    /// `build()` panics if this is combined with `dlq()`, `dlq_named()`,
+    /// `hold_queue()`, `sequenced()` or `for_consumer_group()`.
+    pub fn broadcast(mut self) -> Self {
+        self.broadcast = true;
         self
     }
 
@@ -787,12 +855,49 @@ impl TopologyBuilder {
     ///   [`allow_message_loss`](Self::allow_message_loss) is set).
     /// - [`for_consumer_group`](Self::for_consumer_group) given an empty or
     ///   blank group name.
+    /// - [`broadcast`](Self::broadcast) combined with `dlq()`, `dlq_named()`,
+    ///   `hold_queue()`, `sequenced()` or `for_consumer_group()`.
     pub fn build(mut self) -> QueueTopology {
         if let Some(ref group) = self.consumer_group {
             assert!(
                 !group.trim().is_empty(),
                 "for_consumer_group() requires a non-empty group name"
             );
+        }
+        if self.broadcast {
+            // Each of these declares a retry chain, and a broadcast topology
+            // has nowhere coherent to put one: a redelivery would go to one
+            // subscriber of a fan-out, and a shared DLQ would collect N copies
+            // of every failure. Reject at build() rather than silently
+            // declaring auxiliary queues nothing will ever read.
+            assert!(
+                self.dlq.is_none(),
+                "broadcast() cannot be combined with dlq()/dlq_named() — a broadcast \
+                 subscription is best-effort with no retry chain, and a shared DLQ would \
+                 collect one copy of every failure per subscriber"
+            );
+            assert!(
+                self.hold_queues.is_empty(),
+                "broadcast() cannot be combined with hold_queue() — a broadcast \
+                 subscription is best-effort with no retry chain, and a held message \
+                 would be redelivered to one subscriber of the fan-out"
+            );
+            assert!(
+                self.sequencing.is_none(),
+                "broadcast() cannot be combined with sequenced() — sequencing orders one \
+                 shared consumer group across shard queues, which is the opposite of \
+                 giving every instance its own ephemeral subscription"
+            );
+            assert!(
+                self.consumer_group.is_none(),
+                "broadcast() cannot be combined with for_consumer_group() — broadcast is \
+                 already a per-process group, so the named group would name nothing and \
+                 silently have no effect"
+            );
+            // Broadcast is best-effort by definition; the sequencing/retry
+            // guards below never fire for it, but stating this here keeps the
+            // flag truthful for anything reading the built topology.
+            self.allow_message_loss = true;
         }
         #[cfg(feature = "nats")]
         {
@@ -890,6 +995,7 @@ impl TopologyBuilder {
         QueueTopology {
             queue: self.queue,
             consumer_group: self.consumer_group,
+            broadcast: self.broadcast,
             dlq,
             hold_queues,
             sequencing: self.sequencing,
@@ -1405,6 +1511,120 @@ mod tests {
             .build();
         assert_eq!(topology.dlq(), Some("events-failed"));
         assert!(topology.sequencing().is_some());
+    }
+
+    // -- Broadcast --
+
+    #[test]
+    fn broadcast_is_off_by_default() {
+        assert!(!TopologyBuilder::new("orders").build().broadcast());
+    }
+
+    #[test]
+    fn broadcast_declares_no_auxiliary_queues() {
+        let topology = TopologyBuilder::new("cache-invalidations")
+            .broadcast()
+            .build();
+        assert!(topology.broadcast());
+        assert_eq!(topology.queue(), "cache-invalidations");
+        assert_eq!(topology.dlq(), None);
+        assert!(topology.hold_queues().is_empty());
+        assert!(topology.sequencing().is_none());
+        assert_eq!(topology.consumer_group(), None);
+    }
+
+    // AC1: each conflicting option panics in build(), naming the conflict.
+    // Both orderings, because the guard runs at build() and must not depend on
+    // which call came first.
+
+    #[test]
+    #[should_panic(expected = "broadcast() cannot be combined with dlq()/dlq_named()")]
+    fn broadcast_with_dlq_panics() {
+        let _ = TopologyBuilder::new("cache-invalidations")
+            .broadcast()
+            .dlq()
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "broadcast() cannot be combined with dlq()/dlq_named()")]
+    fn dlq_named_before_broadcast_panics() {
+        let _ = TopologyBuilder::new("cache-invalidations")
+            .dlq_named("shared-dead-letters")
+            .broadcast()
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "broadcast() cannot be combined with hold_queue()")]
+    fn broadcast_with_hold_queue_panics() {
+        let _ = TopologyBuilder::new("cache-invalidations")
+            .broadcast()
+            .hold_queue(Duration::from_secs(5))
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "broadcast() cannot be combined with sequenced()")]
+    fn broadcast_with_sequenced_panics() {
+        let _ = TopologyBuilder::new("cache-invalidations")
+            .broadcast()
+            .sequenced(SequenceFailure::Skip)
+            .build();
+    }
+
+    // Not in the ticket's list, but the same class of defect: under broadcast
+    // the group namespaces nothing (there are no derived names) and no backend
+    // reads it, so accepting it would be a silent no-op.
+    #[test]
+    #[should_panic(expected = "broadcast() cannot be combined with for_consumer_group()")]
+    fn broadcast_with_consumer_group_panics() {
+        let _ = TopologyBuilder::new("cache-invalidations")
+            .broadcast()
+            .for_consumer_group("price-latest")
+            .build();
+    }
+
+    // AC8: every derived name for a topology that does not call `.broadcast()`
+    // is byte-identical to what it was before broadcast existed.
+    #[test]
+    fn broadcast_changes_nothing_for_a_topology_without_it() {
+        let plain = TopologyBuilder::new("orders")
+            .hold_queue(Duration::from_secs(5))
+            .hold_queue(Duration::from_secs(30))
+            .dlq()
+            .build();
+        assert_eq!(plain.queue(), "orders");
+        assert_eq!(plain.dlq(), Some("orders-dlq"));
+        assert_eq!(plain.hold_queues()[0].name(), "orders-hold-5s");
+        assert_eq!(plain.hold_queues()[1].name(), "orders-hold-30s");
+        assert!(!plain.broadcast());
+
+        let grouped = TopologyBuilder::new("orders")
+            .for_consumer_group("latest")
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .build();
+        assert_eq!(grouped.queue(), "orders");
+        assert_eq!(grouped.dlq(), Some("orders-latest-dlq"));
+        assert_eq!(grouped.hold_queues()[0].name(), "orders-latest-hold-5s");
+        assert!(!grouped.broadcast());
+
+        let sequenced = TopologyBuilder::new("ledger")
+            .sequenced(SequenceFailure::FailAll)
+            .routing_shards(4)
+            .hold_queue(Duration::from_secs(5))
+            .dlq()
+            .build();
+        assert_eq!(
+            sequenced.sequencing().map(|s| s.exchange()),
+            Some("ledger-seq-hash")
+        );
+        assert_eq!(
+            sequenced.shard_hold_queue_names(2)[0].name(),
+            "ledger-seq-2-hold-5s"
+        );
+        assert!(!sequenced.broadcast());
     }
 
     // -- NATS stream subjects --

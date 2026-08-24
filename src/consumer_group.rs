@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::RegistryImpl;
 use crate::backend::capability::HasCoordinatedGroups;
+use crate::broadcast::reject_broadcast;
 use crate::consumer_supervisor::SupervisorOutcome;
 use crate::error::{Result, ShoveError};
 use crate::handler::MessageHandler;
@@ -82,6 +83,7 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         T: Topic,
         H: MessageHandler<T, Context = Ctx>,
     {
+        reject_broadcast::<T>("ConsumerGroup::register")?;
         if T::topology().sequencing().is_some() {
             return Err(ShoveError::Topology(format!(
                 "topic '{}' has a sequencing config; `ConsumerGroup::register` \
@@ -118,6 +120,9 @@ impl<B: HasCoordinatedGroups, Ctx: Clone + Send + Sync + 'static> ConsumerGroup<
         T: SequencedTopic,
         H: MessageHandler<T, Context = Ctx>,
     {
+        // No broadcast guard needed here: `.broadcast()` and `.sequenced()`
+        // cannot coexist (`build()` rejects the pair), so a broadcast topology
+        // always fails the sequencing check just below.
         if T::topology().sequencing().is_none() {
             return Err(ShoveError::Topology(format!(
                 "topic '{}' implements `SequencedTopic` but its topology has no \

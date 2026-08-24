@@ -22,6 +22,15 @@ impl InMemoryTopologyDeclarer {
 
 impl InMemoryTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        if topology.broadcast() {
+            // Nothing to declare: a broadcast topic has no shared queue, no DLQ
+            // and no hold queues, and each subscriber's buffer is created by
+            // the subscription itself. Declaring a queue here would leave an
+            // addressable, permanently empty one behind — the residue AC6
+            // exists to rule out.
+            return Ok(());
+        }
+
         if let Some(seq) = topology.sequencing() {
             for shard in 0..seq.routing_shards() {
                 let shard_name = Self::shard_queue_name(topology.queue(), shard);
