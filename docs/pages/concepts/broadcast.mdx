@@ -56,13 +56,13 @@ The contract above is backend-independent. How each backend delivers it is not, 
 | Backend | Status | Mechanism | Notes |
 | --- | --- | --- | --- |
 | **InMemory** | Available | A private buffer per subscriber; publishes clone into each. | The test substrate for broadcast semantics. |
+| **Kafka** | Available | Manual `assign()` of every partition at the latest offset; never `subscribe()`, never commits. | No JoinGroup and no OffsetCommit, so no `__consumer_offsets` churn and no rebalance on boot. See the caveat below. |
+| **RabbitMQ** | Available | A `fanout` exchange `{queue}-fanout`; each instance declares an exclusive, auto-delete, server-named queue bound to it. | The publisher route changes — see the caveat below. |
 | **NATS** | Planned | Ephemeral pull consumer — `durable_name: None`, `DeliverPolicy::New`, `AckPolicy::None`. | The server garbage-collects the consumer on inactivity. |
 | **Redis** | Planned | Plain `XREAD` from `$` — **not** `XREADGROUP`. | No `XGROUP` means no PEL, no consumer registry, and nothing to reap. See the caveat below. |
-| **Kafka** | Planned | Manual `assign()` of every partition at the latest offset; no `group.id`, no commits. | Truly groupless, so no `__consumer_offsets` churn and no rebalance on boot. |
-| **RabbitMQ** | Planned | A `fanout` exchange `{queue}-fanout`; each instance declares an exclusive, auto-delete, server-named queue bound to it. | The publisher route changes — see the caveat below. |
 | **SQS** | Not supported | — | A compile error, not a runtime one. |
 
-A backend marked *planned* has no `HasBroadcast` implementation yet, so `broadcast_subscriber()` does not compile for it — the same gate that keeps SQS out, applied while the implementation lands. The rows are documented now because they are the agreed semantics, and because the Redis and RabbitMQ caveats below affect how you should design around them.
+A backend marked *planned* has no `HasBroadcast` implementation yet, so `broadcast_subscriber()` does not compile for it — the same gate that keeps SQS out, applied while the implementation lands. The rows are documented now because they are the agreed semantics, and because the Redis caveat below affects how you should design around it.
 
 ### SQS is a compile error
 
@@ -81,11 +81,23 @@ The gate is the `HasBroadcast` capability trait, which `Sqs` does not implement 
 
 Broadcast reads with `XREAD`, which never acknowledges and never trims. Nothing about a broadcast subscriber causes the stream to shrink. Declare the stream with a `MAXLEN` bound, or publish with `XADD ... MAXLEN ~ N`; otherwise it grows without limit and the memory cost is eventually the whole retention.
 
-### RabbitMQ: the publisher route changes (once available)
+### RabbitMQ: the publisher route changes
 
 RabbitMQ is the one backend where broadcast changes the *publish* side as well as the consume side. A normal topology publishes to the default exchange with the queue name as routing key. A broadcast topology publishes to the `{queue}-fanout` exchange instead, and each instance binds its own exclusive auto-delete queue to it.
 
 The consequence: **a publisher and its subscribers must agree on the topology.** Publishing a `.broadcast()` topic from a service still running an older build sends the message to the plain queue, where no broadcast subscriber is listening, and it is silently never delivered. Deploy the publisher and the subscribers together, or accept a gap.
+
+`declare_topology::<T>()` declares the exchange and nothing else — no queue, because a broadcast topology has none. A publisher-only service still needs to call it, exactly as a sequenced topic's publisher needs the consistent-hash exchange declared. A subscriber declares the exchange itself before binding, so a subscriber-only process works either way.
+
+### Kafka: a groupless subscription, and one inert `group.id`
+
+A Kafka broadcast subscriber `assign()`s every partition of the topic at its current end offset. It never calls `subscribe()` and never commits, so the broker receives no JoinGroup and no OffsetCommit: no group is created, nothing lands in `__consumer_offsets`, and `kafka-consumer-groups --list` shows nothing for the topic no matter how many times instances restart.
+
+One wrinkle worth knowing about if you go looking at client config: librdkafka refuses `assign()` on a consumer handle with no `group.id` at all, so `shove` configures the fixed string `{queue}-broadcast`. It is inert — nothing joins under it and nothing commits to it — and it is deliberately *not* a per-process value, because a per-restart identifier showing up in client tooling is the same accumulating residue this feature exists to avoid.
+
+Because the assignment is taken at the tail, a reconnect re-assigns at the *then*-current tail: messages published while a subscriber was disconnected are not replayed. That is deliver-new applied to the reconnect window rather than a separate caveat.
+
+`reset_consumer_group_offsets::<T>()` returns a validation error for a broadcast topic. There is no group to re-anchor and no stored position to reset, and rewriting the `{queue}-consumer` offsets — which nothing on the broadcast path reads — would be an ops-facing call that succeeded at nothing.
 
 ## Choosing between broadcast and a consumer group
 

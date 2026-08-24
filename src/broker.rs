@@ -254,6 +254,16 @@ impl Broker<Kafka> {
     /// # }
     /// ```
     ///
+    /// # Not applicable to a broadcast topology
+    ///
+    /// A [`.broadcast()`](crate::topology::TopologyBuilder::broadcast) topic has
+    /// no consumer group to re-anchor: its subscribers assign partitions
+    /// manually and never commit, so there are no offsets and nothing reads the
+    /// `{queue}-consumer` group this method would otherwise resolve. Rewriting
+    /// it would move a group nothing has ever joined, so the call returns
+    /// [`ShoveError::Validation`](crate::ShoveError::Validation) instead of
+    /// succeeding at nothing on an ops-facing method.
+    ///
     /// [`with_group_id`]: KafkaConsumerGroupConfig::with_group_id
     /// [`ConsumerGroup::register`]: crate::ConsumerGroup::register
     pub async fn reset_consumer_group_offsets<T: Topic>(
@@ -262,6 +272,15 @@ impl Broker<Kafka> {
         to: KafkaOffsetReset,
     ) -> Result<KafkaOffsetResetReport> {
         let topology = T::topology();
+        if topology.broadcast() {
+            return Err(crate::ShoveError::Validation(format!(
+                "topic '{}' declares `.broadcast()`, so it has no consumer group to \
+                 re-anchor: its subscribers assign partitions manually and never commit an \
+                 offset. A broadcast subscription always starts at the tail; there is no \
+                 stored position to reset.",
+                topology.queue()
+            )));
+        }
         let group_id = resolved_reset_group_id(config, topology);
         reset_group_offsets(&self.client, topology.queue(), &group_id, to).await
     }

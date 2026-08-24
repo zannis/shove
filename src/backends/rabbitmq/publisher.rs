@@ -15,6 +15,7 @@ use crate::backend::PublisherImpl;
 use crate::backends::rabbitmq::client::RabbitMqClient;
 use crate::backends::rabbitmq::headers::MESSAGE_ID_KEY;
 use crate::backends::rabbitmq::map_lapin_error;
+use crate::backends::rabbitmq::topology::broadcast_exchange;
 use crate::batch::BatchReport;
 use crate::error::{Result, ShoveError};
 use crate::metrics;
@@ -306,6 +307,24 @@ impl RabbitMqPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let topology = T::topology();
 
+        // RabbitMQ is the one backend where broadcast changes the *publish*
+        // side too. There is no shared queue to address, so the message goes to
+        // the fanout exchange with an empty routing key and the broker copies
+        // it into every instance's own ephemeral queue — or discards it, if no
+        // instance is subscribed.
+        //
+        // This is what makes the deployment caveat in
+        // `docs/pages/concepts/broadcast.mdx` real: a publisher on an older
+        // build still takes the `("", queue)` route below, and nothing is bound
+        // there. Publisher and subscribers deploy together.
+        //
+        // `build()` rejects `.broadcast()` combined with `.sequenced()`, so
+        // this branch never competes with the sequencing match below.
+        if topology.broadcast() {
+            let exchange = broadcast_exchange(topology.queue());
+            return self.publish_raw(&exchange, "", &payload, None).await;
+        }
+
         match (topology.sequencing(), T::SEQUENCE_KEY_FN) {
             (Some(seq), Some(kf)) => {
                 let routing_key = kf(message);
@@ -328,6 +347,14 @@ impl RabbitMqPublisher {
         let payload = <T::Codec as crate::Codec<T::Message>>::encode_bytes(message)?;
         let field_table = hashmap_to_field_table(headers);
         let topology = T::topology();
+
+        // Fanout exchange, empty routing key — see the note in `publish`.
+        if topology.broadcast() {
+            let exchange = broadcast_exchange(topology.queue());
+            return self
+                .publish_raw(&exchange, "", &payload, Some(field_table))
+                .await;
+        }
 
         match (topology.sequencing(), T::SEQUENCE_KEY_FN) {
             (Some(seq), Some(kf)) => {
@@ -374,6 +401,15 @@ impl RabbitMqPublisher {
             Ok(v) => v,
             Err(e) => return BatchReport::wholly_unattempted(messages.len(), e),
         };
+
+        // Fanout exchange, empty routing key per record — see the note in
+        // `publish`. The per-index reporting is unchanged: a fanout publish is
+        // confirmed the same way any other publish on a confirm channel is.
+        if topology.broadcast() {
+            let exchange = broadcast_exchange(queue);
+            let items: Vec<(&str, bytes::Bytes)> = payloads.into_iter().map(|p| ("", p)).collect();
+            return self.publish_batch_raw(&exchange, &items).await;
+        }
 
         let routing_keys: Option<Vec<String>> = key_fn.map(|kf| messages.iter().map(kf).collect());
 

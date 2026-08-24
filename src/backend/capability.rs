@@ -71,10 +71,10 @@ pub trait HasCoordinatedGroups: Backend {
 /// | Backend | Implements `HasBroadcast` | Ephemeral primitive |
 /// |---|---|---|
 /// | **InMemory** | **yes** | a per-subscriber buffer |
+/// | **Kafka** | **yes** | groupless `assign()` at the latest offset |
+/// | **RabbitMQ** | **yes** | exclusive auto-delete queue on a fanout exchange |
 /// | NATS | not yet | ephemeral pull consumer |
 /// | Redis (`redis-streams`) | not yet | plain `XREAD` from `$`, no `XGROUP` |
-/// | Kafka | not yet | groupless `assign()` at the latest offset |
-/// | RabbitMQ | not yet | exclusive auto-delete queue on a fanout exchange |
 /// | **SQS** | **never** | — |
 ///
 /// A backend in the *not yet* rows has a primitive that satisfies the contract,
@@ -89,7 +89,7 @@ pub trait HasCoordinatedGroups: Backend {
 /// Sealed via `Backend`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `HasBroadcast`, so `.broadcast()` topologies cannot be consumed on it.",
-    note = "InMemory is the only backend implementing `HasBroadcast` on this version. NATS, Redis, Kafka and RabbitMQ each have a suitable ephemeral primitive and are planned. SQS is excluded permanently: per-process fan-out there needs a real queue plus an SNS subscription whose lifecycle shove does not manage — publish to an SNS topic each instance subscribes to itself instead."
+    note = "InMemory, Kafka and RabbitMQ implement `HasBroadcast` on this version. NATS and Redis each have a suitable ephemeral primitive and are planned. SQS is excluded permanently: per-process fan-out there needs a real queue plus an SNS subscription whose lifecycle shove does not manage — publish to an SNS topic each instance subscribes to itself instead."
 )]
 #[allow(private_interfaces, private_bounds)]
 pub trait HasBroadcast: Backend {

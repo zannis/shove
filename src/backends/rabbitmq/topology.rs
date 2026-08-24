@@ -28,6 +28,47 @@ fn hold_queue_args(route_back_to: &str, ttl_ms: i64) -> FieldTable {
     args
 }
 
+/// The fanout exchange a `.broadcast()` topology publishes to, and that every
+/// instance binds its own ephemeral queue to.
+///
+/// Derived from the topic name so a publisher and its subscribers agree without
+/// configuration, and deliberately *not* equal to the queue name: a broadcast
+/// topology declares no queue at all, and the whole deployment caveat below
+/// turns on the two names being distinguishable.
+pub(crate) fn broadcast_exchange(queue: &str) -> String {
+    format!("{queue}-fanout")
+}
+
+/// Declare the fanout exchange for a broadcast topology.
+///
+/// Idempotent, and called from two places on purpose: the topology declarer, so
+/// a publisher-only process has somewhere to publish, and each subscriber's own
+/// channel, so a subscriber-only process can bind without depending on whether
+/// anyone declared the topology first.
+///
+/// Durable and **not** auto-delete. A publisher must be able to publish across
+/// a window where no instance is subscribed; a fanout with no bindings discards
+/// what it receives, which is precisely the deliver-new contract rather than a
+/// failure.
+pub(crate) async fn declare_broadcast_exchange(channel: &Channel, exchange: &str) -> Result<()> {
+    channel
+        .exchange_declare(
+            exchange.into(),
+            lapin::ExchangeKind::Fanout,
+            ExchangeDeclareOptions {
+                durable: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| {
+            ShoveError::Topology(format!(
+                "failed to declare broadcast exchange '{exchange}': {e}"
+            ))
+        })
+}
+
 /// Declares RabbitMQ broker resources for a topic's topology.
 ///
 /// All declarations are idempotent — safe to call on every startup.
@@ -143,10 +184,46 @@ impl RabbitMqTopologyDeclarer {
 
 impl RabbitMqTopologyDeclarer {
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        if topology.broadcast() {
+            // The exchange, and nothing else. A broadcast topology has no
+            // shared queue, no DLQ and no hold queues, and each subscriber
+            // declares its own queue when its delivery loop starts — so a queue
+            // declared here would be an addressable, permanently empty one that
+            // nothing ever reads, which is the residue AC6 rules out.
+            return declare_broadcast_exchange(
+                &self.channel,
+                &broadcast_exchange(topology.queue()),
+            )
+            .await;
+        }
         if topology.sequencing().is_some() {
             self.declare_sequenced(topology).await
         } else {
             self.declare_unsequenced(topology).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_exchange_is_derived_from_the_topic_name() {
+        assert_eq!(
+            broadcast_exchange("cache-invalidations"),
+            "cache-invalidations-fanout"
+        );
+    }
+
+    // The deployment caveat in `docs/pages/concepts/broadcast.mdx` is only
+    // meaningful if the two routes are distinguishable: an older publisher
+    // sends to the default exchange keyed by the queue name, a new one sends
+    // to this exchange. If they collided the caveat would be describing
+    // nothing.
+    #[test]
+    fn broadcast_exchange_never_collides_with_the_queue_name() {
+        let queue = "cache-invalidations";
+        assert_ne!(broadcast_exchange(queue), queue);
     }
 }

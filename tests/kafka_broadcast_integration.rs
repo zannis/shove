@@ -1,0 +1,489 @@
+#![cfg(feature = "kafka")]
+
+//! Integration tests for Kafka ephemeral per-instance broadcast subscriptions.
+//!
+//! The property that needs a real broker is **AC6 — no consumer group**. A
+//! broadcast subscriber assigns partitions manually and never commits, so the
+//! broker should never learn that it exists: no JoinGroup, no OffsetCommit, and
+//! nothing in `kafka-consumer-groups --list` no matter how many instances start
+//! and stop.
+//!
+//! A bare "the group list does not contain X" assertion is worth very little on
+//! its own — it also passes if the group list is empty because the query is
+//! wrong, or because the subscriber never connected. So
+//! [`broadcast_leaves_no_consumer_group`] carries a control: an ordinary
+//! consumer group on a second topic, which *must* appear in the very same list
+//! read at the very same moment.
+//!
+//! Run with:
+//! `cargo nextest run --features kafka --test kafka_broadcast_integration`
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rdkafka::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer as _};
+use serde::{Deserialize, Serialize};
+use shove::broker::Broker;
+use shove::consumer::ConsumerOptions;
+use shove::consumer_group::ConsumerGroupConfig;
+use shove::handler::MessageHandler;
+use shove::kafka::{KafkaClient, KafkaConfig, KafkaConsumerGroupConfig, KafkaOffsetReset};
+use shove::markers::Kafka;
+use shove::metadata::MessageMetadata;
+use shove::outcome::Outcome;
+use shove::topology::TopologyBuilder;
+use shove::{ShoveError, define_topic};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{self, Kafka as KafkaContainer};
+use tokio::sync::Mutex;
+use tokio::time::Instant;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Invalidate {
+    key: String,
+}
+
+define_topic!(
+    CacheInvalidations,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-invalidations")
+        .broadcast()
+        .build()
+);
+
+define_topic!(
+    DeferTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-defer")
+        .broadcast()
+        .build()
+);
+
+// The control for AC6: an ordinary competing-consumer topic whose group the
+// broker *does* register.
+define_topic!(
+    ControlTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-control").build()
+);
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct Recorder {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl Recorder {
+    async fn keys(&self) -> Vec<String> {
+        self.seen.lock().await.clone()
+    }
+
+    async fn wait_for(&self, target: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.seen.lock().await.len() < target && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+macro_rules! recorder_for {
+    ($($topic:ty),+ $(,)?) => {$(
+        impl MessageHandler<$topic> for Recorder {
+            type Context = ();
+            async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+                self.seen.lock().await.push(msg.key);
+                Outcome::Ack
+            }
+        }
+    )+};
+}
+
+recorder_for!(CacheInvalidations, ControlTopic);
+
+/// Defers the first delivery of each key and acks the redelivery.
+#[derive(Clone, Default)]
+struct DeferOnce {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl DeferOnce {
+    async fn calls(&self) -> Vec<String> {
+        self.calls.lock().await.clone()
+    }
+}
+
+impl MessageHandler<DeferTopic> for DeferOnce {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+        let mut calls = self.calls.lock().await;
+        let seen_before = calls.iter().filter(|k| **k == msg.key).count();
+        calls.push(msg.key);
+        if seen_before == 0 {
+            Outcome::Defer
+        } else {
+            Outcome::Ack
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+struct TestBroker {
+    _container: testcontainers::ContainerAsync<KafkaContainer>,
+    port: u16,
+}
+
+impl TestBroker {
+    async fn start() -> Self {
+        let container = KafkaContainer::default()
+            .start()
+            .await
+            .expect("failed to start Kafka container");
+        let port = container
+            .get_host_port_ipv4(apache::KAFKA_PORT)
+            .await
+            .expect("failed to get Kafka port");
+        Self {
+            _container: container,
+            port,
+        }
+    }
+
+    fn brokers(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
+    /// A broker on its **own** client, against the same container.
+    ///
+    /// One client per subscriber, always: `run_until_timeout` cancels the
+    /// *client's* shutdown token, so a client that has hosted one subscription
+    /// is spent. Separate clients also model what this file is about —
+    /// separate processes.
+    async fn broker(&self) -> Broker<Kafka> {
+        let client = KafkaClient::connect_with_retry(&KafkaConfig::new(self.brokers()), 10)
+            .await
+            .expect("failed to connect to Kafka");
+        Broker::<Kafka>::from_client(client)
+    }
+
+    /// Every consumer group the broker currently knows about.
+    ///
+    /// Read through an independent `BaseConsumer` rather than through anything
+    /// under test, so a bug that stopped the broadcast subscriber connecting at
+    /// all could not also silence this query.
+    fn consumer_group_names(&self) -> HashSet<String> {
+        let probe: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", self.brokers())
+            // The probe itself never subscribes and never commits, so it does
+            // not create the group it is named after — which is the same reason
+            // a broadcast subscriber does not create its own.
+            .set("group.id", "broadcast-test-group-probe")
+            .create()
+            .expect("failed to create group-list probe");
+        probe
+            .client()
+            .fetch_group_list(None, Duration::from_secs(10))
+            .expect("failed to fetch group list")
+            .groups()
+            .iter()
+            .map(|g| g.name().to_string())
+            .collect()
+    }
+}
+
+/// Wait until a broadcast subscription has certainly assigned its partitions.
+///
+/// There is nothing broker-side to poll for — that is the whole point of the
+/// design — so this is a fixed settle window rather than a condition. Publishing
+/// before the assignment lands would test deliver-new's failure mode instead of
+/// the fan-out.
+const ASSIGN_SETTLE: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// AC6: two broadcast subscribers come and go, and the broker ends up with no
+/// consumer group for their topic — while an ordinary group on a control topic
+/// shows up in the same list.
+#[tokio::test]
+async fn broadcast_leaves_no_consumer_group() {
+    let tb = TestBroker::start().await;
+
+    let setup = tb.broker().await;
+    setup
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+    setup
+        .topology()
+        .declare::<ControlTopic>()
+        .await
+        .expect("failed to declare control topic");
+    setup.close().await;
+
+    // Two broadcast instances, started and stopped twice over, so a group that
+    // is only created on a *second* boot would still be caught.
+    for _round in 0..2 {
+        let mut running = Vec::new();
+        for _ in 0..2 {
+            let broker = tb.broker().await;
+            let mut sub = broker.broadcast_subscriber();
+            sub.subscribe::<CacheInvalidations, _>(Recorder::default(), ConsumerOptions::new())
+                .expect("failed to subscribe");
+            running.push((broker, sub));
+        }
+        tokio::time::sleep(ASSIGN_SETTLE).await;
+        for (broker, sub) in running {
+            sub.cancellation_token().cancel();
+            let _ = sub
+                .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+                .await;
+            broker.close().await;
+        }
+    }
+
+    // The control: an ordinary consumer group, which must register.
+    let control_broker = tb.broker().await;
+    let control_handler = Recorder::default();
+    let h = control_handler.clone();
+    let mut group = control_broker.consumer_group();
+    group
+        .register::<ControlTopic, _>(
+            ConsumerGroupConfig::new(KafkaConsumerGroupConfig::new(1..=1)),
+            move || h.clone(),
+        )
+        .await
+        .expect("failed to register control group");
+    let token = group.cancellation_token();
+    let running_group = tokio::spawn(async move {
+        group
+            .run_until_timeout(token.cancelled_owned(), Duration::from_secs(10))
+            .await
+    });
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let groups = tb.consumer_group_names();
+
+    assert!(
+        groups.contains("kafka-broadcast-control-consumer"),
+        "the control group is missing, so this query proves nothing about the \
+         broadcast group's absence; saw {groups:?}"
+    );
+    assert!(
+        !groups.contains("kafka-broadcast-invalidations-broadcast"),
+        "a broadcast subscription registered a consumer group: {groups:?}"
+    );
+    // Belt and braces: nothing named after the topic at all, so a group under
+    // some other derived name (`-consumer`, a per-process UUID) fails too.
+    let topic_groups: Vec<&String> = groups
+        .iter()
+        .filter(|g| g.contains("kafka-broadcast-invalidations"))
+        .collect();
+    assert!(
+        topic_groups.is_empty(),
+        "broadcast left consumer groups behind for its topic: {topic_groups:?}"
+    );
+
+    control_broker.close().await;
+    let _ = running_group.await;
+}
+
+/// Every instance receives every message, and nothing published before a
+/// subscription existed is replayed into it.
+#[tokio::test]
+async fn broadcast_fans_out_to_every_instance_from_the_tail() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    // Published before anyone subscribes. Deliver-new means no subscriber ever
+    // sees this, which is what pins the assignment to the tail rather than to
+    // `auto.offset.reset`.
+    publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher")
+        .publish::<CacheInvalidations>(&Invalidate {
+            key: "before-anyone-listened".into(),
+        })
+        .await
+        .expect("publish failed");
+
+    let mut running = Vec::new();
+    let mut recorders = Vec::new();
+    for _ in 0..2 {
+        let broker = tb.broker().await;
+        let recorder = Recorder::default();
+        let mut sub = broker.broadcast_subscriber();
+        sub.subscribe::<CacheInvalidations, _>(recorder.clone(), ConsumerOptions::new())
+            .expect("failed to subscribe");
+        recorders.push(recorder);
+        running.push((broker, sub));
+    }
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let keys: Vec<Invalidate> = (0..3)
+        .map(|i| Invalidate {
+            key: format!("user:{i}"),
+        })
+        .collect();
+    let pubr = publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher");
+    for msg in &keys {
+        pubr.publish::<CacheInvalidations>(msg)
+            .await
+            .expect("publish failed");
+    }
+
+    for recorder in &recorders {
+        recorder.wait_for(3, Duration::from_secs(30)).await;
+    }
+    // Settle, so a replay of the pre-subscription message has time to show up
+    // before it is asserted absent.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let expected: HashSet<String> = keys.iter().map(|k| k.key.clone()).collect();
+    for (i, recorder) in recorders.iter().enumerate() {
+        let seen: HashSet<String> = recorder.keys().await.into_iter().collect();
+        assert_eq!(
+            seen, expected,
+            "subscriber {i} saw the wrong set — a fan-out delivers every message to \
+             every instance, and replays nothing from before it subscribed"
+        );
+    }
+
+    for (broker, sub) in running {
+        sub.cancellation_token().cancel();
+        let _ = sub
+            .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+            .await;
+        broker.close().await;
+    }
+    publisher_broker.close().await;
+}
+
+/// `Defer` redelivers within the deferring subscription and reaches no other.
+///
+/// On Kafka this cannot be a requeue — there is no queue — so it is an
+/// in-process redelivery. What matters is the observable: the deferring
+/// instance handles the message twice, the other exactly once.
+#[tokio::test]
+async fn defer_redelivers_only_to_the_subscriber_that_deferred() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<DeferTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let deferring_broker = tb.broker().await;
+    let deferring = DeferOnce::default();
+    let mut deferring_sub = deferring_broker.broadcast_subscriber();
+    deferring_sub
+        .subscribe::<DeferTopic, _>(deferring.clone(), ConsumerOptions::new())
+        .expect("failed to subscribe");
+
+    let bystander_broker = tb.broker().await;
+    let bystander = DeferOnce::default();
+    let mut bystander_sub = bystander_broker.broadcast_subscriber();
+    bystander_sub
+        .subscribe::<DeferTopic, _>(bystander.clone(), ConsumerOptions::new())
+        .expect("failed to subscribe");
+
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher")
+        .publish::<DeferTopic>(&Invalidate {
+            key: "deferred".into(),
+        })
+        .await
+        .expect("publish failed");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while deferring.calls().await.len() < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Longer than the one-second defer delay, so a redelivery that leaked to
+    // the bystander would have landed by now.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(
+        deferring.calls().await,
+        vec!["deferred".to_string(), "deferred".to_string()],
+        "the deferring subscriber must see the message again"
+    );
+    assert_eq!(
+        bystander.calls().await,
+        vec!["deferred".to_string()],
+        "a deferral must not be republished to the rest of the fan-out"
+    );
+
+    for (broker, sub) in [
+        (deferring_broker, deferring_sub),
+        (bystander_broker, bystander_sub),
+    ] {
+        sub.cancellation_token().cancel();
+        let _ = sub
+            .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+            .await;
+        broker.close().await;
+    }
+    publisher_broker.close().await;
+}
+
+/// `reset_consumer_group_offsets` refuses a broadcast topology rather than
+/// rewriting offsets for a group nothing on that path reads.
+///
+/// An integration test rather than a unit test because the refusal must happen
+/// *before* the broker round trip: the point is that it is not a runtime
+/// failure deep in the reset, and not a silent success either.
+#[tokio::test]
+async fn reset_consumer_group_offsets_refuses_a_broadcast_topology() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker().await;
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let err = broker
+        .reset_consumer_group_offsets::<CacheInvalidations>(
+            &KafkaConsumerGroupConfig::new(1..=1),
+            KafkaOffsetReset::Latest,
+        )
+        .await
+        .expect_err("resetting offsets for a broadcast topology must be refused");
+
+    assert!(
+        matches!(err, ShoveError::Validation(_)),
+        "expected a Validation error, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("broadcast"),
+        "the error must name broadcast as the reason; got: {err}"
+    );
+
+    broker.close().await;
+}

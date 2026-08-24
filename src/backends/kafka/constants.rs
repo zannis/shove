@@ -58,6 +58,28 @@ pub(super) fn consumer_group_id_fifo_scoped(queue: &str, fan_out_group: Option<&
     }
 }
 
+/// The `group.id` a broadcast subscription's consumer handle is configured
+/// with — inert, and deliberately not a per-process value.
+///
+/// The design for this feature says "no `group.id`", and librdkafka will not
+/// allow that literally: `rd_kafka_assign()` returns `_UNKNOWN_GROUP`
+/// ("Requires a consumer with group.id configured") on a handle whose group id
+/// is empty, because the assignment machinery hangs off the consumer-group
+/// object. What the design is actually asking for — no broker-side group, no
+/// `__consumer_offsets` churn, no rebalance on boot — comes from never calling
+/// `subscribe()` and never committing, not from the string being absent. A
+/// manually assigned consumer sends no JoinGroup and no OffsetCommit, so the
+/// group is never created and never appears in `kafka-consumer-groups --list`.
+///
+/// It is a fixed function of the topic rather than a UUID for exactly the
+/// reason the design rules a per-process group out: a per-restart identifier is
+/// a per-restart name in every tool that enumerates group ids, which is the
+/// residue this feature exists to avoid. Every instance sharing one inert
+/// string leaves nothing to accumulate.
+pub(super) fn broadcast_group_id(queue: &str) -> String {
+    format!("{queue}-broadcast")
+}
+
 /// Derives the DLQ consumer group ID from a DLQ topic name.
 ///
 /// Takes the *resolved* DLQ topic name, so a fan-out group needs no special
