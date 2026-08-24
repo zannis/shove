@@ -419,10 +419,16 @@ mod tests {
             }
         });
 
-        // Let it reach the capacity wait on `doomed` before that subscriber goes.
-        while doomed.queue().buffer.lock().await.is_empty() {
+        // The publish must have *copied the doomed slot* before that subscriber
+        // goes, or the pre-fix code would skip the buffer for the ordinary
+        // reason (it was already deregistered) and the test would pass without
+        // the fix. The snapshot's own `Arc` clone is the observable that says
+        // so: the registry and the subscription hold one each, so a third
+        // strong reference can only be the publish holding it.
+        while Arc::strong_count(doomed.queue()) < 3 {
             tokio::task::yield_now().await;
         }
+        // And it must actually be parked, not merely started.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !publishing.is_finished(),

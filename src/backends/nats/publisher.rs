@@ -323,6 +323,46 @@ mod tests {
         }
     }
 
+    /// The classifier only decides which set an index lands in; this pins what
+    /// the caller actually receives once the publisher's two sets are resolved
+    /// into a report — including the invariant that makes the split safe to act
+    /// on. Mirrors `publish_batch_report`'s tail: ack results first, then the
+    /// submission break's `failed` / `unattempted`.
+    #[test]
+    fn an_unconfirmed_ack_is_reported_as_unattempted_not_failed() {
+        let total = 6;
+        // Indices 0..4 were submitted: 1 was rejected outright, 2's ack never
+        // resolved. Submission then broke at 4, leaving 5 unattempted.
+        let mut ack_rejected = vec![1];
+        let mut ack_unconfirmed = vec![2];
+        ack_rejected.extend(vec![4]);
+        ack_unconfirmed.extend(vec![5]);
+
+        let out = BatchReport::sparse(
+            ack_rejected,
+            ack_unconfirmed,
+            Some(ShoveError::Connection("ack timed out".into())),
+        )
+        .resolve(total);
+
+        let Err(ShoveError::PartialBatch(f)) = out.result else {
+            panic!("a batch with confirmed and unresolved records is partial");
+        };
+        assert_eq!(f.failed(), &[1, 4], "only explicit rejections are `failed`");
+        assert_eq!(
+            f.unattempted(),
+            &[2, 5],
+            "an unresolved ack sits with the never-submitted tail"
+        );
+        assert_eq!(f.to_republish(), &[1, 2, 4, 5]);
+        assert_eq!(f.succeeded(), 2);
+        assert_eq!(
+            f.succeeded() + f.failed().len() + f.unattempted().len(),
+            total
+        );
+        assert_eq!(f.succeeded() + f.to_republish().len(), total);
+    }
+
     #[test]
     fn server_rejections_are_explicit() {
         for kind in [
