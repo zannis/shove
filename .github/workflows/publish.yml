@@ -214,18 +214,39 @@ jobs:
           # The filename check alone vouches for nothing: `cargo set-version`
           # and `pnpm install` both write *inside* those four files, so a
           # dependency, feature or metadata rewrite passes it while still being
-          # a tree CI never built. Every line the commit adds must therefore be
-          # a version line naming the version being released.
-          added=$(git diff --unified=0 HEAD^ HEAD -- \
-            Cargo.toml Cargo.lock package.json pnpm-lock.yaml \
-            | grep -E '^\+' | grep -vE '^\+\+\+' || true)
+          # a tree CI never built.
+          #
+          # Both sides of the patch are checked, not just the additions: a
+          # commit that only *deletes* a dependency or feature line adds
+          # nothing, so an additions-only rule would wave it straight through.
+          patch=$(git diff --unified=0 HEAD^ HEAD -- \
+            Cargo.toml Cargo.lock package.json pnpm-lock.yaml)
+          added=$(printf '%s\n' "$patch" | grep -E '^\+' | grep -vE '^\+\+\+' || true)
+          removed=$(printf '%s\n' "$patch" | grep -E '^-' | grep -vE '^---' || true)
+          # Every added line must name the version being released...
           not_a_bump=$(printf '%s\n' "$added" \
             | grep -v '^$' \
             | grep -vE "^\\+[[:space:]]*\"?version\"?[[:space:]]*[:=][[:space:]]*\"?${VERSION}\"?,?$" \
             || true)
+          # ...and every removed line must be the version line it replaced.
+          not_a_bump="${not_a_bump}$(printf '%s\n' "$removed" \
+            | grep -v '^$' \
+            | grep -vE "^-[[:space:]]*\"?version\"?[[:space:]]*[:=]" \
+            || true)"
           if [ -n "$not_a_bump" ]; then
-            echo "::error::The release commit changes content beyond the version bump. These lines are not \`version = \"${VERSION}\"\`, so the tree being published is not the tree CI tested:"
+            echo "::error::The release commit changes content beyond the version bump. These lines are not the \`version\` edit to \"${VERSION}\", so the tree being published is not the tree CI tested:"
             printf '%s\n' "$not_a_bump"
+            exit 1
+          fi
+          # A version line is replaced, never added or dropped, so the two sides
+          # must balance. This is what catches a deletion whose line happens to
+          # look like a version -- a dependency's own `version = "..."` entry
+          # removed from Cargo.lock.
+          added_count=$(printf '%s\n' "$added" | grep -c '^+' || true)
+          removed_count=$(printf '%s\n' "$removed" | grep -c '^-' || true)
+          if [ "$added_count" != "$removed_count" ]; then
+            echo "::error::The release commit adds ${added_count} lines and removes ${removed_count}. A version bump replaces each version line it touches, so an imbalance means something was added or dropped outright."
+            printf '%s\n' "$patch"
             exit 1
           fi
           echo "Release commit is a pure version bump over the gated commit ${GATED_SHA}:"
