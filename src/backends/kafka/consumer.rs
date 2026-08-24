@@ -4257,10 +4257,6 @@ impl KafkaConsumer {
         drive_fifo_until_timeout(handles, shutdown, signal, drain_timeout).await
     }
 
-    /// Public DLQ entrypoint with default options. Equivalent to
-    /// [`run_dlq_with_options`](Self::run_dlq_with_options) with
-    /// `ConsumerOptions::new()`; kept for callers who don't need to thread
-    /// per-consumer options into the DLQ loop.
     /// Run this process's own groupless subscription to `T` until shutdown.
     ///
     /// Reached only through
@@ -4596,6 +4592,10 @@ impl KafkaConsumer {
         .await
     }
 
+    /// Public DLQ entrypoint with default options. Equivalent to
+    /// [`run_dlq_with_options`](Self::run_dlq_with_options) with
+    /// `ConsumerOptions::new()`; kept for callers who don't need to thread
+    /// per-consumer options into the DLQ loop.
     pub async fn run_dlq<T, H>(&self, handler: H, ctx: H::Context) -> Result<()>
     where
         T: Topic,
