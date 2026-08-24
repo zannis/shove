@@ -130,6 +130,74 @@ mod settling {
             RetryDecision::Hold { .. } => BroadcastAction::Redeliver,
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn settles_done(outcome: Outcome) -> bool {
+            matches!(
+                settle_broadcast_outcome(&outcome, "t", None),
+                BroadcastAction::Done
+            )
+        }
+
+        /// The load-bearing case, and the one that would be silently wrong if
+        /// the budget boundary were `>` instead of `>=`: with `max_retries`
+        /// pinned to zero, the *first* `Retry` must be terminal. If it resolved
+        /// to `Redeliver` instead, a failing handler would be handed the same
+        /// message forever — no DLQ, no counter moving, and nothing in the
+        /// delivery loop to stop it.
+        #[test]
+        fn retry_is_terminal_on_the_first_attempt() {
+            assert!(
+                settles_done(Outcome::Retry),
+                "a broadcast Retry must discard immediately, not redeliver"
+            );
+        }
+
+        #[test]
+        fn reject_is_terminal() {
+            assert!(settles_done(Outcome::Reject));
+        }
+
+        #[test]
+        fn ack_is_terminal() {
+            assert!(settles_done(Outcome::Ack));
+        }
+
+        /// `Defer` is the only outcome that comes back for another attempt —
+        /// the "redelivered within this subscription only" half of the contract.
+        #[test]
+        fn defer_redelivers() {
+            assert!(
+                matches!(
+                    settle_broadcast_outcome(&Outcome::Defer, "t", None),
+                    BroadcastAction::Redeliver
+                ),
+                "a broadcast Defer must redeliver within the subscription"
+            );
+        }
+
+        /// Pins the reason strings the discard is attributed to. These are not
+        /// cosmetic: `docs/pages/concepts/broadcast.mdx` promises that an
+        /// existing `shove_messages_discarded_total` alert covers broadcast
+        /// unchanged, which only holds while broadcast reports the same reasons
+        /// a no-DLQ topology already does.
+        #[test]
+        fn terminal_reasons_match_the_existing_no_dlq_arm() {
+            assert_eq!(
+                decide_retry(&Outcome::Retry, 0, 0),
+                RetryDecision::Dlq {
+                    reason: "max_retries_exceeded"
+                }
+            );
+            assert_eq!(
+                decide_retry(&Outcome::Reject, 0, 0),
+                RetryDecision::Dlq { reason: "rejected" }
+            );
+        }
+    }
 }
 
 #[cfg(any(feature = "nats", feature = "redis-streams"))]
