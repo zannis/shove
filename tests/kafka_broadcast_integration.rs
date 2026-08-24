@@ -61,6 +61,14 @@ define_topic!(
         .build()
 );
 
+define_topic!(
+    RetryTopic,
+    Invalidate,
+    TopologyBuilder::new("kafka-broadcast-retry")
+        .broadcast()
+        .build()
+);
+
 // The control for AC6: an ordinary competing-consumer topic whose group the
 // broker *does* register.
 define_topic!(
@@ -104,6 +112,21 @@ macro_rules! recorder_for {
 }
 
 recorder_for!(CacheInvalidations, ControlTopic, DeferTopic);
+
+/// Always returns `Retry`. Counts calls, so a redelivery loop is visible as a
+/// count above one rather than as a hang.
+#[derive(Clone, Default)]
+struct AlwaysRetry {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl MessageHandler<RetryTopic> for AlwaysRetry {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.calls.lock().await.push(msg.key);
+        Outcome::Retry
+    }
+}
 
 /// Defers the first delivery of each key and acks the redelivery.
 #[derive(Clone, Default)]
@@ -496,4 +519,71 @@ async fn reset_consumer_group_offsets_refuses_a_broadcast_topology() {
     );
 
     broker.close().await;
+}
+
+/// `Retry` on a broadcast subscription discards, and does not loop.
+///
+/// This is the arm a naive implementation gets wrong in the most expensive way.
+/// Kafka's shared `route_outcome` turns a `Retry` under budget into a delayed
+/// **republish to the topic** — which on a broadcast topic is not a retry at
+/// all: it fans the message back out to every instance, forever, at one
+/// redelivery per second per subscriber. So the observable that matters is not
+/// "the message was discarded" but "the handler ran exactly once, on each
+/// instance", and a second subscriber is here to catch the fan-out half of it.
+#[tokio::test]
+async fn retry_discards_instead_of_looping_the_fan_out() {
+    let tb = TestBroker::start().await;
+
+    let publisher_broker = tb.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<RetryTopic>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let mut running = Vec::new();
+    let mut handlers = Vec::new();
+    for _ in 0..2 {
+        let broker = tb.broker().await;
+        let handler = AlwaysRetry::default();
+        let mut sub = broker.broadcast_subscriber();
+        sub.subscribe::<RetryTopic, _>(handler.clone(), ConsumerOptions::new())
+            .expect("failed to subscribe");
+        handlers.push(handler);
+        running.push((broker, sub));
+    }
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher")
+        .publish::<RetryTopic>(&Invalidate {
+            key: "doomed".into(),
+        })
+        .await
+        .expect("publish failed");
+
+    // Well past the one-second republish delay a looping implementation would
+    // use, so "did not loop" is an observation rather than an absence of time.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    for (i, handler) in handlers.iter().enumerate() {
+        let calls = handler.calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec!["doomed".to_string()],
+            "subscriber {i} handled a Retry more than once — broadcast has no retry chain, \
+             so the first Retry must discard"
+        );
+    }
+
+    for (broker, sub) in running {
+        sub.cancellation_token().cancel();
+        let _ = sub
+            .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+            .await;
+        broker.close().await;
+    }
+    publisher_broker.close().await;
 }

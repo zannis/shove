@@ -244,6 +244,14 @@ define_topic!(
         .build()
 );
 
+define_topic!(
+    RetryTopic,
+    Invalidate,
+    TopologyBuilder::new("rmq-broadcast-retry")
+        .broadcast()
+        .build()
+);
+
 /// Records every key it sees and acks.
 #[derive(Clone, Default)]
 struct Recorder {
@@ -276,6 +284,21 @@ macro_rules! recorder_for {
 }
 
 recorder_for!(CacheInvalidations, DeferTopic);
+
+/// Always returns `Retry`. Counts calls, so a redelivery loop is visible as a
+/// count above one rather than as a hang.
+#[derive(Clone, Default)]
+struct AlwaysRetry {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl MessageHandler<RetryTopic> for AlwaysRetry {
+    type Context = ();
+    async fn handle(&self, msg: Invalidate, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.calls.lock().await.push(msg.key);
+        Outcome::Retry
+    }
+}
 
 /// Defers the first delivery of each key and acks the redelivery, so the count
 /// of handler calls tells `Defer` redelivered from a count of calls that says
@@ -554,6 +577,65 @@ async fn defer_redelivers_only_to_the_subscriber_that_deferred() {
             .await;
         broker.close().await;
     }
+    publisher_broker.close().await;
+    ctx.cleanup().await;
+}
+
+/// `Retry` on a broadcast subscription discards, and does not loop.
+///
+/// RabbitMQ's shared `route_retry` falls back to a nack-**requeue** when a
+/// topology declares no hold queues, and a broadcast topology can declare none.
+/// Requeuing onto an exclusive queue puts the message straight back in front of
+/// the same consumer, so reusing that path here would spin a broadcast message
+/// forever at full speed. Hence the observable: exactly one handler call.
+#[tokio::test]
+async fn retry_discards_instead_of_requeuing_forever() {
+    let ctx = TestContext::new().await;
+
+    let publisher_broker = ctx.broker().await;
+    publisher_broker
+        .topology()
+        .declare::<RetryTopic>()
+        .await
+        .expect("failed to declare broadcast topology");
+
+    let broker = ctx.broker().await;
+    let handler = AlwaysRetry::default();
+    let mut sub = broker.broadcast_subscriber();
+    sub.subscribe::<RetryTopic, _>(handler.clone(), ConsumerOptions::new())
+        .expect("failed to subscribe");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while ctx.queue_names().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(ctx.queue_names().await.len(), 1);
+
+    publisher_broker
+        .publisher()
+        .await
+        .expect("failed to build publisher")
+        .publish::<RetryTopic>(&Invalidate {
+            key: "doomed".into(),
+        })
+        .await
+        .expect("broadcast publish failed");
+
+    // A requeue loop on an exclusive queue redelivers with no delay at all, so
+    // a few seconds is thousands of calls rather than a second one.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    assert_eq!(
+        handler.calls.lock().await.clone(),
+        vec!["doomed".to_string()],
+        "a broadcast Retry must discard on the first attempt, not requeue"
+    );
+
+    sub.cancellation_token().cancel();
+    let _ = sub
+        .run_until_timeout(std::future::pending(), Duration::from_secs(10))
+        .await;
+    broker.close().await;
     publisher_broker.close().await;
     ctx.cleanup().await;
 }
