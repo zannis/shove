@@ -142,9 +142,15 @@ jobs:
         if: inputs.bump != 'none'
         run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version
 
-      - name: Update pnpm lockfile
+      # `--frozen-lockfile`, so this validates rather than rewrites. The lockfile
+      # does not record the root package's own version, so a bump gives it
+      # nothing to sync -- but `package.json` floats `react`, `typescript` and
+      # `@types/react` on `latest`, so a plain `pnpm install` here would
+      # re-resolve them and fold a docs-dependency upgrade CI never built into a
+      # commit labelled "pure version bump".
+      - name: Verify the pnpm lockfile still matches package.json
         if: inputs.bump != 'none'
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Import GPG signing key
         if: inputs.bump != 'none'
@@ -186,6 +192,7 @@ jobs:
         if: inputs.bump != 'none'
         env:
           GATED_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           parent=$(git rev-parse HEAD^)
           if [ "$parent" != "$GATED_SHA" ]; then
@@ -202,6 +209,23 @@ jobs:
           if [ -n "$unexpected" ]; then
             echo "::error::The release commit changes files beyond the version bump. CI never saw these, and this job does not test them:"
             printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          # The filename check alone vouches for nothing: `cargo set-version`
+          # and `pnpm install` both write *inside* those four files, so a
+          # dependency, feature or metadata rewrite passes it while still being
+          # a tree CI never built. Every line the commit adds must therefore be
+          # a version line naming the version being released.
+          added=$(git diff --unified=0 HEAD^ HEAD -- \
+            Cargo.toml Cargo.lock package.json pnpm-lock.yaml \
+            | grep -E '^\+' | grep -vE '^\+\+\+' || true)
+          not_a_bump=$(printf '%s\n' "$added" \
+            | grep -v '^$' \
+            | grep -vE "^\\+[[:space:]]*\"?version\"?[[:space:]]*[:=][[:space:]]*\"?${VERSION}\"?,?$" \
+            || true)
+          if [ -n "$not_a_bump" ]; then
+            echo "::error::The release commit changes content beyond the version bump. These lines are not \`version = \"${VERSION}\"\`, so the tree being published is not the tree CI tested:"
+            printf '%s\n' "$not_a_bump"
             exit 1
           fi
           echo "Release commit is a pure version bump over the gated commit ${GATED_SHA}:"
