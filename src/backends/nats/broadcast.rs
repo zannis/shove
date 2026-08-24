@@ -81,6 +81,14 @@ use super::consumer::{
 /// pull requests count as activity.
 const BROADCAST_INACTIVE_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// How many times the awaited teardown asks the server to delete the consumer
+/// before leaving it to the guard and `BROADCAST_INACTIVE_THRESHOLD`.
+const BROADCAST_DELETE_ATTEMPTS: u32 = 3;
+
+/// Gap between those attempts. Short: this sits on the shutdown path, and the
+/// failure it covers is a blip rather than an outage.
+const BROADCAST_DELETE_RETRY_DELAY: Duration = Duration::from_millis(200);
+
 /// Deletes this subscription's ephemeral consumer when it goes out of scope.
 ///
 /// The awaited delete on the happy path is the primary mechanism; this guard
@@ -160,21 +168,59 @@ async fn delete_ephemeral(client: &NatsClient, stream: &str, consumer: &str) -> 
         }
     };
     match js_stream.delete_consumer(consumer).await {
-        Ok(_) => {
+        // `DeleteStatus` carries the server's own verdict. `Ok` means the
+        // request round-tripped, not that the consumer went, so a `success:
+        // false` reply has to keep the guard armed like any other failure.
+        Ok(status) if status.success => {
             tracing::debug!(stream, consumer, "ephemeral broadcast consumer deleted");
             true
+        }
+        Ok(_) => {
+            tracing::warn!(
+                stream,
+                consumer,
+                "the server declined to delete the ephemeral broadcast consumer"
+            );
+            false
         }
         Err(e) => {
             tracing::warn!(
                 stream,
                 consumer,
                 error = %e,
-                "failed to delete the ephemeral broadcast consumer; the server's \
-                 inactive_threshold will reap it"
+                "failed to delete the ephemeral broadcast consumer"
             );
             false
         }
     }
+}
+
+/// Attempts a delete until the server confirms it, or the budget runs out.
+///
+/// The awaited delete is what makes "nothing survives the future resolving"
+/// literally true, so a single failed attempt handing off to a detached `Drop`
+/// spawn would give that up for a transient blip. Bounded rather than
+/// open-ended: this runs on the shutdown path, where a drain is already racing
+/// a deadline, and `inactive_threshold` is the backstop that makes giving up
+/// safe.
+async fn delete_ephemeral_with_retry(client: &NatsClient, stream: &str, consumer: &str) -> bool {
+    for attempt in 0..BROADCAST_DELETE_ATTEMPTS {
+        if delete_ephemeral(client, stream, consumer).await {
+            return true;
+        }
+        if attempt.saturating_add(1) < BROADCAST_DELETE_ATTEMPTS {
+            tokio::time::sleep(BROADCAST_DELETE_RETRY_DELAY).await;
+        }
+    }
+    tracing::warn!(
+        stream,
+        consumer,
+        attempts = BROADCAST_DELETE_ATTEMPTS,
+        threshold_secs = BROADCAST_INACTIVE_THRESHOLD.as_secs(),
+        "giving up on deleting the ephemeral broadcast consumer; the guard's \
+         detached attempt and the server's inactive_threshold are what remain"
+    );
+    false
 }
 
 impl NatsConsumer {
@@ -290,7 +336,7 @@ where
             // Disarmed only once the delete is confirmed: disarming first would
             // drop the guard's second chance if this await were cancelled
             // mid-delete, or if the delete simply failed.
-            if delete_ephemeral(&client, queue, &consumer_name).await {
+            if delete_ephemeral_with_retry(&client, queue, &consumer_name).await {
                 guard.disarm();
             }
 
