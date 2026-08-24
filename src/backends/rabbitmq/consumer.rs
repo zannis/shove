@@ -2012,7 +2012,11 @@ impl RabbitMqConsumer {
             opts.prefetch_count = prefetch;
             // Per shard: each tracks its own in-flight count and stores
             // `in_flight_count > 0`, so one shared flag would let an idle shard
-            // clear a busy shard's mark.
+            // clear a busy shard's mark. The consequence, unchanged from before
+            // this clone: a caller's own `processing_handle()` stays flat on
+            // this path. Inert for scaling, because a FIFO group is pinned to
+            // one consumer and `scale_down` refuses at `min_consumers`.
+            // Aggregating it honestly needs a busy-shard counter, not a bool.
             opts.processing = Arc::new(AtomicBool::new(false));
             handles.push(tokio::spawn(async move {
                 let consumer = RabbitMqConsumer::new(inner_client);

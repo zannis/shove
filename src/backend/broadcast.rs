@@ -32,6 +32,17 @@ pub(crate) trait BroadcastImpl: Send + Sync {
     ///   resolves — no consumer group, no durable consumer, no leftover queue.
     ///   The teardown also has to survive the task being dropped mid-run,
     ///   which is what a drain-timeout abort does.
+    ///
+    ///   Where a backend's teardown is a request that can be refused, that
+    ///   holds for the path where the request succeeds, and *eventual* cleanup
+    ///   is the guarantee otherwise. NATS is the case in point: an ephemeral
+    ///   consumer is deleted by an awaited request, retried a bounded number
+    ///   of times, then left to a drop guard's detached attempt and finally to
+    ///   the server's `inactive_threshold`. So a future can resolve with the
+    ///   consumer still present for up to that interval after a delete the
+    ///   server would not honour. Redis and Kafka have nothing to refuse —
+    ///   neither creates broker-side state to begin with — and RabbitMQ's
+    ///   exclusive auto-delete queue is removed by the broker on disconnect.
     /// - **One consumer.** Exactly one delivery loop per call. Broadcast has no
     ///   autoscaling: a second consumer in the same process would split this
     ///   subscription rather than duplicate it.
