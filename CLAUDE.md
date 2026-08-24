@@ -8,18 +8,20 @@ human build/test/lint workflow see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 `shove` is a type-safe, async pub/sub library over six message backends. The
 entire public surface hangs off a single generic `Broker<B>`: you parameterize
 it with a backend marker type `B`, and one consistent API (publish, consume,
-consumer groups, topology, autoscaling) works across every backend.
+consumer groups, broadcast, topology, autoscaling) works across every backend.
 
 ## Architecture map
 
 - **Generic layer** lives directly in `src/`: `broker.rs`, `publisher.rs`,
-  `consumer.rs`, `consumer_group.rs`, `consumer_supervisor.rs`, `autoscaler.rs`,
-  `topology.rs`, `topology_declarer.rs`. These are backend-agnostic wrappers
-  around `Broker<B>`.
+  `consumer.rs`, `consumer_group.rs`, `consumer_supervisor.rs`, `broadcast.rs`,
+  `autoscaler.rs`, `topology.rs`, `topology_declarer.rs`. These are
+  backend-agnostic wrappers around `Broker<B>`.
 - **Per-backend implementations** live in `src/backends/<name>/`. Each backend
   has the same file layout: `backend.rs`, `client.rs`, `consumer.rs`,
   `consumer_group.rs`, `publisher.rs`, `topology.rs`, `autoscaler.rs`, plus
-  `constants.rs`/`headers.rs`.
+  `constants.rs`/`headers.rs`. NATS and Redis put their ephemeral broadcast
+  loop in a `broadcast.rs`; Kafka, RabbitMQ and InMemory keep theirs in
+  `consumer.rs`.
 - The **sealed `Backend` trait** (`src/backend/mod.rs`) binds, for each marker
   type, that backend's client / publisher / consumer / topology / registry
   types. Being sealed means external crates cannot add backends.
@@ -39,11 +41,22 @@ Other add-on features: `audit`, `metrics`, `protobuf`, `rabbitmq-transactional`.
 
 ## Capability gating
 
-- Kafka, RabbitMQ, NATS, InMemory, and Redis implement `HasCoordinatedGroups`
-  and expose `Broker::consumer_group`.
-- SQS does **not** implement `HasCoordinatedGroups` — calling `consumer_group()`
-  on `Broker<Sqs>` is a **compile error**. SQS uses `ConsumerSupervisor`
-  (`src/consumer_supervisor.rs`) instead.
+Two traits in `src/backend/capability.rs` gate a public entry point to the
+backends that have the underlying broker primitive. SQS implements neither, so
+both are compile errors on `Broker<Sqs>` rather than runtime surprises.
+
+- `HasCoordinatedGroups` gates `Broker::consumer_group`. Kafka, RabbitMQ, NATS,
+  InMemory and Redis implement it; SQS instead uses `ConsumerSupervisor`
+  (`src/consumer_supervisor.rs`), which is N parallel independent pollers.
+- `HasBroadcast` gates `Broker::broadcast_subscriber` — each process gets its
+  own ephemeral subscription, so every instance receives every message. Kafka,
+  RabbitMQ, NATS, InMemory and Redis implement it. SQS is excluded
+  **permanently**, not pending: per-process fan-out there needs a real queue
+  plus an SNS subscription whose lifecycle shove does not manage, and a leaked
+  queue costs money forever.
+
+The trait's own doc comment is the authoritative per-backend list — update it
+there rather than restating the table in a third place.
 
 ## Where things live
 
@@ -55,6 +68,12 @@ Other add-on features: `audit`, `metrics`, `protobuf`, `rabbitmq-transactional`.
   `src/backends/<name>/consumer.rs::route_outcome` (RabbitMQ also has
   `src/backends/rabbitmq/router.rs`). This is where a delivery-semantics
   decision is turned into ack/commit/publish/DLQ mechanics.
+- **Broadcast outcome settling** — `src/backend/broadcast.rs::settle_broadcast_outcome`,
+  shared by the Kafka, NATS and Redis broadcast loops. It does **not** go
+  through `route_outcome`, so a retry/discard fix applied to every backend's
+  `route_outcome` still misses broadcast. RabbitMQ settles broadcast through
+  its own router (an AMQP delivery must be nacked on the channel it arrived
+  on), and InMemory reuses its own `route_outcome` over a private buffer.
 
 ## Build / test / lint commands
 
@@ -78,7 +97,8 @@ Other add-on features: `audit`, `metrics`, `protobuf`, `rabbitmq-transactional`.
   routing, defer handling) usually must be fixed in **all** backends'
   `route_outcome`, not just one. The git history shows recurring
   "cross-backend consistency" commits because a fix landed in one backend and
-  was missed in the others. When you touch retry/DLQ logic, check every backend.
+  was missed in the others. When you touch retry/DLQ logic, check every backend
+  — and the broadcast settling path above, which bypasses `route_outcome`.
 - **Conventional Commits** for commit messages. No CHANGELOG — releases are
   `release: vX.Y.Z` commits.
 - Do **not** add `Co-Authored-By` trailers to commits.
