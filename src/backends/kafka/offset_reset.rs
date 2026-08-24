@@ -193,20 +193,34 @@ fn target_from_watermarks(target: WatermarkTarget, low: i64, high: i64) -> i64 {
 /// Target offset for one partition from an `offsets_for_times` result.
 ///
 /// Kafka answers "no record at or after that timestamp" with a null offset,
-/// which librdkafka surfaces as `Offset::End` (and, for a partition it could
-/// not resolve at all, `Offset::Invalid`). Both mean the same thing for a
-/// re-anchor: there is nothing left to read from that point, so the group
-/// belongs at the tail. Anything else is a concrete offset.
+/// which librdkafka passes through as `-1` and rdkafka reads as `Offset::End`.
+/// That is a real answer, and the tail is the right re-anchor for it.
 ///
-/// Every branch resolves to a real offset inside `low..=high`, never a
-/// symbolic one: a committed offset outside the retained range would be
-/// silently reinterpreted by `auto.offset.reset` on the next join, quietly
-/// undoing the reset.
-fn target_from_timestamp_lookup(looked_up: Offset, low: i64, high: i64) -> i64 {
+/// `Offset::Invalid` is librdkafka's own `-1001` sentinel and means the
+/// opposite: the partition was never resolved. Reading it as "nothing after
+/// this point" would commit the high watermark and skip every record the reset
+/// was asked to replay, so it is refused here along with any other offset that
+/// is not a real position.
+///
+/// Every accepted branch resolves inside `low..=high`, never to a symbolic
+/// offset: a committed offset outside the retained range would be silently
+/// reinterpreted by `auto.offset.reset` on the next join, undoing the reset.
+fn target_from_timestamp_lookup(
+    looked_up: Offset,
+    low: i64,
+    high: i64,
+    queue: &str,
+    partition: i32,
+) -> Result<i64> {
     match looked_up {
-        Offset::Offset(n) if n >= 0 => n.clamp(low, high),
-        Offset::Beginning => low,
-        _ => high,
+        Offset::Offset(n) if n >= 0 => Ok(n.clamp(low, high)),
+        Offset::Beginning => Ok(low),
+        Offset::End => Ok(high),
+        other => Err(ShoveError::Connection(format!(
+            "offset lookup by timestamp did not resolve {queue}[{partition}] \
+             (got {other:?}); refusing to re-anchor it at a position the broker \
+             never gave"
+        ))),
     }
 }
 
@@ -401,7 +415,7 @@ where
                         "offset lookup by timestamp returned no entry for {queue}[{pid}]"
                     ))
                 })?;
-                let target = target_from_timestamp_lookup(found, low, high);
+                let target = target_from_timestamp_lookup(found, low, high, queue, pid)?;
                 targets
                     .add_partition_offset(queue, pid, Offset::Offset(target))
                     .map_err(|e| {
@@ -649,28 +663,38 @@ mod tests {
         );
     }
 
+    fn ts_target(looked_up: Offset, low: i64, high: i64) -> Result<i64> {
+        target_from_timestamp_lookup(looked_up, low, high, "prices", 3)
+    }
+
     #[test]
     fn timestamp_lookup_uses_the_resolved_offset() {
-        assert_eq!(
-            target_from_timestamp_lookup(Offset::Offset(55), 40, 100),
-            55
-        );
+        assert_eq!(ts_target(Offset::Offset(55), 40, 100).unwrap(), 55);
     }
 
     #[test]
     fn timestamp_past_the_last_record_falls_back_to_the_tail() {
         // Kafka returns a null offset ("no record at or after that time"),
-        // which librdkafka surfaces as `End`.
-        assert_eq!(target_from_timestamp_lookup(Offset::End, 40, 100), 100);
+        // which librdkafka passes through as -1 and rdkafka reads as `End`.
+        // That is an answer, so the tail is the right re-anchor.
+        assert_eq!(ts_target(Offset::End, 40, 100).unwrap(), 100);
     }
 
+    /// `Offset::Invalid` is librdkafka's -1001 "not set" sentinel, not Kafka's
+    /// -1 "no record after that time". Re-anchoring it at the tail would commit
+    /// past every record the reset was asked to replay and report success, so a
+    /// partition that never resolved must fail the reset by name instead.
     #[test]
-    fn unresolvable_timestamp_partition_falls_back_to_the_tail() {
-        assert_eq!(target_from_timestamp_lookup(Offset::Invalid, 40, 100), 100);
-        assert_eq!(
-            target_from_timestamp_lookup(Offset::Offset(-1), 40, 100),
-            100
-        );
+    fn an_unresolved_timestamp_partition_is_refused_rather_than_tailed() {
+        for unresolved in [Offset::Invalid, Offset::Offset(-1), Offset::Stored] {
+            let err = ts_target(unresolved, 40, 100)
+                .expect_err("an unresolved partition must not resolve to an offset");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("prices[3]"),
+                "the error must name the partition, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -678,16 +702,13 @@ mod tests {
         // The head is the *low watermark*, not literal 0: committing 0 on a
         // partition whose history has aged out would fall outside the retained
         // range and be reinterpreted by `auto.offset.reset`.
-        assert_eq!(target_from_timestamp_lookup(Offset::Beginning, 40, 100), 40);
+        assert_eq!(ts_target(Offset::Beginning, 40, 100).unwrap(), 40);
     }
 
     #[test]
     fn a_resolved_offset_is_clamped_into_the_retained_range() {
-        assert_eq!(target_from_timestamp_lookup(Offset::Offset(5), 40, 100), 40);
-        assert_eq!(
-            target_from_timestamp_lookup(Offset::Offset(500), 40, 100),
-            100
-        );
+        assert_eq!(ts_target(Offset::Offset(5), 40, 100).unwrap(), 40);
+        assert_eq!(ts_target(Offset::Offset(500), 40, 100).unwrap(), 100);
     }
 
     #[test]
