@@ -232,6 +232,18 @@ jobs:
             exit 1
           fi
 
+          # A diff is more than its lines: a mode change, a rename, a symlink
+          # swap, an addition or a deletion all leave the content check with
+          # nothing to look at. `git diff --summary` is empty for a commit that
+          # only edits existing regular files in place, which is exactly what a
+          # version bump is.
+          structural=$(git diff --summary HEAD^ HEAD)
+          if [ -n "$structural" ]; then
+            echo "::error::The release commit changes more than file contents. A version bump edits four files in place and does nothing else:"
+            printf '%s\n' "$structural"
+            exit 1
+          fi
+
           # One line replaced, in each file that changed at all. Anything
           # smuggled alongside the bump -- added, removed, or swapped -- moves
           # this count off two.
