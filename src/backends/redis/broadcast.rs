@@ -311,7 +311,7 @@ async fn handle_entry<T, H>(
         .await;
         options.processing.store(false, Ordering::Release);
 
-        match settle_broadcast_outcome(&outcome, topic, None) {
+        match settle_broadcast_outcome(&outcome, topic, options.consumer_group.as_deref()) {
             BroadcastAction::Done => return,
             BroadcastAction::Redeliver => {
                 tokio::select! {
