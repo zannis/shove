@@ -105,7 +105,7 @@ fn poison_key(poisoned: &PoisonedKeys, key: &str, queue: &str) {
 }
 
 /// Extracts message metadata from a JetStream message.
-fn extract_message_metadata(msg: &Message) -> MessageMetadata {
+pub(super) fn extract_message_metadata(msg: &Message) -> MessageMetadata {
     let retry_count = get_retry_count(&msg.headers);
 
     let delivery_id = msg
@@ -499,7 +499,7 @@ where
 /// Maps a NATS `GetStreamError` to the appropriate `ShoveError` variant based
 /// on the underlying error kind. Only `Request` errors (transient network
 /// failures) become `Connection`; everything else is a `Topology` error.
-fn map_get_stream_error(queue: &str, e: GetStreamError) -> ShoveError {
+pub(super) fn map_get_stream_error(queue: &str, e: GetStreamError) -> ShoveError {
     match e.kind() {
         GetStreamErrorKind::Request => {
             ShoveError::Connection(format!("failed to get stream {queue}: {e}"))
@@ -518,7 +518,7 @@ const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(60);
 
 /// Runs `f` in a reconnect loop, retrying on transient errors until shutdown
 /// or `max_retries` consecutive failures.
-async fn run_with_reconnect<F, Fut>(
+pub(super) async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
     max_reconnect_attempts: Option<u32>,
@@ -589,6 +589,13 @@ pub struct NatsConsumer {
 impl NatsConsumer {
     pub fn new(client: NatsClient) -> Self {
         Self { client }
+    }
+
+    /// The underlying client, for the sibling broadcast module — which needs
+    /// the raw JetStream context to create and delete its own ephemeral
+    /// consumer rather than reading a pre-declared durable one by name.
+    pub(super) fn client_ref(&self) -> &NatsClient {
+        &self.client
     }
 }
 

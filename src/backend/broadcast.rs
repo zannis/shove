@@ -45,3 +45,92 @@ pub(crate) trait BroadcastImpl: Send + Sync {
         T: Topic,
         H: MessageHandler<T>;
 }
+
+// Gated to the backends that actually call it, for two reasons. `routing` is
+// itself compiled only when some backend is, so an ungated body fails to
+// resolve `crate::routing` under `--no-default-features`. And InMemory is
+// deliberately *not* in the list: its broadcast path reuses its own
+// `route_outcome` over a private buffer, so including it would leave this
+// re-export unused under `--features inmemory` alone — which `-D warnings`
+// rejects, and which CI's per-feature clippy legs would catch.
+#[cfg(any(feature = "nats", feature = "redis-streams"))]
+mod settling {
+    use std::time::Duration;
+
+    use crate::metrics;
+    use crate::outcome::Outcome;
+    use crate::routing::{RetryDecision, decide_retry};
+
+    /// How long a `Defer` waits before the same message is handed back to the
+    /// handler.
+    ///
+    /// A broadcast topology cannot declare hold queues (`build()` rejects the
+    /// pair), so there is no configured backoff to read. One second matches the
+    /// fallback every backend's `route_outcome` already uses when `hold_queues` is
+    /// empty, so a `Defer` on a broadcast subscription is paced like a `Defer`
+    /// anywhere else.
+    #[allow(dead_code)] // Callers gated behind backend features.
+    pub(crate) const BROADCAST_DEFER_DELAY: Duration = Duration::from_secs(1);
+
+    /// What the delivery loop should do with a message after the handler has run.
+    #[allow(dead_code)] // Callers gated behind backend features.
+    pub(crate) enum BroadcastAction {
+        /// The message is finished with — acked, or discarded and already counted.
+        Done,
+        /// `Outcome::Defer`: hand the *same* message back to the handler after
+        /// [`BROADCAST_DEFER_DELAY`], within this subscription only.
+        Redeliver,
+    }
+
+    /// Settle a handler outcome on an ephemeral broadcast subscription.
+    ///
+    /// Shared by every backend's broadcast loop so the terminal accounting cannot
+    /// drift between them — the recurring cross-backend defect this crate keeps
+    /// paying for when each `route_outcome` restates the same rule.
+    ///
+    /// The decision itself still goes through [`decide_retry`], with the retry
+    /// budget pinned to zero exactly as
+    /// [`BroadcastSubscriber::subscribe`](crate::broadcast::BroadcastSubscriber::subscribe)
+    /// pins it. That is deliberate: a `Retry` must land on the *existing* no-DLQ
+    /// terminal arm and report `reason="max_retries_exceeded"`, so an operator's
+    /// existing `shove_messages_discarded_total` alert covers broadcast without
+    /// being taught about a second, quieter discard path.
+    #[allow(dead_code)] // Callers gated behind backend features.
+    pub(crate) fn settle_broadcast_outcome(
+        outcome: &Outcome,
+        topic: &str,
+        group: Option<&str>,
+    ) -> BroadcastAction {
+        match decide_retry(outcome, 0, 0) {
+            RetryDecision::Ack => BroadcastAction::Done,
+            RetryDecision::Dlq { reason } => {
+                let fail_reason = match reason {
+                    "rejected" => metrics::FailReason::Rejected,
+                    _ => metrics::FailReason::MaxRetriesExceeded,
+                };
+                tracing::warn!(
+                    topic,
+                    reason,
+                    "broadcast subscription has no DLQ — discarding message"
+                );
+                // Confirmed immediately, unlike every other backend's terminal
+                // path, and that is correct rather than sloppy: an ephemeral
+                // broadcast subscription has no retirement operation that can fail.
+                // NATS reads it with `AckPolicy::None` and Redis with a bare
+                // `XREAD` (no group, so no PEL and no `XACK`), so nothing on either
+                // broker is still holding the delivery and no redelivery can
+                // resurrect it. The message is already gone at this point.
+                metrics::record_terminal(topic, group, fail_reason, false).confirm();
+                BroadcastAction::Done
+            }
+            // `Hold { increment: false }` is `Outcome::Defer`. `increment: true`
+            // (a `Retry` with budget left) is unreachable here because the budget
+            // is pinned to zero, but redelivering is the safe reading of it either
+            // way: it keeps the message alive rather than dropping it uncounted.
+            RetryDecision::Hold { .. } => BroadcastAction::Redeliver,
+        }
+    }
+}
+
+#[cfg(any(feature = "nats", feature = "redis-streams"))]
+pub(crate) use settling::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};

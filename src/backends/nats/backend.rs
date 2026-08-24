@@ -18,8 +18,10 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    RegistryImpl, TopologyImpl, capability::HasCoordinatedGroups, sealed,
+    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
+    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBroadcast, HasCoordinatedGroups},
+    sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
@@ -108,6 +110,33 @@ impl HasCoordinatedGroups for Nats {
 // ---------------------------------------------------------------------------
 // ConsumerImpl — delegate through the existing `Consumer` trait (Context = ())
 // ---------------------------------------------------------------------------
+
+impl HasBroadcast for Nats {
+    // Same type as the competing-consumer path: a broadcast subscription is
+    // another delivery loop over the same stream, differing in the consumer it
+    // creates (ephemeral, `AckPolicy::None`, `DeliverPolicy::New`) rather than
+    // in what it needs from the client.
+    type BroadcastImpl = NatsConsumer;
+
+    fn make_broadcast(client: &Self::Client) -> Self::BroadcastImpl {
+        NatsConsumer::new(client.clone())
+    }
+}
+
+impl BroadcastImpl for NatsConsumer {
+    async fn run_broadcast<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        NatsConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+}
 
 impl ConsumerImpl for NatsConsumer {
     async fn run<T, H>(

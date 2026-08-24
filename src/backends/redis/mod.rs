@@ -5,6 +5,7 @@
 
 mod autoscaler;
 mod backend;
+mod broadcast;
 pub(super) mod client;
 pub(super) mod constants;
 mod consumer;

@@ -45,24 +45,28 @@ So `.broadcast()` implies `allow_message_loss`, and the retry budget is pinned t
 
 That is the same terminal path a topology with no DLQ already takes, so an existing data-loss alert on `shove_messages_discarded_total` covers broadcast without changes. If losing a message on handler failure is unacceptable for your use case, broadcast is the wrong primitive — use a consumer group per reader with `for_consumer_group`.
 
+`Defer` deserves one warning. A broadcast subscription is a single delivery loop, so a deferred message is retried **in place**, holding up the messages behind it — and because `Defer` never spends the retry budget, a handler that always defers stalls the subscription indefinitely. There is nowhere else to put the message: no second consumer to hand the backlog to, and no DLQ or hold queue to park it in. Use `Defer` on a broadcast topic only for a condition you expect to clear on its own.
+
 **One consumer per instance.** There is no autoscaling knob on `BroadcastSubscriber`, because a second consumer inside the same process would *split* the fan-out rather than duplicate it — competing consumption sneaking back in through the wrong door. Registering a `.broadcast()` topology on `consumer_group()` or `consumer_supervisor()` returns a `ShoveError::Topology` for the same reason.
 
-**Ephemeral identity.** The subscription is created when the delivery loop starts and destroyed when it ends, including when the process dies without draining. Nothing accumulates per pod restart. This is the property that the obvious workarounds — a per-pod UUID consumer group on Kafka or Redis — fail: each of those leaves broker-side state behind on every restart, and nothing reaps it.
+**Ephemeral identity.** The subscription is created when the delivery loop starts and destroyed when it ends, including when the process dies without draining — on NATS a hard kill leaves the consumer for the server's inactivity threshold and no longer, and on Redis there is no per-subscriber state to leave in the first place. Nothing accumulates per pod restart. This is the property that the obvious workarounds — a per-pod UUID consumer group on Kafka or Redis — fail: each of those leaves broker-side state behind on every restart, and nothing reaps it.
+
+**A broker outage is a gap, not a stop.** A broadcast subscription reconnects with backoff like any other consumer, rather than resolving with the error. That is deliberate: `BroadcastSubscriber` reports a task's error only through `SupervisorOutcome`, and only once `run_until_timeout` returns — so a subscription that gave up on the first blip would look healthy while receiving nothing for the rest of the process's life, which is a far worse failure than missing a window. On NATS the reconnect creates a fresh ephemeral consumer at `DeliverPolicy::New`, so whatever was published during the outage is not replayed; the previous consumer is deleted rather than left to accumulate. On Redis the read position is carried across the reconnect instead of resetting to `$`, so entries that arrived during the outage are still delivered — provided they survived Redis persistence and the stream's `MAXLEN` bound.
 
 ## Per-backend semantics
 
-The contract above is backend-independent. How each backend delivers it is not, and one of them changes the publisher's behaviour as well.
+The contract above is backend-independent. How each backend delivers it is not: one of them changes how the stream is *declared*, and another changes the *publisher's* behaviour.
 
 | Backend | Status | Mechanism | Notes |
 | --- | --- | --- | --- |
 | **InMemory** | Available | A private buffer per subscriber; publishes clone into each. | The test substrate for broadcast semantics. |
-| **NATS** | Planned | Ephemeral pull consumer — `durable_name: None`, `DeliverPolicy::New`, `AckPolicy::None`. | The server garbage-collects the consumer on inactivity. |
-| **Redis** | Planned | Plain `XREAD` from `$` — **not** `XREADGROUP`. | No `XGROUP` means no PEL, no consumer registry, and nothing to reap. See the caveat below. |
+| **NATS** | Available | Ephemeral pull consumer — `durable_name: None`, `DeliverPolicy::New`, `AckPolicy::None` — on an `Interest`-retention stream. | The stream *declaration* changes — see the caveat below. Teardown deletes the consumer itself; server-side inactivity GC is only the crash backstop. |
+| **Redis** | Available | Plain `XREAD` from `$` — **not** `XREADGROUP`. | No `XGROUP` means no PEL, no consumer registry, and nothing to reap. See the caveat below. |
 | **Kafka** | Planned | Manual `assign()` of every partition at the latest offset; no `group.id`, no commits. | Truly groupless, so no `__consumer_offsets` churn and no rebalance on boot. |
 | **RabbitMQ** | Planned | A `fanout` exchange `{queue}-fanout`; each instance declares an exclusive, auto-delete, server-named queue bound to it. | The publisher route changes — see the caveat below. |
 | **SQS** | Not supported | — | A compile error, not a runtime one. |
 
-A backend marked *planned* has no `HasBroadcast` implementation yet, so `broadcast_subscriber()` does not compile for it — the same gate that keeps SQS out, applied while the implementation lands. The rows are documented now because they are the agreed semantics, and because the Redis and RabbitMQ caveats below affect how you should design around them.
+A backend marked *planned* has no `HasBroadcast` implementation yet, so `broadcast_subscriber()` does not compile for it — the same gate that keeps SQS out, applied while the implementation lands. The rows are documented now because they are the agreed semantics, and because the caveats below affect how you should design around them.
 
 ### SQS is a compile error
 
@@ -77,9 +81,29 @@ let _ = broker.broadcast_subscriber();
 
 The gate is the `HasBroadcast` capability trait, which `Sqs` does not implement — the same mechanism that keeps `consumer_group()` off `Broker<Sqs>`. Per-instance fan-out on SQS would mean creating and deleting a real queue plus an SNS subscription for every process, and a queue leaked by a pod that died badly costs money for as long as nobody notices. If you need fan-out on AWS, publish to an SNS topic and have each instance manage its own subscription — that lifecycle is yours to own, and `shove` does not pretend otherwise.
 
-### Redis: bound the stream (once available)
+### NATS: a broadcast topology declares an `Interest` stream
 
-Broadcast reads with `XREAD`, which never acknowledges and never trims. Nothing about a broadcast subscriber causes the stream to shrink. Declare the stream with a `MAXLEN` bound, or publish with `XADD ... MAXLEN ~ N`; otherwise it grows without limit and the memory cost is eventually the whole retention.
+NATS is the one backend where `.broadcast()` changes how the *stream* is declared. shove's default retention is `WorkQueue`, and JetStream refuses both halves of the ephemeral broadcast consumer on such a stream:
+
+```text
+AckPolicy::None     -> "consumer in pull mode requires ack policy"        (10084)
+DeliverPolicy::New  -> "consumer must be deliver all on workqueue stream" (10101)
+```
+
+So a `.broadcast()` topology is declared `Interest` instead. That is not a workaround but the closest match to the contract: with `AckPolicy::None`, interest is satisfied on delivery, so the stream retains **nothing** — neither messages already fanned out, nor messages published while no subscriber exists. This is why NATS needs no "bound the stream" caveat of the kind Redis does.
+
+Two consequences:
+
+- **Pinning the retention is refused.** `nats_stream_config(NatsRetention::WorkQueue)` on a broadcast topology fails at `declare()` with a `ShoveError::Topology` naming the conflict, rather than surfacing later as an opaque consumer-create error. `Interest` (the default) and `Limits` (bounded replay, at the cost of retaining messages nobody will read) both work.
+- **Retention is immutable on an existing stream.** Adding `.broadcast()` to a topic that already has a `WorkQueue` stream makes `declare()` fail — JetStream cannot change a stream's retention policy. Recreate the stream, or use a new topic name.
+
+Teardown deletes the ephemeral consumer explicitly when the delivery loop ends. An ephemeral consumer is **not** removed by the client disconnecting, so the server's inactivity threshold (30s) is only the backstop for a process that dies without draining.
+
+### Redis: bound the stream
+
+Broadcast reads with `XREAD`, which never acknowledges and never trims. Nothing about a broadcast subscriber causes the stream to shrink. Declare the stream with a `MAXLEN` bound, or publish with `XADD ... MAXLEN ~ N`; otherwise it grows without limit and the memory cost is eventually the whole retention. Note that `MAXLEN ~` trims at radix-node granularity, so the stream can sit somewhat above the bound — it is a cap on growth, not an exact length.
+
+A broadcast topology on Redis declares **nothing**: no consumer group, and not even the stream (a blocking `XREAD` against a key that does not exist yet is valid and delivers the first entry written while it waits). That absence is the feature — a group created here would never be read from and nothing would ever reap it.
 
 ### RabbitMQ: the publisher route changes (once available)
 

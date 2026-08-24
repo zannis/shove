@@ -12,6 +12,46 @@ use crate::topology::{NatsRetention, NatsStreamConfig, QueueTopology};
 
 use super::client::NatsClient;
 
+/// The stream config a `.broadcast()` topology must be declared with.
+///
+/// shove's historical default is [`NatsRetention::WorkQueue`], and JetStream
+/// rejects *both* halves of the ephemeral broadcast consumer on such a stream:
+/// `AckPolicy::None` fails with "consumer in pull mode requires ack policy"
+/// (10084) and `DeliverPolicy::New` with "consumer must be deliver all on
+/// workqueue stream" (10101). So broadcast cannot use the default at all.
+///
+/// [`NatsRetention::Interest`] is used instead. It accepts the ephemeral
+/// consumer, delivers every message to every subscriber, and retains nothing —
+/// with `AckPolicy::None` interest is satisfied on delivery, so the stream stays
+/// empty both while subscribers are live and when there are none. That is the
+/// documented broadcast contract, and it is why NATS needs no "bound the stream"
+/// caveat of the sort Redis carries.
+///
+/// An explicit [`nats_stream_config`](crate::TopologyBuilder::nats_stream_config)
+/// is honoured — except for `WorkQueue`, which is refused here rather than left
+/// to fail later as an opaque consumer-create error.
+fn broadcast_stream_config(topology: &QueueTopology) -> Result<NatsStreamConfig> {
+    let explicit = topology.nats_stream_config();
+    let mut cfg = explicit.cloned().unwrap_or_default();
+    if cfg.retention == NatsRetention::WorkQueue {
+        if explicit.is_some() {
+            return Err(ShoveError::Topology(format!(
+                "topic '{}' combines `.broadcast()` with \
+                 `nats_stream_config(NatsRetention::WorkQueue)`, which JetStream cannot \
+                 serve: a WorkQueue stream rejects both the `AckPolicy::None` and the \
+                 `DeliverPolicy::New` that an ephemeral broadcast consumer requires. Use \
+                 `NatsRetention::Interest` (retains nothing — the broadcast default) or \
+                 `NatsRetention::Limits` (bounded replay).",
+                topology.queue()
+            )));
+        }
+        // Not a choice the caller made for this topology — just the crate-wide
+        // default, which broadcast overrides.
+        cfg.retention = NatsRetention::Interest;
+    }
+    Ok(cfg)
+}
+
 pub struct NatsTopologyDeclarer {
     client: NatsClient,
 }
@@ -96,8 +136,15 @@ impl NatsTopologyDeclarer {
                 Some(subjects) => subjects.to_vec(),
                 None => vec![queue.to_string()],
             };
-            self.create_stream(queue, subjects, topology.nats_stream_config())
-                .await?;
+            // A broadcast topology cannot be served by shove's default
+            // WorkQueue retention — see `broadcast_stream_config`.
+            if topology.broadcast() {
+                let cfg = broadcast_stream_config(topology)?;
+                self.create_stream(queue, subjects, Some(&cfg)).await?;
+            } else {
+                self.create_stream(queue, subjects, topology.nats_stream_config())
+                    .await?;
+            }
         }
 
         // shove always owns its own dead-letter stream (its dead-letter mechanism,

@@ -54,6 +54,20 @@ impl RedisTopologyDeclarer {
     /// Returns `ShoveError::Topology` if stream or group creation fails
     /// (other than BUSYGROUP, which is idempotent).
     pub async fn declare(&self, topology: &QueueTopology) -> Result<()> {
+        // A broadcast topology declares nothing, and that is the point rather
+        // than a shortcut. Its subscribers read with a bare `XREAD` from `$`, so
+        // the consumer group this method would otherwise create is never read
+        // from — it would be a permanent orphan, and the one piece of
+        // Redis-side state a broadcast subscription could not clean up, since it
+        // never holds a handle on it. Nor does the stream itself need creating:
+        // `XREAD ... BLOCK` against a key that does not exist yet is accepted,
+        // blocks, and delivers the first entry written while it waits. So
+        // "nothing survives" is structural on Redis — there is nothing to
+        // survive.
+        if topology.broadcast() {
+            return Ok(());
+        }
+
         let mut conn = self.client.multiplexed_conn().await?;
 
         if let Some(seq) = topology.sequencing() {
