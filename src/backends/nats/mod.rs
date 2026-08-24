@@ -1,5 +1,6 @@
 pub mod autoscaler;
 mod backend;
+mod broadcast;
 mod client;
 mod constants;
 mod consumer;

@@ -17,8 +17,10 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
-    capability::HasCoordinatedGroups, sealed,
+    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
+    RegistryImpl, TopologyImpl,
+    capability::{HasBroadcast, HasCoordinatedGroups},
+    sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
@@ -83,6 +85,33 @@ impl Backend for Redis {
 
     async fn ping(client: &Self::Client, timeout: std::time::Duration) -> Result<()> {
         client.ping(timeout).await
+    }
+}
+
+impl HasBroadcast for Redis {
+    // Same type as the competing-consumer path: a broadcast subscription is
+    // another delivery loop over the same stream, differing in the command it
+    // issues (`XREAD` from `$` rather than `XREADGROUP`) rather than in what it
+    // needs from the client.
+    type BroadcastImpl = RedisConsumer;
+
+    fn make_broadcast(client: &Self::Client) -> Self::BroadcastImpl {
+        RedisConsumer::new(client.clone())
+    }
+}
+
+impl BroadcastImpl for RedisConsumer {
+    async fn run_broadcast<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: ConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: Topic,
+        H: MessageHandler<T>,
+    {
+        RedisConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

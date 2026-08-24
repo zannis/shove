@@ -48,6 +48,13 @@ impl RedisConsumer {
         Self { client }
     }
 
+    /// The underlying client, for the sibling broadcast module — which issues a
+    /// bare `XREAD` on its own connection rather than going through any of the
+    /// group-aware helpers here.
+    pub(super) fn client_ref(&self) -> &RedisClient {
+        &self.client
+    }
+
     /// Generate a unique consumer name for this process instance.
     ///
     /// Format: `{hostname}-{uuid4}`. Unique per task so XAUTOCLAIM can
@@ -395,7 +402,7 @@ impl ConsumerImpl for RedisConsumer {
 ///
 /// Acquires a fresh connection on each attempt and applies exponential backoff
 /// with jitter (1 s → 30 s). Non-retryable errors are propagated immediately.
-async fn run_with_reconnect<F, Fut>(
+pub(super) async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     stream: &str,
     max_reconnect_attempts: Option<u32>,
@@ -2040,7 +2047,7 @@ const INTERNAL_KEYS: &[&str] = &[
 ///
 /// The two maps are disjoint by construction, so [`merged_entry_fields`] can
 /// re-join them for a write-back without any key colliding.
-fn partition_entry_fields(
+pub(super) fn partition_entry_fields(
     fields_vec: Vec<(String, String)>,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
     let mut internal = HashMap::with_capacity(INTERNAL_KEYS.len());

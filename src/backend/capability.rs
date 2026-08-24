@@ -72,14 +72,20 @@ pub trait HasCoordinatedGroups: Backend {
 /// |---|---|---|
 /// | **InMemory** | **yes** | a per-subscriber buffer |
 /// | **Kafka** | **yes** | groupless `assign()` at the latest offset |
+/// | **NATS** | **yes** | ephemeral pull consumer on an `Interest`-retention stream |
 /// | **RabbitMQ** | **yes** | exclusive auto-delete queue on a fanout exchange |
-/// | NATS | not yet | ephemeral pull consumer |
-/// | Redis (`redis-streams`) | not yet | plain `XREAD` from `$`, no `XGROUP` |
+/// | **Redis** (`redis-streams`) | **yes** | plain `XREAD` from `$`, no `XGROUP` |
 /// | **SQS** | **never** | — |
 ///
-/// A backend in the *not yet* rows has a primitive that satisfies the contract,
-/// but no implementation on this version — `broadcast_subscriber()` does not
-/// compile for it, by the same gate that excludes SQS.
+/// Every backend except SQS implements it on this version, so there is no
+/// longer a *not yet* row: `broadcast_subscriber()` compiles everywhere but
+/// `Broker<Sqs>`, and that gate is permanent rather than pending.
+///
+/// NATS is the one backend where `.broadcast()` changes how the *stream* is
+/// declared: shove's default `WorkQueue` retention rejects both the
+/// `AckPolicy::None` and the `DeliverPolicy::New` an ephemeral consumer needs,
+/// so a broadcast topology is declared `Interest` instead. Pinning one to
+/// `WorkQueue` via `nats_stream_config` is refused at declare time.
 ///
 /// SQS is different in kind, not in schedule: per-pod fan-out there means
 /// creating and deleting a real queue plus an SNS subscription per process, and
@@ -89,7 +95,7 @@ pub trait HasCoordinatedGroups: Backend {
 /// Sealed via `Backend`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `HasBroadcast`, so `.broadcast()` topologies cannot be consumed on it.",
-    note = "InMemory, Kafka and RabbitMQ implement `HasBroadcast` on this version. NATS and Redis each have a suitable ephemeral primitive and are planned. SQS is excluded permanently: per-process fan-out there needs a real queue plus an SNS subscription whose lifecycle shove does not manage — publish to an SNS topic each instance subscribes to itself instead."
+    note = "Every backend except SQS implements `HasBroadcast` on this version: InMemory, Kafka, NATS, RabbitMQ and Redis (redis-streams). SQS is excluded permanently: per-process fan-out there needs a real queue plus an SNS subscription whose lifecycle shove does not manage — publish to an SNS topic each instance subscribes to itself instead."
 )]
 #[allow(private_interfaces, private_bounds)]
 pub trait HasBroadcast: Backend {

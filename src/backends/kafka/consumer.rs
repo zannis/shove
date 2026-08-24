@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
@@ -911,16 +912,6 @@ async fn route_outcome(
 /// use for their own metadata round trips.
 const BROADCAST_ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Delay before a `Defer`red broadcast message is offered back to its own
-/// subscription.
-///
-/// The same one second the shared Kafka path uses when a topology declares no
-/// hold queues — and a broadcast topology can declare none, because `build()`
-/// rejects `hold_queue()` outright. Stating it as a constant rather than
-/// reaching for `hold_queues[0]` keeps the fact that the list is always empty
-/// from looking like an oversight.
-const BROADCAST_DEFER_DELAY: Duration = Duration::from_secs(1);
-
 /// A message travelling through a broadcast subscription: the raw payload and
 /// its headers, owned, so the same value can come off the wire or off this
 /// subscription's own defer channel.
@@ -942,15 +933,18 @@ fn discard_broadcast(topic: &str, group: Option<&str>, reason: metrics::FailReas
 
 /// Outcome routing for a Kafka broadcast subscription.
 ///
-/// `Ack` retires the message by doing nothing — there is no offset to advance.
-/// `Retry` and `Reject` are both terminal discards, counted under the same two
-/// reasons `decide_retry` produces at `max_retries = 0`, which is what
-/// `BroadcastSubscriber` pins the budget to.
+/// The decision itself is
+/// [`settle_broadcast_outcome`](crate::backend::broadcast::settle_broadcast_outcome),
+/// shared with NATS and Redis so the terminal accounting cannot drift between
+/// the three loops that settle in-process: `Ack` retires the message by doing
+/// nothing (there is no offset to advance), and `Retry` and `Reject` are both
+/// terminal discards counted under the two reasons `decide_retry` produces at
+/// `max_retries = 0`, which is what `BroadcastSubscriber` pins the budget to.
 ///
-/// `Defer` is the one outcome that cannot reuse the shared path. Kafka's
-/// ordinary defer republishes to the topic, and on a broadcast topic that would
-/// fan the message back out to *every* subscriber instead of redelivering it to
-/// the one that deferred. So it is redelivered in-process instead, back into
+/// The `Redeliver` half is what stays here, because it is the one part that is
+/// Kafka-specific. Kafka's ordinary defer republishes to the topic, and on a
+/// broadcast topic that would fan the message back out to *every* subscriber
+/// instead of redelivering it to the one that deferred. So it goes back into
 /// this subscription's own loop, which is the only place a redelivery can go
 /// without reaching the rest of the fan-out.
 async fn route_broadcast_outcome(
@@ -961,24 +955,9 @@ async fn route_broadcast_outcome(
     defer_tx: &mpsc::Sender<DeferredDelivery>,
     shutdown: &CancellationToken,
 ) {
-    match outcome {
-        Outcome::Ack => {}
-        Outcome::Retry => {
-            tracing::warn!(
-                topic,
-                "handler returned Retry on a broadcast subscription, which has no retry \
-                 chain — discarding"
-            );
-            discard_broadcast(topic, group, metrics::FailReason::MaxRetriesExceeded);
-        }
-        Outcome::Reject => {
-            tracing::warn!(
-                topic,
-                "handler rejected a broadcast message and the topology has no DLQ — discarding"
-            );
-            discard_broadcast(topic, group, metrics::FailReason::Rejected);
-        }
-        Outcome::Defer => {
+    match settle_broadcast_outcome(&outcome, topic, group) {
+        BroadcastAction::Done => {}
+        BroadcastAction::Redeliver => {
             tokio::select! {
                 _ = tokio::time::sleep(BROADCAST_DEFER_DELAY) => {}
                 // A deferral outliving shutdown would hold the drain open for
