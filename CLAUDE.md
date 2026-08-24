@@ -67,8 +67,13 @@ Other add-on features: `audit`, `metrics`, `protobuf`, `rabbitmq-transactional`.
   for per-backend feature sets.
 - **Lint gates CI enforces**:
   - `cargo fmt -- --check`
-  - `cargo clippy --all-features -- -D warnings`
-  - `cargo clippy --no-default-features -- -D warnings`
+  - `cargo clippy --all-features --all-targets -- -D warnings`
+  - `cargo clippy --no-default-features --all-targets -- -D warnings`
+  - `cargo clippy --lib --no-default-features --features <set> -- -D warnings`
+    for each single-backend feature set (the `feature-lint` job). The two gates
+    above can both be clean while one of these is not: an item whose callers
+    are all behind a feature gate that set does not enable is dead code there
+    and nowhere else.
 - **Never** run tests with plain `cargo test` if you can use `cargo nextest run`;
   do not pass `-q`/`--quiet` to `nextest` (it rejects it).
 

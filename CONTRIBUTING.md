@@ -71,9 +71,19 @@ cargo nextest run --features <backend-feature-set>
 
 ```sh
 cargo fmt -- --check
-cargo clippy --all-features -- -D warnings
-cargo clippy --no-default-features -- -D warnings
+cargo clippy --all-features --all-targets -- -D warnings
+cargo clippy --no-default-features --all-targets -- -D warnings
 cargo publish --dry-run --all-features
+```
+
+Clippy is also gated per backend, because `--all-features` and
+`--no-default-features` can both be clean while a single-backend build is not:
+an item whose only callers sit behind a feature gate that set does not enable
+is dead code there and nowhere else. The `feature-lint` job runs this over each
+row of the table above, plus `pub-aws-sns` on its own:
+
+```sh
+cargo clippy --lib --no-default-features --features <backend-feature-set> -- -D warnings
 ```
 
 CI also runs `cargo audit --deny warnings`.
@@ -88,8 +98,9 @@ release whose version commit already landed).
 ### The commit being released must have a green CI run
 
 Before anything else, the workflow resolves the `ci.yml` run for the commit it
-is about to release and refuses to go on unless every leg — `check`, `msrv`,
-`audit` and all seven `coverage` entries — completed successfully
+is about to release and refuses to go on unless every leg — `check`,
+`feature-lint`, `msrv`, `audit` and all seven `coverage` entries — completed
+successfully
 ([`.github/scripts/require-green-ci.sh`](.github/scripts/require-green-ci.sh)).
 
 **A missing run fails the gate.** `ci.yml` has a `paths:` filter, so a commit
