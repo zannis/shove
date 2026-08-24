@@ -1,0 +1,24 @@
+src/backends/redis/broadcast.rs
+  s_420023e1d44cb7::t_fb48266ab56055 231-237,241,253-259,281-286,345,363-367,381
+  s_420023e1d44cb7::t_f675d713451227 287,382-387
+src/backends/nats/broadcast.rs
+  s_420023e1d44cb7::t_f675d713451227 492-497
+  s_420023e1d44cb7::t_802b25fc621fe2 343,455,473-477,491
+  s_420023e1d44cb7::t_85860c90f47304 355-361,403-409
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "57b8204951377dcb466f6faf3d9be631c0566016",
+  "prompts": {},
+  "sessions": {
+    "s_420023e1d44cb7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f98600ff-3364-47d7-bbdd-79f1d6c5a993",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
