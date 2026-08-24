@@ -230,14 +230,19 @@ impl NatsPublisher {
         // those messages were accepted by NATS and must be counted, not
         // abandoned. A submission error takes precedence in `first_err`; an
         // ack error only replaces it when nothing has failed yet.
-        let mut ack_failed: Vec<usize> = Vec::new();
+        let mut ack_rejected: Vec<usize> = Vec::new();
+        let mut ack_unconfirmed: Vec<usize> = Vec::new();
         for (i, ack) in ack_futures {
             if let Err(e) = ack.await {
                 metrics::record_backend_error(
                     metrics::BackendLabel::Nats,
                     metrics::BackendErrorKind::Publish,
                 );
-                ack_failed.push(i);
+                if ack_error_is_explicit_rejection(e.kind()) {
+                    ack_rejected.push(i);
+                } else {
+                    ack_unconfirmed.push(i);
+                }
                 if first_err.is_none() {
                     first_err = Some(ShoveError::Connection(format!(
                         "batch publish ack failed: {e}"
@@ -248,10 +253,33 @@ impl NatsPublisher {
         if first_err.is_none() {
             return BatchReport::all_succeeded();
         }
-        // Ack failures all sit below the submission break, so prepending them
-        // keeps `failed` ascending.
-        ack_failed.extend(failed);
-        BatchReport::sparse(ack_failed, unattempted, first_err)
+        // Ack results all sit below the submission break, so prepending them
+        // keeps each set ascending.
+        ack_rejected.extend(failed);
+        ack_unconfirmed.extend(unattempted);
+        BatchReport::sparse(ack_rejected, ack_unconfirmed, first_err)
+    }
+}
+
+/// Whether a failed publish-ack means the server definitely rejected the record.
+///
+/// The batch contract splits by what the backend *confirmed*: `failed` is
+/// "attempted and explicitly rejected", `unattempted` is "submitted without a
+/// resolution the backend could confirm". An ack that timed out or died with
+/// the connection is the second kind — the server may well have stored the
+/// message — so reporting it as an explicit rejection overstates what is known.
+/// Both sets are re-published either way; only the diagnosis differs.
+fn ack_error_is_explicit_rejection(kind: jetstream::context::PublishErrorKind) -> bool {
+    use jetstream::context::PublishErrorKind as K;
+    match kind {
+        K::StreamNotFound
+        | K::WrongLastMessageId
+        | K::WrongLastSequence
+        | K::MaxPayloadExceeded
+        | K::MaxAckPending => true,
+        // `Other` covers client-side and unclassified server conditions alike,
+        // so it takes the ambiguous side with the rest.
+        K::TimedOut | K::BrokenPipe | K::Other => false,
     }
 }
 
@@ -273,5 +301,41 @@ impl PublisherImpl for NatsPublisher {
         msgs: &[T::Message],
     ) -> impl Future<Output = BatchReport> + Send {
         NatsPublisher::publish_batch_report::<T>(self, msgs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jetstream::context::PublishErrorKind as K;
+
+    /// An ack that never arrived says nothing about whether the server stored
+    /// the record, so it belongs in `unattempted` ("submitted without a
+    /// resolution the backend could confirm"), not in `failed` ("attempted and
+    /// explicitly reported as rejected").
+    #[test]
+    fn unconfirmed_acks_are_not_explicit_rejections() {
+        for kind in [K::TimedOut, K::BrokenPipe, K::Other] {
+            assert!(
+                !ack_error_is_explicit_rejection(kind),
+                "{kind:?} is ambiguous, not an explicit rejection"
+            );
+        }
+    }
+
+    #[test]
+    fn server_rejections_are_explicit() {
+        for kind in [
+            K::StreamNotFound,
+            K::WrongLastMessageId,
+            K::WrongLastSequence,
+            K::MaxPayloadExceeded,
+            K::MaxAckPending,
+        ] {
+            assert!(
+                ack_error_is_explicit_rejection(kind),
+                "{kind:?} is the server saying no"
+            );
+        }
     }
 }
