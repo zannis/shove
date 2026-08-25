@@ -1,0 +1,19 @@
+package.json
+  s_3b41de6cf4e70d::t_a022e4eb16d232 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "352c78c23ffac9f569ecf2287c3f2336ddaf726a",
+  "prompts": {},
+  "sessions": {
+    "s_3b41de6cf4e70d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3a4bc10-56dc-4e16-9b87-740ddd58823e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
