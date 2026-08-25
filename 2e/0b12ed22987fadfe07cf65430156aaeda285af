@@ -1,0 +1,51 @@
+docs/pages/guides/exactly-once.mdx
+  s_3b41de6cf4e70d::t_0abbfecc33f099 43
+docs/pages/index.mdx
+  s_3b41de6cf4e70d::t_cca794e49b2868 32,37,44
+docs/pages/backends/rabbitmq.mdx
+  s_3b41de6cf4e70d::t_300b5f46fbf810 151
+docs/pages/guides/observability.mdx
+  s_3b41de6cf4e70d::t_0abbfecc33f099 17
+  s_3b41de6cf4e70d::t_e702dc725cedeb 110
+docs/pages/backends/sqs.mdx
+  s_3b41de6cf4e70d::t_300b5f46fbf810 124
+docs/pages/guides/groups.mdx
+  s_3b41de6cf4e70d::t_cca794e49b2868 191
+docs/pages/concepts/broadcast.mdx
+  s_3b41de6cf4e70d::t_8fbc672258fc4e 35
+docs/pages/backends/kafka.mdx
+  s_3b41de6cf4e70d::t_300b5f46fbf810 418
+docs/pages/concepts/codecs.mdx
+  s_3b41de6cf4e70d::t_0abbfecc33f099 73
+docs/pages/getting-started.mdx
+  s_3b41de6cf4e70d::t_cca794e49b2868 62
+docs/pages/backends/inmemory.mdx
+  s_3b41de6cf4e70d::t_300b5f46fbf810 99
+docs/pages/backends/nats.mdx
+  s_3b41de6cf4e70d::t_300b5f46fbf810 174
+docs/pages/guides/batch-publishing.mdx
+  s_3b41de6cf4e70d::t_8fbc672258fc4e 59,63
+  s_3b41de6cf4e70d::t_b1163fb8424c8d 64
+docs/pages/reference.mdx
+  s_3b41de6cf4e70d::t_0abbfecc33f099 12,21-22
+docs/pages/concepts/topics.mdx
+  s_3b41de6cf4e70d::t_226a5a33f4f1f3 67
+docs/pages/backends/redis.mdx
+  s_3b41de6cf4e70d::t_300b5f46fbf810 150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "2e0b12ed22987fadfe07cf65430156aaeda285af",
+  "prompts": {},
+  "sessions": {
+    "s_3b41de6cf4e70d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a3a4bc10-56dc-4e16-9b87-740ddd58823e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
