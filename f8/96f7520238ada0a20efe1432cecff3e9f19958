@@ -1,0 +1,59 @@
+src/batch.rs
+  s_febb88d6eb569e::t_962ce528fa70d2 56-57
+src/backends/inmemory/consumer.rs
+  s_febb88d6eb569e::t_86135d54c10d1a 901,1056,1359-1407,1409-1426
+  s_febb88d6eb569e::t_68fa488ff89723 191-200,222,236,324,344,385,399,884-886,888-889,891,925,966,982-989,1016-1029,1051-1055,1408
+  s_febb88d6eb569e::t_1b95bdf9be1711 405-408
+  s_febb88d6eb569e::t_7a864b636b89e2 855,887,890,896-900
+  s_febb88d6eb569e::t_71dc0c492b3dc1 902
+  s_febb88d6eb569e::t_b275e3e1a78ad1 1057
+src/backends/redis/client.rs
+  s_febb88d6eb569e::t_9d92ae37e01a07 164-176,182-184
+src/backends/redis/publisher.rs
+  s_febb88d6eb569e::t_6247f915da1f5e 137-140
+  s_febb88d6eb569e::t_962ce528fa70d2 190-194,424-438
+  s_febb88d6eb569e::t_e6e1f76cbcb822 216
+  s_febb88d6eb569e::t_9d92ae37e01a07 51-75,110,112-113,119-123,133-135,152,166-168,183-185,208,213-215,217,263,273
+  s_febb88d6eb569e::t_c825d9ca0da70d 282-288,290-423,439
+docs/pages/guides/batch-publishing.mdx
+  s_febb88d6eb569e::t_962ce528fa70d2 60,63
+src/consumer.rs
+  s_febb88d6eb569e::t_a0fd4803e3aa3d 116-118,297,502,789-800
+  s_febb88d6eb569e::t_30d4973317e526 801-802
+src/backends/kafka/consumer.rs
+  s_febb88d6eb569e::t_d687215a4cad27 2875,4476-4477
+  s_febb88d6eb569e::t_f17fc3501883f2 4381
+  s_febb88d6eb569e::t_e6e1f76cbcb822 1499
+  s_febb88d6eb569e::t_6e42ffea27331f 915-919,1426-1433,1490-1498,1500-1545,4480-4485,4500-4511,4537-4538
+  s_febb88d6eb569e::t_0dfa9355224242 4512-4536
+  s_febb88d6eb569e::t_e6e42253378c8a 1546-1547
+  s_febb88d6eb569e::t_acf02fc16c7262 4539-4540
+tests/kafka_broadcast_integration.rs
+  s_febb88d6eb569e::t_c2936c3504046c 331-334,376-377,442-445
+  s_febb88d6eb569e::t_86135d54c10d1a 26-27,29-30,226-244,263-278,289-330,335-342,347-363,378-380,396-397,399-405,416-417,419,422,437-441,446-447
+  s_febb88d6eb569e::t_d687215a4cad27 421
+  s_febb88d6eb569e::t_3bae8f143abf5d 411
+  s_febb88d6eb569e::t_545a189a48e976 245-262,364,398
+  s_febb88d6eb569e::t_438e228c6fc34c 343-346,365-375,381-395,406-410,412-415,418,420,423-436
+  s_febb88d6eb569e::t_91960eda5677e8 448
+src/publisher.rs
+  s_febb88d6eb569e::t_962ce528fa70d2 72
+src/backends/inmemory/client.rs
+  s_febb88d6eb569e::t_68fa488ff89723 162-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "f896f7520238ada0a20efe1432cecff3e9f19958",
+  "prompts": {},
+  "sessions": {
+    "s_febb88d6eb569e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a036ee-d441-7d80-adee-fefd6474cc01",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
