@@ -19,7 +19,7 @@ use shove::outcome::Outcome;
 use shove::rabbitmq::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 // Explicit import to disambiguate from shove::consumer_group::ConsumerGroupConfig (the wrapper).
 use shove::rabbitmq::RabbitMqConsumerGroupConfig;
@@ -467,6 +467,21 @@ define_sequenced_topic!(
     OrderMessage,
     |msg: &OrderMessage| msg.account.clone(),
     TopologyBuilder::new("test-defer-seq-orders")
+        .dlq()
+        .hold_queue(Duration::from_secs(1))
+        .sequenced(SequenceFailure::Skip)
+        .routing_shards(1)
+        .build()
+);
+
+// Topic for the sequenced handler-timeout-outcome test. Same shape as the
+// other sequenced fixtures; a separate topic so its hold queue and DLQ are not
+// shared with a test that puts messages in them for other reasons.
+define_sequenced_topic!(
+    TimeoutSeqOrders,
+    OrderMessage,
+    |msg: &OrderMessage| msg.account.clone(),
+    TopologyBuilder::new("test-timeout-seq-orders")
         .dlq()
         .hold_queue(Duration::from_secs(1))
         .sequenced(SequenceFailure::Skip)
@@ -981,6 +996,17 @@ impl MessageHandler<SkipOrders> for OrderDlqHandler {
 }
 
 impl MessageHandler<FailAllOrders> for OrderDlqHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        Outcome::Ack
+    }
+    async fn handle_dead(&self, _msg: OrderMessage, _meta: DeadMessageMetadata, _: &()) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.signal.notify_waiters();
+    }
+}
+
+impl MessageHandler<TimeoutSeqOrders> for OrderDlqHandler {
     type Context = ();
     async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
         Outcome::Ack
@@ -3908,6 +3934,102 @@ async fn sequenced_consumer_retry_via_shard_hold_queues() {
     shutdown.cancel();
     consume_handle.await.unwrap().unwrap();
     client.shutdown().await;
+    ctx.cleanup().await;
+}
+
+// --- Sequenced consumer — handler timeout outcome ---
+
+/// A handler that never returns, so the deadline is always what settles the
+/// delivery. Counts how many times it was entered.
+#[derive(Clone)]
+struct SeqHangHandler {
+    calls: Arc<AtomicUsize>,
+}
+
+impl SeqHangHandler {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl MessageHandler<TimeoutSeqOrders> for SeqHangHandler {
+    type Context = ();
+    async fn handle(&self, _msg: OrderMessage, _meta: MessageMetadata, _: &()) -> Outcome {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        // Far longer than the handler timeout, and than the test.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Outcome::Ack
+    }
+}
+
+/// `with_handler_timeout_outcome(Reject)` must reach the sequenced consumer.
+///
+/// The FIFO path builds each shard's options from the caller's, and a
+/// hand-copied allowlist of fields silently dropped this one — so a configured
+/// `Reject` fell back to the default `Retry` and the message went round the
+/// hold queue until its budget ran out instead of being dead-lettered at once.
+/// The call count is what separates the two: `Reject` is terminal, so the
+/// handler is entered exactly once.
+#[tokio::test]
+async fn sequenced_handler_timeout_outcome_reject_dead_letters_without_retrying() {
+    let ctx = TestContext::new().await;
+    let client = RabbitMqClient::connect(&ctx.rmq_config()).await.unwrap();
+    let b = ctx.broker_from(client.clone());
+    b.topology().declare::<TimeoutSeqOrders>().await.unwrap();
+
+    let publisher = b.publisher().await.unwrap();
+    publisher
+        .publish::<TimeoutSeqOrders>(&OrderMessage {
+            account: "ACC-TIMEOUT".into(),
+            seq: 1,
+        })
+        .await
+        .unwrap();
+
+    let dlq_handler = OrderDlqHandler::new();
+    let dlq_consumer = RabbitMqConsumer::new(client.clone());
+    let dh = dlq_handler.clone();
+    let dlq_handle =
+        tokio::spawn(async move { dlq_consumer.run_dlq::<TimeoutSeqOrders, _>(dh, ()).await });
+
+    let handler = SeqHangHandler::new();
+    let shutdown = CancellationToken::new();
+    let consumer = RabbitMqConsumer::new(client.clone());
+    let h = handler.clone();
+    let s = shutdown.clone();
+    let consume_handle = tokio::spawn(async move {
+        let opts = ConsumerOptions::<RabbitMqMarker>::new()
+            .with_shutdown(s)
+            // A budget the default `Retry` would visibly spend, so falling back
+            // to it cannot look the same as honouring `Reject`.
+            .with_max_retries(5)
+            .with_handler_timeout(Duration::from_millis(300))
+            .with_handler_timeout_outcome(Outcome::Reject);
+        consumer.run_fifo::<TimeoutSeqOrders, _>(h, (), opts).await
+    });
+
+    assert!(
+        dlq_handler.wait_for_count(1, Duration::from_secs(20)).await,
+        "the timed-out message never reached the DLQ"
+    );
+    assert_eq!(
+        handler.calls(),
+        1,
+        "Reject is terminal, so the handler runs once; {} calls means the \
+         timeout resolved to Retry instead",
+        handler.calls()
+    );
+
+    shutdown.cancel();
+    let _ = consume_handle.await;
+    client.shutdown().await;
+    dlq_handle.abort();
     ctx.cleanup().await;
 }
 

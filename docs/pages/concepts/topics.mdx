@@ -64,6 +64,7 @@ The full chain of methods, in the order you would typically call them:
 
 - `.new(name)` — required; the primary queue name.
 - `.for_consumer_group(name)` — declare this topology on behalf of a named fan-out group, so a second independent reader of the same topic gets its own retry/DLQ chain. See [Fan-out](#fan-out-two-readers-on-one-topic).
+- `.broadcast()` — every *instance* gets its own ephemeral subscription and receives every message, instead of the instances sharing one queue. Combining it with `.for_consumer_group()`, `.dlq()`, `.dlq_named()`, `.hold_queue()` or `.sequenced()` panics at `.build()`, and it implies `.allow_message_loss()`. See [Broadcast](/concepts/broadcast).
 - `.hold_queue(Duration)` — add a delayed-redelivery queue; callable multiple times for escalating backoff.
 - `.dlq()` — add a dead-letter queue named `{name}-dlq`.
 - `.dlq_named(name)` — add a dead-letter queue with a custom name.

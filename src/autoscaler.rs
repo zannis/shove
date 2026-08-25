@@ -112,7 +112,7 @@ impl AutoscalerConfig {
 fn positive_multiplier(vars: &EnvVars, key: &str, default: f64) -> Result<f64> {
     let value = vars.parse::<f64>(key, default)?;
     if !value.is_finite() || value <= 0.0 {
-        let raw = vars.get(key).unwrap_or_default();
+        let raw = vars.get(key)?.unwrap_or_default();
         return Err(vars.invalid(key, &raw, "expected a finite number > 0"));
     }
     Ok(value)

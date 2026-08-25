@@ -69,7 +69,7 @@ impl<B: Backend> Publisher<B> {
     /// | SNS | **sparse** | rejected entries are named per 10-entry chunk; a chunk that errors as a whole, and every later chunk, becomes `unattempted()` |
     /// | NATS | **sparse + tail** | ack failures are exact over the submitted prefix; if submission breaks partway, the rest of the batch is `unattempted()` |
     /// | RabbitMQ | **prefix** | confirms are awaited in order and the call stops at the first nack: `failed()` is that one index, `unattempted()` is everything after it |
-    /// | Redis | **prefix** | sequential; stops at the first error |
+    /// | Redis | **prefix or unresolved tail** | sequential; a server rejection names the current index, while a lost reply leaves the current index and tail `unattempted()` |
     /// | InMemory | **prefix** | sequential; stops at the first error |
     ///
     /// On the prefix backends a record after the failure point may in fact

@@ -23,7 +23,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rdkafka::ClientConfig;
+use rdkafka::admin::{AdminClient, AdminOptions, NewPartitions};
+use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer as _};
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
 use serde::{Deserialize, Serialize};
 use shove::broker::Broker;
 use shove::consumer::ConsumerOptions;
@@ -219,6 +223,59 @@ impl TestBroker {
             .map(|g| g.name().to_string())
             .collect()
     }
+
+    async fn expand_topic(&self, topic: &str, partitions: usize) {
+        let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+            .set("bootstrap.servers", self.brokers())
+            .create()
+            .expect("failed to create partition-expansion admin client");
+        let results = admin
+            .create_partitions(
+                &[NewPartitions::new(topic, partitions)],
+                &AdminOptions::new().operation_timeout(Some(Duration::from_secs(10))),
+            )
+            .await
+            .expect("partition-expansion request failed");
+        assert!(
+            matches!(results.as_slice(), [Ok(name)] if name == topic),
+            "partition expansion failed: {results:?}"
+        );
+    }
+
+    fn partition_count(&self, topic: &str) -> usize {
+        let probe: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", self.brokers())
+            .set("group.id", "broadcast-partition-count-probe")
+            .create()
+            .expect("failed to create metadata probe");
+        let metadata = probe
+            .fetch_metadata(Some(topic), Duration::from_secs(10))
+            .expect("failed to fetch topic metadata");
+        metadata
+            .topics()
+            .iter()
+            .find(|candidate| candidate.name() == topic)
+            .expect("declared topic missing from metadata")
+            .partitions()
+            .len()
+    }
+
+    async fn publish_to_partition(&self, topic: &str, partition: i32, msg: &Invalidate) {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", self.brokers())
+            .create()
+            .expect("failed to create partition-targeted producer");
+        let payload = serde_json::to_string(msg).expect("serialize partition-targeted message");
+        producer
+            .send(
+                FutureRecord::<str, str>::to(topic)
+                    .partition(partition)
+                    .payload(&payload),
+                Timeout::After(Duration::from_secs(10)),
+            )
+            .await
+            .expect("partition-targeted publish failed");
+    }
 }
 
 /// Wait until a broadcast subscription has certainly assigned its partitions.
@@ -228,6 +285,166 @@ impl TestBroker {
 /// before the assignment lands would test deliver-new's failure mode instead of
 /// the fan-out.
 const ASSIGN_SETTLE: Duration = Duration::from_secs(5);
+
+/// A caller-provided zero prefetch must still allow one handler to run.
+///
+/// The public option is a plain `u16`, so zero reaches the backend. A
+/// zero-permit semaphore parks the loop after receiving its first record and
+/// also prevents graceful shutdown from completing.
+#[tokio::test]
+async fn zero_prefetch_is_clamped_for_broadcast() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker().await;
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let recorder = Recorder::default();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(
+            recorder.clone(),
+            ConsumerOptions::new().with_prefetch_count(0),
+        )
+        .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    broker
+        .publisher()
+        .await
+        .expect("failed to build publisher")
+        .publish::<CacheInvalidations>(&Invalidate {
+            key: "zero-prefetch".into(),
+        })
+        .await
+        .expect("publish failed");
+
+    recorder.wait_for(1, Duration::from_secs(10)).await;
+    assert_eq!(recorder.keys().await, vec!["zero-prefetch"]);
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(2))
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "zero-prefetch subscriber failed to drain: {outcome:?}"
+    );
+    broker.close().await;
+}
+
+/// A connected assign-only subscriber must discover partitions added later.
+///
+/// Messages sent before the new assignment is visible are legitimately before
+/// that partition's deliver-new boundary. Repeated targeted publishes make the
+/// boundary observable: once metadata refresh extends the assignment, a later
+/// marker from the new partition must arrive without reconnecting the
+/// subscriber. Markers on partition 0 pin the other half of the operation:
+/// extending the assignment must preserve existing positions without loss or
+/// replay.
+#[tokio::test]
+async fn connected_broadcast_discovers_new_partitions() {
+    let tb = TestBroker::start().await;
+    let broker = tb.broker().await;
+    broker
+        .topology()
+        .declare::<CacheInvalidations>()
+        .await
+        .expect("failed to declare broadcast topic");
+
+    let recorder = Recorder::default();
+    let mut subscriber = broker.broadcast_subscriber();
+    subscriber
+        .subscribe::<CacheInvalidations, _>(recorder.clone(), ConsumerOptions::new())
+        .expect("failed to subscribe");
+    tokio::time::sleep(ASSIGN_SETTLE).await;
+
+    let original_partitions = tb.partition_count("kafka-broadcast-invalidations");
+    tb.publish_to_partition(
+        "kafka-broadcast-invalidations",
+        0,
+        &Invalidate {
+            key: "before-expansion".into(),
+        },
+    )
+    .await;
+    recorder.wait_for(1, Duration::from_secs(10)).await;
+    assert_eq!(recorder.keys().await, vec!["before-expansion"]);
+
+    tb.expand_topic("kafka-broadcast-invalidations", original_partitions + 1)
+        .await;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut marker = 0u32;
+    while !recorder
+        .keys()
+        .await
+        .iter()
+        .any(|key| key.starts_with("expanded-"))
+        && Instant::now() < deadline
+    {
+        tb.publish_to_partition(
+            "kafka-broadcast-invalidations",
+            0,
+            &Invalidate {
+                key: format!("steady-{marker}"),
+            },
+        )
+        .await;
+        tb.publish_to_partition(
+            "kafka-broadcast-invalidations",
+            original_partitions as i32,
+            &Invalidate {
+                key: format!("expanded-{marker}"),
+            },
+        )
+        .await;
+        marker += 1;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let delivery_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = recorder.keys().await;
+        let steady = seen.iter().filter(|key| key.starts_with("steady-")).count();
+        if steady == marker as usize || Instant::now() >= delivery_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let seen = recorder.keys().await;
+    assert!(
+        seen.iter().any(|key| key.starts_with("expanded-")),
+        "the connected subscriber never extended its assignment to partition {original_partitions}"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|key| key.as_str() == "before-expansion")
+            .count(),
+        1,
+        "refreshing the assignment must not replay an existing partition"
+    );
+    for expected in (0..marker).map(|i| format!("steady-{i}")) {
+        assert_eq!(
+            seen.iter().filter(|key| **key == expected).count(),
+            1,
+            "refreshing the assignment lost or replayed {expected}; saw {seen:?}"
+        );
+    }
+
+    subscriber.cancellation_token().cancel();
+    let outcome = subscriber
+        .run_until_timeout(std::future::pending(), Duration::from_secs(5))
+        .await;
+    assert!(
+        outcome.is_clean(),
+        "subscriber failed to drain: {outcome:?}"
+    );
+    broker.close().await;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -383,7 +600,19 @@ async fn broadcast_fans_out_to_every_instance_from_the_tail() {
 
     let expected: HashSet<String> = keys.iter().map(|k| k.key.clone()).collect();
     for (i, recorder) in recorders.iter().enumerate() {
-        let seen: HashSet<String> = recorder.keys().await.into_iter().collect();
+        let delivered = recorder.keys().await;
+        // Length before set, and from the raw vector: collapsing into a
+        // `HashSet` first would swallow a duplicate delivery, and broadcast is
+        // documented as lossy *at-most-once*. A second copy of one key is as
+        // much a contract break as a missing one.
+        assert_eq!(
+            delivered.len(),
+            expected.len(),
+            "subscriber {i} received {} deliveries for {} messages: {delivered:?}",
+            delivered.len(),
+            expected.len()
+        );
+        let seen: HashSet<String> = delivered.into_iter().collect();
         assert_eq!(
             seen, expected,
             "subscriber {i} saw the wrong set — a fan-out delivers every message to \

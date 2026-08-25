@@ -14,6 +14,7 @@
 //! group's member list first so the failure is an actionable shove error
 //! rather than a bare `UNKNOWN_MEMBER_ID` from librdkafka.
 
+use std::collections::HashMap;
 #[cfg(feature = "kafka-msk-iam")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -158,35 +159,96 @@ pub(crate) fn resolved_reset_group_id(
     }
 }
 
-/// Target offset for one partition given its watermarks. `Timestamp` is not
-/// answerable from watermarks alone and returns `None` — it needs the
-/// broker-side `offsets_for_times` lookup instead.
-fn target_from_watermarks(to: KafkaOffsetReset, low: i64, high: i64) -> Option<i64> {
-    match to {
-        KafkaOffsetReset::Earliest => Some(low),
-        KafkaOffsetReset::Latest => Some(high),
-        KafkaOffsetReset::Timestamp(_) => None,
+/// The watermark a reset target resolves to directly.
+///
+/// `Timestamp` is deliberately not representable here: it needs the broker-side
+/// `offsets_for_times` lookup, and keeping it out of this type is what lets the
+/// watermark path resolve every partition without an unreachable branch to
+/// assert against at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatermarkTarget {
+    Low,
+    High,
+}
+
+impl KafkaOffsetReset {
+    /// The watermark this target resolves to, or `None` for `Timestamp`.
+    fn watermark_target(self) -> Option<WatermarkTarget> {
+        match self {
+            KafkaOffsetReset::Earliest => Some(WatermarkTarget::Low),
+            KafkaOffsetReset::Latest => Some(WatermarkTarget::High),
+            KafkaOffsetReset::Timestamp(_) => None,
+        }
+    }
+}
+
+/// Target offset for one partition given its watermarks.
+fn target_from_watermarks(target: WatermarkTarget, low: i64, high: i64) -> i64 {
+    match target {
+        WatermarkTarget::Low => low,
+        WatermarkTarget::High => high,
     }
 }
 
 /// Target offset for one partition from an `offsets_for_times` result.
 ///
 /// Kafka answers "no record at or after that timestamp" with a null offset,
-/// which librdkafka surfaces as `Offset::End` (and, for a partition it could
-/// not resolve at all, `Offset::Invalid`). Both mean the same thing for a
-/// re-anchor: there is nothing left to read from that point, so the group
-/// belongs at the tail. Anything else is a concrete offset.
+/// which librdkafka passes through as `-1` and rdkafka reads as `Offset::End`.
+/// That is a real answer, and the tail is the right re-anchor for it.
 ///
-/// Every branch resolves to a real offset inside `low..=high`, never a
-/// symbolic one: a committed offset outside the retained range would be
-/// silently reinterpreted by `auto.offset.reset` on the next join, quietly
-/// undoing the reset.
-fn target_from_timestamp_lookup(looked_up: Offset, low: i64, high: i64) -> i64 {
+/// `Offset::Invalid` is librdkafka's own `-1001` sentinel and means the
+/// opposite: the partition was never resolved. Reading it as "nothing after
+/// this point" would commit the high watermark and skip every record the reset
+/// was asked to replay, so it is refused here along with any other offset that
+/// is not a real position.
+///
+/// Every accepted branch resolves inside `low..=high`, never to a symbolic
+/// offset: a committed offset outside the retained range would be silently
+/// reinterpreted by `auto.offset.reset` on the next join, undoing the reset.
+fn target_from_timestamp_lookup(
+    looked_up: Offset,
+    low: i64,
+    high: i64,
+    queue: &str,
+    partition: i32,
+) -> Result<i64> {
     match looked_up {
-        Offset::Offset(n) if n >= 0 => n.clamp(low, high),
-        Offset::Beginning => low,
-        _ => high,
+        Offset::Offset(n) if n >= 0 => Ok(n.clamp(low, high)),
+        Offset::Beginning => Ok(low),
+        Offset::End => Ok(high),
+        other => Err(ShoveError::Connection(format!(
+            "offset lookup by timestamp did not resolve {queue}[{partition}] \
+             (got {other:?}); refusing to re-anchor it at a position the broker \
+             never gave"
+        ))),
     }
+}
+
+/// Index one `TopicPartitionList` response by partition, refusing any element
+/// the broker flagged as failed.
+///
+/// `to_topic_map()` drops each element's error field, so a partition the broker
+/// could not answer for arrives indistinguishable from a real answer — and
+/// [`target_from_timestamp_lookup`] would read that as "nothing at or after
+/// this point" and re-anchor it at the tail. A reset that skipped a partition's
+/// data and still reported success is the one outcome this operation must never
+/// produce, so a flagged element fails the whole reset instead.
+fn offsets_by_partition(
+    list: &TopicPartitionList,
+    queue: &str,
+    what: &str,
+) -> Result<HashMap<i32, Offset>> {
+    let mut out = HashMap::with_capacity(list.count());
+    for elem in list.elements_for_topic(queue) {
+        elem.error().map_err(|e| {
+            ShoveError::Connection(format!(
+                "{what} failed for {queue}[{}]: {e}",
+                elem.partition()
+            ))
+        })?;
+        out.insert(elem.partition(), elem.offset());
+    }
+    Ok(out)
 }
 
 /// Committed offset for one partition as reported by `committed_offsets`.
@@ -342,13 +404,18 @@ where
                         "failed to look up offsets for timestamp {ms} on {queue}: {e}"
                     ))
                 })?;
-            let by_partition = looked_up.to_topic_map();
+            let by_partition =
+                offsets_by_partition(&looked_up, queue, "offset lookup by timestamp")?;
             for &(pid, low, high) in &watermarks {
-                let found = by_partition
-                    .get(&(queue.to_string(), pid))
-                    .copied()
-                    .unwrap_or(Offset::End);
-                let target = target_from_timestamp_lookup(found, low, high);
+                // Every partition was in the query, so an absent one is the
+                // broker declining to answer rather than "no record at or after
+                // this point" — which `Offset::Invalid` already covers.
+                let found = by_partition.get(&pid).copied().ok_or_else(|| {
+                    ShoveError::Connection(format!(
+                        "offset lookup by timestamp returned no entry for {queue}[{pid}]"
+                    ))
+                })?;
+                let target = target_from_timestamp_lookup(found, low, high, queue, pid)?;
                 targets
                     .add_partition_offset(queue, pid, Offset::Offset(target))
                     .map_err(|e| {
@@ -356,10 +423,16 @@ where
                     })?;
             }
         }
-        _ => {
+        KafkaOffsetReset::Earliest | KafkaOffsetReset::Latest => {
+            // `watermark_target` is `None` only for `Timestamp`, matched above.
+            let Some(target_kind) = to.watermark_target() else {
+                return Err(ShoveError::Topology(format!(
+                    "offset reset target {} is not answerable from watermarks",
+                    to.label()
+                )));
+            };
             for &(pid, low, high) in &watermarks {
-                let target = target_from_watermarks(to, low, high)
-                    .expect("Timestamp is handled in the arm above");
+                let target = target_from_watermarks(target_kind, low, high);
                 targets
                     .add_partition_offset(queue, pid, Offset::Offset(target))
                     .map_err(|e| {
@@ -382,7 +455,7 @@ where
                 "failed to read committed offsets for group '{group_id}': {e}"
             ))
         })?;
-    let previous = committed.to_topic_map();
+    let previous = offsets_by_partition(&committed, queue, "committed-offset read")?;
 
     // Bounded independently of `RPC_TIMEOUT`: librdkafka defers a commit issued
     // before the group coordinator is reachable and gives up after
@@ -407,7 +480,7 @@ where
         };
         entries.push(KafkaPartitionOffsetReset {
             partition: pid,
-            previous: previous.get(&key).copied().and_then(previous_committed),
+            previous: previous.get(&pid).copied().and_then(previous_committed),
             new,
         });
     }
@@ -560,25 +633,24 @@ mod tests {
 
     #[test]
     fn earliest_targets_the_low_watermark() {
-        assert_eq!(
-            target_from_watermarks(KafkaOffsetReset::Earliest, 40, 100),
-            Some(40)
-        );
+        assert_eq!(target_from_watermarks(WatermarkTarget::Low, 40, 100), 40);
     }
 
     #[test]
     fn latest_targets_the_high_watermark() {
-        assert_eq!(
-            target_from_watermarks(KafkaOffsetReset::Latest, 40, 100),
-            Some(100)
-        );
+        assert_eq!(target_from_watermarks(WatermarkTarget::High, 40, 100), 100);
     }
 
     #[test]
     fn timestamp_is_not_answerable_from_watermarks() {
+        assert_eq!(KafkaOffsetReset::Timestamp(1).watermark_target(), None);
         assert_eq!(
-            target_from_watermarks(KafkaOffsetReset::Timestamp(1), 40, 100),
-            None
+            KafkaOffsetReset::Earliest.watermark_target(),
+            Some(WatermarkTarget::Low)
+        );
+        assert_eq!(
+            KafkaOffsetReset::Latest.watermark_target(),
+            Some(WatermarkTarget::High)
         );
     }
 
@@ -586,33 +658,43 @@ mod tests {
     fn empty_partition_reanchors_at_the_same_offset_either_way() {
         // low == high: nothing retained, so Earliest and Latest agree.
         assert_eq!(
-            target_from_watermarks(KafkaOffsetReset::Earliest, 7, 7),
-            target_from_watermarks(KafkaOffsetReset::Latest, 7, 7)
+            target_from_watermarks(WatermarkTarget::Low, 7, 7),
+            target_from_watermarks(WatermarkTarget::High, 7, 7)
         );
+    }
+
+    fn ts_target(looked_up: Offset, low: i64, high: i64) -> Result<i64> {
+        target_from_timestamp_lookup(looked_up, low, high, "prices", 3)
     }
 
     #[test]
     fn timestamp_lookup_uses_the_resolved_offset() {
-        assert_eq!(
-            target_from_timestamp_lookup(Offset::Offset(55), 40, 100),
-            55
-        );
+        assert_eq!(ts_target(Offset::Offset(55), 40, 100).unwrap(), 55);
     }
 
     #[test]
     fn timestamp_past_the_last_record_falls_back_to_the_tail() {
         // Kafka returns a null offset ("no record at or after that time"),
-        // which librdkafka surfaces as `End`.
-        assert_eq!(target_from_timestamp_lookup(Offset::End, 40, 100), 100);
+        // which librdkafka passes through as -1 and rdkafka reads as `End`.
+        // That is an answer, so the tail is the right re-anchor.
+        assert_eq!(ts_target(Offset::End, 40, 100).unwrap(), 100);
     }
 
+    /// `Offset::Invalid` is librdkafka's -1001 "not set" sentinel, not Kafka's
+    /// -1 "no record after that time". Re-anchoring it at the tail would commit
+    /// past every record the reset was asked to replay and report success, so a
+    /// partition that never resolved must fail the reset by name instead.
     #[test]
-    fn unresolvable_timestamp_partition_falls_back_to_the_tail() {
-        assert_eq!(target_from_timestamp_lookup(Offset::Invalid, 40, 100), 100);
-        assert_eq!(
-            target_from_timestamp_lookup(Offset::Offset(-1), 40, 100),
-            100
-        );
+    fn an_unresolved_timestamp_partition_is_refused_rather_than_tailed() {
+        for unresolved in [Offset::Invalid, Offset::Offset(-1), Offset::Stored] {
+            let err = ts_target(unresolved, 40, 100)
+                .expect_err("an unresolved partition must not resolve to an offset");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("prices[3]"),
+                "the error must name the partition, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -620,16 +702,13 @@ mod tests {
         // The head is the *low watermark*, not literal 0: committing 0 on a
         // partition whose history has aged out would fall outside the retained
         // range and be reinterpreted by `auto.offset.reset`.
-        assert_eq!(target_from_timestamp_lookup(Offset::Beginning, 40, 100), 40);
+        assert_eq!(ts_target(Offset::Beginning, 40, 100).unwrap(), 40);
     }
 
     #[test]
     fn a_resolved_offset_is_clamped_into_the_retained_range() {
-        assert_eq!(target_from_timestamp_lookup(Offset::Offset(5), 40, 100), 40);
-        assert_eq!(
-            target_from_timestamp_lookup(Offset::Offset(500), 40, 100),
-            100
-        );
+        assert_eq!(ts_target(Offset::Offset(5), 40, 100).unwrap(), 40);
+        assert_eq!(ts_target(Offset::Offset(500), 40, 100).unwrap(), 100);
     }
 
     #[test]

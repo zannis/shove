@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, Notify};
@@ -119,10 +119,27 @@ pub(super) struct BrokerInner {
     /// no live subscribers has no entry at all, which is what makes
     /// deliver-new structural — there is nowhere for an earlier message to
     /// have been buffered.
-    pub broadcast: DashMap<String, Vec<(u64, Arc<QueueState>)>>,
-    pub next_subscription_id: AtomicU64,
+    pub broadcast: DashMap<String, Vec<BroadcastSlot>>,
     pub default_capacity: usize,
     pub shutdown: CancellationToken,
+}
+
+/// One live subscriber in the broadcast registry.
+///
+/// Identity is the buffer's own address: the registry holds a strong reference
+/// for as long as a subscription is registered, so no two live slots can share
+/// one. A counter would have to be checked for wrap; an allocation cannot
+/// collide with itself.
+pub(super) struct BroadcastSlot {
+    queue: Arc<QueueState>,
+    /// Fired when the subscriber goes away.
+    ///
+    /// A publish copies the slots out before its first `await`, so it can still
+    /// be holding a buffer whose subscriber has since left. Waiting for capacity
+    /// on that buffer would never end — nothing drains it and nothing notifies
+    /// `space` — so the publish races the wait against this token and moves on
+    /// to the subscribers behind it.
+    closed: CancellationToken,
 }
 
 /// One process's ephemeral subscription to a broadcast topic.
@@ -134,21 +151,28 @@ pub(super) struct BrokerInner {
 pub(super) struct BroadcastSubscription {
     broker: InMemoryBroker,
     topic: String,
-    id: u64,
     queue: Arc<QueueState>,
+    closed: CancellationToken,
 }
 
 impl BroadcastSubscription {
     pub(super) fn queue(&self) -> &Arc<QueueState> {
         &self.queue
     }
+
+    pub(super) fn closed_token(&self) -> &CancellationToken {
+        &self.closed
+    }
 }
 
 impl Drop for BroadcastSubscription {
     fn drop(&mut self) {
+        // Released before deregistering, so a publish already parked on this
+        // buffer stops waiting rather than blocking every subscriber behind it.
+        self.closed.cancel();
         let now_empty = match self.broker.inner.broadcast.get_mut(&self.topic) {
             Some(mut subs) => {
-                subs.retain(|(id, _)| *id != self.id);
+                subs.retain(|slot| !Arc::ptr_eq(&slot.queue, &self.queue));
                 subs.is_empty()
             }
             None => false,
@@ -190,7 +214,6 @@ impl InMemoryBroker {
             inner: Arc::new(BrokerInner {
                 queues: DashMap::new(),
                 broadcast: DashMap::new(),
-                next_subscription_id: AtomicU64::new(0),
                 default_capacity: config.default_capacity,
                 shutdown: CancellationToken::new(),
             }),
@@ -247,20 +270,20 @@ impl InMemoryBroker {
     /// of one.
     pub(super) fn broadcast_subscribe(&self, topic: &str) -> BroadcastSubscription {
         let queue = Arc::new(QueueState::new(self.inner.default_capacity));
-        let id = self
-            .inner
-            .next_subscription_id
-            .fetch_add(1, Ordering::Relaxed);
+        let closed = CancellationToken::new();
         self.inner
             .broadcast
             .entry(topic.to_string())
             .or_default()
-            .push((id, Arc::clone(&queue)));
+            .push(BroadcastSlot {
+                queue: Arc::clone(&queue),
+                closed: closed.clone(),
+            });
         BroadcastSubscription {
             broker: self.clone(),
             topic: topic.to_string(),
-            id,
             queue,
+            closed,
         }
     }
 
@@ -273,9 +296,9 @@ impl InMemoryBroker {
     ///
     /// The subscriber list is copied out before the first `await`, so the
     /// `DashMap` shard lock is never held across one — a subscriber arriving or
-    /// leaving mid-publish cannot deadlock against the enqueue. The cost is
-    /// that a subscriber which leaves during a publish may still be handed the
-    /// message, which is harmless: its buffer is about to be dropped.
+    /// leaving mid-publish cannot deadlock against the enqueue. A subscriber
+    /// that leaves during a publish may still be handed the message, which is
+    /// harmless: its buffer is about to be dropped.
     ///
     /// Backpressure is shared, as it is for every other in-process publish:
     /// `enqueue` awaits capacity, so a subscriber whose handler has stalled
@@ -283,16 +306,30 @@ impl InMemoryBroker {
     /// the existing `InMemoryConfig::default_capacity` contract rather than
     /// something broadcast introduces — and dropping instead would be a second
     /// discard path, invisible to the discard metrics.
+    ///
+    /// A *departed* subscriber is the one case where that wait would never end:
+    /// the copied `Arc` keeps its full buffer alive while nothing is left to
+    /// drain it or notify `space`. Each wait therefore races the slot's close
+    /// token, so an abandoned buffer costs the publish nothing rather than
+    /// parking it — and the subscribers behind it still get the message.
     pub(super) async fn broadcast_publish(&self, topic: &str, env: Envelope) -> Result<()> {
-        let subscribers: Vec<Arc<QueueState>> = match self.inner.broadcast.get(topic) {
-            Some(subs) => subs.iter().map(|(_, q)| Arc::clone(q)).collect(),
-            None => return Ok(()),
-        };
+        let subscribers: Vec<(Arc<QueueState>, CancellationToken)> =
+            match self.inner.broadcast.get(topic) {
+                Some(subs) => subs
+                    .iter()
+                    .map(|slot| (Arc::clone(&slot.queue), slot.closed.clone()))
+                    .collect(),
+                None => return Ok(()),
+            };
 
-        for queue in &subscribers {
+        for (queue, closed) in &subscribers {
             // Each subscriber gets its own envelope; the payload is `Bytes`, so
             // the clone shares one buffer rather than copying the message.
-            self.enqueue(queue, env.clone()).await?;
+            tokio::select! {
+                biased;
+                () = closed.cancelled() => continue,
+                res = self.enqueue(queue, env.clone()) => res?,
+            }
         }
         Ok(())
     }
@@ -342,6 +379,103 @@ impl InMemoryBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn env(body: &'static [u8]) -> Envelope {
+        Envelope::new(bytes::Bytes::from_static(body), HashMap::new())
+    }
+
+    /// A subscriber that leaves with a full buffer must not be able to park the
+    /// publisher.
+    ///
+    /// A publish copies its subscriber handles out before the first await, so it
+    /// can be parked on a buffer whose subscriber has since gone. That `Arc`
+    /// keeps the full buffer alive while nothing is left to drain it or notify
+    /// `space`, so without a close signal the wait never ends — and every
+    /// subscriber behind it in the copied list is starved along with it.
+    #[tokio::test]
+    async fn a_departed_full_subscriber_does_not_park_the_broadcast() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 1,
+        });
+
+        // Registration order matters: the publish walks the list in order, so
+        // `doomed` is the one it parks on.
+        let doomed = broker.broadcast_subscribe("cache-invalidations");
+        let live = broker.broadcast_subscribe("cache-invalidations");
+
+        broker
+            .broadcast_publish("cache-invalidations", env(b"first"))
+            .await
+            .expect("both buffers have room for the first message");
+
+        // Make room in the live subscriber only, so the publish below can be
+        // blocked by `doomed` and nothing else.
+        live.queue().buffer.lock().await.pop_front();
+        live.queue().space.notify_one();
+
+        let publishing = tokio::spawn({
+            let broker = broker.clone();
+            async move {
+                broker
+                    .broadcast_publish("cache-invalidations", env(b"second"))
+                    .await
+            }
+        });
+
+        // The publish must have *copied the doomed slot* before that subscriber
+        // goes, or the pre-fix code would skip the buffer for the ordinary
+        // reason (it was already deregistered) and the test would pass without
+        // the fix. The snapshot's own `Arc` clone is the observable that says
+        // so: the registry and the subscription hold one each, so a third
+        // strong reference can only be the publish holding it.
+        while Arc::strong_count(doomed.queue()) < 3 {
+            tokio::task::yield_now().await;
+        }
+        // And it must actually be parked, not merely started.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !publishing.is_finished(),
+            "the publish should be parked on the full buffer at this point"
+        );
+
+        drop(doomed);
+
+        tokio::time::timeout(Duration::from_secs(5), publishing)
+            .await
+            .expect("publish must stop waiting on a buffer nobody is draining")
+            .expect("publish task must not panic")
+            .expect("delivery to the live subscriber must succeed");
+
+        assert_eq!(
+            live.queue().buffer.lock().await.len(),
+            1,
+            "the subscriber behind the departed one still receives the message"
+        );
+    }
+
+    /// Dropping one subscription must not deregister another. Slots are keyed
+    /// by buffer address, so this pins that two live subscriptions to the same
+    /// topic are always distinguishable.
+    #[tokio::test]
+    async fn dropping_one_subscription_leaves_the_other_registered() {
+        let broker = InMemoryBroker::new();
+        let first = broker.broadcast_subscribe("signals");
+        let second = broker.broadcast_subscribe("signals");
+        assert_eq!(broker.broadcast_subscriber_count("signals"), 2);
+
+        drop(first);
+        assert_eq!(broker.broadcast_subscriber_count("signals"), 1);
+
+        broker
+            .broadcast_publish("signals", env(b"x"))
+            .await
+            .unwrap();
+        assert_eq!(second.queue().buffer.lock().await.len(), 1);
+
+        drop(second);
+        assert_eq!(broker.broadcast_subscriber_count("signals"), 0);
+    }
 
     #[tokio::test]
     async fn declare_is_idempotent() {

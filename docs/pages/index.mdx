@@ -29,18 +29,19 @@ cargo add shove --features inmemory
 
 ## What you get
 
-A small API on top of the brokers you already run. Three pillars:
+A small API on top of the brokers you already run. Four pillars:
 
 - **Strongly typed topics** — bind a message type to a queue topology once; the compiler keeps publishers and consumers in sync.
 - **Managed consumer groups with autoscaling** — min/max worker bounds driven by queue depth or consumer lag.
 - **Delivery ordering** — strict per-key ordering with a single `.sequenced()` switch.
+- **Per-instance broadcast** — every replica hears every message, with a single `.broadcast()` switch and nothing left behind on the broker.
 
 Plugs into **RabbitMQ**, **AWS SNS+SQS**, **NATS JetStream**, **Apache Kafka**, and **Redis/Valkey Streams**.
 
 ## What's next
 
 - **[Get started in 60 seconds](/getting-started)** — runs in-process, no Docker required.
-- **[Core concepts](/concepts/topics)** — topics, outcomes, handlers, the `Broker<B>` pattern.
+- **[Core concepts](/concepts/topics)** — topics, outcomes, handlers, broadcast, the `Broker<B>` pattern.
 - **[Per-broker setup](/backends/choosing)** — production patterns for RabbitMQ, SNS+SQS, NATS, Kafka, and Redis/Valkey.
 - **[Full API reference](https://docs.rs/shove)** — auto-generated rustdoc on docs.rs.
 

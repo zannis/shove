@@ -43,12 +43,19 @@ Per-backend feature sets (matching the CI matrix):
 
 | Backend | Feature set |
 |---|---|
-| inmemory | `inmemory,metrics` |
-| rabbitmq | `rabbitmq,audit,rabbitmq-transactional` |
-| aws-sns-sqs | `pub-aws-sns,aws-sns-sqs,audit` |
-| nats | `nats,audit` |
-| kafka | `kafka,kafka-ssl,audit` |
-| redis-streams | `redis-streams` |
+| inmemory | `inmemory,metrics,sbe,env-config` |
+| rabbitmq | `rabbitmq,audit,rabbitmq-transactional,metrics,sbe` |
+| aws-sns-sqs | `pub-aws-sns,aws-sns-sqs,audit,metrics,sbe` |
+| nats | `nats,audit,metrics,sbe,env-config` |
+| kafka | `kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config` |
+| kafka (schema registry) | `kafka,kafka-schema-registry,protobuf` |
+| redis-streams | `redis-streams,metrics,sbe` |
+
+Take these verbatim. `metrics` in particular is load-bearing: the
+`tests/metrics_*.rs` binaries are gated on it, so a set that leaves it out
+compiles them to zero tests and reports green without having run any of them.
+The authoritative copy is the `coverage` matrix in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 The Kafka feature set also needs system libraries on Linux:
 `librdkafka-dev` and `libsasl2-dev`.
@@ -64,10 +71,26 @@ cargo nextest run --features <backend-feature-set>
 
 ```sh
 cargo fmt -- --check
-cargo clippy --all-features -- -D warnings
-cargo clippy --no-default-features -- -D warnings
+cargo clippy --all-features --all-targets -- -D warnings
+cargo clippy --no-default-features --all-targets -- -D warnings
 cargo publish --dry-run --all-features
 ```
+
+Clippy is also gated per backend, because `--all-features` and
+`--no-default-features` can both be clean while a single-backend build is not:
+an item whose only callers sit behind a feature gate that set does not enable
+is dead code there and nowhere else. The `feature-lint` job runs this over each
+row of the table above, plus the two publisher-only SNS builds (`pub-aws-sns`
+and `pub-aws-sns,metrics`) that no coverage entry compiles on their own:
+
+```sh
+cargo clippy --lib --no-default-features --features <backend-feature-set> -- -D warnings
+```
+
+`--lib` rather than `--all-targets`: the `coverage` matrix already builds every
+other target for these same feature sets, so a test that fails to compile under
+one of them fails there. What this job adds is the lint pass over the library,
+which is where a feature-gated item goes dead.
 
 CI also runs `cargo audit --deny warnings`.
 
@@ -81,8 +104,9 @@ release whose version commit already landed).
 ### The commit being released must have a green CI run
 
 Before anything else, the workflow resolves the `ci.yml` run for the commit it
-is about to release and refuses to go on unless every leg — `check`, `msrv`,
-`audit` and all seven `coverage` entries — completed successfully
+is about to release and refuses to go on unless every leg — `check`,
+`feature-lint`, `msrv`, `audit` and all seven `coverage` entries — completed
+successfully
 ([`.github/scripts/require-green-ci.sh`](.github/scripts/require-green-ci.sh)).
 
 **A missing run fails the gate.** `ci.yml` has a `paths:` filter, so a commit

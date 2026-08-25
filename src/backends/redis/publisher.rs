@@ -48,6 +48,31 @@ pub struct RedisPublisher {
     conn: Arc<Mutex<Option<RedisConnection>>>,
 }
 
+struct RedisPublishError {
+    error: ShoveError,
+    explicit_rejection: bool,
+}
+
+impl RedisPublishError {
+    fn unresolved(error: ShoveError) -> Self {
+        Self {
+            error,
+            explicit_rejection: false,
+        }
+    }
+
+    fn xadd(stream: &str, source: redis::RedisError) -> Self {
+        let explicit_rejection = matches!(
+            source.kind(),
+            redis::ErrorKind::Server(_) | redis::ErrorKind::Extension
+        );
+        Self {
+            error: ShoveError::Connection(format!("XADD to {stream} failed: {source}")),
+            explicit_rejection,
+        }
+    }
+}
+
 impl RedisPublisher {
     /// Create a new publisher backed by the given [`RedisClient`].
     pub fn new(client: RedisClient) -> Self {
@@ -82,17 +107,20 @@ impl RedisPublisher {
         msg: &T::Message,
         headers: HashMap<String, String>,
         conn: Option<&mut RedisConnection>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), RedisPublishError> {
         let topology = T::topology();
-        let payload = <T::Codec as crate::Codec<T::Message>>::encode_to_string(msg)?;
+        let payload = <T::Codec as crate::Codec<T::Message>>::encode_to_string(msg)
+            .map_err(RedisPublishError::unresolved)?;
 
         let (stream, sequence_key) = if let Some(key_fn) = T::SEQUENCE_KEY_FN {
             let seq_key = key_fn(msg);
             let routing_shards = topology
                 .sequencing()
-                .ok_or_else(|| ShoveError::Validation(
-                    "topic has SEQUENCE_KEY_FN but topology.sequencing() is None; declare with sequenced()".into()
-                ))?
+                .ok_or_else(|| {
+                    RedisPublishError::unresolved(ShoveError::Validation(
+                        "topic has SEQUENCE_KEY_FN but topology.sequencing() is None; declare with sequenced()".into()
+                    ))
+                })?
                 .routing_shards();
             let shard_idx = shard_for_key(&seq_key, routing_shards);
             let stream = RedisTopologyDeclarer::shard_stream_name(topology.queue(), shard_idx);
@@ -102,9 +130,14 @@ impl RedisPublisher {
         };
 
         match conn {
-            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref()).await,
+            Some(c) => xadd_on_conn(c, &stream, &payload, &headers, sequence_key.as_deref())
+                .await
+                .map_err(|e| RedisPublishError::xadd(&stream, e)),
             None => {
-                let mut owned = self.cached_conn().await?;
+                let mut owned = self
+                    .cached_conn()
+                    .await
+                    .map_err(RedisPublishError::unresolved)?;
                 let result = xadd_on_conn(
                     &mut owned,
                     &stream,
@@ -116,7 +149,7 @@ impl RedisPublisher {
                 if result.is_err() {
                     self.invalidate_conn().await;
                 }
-                result
+                result.map_err(|e| RedisPublishError::xadd(&stream, e))
             }
         }
     }
@@ -130,7 +163,9 @@ impl RedisPublisher {
     /// Publish `msg` to the topic's stream (or a sharded stream if `T` is
     /// sequenced).
     pub async fn publish<T: Topic>(&self, msg: &T::Message) -> Result<()> {
-        self.publish_inner::<T>(msg, HashMap::new(), None).await
+        self.publish_inner::<T>(msg, HashMap::new(), None)
+            .await
+            .map_err(|e| e.error)
     }
 
     /// Publish `msg` with caller-provided headers carried in the XADD entry.
@@ -145,16 +180,18 @@ impl RedisPublisher {
         headers: HashMap<String, String>,
     ) -> Result<()> {
         validate_headers(&headers)?;
-        self.publish_inner::<T>(msg, headers, None).await
+        self.publish_inner::<T>(msg, headers, None)
+            .await
+            .map_err(|e| e.error)
     }
 
     /// Publish a batch on a single multiplexed connection.
     ///
-    /// Prefix semantics: XADDs are issued sequentially and the call returns
-    /// at the first error,
-    /// so that index is the failure and the remainder was never attempted.
-    /// Failing to acquire the connection at all leaves the whole batch
-    /// unattempted.
+    /// XADDs are issued sequentially and the call returns at the first error.
+    /// A server error explicitly rejects that index; a transport or protocol
+    /// error leaves its fate unresolved, so that index and the untouched tail
+    /// are reported as unattempted. Failing to acquire the connection at all
+    /// leaves the whole batch unattempted.
     pub async fn publish_batch<T: Topic>(&self, msgs: &[T::Message]) -> Result<()> {
         self.publish_batch_report::<T>(msgs)
             .await
@@ -168,12 +205,16 @@ impl RedisPublisher {
             Err(e) => return BatchReport::wholly_unattempted(msgs.len(), e),
         };
         for (i, msg) in msgs.iter().enumerate() {
-            if let Err(e) = self
+            if let Err(failure) = self
                 .publish_inner::<T>(msg, HashMap::new(), Some(&mut conn))
                 .await
             {
                 self.invalidate_conn().await;
-                return BatchReport::prefix(i, msgs.len(), e);
+                return if failure.explicit_rejection {
+                    BatchReport::prefix(i, msgs.len(), failure.error)
+                } else {
+                    BatchReport::sparse(Vec::new(), (i..msgs.len()).collect(), Some(failure.error))
+                };
             }
         }
         BatchReport::all_succeeded()
@@ -219,7 +260,7 @@ async fn xadd_on_conn(
     payload: &str,
     headers: &HashMap<String, String>,
     sequence_key: Option<&str>,
-) -> Result<()> {
+) -> redis::RedisResult<()> {
     let mut cmd = redis::cmd("XADD");
     cmd.arg(stream).arg("*");
     cmd.arg(PAYLOAD_FIELD).arg(payload);
@@ -229,10 +270,7 @@ async fn xadd_on_conn(
     if let Some(seq_key) = sequence_key {
         cmd.arg(X_SEQUENCE_KEY).arg(seq_key);
     }
-    conn.query::<redis::Value>(&mut cmd)
-        .await
-        .map(|_| ())
-        .map_err(|e| ShoveError::Connection(format!("XADD to {stream} failed: {e}")))
+    conn.query_redis::<redis::Value>(&mut cmd).await.map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +279,164 @@ async fn xadd_on_conn(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
     use super::*;
+    use crate::backends::redis::client::{RedisConfig, RedisMode};
+    use crate::topology::TopologyBuilder;
+    use crate::{ShoveError, define_topic};
+
+    define_topic!(
+        AmbiguousBatchTopic,
+        u64,
+        TopologyBuilder::new("redis-ambiguous-batch").build()
+    );
+
+    async fn read_command(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<Vec<Vec<u8>>> {
+        loop {
+            if let Some((command, consumed)) = parse_command(buffer) {
+                buffer.drain(..consumed);
+                return Some(command);
+            }
+            let mut chunk = [0u8; 4096];
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    fn parse_command(buffer: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
+        fn line(buffer: &[u8], start: usize) -> Option<(&[u8], usize)> {
+            let rel = buffer.get(start..)?.windows(2).position(|w| w == b"\r\n")?;
+            let end = start + rel;
+            Some((&buffer[start..end], end + 2))
+        }
+
+        let (array, mut cursor) = line(buffer, 0)?;
+        let count: usize = std::str::from_utf8(array.strip_prefix(b"*")?)
+            .ok()?
+            .parse()
+            .ok()?;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (length, after_length) = line(buffer, cursor)?;
+            let length: usize = std::str::from_utf8(length.strip_prefix(b"$")?)
+                .ok()?
+                .parse()
+                .ok()?;
+            let end = after_length.checked_add(length)?;
+            if buffer.get(end..end + 2)? != b"\r\n" {
+                return None;
+            }
+            parts.push(buffer.get(after_length..end)?.to_vec());
+            cursor = end + 2;
+        }
+        Some((parts, cursor))
+    }
+
+    async fn serve_mock_redis_connection(
+        mut stream: TcpStream,
+        xadds: Arc<AtomicUsize>,
+    ) -> std::io::Result<()> {
+        let mut buffer = Vec::new();
+        while let Some(command) = read_command(&mut stream, &mut buffer).await {
+            let name = command
+                .first()
+                .map(|part| part.to_ascii_uppercase())
+                .unwrap_or_default();
+            match name.as_slice() {
+                b"INFO" => {
+                    let info = b"# Server\r\nredis_version:7.2.0\r\n";
+                    stream
+                        .write_all(format!("${}\r\n", info.len()).as_bytes())
+                        .await?;
+                    stream.write_all(info).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                b"XADD" if xadds.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    stream.write_all(b"$3\r\n1-0\r\n").await?;
+                }
+                b"XADD" => {
+                    // Model the transport disappearing after Redis applied the
+                    // command but before its response reached the client.
+                    return Ok(());
+                }
+                b"PING" => stream.write_all(b"+PONG\r\n").await?,
+                _ => stream.write_all(b"+OK\r\n").await?,
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_ambiguous_xadd_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Redis server");
+        let address = listener.local_addr().expect("mock Redis address");
+        let xadds = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let xadds = Arc::clone(&xadds);
+                tokio::spawn(async move {
+                    let _ = serve_mock_redis_connection(stream, xadds).await;
+                });
+            }
+        });
+        (format!("redis://{address}/"), server)
+    }
+
+    #[tokio::test]
+    async fn ambiguous_xadd_response_is_unattempted_not_failed() {
+        let (url, server) = start_ambiguous_xadd_server().await;
+        let client = RedisClient::connect(
+            RedisConfig::new(RedisMode::Standalone { url })
+                .with_response_timeout(Duration::from_secs(3)),
+        )
+        .await
+        .expect("connect to mock Redis");
+        let publisher = RedisPublisher::new(client);
+
+        let outcome = publisher
+            .publish_batch_report::<AmbiguousBatchTopic>(&[1, 2, 3])
+            .await
+            .resolve(3);
+        let ShoveError::PartialBatch(failure) = outcome.result.expect_err("batch must be partial")
+        else {
+            panic!("expected PartialBatch")
+        };
+
+        assert_eq!(failure.succeeded(), 1);
+        assert!(
+            failure.failed().is_empty(),
+            "a lost reply is not an explicit broker rejection"
+        );
+        assert_eq!(failure.unattempted(), &[1, 2]);
+        assert_eq!(failure.to_republish(), &[1, 2]);
+
+        server.abort();
+    }
+
+    #[test]
+    fn only_a_redis_error_response_is_an_explicit_rejection() {
+        let response = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "XADD rejected",
+        ));
+        assert!(RedisPublishError::xadd("stream", response).explicit_rejection);
+
+        let transport = redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "reply lost",
+        ));
+        assert!(!RedisPublishError::xadd("stream", transport).explicit_rejection);
+    }
 
     #[test]
     fn shard_for_key_is_stable_and_bounded() {

@@ -415,3 +415,4 @@ The Kafka backend emits `shove_messages_failed_total` with the following `reason
 ## See also
 
 - [Liveness Probes](/guides/liveness) — wire `Broker::ping` into a k8s health endpoint.
+- [Broadcast](/concepts/broadcast) — per-instance fan-out via a groupless `assign()` at the tail, leaving `__consumer_offsets` untouched.

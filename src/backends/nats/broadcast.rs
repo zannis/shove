@@ -81,6 +81,14 @@ use super::consumer::{
 /// pull requests count as activity.
 const BROADCAST_INACTIVE_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// How many times the awaited teardown asks the server to delete the consumer
+/// before leaving it to the guard and `BROADCAST_INACTIVE_THRESHOLD`.
+const BROADCAST_DELETE_ATTEMPTS: u32 = 3;
+
+/// Gap between those attempts. Short: this sits on the shutdown path, and the
+/// failure it covers is a blip rather than an outage.
+const BROADCAST_DELETE_RETRY_DELAY: Duration = Duration::from_millis(200);
+
 /// Deletes this subscription's ephemeral consumer when it goes out of scope.
 ///
 /// The awaited delete on the happy path is the primary mechanism; this guard
@@ -125,7 +133,7 @@ impl Drop for EphemeralConsumerGuard {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    delete_ephemeral(&client, &stream, &consumer).await;
+                    let _ = delete_ephemeral(&client, &stream, &consumer).await;
                 });
             }
             Err(_) => {
@@ -141,10 +149,11 @@ impl Drop for EphemeralConsumerGuard {
     }
 }
 
-/// Best-effort delete of an ephemeral consumer. Failure is logged, never
-/// propagated: the subscription is already over, and the server's
-/// `inactive_threshold` removes the consumer regardless.
-async fn delete_ephemeral(client: &NatsClient, stream: &str, consumer: &str) {
+/// Delete an ephemeral consumer. Returns whether the consumer is confirmed
+/// gone, so the caller can keep its `Drop` guard armed for another attempt
+/// instead of leaving the consumer to `inactive_threshold`. Failure is logged,
+/// never propagated: the subscription is already over either way.
+async fn delete_ephemeral(client: &NatsClient, stream: &str, consumer: &str) -> bool {
     let js_stream = match client.jetstream().get_stream(stream).await {
         Ok(s) => s,
         Err(e) => {
@@ -155,19 +164,63 @@ async fn delete_ephemeral(client: &NatsClient, stream: &str, consumer: &str) {
                 "could not reach the stream to delete the ephemeral broadcast consumer; \
                  the server's inactive_threshold will reap it"
             );
-            return;
+            return false;
         }
     };
     match js_stream.delete_consumer(consumer).await {
-        Ok(_) => tracing::debug!(stream, consumer, "ephemeral broadcast consumer deleted"),
-        Err(e) => tracing::warn!(
-            stream,
-            consumer,
-            error = %e,
-            "failed to delete the ephemeral broadcast consumer; the server's \
-             inactive_threshold will reap it"
-        ),
+        // `DeleteStatus` carries the server's own verdict. `Ok` means the
+        // request round-tripped, not that the consumer went, so a `success:
+        // false` reply has to keep the guard armed like any other failure.
+        Ok(status) if status.success => {
+            tracing::debug!(stream, consumer, "ephemeral broadcast consumer deleted");
+            true
+        }
+        Ok(_) => {
+            tracing::warn!(
+                stream,
+                consumer,
+                "the server declined to delete the ephemeral broadcast consumer"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                stream,
+                consumer,
+                error = %e,
+                "failed to delete the ephemeral broadcast consumer"
+            );
+            false
+        }
     }
+}
+
+/// Attempts a delete until the server confirms it, or the budget runs out.
+///
+/// The awaited delete is what makes "nothing survives the future resolving"
+/// literally true, so a single failed attempt handing off to a detached `Drop`
+/// spawn would give that up for a transient blip. Bounded rather than
+/// open-ended: this runs on the shutdown path, where a drain is already racing
+/// a deadline, and `inactive_threshold` is the backstop that makes giving up
+/// safe.
+async fn delete_ephemeral_with_retry(client: &NatsClient, stream: &str, consumer: &str) -> bool {
+    for attempt in 0..BROADCAST_DELETE_ATTEMPTS {
+        if delete_ephemeral(client, stream, consumer).await {
+            return true;
+        }
+        if attempt.saturating_add(1) < BROADCAST_DELETE_ATTEMPTS {
+            tokio::time::sleep(BROADCAST_DELETE_RETRY_DELAY).await;
+        }
+    }
+    tracing::warn!(
+        stream,
+        consumer,
+        attempts = BROADCAST_DELETE_ATTEMPTS,
+        threshold_secs = BROADCAST_INACTIVE_THRESHOLD.as_secs(),
+        "giving up on deleting the ephemeral broadcast consumer; the guard's \
+         detached attempt and the server's inactive_threshold are what remain"
+    );
+    false
 }
 
 impl NatsConsumer {
@@ -279,8 +332,13 @@ where
             // true on this path rather than merely scheduled — and it runs per
             // attempt, so a reconnect does not accumulate consumers. The guard
             // covers the abort path, where nothing below this line runs at all.
-            guard.disarm();
-            delete_ephemeral(&client, queue, &consumer_name).await;
+            //
+            // Disarmed only once the delete is confirmed: disarming first would
+            // drop the guard's second chance if this await were cancelled
+            // mid-delete, or if the delete simply failed.
+            if delete_ephemeral_with_retry(&client, queue, &consumer_name).await {
+                guard.disarm();
+            }
 
             result
         }
@@ -340,7 +398,7 @@ where
             },
         };
 
-        metrics::record_message_size(&topic, None, msg.payload.len());
+        metrics::record_message_size(&topic, options.consumer_group.as_deref(), msg.payload.len());
 
         // No DLQ to route a malformed message to — `build()` rejects
         // `.broadcast()` with `.dlq()`. So the pre-handler rejections discard
@@ -352,7 +410,13 @@ where
                 error = %e,
                 "oversized message on a broadcast subscription — discarding (no DLQ)"
             );
-            metrics::record_terminal(&topic, None, metrics::FailReason::Oversize, false).confirm();
+            metrics::record_terminal(
+                &topic,
+                options.consumer_group.as_deref(),
+                metrics::FailReason::Oversize,
+                false,
+            )
+            .confirm();
             continue;
         }
 
@@ -394,8 +458,13 @@ async fn deliver_until_settled<T, H>(
                         error = %e,
                         "undeserializable message on a broadcast subscription — discarding (no DLQ)"
                     );
-                    metrics::record_terminal(topic, None, metrics::FailReason::Deserialize, false)
-                        .confirm();
+                    metrics::record_terminal(
+                        topic,
+                        options.consumer_group.as_deref(),
+                        metrics::FailReason::Deserialize,
+                        false,
+                    )
+                    .confirm();
                     return;
                 }
             };
@@ -411,7 +480,7 @@ async fn deliver_until_settled<T, H>(
         )
         .await;
 
-        match settle_broadcast_outcome(&outcome, topic, None) {
+        match settle_broadcast_outcome(&outcome, topic, options.consumer_group.as_deref()) {
             BroadcastAction::Done => return,
             BroadcastAction::Redeliver => {
                 tokio::select! {
@@ -441,7 +510,7 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
-    let _inflight = metrics::InflightGuard::new(topic.clone(), None);
+    let _inflight = metrics::InflightGuard::new(topic.clone(), options.consumer_group.clone());
     let start = std::time::Instant::now();
     // Spawned so a panicking handler surfaces as a `JoinError` here instead of
     // taking the delivery loop down with it.
@@ -459,7 +528,11 @@ where
                 join.abort();
                 let resolved = handler_timeout_outcome(options.handler_timeout_outcome.clone());
                 tracing::warn!(outcome = ?resolved, "broadcast handler timed out after {duration:?}");
-                metrics::record_failed(topic, None, metrics::FailReason::Timeout);
+                metrics::record_failed(
+                    topic,
+                    options.consumer_group.as_deref(),
+                    metrics::FailReason::Timeout,
+                );
                 resolved
             }
         },
@@ -473,7 +546,12 @@ where
     };
 
     let elapsed = start.elapsed().as_secs_f64();
-    metrics::record_consumed(topic, None, &outcome);
-    metrics::record_processing_duration(topic, None, &outcome, elapsed);
+    metrics::record_consumed(topic, options.consumer_group.as_deref(), &outcome);
+    metrics::record_processing_duration(
+        topic,
+        options.consumer_group.as_deref(),
+        &outcome,
+        elapsed,
+    );
     outcome
 }

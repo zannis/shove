@@ -228,11 +228,17 @@ async fn handle_entry<T, H>(
             entry_id,
             "entry has no payload field on a broadcast subscription — discarding"
         );
-        metrics::record_terminal(topic, None, metrics::FailReason::Malformed, false).confirm();
+        metrics::record_terminal(
+            topic,
+            options.consumer_group.as_deref(),
+            metrics::FailReason::Malformed,
+            false,
+        )
+        .confirm();
         return;
     };
 
-    metrics::record_message_size(topic, None, payload_raw.len());
+    metrics::record_message_size(topic, options.consumer_group.as_deref(), payload_raw.len());
 
     if let Some(max) = options.max_message_size
         && payload_raw.len() > max
@@ -244,7 +250,13 @@ async fn handle_entry<T, H>(
             limit = max,
             "oversized message on a broadcast subscription — discarding (no DLQ)"
         );
-        metrics::record_terminal(topic, None, metrics::FailReason::Oversize, false).confirm();
+        metrics::record_terminal(
+            topic,
+            options.consumer_group.as_deref(),
+            metrics::FailReason::Oversize,
+            false,
+        )
+        .confirm();
         return;
     }
 
@@ -266,8 +278,13 @@ async fn handle_entry<T, H>(
                         error = %e,
                         "undeserializable message on a broadcast subscription — discarding (no DLQ)"
                     );
-                    metrics::record_terminal(topic, None, metrics::FailReason::Deserialize, false)
-                        .confirm();
+                    metrics::record_terminal(
+                        topic,
+                        options.consumer_group.as_deref(),
+                        metrics::FailReason::Deserialize,
+                        false,
+                    )
+                    .confirm();
                     return;
                 }
             };
@@ -294,7 +311,7 @@ async fn handle_entry<T, H>(
         .await;
         options.processing.store(false, Ordering::Release);
 
-        match settle_broadcast_outcome(&outcome, topic, None) {
+        match settle_broadcast_outcome(&outcome, topic, options.consumer_group.as_deref()) {
             BroadcastAction::Done => return,
             BroadcastAction::Redeliver => {
                 tokio::select! {
@@ -325,7 +342,7 @@ where
     T: Topic,
     H: MessageHandler<T>,
 {
-    let _inflight = metrics::InflightGuard::new(topic.clone(), None);
+    let _inflight = metrics::InflightGuard::new(topic.clone(), options.consumer_group.clone());
     let start = std::time::Instant::now();
     let mut join = tokio::spawn(async move { handler.handle(msg, meta, ctx.as_ref()).await });
 
@@ -343,7 +360,11 @@ where
                     outcome = ?resolved,
                     "broadcast handler timed out after {duration:?}"
                 );
-                metrics::record_failed(topic, None, metrics::FailReason::Timeout);
+                metrics::record_failed(
+                    topic,
+                    options.consumer_group.as_deref(),
+                    metrics::FailReason::Timeout,
+                );
                 resolved
             }
         },
@@ -357,7 +378,12 @@ where
     };
 
     let elapsed = start.elapsed().as_secs_f64();
-    metrics::record_consumed(topic, None, &outcome);
-    metrics::record_processing_duration(topic, None, &outcome, elapsed);
+    metrics::record_consumed(topic, options.consumer_group.as_deref(), &outcome);
+    metrics::record_processing_duration(
+        topic,
+        options.consumer_group.as_deref(),
+        &outcome,
+        elapsed,
+    );
     outcome
 }

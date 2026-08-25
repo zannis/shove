@@ -113,10 +113,9 @@ pub struct ConsumerOptions<B: Backend> {
     pub max_retries: u32,
     /// Prefetch count (number of unacked messages the broker will deliver).
     ///
-    /// Note: when [`concurrent_processing`](Self::concurrent_processing) is
-    /// `false`, [`into_inner`](Self::into_inner) clamps the effective
-    /// prefetch to `1` regardless of this value, so the consumer processes
-    /// one message at a time.
+    /// The effective value passed to a backend is always at least `1`. When
+    /// [`concurrent_processing`](Self::concurrent_processing) is `false`, it is
+    /// exactly `1` regardless of this value.
     pub prefetch_count: u16,
     /// Process prefetched messages concurrently (`true`, default) or one at
     /// a time (`false`). When `false`, [`into_inner`](Self::into_inner)
@@ -295,6 +294,7 @@ impl<B: Backend> ConsumerOptions<B> {
     }
 
     /// Set the prefetch count (number of unacked messages the broker will deliver).
+    /// Zero is accepted for configuration compatibility and lowered to `1`.
     pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
         self.prefetch_count = prefetch_count;
         self
@@ -499,7 +499,7 @@ impl<B: Backend> ConsumerOptions<B> {
     /// per-backend `ConsumerGroupConfig::with_concurrent_processing`.
     pub(crate) fn into_inner(self) -> ConsumerOptionsInner {
         let effective_prefetch = if self.concurrent_processing {
-            self.prefetch_count
+            self.prefetch_count.max(1)
         } else {
             1
         };
@@ -784,6 +784,20 @@ mod tests {
             .with_prefetch_count(32)
             .into_inner();
         assert_eq!(inner.prefetch_count, 32);
+    }
+
+    #[cfg(any(
+        feature = "inmemory",
+        feature = "kafka",
+        feature = "nats",
+        feature = "rabbitmq"
+    ))]
+    #[test]
+    fn into_inner_clamps_zero_prefetch_when_concurrent() {
+        let inner = ConsumerOptions::<TestBackend>::new()
+            .with_prefetch_count(0)
+            .into_inner();
+        assert_eq!(inner.prefetch_count, 1);
     }
 
     #[cfg(any(

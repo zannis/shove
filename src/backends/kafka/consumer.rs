@@ -912,6 +912,11 @@ async fn route_outcome(
 /// use for their own metadata round trips.
 const BROADCAST_ASSIGN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How often an assign-only broadcast subscriber checks for partitions added
+/// after it connected. Manual assignments do not participate in rebalances, so
+/// metadata growth has to be reflected explicitly.
+const BROADCAST_ASSIGN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A message travelling through a broadcast subscription: the raw payload and
 /// its headers, owned, so the same value can come off the wire or off this
 /// subscription's own defer channel.
@@ -1418,6 +1423,14 @@ impl KafkaStreamConsumer {
         }
     }
 
+    fn position(&self) -> KafkaResult<TopicPartitionList> {
+        match self {
+            Self::Default(c) => c.position(),
+            #[cfg(feature = "kafka-msk-iam")]
+            Self::MskIam(c) => c.position(),
+        }
+    }
+
     /// Assign every partition of `topic` at its current end offset.
     ///
     /// The groupless half of a broadcast subscription. `assign()` instead of
@@ -1472,6 +1485,64 @@ impl KafkaStreamConsumer {
         self.assign(&tpl)
             .map_err(|e| map_kafka_error(&format!("failed to assign partitions of {topic}"), e))?;
         Ok(partitions.len())
+    }
+
+    /// Extend a manual broadcast assignment with partitions added since the
+    /// previous metadata snapshot.
+    ///
+    /// Existing partitions are re-assigned at their current consumer position;
+    /// only newly discovered partitions start at `Offset::End`. This avoids
+    /// both replaying already-delivered records and moving an existing
+    /// partition to the tail.
+    ///
+    /// **Blocking** for the metadata fetch; callers must use `spawn_blocking`.
+    fn refresh_broadcast_partitions(&self, topic: &str, timeout: Duration) -> Result<usize> {
+        let metadata = self
+            .fetch_metadata(Some(topic), timeout)
+            .map_err(|e| map_kafka_error(&format!("failed to refresh metadata for {topic}"), e))?;
+        let mut positions = self.position().map_err(|e| {
+            map_kafka_error(
+                &format!("failed to read broadcast positions for {topic}"),
+                e,
+            )
+        })?;
+        let partition_ids = metadata
+            .topics()
+            .iter()
+            .find(|candidate| candidate.name() == topic)
+            .map(|metadata_topic| {
+                metadata_topic
+                    .partitions()
+                    .iter()
+                    .map(|partition| partition.id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut added = 0;
+        for partition in partition_ids {
+            if positions.find_partition(topic, partition).is_none() {
+                positions
+                    .add_partition_offset(topic, partition, Offset::End)
+                    .map_err(|e| {
+                        map_kafka_error(
+                            &format!("failed to target the tail of {topic}[{partition}]"),
+                            e,
+                        )
+                    })?;
+                added += 1;
+            }
+        }
+
+        if added > 0 {
+            self.assign(&positions).map_err(|e| {
+                map_kafka_error(
+                    &format!("failed to extend broadcast assignment for {topic}"),
+                    e,
+                )
+            })?;
+        }
+        Ok(added)
     }
 
     fn fetch_metadata(&self, topic: Option<&str>, timeout: Duration) -> KafkaResult<Metadata> {
@@ -2801,7 +2872,7 @@ impl KafkaConsumer {
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
         let max_retries = options.max_retries;
-        let prefetch_count = options.prefetch_count;
+        let prefetch_count = options.prefetch_count.max(1);
         let handler_timeout = options.handler_timeout;
         let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
@@ -4307,7 +4378,7 @@ impl KafkaConsumer {
 
         let shutdown = options.shutdown.clone();
         let processing = options.processing.clone();
-        let prefetch_count = options.prefetch_count;
+        let prefetch_count = options.prefetch_count.max(1);
         let handler_timeout = options.handler_timeout;
         let handler_timeout_outcome_cfg = options.handler_timeout_outcome.clone();
         let max_message_size = options.max_message_size;
@@ -4402,10 +4473,16 @@ impl KafkaConsumer {
                 // per prefetch permit: a deferring handler holds its permit
                 // until the redelivery is handed over, so no more than
                 // `prefetch_count` deferrals can be in flight at once. The
-                // `max(1)` is not decoration — `mpsc::channel(0)` panics, and
-                // `prefetch_count` is a plain `u16` a caller can set to zero.
+                // Keep the channel defensive even though the effective
+                // prefetch was normalised above.
                 let (defer_tx, mut defer_rx) =
                     mpsc::channel::<DeferredDelivery>((prefetch_count as usize).max(1));
+                let mut assignment_refresh =
+                    tokio::time::interval(BROADCAST_ASSIGN_REFRESH_INTERVAL);
+                assignment_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // `interval`'s first tick is immediate. The initial assignment
+                // above is already the authoritative metadata snapshot.
+                assignment_refresh.tick().await;
 
                 loop {
                     let delivery = tokio::select! {
@@ -4418,6 +4495,47 @@ impl KafkaConsumer {
                             // which is dropped when this future resolves.
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
                             return Ok(());
+                        }
+
+                        refresh = async {
+                            assignment_refresh.tick().await;
+                            let refresh_consumer = consumer.clone();
+                            let refresh_topic = queue.to_string();
+                            tokio::task::spawn_blocking(move || {
+                                refresh_consumer.refresh_broadcast_partitions(
+                                    &refresh_topic,
+                                    BROADCAST_ASSIGN_TIMEOUT,
+                                )
+                            })
+                            .await
+                        } => {
+                            match refresh {
+                                Ok(Ok(added)) if added > 0 => {
+                                    tracing::info!(
+                                        queue,
+                                        added,
+                                        "broadcast subscription extended its partition assignment"
+                                    );
+                                }
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => {
+                                    // The existing assignment remains valid.
+                                    // Retry on the next tick instead of
+                                    // reconnecting at the tail and creating an
+                                    // avoidable delivery gap on every partition.
+                                    tracing::warn!(
+                                        error = %e,
+                                        queue,
+                                        "broadcast assignment refresh failed; keeping the current assignment"
+                                    );
+                                }
+                                Err(e) => {
+                                    return Err(ShoveError::Connection(format!(
+                                        "broadcast assignment refresh task panicked: {e}"
+                                    )));
+                                }
+                            }
+                            continue;
                         }
 
                         deferred = defer_rx.recv() => {

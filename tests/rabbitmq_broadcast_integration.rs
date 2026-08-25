@@ -408,12 +408,27 @@ async fn broadcast_fans_out_and_leaves_no_queue_behind() {
     for recorder in &recorders {
         recorder.wait_for(3, Duration::from_secs(20)).await;
     }
+    // Settle, so a fourth delivery has time to arrive and fail the exact-count
+    // assertion below rather than land after the test has already passed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Every instance saw every message — the whole point. A competing-consumer
     // topology would split these three across the two subscribers.
     let expected: HashSet<String> = keys.iter().map(|k| k.key.clone()).collect();
     for (i, recorder) in recorders.iter().enumerate() {
-        let seen: HashSet<String> = recorder.keys().await.into_iter().collect();
+        let delivered = recorder.keys().await;
+        // Length before set, and from the raw vector: collapsing into a
+        // `HashSet` first would swallow a duplicate delivery, and broadcast is
+        // documented as lossy *at-most-once*. A second copy of one key is as
+        // much a contract break as a missing one.
+        assert_eq!(
+            delivered.len(),
+            expected.len(),
+            "subscriber {i} received {} deliveries for {} messages: {delivered:?}",
+            delivered.len(),
+            expected.len()
+        );
+        let seen: HashSet<String> = delivered.into_iter().collect();
         assert_eq!(
             seen, expected,
             "subscriber {i} did not receive the full fan-out"

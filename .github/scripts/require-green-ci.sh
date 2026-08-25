@@ -41,11 +41,12 @@ REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set to owner/repo}"
 GATE_LEVEL="${GATE_LEVEL:-error}"
 
 # Every job in ci.yml. `check` covers fmt/clippy/`cargo test
-# --no-default-features`/`cargo publish --dry-run`, `coverage` is the
-# per-backend integration matrix; a release wants all of them, so all of them
-# are listed. Keep this in sync with ci.yml -- a job renamed there and not here
-# fails the gate closed, which is the safe direction.
-REQUIRED_JOBS="check msrv audit"
+# --no-default-features`/`cargo publish --dry-run`, `feature-lint` covers
+# clippy for each single-backend feature set, `coverage` is the per-backend
+# integration matrix; a release wants all of them, so all of them are listed.
+# Keep this in sync with ci.yml -- a job renamed there and not here fails the
+# gate closed, which is the safe direction.
+REQUIRED_JOBS="check feature-lint msrv audit"
 REQUIRED_COVERAGE_LEGS="inmemory rabbitmq aws-sns-sqs nats kafka kafka-schema-registry redis-streams"
 
 # GitHub renders a matrix job as "<job> (<value>, <value>, ...)" over the

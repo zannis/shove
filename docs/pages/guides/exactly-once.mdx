@@ -40,7 +40,7 @@ Enable the feature in `Cargo.toml`:
 
 ```toml
 [dependencies]
-shove = { version = "0.11", features = ["rabbitmq-transactional"] }
+shove = { version = "0.x", features = ["rabbitmq-transactional"] }
 ```
 
 With the feature enabled, `ConsumerOptions\<RabbitMq\>` gains the `.with_exactly_once()` builder method. When set, the consumer channel is put in AMQP transaction mode (`tx_select`) before the first delivery. Every routing decision — publish-to-hold-queue AND ack/nack of the original — is wrapped in a `tx_commit`. The broker either applies both operations or neither. The publish-then-ack race is gone.

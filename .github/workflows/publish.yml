@@ -142,9 +142,15 @@ jobs:
         if: inputs.bump != 'none'
         run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version
 
-      - name: Update pnpm lockfile
+      # `--frozen-lockfile`, so this validates rather than rewrites. The lockfile
+      # does not record the root package's own version, so a bump gives it
+      # nothing to sync -- but `package.json` floats `react`, `typescript` and
+      # `@types/react` on `latest`, so a plain `pnpm install` here would
+      # re-resolve them and fold a docs-dependency upgrade CI never built into a
+      # commit labelled "pure version bump".
+      - name: Verify the pnpm lockfile still matches package.json
         if: inputs.bump != 'none'
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Import GPG signing key
         if: inputs.bump != 'none'
@@ -186,6 +192,7 @@ jobs:
         if: inputs.bump != 'none'
         env:
           GATED_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           parent=$(git rev-parse HEAD^)
           if [ "$parent" != "$GATED_SHA" ]; then
@@ -204,6 +211,70 @@ jobs:
             printf '%s\n' "$unexpected"
             exit 1
           fi
+          # The filename check alone vouches for nothing: `cargo set-version`
+          # and `pnpm install` both write *inside* those four files, so a
+          # dependency, feature or metadata rewrite passes it while still being
+          # a tree CI never built.
+          #
+          # Checked structurally rather than by matching lines. A pattern over
+          # added lines misses a deletion; adding removed lines misses a
+          # balanced replacement of some *other* `version` field; and each
+          # widening invites the next. What the bump actually does is
+          # well-defined: it rewrites one field per file and touches nothing
+          # else, so that is what is asserted.
+          #
+          # pnpm-lock.yaml is the easy half -- it does not record the root
+          # package's own version, so a bump gives it nothing to sync and it
+          # must not move at all.
+          if printf '%s\n' "$changed" | grep -qx 'pnpm-lock\.yaml'; then
+            echo "::error::The release commit changes pnpm-lock.yaml. A version bump has nothing to sync there, so this is a dependency change CI never built:"
+            git diff HEAD^ HEAD -- pnpm-lock.yaml
+            exit 1
+          fi
+
+          # A diff is more than its lines: a mode change, a rename, a symlink
+          # swap, an addition or a deletion all leave the content check with
+          # nothing to look at. `git diff --summary` is empty for a commit that
+          # only edits existing regular files in place, which is exactly what a
+          # version bump is.
+          structural=$(git diff --summary HEAD^ HEAD)
+          if [ -n "$structural" ]; then
+            echo "::error::The release commit changes more than file contents. A version bump edits four files in place and does nothing else:"
+            printf '%s\n' "$structural"
+            exit 1
+          fi
+
+          # One line replaced, in each file that changed at all. Anything
+          # smuggled alongside the bump -- added, removed, or swapped -- moves
+          # this count off two.
+          for f in Cargo.toml Cargo.lock package.json; do
+            printf '%s\n' "$changed" | grep -qxF "$f" || continue
+            lines=$(git diff --unified=0 HEAD^ HEAD -- "$f" | grep -cE '^[+-][^+-]' || true)
+            if [ "$lines" != "2" ]; then
+              echo "::error::${f} has ${lines} changed lines; a version bump replaces exactly one. The tree being published is not the tree CI tested:"
+              git diff HEAD^ HEAD -- "$f"
+              exit 1
+            fi
+          done
+
+          # ...and the field that moved is the package's own version, read as a
+          # field rather than matched as text, so a dependency's `version` entry
+          # cannot stand in for it.
+          toml_version=$(git show HEAD:Cargo.toml \
+            | sed -n '/^\[package\]/,/^\[/p' \
+            | sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' | head -1)
+          lock_version=$(git show HEAD:Cargo.lock \
+            | awk '/^name = "shove"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }')
+          json_version=$(git show HEAD:package.json | jq -r '.version')
+          for pair in "Cargo.toml:${toml_version}" "Cargo.lock:${lock_version}" "package.json:${json_version}"; do
+            file=${pair%%:*}
+            found=${pair#*:}
+            if [ "$found" != "$VERSION" ]; then
+              echo "::error::${file} declares version '${found}', but this release is '${VERSION}'. The bump did not land where it was supposed to."
+              exit 1
+            fi
+          done
+
           echo "Release commit is a pure version bump over the gated commit ${GATED_SHA}:"
           printf '%s\n' "$changed"
 

@@ -22,6 +22,7 @@
 //! at the end — progress is waited on through handler counters and the DLQ,
 //! never by peeking at the metrics.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -262,6 +263,25 @@ type Snapshot = std::collections::HashMap<
     ),
 >;
 
+/// The group name the sequenced consumer is configured with. Deliberately not a
+/// name any derived identifier could coincide with: the label under test is the
+/// logical group, never a broker-side queue or exchange name.
+const FIFO_GROUP: &str = "ledger-fifo-team";
+
+/// Every `consumer_group` label value carried by `metric` in the snapshot.
+fn consumer_group_labels(snapshot: &Snapshot, metric: &str) -> BTreeSet<String> {
+    snapshot
+        .iter()
+        .filter(|(k, _)| k.key().name() == metric)
+        .map(|(k, _)| {
+            k.key()
+                .labels()
+                .find(|l| l.key() == "consumer_group")
+                .map_or_else(|| "<unlabelled>".to_string(), |l| l.value().to_string())
+        })
+        .collect()
+}
+
 /// Sum `shove_messages_failed_total` across every series whose `reason` label
 /// matches, so the assertion is on the number the operator actually alerts on.
 fn failed_total(snapshot: &Snapshot, reason: &str) -> u64 {
@@ -385,7 +405,8 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
         let opts = ConsumerOptions::<RabbitMqMarker>::new()
             .with_shutdown(s)
             .with_prefetch_count(10)
-            .with_max_retries(1);
+            .with_max_retries(1)
+            .with_consumer_group(FIFO_GROUP);
         consumer
             .run_fifo::<Ledger, _>(Handler, handler_ctx, opts)
             .await
@@ -468,5 +489,20 @@ async fn sequenced_discards_are_counted_but_failall_cascades_are_not() {
     assert!(
         discarded.is_empty(),
         "a cascade that reached the DLQ must not claim data loss; got {discarded:?}"
+    );
+
+    // The sequenced path spawns one consumer per routing shard and builds each
+    // shard's options from the caller's. A hand-copied allowlist of fields
+    // dropped `consumer_group`, so every series above was labelled `default`
+    // and `sum by (consumer_group)` split one logical group in two — the exact
+    // thing the observability guide promises it does not do.
+    // `shove_messages_failed_total` is the sharpest probe available here: both
+    // of its series above (`rejected`, `max_retries_exceeded`) come from the
+    // sequenced consumer, and the DLQ drain running alongside it records no
+    // failures at all, so nothing else can contribute a value.
+    assert_eq!(
+        consumer_group_labels(&snapshot, "shove_messages_failed_total"),
+        BTreeSet::from([FIFO_GROUP.to_string()]),
+        "every sequenced series must carry the configured group name"
     );
 }

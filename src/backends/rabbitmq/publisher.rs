@@ -238,6 +238,11 @@ impl RabbitMqPublisher {
     /// broker ever received them. Re-publishing them risks a duplicate;
     /// not re-publishing them risks a loss, and this crate always picks the
     /// duplicate.
+    ///
+    /// A broker NACK is the *only* thing here that lands in `failed`. It is the
+    /// only outcome where the broker gave a verdict; a `basic_publish` error and
+    /// a failed confirm are both transport failures that leave the record's fate
+    /// unknown, which is what `unattempted` means.
     async fn do_publish_batch(
         channel: &Channel,
         exchange: &str,
@@ -246,7 +251,7 @@ impl RabbitMqPublisher {
         let total = items.len();
         let mut confirms = Vec::with_capacity(total);
         let props = base_properties();
-        for (i, (routing_key, payload)) in items.iter().enumerate() {
+        for (routing_key, payload) in items.iter() {
             match channel
                 .basic_publish(
                     exchange.into(),
@@ -259,14 +264,15 @@ impl RabbitMqPublisher {
             {
                 Ok(confirm) => confirms.push(confirm),
                 Err(e) => {
-                    // Index `i` was attempted and rejected. Indices before it
-                    // were submitted but will never be confirmed now, and
-                    // indices after it were never submitted — both are
-                    // outstanding.
-                    let unattempted = (0..i).chain(i.saturating_add(1)..total).collect();
+                    // Nothing here is an explicit rejection: `basic_publish`
+                    // fails on the channel, not on a broker verdict. Index `i`
+                    // may or may not have gone out, the indices before it went
+                    // out but will never be confirmed now, and the ones after
+                    // it were never submitted. All three are "submitted without
+                    // a resolution the backend could confirm" at best.
                     return BatchReport::sparse(
-                        vec![i],
-                        unattempted,
+                        Vec::new(),
+                        (0..total).collect(),
                         Some(map_lapin_error("batch publish failed", e)),
                     );
                 }
@@ -289,10 +295,15 @@ impl RabbitMqPublisher {
                     }
                 }
                 Err(e) => {
-                    return BatchReport::prefix(
-                        i,
-                        total,
-                        map_lapin_error("batch confirm failed", e),
+                    // `prefix` would report index `i` as `failed`, which claims
+                    // the broker rejected it. It did not say anything: the
+                    // confirm itself failed, so `i` is unresolved exactly like
+                    // the tail behind it. The prefix before it is still
+                    // genuinely confirmed and stays counted as such.
+                    return BatchReport::sparse(
+                        Vec::new(),
+                        (i..total).collect(),
+                        Some(map_lapin_error("batch confirm failed", e)),
                     );
                 }
             }

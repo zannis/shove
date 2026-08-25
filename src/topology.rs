@@ -535,8 +535,9 @@ impl TopologyBuilder {
     /// groups*, which is a backend-level notion:
     ///
     /// - **Kafka** — the group is wired through: the `group.id` defaults to
-    ///   `{queue}-{group}` instead of `{queue}-consumer`, so the two readers
-    ///   get independent partition assignments rather than splitting one set.
+    ///   `{queue}-{group}-consumer` instead of `{queue}-consumer` (and to
+    ///   `{queue}-{group}-fifo` for a sequenced topic), so the two readers get
+    ///   independent partition assignments rather than splitting one set.
     ///   An explicit
     ///   [`ConsumerOptions::with_group_id`](crate::ConsumerOptions::with_group_id)
     ///   or [`KafkaConsumerGroupConfig::with_group_id`](crate::kafka::KafkaConsumerGroupConfig::with_group_id)
