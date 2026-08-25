@@ -56,9 +56,11 @@ Brokers fail differently, and `shove` reports what each one actually knows rathe
 | Kafka | **sparse** | Every record is submitted independently, so `failed()` names exactly the rejected ones and `unattempted()` is empty. |
 | SNS | **sparse** | Rejected entries are named per 10-entry chunk. A chunk that errors as a whole, and every later chunk, becomes `unattempted()`. |
 | NATS | **sparse + tail** | Ack failures are exact over the submitted prefix; if submission breaks partway, the rest of the batch is `unattempted()`. |
-| RabbitMQ | **prefix** | Confirms are awaited in order and the call stops at the first nack: `failed()` is that one index, `unattempted()` is everything after it. |
+| RabbitMQ | **prefix on a NACK, tail otherwise** | Every record is submitted, then confirms are awaited in order. A NACK stops the call: `failed()` is that one index, `unattempted()` is everything after it. A `basic_publish` or confirm *error* names nothing as rejected — see the rule below. |
 | Redis | **prefix** | Sequential; stops at the first error. |
 | InMemory | **prefix** | Sequential; stops at the first error. |
+
+`failed()` means the broker gave a verdict — nothing else earns it. A transport failure says nothing about whether the record was stored, so RabbitMQ (a failed `basic_publish` or confirm) and NATS (an ack that timed out or died with the connection) report those indices as `unattempted()` instead. The re-publish set is identical either way; only the diagnosis differs.
 
 This is why the payload is a **set of indices** rather than "the index of the first failure". On the sparse backends a record *after* a failure has usually already succeeded, so "re-publish everything from the first failure onwards" re-sends records that were fine. Its inverse — "skip the first `succeeded` records" — is worse: it loses data, because `succeeded` is a count, not a prefix length.
 

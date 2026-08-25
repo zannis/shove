@@ -32,7 +32,7 @@ Broadcast is deliberately lossy. Each constraint below exists because the altern
 
 **Deliver-new only.** An instance receives what is published while it is subscribed. Nothing is replayed for an instance that was down, and nothing accumulates for one that has not started. This is correct for invalidation — a process that just booted has an empty cache, so there is nothing stale to invalidate — and it is what removes the need to store a per-instance offset anywhere.
 
-**No retry chain.** `.dlq()`, `.dlq_named()`, `.hold_queue()` and `.sequenced()` each panic in `build()` when combined with `.broadcast()`. This is not an oversight to be filled in later. Redelivery to *one* subscriber of a fan-out is not expressible on most of these brokers, and a shared DLQ would collect one copy of every failure per subscriber — the failure of a single message would look like N failures.
+**No retry chain.** `.dlq()`, `.dlq_named()`, `.hold_queue()` and `.sequenced()` each panic in `build()` when combined with `.broadcast()`. (`.for_consumer_group()` panics too — broadcast is already a per-process group, so a named one would name nothing.) This is not an oversight to be filled in later. Redelivery to *one* subscriber of a fan-out is not expressible on most of these brokers, and a shared DLQ would collect one copy of every failure per subscriber — the failure of a single message would look like N failures.
 
 So `.broadcast()` implies `allow_message_loss`, and the retry budget is pinned to zero no matter what `ConsumerOptions::with_max_retries` says:
 

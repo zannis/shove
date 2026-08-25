@@ -14,7 +14,7 @@ Add the `metrics` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-shove = { version = "0.11", features = ["rabbitmq", "metrics"] }
+shove = { version = "0.x", features = ["rabbitmq", "metrics"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 ```
@@ -107,7 +107,7 @@ shove::metrics::set_prefix("billing_shove");
 - `backend` on `backend_errors_total`: `inmemory`, `rabbitmq`, `kafka`, `nats`, `sns_sqs`, `redis`.
 - `kind` on `backend_errors_total`: `connection`, `publish`, `consume`, `topology`, `ack`.
 - `topic`: the queue name from the topology (`QueueTopology::queue()`) — including on the dedicated DLQ-drain consumers (`run_dlq`), which label their samples with the **source** topic rather than the DLQ name, so a topic's main-path and DLQ-path series stay summable under one `topic`. To separate them, filter on `consumer_group` instead.
-- `consumer_group`: the group name set by a coordinated group registry, set explicitly with `ConsumerOptions::with_consumer_group` (or `BatchConsumerOptions::with_consumer_group` on Kafka's `run_batch`), or `"default"` when the consumer was registered through `ConsumerSupervisor` directly. It is **always** that logical name, never a backend's own group identifier — on Kafka in particular it is not the `group.id`, which stays in the consumer's startup log line and the broker's own tooling. Every consume entrypoint reports it the same way, so `sum by (consumer_group)` over a topic consumed with `run`, `run_fifo` and `run_batch` returns one series, not three. A dedicated DLQ drain follows the same rule: it reports `"default"` unless it was given a group explicitly, never the internal `{dlq}-consumer` id it joins under on Kafka.
+- `consumer_group`: the group name set by a coordinated group registry, set explicitly with `ConsumerOptions::with_consumer_group` (or `BatchConsumerOptions::with_consumer_group` on Kafka's `run_batch`), or `"default"` when the consumer was registered through `ConsumerSupervisor` directly. It is **always** that logical name, never a backend's own group identifier — on Kafka in particular it is not the `group.id`, which stays in the consumer's startup log line and the broker's own tooling. Every consume entrypoint reports it the same way, so `sum by (consumer_group)` over a topic consumed with `run`, `run_fifo` and `run_batch` returns one series, not three. A dedicated DLQ drain follows the same rule: it reports `"default"` unless it was given a group explicitly, never the internal `{dlq}-consumer` id it joins under on Kafka. A broadcast subscription reports whatever its `ConsumerOptions` carried, and `"default"` otherwise, so name its group explicitly if you want its series separable from the topic's other readers.
 
 **A pre-handler rejection is counted once, under its precise reason.** A payload rejected by the oversize gate is counted as `oversize` and *not* additionally as `rejected` when it is retired; the same holds for `deserialize`, `malformed`, and the schema-registry reasons. That is what makes the `reason` label trustworthy: `oversize` means the gate fired, not "something failed somewhere upstream of the DLQ".
 
