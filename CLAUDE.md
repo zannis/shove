@@ -28,14 +28,18 @@ consumer groups, broadcast, topology, autoscaling) works across every backend.
 
 ### Backends, feature flags, marker types
 
-| Backend | Feature flag | Marker type |
-|---|---|---|
-| RabbitMQ | `rabbitmq` | `RabbitMq` |
-| AWS SNS+SQS | `aws-sns-sqs` (publisher-only: `pub-aws-sns`) | `Sqs` |
-| NATS JetStream | `nats` | `Nats` |
-| Apache Kafka | `kafka` (+ `kafka-ssl`, `kafka-msk-iam`, `kafka-schema-registry`) | `Kafka` |
-| Redis/Valkey Streams | `redis-streams` | `Redis` |
-| In-process | `inmemory` | `InMemory` |
+| Backend | Feature flag | Marker type | Directory under `src/backends/` |
+|---|---|---|---|
+| RabbitMQ | `rabbitmq` | `RabbitMq` | `rabbitmq` |
+| AWS SNS+SQS | `aws-sns-sqs` (publisher-only: `pub-aws-sns`) | `Sqs` | `sns` |
+| NATS JetStream | `nats` | `Nats` | `nats` |
+| Apache Kafka | `kafka` (+ `kafka-ssl`, `kafka-msk-iam`, `kafka-schema-registry`) | `Kafka` | `kafka` |
+| Redis/Valkey Streams | `redis-streams` | `Redis` | `redis` |
+| In-process | `inmemory` | `InMemory` | `inmemory` |
+
+The directory is not always the marker type lowercased: the `Sqs` backend lives in
+`src/backends/sns/`, because the crate models SNS-publish plus SQS-consume as one
+backend. There is no `src/backends/sqs/`.
 
 Other add-on features: `audit`, `metrics`, `protobuf`, `rabbitmq-transactional`.
 
@@ -65,9 +69,11 @@ there rather than restating the table in a third place.
 - **Outcome / retry semantics** — `src/outcome.rs` (the `Outcome` enum:
   `Ack` / `Retry` / `Reject` / `Defer`) and `src/retry.rs`.
 - **Per-backend retry/DLQ routing** — each backend's
-  `src/backends/<name>/consumer.rs::route_outcome` (RabbitMQ also has
-  `src/backends/rabbitmq/router.rs`). This is where a delivery-semantics
-  decision is turned into ack/commit/publish/DLQ mechanics.
+  `src/backends/<name>/consumer.rs::route_outcome`. This is where a
+  delivery-semantics decision is turned into ack/commit/publish/DLQ mechanics.
+  Two backends split the mechanics out into a helper module the routing calls
+  into — `src/backends/rabbitmq/router.rs` and `src/backends/sns/router.rs` —
+  so a routing change there means both files, not just `consumer.rs`.
 - **Broadcast outcome settling** — `src/backend/broadcast.rs::settle_broadcast_outcome`,
   shared by the Kafka, NATS and Redis broadcast loops. It does **not** go
   through `route_outcome`, so a retry/discard fix applied to every backend's
