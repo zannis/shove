@@ -159,6 +159,10 @@ impl BroadcastSubscription {
     pub(super) fn queue(&self) -> &Arc<QueueState> {
         &self.queue
     }
+
+    pub(super) fn closed_token(&self) -> &CancellationToken {
+        &self.closed
+    }
 }
 
 impl Drop for BroadcastSubscription {

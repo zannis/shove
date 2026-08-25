@@ -161,21 +161,27 @@ impl Clone for RedisConnection {
 }
 
 impl RedisConnection {
+    /// Execute `cmd` while preserving redis-rs's error taxonomy for callers
+    /// that need to distinguish a server response from an unresolved transport
+    /// failure.
+    pub(crate) async fn query_redis<T: redis::FromRedisValue + Send>(
+        &mut self,
+        cmd: &mut redis::Cmd,
+    ) -> redis::RedisResult<T> {
+        match self {
+            RedisConnection::Standalone(conn) => cmd.query_async(conn).await,
+            RedisConnection::Cluster(conn) => cmd.query_async(conn).await,
+        }
+    }
+
     /// Execute `cmd` and deserialize the response into `T`.
     pub(crate) async fn query<T: redis::FromRedisValue + Send>(
         &mut self,
         cmd: &mut redis::Cmd,
     ) -> Result<T> {
-        match self {
-            RedisConnection::Standalone(conn) => cmd
-                .query_async(conn)
-                .await
-                .map_err(|e| ShoveError::Connection(e.to_string())),
-            RedisConnection::Cluster(conn) => cmd
-                .query_async(conn)
-                .await
-                .map_err(|e| ShoveError::Connection(e.to_string())),
-        }
+        self.query_redis(cmd)
+            .await
+            .map_err(|e| ShoveError::Connection(e.to_string()))
     }
 }
 

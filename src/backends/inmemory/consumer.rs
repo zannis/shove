@@ -188,7 +188,16 @@ where
 
     let subscription = broker.broadcast_subscribe(topology.queue());
     let queue = Arc::clone(subscription.queue());
-    let result = run_concurrent_on::<T, H>(broker, queue, handler, ctx, options).await;
+    let subscription_closed = subscription.closed_token().clone();
+    let result = run_concurrent_on::<T, H>(
+        broker,
+        queue,
+        handler,
+        ctx,
+        options,
+        Some(subscription_closed),
+    )
+    .await;
     // Explicit rather than implicit: dropping the guard is what deregisters
     // this subscriber, and it must happen after the loop, not before it.
     drop(subscription);
@@ -210,7 +219,7 @@ where
     H: MessageHandler<T>,
 {
     let queue = broker.lookup(T::topology().queue())?;
-    run_concurrent_on::<T, H>(broker, queue, handler, ctx, options).await
+    run_concurrent_on::<T, H>(broker, queue, handler, ctx, options, None).await
 }
 
 /// The concurrent delivery loop, against an already-resolved queue.
@@ -224,6 +233,7 @@ async fn run_concurrent_on<T, H>(
     handler: H,
     ctx: H::Context,
     options: ConsumerOptionsInner,
+    subscription_closed: Option<CancellationToken>,
 ) -> Result<()>
 where
     T: Topic,
@@ -311,6 +321,7 @@ where
                                 &mut pending,
                                 &mut next_route,
                                 &options,
+                                subscription_closed.as_ref(),
                             )
                             .await;
                             if inflight.is_empty() {
@@ -330,6 +341,7 @@ where
                                 &mut pending,
                                 &mut next_route,
                                 &options,
+                                subscription_closed.as_ref(),
                             )
                             .await;
                             if inflight.is_empty() {
@@ -370,6 +382,7 @@ where
         &mut pending,
         &mut next_route,
         &options,
+        subscription_closed.as_ref(),
     )
     .await;
     options.processing.store(false, Ordering::Release);
@@ -383,12 +396,16 @@ async fn drain_pending(
     pending: &mut BTreeMap<u64, (Envelope, Handled)>,
     next_route: &mut u64,
     options: &ConsumerOptionsInner,
+    subscription_closed: Option<&CancellationToken>,
 ) {
     while let Some((env, (outcome, pre_handler_reason))) = pending.remove(next_route) {
         route_outcome(
             broker,
             topology,
-            queue,
+            DeliverySource {
+                queue,
+                subscription_closed,
+            },
             env,
             outcome,
             pre_handler_reason,
@@ -835,9 +852,7 @@ where
 async fn route_outcome(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
-    // The queue this delivery came from. Used as the redelivery target for a
-    // broadcast subscription, whose buffer is private and has no name.
-    source: &Arc<QueueState>,
+    source: DeliverySource<'_>,
     env: Envelope,
     outcome: Outcome,
     // `Some` when the message was rejected before the handler ran; overrides
@@ -866,9 +881,23 @@ async fn route_outcome(
             resolve_reject(route_reject(broker, topology, env).await, pending);
         }
         RetryDecision::Hold { increment } => {
-            schedule_redelivery(broker, topology, source, env, increment);
+            schedule_redelivery(
+                broker,
+                topology,
+                source.queue,
+                env,
+                increment,
+                source.subscription_closed,
+            );
         }
     }
+}
+
+/// The queue a delivery came from and, for a private broadcast queue, the
+/// lifecycle signal that makes detached redelivery stop retaining it.
+struct DeliverySource<'a> {
+    queue: &'a Arc<QueueState>,
+    subscription_closed: Option<&'a CancellationToken>,
 }
 
 /// Apply the pending discard given where [`route_reject`] actually put the
@@ -893,6 +922,7 @@ fn schedule_redelivery(
     source: &Arc<QueueState>,
     env: Envelope,
     increment: bool,
+    subscription_closed: Option<&CancellationToken>,
 ) {
     let retry_count = get_retry_count(&env.headers);
     let hold_queues = topology.hold_queues();
@@ -933,6 +963,7 @@ fn schedule_redelivery(
     // topologies keep the historical lookup, whose failure case (queue removed
     // mid-backoff) still applies to them.
     let target: Option<Arc<QueueState>> = topology.broadcast().then(|| Arc::clone(source));
+    let subscription_closed = subscription_closed.cloned();
 
     // Every `return` below destroys the message. None is counted — see
     // `metrics::FailReason` for why in-process broker drops stay log-only.
@@ -945,6 +976,14 @@ fn schedule_redelivery(
                     queue = %main_queue,
                     %message_id,
                     "broker shutdown cancelled a pending redelivery — message dropped"
+                );
+                return;
+            }
+            _ = subscription_cancelled(&subscription_closed) => {
+                tracing::debug!(
+                    queue = %main_queue,
+                    %message_id,
+                    "subscription closed during redelivery backoff"
                 );
                 return;
             }
@@ -974,7 +1013,20 @@ fn schedule_redelivery(
             }
         };
         let redelivery_timeout = Duration::from_secs(30);
-        match tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env)).await {
+        let enqueue = tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env));
+        tokio::pin!(enqueue);
+        let result = tokio::select! {
+            result = &mut enqueue => result,
+            _ = subscription_cancelled(&subscription_closed) => {
+                tracing::debug!(
+                    queue = %main_queue,
+                    %message_id,
+                    "subscription closed during redelivery enqueue"
+                );
+                return;
+            }
+        };
+        match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -994,6 +1046,13 @@ fn schedule_redelivery(
             }
         }
     });
+}
+
+async fn subscription_cancelled(token: &Option<CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Dead-letter a rejected message, or drop it when there is nowhere to put it.
@@ -1296,4 +1355,72 @@ fn get_retry_count(headers: &HashMap<String, String>) -> u32 {
 
 fn set_retry_count(headers: &mut HashMap<String, String>, count: u32) {
     headers.insert(X_RETRY_COUNT.to_string(), count.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::backends::inmemory::client::{Envelope, InMemoryConfig};
+    use crate::topology::TopologyBuilder;
+
+    fn broadcast_topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("deferred-teardown-broadcast")
+                .broadcast()
+                .build()
+        })
+    }
+
+    fn envelope(body: &'static [u8]) -> Envelope {
+        Envelope::new(Bytes::from_static(body), HashMap::new())
+    }
+
+    /// A deferred delivery parked on a full private broadcast buffer must stop
+    /// owning that buffer when the subscriber leaves. Broker shutdown is not a
+    /// substitute: the broker may continue serving unrelated subscriptions.
+    #[tokio::test]
+    async fn unsubscribe_cancels_a_blocked_broadcast_redelivery() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 1,
+        });
+        let subscription = broker.broadcast_subscribe("deferred-teardown-broadcast");
+        let source = Arc::clone(subscription.queue());
+
+        broker
+            .enqueue(&source, envelope(b"fills-capacity"))
+            .await
+            .expect("fill private buffer");
+        let source_weak = Arc::downgrade(&source);
+
+        schedule_redelivery(
+            &broker,
+            broadcast_topology(),
+            &source,
+            envelope(b"deferred"),
+            false,
+            Some(subscription.closed_token()),
+        );
+
+        // Let the detached task reach the full-buffer capacity wait, then
+        // remove every owner except that task.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(source);
+        drop(subscription);
+        drop(broker);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source_weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred task retained a departed subscriber's private queue");
+    }
 }
