@@ -277,7 +277,7 @@ cargo add shove --features kafka-schema-registry
 use std::time::Duration;
 use shove::schema_registry::{SchemaRegistry, SchemaRegistryAuth};
 
-let registry = SchemaRegistry::builder("http://schema-registry:8081")
+let registry = SchemaRegistry::builder("https://schema-registry:8081")
     .auth(SchemaRegistryAuth::Basic {
         user: "sr-user".into(),
         pass: "sr-pass".into(),
@@ -293,6 +293,17 @@ let registry = SchemaRegistry::builder("http://schema-registry:8081")
 - `SchemaRegistryAuth::None` — no authentication (default)
 - `SchemaRegistryAuth::Bearer(token)` — `Authorization: Bearer <token>`
 - `SchemaRegistryAuth::Basic { user, pass }` — HTTP Basic auth
+
+Credentials require TLS. Combining any auth other than `None` with an `http://` base URL makes `build()` panic, because the token or password would be sent in cleartext on every schema fetch. An unauthenticated `http://` registry is unaffected. For a registry that is genuinely unreachable from an untrusted network — a local development stack — opt in explicitly:
+
+```rust,no_run
+use shove::schema_registry::{SchemaRegistry, SchemaRegistryAuth};
+
+let registry = SchemaRegistry::builder("http://localhost:8081")
+    .auth(SchemaRegistryAuth::Bearer("dev-token".into()))
+    .allow_plaintext_credentials()
+    .build();
+```
 
 The returned value is an `Arc<SchemaRegistry>`. Clone it to share the same schema cache across multiple consumers or a consumer group.
 

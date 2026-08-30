@@ -145,8 +145,13 @@ async fn configured_headers_are_sent_on_registry_requests() {
 #[tokio::test]
 async fn custom_headers_coexist_with_bearer_auth() {
     let (url, state) = spawn_header_mock().await;
+    // The mock is plaintext loopback, so the credential guard in `build()`
+    // applies and has to be opted out of explicitly. This doubles as the
+    // end-to-end proof that the opt-in yields a working client, not merely one
+    // that survives `build()`.
     let registry = SchemaRegistry::builder(url)
         .auth(SchemaRegistryAuth::Bearer("token-abc".into()))
+        .allow_plaintext_credentials()
         .header("CF-Access-Client-Id", "client-id-123")
         .build();
     registry.resolve(SchemaId(1)).await.unwrap();

@@ -22,7 +22,7 @@ cargo add shove --features kafka-schema-registry
 use std::time::Duration;
 use shove::schema_registry::{SchemaRegistry, SchemaRegistryAuth};
 
-let registry = SchemaRegistry::builder("http://schema-registry:8081")
+let registry = SchemaRegistry::builder("https://schema-registry:8081")
     .auth(SchemaRegistryAuth::Basic {
         user: "sr-user".into(),
         pass: "sr-pass".into(),
@@ -42,6 +42,21 @@ Auth options:
 | `SchemaRegistryAuth::None` | No authentication (default) |
 | `SchemaRegistryAuth::Bearer(token)` | `Authorization: Bearer <token>` |
 | `SchemaRegistryAuth::Basic { user, pass }` | HTTP Basic auth |
+
+### Credentials require TLS
+
+Any auth other than `None` against an `http://` base URL makes `build()` panic — the bearer token or basic-auth password would otherwise be sent in cleartext on every schema fetch, readable by anything on the path. An unauthenticated `http://` registry keeps working unchanged.
+
+For a registry genuinely unreachable from an untrusted network, such as a local development stack, opt in explicitly:
+
+```rust,no_run
+use shove::schema_registry::{SchemaRegistry, SchemaRegistryAuth};
+
+let registry = SchemaRegistry::builder("http://localhost:8081")
+    .auth(SchemaRegistryAuth::Bearer("dev-token".into()))
+    .allow_plaintext_credentials()
+    .build();
+```
 
 ## Per-consumer setup
 
