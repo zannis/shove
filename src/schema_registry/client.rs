@@ -836,12 +836,14 @@ mod tests {
             ]
         );
         // The panic message is built from this list, so it must never carry a
-        // secret value or the base URL.
+        // configured value or the base URL. A failure prints the rendered list,
+        // which is where the leaked value would be visible; naming the fixture
+        // again would add nothing.
         let rendered = channels.join(", ");
-        for secret in ["bearer-secret", "url-secret", "header-secret", "sr-user"] {
+        for configured in ["bearer-secret", "url-secret", "header-secret", "sr-user"] {
             assert!(
-                !rendered.contains(secret),
-                "{secret} leaked into {rendered}"
+                !rendered.contains(configured),
+                "a configured credential value leaked into the channel list: {rendered}"
             );
         }
         assert!(!rendered.contains("sr:8081"), "no base URL: {rendered}");
