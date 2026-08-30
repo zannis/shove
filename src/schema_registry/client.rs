@@ -68,7 +68,11 @@ pub struct SchemaRegistry {
 }
 
 impl SchemaRegistry {
-    /// Start building a registry client for `base_url` (e.g. `http://sr:8081`).
+    /// Start building a registry client for `base_url` (e.g. `https://sr:8081`).
+    ///
+    /// A plaintext `http://` URL is fine on its own. Combining it with
+    /// [`SchemaRegistryAuth`] is not: see
+    /// [`SchemaRegistryBuilder::allow_plaintext_credentials`].
     pub fn builder(base_url: impl Into<String>) -> SchemaRegistryBuilder {
         SchemaRegistryBuilder {
             base_url: base_url.into(),
@@ -77,6 +81,7 @@ impl SchemaRegistry {
             timeout: Duration::from_secs(5),
             max_retries: 3,
             negative_cache_ttl: Duration::from_secs(30),
+            allow_plaintext_credentials: false,
         }
     }
 
@@ -299,9 +304,9 @@ impl FetchCtx {
 }
 
 /// True when reusable registry credentials would travel over an unencrypted
-/// transport. `build()` cannot reject this — it returns the client rather than
-/// a `Result`, and plaintext registries on a trusted network are a legitimate
-/// deployment — so this only drives a startup warning.
+/// transport. [`SchemaRegistryBuilder::build`] refuses this outright unless the
+/// caller opted in via
+/// [`SchemaRegistryBuilder::allow_plaintext_credentials`].
 fn sends_credentials_in_cleartext(base_url: &str, auth: &SchemaRegistryAuth) -> bool {
     let has_credentials = !matches!(auth, SchemaRegistryAuth::None);
     has_credentials
@@ -319,11 +324,24 @@ pub struct SchemaRegistryBuilder {
     timeout: Duration,
     max_retries: u32,
     negative_cache_ttl: Duration,
+    allow_plaintext_credentials: bool,
 }
 
 impl SchemaRegistryBuilder {
     pub fn auth(mut self, auth: SchemaRegistryAuth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Permit [`SchemaRegistryAuth`] credentials against a plaintext `http://`
+    /// base URL, which [`SchemaRegistryBuilder::build`] otherwise refuses.
+    ///
+    /// The bearer token or basic-auth password is then sent in cleartext on
+    /// every schema fetch, readable by anything on the path. Call this only for
+    /// a registry that is genuinely unreachable from an untrusted network — a
+    /// local development stack, or a test against a loopback mock.
+    pub fn allow_plaintext_credentials(mut self) -> Self {
+        self.allow_plaintext_credentials = true;
         self
     }
 
@@ -353,18 +371,41 @@ impl SchemaRegistryBuilder {
         self.negative_cache_ttl = ttl;
         self
     }
+    /// # Panics
+    ///
+    /// Panics when [`SchemaRegistryAuth`] credentials are configured against a
+    /// plaintext `http://` base URL and
+    /// [`SchemaRegistryBuilder::allow_plaintext_credentials`] was not called.
+    /// A misconfiguration that puts a reusable secret on the wire is caught at
+    /// startup rather than on the first schema fetch; this builder cannot
+    /// return an error because it yields the client directly.
+    ///
+    /// Also panics if the underlying `reqwest` client cannot be constructed.
     pub fn build(self) -> Arc<SchemaRegistry> {
+        // sec-SR-1: refuse reusable credentials over an unencrypted transport.
+        // A warning is too easy to miss — the token is already on the wire by
+        // the time anyone reads the log. The base URL is deliberately kept out
+        // of the message: it may carry `user:pass@` userinfo, and a panic
+        // message reaches logs and crash reports.
+        if sends_credentials_in_cleartext(&self.base_url, &self.auth) {
+            assert!(
+                self.allow_plaintext_credentials,
+                "schema registry credentials require TLS: use an https:// base URL. \
+                 Sending a bearer token or basic-auth password over plaintext exposes \
+                 it to any network observer. For a registry on a trusted network, call \
+                 SchemaRegistryBuilder::allow_plaintext_credentials() to opt in."
+            );
+            tracing::warn!(
+                "schema registry auth is configured against a plaintext http:// base URL \
+                 with allow_plaintext_credentials(); the bearer token or basic-auth \
+                 password is sent in cleartext on every request. Use https:// for any \
+                 registry reachable outside a trusted network."
+            );
+        }
         let http = reqwest::Client::builder()
             .timeout(self.timeout)
             .build()
             .expect("reqwest client builds with default TLS");
-        if sends_credentials_in_cleartext(&self.base_url, &self.auth) {
-            tracing::warn!(
-                "schema registry auth is configured against a plaintext http:// base URL; \
-                 the bearer token or basic-auth password is sent in cleartext on every \
-                 request. Use https:// for any registry reachable outside a trusted network."
-            );
-        }
         Arc::new(SchemaRegistry {
             base_url: Arc::from(self.base_url.trim_end_matches('/')),
             http,
@@ -415,14 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn cleartext_credential_warning_tracks_scheme_and_auth() {
+    fn cleartext_credential_guard_tracks_scheme_and_auth() {
         let bearer = SchemaRegistryAuth::Bearer("t".into());
         let basic = SchemaRegistryAuth::Basic {
             user: "u".into(),
             pass: "p".into(),
         };
 
-        // Credentials + plaintext transport is the case worth warning about.
+        // Credentials + plaintext transport is the case `build()` refuses.
         assert!(sends_credentials_in_cleartext("http://sr:8081", &bearer));
         assert!(sends_credentials_in_cleartext("HTTP://sr:8081", &basic));
 
@@ -442,6 +483,42 @@ mod tests {
             "http://sr:8081",
             &SchemaRegistryAuth::None
         ));
+    }
+
+    // The matrix above pins which configurations the predicate selects. These
+    // pin what `build()` does with that verdict, on both sides of the opt-in.
+
+    #[test]
+    #[should_panic(expected = "schema registry credentials require TLS")]
+    fn plaintext_credentials_are_refused_at_build() {
+        let _ = SchemaRegistry::builder("http://sr:8081")
+            .auth(SchemaRegistryAuth::Bearer("t".into()))
+            .build();
+    }
+
+    #[test]
+    fn plaintext_credentials_build_once_opted_in() {
+        let registry = SchemaRegistry::builder("http://sr:8081")
+            .auth(SchemaRegistryAuth::Bearer("t".into()))
+            .allow_plaintext_credentials()
+            .build();
+
+        assert!(matches!(registry.auth, SchemaRegistryAuth::Bearer(_)));
+    }
+
+    #[test]
+    fn the_guard_leaves_safe_configurations_alone() {
+        // TLS carries the credentials, so no opt-in is needed.
+        let _ = SchemaRegistry::builder("https://sr:8081")
+            .auth(SchemaRegistryAuth::Basic {
+                user: "u".into(),
+                pass: "p".into(),
+            })
+            .build();
+
+        // Plaintext with nothing to disclose stays allowed: this is the common
+        // unauthenticated development registry, and the guard must not break it.
+        let _ = SchemaRegistry::builder("http://sr:8081").build();
     }
 
     #[tokio::test]

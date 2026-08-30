@@ -26,7 +26,9 @@
 //! use shove::markers::Kafka;
 //!
 //! // Build the registry client once and share it across consumers via Arc.
-//! let registry = SchemaRegistry::builder("http://schema-registry:8081")
+//! // Credentials require an `https://` base URL: `build()` panics on
+//! // `http://` + auth unless `.allow_plaintext_credentials()` is called.
+//! let registry = SchemaRegistry::builder("https://schema-registry:8081")
 //!     .auth(SchemaRegistryAuth::Basic {
 //!         user: "sr-user".into(),
 //!         pass: "sr-pass".into(),
