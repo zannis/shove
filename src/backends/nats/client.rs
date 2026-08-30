@@ -30,6 +30,14 @@ pub struct NatsConfig {
     pub nkey_seed: Option<String>,
     /// Path to a NATS `.creds` file (JWT + NKey) for credentials-based authentication.
     pub creds_file: Option<PathBuf>,
+    /// Send static username/password or token credentials over a plaintext
+    /// `nats://` connection. Default: `false`.
+    ///
+    /// **For development use only.** NATS sends these credentials in the
+    /// CONNECT protocol, so a plaintext transport exposes them to any network
+    /// observer. Production deployments should use a `tls://` or `nats+tls://`
+    /// endpoint rather than setting this.
+    pub allow_plaintext_credentials: bool,
 }
 
 impl NatsConfig {
@@ -44,6 +52,7 @@ impl NatsConfig {
             token: None,
             nkey_seed: None,
             creds_file: None,
+            allow_plaintext_credentials: false,
         }
     }
 
@@ -62,22 +71,8 @@ impl Default for NatsConfig {
 
 impl fmt::Debug for NatsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Redact credentials: nats://user:pass@host → nats://***@host
-        let redacted = if let Some(at_pos) = self.url.find('@') {
-            if let Some(scheme_end) = self.url.find("://") {
-                format!(
-                    "{}://***@{}",
-                    &self.url[..scheme_end],
-                    &self.url[at_pos + 1..]
-                )
-            } else {
-                "***".to_string()
-            }
-        } else {
-            self.url.clone()
-        };
         f.debug_struct("NatsConfig")
-            .field("url", &redacted)
+            .field("url", &redact_url_credentials(&self.url))
             .field("tls_ca_cert", &self.tls_ca_cert)
             .field("tls_client_cert", &self.tls_client_cert)
             .field("tls_client_key", &self.tls_client_key)
@@ -86,6 +81,10 @@ impl fmt::Debug for NatsConfig {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("nkey_seed", &self.nkey_seed.as_ref().map(|_| "<redacted>"))
             .field("creds_file", &self.creds_file)
+            .field(
+                "allow_plaintext_credentials",
+                &self.allow_plaintext_credentials,
+            )
             .finish()
     }
 }
@@ -106,6 +105,35 @@ fn has_tls_options(config: &NatsConfig) -> bool {
         || config.tls_client_key.is_some()
 }
 
+/// Redact URL userinfo before a NATS endpoint reaches Debug or an error that
+/// callers may log. NATS URLs commonly carry `user:password` or token auth in
+/// this position, so the raw value must never be included in diagnostics.
+fn redact_url_credentials(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return if url.contains('@') {
+            "***".to_string()
+        } else {
+            url.to_string()
+        };
+    };
+    let Some(at_pos) = url_userinfo_delimiter(url) else {
+        return url.to_string();
+    };
+    format!("{}://***@{}", &url[..scheme_end], &url[at_pos + 1..])
+}
+
+/// Return the absolute position of the final `@` in the URL authority. An `@`
+/// in the path, query, or fragment is not userinfo.
+fn url_userinfo_delimiter(url: &str) -> Option<usize> {
+    let scheme_end = url.find("://")?;
+    let authority_start = scheme_end + 3;
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    rest[..authority_end]
+        .rfind('@')
+        .map(|offset| authority_start + offset)
+}
+
 /// Returns `true` when the URL scheme requests an encrypted transport.
 ///
 /// Both `tls://` and `nats+tls://` are accepted; `nats://` is plaintext.
@@ -113,17 +141,39 @@ fn url_scheme_is_tls(url: &str) -> bool {
     url.starts_with("tls://") || url.starts_with("nats+tls://")
 }
 
+/// Reject transport/auth combinations that would silently discard TLS options
+/// or disclose reusable credentials on the wire.
+fn validate_transport_security(config: &NatsConfig) -> Result<()> {
+    if has_tls_options(config) && !url_scheme_is_tls(&config.url) {
+        return Err(ShoveError::Connection(format!(
+            "TLS options are configured but NATS URL '{}' uses a plaintext scheme; \
+             change the URL scheme to tls:// or nats+tls:// to prevent silent downgrade",
+            redact_url_credentials(&config.url)
+        )));
+    }
+
+    let has_static_credentials = (config.username.is_some() && config.password.is_some())
+        || config.token.is_some()
+        || url_userinfo_delimiter(&config.url).is_some();
+    if has_static_credentials
+        && !url_scheme_is_tls(&config.url)
+        && !config.allow_plaintext_credentials
+    {
+        return Err(ShoveError::Connection(
+            "NATS username/password and token credentials require TLS: use a tls:// or \
+             nats+tls:// URL. Sending reusable credentials over plaintext exposes them to \
+             network observers. For local development only, set \
+             NatsConfig::allow_plaintext_credentials = true."
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
 impl NatsClient {
     pub async fn connect(config: &NatsConfig) -> Result<Self> {
-        // Guard: TLS options configured but URL scheme is plaintext — this
-        // would silently connect without encryption, so we reject it outright.
-        if has_tls_options(config) && !url_scheme_is_tls(&config.url) {
-            return Err(ShoveError::Connection(format!(
-                "TLS options are configured but NATS URL '{}' uses a plaintext scheme; \
-                 change the URL scheme to tls:// or nats+tls:// to prevent silent downgrade",
-                config.url
-            )));
-        }
+        validate_transport_security(config)?;
 
         let client_name = format!("shove-rs-{}", process::id());
         let mut opts = async_nats::ConnectOptions::new().name(client_name);
@@ -276,6 +326,7 @@ mod tests {
         assert!(cfg.token.is_none());
         assert!(cfg.nkey_seed.is_none());
         assert!(cfg.creds_file.is_none());
+        assert!(!cfg.allow_plaintext_credentials);
     }
 
     #[test]
@@ -369,6 +420,91 @@ mod tests {
             !url_scheme_is_tls(&cfg.url),
             "nats:// must not be considered a TLS scheme"
         );
+        assert!(
+            validate_transport_security(&cfg).is_err(),
+            "TLS options on a plaintext URL must be rejected"
+        );
+    }
+
+    #[test]
+    fn tls_plaintext_error_redacts_url_credentials() {
+        let mut cfg = NatsConfig::new("nats://alice:sentinel-password@broker.example.com:4222");
+        cfg.tls_ca_cert = Some(std::path::PathBuf::from("/etc/certs/ca.pem"));
+
+        let err = validate_transport_security(&cfg)
+            .err()
+            .expect("TLS options with a plaintext URL must fail before connecting");
+        let rendered = err.to_string();
+
+        assert!(!rendered.contains("alice"), "username leaked: {rendered}");
+        assert!(
+            !rendered.contains("sentinel-password"),
+            "password leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("nats://***@broker.example.com:4222"),
+            "redacted endpoint should remain actionable: {rendered}"
+        );
+    }
+
+    #[test]
+    fn plaintext_username_and_password_are_rejected() {
+        let mut cfg = NatsConfig::new("nats://broker.example.com:4222");
+        cfg.username = Some("alice".into());
+        cfg.password = Some("sentinel-password".into());
+
+        let err = validate_transport_security(&cfg)
+            .expect_err("reusable credentials over plaintext must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("require TLS"),
+            "unexpected error: {rendered}"
+        );
+        assert!(!rendered.contains("alice"), "username leaked: {rendered}");
+        assert!(
+            !rendered.contains("sentinel-password"),
+            "password leaked: {rendered}"
+        );
+    }
+
+    #[test]
+    fn plaintext_token_and_url_userinfo_are_rejected() {
+        let mut token_cfg = NatsConfig::new("nats://broker.example.com:4222");
+        token_cfg.token = Some("sentinel-token".into());
+        assert!(validate_transport_security(&token_cfg).is_err());
+
+        let url_cfg = NatsConfig::new("nats://alice:sentinel-password@broker.example.com:4222");
+        assert!(validate_transport_security(&url_cfg).is_err());
+    }
+
+    /// Every `NatsConfig` field is public so callers can build one with struct
+    /// update syntax. A private field would still compile in-crate and only
+    /// break downstream users, so pin the property here.
+    #[test]
+    fn config_is_constructible_with_struct_update_syntax() {
+        let cfg = NatsConfig {
+            url: "tls://broker.example.com:4222".to_string(),
+            token: Some("t".into()),
+            ..Default::default()
+        };
+
+        assert!(validate_transport_security(&cfg).is_ok());
+    }
+
+    #[test]
+    fn explicit_plaintext_credential_override_is_accepted() {
+        let mut cfg = NatsConfig::new("nats://broker.example.com:4222");
+        cfg.token = Some("development-token".into());
+        cfg.allow_plaintext_credentials = true;
+
+        assert!(validate_transport_security(&cfg).is_ok());
+    }
+
+    #[test]
+    fn at_sign_outside_authority_is_not_treated_as_userinfo() {
+        let cfg = NatsConfig::new("nats://broker.example.com/path?contact=ops@example.com");
+        assert!(url_userinfo_delimiter(&cfg.url).is_none());
+        assert_eq!(redact_url_credentials(&cfg.url), cfg.url);
     }
 
     #[test]

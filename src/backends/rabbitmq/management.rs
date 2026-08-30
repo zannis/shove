@@ -100,8 +100,7 @@ impl ManagementClient {
     pub fn new(config: ManagementConfig) -> Result<Self> {
         let base_url = Url::parse(&config.base_url).map_err(|e| {
             ShoveError::Connection(format!(
-                "ManagementConfig::base_url is not a valid URL ({e}): {:?}",
-                config.base_url
+                "ManagementConfig::base_url is not a valid URL ({e})"
             ))
         })?;
 
@@ -113,11 +112,11 @@ impl ManagementClient {
         }
 
         if !base_url.username().is_empty() || base_url.password().is_some() {
-            return Err(ShoveError::Connection(format!(
+            return Err(ShoveError::Connection(
                 "ManagementConfig::base_url must not embed credentials \
-                 (found userinfo in {:?})",
-                config.base_url
-            )));
+                 (URL userinfo is not allowed)"
+                    .into(),
+            ));
         }
 
         let mut builder = reqwest::ClientBuilder::new()
@@ -451,10 +450,13 @@ mod tests {
             "p",
         ))
         .unwrap_err();
+        let rendered = err.to_string();
         assert!(
-            err.to_string().contains("must not embed credentials"),
+            rendered.contains("must not embed credentials"),
             "unexpected error: {err}"
         );
+        assert!(!rendered.contains("admin"), "username leaked: {rendered}");
+        assert!(!rendered.contains("secret"), "password leaked: {rendered}");
     }
 
     #[test]
@@ -477,6 +479,24 @@ mod tests {
         assert!(
             err.to_string().contains("not a valid URL"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn management_client_does_not_echo_credentials_from_malformed_url() {
+        let err = ManagementClient::new(ManagementConfig::new(
+            "http://admin:sentinel-password@[/management",
+            "u",
+            "p",
+        ))
+        .unwrap_err();
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("not a valid URL"));
+        assert!(!rendered.contains("admin"), "username leaked: {rendered}");
+        assert!(
+            !rendered.contains("sentinel-password"),
+            "password leaked: {rendered}"
         );
     }
 }
