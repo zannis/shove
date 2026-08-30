@@ -45,11 +45,20 @@ config.tls_client_key  = Some(PathBuf::from("/etc/nats/client.key"));
 ```
 
 All slots are `Option<…>` — set only the ones your deployment uses. Static
-username/password and token credentials require a `tls://` or `nats+tls://`
-URL so reusable secrets are never sent in cleartext. A local development broker
-that deliberately uses plaintext must opt in with
-`config.allow_plaintext_credentials = true`. The `Debug` impl and connection errors
-redact every credential and the user-info portion of the URL.
+username/password and token credentials require an encrypted transport — a
+`tls://` or `wss://` URL — so reusable secrets are never sent in cleartext. A
+local development broker that deliberately uses plaintext must opt in with
+`config.allow_plaintext_credentials = true`; that opt-in covers the credential
+fields above and nothing else.
+
+Credentials embedded in the URL itself (`tls://user:password@broker:4222`) are
+rejected on every scheme, encrypted ones included, and the development opt-in
+does not re-admit them. The NATS client never sends URL user-info in the
+CONNECT frame, so those credentials authenticate nothing — but it does render
+the URL, password and all, into its own connection debug logs. Put the
+credentials in `username`/`password`, `token`, or `creds_file` instead. The
+`Debug` impl and connection errors redact every credential and the user-info
+portion of the URL.
 
 ## Declare topology
 
@@ -162,7 +171,7 @@ See the [Basic example](/backends/nats/examples/basic) for a complete runnable w
 - **De-duplication via `Nats-Msg-Id`.** shove sets the `Nats-Msg-Id` header on every publish (a fresh UUID per call). JetStream de-duplicates within a configurable window (default 120 seconds) — if a publisher retries the same logical message inside that window, JetStream rejects the duplicate. Note that the header is generated per-publish-call, so deduplicating across application-level retries requires the caller to pass a stable id via `publish_with_headers`.
 - **Work-queue semantics by default.** shove provisions JetStream streams with work-queue (delete-on-ack) semantics unless you override `retention` via [`nats_stream_config`](#bounded--replicated-managed-stream) or bind to an infra-owned stream with [`nats_external_stream`](#bind-to-an-externally-provisioned-stream). Work-queue streams allow a single logical consumer over a subject — each `consumer_group()` registration gets its own durable consumer on the stream.
 - **JetStream must be enabled on the server.** Connecting to a server without JetStream and calling `topology().declare::<T>()` will return an error. The `-js` flag is required on the NATS server.
-- **TLS scheme must match TLS options.** Setting any of `tls_ca_cert`, `tls_client_cert`, or `tls_client_key` on a plaintext `nats://` URL is rejected at connect time. Use `tls://` or `nats+tls://` to make the encrypted transport explicit — this guards against silent downgrade.
+- **URL scheme must be one the client can connect with, and must match your TLS options.** The four supported schemes are `nats://`, `tls://`, `ws://`, and `wss://` — the exact set `async-nats` accepts. Anything else, `nats+tls://` included, is rejected before a connection is attempted rather than failing inside the client. Of those, `tls://` and `wss://` are encrypted; `nats://` and `ws://` are cleartext, as is a schemeless address (the client reads it as `nats://`). Setting any of `tls_ca_cert`, `tls_client_cert`, or `tls_client_key` on a cleartext URL is rejected at connect time — use `tls://` or `wss://` to make the encrypted transport explicit, which guards against silent downgrade.
 - **Reconnect bounds.** `ConsumerOptions::<Nats>::new().with_max_reconnect_attempts(N)` caps reconnect attempts after a connection drop; default is unlimited. Set this when you want the consumer to surface `Connection` errors after `N` failed redials rather than retry forever.
 - **Stream config is tunable; durable-consumer tuning is fixed.** Stream retention, storage bounds (`max_age` / `max_bytes` / `max_messages`), and `num_replicas` are configurable via [`nats_stream_config`](#bounded--replicated-managed-stream) (or skipped entirely with [`nats_external_stream`](#bind-to-an-externally-provisioned-stream)); the defaults remain `WorkQueue` / `StorageType::File` / `DiscardPolicy::New` / single-replica / unbounded. The **durable consumers** are still declared with `AckPolicy::Explicit`, `max_ack_pending = prefetch × max_consumers`, and a 120 s deduplication window — these are not yet user-configurable, so open an issue if you need them surfaced as knobs.
 
