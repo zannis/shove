@@ -432,8 +432,7 @@ mod tests {
         cfg.tls_ca_cert = Some(std::path::PathBuf::from("/etc/certs/ca.pem"));
 
         let err = validate_transport_security(&cfg)
-            .err()
-            .expect("TLS options with a plaintext URL must fail before connecting");
+            .expect_err("TLS options with a plaintext URL must fail before connecting");
         let rendered = err.to_string();
 
         assert!(!rendered.contains("alice"), "username leaked: {rendered}");
