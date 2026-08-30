@@ -60,6 +60,15 @@ credentials in `username`/`password`, `token`, or `creds_file` instead. The
 `Debug` impl and connection errors redact every credential and the user-info
 portion of the URL.
 
+:::warning
+Both rules are a behaviour change. URL user-info is now rejected rather than
+accepted-and-ignored — if your URL carries `user:password@`, move it to the
+`username`/`password` fields; the connection was never authenticated by it.
+`nats+tls://` is likewise rejected up front rather than failing inside the
+client; it was never a scheme the client could connect with, so `tls://` is the
+substitution.
+:::
+
 ## Declare topology
 
 ```rust

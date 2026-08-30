@@ -1,9 +1,11 @@
+use async_nats::ServerAddr;
 use async_nats::connection::State;
 use async_nats::jetstream;
 use futures_util::StreamExt;
 use std::fmt;
 use std::path::PathBuf;
 use std::process;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -30,11 +32,12 @@ pub struct NatsConfig {
     pub nkey_seed: Option<String>,
     /// Path to a NATS `.creds` file (JWT + NKey) for credentials-based authentication.
     pub creds_file: Option<PathBuf>,
-    /// Send static username/password or token credentials over a plaintext
-    /// `nats://` connection. Default: `false`.
+    /// Send static username/password or token credentials over a cleartext
+    /// connection — `nats://`, `ws://`, or a schemeless address, which the
+    /// client reads as `nats://`. Default: `false`.
     ///
     /// **For development use only.** NATS sends these credentials in the
-    /// CONNECT protocol, so a plaintext transport exposes them to any network
+    /// CONNECT protocol, so a cleartext transport exposes them to any network
     /// observer. Production deployments should use a `tls://` or `wss://`
     /// endpoint rather than setting this.
     ///
@@ -112,9 +115,29 @@ fn has_tls_options(config: &NatsConfig) -> bool {
 /// Redact URL userinfo before a NATS endpoint reaches Debug or an error that
 /// callers may log. NATS URLs commonly carry `user:password` or token auth in
 /// this position, so the raw value must never be included in diagnostics.
+///
+/// Where the client can parse the URL, its parse decides: a textual scan and
+/// `url::Url` disagree on real inputs (see [`parse_server_addr`]), and the side
+/// that decides what gets logged must be the side that decides what is a
+/// credential. The scan below is reached only for a URL the client itself
+/// rejects, where it errs toward hiding.
 fn redact_url_credentials(url: &str) -> String {
+    if let Ok(addr) = parse_server_addr(url) {
+        return if has_url_userinfo(&addr) {
+            redacted_endpoint(&addr)
+        } else {
+            url.to_string()
+        };
+    }
+
     let Some(at_pos) = url_userinfo_delimiter(url) else {
-        return url.to_string();
+        // An unparseable URL with an `@` somewhere it was not expected: the
+        // scan cannot say which side of it is a secret, so disclose neither.
+        return if url.contains('@') {
+            "***".to_string()
+        } else {
+            url.to_string()
+        };
     };
     let host_and_rest = &url[at_pos + 1..];
     match url.find("://") {
@@ -123,12 +146,19 @@ fn redact_url_credentials(url: &str) -> String {
     }
 }
 
+/// The endpoint of a parsed address with the userinfo replaced. Rebuilt from
+/// the parsed components rather than sliced out of the input, so no part of the
+/// credential can survive in the output.
+fn redacted_endpoint(addr: &ServerAddr) -> String {
+    format!("{}://***@{}:{}", addr.scheme(), addr.host(), addr.port())
+}
+
 /// Return the absolute position of the final `@` in the URL authority. An `@`
 /// in the path, query, or fragment is not userinfo.
 ///
+/// Best-effort only — this is the fallback for URLs the client cannot parse.
 /// A schemeless address has no `://` to anchor on, but its authority still
-/// starts at byte 0 — `ServerAddr::from_str` prepends `nats://` before parsing,
-/// so `user:pass@host` carries userinfo just as `nats://user:pass@host` does.
+/// starts at byte 0, since `ServerAddr::from_str` prepends `nats://`.
 fn url_userinfo_delimiter(url: &str) -> Option<usize> {
     let authority_start = url.find("://").map_or(0, |scheme_end| scheme_end + 3);
     let rest = &url[authority_start..];
@@ -147,41 +177,58 @@ enum SchemeSecurity {
     Plaintext,
 }
 
-/// The schemes `async_nats::ServerAddr` accepts, in the order the error lists
-/// them. Anything else fails to parse inside the client, so shove rejects it
-/// here rather than letting a connection attempt fail with a scheme error.
+/// The schemes `async_nats::ServerAddr` accepts. Anything else fails to parse
+/// inside the client, so shove rejects it here rather than letting a connection
+/// attempt fail with a scheme error.
 const SUPPORTED_SCHEMES: &str = "nats://, tls://, ws://, wss://";
 
-/// Classify a NATS URL by the transport its scheme selects.
+/// Parse a NATS URL exactly the way the client will.
 ///
-/// This mirrors `async_nats::ServerAddr`, which is the only contract that
-/// matters: it accepts exactly `nats`, `tls`, `ws` and `wss`, and rejects
-/// everything else — `nats+tls://` included. Of those, `tls` and `wss` are
-/// encrypted (the connector wraps `wss` in a rustls connector built from the
-/// same `ConnectOptions` TLS settings), while `nats` and `ws` are cleartext.
-fn classify_scheme(url: &str) -> Result<SchemeSecurity> {
-    let Some((scheme, _)) = url.split_once("://") else {
-        // `ServerAddr::from_str` prepends `nats://` to a schemeless address.
-        return Ok(SchemeSecurity::Plaintext);
-    };
+/// Deliberately not a hand-rolled scan. `ServerAddr::from_str` runs the WHATWG
+/// URL parser, which does not agree with `split` on `"://"` on real inputs:
+/// `ws`/`wss` are *special* schemes, so an arbitrary run of slashes before the
+/// authority is skipped and `wss:///user:pass@host` carries live credentials;
+/// leading whitespace is trimmed, so `" tls://host"` is a TLS endpoint; and an
+/// empty `@` section records no credential at all. Every one of those
+/// divergences is a wrong answer with a security or availability cost, so the
+/// client's own parse is the only thing shove classifies from.
+fn parse_server_addr(url: &str) -> Result<ServerAddr> {
+    ServerAddr::from_str(url).map_err(|e| {
+        // `e` names the offending scheme or the parse failure, never the URL,
+        // so it cannot carry a credential into the message.
+        ShoveError::Connection(format!(
+            "NATS URL is not one the client can connect with ({e}); \
+             supported schemes are {SUPPORTED_SCHEMES}"
+        ))
+    })
+}
 
-    // `url::Url` lowercases the scheme while parsing, so the client accepts
-    // `TLS://`. Matching case-sensitively here would reject a working URL.
-    match scheme.to_ascii_lowercase().as_str() {
-        "tls" | "wss" => Ok(SchemeSecurity::Encrypted),
-        "nats" | "ws" => Ok(SchemeSecurity::Plaintext),
-        _ => Err(ShoveError::Connection(format!(
-            "NATS URL '{}' uses a scheme the client cannot connect with; \
-             supported schemes are {SUPPORTED_SCHEMES}",
-            redact_url_credentials(url)
-        ))),
+/// Classify a parsed address by the transport its scheme selects.
+///
+/// `tls` and `wss` are encrypted — the connector wraps `wss` in a rustls
+/// connector built from the same `ConnectOptions` TLS settings. `nats` and `ws`
+/// are cleartext, as is a schemeless address, which the parser reads as
+/// `nats://`. Anything unrecognised is treated as cleartext rather than
+/// trusted; `parse_server_addr` has already rejected it.
+fn scheme_security(addr: &ServerAddr) -> SchemeSecurity {
+    match addr.scheme() {
+        "tls" | "wss" => SchemeSecurity::Encrypted,
+        _ => SchemeSecurity::Plaintext,
     }
+}
+
+/// Whether the parsed address carries credentials in its authority. Empty
+/// user-info (`nats://@host`, `nats://:@host`) is not a credential — the parser
+/// records neither a username nor a password for it.
+fn has_url_userinfo(addr: &ServerAddr) -> bool {
+    addr.username().is_some() || addr.password().is_some()
 }
 
 /// Reject transport/auth combinations that would silently discard TLS options
 /// or disclose reusable credentials on the wire.
 fn validate_transport_security(config: &NatsConfig) -> Result<()> {
-    let security = classify_scheme(&config.url)?;
+    let addr = parse_server_addr(&config.url)?;
+    let security = scheme_security(&addr);
 
     // Credentials in the URL authority are rejected on every scheme, encrypted
     // ones included. `async_nats` never puts URL userinfo into the CONNECT
@@ -191,14 +238,14 @@ fn validate_transport_security(config: &NatsConfig) -> Result<()> {
     // `Debug` prints the password in the clear, and the connector logs
     // `server = ?addr` on every attempt and every failure. Passing them through
     // would leak a secret to buy nothing.
-    if url_userinfo_delimiter(&config.url).is_some() {
+    if has_url_userinfo(&addr) {
         return Err(ShoveError::Connection(format!(
             "NATS URL '{}' embeds credentials in the URL. The client never sends URL \
              userinfo when authenticating, and it renders the URL — password included — \
              into its connection debug logs. Remove the credentials from the URL and set \
              NatsConfig::username and NatsConfig::password, NatsConfig::token, or \
              NatsConfig::creds_file instead.",
-            redact_url_credentials(&config.url)
+            redacted_endpoint(&addr)
         )));
     }
 
@@ -473,8 +520,9 @@ mod tests {
             has_tls_options(&cfg),
             "config with ca_cert must be detected as having TLS options"
         );
+        let addr = parse_server_addr(&cfg.url).expect("nats:// is supported");
         assert_eq!(
-            classify_scheme(&cfg.url).expect("nats:// is supported"),
+            scheme_security(&addr),
             SchemeSecurity::Plaintext,
             "nats:// must not be considered an encrypted scheme"
         );
@@ -568,27 +616,25 @@ mod tests {
         assert_eq!(redact_url_credentials(&cfg.url), cfg.url);
     }
 
+    /// The full classification matrix, including the schemeless form the
+    /// client reads as `nats://`. Asserted positively so an implementation that
+    /// rejected a supported scheme outright could not pass by erroring.
     #[test]
-    fn tls_scheme_is_accepted() {
-        assert_eq!(
-            classify_scheme("tls://broker.example.com:4222").expect("tls:// is supported"),
-            SchemeSecurity::Encrypted
-        );
-        assert_eq!(
-            classify_scheme("wss://broker.example.com:443").expect("wss:// is supported"),
-            SchemeSecurity::Encrypted
-        );
-        assert_eq!(
-            classify_scheme("nats://broker.example.com:4222").expect("nats:// is supported"),
-            SchemeSecurity::Plaintext
-        );
-        assert_eq!(
-            classify_scheme("ws://broker.example.com:80").expect("ws:// is supported"),
-            SchemeSecurity::Plaintext
-        );
+    fn every_supported_scheme_is_classified() {
+        for (url, expected) in [
+            ("tls://broker.example.com:4222", SchemeSecurity::Encrypted),
+            ("wss://broker.example.com:443", SchemeSecurity::Encrypted),
+            ("nats://broker.example.com:4222", SchemeSecurity::Plaintext),
+            ("ws://broker.example.com:80", SchemeSecurity::Plaintext),
+            ("broker.example.com:4222", SchemeSecurity::Plaintext),
+        ] {
+            let addr = parse_server_addr(url).unwrap_or_else(|e| panic!("{url} is supported: {e}"));
+            assert_eq!(scheme_security(&addr), expected, "misclassified {url}");
+        }
+
         // `async_nats::ServerAddr::from_url` rejects every other scheme, so a
         // `nats+tls://` endpoint could never have connected.
-        assert!(classify_scheme("nats+tls://broker.example.com:4222").is_err());
+        assert!(parse_server_addr("nats+tls://broker.example.com:4222").is_err());
     }
 
     #[test]
@@ -714,6 +760,54 @@ mod tests {
         );
     }
 
+    /// Every other plaintext-scheme test asserts a *rejection*, so an
+    /// over-strict validator that refused these would go unnoticed. Each of
+    /// these is a config the client connects with.
+    #[test]
+    fn unauthenticated_endpoints_are_accepted_on_every_supported_scheme() {
+        for url in [
+            "nats://broker.example.com:4222",
+            "tls://broker.example.com:4222",
+            "ws://broker.example.com:80",
+            "wss://broker.example.com:443",
+            // Schemeless: the client reads this as `nats://`.
+            "broker.example.com:4222",
+        ] {
+            assert!(
+                validate_transport_security(&NatsConfig::new(url)).is_ok(),
+                "{url} carries no credentials and no TLS options; it must validate"
+            );
+        }
+    }
+
+    /// The development opt-in has to work on every cleartext scheme it claims
+    /// to cover, not just `nats://`.
+    #[test]
+    fn plaintext_opt_in_covers_every_cleartext_scheme() {
+        for url in [
+            "nats://broker.example.com:4222",
+            "ws://broker.example.com:80",
+            "broker.example.com:4222",
+        ] {
+            let mut cfg = NatsConfig::new(url);
+            cfg.token = Some("development-token".into());
+            cfg.allow_plaintext_credentials = true;
+            assert!(
+                validate_transport_security(&cfg).is_ok(),
+                "the opt-in must cover the cleartext scheme {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn schemeless_url_rejects_tls_options() {
+        let cfg = ca_cert_config("broker.example.com:4222");
+        assert!(
+            validate_transport_security(&cfg).is_err(),
+            "TLS options on an implicitly-plaintext address would be discarded"
+        );
+    }
+
     // --- URL userinfo must never reach async-nats on any scheme. ---
 
     #[test]
@@ -761,6 +855,98 @@ mod tests {
             rendered.contains("***@broker.example.com:4222"),
             "redacted endpoint should remain actionable: {rendered}"
         );
+    }
+
+    /// `ws` and `wss` are *special* schemes in the WHATWG URL grammar, so the
+    /// parser skips an arbitrary run of `/` before the authority instead of
+    /// exactly two. `wss:///user:pass@host` therefore parses with real
+    /// credentials and a real host — it connects, and the connector logs the
+    /// password — while a scan anchored at `"://" + 3` sees only a path.
+    /// Verified against `ServerAddr` in `serveraddr_is_the_authority_on_userinfo`.
+    #[test]
+    fn extra_slashes_before_the_authority_do_not_hide_userinfo() {
+        for url in [
+            "wss:///alice:sentinel-password@broker.example.com:443",
+            "ws:///alice:sentinel-password@broker.example.com:80",
+        ] {
+            let cfg = NatsConfig::new(url);
+            let err = validate_transport_security(&cfg)
+                .err()
+                .unwrap_or_else(|| panic!("userinfo must be rejected in {url}"));
+            let rendered = err.to_string();
+            assert!(
+                !rendered.contains("sentinel-password"),
+                "password leaked: {rendered}"
+            );
+        }
+    }
+
+    /// The `Debug` impl must not print credentials the textual scan misses
+    /// either — it is the other consumer of the redactor.
+    #[test]
+    fn debug_redacts_userinfo_behind_extra_slashes() {
+        let cfg = NatsConfig::new("wss:///alice:sentinel-password@broker.example.com:443");
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("sentinel-password"),
+            "password leaked into Debug: {rendered}"
+        );
+        assert!(!rendered.contains("alice"), "username leaked: {rendered}");
+    }
+
+    /// `url::Url` trims leading control characters and spaces, so async-nats
+    /// connects to `" tls://host"` over TLS. Rejecting it as an unsupported
+    /// scheme would fail a config that works.
+    #[test]
+    fn surrounding_whitespace_does_not_change_the_scheme() {
+        let cfg = ca_cert_config(" tls://broker.example.com:4222 ");
+        assert!(
+            validate_transport_security(&cfg).is_ok(),
+            "a URL the client trims to tls:// must be classified as encrypted"
+        );
+    }
+
+    /// An empty user-info section carries no credential — `url` records
+    /// neither a username nor a password. This is what an unset
+    /// `nats://${USER}:${PASS}@host` template expands to, and rejecting it
+    /// with "embeds credentials" would name a secret that does not exist.
+    #[test]
+    fn empty_userinfo_is_not_treated_as_a_credential() {
+        for url in [
+            "nats://@broker.example.com:4222",
+            "nats://:@broker.example.com:4222",
+        ] {
+            let cfg = NatsConfig::new(url);
+            assert!(
+                validate_transport_security(&cfg).is_ok(),
+                "{url} carries no credential and must not be rejected"
+            );
+        }
+    }
+
+    /// Pins the parser contract the three tests above rely on, so a future
+    /// async-nats bump that changes it fails here rather than silently
+    /// reopening the leak.
+    #[test]
+    fn serveraddr_is_the_authority_on_userinfo() {
+        use std::str::FromStr as _;
+
+        let hidden = async_nats::ServerAddr::from_str(
+            "wss:///alice:sentinel-password@broker.example.com:443",
+        )
+        .expect("wss:// with extra slashes parses");
+        assert_eq!(hidden.username(), Some("alice"));
+        assert_eq!(hidden.password(), Some("sentinel-password"));
+        assert_eq!(hidden.host(), "broker.example.com");
+
+        let empty = async_nats::ServerAddr::from_str("nats://:@broker.example.com:4222")
+            .expect("empty userinfo parses");
+        assert_eq!(empty.username(), None);
+        assert_eq!(empty.password(), None);
+
+        let trimmed = async_nats::ServerAddr::from_str(" tls://broker.example.com:4222 ")
+            .expect("surrounding whitespace is trimmed");
+        assert_eq!(trimmed.scheme(), "tls");
     }
 
     #[test]
