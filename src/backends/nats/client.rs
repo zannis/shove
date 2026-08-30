@@ -122,7 +122,14 @@ fn has_tls_options(config: &NatsConfig) -> bool {
 /// credential. The scan below is reached only for a URL the client itself
 /// rejects, where it errs toward hiding.
 fn redact_url_credentials(url: &str) -> String {
-    if let Ok(addr) = parse_server_addr(url) {
+    // A parsed address is only a trustworthy oracle when it actually resolved
+    // an authority. `nats:///user:pass@host` parses "successfully" with no host
+    // and no userinfo, because the whole authority landed in the path — so the
+    // parse reports nothing to redact while the password sits in the string.
+    // Fall through to the scan whenever the host is empty.
+    if let Ok(addr) = parse_server_addr(url)
+        && !addr.host().is_empty()
+    {
         return if has_url_userinfo(&addr) {
             redacted_endpoint(&addr)
         } else {
@@ -146,11 +153,26 @@ fn redact_url_credentials(url: &str) -> String {
     }
 }
 
-/// The endpoint of a parsed address with the userinfo replaced. Rebuilt from
-/// the parsed components rather than sliced out of the input, so no part of the
-/// credential can survive in the output.
+/// The endpoint of a parsed address with the userinfo replaced.
+///
+/// Scans the address's own *serialized* form rather than the caller's input.
+/// Serialization is canonical — exactly one `//` before the authority — so the
+/// authority window is unambiguous here in a way it is not in raw input, and
+/// unlike rebuilding from `host()`/`port()` it keeps the brackets an IPv6
+/// literal needs and the path that identifies a websocket route. The endpoint
+/// has to stay something the operator can copy back.
 fn redacted_endpoint(addr: &ServerAddr) -> String {
-    format!("{}://***@{}:{}", addr.scheme(), addr.host(), addr.port())
+    let serialized = addr.as_url_str();
+    let (Some(scheme_end), Some(at_pos)) =
+        (serialized.find("://"), url_userinfo_delimiter(serialized))
+    else {
+        return serialized.to_string();
+    };
+    format!(
+        "{}://***@{}",
+        &serialized[..scheme_end],
+        &serialized[at_pos + 1..]
+    )
 }
 
 /// Return the absolute position of the final `@` in the URL authority. An `@`
@@ -194,8 +216,9 @@ const SUPPORTED_SCHEMES: &str = "nats://, tls://, ws://, wss://";
 /// client's own parse is the only thing shove classifies from.
 fn parse_server_addr(url: &str) -> Result<ServerAddr> {
     ServerAddr::from_str(url).map_err(|e| {
-        // `e` names the offending scheme or the parse failure, never the URL,
-        // so it cannot carry a credential into the message.
+        // `e` is either a fixed `url::ParseError` string or the offending
+        // scheme echoed back. A scheme cannot contain `:`, `@` or `/`, so no
+        // credential fits through it into the message.
         ShoveError::Connection(format!(
             "NATS URL is not one the client can connect with ({e}); \
              supported schemes are {SUPPORTED_SCHEMES}"
@@ -249,10 +272,29 @@ fn validate_transport_security(config: &NatsConfig) -> Result<()> {
         )));
     }
 
+    // An address the parser resolved no host for cannot connect, and refusing
+    // it here is what keeps `nats:///user:pass@host` — where the authority
+    // parsed as a *path*, so the check above sees no credentials — from being
+    // handed to the client verbatim and logged. The endpoint is redacted by the
+    // textual scan, since the parse is precisely what could not be trusted.
+    if addr.host().is_empty() {
+        return Err(ShoveError::Connection(format!(
+            "NATS URL '{}' names no host. Note that an extra slash after the scheme \
+             (nats:///broker:4222) puts the whole address in the URL path, where it \
+             cannot be connected to — and where credentials in it would be logged \
+             verbatim by the client.",
+            redact_url_credentials(&config.url)
+        )));
+    }
+
     if has_tls_options(config) && security == SchemeSecurity::Plaintext {
         return Err(ShoveError::Connection(format!(
             "TLS options are configured but NATS URL '{}' uses a plaintext scheme; \
              change the URL scheme to tls:// or wss:// to prevent silent downgrade",
+            // Belt and braces: the userinfo check above has already returned for
+            // every URL this could redact, so today this is `config.url`
+            // verbatim. It stays a redacting call so that reordering the checks
+            // cannot turn this message into a disclosure.
             redact_url_credentials(&config.url)
         )));
     }
@@ -879,6 +921,84 @@ mod tests {
                 "password leaked: {rendered}"
             );
         }
+    }
+
+    /// The mirror image of the case above, and the reason a parse alone is not
+    /// a sufficient oracle. `nats` and `tls` are *not* special schemes, so the
+    /// parser does the opposite of what it does for `ws`/`wss`: the extra slash
+    /// is not collapsed, the whole authority lands in the path, and the parse
+    /// reports no host and no userinfo. The password is still right there in
+    /// the string that reaches the connector's `server = ?addr` log.
+    #[test]
+    fn a_hostless_url_is_rejected_rather_than_forwarded() {
+        for url in [
+            "nats:///alice:sentinel-password@broker.example.com:4222",
+            "tls:///alice:sentinel-password@broker.example.com:4222",
+        ] {
+            let cfg = NatsConfig::new(url);
+            let err = validate_transport_security(&cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{url} names no host and must be rejected"));
+            let rendered = err.to_string();
+            assert!(
+                !rendered.contains("sentinel-password"),
+                "password leaked into the error: {rendered}"
+            );
+
+            let debugged = format!("{cfg:?}");
+            assert!(
+                !debugged.contains("sentinel-password"),
+                "password leaked into Debug: {debugged}"
+            );
+        }
+    }
+
+    /// Half of a `nats://${USER}:${PASS}@host` template with only the *user*
+    /// variable unset. The password is a real credential even though the
+    /// username is empty.
+    #[test]
+    fn password_without_a_username_is_still_a_credential() {
+        let cfg = NatsConfig::new("nats://:sentinel-password@broker.example.com:4222");
+        let err = validate_transport_security(&cfg)
+            .expect_err("a password with no username must still be rejected");
+        assert!(
+            !err.to_string().contains("sentinel-password"),
+            "password leaked: {err}"
+        );
+        assert!(
+            !format!("{cfg:?}").contains("sentinel-password"),
+            "password leaked into Debug"
+        );
+    }
+
+    /// The redacted endpoint has to stay a usable address. Rebuilding it from
+    /// `host()` and `port()` drops the brackets an IPv6 literal needs and
+    /// discards the websocket path, which is the part that distinguishes two
+    /// routes behind the same proxy.
+    #[test]
+    fn redacted_endpoint_stays_a_valid_address() {
+        let ipv6 = NatsConfig::new("tls://alice:sentinel-password@[2001:db8::1]:4222");
+        let rendered = validate_transport_security(&ipv6)
+            .expect_err("userinfo is rejected")
+            .to_string();
+        assert!(
+            rendered.contains("[2001:db8::1]"),
+            "IPv6 host must stay bracketed so the endpoint can be copied back: {rendered}"
+        );
+        assert!(!rendered.contains("alice"), "username leaked: {rendered}");
+
+        let routed = NatsConfig::new("wss://alice:sentinel-password@broker.example.com/nats-ws");
+        let rendered = validate_transport_security(&routed)
+            .expect_err("userinfo is rejected")
+            .to_string();
+        assert!(
+            rendered.contains("/nats-ws"),
+            "the websocket path identifies the endpoint and must survive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sentinel-password"),
+            "password leaked: {rendered}"
+        );
     }
 
     /// The `Debug` impl must not print credentials the textual scan misses

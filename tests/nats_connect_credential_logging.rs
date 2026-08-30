@@ -115,17 +115,45 @@ async fn connect_does_not_log_url_userinfo() {
          pipeline is broken and the assertions below would be vacuous:\n{control_logs}"
     );
 
+    // Each URL is paired with the phrase identifying the check that must reject
+    // it, so the test pins *which* layer refused rather than merely observing
+    // that something did.
     let credential_urls = [
-        format!("tls://{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
-        // `ws`/`wss` are special schemes, so the parser skips the extra slash
+        (
+            format!("tls://{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+            "embeds credentials in the URL",
+        ),
+        // `ws`/`wss` are special schemes, so the parser skips the extra slashes
         // and this carries live credentials to the connector.
-        format!("wss:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+        (
+            format!("wss:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+            "embeds credentials in the URL",
+        ),
+        // `nats`/`tls` are not special, so the same typo goes the other way:
+        // the authority parses as a *path*, the address has no host and no
+        // userinfo, and the password would reach the connector inside the URL.
+        (
+            format!("nats:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+            "names no host",
+        ),
+        (
+            format!("tls:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+            "names no host",
+        ),
+        // A password with no username is still a credential.
+        (
+            format!("nats://:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+            "embeds credentials in the URL",
+        ),
         // `ServerAddr::from_str` prepends `nats://` to a schemeless address, so
         // the userinfo reaches the connector on this form too.
-        format!("{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+        (
+            format!("{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+            "embeds credentials in the URL",
+        ),
     ];
 
-    for url in credential_urls {
+    for (url, expected_rejection) in credential_urls {
         logs.clear();
 
         let err = match NatsClient::connect(&NatsConfig::new(url.clone())).await {
@@ -156,20 +184,23 @@ async fn connect_does_not_log_url_userinfo() {
         // future change let the URL through to a path that merely happens not
         // to log it.
         assert!(
-            rendered.contains("embeds credentials in the URL"),
-            "expected shove's own validation to reject {url}, got: {rendered}"
+            rendered.contains(expected_rejection),
+            "expected shove's own validation to reject {url} with {expected_rejection:?}, \
+             got: {rendered}"
         );
     }
 
-    // The `Debug` impl is the other place an operator sees the URL.
-    let rendered = format!(
-        "{:?}",
-        NatsConfig::new(format!(
-            "wss:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"
-        ))
-    );
-    assert!(
-        !rendered.contains(SENTINEL_PASSWORD) && !rendered.contains(SENTINEL_USER),
-        "credentials leaked into NatsConfig's Debug output: {rendered}"
-    );
+    // The `Debug` impl is the other place an operator sees the URL, and it is
+    // reached whether or not the config was ever validated.
+    for url in [
+        format!("wss:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+        format!("nats:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+        format!("nats://:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+    ] {
+        let rendered = format!("{:?}", NatsConfig::new(url.clone()));
+        assert!(
+            !rendered.contains(SENTINEL_PASSWORD) && !rendered.contains(SENTINEL_USER),
+            "credentials leaked into NatsConfig's Debug output for {url}: {rendered}"
+        );
+    }
 }

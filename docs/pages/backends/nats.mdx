@@ -61,9 +61,17 @@ credentials in `username`/`password`, `token`, or `creds_file` instead. The
 portion of the URL.
 
 :::warning
-Both rules are a behaviour change. URL user-info is now rejected rather than
-accepted-and-ignored — if your URL carries `user:password@`, move it to the
-`username`/`password` fields; the connection was never authenticated by it.
+Both rules are a behaviour change.
+
+On `tls://` and `wss://`, URL user-info used to be accepted and silently
+ignored; it is now rejected. **This includes the case where `username` and
+`password` are also set** — that connection authenticated correctly, from the
+explicit fields, and it will now be refused until the copy in the URL is
+removed. Deleting `user:password@` from the URL is the whole migration; the URL
+copy was never what authenticated you. On `nats://` and `ws://` a URL carrying
+user-info was already rejected unless `allow_plaintext_credentials` was set,
+and that opt-in no longer re-admits it.
+
 `nats+tls://` is likewise rejected up front rather than failing inside the
 client; it was never a scheme the client could connect with, so `tls://` is the
 substitution.
