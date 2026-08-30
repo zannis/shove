@@ -350,14 +350,20 @@ async fn a_credential_bearing_client_does_not_follow_redirects() {
         .allow_plaintext_credentials()
         .build();
 
-    let outcome = registry.resolve(SchemaId(1)).await;
-    assert!(
-        outcome.is_err(),
-        "the redirect must surface as an error, not be followed"
-    );
+    let error = registry
+        .resolve(SchemaId(1))
+        .await
+        .expect_err("the redirect must surface as an error, not be followed");
     assert!(
         leak_state.versions_headers.lock().unwrap().is_none(),
         "the redirect target must never see the secret header"
+    );
+    // The failure has to name the redirect and the base URL, or an operator
+    // debugs the registry instead of their configuration.
+    let message = error.to_string();
+    assert!(
+        message.contains("redirect") && message.contains("base URL"),
+        "the error must explain the redirect and what to change: {message}"
     );
 }
 

@@ -89,7 +89,9 @@ let registry = SchemaRegistry::builder("https://schema-registry:8081")
     .build();
 ```
 
-Reach for `non_secret_header` rather than `allow_plaintext_credentials()` when a benign header is the only thing tripping the guard — that opt-in is not scoped to a single header, so using it to quiet an `Accept` header would also permit a real bearer token in cleartext.
+When a benign header is the only thing tripping the guard, move it to `non_secret_header` rather than reaching for `allow_plaintext_credentials()`: that opt-in is not scoped to a single header, so using it to quiet an `Accept` header would also permit a real bearer token in cleartext.
+
+`non_secret_header` is an assertion about the value, not a way to silence the guard. Using it on a header that *does* carry a secret disables both the TLS requirement and the redirect protection for that secret, with nothing to warn you. `Authorization`, `Proxy-Authorization` and `Cookie` are rejected outright, since no configuration makes that assertion true for them — but a vendor-specific name like `CF-Access-Client-Secret` cannot be recognised, and only you know what is in it. When in doubt, use `.header(...)`.
 
 ## Per-consumer setup
 

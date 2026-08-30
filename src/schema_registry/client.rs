@@ -47,6 +47,17 @@ type SharedResolve = Shared<BoxFuture<'static, Result<Arc<CachedSchema>>>>;
 /// grow the process for its entire lifetime.
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
 
+/// Headers whose whole purpose is to carry a credential. Declaring one of these
+/// non-secret is never a true statement about a configuration, so
+/// [`SchemaRegistryBuilder::non_secret_header`] refuses them rather than let a
+/// caller disable the plaintext refusal and the redirect guard by accident.
+///
+/// Deliberately short. This is not an attempt to recognise secrets by name —
+/// that is what the fail-closed default on
+/// [`SchemaRegistryBuilder::header`] is for — only to reject an assertion that
+/// cannot hold.
+const ALWAYS_SECRET_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
+
 /// Cached registry client. `Arc`-shared; clone is a refcount bump. `'static`.
 pub struct SchemaRegistry {
     base_url: Arc<str>,
@@ -71,8 +82,10 @@ pub struct SchemaRegistry {
 impl SchemaRegistry {
     /// Start building a registry client for `base_url` (e.g. `https://sr:8081`).
     ///
-    /// A plaintext `http://` URL is fine on its own. Combining it with
-    /// [`SchemaRegistryAuth`] is not: see
+    /// A plaintext `http://` URL is fine on its own. Combining it with a
+    /// credential is not — and three things count as one: any
+    /// [`SchemaRegistryAuth`] other than `None`, `user:pass@` userinfo in this
+    /// URL, and any header set with [`SchemaRegistryBuilder::header`]. See
     /// [`SchemaRegistryBuilder::allow_plaintext_credentials`].
     pub fn builder(base_url: impl Into<String>) -> SchemaRegistryBuilder {
         SchemaRegistryBuilder {
@@ -302,6 +315,24 @@ impl FetchCtx {
                 Ok(resp) if resp.status().as_u16() == 404 => {
                     return Err(not_found);
                 }
+                // Only reachable on a credential-bearing client: that is the
+                // configuration `build()` gives a no-redirect policy, so an
+                // unauthenticated client follows the hop and never lands here.
+                // Say what happened and what to change — a bare
+                // "unexpected status 301" would send the reader hunting the
+                // registry rather than the base URL.
+                Ok(resp) if resp.status().is_redirection() => {
+                    return Err(SchemaRegistryError::Transport {
+                        retriable: false,
+                        message: format!(
+                            "registry responded with a redirect ({}), which is not \
+                             followed because credentials are configured: the hop \
+                             would replay them to the host named in Location. Point \
+                             the base URL at the registry's final address.",
+                            resp.status()
+                        ),
+                    });
+                }
                 Ok(resp) if resp.status().is_server_error() => {
                     if attempt >= self.max_retries {
                         return Err(SchemaRegistryError::Transport {
@@ -408,13 +439,20 @@ impl SchemaRegistryBuilder {
         self
     }
 
-    /// Permit [`SchemaRegistryAuth`] credentials against a plaintext `http://`
-    /// base URL, which [`SchemaRegistryBuilder::build`] otherwise refuses.
+    /// Permit credentials against a base URL that is not `https://`, which
+    /// [`SchemaRegistryBuilder::build`] otherwise refuses.
     ///
-    /// The bearer token or basic-auth password is then sent in cleartext on
-    /// every schema fetch, readable by anything on the path. Call this only for
-    /// a registry that is genuinely unreachable from an untrusted network — a
+    /// **Unscoped.** This opts in every credential channel at once —
+    /// [`SchemaRegistryAuth`], `user:pass@` userinfo in the base URL, and every
+    /// header set with [`header`](Self::header) — not just the one that
+    /// tripped the refusal. All of them are then sent in cleartext on every
+    /// schema fetch, readable by anything on the path. Call this only for a
+    /// registry that is genuinely unreachable from an untrusted network — a
     /// local development stack, or a test against a loopback mock.
+    ///
+    /// If a header that carries no secret is the only thing being refused,
+    /// move it to [`non_secret_header`](Self::non_secret_header) rather than
+    /// reaching for this: that keeps the refusal working for everything else.
     pub fn allow_plaintext_credentials(mut self) -> Self {
         self.allow_plaintext_credentials = true;
         self
@@ -455,7 +493,27 @@ impl SchemaRegistryBuilder {
     /// here disables both the plaintext refusal and the redaction that
     /// [`header`](Self::header) would have applied. When in doubt, use
     /// [`header`](Self::header).
+    ///
+    /// # Panics
+    ///
+    /// Panics for a header that carries a credential by definition —
+    /// `Authorization`, `Proxy-Authorization`, `Cookie` — because there is no
+    /// configuration in which that assertion is true. This cannot catch a
+    /// vendor-specific name such as `CF-Access-Client-Secret`; naming the
+    /// header here is the caller's assertion that it holds no secret, and only
+    /// the caller knows.
+    ///
+    /// Also panics if `name` or `value` is not a valid HTTP header.
     pub fn non_secret_header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        let name = name.as_ref();
+        assert!(
+            !ALWAYS_SECRET_HEADERS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name)),
+            "`{name}` carries a credential by definition and cannot be declared \
+             non-secret. Use SchemaRegistryBuilder::header() — or, for bearer and \
+             basic auth, SchemaRegistryBuilder::auth()."
+        );
         self.insert_header(name, value, false)
     }
 
@@ -647,8 +705,14 @@ mod tests {
             );
         }
 
-        // A base URL that does not parse cannot be shown to be encrypted.
+        // `sr:8081` does parse — scheme `sr`, path `8081` — it is simply not
+        // https, which is the fail-closed half of the same rule.
+        assert!(parse_base_url("sr:8081").is_some());
         assert!(refuses("sr:8081", &bearer, &none));
+
+        // This one genuinely does not parse, so nothing about its transport can
+        // be established and it is treated as plaintext.
+        assert!(parse_base_url("not a url").is_none());
         assert!(refuses("not a url", &bearer, &none));
     }
 
@@ -704,6 +768,29 @@ mod tests {
             .non_secret_header("Accept", "application/json")
             .headers;
         assert!(!refuses("http://sr:8081", &no_auth, &public));
+    }
+
+    /// The escape hatch must not be usable to switch the guard off for a header
+    /// that is a credential by definition — that would make the whole contract
+    /// opt-out with one call.
+    #[test]
+    #[should_panic(expected = "carries a credential by definition")]
+    fn non_secret_header_refuses_authorization() {
+        let _ = SchemaRegistry::builder("http://sr:8081")
+            .non_secret_header("Authorization", "Bearer token-abc");
+    }
+
+    #[test]
+    #[should_panic(expected = "carries a credential by definition")]
+    fn non_secret_header_refuses_cookie_case_insensitively() {
+        let _ = SchemaRegistry::builder("http://sr:8081").non_secret_header("CoOkIe", "sid=abc");
+    }
+
+    #[test]
+    #[should_panic(expected = "carries a credential by definition")]
+    fn non_secret_header_refuses_proxy_authorization() {
+        let _ = SchemaRegistry::builder("http://sr:8081")
+            .non_secret_header("proxy-authorization", "Basic abc");
     }
 
     #[test]
