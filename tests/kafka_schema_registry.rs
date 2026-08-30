@@ -365,6 +365,13 @@ async fn a_credential_bearing_client_does_not_follow_redirects() {
         message.contains("redirect") && message.contains("base URL"),
         "the error must explain the redirect and what to change: {message}"
     );
+    // The converse of `an_unfollowable_redirect_does_not_blame_absent_credentials`:
+    // here credentials really are why the hop was refused, so the message must
+    // say so.
+    assert!(
+        message.contains("credential"),
+        "a refusal caused by credentials must name them: {message}"
+    );
 }
 
 /// Without credentials there is nothing to disclose, so redirect handling is
@@ -462,6 +469,37 @@ async fn not_found_is_negative_cached() {
         after_first,
         "NotFound must be negative-cached"
     );
+}
+
+/// Not every 3xx that reaches the redirect arm was refused by the no-redirect
+/// policy. `reqwest` cannot follow a 3xx that carries no `Location`, and never
+/// follows a 300 or a 304 at all, so an unauthenticated client — which builds
+/// with the *default* policy — lands in the same arm. Its diagnosis must
+/// therefore describe what actually happened rather than blame credentials the
+/// caller never configured, which would send an operator auditing an empty
+/// configuration.
+#[tokio::test]
+async fn an_unfollowable_redirect_does_not_blame_absent_credentials() {
+    for status in [300, 302, 304] {
+        let (url, _calls) = spawn_status_mock(status).await;
+        let registry = SchemaRegistry::builder(url).build();
+
+        let error = registry
+            .resolve(SchemaId(1))
+            .await
+            .expect_err("an unfollowable redirect must surface as an error");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("redirect"),
+            "the error must still name the redirect ({status}): {message}"
+        );
+        assert!(
+            !message.contains("credential"),
+            "no credentials are configured, so the message must not blame them \
+             ({status}): {message}"
+        );
+    }
 }
 
 #[tokio::test]

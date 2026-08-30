@@ -65,6 +65,11 @@ pub struct SchemaRegistry {
     auth: SchemaRegistryAuth,
     headers: HeaderMap,
     max_retries: u32,
+    // Whether any credential channel is configured — i.e. whether this client
+    // was built with `Policy::none()`. Used only to diagnose a 3xx correctly:
+    // a client with no credentials keeps the default redirect policy and can
+    // still meet a redirect it is unable to follow.
+    credentials_configured: bool,
     negative_cache_ttl: Duration,
     // Tier 1: resolved schemas, immutable by id.
     resolved: DashMap<SchemaId, Arc<CachedSchema>>,
@@ -193,6 +198,7 @@ impl SchemaRegistry {
             auth: self.auth.clone(),
             headers: self.headers.clone(),
             max_retries: self.max_retries,
+            credentials_configured: self.credentials_configured,
         };
         let url = format!("{}/subjects/{}/versions/latest", self.base_url, subject);
         let not_found = SchemaRegistryError::Transport {
@@ -219,6 +225,7 @@ impl SchemaRegistry {
                     auth: self.auth.clone(),
                     headers: self.headers.clone(),
                     max_retries: self.max_retries,
+                    credentials_configured: self.credentials_configured,
                 };
                 let fut = async move { ctx.fetch(id).await };
                 let shared: SharedResolve = fut.boxed().shared();
@@ -236,6 +243,7 @@ struct FetchCtx {
     auth: SchemaRegistryAuth,
     headers: HeaderMap,
     max_retries: u32,
+    credentials_configured: bool,
 }
 
 impl FetchCtx {
@@ -315,22 +323,35 @@ impl FetchCtx {
                 Ok(resp) if resp.status().as_u16() == 404 => {
                     return Err(not_found);
                 }
-                // Only reachable on a credential-bearing client: that is the
-                // configuration `build()` gives a no-redirect policy, so an
-                // unauthenticated client follows the hop and never lands here.
-                // Say what happened and what to change — a bare
-                // "unexpected status 301" would send the reader hunting the
-                // registry rather than the base URL.
+                // Reachable two ways, and they need different diagnoses. On a
+                // credential-bearing client `build()` installed
+                // `Policy::none()`, so every 3xx arrives here. But an
+                // unauthenticated client keeps the default policy and still
+                // lands here for any 3xx `reqwest` will not follow — a 300, a
+                // 304, or a 30x with no `Location`. Blaming credentials in that
+                // case sends an operator auditing a configuration that has
+                // none. Either way, name the redirect: a bare "unexpected
+                // status 301" would send the reader hunting the registry
+                // rather than their base URL.
                 Ok(resp) if resp.status().is_redirection() => {
+                    let status = resp.status();
+                    let message = if self.credentials_configured {
+                        format!(
+                            "registry responded with a redirect ({status}), which is \
+                             not followed because credentials are configured: the hop \
+                             would replay them to the host named in Location. Point \
+                             the base URL at the registry's final address."
+                        )
+                    } else {
+                        format!(
+                            "registry responded with a redirect ({status}) that cannot \
+                             be followed. Point the base URL at the registry's final \
+                             address."
+                        )
+                    };
                     return Err(SchemaRegistryError::Transport {
                         retriable: false,
-                        message: format!(
-                            "registry responded with a redirect ({}), which is not \
-                             followed because credentials are configured: the hop \
-                             would replay them to the host named in Location. Point \
-                             the base URL at the registry's final address.",
-                            resp.status()
-                        ),
+                        message,
                     });
                 }
                 Ok(resp) if resp.status().is_server_error() => {
@@ -611,6 +632,10 @@ impl SchemaRegistryBuilder {
             auth: self.auth,
             headers: self.headers,
             max_retries: self.max_retries,
+            // Same answer that chose the redirect policy just above, so the
+            // diagnosis for a 3xx cannot drift from the policy that produced
+            // it.
+            credentials_configured: !channels.is_empty(),
             negative_cache_ttl: self.negative_cache_ttl,
             resolved: DashMap::new(),
             inflight: DashMap::new(),
