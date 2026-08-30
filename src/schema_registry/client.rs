@@ -463,7 +463,7 @@ mod tests {
             pass: "p".into(),
         };
 
-        // Credentials + plaintext transport is the case worth warning about.
+        // Credentials + plaintext transport is the case `build()` refuses.
         assert!(sends_credentials_in_cleartext("http://sr:8081", &bearer));
         assert!(sends_credentials_in_cleartext("HTTP://sr:8081", &basic));
 
