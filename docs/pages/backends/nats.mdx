@@ -44,7 +44,12 @@ config.tls_client_cert = Some(PathBuf::from("/etc/nats/client.pem"));
 config.tls_client_key  = Some(PathBuf::from("/etc/nats/client.key"));
 ```
 
-All slots are `Option<…>` — set only the ones your deployment uses. The `Debug` impl redacts every credential and the user-info portion of the URL.
+All slots are `Option<…>` — set only the ones your deployment uses. Static
+username/password and token credentials require a `tls://` or `nats+tls://`
+URL so reusable secrets are never sent in cleartext. A local development broker
+that deliberately uses plaintext must opt in with
+`config.allow_plaintext_credentials = true`. The `Debug` impl and connection errors
+redact every credential and the user-info portion of the URL.
 
 ## Declare topology
 

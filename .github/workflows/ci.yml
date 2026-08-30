@@ -191,8 +191,19 @@ jobs:
             features: kafka,kafka-schema-registry,protobuf
             # `kafka-schema-registry` implies `kafka`, so without a filter this
             # entry would re-run the entire Kafka suite the `kafka` entry
-            # already covers. Restrict it to the three schema-registry binaries.
-            filter: -E 'binary(/^kafka_schema_registry/)'
+            # already covers. Restrict it to the three schema-registry binaries,
+            # plus the `schema_registry::` unit tests in the lib binary.
+            #
+            # That second term is not optional. This is the only matrix entry
+            # that enables `kafka-schema-registry`, so `src/schema_registry/`
+            # is compiled out everywhere else -- and `binary(...)` alone selects
+            # only the integration binaries, never the lib. The result was that
+            # all 31 `schema_registry::` unit tests ran in NO CI job at all,
+            # including `wire::tests`, whose truncated-frame and varint-overflow
+            # cases are what stop a malformed broker frame from panicking a
+            # consumer. The job was green because it ran 13 tests, not because
+            # those 31 passed.
+            filter: -E 'binary(/^kafka_schema_registry/) + test(/^schema_registry::/)'
           - name: redis-streams
             # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`,
             # `metrics_redis_failall` and `metrics_redis_failall_no_dlq`.

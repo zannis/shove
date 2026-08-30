@@ -47,14 +47,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Resolve the rehearsal flag once, and fail closed: an unrecognised value
-      # must not quietly mean "real release". `type: boolean` makes this
-      # unreachable from the Actions UI, but a dispatch through the API can put
-      # anything in the field. Read through the environment rather than
-      # interpolating the input into the script.
-      - name: Resolve release mode
+      # Resolve dispatch inputs once and fail closed. Their declared types and
+      # choices constrain the Actions UI, but an API dispatch can still supply
+      # arbitrary strings. Read through the environment rather than
+      # interpolating either input into the script.
+      - name: Resolve release inputs
         env:
           DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          BUMP_INPUT: ${{ inputs.bump }}
         run: |
           case "$DRY_RUN_INPUT" in
             true)  echo "Rehearsal: nothing will be pushed or published." ;;
@@ -64,7 +64,15 @@ jobs:
               exit 1
               ;;
           esac
+          case "$BUMP_INPUT" in
+            patch|minor|major|none) ;;
+            *)
+              echo "::error::bump must be 'patch', 'minor', 'major' or 'none', got '$BUMP_INPUT'."
+              exit 1
+              ;;
+          esac
           echo "DRY_RUN=$DRY_RUN_INPUT" >> "$GITHUB_ENV"
+          echo "BUMP=$BUMP_INPUT" >> "$GITHUB_ENV"
 
       # Do not ship code CI never ran. v0.13.0 was published from b36dcff, a
       # commit with zero ci.yml legs -- ci.yml's `paths:` filter skipped it --
@@ -121,7 +129,7 @@ jobs:
 
       - name: Bump version
         if: inputs.bump != 'none'
-        run: cargo set-version -q --bump ${{ inputs.bump }}
+        run: cargo set-version -q --bump "$BUMP"
 
       - name: Resolve version
         id: version
@@ -154,7 +162,9 @@ jobs:
 
       - name: Import GPG signing key
         if: inputs.bump != 'none'
-        uses: crazy-max/ghaction-import-gpg@v7
+        # This action receives the long-lived release signing key. Keep the
+        # human-readable release in the comment, but execute an immutable SHA.
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7
         with:
           gpg_private_key: ${{ secrets.BOT_GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.BOT_GPG_PASSPHRASE }}
@@ -280,17 +290,20 @@ jobs:
 
       - name: Push the release commit and tag
         if: inputs.bump != 'none'
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           # The commit and tag were created for real even on a rehearsal --
           # signing them is a step that can fail, so it has to be exercised.
           # Only the push is withheld, leaving both objects local to the runner.
           if [ "$DRY_RUN" = "true" ]; then
-            echo "dry run: not pushing v${{ steps.version.outputs.version }} to ${{ github.ref_name }}"
+            echo "dry run: not pushing v${RELEASE_VERSION} to ${RELEASE_REF}"
             git --no-pager log -1 --show-signature
-            git tag -v "v${{ steps.version.outputs.version }}"
+            git tag -v "v${RELEASE_VERSION}"
             exit 0
           fi
-          git push origin "HEAD:${{ github.ref_name }}" --follow-tags
+          git push origin "HEAD:${RELEASE_REF}" --follow-tags
 
       # Generate the notes *before* `cargo publish`, the one irreversible step
       # in this job: a crate version cannot be unpublished, so anything that can
@@ -306,7 +319,9 @@ jobs:
       # `exclude` list.
       - name: Generate changelog
         run: |
-          cargo install -q git-cliff --locked
+          # --locked only locks the selected release's dependencies; pin the
+          # release itself so a new crates.io upload cannot enter this job.
+          cargo install -q git-cliff --version 2.13.1 --locked
           VERSION="${{ steps.version.outputs.version }}"
           NOTES="${RUNNER_TEMP}/RELEASE_NOTES.md"
           # Do not use `--latest`: on the `bump: none` path the "Commit and tag"
@@ -362,7 +377,10 @@ jobs:
       - name: Authenticate with crates.io (trusted publishing)
         id: crates-auth
         if: env.DRY_RUN != 'true'
-        uses: rust-lang/crates-io-auth-action@v1
+        # Mints the crates.io publish token, so a compromised release of this
+        # action could ship a malicious `shove`. Same rule as the GPG import
+        # above: human-readable release in the comment, immutable SHA executed.
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish to crates.io
         run: |

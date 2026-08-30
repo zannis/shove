@@ -42,6 +42,10 @@ impl fmt::Debug for SchemaRegistryAuth {
 type Result<T> = std::result::Result<T, SchemaRegistryError>;
 type SharedResolve = Shared<BoxFuture<'static, Result<Arc<CachedSchema>>>>;
 
+/// Cap attacker-controlled misses so arbitrary Confluent schema IDs cannot
+/// grow the process for its entire lifetime.
+const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
+
 /// Cached registry client. `Arc`-shared; clone is a refcount bump. `'static`.
 pub struct SchemaRegistry {
     base_url: Arc<str>,
@@ -56,6 +60,9 @@ pub struct SchemaRegistry {
     inflight: DashMap<SchemaId, SharedResolve>,
     // Negative cache: id -> (instant inserted, error that caused the miss).
     negative: DashMap<SchemaId, (std::time::Instant, SchemaRegistryError)>,
+    // Serialises bounded eviction + insertion so concurrent unique misses
+    // cannot all observe spare capacity and overfill the cache.
+    negative_insert_lock: tokio::sync::Mutex<()>,
     // Producer-side subject -> latest id cache (TopicNameStrategy lookups).
     subject_ids: DashMap<Arc<str>, SchemaId>,
 }
@@ -83,9 +90,13 @@ impl SchemaRegistry {
         // Negative cache: suppress hammering on a known-bad id within the TTL.
         if let Some(entry) = self.negative.get(&id) {
             let (at, err) = entry.value();
-            if at.elapsed() < self.negative_cache_ttl {
-                return Err(err.clone());
+            let fresh = at.elapsed() < self.negative_cache_ttl;
+            let err = err.clone();
+            drop(entry);
+            if fresh {
+                return Err(err);
             }
+            self.negative.remove(&id);
         }
         // Tier 2: single-flight — collapse concurrent misses into one fetch.
         let shared = self.shared_fetch(id);
@@ -98,13 +109,25 @@ impl SchemaRegistry {
             }
             Err(e) => {
                 if !e.is_retriable() {
-                    self.negative
-                        .insert(id, (std::time::Instant::now(), e.clone()));
+                    self.cache_negative(id, e.clone()).await;
                 }
                 self.inflight.remove(&id);
             }
         }
         result
+    }
+
+    async fn cache_negative(&self, id: SchemaId, error: SchemaRegistryError) {
+        let _guard = self.negative_insert_lock.lock().await;
+        if self.negative.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
+            // Copy the key and drop the iterator guard before removing: a
+            // DashMap removal while holding a shard read guard can deadlock.
+            let victim = { self.negative.iter().next().map(|entry| *entry.key()) };
+            if let Some(victim) = victim {
+                self.negative.remove(&victim);
+            }
+        }
+        self.negative.insert(id, (std::time::Instant::now(), error));
     }
 
     /// Resolve a subject to its latest schema id via
@@ -275,6 +298,19 @@ impl FetchCtx {
     }
 }
 
+/// True when reusable registry credentials would travel over an unencrypted
+/// transport. `build()` cannot reject this — it returns the client rather than
+/// a `Result`, and plaintext registries on a trusted network are a legitimate
+/// deployment — so this only drives a startup warning.
+fn sends_credentials_in_cleartext(base_url: &str, auth: &SchemaRegistryAuth) -> bool {
+    let has_credentials = !matches!(auth, SchemaRegistryAuth::None);
+    has_credentials
+        && base_url
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+}
+
 /// Builder for [`SchemaRegistry`].
 pub struct SchemaRegistryBuilder {
     base_url: String,
@@ -322,6 +358,13 @@ impl SchemaRegistryBuilder {
             .timeout(self.timeout)
             .build()
             .expect("reqwest client builds with default TLS");
+        if sends_credentials_in_cleartext(&self.base_url, &self.auth) {
+            tracing::warn!(
+                "schema registry auth is configured against a plaintext http:// base URL; \
+                 the bearer token or basic-auth password is sent in cleartext on every \
+                 request. Use https:// for any registry reachable outside a trusted network."
+            );
+        }
         Arc::new(SchemaRegistry {
             base_url: Arc::from(self.base_url.trim_end_matches('/')),
             http,
@@ -332,6 +375,7 @@ impl SchemaRegistryBuilder {
             resolved: DashMap::new(),
             inflight: DashMap::new(),
             negative: DashMap::new(),
+            negative_insert_lock: tokio::sync::Mutex::new(()),
             subject_ids: DashMap::new(),
         })
     }
@@ -339,7 +383,7 @@ impl SchemaRegistryBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::SchemaRegistryAuth;
+    use super::*;
 
     #[test]
     fn bearer_token_is_redacted_in_debug() {
@@ -368,5 +412,49 @@ mod tests {
             "missing redaction marker: {dbg}"
         );
         assert!(dbg.contains("alice"), "user should be visible: {dbg}");
+    }
+
+    #[test]
+    fn cleartext_credential_warning_tracks_scheme_and_auth() {
+        let bearer = SchemaRegistryAuth::Bearer("t".into());
+        let basic = SchemaRegistryAuth::Basic {
+            user: "u".into(),
+            pass: "p".into(),
+        };
+
+        // Credentials + plaintext transport is the case worth warning about.
+        assert!(sends_credentials_in_cleartext("http://sr:8081", &bearer));
+        assert!(sends_credentials_in_cleartext("HTTP://sr:8081", &basic));
+
+        // TLS carries them safely.
+        assert!(!sends_credentials_in_cleartext("https://sr:8081", &bearer));
+        // `https` must not be matched by a naive `http` prefix test.
+        assert!(!sends_credentials_in_cleartext(
+            "https://sr:8081",
+            &SchemaRegistryAuth::Basic {
+                user: "u".into(),
+                pass: "p".into()
+            }
+        ));
+
+        // No credentials means nothing to disclose.
+        assert!(!sends_credentials_in_cleartext(
+            "http://sr:8081",
+            &SchemaRegistryAuth::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn negative_cache_evicts_at_its_capacity() {
+        let registry = SchemaRegistry::builder("http://registry.invalid").build();
+
+        for raw_id in 0..(MAX_NEGATIVE_CACHE_ENTRIES + 32) {
+            let id = SchemaId(raw_id as u32);
+            registry
+                .cache_negative(id, SchemaRegistryError::NotFound(id.0))
+                .await;
+        }
+
+        assert_eq!(registry.negative.len(), MAX_NEGATIVE_CACHE_ENTRIES);
     }
 }
