@@ -114,12 +114,134 @@ async fn spawn_header_mock() -> (String, HeaderMockState) {
     (format!("http://{addr}"), state)
 }
 
+/// Redirects every request to the same path on `target`, counting the hops.
+#[derive(Clone)]
+struct RedirectMockState {
+    target: String,
+    hops: Arc<AtomicUsize>,
+}
+
+async fn redirect_versions(
+    State(s): State<RedirectMockState>,
+    Path(id): Path<u32>,
+) -> (StatusCode, [(&'static str, String); 1]) {
+    s.hops.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::FOUND,
+        [(
+            "location",
+            format!("{}/schemas/ids/{id}/versions", s.target),
+        )],
+    )
+}
+
+async fn redirect_schema(
+    State(s): State<RedirectMockState>,
+    Path(id): Path<u32>,
+) -> (StatusCode, [(&'static str, String); 1]) {
+    s.hops.fetch_add(1, Ordering::SeqCst);
+    (
+        StatusCode::FOUND,
+        [("location", format!("{}/schemas/ids/{id}", s.target))],
+    )
+}
+
+/// Spawn a mock that 302s every registry endpoint to `target`, returning
+/// (base_url, hop-counter).
+async fn spawn_redirecting_mock(target: String) -> (String, Arc<AtomicUsize>) {
+    let hops = Arc::new(AtomicUsize::new(0));
+    let state = RedirectMockState {
+        target,
+        hops: hops.clone(),
+    };
+    let app = Router::new()
+        .route("/schemas/ids/{id}/versions", get(redirect_versions))
+        .route("/schemas/ids/{id}", get(redirect_schema))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), hops)
+}
+
+/// Base URL userinfo is a credential channel: `reqwest` strips `user:pass@`
+/// from the URL and replays it as an `Authorization: Basic` header, so a
+/// `http://user:pass@registry` base URL puts a reusable secret on a plaintext
+/// wire without any [`SchemaRegistryAuth`] ever being configured.
+#[tokio::test]
+async fn url_userinfo_reaches_the_registry_as_basic_auth() {
+    let (url, state) = spawn_header_mock().await;
+    let with_userinfo = url.replace("http://", "http://sr-user:sr-pass@");
+    // The opt-in is required precisely because this is a credential. That it
+    // still reaches the registry is the point: the guard classifies userinfo
+    // correctly rather than merely rejecting a URL shape.
+    let registry = SchemaRegistry::builder(with_userinfo)
+        .allow_plaintext_credentials()
+        .build();
+    registry.resolve(SchemaId(1)).await.unwrap();
+
+    let headers = state
+        .versions_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("endpoint should have been called");
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        // base64("sr-user:sr-pass")
+        "Basic c3ItdXNlcjpzci1wYXNz",
+        "URL userinfo must be recognised as a credential: it is on the wire"
+    );
+}
+
+/// `url` treats a missing or repeated `//` after a special scheme as a
+/// recoverable syntax violation, so these spellings reach the same origin as
+/// `http://…` and put the same credentials on the same plaintext wire. Each was
+/// confirmed against a live mock registry before this guard existed: all three
+/// resolved successfully and sent `Authorization: Basic c3ItdXNlcjpzci1wYXNz`.
+#[test]
+#[should_panic(expected = "schema registry credentials require TLS")]
+fn single_slash_url_with_userinfo_is_refused() {
+    let _ = SchemaRegistry::builder("http:sr-user:sr-pass@sr:8081").build();
+}
+
+#[test]
+#[should_panic(expected = "schema registry credentials require TLS")]
+fn triple_slash_url_with_userinfo_is_refused() {
+    let _ = SchemaRegistry::builder("http:///sr-user:sr-pass@sr:8081").build();
+}
+
+/// The same normalisation defeated the `SchemaRegistryAuth` check as shipped:
+/// `"http:host".starts_with("http://")` is false, so a bearer token against
+/// `http:registry:8081` built with no opt-in and went out in cleartext.
+#[test]
+#[should_panic(expected = "schema registry credentials require TLS")]
+fn single_slash_url_does_not_bypass_the_auth_guard() {
+    let _ = SchemaRegistry::builder("http:sr:8081")
+        .auth(SchemaRegistryAuth::Bearer("token-abc".into()))
+        .build();
+}
+
+/// A base URL that does not parse cannot be shown to be encrypted, so
+/// credentials against it are refused rather than assumed safe.
+#[test]
+#[should_panic(expected = "schema registry credentials require TLS")]
+fn unparseable_base_url_with_credentials_is_refused() {
+    let _ = SchemaRegistry::builder("sr:8081")
+        .auth(SchemaRegistryAuth::Bearer("token-abc".into()))
+        .build();
+}
+
 #[tokio::test]
 async fn configured_headers_are_sent_on_registry_requests() {
     let (url, state) = spawn_header_mock().await;
+    // `header()` treats its value as a secret, so a plaintext mock needs the
+    // explicit opt-in. Before that was true this test asserted a Cloudflare
+    // Access client secret travelling over plaintext with nothing objecting.
     let registry = SchemaRegistry::builder(url)
         .header("CF-Access-Client-Id", "client-id-123")
         .header("CF-Access-Client-Secret", "client-secret-456")
+        .allow_plaintext_credentials()
         .build();
     registry.resolve(SchemaId(1)).await.unwrap();
 
@@ -171,6 +293,91 @@ async fn custom_headers_coexist_with_bearer_auth() {
         headers.get("cf-access-client-id").unwrap(),
         "client-id-123",
         "custom header must coexist with auth"
+    );
+}
+
+#[test]
+#[should_panic(expected = "schema registry credentials require TLS")]
+fn url_userinfo_over_plaintext_is_refused_without_opt_in() {
+    let _ = SchemaRegistry::builder("http://sr-user:sr-pass@sr:8081").build();
+}
+
+#[test]
+#[should_panic(expected = "schema registry credentials require TLS")]
+fn secret_header_over_plaintext_is_refused_without_opt_in() {
+    let _ = SchemaRegistry::builder("http://sr:8081")
+        .header("CF-Access-Client-Secret", "client-secret-456")
+        .build();
+}
+
+/// A header the caller states carries no secret needs no opt-in, and still
+/// reaches the registry. Without this escape the only way to send an `Accept`
+/// header to a development registry would be the credential opt-in — which is
+/// not scoped to one header and would also permit a real bearer token.
+#[tokio::test]
+async fn non_secret_header_needs_no_opt_in_and_is_still_sent() {
+    let (url, state) = spawn_header_mock().await;
+    let registry = SchemaRegistry::builder(url)
+        .non_secret_header("X-Client-Build", "2026.08.30")
+        .build();
+    registry.resolve(SchemaId(1)).await.unwrap();
+
+    let headers = state
+        .versions_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("endpoint should have been called");
+    assert_eq!(
+        headers.get("x-client-build").unwrap(),
+        "2026.08.30",
+        "a non-secret header must still reach the registry"
+    );
+}
+
+/// `reqwest` follows redirects by default and, across an origin change, strips
+/// only `Authorization`, `Cookie`, `Proxy-Authorization` and
+/// `WWW-Authenticate`. A custom secret header is not on that list, so a
+/// redirect would replay it to whatever host — and whatever scheme — the
+/// `Location` names. A credential-bearing client therefore declines to follow.
+#[tokio::test]
+async fn a_credential_bearing_client_does_not_follow_redirects() {
+    let (leak_url, leak_state) = spawn_header_mock().await;
+    let (registry_url, _redirects) = spawn_redirecting_mock(leak_url).await;
+
+    let registry = SchemaRegistry::builder(registry_url)
+        .header("CF-Access-Client-Secret", "client-secret-456")
+        .allow_plaintext_credentials()
+        .build();
+
+    let outcome = registry.resolve(SchemaId(1)).await;
+    assert!(
+        outcome.is_err(),
+        "the redirect must surface as an error, not be followed"
+    );
+    assert!(
+        leak_state.versions_headers.lock().unwrap().is_none(),
+        "the redirect target must never see the secret header"
+    );
+}
+
+/// Without credentials there is nothing to disclose, so redirect handling is
+/// left alone — the guard must not silently change behaviour for the common
+/// unauthenticated registry.
+#[tokio::test]
+async fn an_unauthenticated_client_still_follows_redirects() {
+    let (target_url, target_state) = spawn_header_mock().await;
+    let (registry_url, _redirects) = spawn_redirecting_mock(target_url).await;
+
+    let registry = SchemaRegistry::builder(registry_url).build();
+    registry
+        .resolve(SchemaId(1))
+        .await
+        .expect("an unauthenticated client follows the redirect as before");
+
+    assert!(
+        target_state.versions_headers.lock().unwrap().is_some(),
+        "the redirect target should have been reached"
     );
 }
 

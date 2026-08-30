@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Shared};
 use reqwest::header::HeaderMap;
+use reqwest::{Url, redirect::Policy};
 
 use crate::retry::Backoff;
 
@@ -122,9 +123,39 @@ impl SchemaRegistry {
         result
     }
 
+    /// True when `id` holds a negative entry that has not yet expired.
+    fn negative_is_fresh(&self, id: SchemaId) -> bool {
+        match self.negative.get(&id) {
+            Some(entry) => entry.value().0.elapsed() < self.negative_cache_ttl,
+            None => false,
+        }
+    }
+
     async fn cache_negative(&self, id: SchemaId, error: SchemaRegistryError) {
+        // Every waiter of one shared fetch runs this, so a burst on a single
+        // bad id arrives here N times for the same key. Once a sibling waiter
+        // has cached the failure there is nothing left to insert, so the rest
+        // of the burst neither queues on the lock nor touches the map.
+        //
+        // Safe to skip: reaching this point means `resolve` got past its
+        // freshness check and started a fetch, so any entry visible now was
+        // inserted by a concurrent waiter on that same failed fetch.
+        if self.negative_is_fresh(id) {
+            return;
+        }
         let _guard = self.negative_insert_lock.lock().await;
-        if self.negative.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
+        // Load-bearing, not defensive padding: the whole burst can clear the
+        // check above before any one of them inserts, so this is the
+        // authoritative test.
+        if self.negative_is_fresh(id) {
+            return;
+        }
+        // Replacing an entry does not grow the map, so it must not evict.
+        // Paying for a replacement with an eviction is what let a duplicate
+        // burst drop unrelated negatives — each one costing a fresh registry
+        // round trip — and leave the cache permanently one below its cap.
+        let replacing = self.negative.contains_key(&id);
+        if !replacing && self.negative.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
             // Copy the key and drop the iterator guard before removing: a
             // DashMap removal while holding a shard read guard can deadlock.
             let victim = { self.negative.iter().next().map(|entry| *entry.key()) };
@@ -303,17 +334,61 @@ impl FetchCtx {
     }
 }
 
-/// True when reusable registry credentials would travel over an unencrypted
-/// transport. [`SchemaRegistryBuilder::build`] refuses this outright unless the
-/// caller opted in via
-/// [`SchemaRegistryBuilder::allow_plaintext_credentials`].
-fn sends_credentials_in_cleartext(base_url: &str, auth: &SchemaRegistryAuth) -> bool {
-    let has_credentials = !matches!(auth, SchemaRegistryAuth::None);
-    has_credentials
-        && base_url
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("http://")
+/// Parse the base URL the way the HTTP client will.
+///
+/// A security decision must never be made by scanning the configuration
+/// string. `Url::parse` normalises spellings a prefix test does not recognise:
+/// for a special scheme it skips any number of leading slashes and treats the
+/// missing `//` as a non-fatal syntax violation, so `http:sr:8081`,
+/// `http:/sr:8081` and `http:///sr:8081` all parse to the same origin as
+/// `http://sr:8081` and all reach the network. A `starts_with("http://")` test
+/// calls those three encrypted.
+fn parse_base_url(base_url: &str) -> Option<Url> {
+    Url::parse(base_url).ok()
+}
+
+/// True when the base URL is carried by TLS.
+///
+/// Fail closed on both axes: a URL that does not parse cannot be shown to be
+/// encrypted, and `reqwest` speaks only `http` and `https`, so anything that is
+/// not `https` is plaintext.
+fn transport_is_encrypted(base_url: Option<&Url>) -> bool {
+    base_url.is_some_and(|url| url.scheme() == "https")
+}
+
+/// Names every channel through which this configuration would put a reusable
+/// secret on the wire. Empty means there is nothing to disclose.
+///
+/// Deliberately independent of the transport: the same answer decides whether
+/// [`SchemaRegistryBuilder::build`] refuses a plaintext base URL *and* whether
+/// the client is allowed to follow redirects.
+///
+/// Only channel *names* are produced. A header name is safe to put in a panic
+/// message or a log line; its value is exactly what must never appear there.
+fn credential_channels(
+    base_url: Option<&Url>,
+    auth: &SchemaRegistryAuth,
+    headers: &HeaderMap,
+) -> Vec<String> {
+    let mut channels = Vec::new();
+    match auth {
+        SchemaRegistryAuth::None => {}
+        SchemaRegistryAuth::Bearer(_) => channels.push("SchemaRegistryAuth::Bearer".to_owned()),
+        SchemaRegistryAuth::Basic { .. } => channels.push("SchemaRegistryAuth::Basic".to_owned()),
+    }
+    // `reqwest` lifts `user:pass@` out of the URL and replays it as an
+    // `Authorization: Basic` header, so URL userinfo is a credential even when
+    // no `SchemaRegistryAuth` is configured. This is the exact condition
+    // reqwest's own `extract_authority` uses, so the two cannot disagree.
+    if base_url.is_some_and(|url| !url.username().is_empty() || url.password().is_some()) {
+        channels.push("base URL userinfo".to_owned());
+    }
+    for (name, value) in headers {
+        if value.is_sensitive() {
+            channels.push(format!("header `{name}`"));
+        }
+    }
+    channels
 }
 
 /// Builder for [`SchemaRegistry`].
@@ -350,12 +425,52 @@ impl SchemaRegistryBuilder {
     /// headers (e.g. Cloudflare Access `CF-Access-Client-Id` and
     /// `CF-Access-Client-Secret`). Panics if `name` or `value` is not a valid
     /// HTTP header.
-    pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+    ///
+    /// **The value is treated as a secret.** This method is documented for, and
+    /// overwhelmingly used to carry, credentials, and the builder cannot tell
+    /// which vendor-specific header name happens to hold one — so it assumes
+    /// every value here does. Consequences: the header counts as a credential
+    /// for the plaintext check in [`build`](Self::build), the client will not
+    /// follow redirects, and the value is marked sensitive so it prints as
+    /// `Sensitive` rather than in clear.
+    ///
+    /// For a header that genuinely carries no secret, use
+    /// [`non_secret_header`](Self::non_secret_header) instead of reaching for
+    /// [`allow_plaintext_credentials`](Self::allow_plaintext_credentials) —
+    /// that opt-in is not scoped to one header, so using it to quiet an
+    /// `Accept` header would also permit a real bearer token in cleartext.
+    pub fn header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.insert_header(name, value, true)
+    }
+
+    /// Attach a static header whose value is **not** a secret — an `Accept`, a
+    /// build identifier, a request tag.
+    ///
+    /// Identical on the wire to [`header`](Self::header); the difference is the
+    /// assertion the caller makes by choosing it. A non-secret header does not
+    /// require TLS and does not restrict redirects. Panics if `name` or `value`
+    /// is not a valid HTTP header.
+    ///
+    /// Getting this wrong is a silent credential disclosure: passing a token
+    /// here disables both the plaintext refusal and the redaction that
+    /// [`header`](Self::header) would have applied. When in doubt, use
+    /// [`header`](Self::header).
+    pub fn non_secret_header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.insert_header(name, value, false)
+    }
+
+    fn insert_header(
+        mut self,
+        name: impl AsRef<str>,
+        value: impl AsRef<str>,
+        secret: bool,
+    ) -> Self {
         use reqwest::header::{HeaderName, HeaderValue};
         let name = HeaderName::from_bytes(name.as_ref().as_bytes())
             .expect("schema registry header name is a valid HTTP header name");
-        let value = HeaderValue::from_str(value.as_ref())
+        let mut value = HeaderValue::from_str(value.as_ref())
             .expect("schema registry header value is a valid HTTP header value");
+        value.set_sensitive(secret);
         self.headers.insert(name, value);
         self
     }
@@ -373,37 +488,63 @@ impl SchemaRegistryBuilder {
     }
     /// # Panics
     ///
-    /// Panics when [`SchemaRegistryAuth`] credentials are configured against a
-    /// plaintext `http://` base URL and
+    /// Panics when the configuration would put a reusable secret on a plaintext
+    /// transport and
     /// [`SchemaRegistryBuilder::allow_plaintext_credentials`] was not called.
-    /// A misconfiguration that puts a reusable secret on the wire is caught at
-    /// startup rather than on the first schema fetch; this builder cannot
-    /// return an error because it yields the client directly.
+    /// Three channels count as a secret: [`SchemaRegistryAuth`], `user:pass@`
+    /// userinfo in the base URL (which `reqwest` replays as an
+    /// `Authorization: Basic` header), and any header set via
+    /// [`header`](Self::header). A misconfiguration that puts a reusable secret
+    /// on the wire is caught at startup rather than on the first schema fetch;
+    /// this builder cannot return an error because it yields the client
+    /// directly.
     ///
     /// Also panics if the underlying `reqwest` client cannot be constructed.
     pub fn build(self) -> Arc<SchemaRegistry> {
+        let parsed = parse_base_url(&self.base_url);
+        let channels = credential_channels(parsed.as_ref(), &self.auth, &self.headers);
+
         // sec-SR-1: refuse reusable credentials over an unencrypted transport.
         // A warning is too easy to miss — the token is already on the wire by
         // the time anyone reads the log. The base URL is deliberately kept out
         // of the message: it may carry `user:pass@` userinfo, and a panic
-        // message reaches logs and crash reports.
-        if sends_credentials_in_cleartext(&self.base_url, &self.auth) {
+        // message reaches logs and crash reports. Channel names are safe;
+        // channel values are the thing being protected.
+        if !channels.is_empty() && !transport_is_encrypted(parsed.as_ref()) {
             assert!(
                 self.allow_plaintext_credentials,
                 "schema registry credentials require TLS: use an https:// base URL. \
-                 Sending a bearer token or basic-auth password over plaintext exposes \
-                 it to any network observer. For a registry on a trusted network, call \
-                 SchemaRegistryBuilder::allow_plaintext_credentials() to opt in."
+                 These configured credentials would be sent in cleartext, readable by \
+                 any network observer: {}. For a registry on a trusted network, call \
+                 SchemaRegistryBuilder::allow_plaintext_credentials() to opt in. A \
+                 header that carries no secret belongs in \
+                 SchemaRegistryBuilder::non_secret_header() instead.",
+                channels.join(", ")
             );
             tracing::warn!(
-                "schema registry auth is configured against a plaintext http:// base URL \
-                 with allow_plaintext_credentials(); the bearer token or basic-auth \
-                 password is sent in cleartext on every request. Use https:// for any \
-                 registry reachable outside a trusted network."
+                credential_channels = %channels.join(", "),
+                "schema registry credentials are configured against a plaintext base URL \
+                 with allow_plaintext_credentials(); they are sent in cleartext on every \
+                 request. Use https:// for any registry reachable outside a trusted \
+                 network."
             );
         }
-        let http = reqwest::Client::builder()
-            .timeout(self.timeout)
+
+        let mut http = reqwest::Client::builder().timeout(self.timeout);
+        if !channels.is_empty() {
+            // A credential-bearing client must not follow redirects. `reqwest`
+            // follows up to 10 by default and, across an origin change, strips
+            // only `Authorization`, `Cookie`, `Proxy-Authorization` and
+            // `WWW-Authenticate` — a custom secret header such as
+            // `CF-Access-Client-Secret` is replayed to whatever host a 302
+            // names, over whatever scheme it names. No build-time check can see
+            // that hop, and a schema registry has no legitimate reason to
+            // redirect, so the credential-bearing case declines to follow one.
+            // The 3xx then surfaces as an `unexpected status` transport error
+            // rather than as a silent disclosure.
+            http = http.redirect(Policy::none());
+        }
+        let http = http
             .build()
             .expect("reqwest client builds with default TLS");
         Arc::new(SchemaRegistry {
@@ -455,8 +596,23 @@ mod tests {
         assert!(dbg.contains("alice"), "user should be visible: {dbg}");
     }
 
+    /// `credential_channels` + `transport_is_encrypted` in the combination
+    /// `build()` uses them.
+    fn refuses(base_url: &str, auth: &SchemaRegistryAuth, headers: &HeaderMap) -> bool {
+        let parsed = parse_base_url(base_url);
+        !credential_channels(parsed.as_ref(), auth, headers).is_empty()
+            && !transport_is_encrypted(parsed.as_ref())
+    }
+
+    fn secret_header(name: &str, value: &str) -> HeaderMap {
+        SchemaRegistry::builder("https://sr:8081")
+            .header(name, value)
+            .headers
+    }
+
     #[test]
     fn cleartext_credential_guard_tracks_scheme_and_auth() {
+        let none = HeaderMap::new();
         let bearer = SchemaRegistryAuth::Bearer("t".into());
         let basic = SchemaRegistryAuth::Basic {
             user: "u".into(),
@@ -464,25 +620,119 @@ mod tests {
         };
 
         // Credentials + plaintext transport is the case `build()` refuses.
-        assert!(sends_credentials_in_cleartext("http://sr:8081", &bearer));
-        assert!(sends_credentials_in_cleartext("HTTP://sr:8081", &basic));
+        assert!(refuses("http://sr:8081", &bearer, &none));
+        assert!(refuses("HTTP://sr:8081", &basic, &none));
 
-        // TLS carries them safely.
-        assert!(!sends_credentials_in_cleartext("https://sr:8081", &bearer));
-        // `https` must not be matched by a naive `http` prefix test.
-        assert!(!sends_credentials_in_cleartext(
-            "https://sr:8081",
-            &SchemaRegistryAuth::Basic {
-                user: "u".into(),
-                pass: "p".into()
-            }
-        ));
+        // TLS carries them safely, in either casing.
+        assert!(!refuses("https://sr:8081", &bearer, &none));
+        assert!(!refuses("HTTPS://sr:8081", &basic, &none));
 
         // No credentials means nothing to disclose.
-        assert!(!sends_credentials_in_cleartext(
+        assert!(!refuses("http://sr:8081", &SchemaRegistryAuth::None, &none));
+    }
+
+    /// `Url::parse` normalises spellings a string scan does not recognise. Each
+    /// of these reaches the same origin as `http://sr:8081` and sends the
+    /// bearer token in cleartext, so each must be refused. A
+    /// `starts_with("http://")` test calls all three encrypted.
+    #[test]
+    fn alternate_plaintext_spellings_are_refused() {
+        let none = HeaderMap::new();
+        let bearer = SchemaRegistryAuth::Bearer("t".into());
+
+        for spelling in ["http:sr:8081", "http:/sr:8081", "http:///sr:8081"] {
+            assert!(
+                refuses(spelling, &bearer, &none),
+                "{spelling} reaches the network in cleartext and must be refused"
+            );
+        }
+
+        // A base URL that does not parse cannot be shown to be encrypted.
+        assert!(refuses("sr:8081", &bearer, &none));
+        assert!(refuses("not a url", &bearer, &none));
+    }
+
+    /// `reqwest` lifts URL userinfo into an `Authorization: Basic` header, so
+    /// it is a credential even with `SchemaRegistryAuth::None`.
+    #[test]
+    fn url_userinfo_counts_as_a_credential() {
+        let none = HeaderMap::new();
+        let no_auth = SchemaRegistryAuth::None;
+
+        assert!(refuses("http://u:p@sr:8081", &no_auth, &none));
+        assert!(refuses("http://u@sr:8081", &no_auth, &none));
+        assert!(refuses("http://:p@sr:8081", &no_auth, &none));
+        // The authority-bounded spellings a naive `@` scan misses.
+        assert!(refuses("http:u:p@sr:8081", &no_auth, &none));
+        assert!(refuses("http:///u:p@sr:8081", &no_auth, &none));
+
+        // TLS carries userinfo exactly as it carries `SchemaRegistryAuth`.
+        assert!(!refuses("https://u:p@sr:8081", &no_auth, &none));
+
+        // An `@` in the path is not userinfo, and empty userinfo is not a
+        // credential — this matches reqwest's own `extract_authority`, which
+        // sets no header in either case.
+        assert!(!refuses("http://sr:8081/a@b", &no_auth, &none));
+        assert!(!refuses("http://@sr:8081", &no_auth, &none));
+    }
+
+    #[test]
+    fn header_secrecy_decides_whether_the_guard_fires() {
+        let no_auth = SchemaRegistryAuth::None;
+
+        // `header()` is fail-closed: its value is assumed to be a secret.
+        assert!(refuses(
             "http://sr:8081",
-            &SchemaRegistryAuth::None
+            &no_auth,
+            &secret_header("CF-Access-Client-Secret", "s")
         ));
+        // Even a name that sounds harmless — the builder cannot know.
+        assert!(refuses(
+            "http://sr:8081",
+            &no_auth,
+            &secret_header("X-Tag", "s")
+        ));
+        // TLS carries it.
+        assert!(!refuses(
+            "https://sr:8081",
+            &no_auth,
+            &secret_header("CF-Access-Client-Secret", "s")
+        ));
+
+        // `non_secret_header()` asserts there is nothing to disclose.
+        let public = SchemaRegistry::builder("http://sr:8081")
+            .non_secret_header("Accept", "application/json")
+            .headers;
+        assert!(!refuses("http://sr:8081", &no_auth, &public));
+    }
+
+    #[test]
+    fn the_channel_list_names_every_configured_credential() {
+        let parsed = parse_base_url("http://sr-user:url-secret@sr:8081");
+        let channels = credential_channels(
+            parsed.as_ref(),
+            &SchemaRegistryAuth::Bearer("bearer-secret".into()),
+            &secret_header("CF-Access-Client-Secret", "header-secret"),
+        );
+
+        assert_eq!(
+            channels,
+            vec![
+                "SchemaRegistryAuth::Bearer".to_owned(),
+                "base URL userinfo".to_owned(),
+                "header `cf-access-client-secret`".to_owned(),
+            ]
+        );
+        // The panic message is built from this list, so it must never carry a
+        // secret value or the base URL.
+        let rendered = channels.join(", ");
+        for secret in ["bearer-secret", "url-secret", "header-secret", "sr-user"] {
+            assert!(
+                !rendered.contains(secret),
+                "{secret} leaked into {rendered}"
+            );
+        }
+        assert!(!rendered.contains("sr:8081"), "no base URL: {rendered}");
     }
 
     // The matrix above pins which configurations the predicate selects. These
@@ -533,5 +783,114 @@ mod tests {
         }
 
         assert_eq!(registry.negative.len(), MAX_NEGATIVE_CACHE_ENTRIES);
+    }
+
+    /// Every waiter of one shared single-flight future runs `resolve`'s error
+    /// arm, so a burst on a single bad id calls `cache_negative` N times for
+    /// the same key. At capacity those duplicates must not evict: they replace
+    /// an entry that is already there, so they cost no space, and paying for
+    /// them in evictions flushes unrelated negatives back into HTTP fetches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn duplicate_waiters_do_not_flush_unrelated_negatives() {
+        let registry = SchemaRegistry::builder("http://registry.invalid").build();
+
+        for raw_id in 0..MAX_NEGATIVE_CACHE_ENTRIES {
+            let id = SchemaId(raw_id as u32);
+            registry
+                .cache_negative(id, SchemaRegistryError::NotFound(id.0))
+                .await;
+        }
+        assert_eq!(registry.negative.len(), MAX_NEGATIVE_CACHE_ENTRIES);
+
+        // One more id fails, with a burst of waiters all reporting it.
+        let duplicate = SchemaId(MAX_NEGATIVE_CACHE_ENTRIES as u32);
+        let mut waiters = Vec::with_capacity(64);
+        for _ in 0..64 {
+            let registry = registry.clone();
+            waiters.push(tokio::spawn(async move {
+                registry
+                    .cache_negative(duplicate, SchemaRegistryError::NotFound(duplicate.0))
+                    .await;
+            }));
+        }
+        for waiter in waiters {
+            waiter.await.expect("waiter task must not panic");
+        }
+
+        assert_eq!(
+            registry.negative.len(),
+            MAX_NEGATIVE_CACHE_ENTRIES,
+            "the cap must still be full: duplicates replace, they do not shrink the cache"
+        );
+        assert!(
+            registry.negative.contains_key(&duplicate),
+            "the failing id must be negative-cached"
+        );
+        let survivors = (0..MAX_NEGATIVE_CACHE_ENTRIES)
+            .filter(|raw_id| registry.negative.contains_key(&SchemaId(*raw_id as u32)))
+            .count();
+        assert_eq!(
+            survivors,
+            MAX_NEGATIVE_CACHE_ENTRIES - 1,
+            "a burst on one id may cost exactly the single eviction that made room for it"
+        );
+    }
+
+    /// The freshness fast path above short-circuits the burst before it can
+    /// reach the replacement branch, so on its own it proves nothing about
+    /// replacement. A zero TTL disables that fast path — no entry is ever
+    /// fresh — which leaves "do not evict when replacing" as the only thing
+    /// holding the cap. Delete that check and this test goes red while the
+    /// burst test above stays green.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replacing_an_entry_at_capacity_does_not_evict() {
+        let registry = SchemaRegistry::builder("http://registry.invalid")
+            .negative_cache_ttl(Duration::ZERO)
+            .build();
+
+        for raw_id in 0..MAX_NEGATIVE_CACHE_ENTRIES {
+            let id = SchemaId(raw_id as u32);
+            registry
+                .cache_negative(id, SchemaRegistryError::NotFound(id.0))
+                .await;
+        }
+        assert_eq!(registry.negative.len(), MAX_NEGATIVE_CACHE_ENTRIES);
+
+        // Eviction takes whatever `iter().next()` yields, so the id being
+        // replaced must not be that entry — otherwise an unguarded eviction
+        // would remove exactly the id about to be re-inserted and cancel
+        // itself out, leaving the test unable to observe the defect.
+        let would_be_evicted = registry
+            .negative
+            .iter()
+            .next()
+            .map(|entry| *entry.key())
+            .expect("the cache was just filled");
+        let present = (0..MAX_NEGATIVE_CACHE_ENTRIES)
+            .map(|raw_id| SchemaId(raw_id as u32))
+            .find(|id| *id != would_be_evicted)
+            .expect("the cache holds more than one entry");
+
+        // Re-report a failure for an id the cache already holds. Nothing needs
+        // to be made room for, so nothing may be evicted.
+        for _ in 0..64 {
+            registry
+                .cache_negative(present, SchemaRegistryError::NotFound(present.0))
+                .await;
+        }
+
+        assert_eq!(
+            registry.negative.len(),
+            MAX_NEGATIVE_CACHE_ENTRIES,
+            "replacing an entry must not evict a different one"
+        );
+        assert!(
+            registry.negative.contains_key(&present),
+            "the replaced id must still be cached"
+        );
+        assert!(
+            registry.negative.contains_key(&would_be_evicted),
+            "an unrelated entry was evicted to pay for a replacement"
+        );
     }
 }

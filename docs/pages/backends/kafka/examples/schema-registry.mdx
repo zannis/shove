@@ -45,7 +45,21 @@ Auth options:
 
 ### Credentials require TLS
 
-Any auth other than `None` against an `http://` base URL makes `build()` panic — the bearer token or basic-auth password would otherwise be sent in cleartext on every schema fetch, readable by anything on the path. An unauthenticated `http://` registry keeps working unchanged.
+A credential configured against a base URL that is not `https://` makes `build()` panic — the secret would otherwise be sent in cleartext on every schema fetch, readable by anything on the path. An unauthenticated `http://` registry keeps working unchanged.
+
+Three configurations count as a credential, because all three put a reusable secret on the wire:
+
+| Configuration | Why it is a credential |
+|---|---|
+| `SchemaRegistryAuth::Bearer` / `Basic` | the token or password is sent on every request |
+| `user:pass@` in the base URL | the HTTP client lifts userinfo out of the URL and replays it as an `Authorization: Basic` header — no `SchemaRegistryAuth` needed |
+| any header set with `.header(...)` | assumed to be a secret; see [Custom headers](#custom-headers) |
+
+The panic message names which of them it found, never their values.
+
+The base URL is parsed before it is judged rather than pattern-matched as a string. `url` treats a missing or repeated `//` after a special scheme as a recoverable syntax violation, so `http:registry:8081`, `http:/registry:8081` and `http:///registry:8081` all reach the same origin as `http://registry:8081` — and are all refused. A base URL that does not parse cannot be shown to be encrypted, so it is treated as plaintext.
+
+A credential-bearing client additionally refuses to follow redirects, and surfaces a `3xx` as a transport error. Following one would replay a custom secret header to whatever host and scheme the `Location` names; the HTTP client only strips `Authorization`, `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` across an origin change, and a header such as `CF-Access-Client-Secret` is on none of those lists. An unauthenticated client follows redirects as before.
 
 For a registry genuinely unreachable from an untrusted network, such as a local development stack, opt in explicitly:
 
@@ -57,6 +71,25 @@ let registry = SchemaRegistry::builder("http://localhost:8081")
     .allow_plaintext_credentials()
     .build();
 ```
+
+### Custom headers
+
+`.header(name, value)` attaches a static header to every registry request. **Its value is treated as a secret**: the builder cannot tell which vendor-specific header name holds a credential, and this method exists mainly to carry them (Cloudflare Access, API gateways). So a `.header(...)` call makes the registry credential-bearing — TLS required, no redirects, and the value is marked sensitive so it prints as `Sensitive` rather than in clear.
+
+For a header that genuinely carries no secret, use `.non_secret_header(name, value)`. It is identical on the wire; the difference is the assertion you are making:
+
+```rust,no_run
+use shove::schema_registry::SchemaRegistry;
+
+let registry = SchemaRegistry::builder("https://schema-registry:8081")
+    // A credential: requires TLS, redacted in diagnostics.
+    .header("CF-Access-Client-Secret", "…")
+    // Not a credential: no TLS requirement of its own.
+    .non_secret_header("X-Client-Build", "2026.08.30")
+    .build();
+```
+
+Reach for `non_secret_header` rather than `allow_plaintext_credentials()` when a benign header is the only thing tripping the guard — that opt-in is not scoped to a single header, so using it to quiet an `Accept` header would also permit a real bearer token in cleartext.
 
 ## Per-consumer setup
 
