@@ -173,10 +173,19 @@ impl Gates {
             .saturating_sub(self.polled_instances.load(Ordering::SeqCst))
     }
 
-    /// Waits until `published` deliveries have been handled.
+    /// Waits until `published` deliveries have been handled, then disarms the
+    /// gate again.
+    ///
+    /// The disarm is what keeps warm-up accounting out of the timed round.
+    /// `seen` is monotonic across both phases and one [`Gates`] serves both, so
+    /// a `drain_target` left behind at the warm-up total stays satisfied for
+    /// the rest of the iteration: every timed delivery would go on calling
+    /// `notify_one` on a gate nobody is waiting on, inside the region
+    /// [`bench_dispatch`] exists to measure.
     async fn drain_to(&self, published: u64) {
         self.drain_target.store(published, Ordering::SeqCst);
         self.wait_for(&self.drained, published, "warm-up").await;
+        self.drain_target.store(u64::MAX, Ordering::SeqCst);
     }
 
     /// Arms the timed round at `count` deliveries beyond what has been handled
@@ -237,7 +246,14 @@ impl MessageHandler<OverheadTopic> for BenchHandler {
     type Context = ();
 
     async fn handle(&self, _msg: BenchMsg, _meta: MessageMetadata, _ctx: &()) -> Outcome {
-        if !self.polled.swap(true, Ordering::SeqCst) {
+        // The relaxed load short-circuits every delivery after this instance's
+        // first, so readiness accounting costs one plain load rather than a
+        // read-modify-write on the timed dispatch path. The `swap` still
+        // decides the increment, so two deliveries racing here on the same
+        // instance (prefetch is greater than one) still increment the tally
+        // exactly once. The flag only ever goes false -> true, so a stale load
+        // costs at most one extra swap and can neither double-count nor miss.
+        if !self.polled.load(Ordering::Relaxed) && !self.polled.swap(true, Ordering::SeqCst) {
             // Wrapping is unreachable: one increment per instance, and the
             // group is bounded by `u16::MAX` consumers.
             self.gates.polled_instances.fetch_add(1, Ordering::SeqCst);
@@ -481,9 +497,19 @@ struct ProbeSample {
 /// which carries the runtime, the broker and the declared topology but no
 /// consumer group.
 ///
-/// The measured consumers are idle — started, with no traffic — which is what
-/// `IDLE CPU` reports and what makes the RSS figure a resting cost rather than
-/// a working-set peak.
+/// The measured consumers are idle when sampled, but not untouched: the probe
+/// waits until every consumer task has handled a warm-up delivery and that
+/// traffic has fully drained before it opens the sample window. That is what
+/// makes `IDLE CPU` a resting figure rather than a race against task start-up,
+/// and it is wanted for `RSS KB` too — a task that has never been polled has
+/// not yet allocated the machinery it receives on, so sampling one would
+/// understate what a live consumer costs.
+///
+/// Its price is disclosed rather than removed: each row's RSS also carries the
+/// allocator slack its own warm-up traffic left behind. That traffic is sized
+/// by the number of instances still to be woken, so it scales with the row and
+/// lands in `KB/CONSUMER` — it is part of what a consumer costs here, not a
+/// fixed cost smeared across the rows.
 fn resource_probe() {
     // Listing benchmark ids must not fork the process 5 times.
     if std::env::args().any(|arg| arg == "--list") {
@@ -592,19 +618,39 @@ fn probe_child(consumers: u16) -> ProbeSample {
     }
 }
 
-/// The isolated probe process: build a group of `consumers`, hold it idle for
-/// [`IDLE_SAMPLE`], print `<rss-bytes> <idle-cpu-percent>` and exit.
+/// The isolated probe process: build a group of `consumers`, wait until every
+/// one of them has run, hold the group idle for [`IDLE_SAMPLE`], print
+/// `<rss-bytes> <idle-cpu-percent>` and exit.
 ///
-/// `consumers == 0` is the baseline: broker and topology, no registry and no
-/// group. It is what every row is measured against.
+/// `consumers == 0` is the baseline: broker, topology and a publisher, but no
+/// registry and no group. It is what every row is measured against, and it
+/// builds the publisher for exactly that reason — so `OVER BASE` reports the
+/// group rather than the group plus a publisher.
 fn rss_probe_child(consumers: u16) {
     let rt = runtime();
     let (rss_bytes, idle_cpu_pct) = rt.block_on(async move {
-        let (client, _broker) = fresh_broker().await;
+        let (client, broker) = fresh_broker().await;
+
+        // Built on every row, the baseline included, so its fixed cost cancels
+        // in the subtraction instead of being charged to the consumers. The
+        // baseline row holds one and never publishes through it.
+        let publisher = broker.publisher().await.expect("publisher");
 
         let live = if consumers > 0 {
-            let mut reg = registry(&client, consumers, &Gates::inert()).await;
+            let gates = Gates::for_group(u64::from(consumers));
+            let mut reg = registry(&client, consumers, &gates).await;
             reg.start_all();
+
+            // Readiness barrier, and the reason this probe uses real gates
+            // rather than `Gates::inert()`. `start_all` only `tokio::spawn`s:
+            // without waiting here, each consumer task's first poll — and
+            // whatever it allocates on the way into its receive loop — would
+            // land inside the sample window below, billed as idle CPU and
+            // missing from the RSS figure. `warm_up` returns only once every
+            // instance has handled a delivery and that traffic has drained, so
+            // the sample sees a group that is fully up and doing nothing.
+            warm_up(&publisher, &payload(WARMUP_PAYLOAD_BYTES), &gates).await;
+
             Some(reg)
         } else {
             None
