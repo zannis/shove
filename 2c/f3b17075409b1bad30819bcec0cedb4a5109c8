@@ -1,0 +1,27 @@
+.github/scripts/check-action-pins.sh
+  s_0543e24843eca6::t_fc6e997b520101 1-211
+.github/scripts/check-action-pins.test.sh
+  s_0543e24843eca6::t_bb88ae7a63c5b2 1-367
+.github/workflows/action-pins.yml
+  s_0543e24843eca6::t_03af56a92143e1 1-47
+.github/workflows/publish.yml
+  s_0543e24843eca6::t_aaf7e45f3abc82 46-56,60-75,146-169,184,187
+CONTRIBUTING.md
+  s_0543e24843eca6::t_200d2379629379 137-180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "2cf3b17075409b1bad30819bcec0cedb4a5109c8",
+  "prompts": {},
+  "sessions": {
+    "s_0543e24843eca6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83b42429-bf3f-4e9a-a742-3416fde2ea47",
+        "model": "claude-fable-5"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
