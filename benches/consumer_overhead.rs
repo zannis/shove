@@ -46,7 +46,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use mach2::traps::mach_task_self;
 
-use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group};
+use criterion::{
+    BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+};
 use serde::{Deserialize, Serialize};
 use shove::inmemory::{InMemoryBroker, InMemoryConsumerGroupConfig, InMemoryConsumerGroupRegistry};
 use shove::{
@@ -786,21 +788,30 @@ fn bench_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_startup, bench_shutdown, bench_dispatch);
+criterion_group!(
+    name = benches;
+    config = rss_child_gate();
+    targets = bench_startup, bench_shutdown, bench_dispatch
+);
+criterion_main!(benches);
 
-/// `criterion_main!` expanded by hand, with one branch in front of it: when
-/// [`RSS_CHILD_ENV`] is set this executable is an isolated probe process, not
-/// a benchmark run, and must sample and exit before criterion parses any args.
-fn main() {
+/// Criterion's default configuration — except in an isolated RSS probe child,
+/// where this samples and exits instead of returning a configuration at all.
+///
+/// [`probe_child`] re-runs this executable with [`RSS_CHILD_ENV`] set, and that
+/// child must never parse the parent's benchmark arguments. This is the earliest
+/// point in the program at which we can intercept it: `criterion_main!` calls
+/// the group function first, and `criterion_group!`'s named form evaluates this
+/// expression before `.configure_from_args()`.
+fn rss_child_gate() -> Criterion {
     if let Some(spec) = std::env::var_os(RSS_CHILD_ENV) {
         let consumers = spec
             .to_str()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or_else(|| panic!("{RSS_CHILD_ENV} must be a consumer count, got {spec:?}"));
         rss_probe_child(consumers);
-        return;
+        std::process::exit(0);
     }
 
-    benches();
-    Criterion::default().configure_from_args().final_summary();
+    Criterion::default()
 }
