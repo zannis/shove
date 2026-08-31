@@ -563,25 +563,48 @@ fn median(values: &mut [f64]) -> f64 {
     values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
-/// A difference between two shapes, printed as a number only when it clears
-/// the probe's resolution floor. Below the floor the honest reading is "closer
-/// together than this probe can see", not a signed quantity.
+/// The resolution floor for a difference between two shapes: the wider of the
+/// two shapes' own spreads.
+///
+/// Local to the pair on purpose. A single floor taken across the whole table —
+/// the widest spread anywhere on it — lets one noisy shape set the bar for
+/// every other comparison, including comparisons it takes no part in. One
+/// anomalous `Group(256)` process would then raise the threshold that
+/// `GROUP FIXED` (bare against the zero-consumer group) has to clear, and
+/// suppress a real difference between two shapes that were both perfectly
+/// stable. A difference can only be obscured by the noise on its own two
+/// sides, so that is the only noise it is judged against.
+fn pair_floor(a: &ProbeStats, b: &ProbeStats) -> f64 {
+    a.rss_spread_kb.max(b.rss_spread_kb)
+}
+
+/// A difference between two shapes, printed with a `~` when it does not clear
+/// that pair's floor.
+///
+/// The marked form still prints the observed difference, because that is the
+/// measurement; the `~` says this probe cannot tell it apart from zero. It is
+/// deliberately not `<floor`. The floor is the max-min spread of
+/// [`PROBE_REPEATS`] samples, not a confidence interval, so it supports no
+/// claim about where the true difference lies — and at `delta == floor`, which
+/// is unremarkable when both are whole 4 KiB pages, `<floor` prints a strict
+/// inequality that the probe's own numbers contradict.
 fn resolved_delta(delta_kb: f64, floor_kb: f64) -> String {
     if delta_kb.abs() > floor_kb {
         format!("{delta_kb:.1}")
     } else {
-        format!("<{floor_kb:.1}")
+        format!("~{delta_kb:.1}")
     }
 }
 
-/// The same difference spread over the consumers a row added. An unresolved
-/// row-to-row difference still bounds the per-consumer cost — by the floor
-/// divided over those consumers, which is the number worth printing.
+/// The same difference spread over the consumers a row added, marked the same
+/// way: an unresolved row-to-row difference gives an unresolved per-consumer
+/// figure, and dividing it by the consumers added does not make it resolved.
 fn resolved_per_consumer(delta_kb: f64, added: f64, floor_kb: f64) -> String {
+    let per_consumer_kb = delta_kb / added;
     if delta_kb.abs() > floor_kb {
-        format!("{:.1}", delta_kb / added)
+        format!("{per_consumer_kb:.1}")
     } else {
-        format!("<{:.1}", floor_kb / added)
+        format!("~{per_consumer_kb:.1}")
     }
 }
 
@@ -635,12 +658,19 @@ fn resolved_per_consumer(delta_kb: f64, added: f64, floor_kb: f64) -> String {
 ///
 /// Every shape is therefore sampled in [`PROBE_REPEATS`] processes and the
 /// table reports each row's **median** and its own **spread** (`max - min`
-/// over that shape's processes). The largest spread on the table is its
-/// resolution floor: a difference that does not clear the floor is printed as
-/// `<floor` rather than as a number, in `OVER BASE`, in `KB/CONSUMER` and in
-/// `GROUP FIXED` alike. So a reader can tell a cost from noise without
-/// re-running anything, and a regression has to exceed the observed jitter
-/// before this probe will claim one.
+/// over that shape's processes).
+///
+/// Each difference is then judged against **its own** floor — [`pair_floor`],
+/// the wider of the two shapes it is taken between — rather than against one
+/// floor shared by the whole table. Sharing one would let a single noisy shape
+/// raise the bar for every unrelated comparison. A difference that does not
+/// clear its floor is printed with a leading `~`, in `OVER BASE`, in
+/// `KB/CONSUMER` and in `GROUP FIXED` alike: the value observed, flagged as
+/// indistinguishable from zero at this probe's resolution. It is not reported
+/// as a bound on the true difference — [`PROBE_REPEATS`] samples support no
+/// such claim. So a reader can tell a cost from noise without re-running
+/// anything, and a regression has to exceed the jitter on the two shapes it
+/// sits between before this probe will claim one.
 ///
 /// The measured consumers are idle — started, with no traffic — which is what
 /// `IDLE CPU` reports and what makes the RSS figure a resting cost rather than
@@ -658,14 +688,6 @@ fn resource_probe() {
         .map(|n| probe_shape(Probe::Group(*n)))
         .collect();
 
-    // The resolution floor: the widest any one shape moved across its own
-    // processes. Nothing narrower than this is a difference between shapes.
-    let floor_kb = std::iter::once(&bare)
-        .chain(std::iter::once(&empty_group))
-        .chain(rows.iter())
-        .map(|s| s.rss_spread_kb)
-        .fold(0.0_f64, f64::max);
-
     eprintln!();
     eprintln!("consumer resource probe (not a criterion measurement)");
     eprintln!(
@@ -675,12 +697,21 @@ fn resource_probe() {
     eprintln!("group cost cancelled — including row 1, which is differenced against the");
     eprintln!("zero-consumer group below it.");
     eprintln!(
-        "SPREAD is a row's own max-min: the identical shape re-measured. The widest of them is"
+        "SPREAD is a row's own max-min: the identical shape re-measured. Every difference is"
     );
     eprintln!(
-        "this probe's resolution floor ({floor_kb:.1} KB); a difference that does not clear it is"
+        "judged against the wider of the two SPREADs it is taken between — its own floor, so"
     );
-    eprintln!("jitter, and prints as `<floor` instead of as a number.");
+    eprintln!(
+        "a noisy shape cannot raise the bar for a comparison it is not part of. A difference"
+    );
+    eprintln!(
+        "that does not clear its floor prints with a leading `~`: the value observed, flagged"
+    );
+    eprintln!(
+        "as indistinguishable from zero here. `~` is not an upper bound — {PROBE_REPEATS} samples \
+         give none."
+    );
     eprintln!(
         "bare process (runtime + broker + topology, no registry, no group): {:.1} KB RSS \
          (spread {:.1} KB)",
@@ -700,7 +731,10 @@ fn resource_probe() {
         empty_group.probe.consumers(),
         empty_group.rss_kb,
         empty_group.rss_spread_kb,
-        resolved_delta(empty_group.rss_kb - bare.rss_kb, floor_kb),
+        resolved_delta(
+            empty_group.rss_kb - bare.rss_kb,
+            pair_floor(&empty_group, &bare),
+        ),
         "-",
         empty_group.idle_cpu_pct,
     );
@@ -713,7 +747,11 @@ fn resource_probe() {
                 .saturating_sub(previous.probe.consumers()),
         );
         let marginal = if added > 0.0 {
-            resolved_per_consumer(row.rss_kb - previous.rss_kb, added, floor_kb)
+            resolved_per_consumer(
+                row.rss_kb - previous.rss_kb,
+                added,
+                pair_floor(row, previous),
+            )
         } else {
             "-".to_owned()
         };
@@ -722,7 +760,7 @@ fn resource_probe() {
             row.probe.consumers(),
             row.rss_kb,
             row.rss_spread_kb,
-            resolved_delta(row.rss_kb - bare.rss_kb, floor_kb),
+            resolved_delta(row.rss_kb - bare.rss_kb, pair_floor(row, &bare)),
             marginal,
             row.idle_cpu_pct,
         );
@@ -735,7 +773,10 @@ fn resource_probe() {
         "GROUP FIXED: {} KB — registry + group + tokens + spawner, measured as the \
          zero-consumer group's growth over the bare process, each the median of \
          {PROBE_REPEATS} processes",
-        resolved_delta(empty_group.rss_kb - bare.rss_kb, floor_kb),
+        resolved_delta(
+            empty_group.rss_kb - bare.rss_kb,
+            pair_floor(&empty_group, &bare),
+        ),
     );
     eprintln!();
 }
