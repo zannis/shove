@@ -116,17 +116,16 @@ fn has_tls_options(config: &NatsConfig) -> bool {
 /// callers may log. NATS URLs commonly carry `user:password` or token auth in
 /// this position, so the raw value must never be included in diagnostics.
 ///
-/// Where the client can parse the URL, its parse decides: a textual scan and
-/// `url::Url` disagree on real inputs (see [`parse_server_addr`]), and the side
-/// that decides what gets logged must be the side that decides what is a
-/// credential. The scan below is reached only for a URL the client itself
-/// rejects, where it errs toward hiding.
+/// Where the client can parse the URL into a real authority, its parse decides:
+/// a textual scan and `url::Url` disagree on real inputs (see
+/// [`parse_server_addr`]), and the side that decides what gets logged must be
+/// the side that decides what is a credential. For anything else there is no
+/// reliable way to tell an endpoint from a secret, so nothing is disclosed.
 fn redact_url_credentials(url: &str) -> String {
     // A parsed address is only a trustworthy oracle when it actually resolved
     // an authority. `nats:///user:pass@host` parses "successfully" with no host
     // and no userinfo, because the whole authority landed in the path — so the
     // parse reports nothing to redact while the password sits in the string.
-    // Fall through to the scan whenever the host is empty.
     if let Ok(addr) = parse_server_addr(url)
         && !addr.host().is_empty()
     {
@@ -137,19 +136,16 @@ fn redact_url_credentials(url: &str) -> String {
         };
     }
 
-    let Some(at_pos) = url_userinfo_delimiter(url) else {
-        // An unparseable URL with an `@` somewhere it was not expected: the
-        // scan cannot say which side of it is a secret, so disclose neither.
-        return if url.contains('@') {
-            "***".to_string()
-        } else {
-            url.to_string()
-        };
-    };
-    let host_and_rest = &url[at_pos + 1..];
-    match url.find("://") {
-        Some(scheme_end) => format!("{}://***@{host_and_rest}", &url[..scheme_end]),
-        None => format!("***@{host_and_rest}"),
+    // The client could not make an address out of this. Guessing where the
+    // authority ends is what a scan does badly: in
+    // `nats://alice@corp.example.com:aB3/password@broker`, terminating the
+    // authority at the first `/` picks the `@` after `alice` and echoes the
+    // password as if it were the host. An `@` anywhere means some part of this
+    // string may be a secret and none of it can be shown.
+    if url.contains('@') {
+        "***".to_string()
+    } else {
+        url.to_string()
     }
 }
 
@@ -178,9 +174,11 @@ fn redacted_endpoint(addr: &ServerAddr) -> String {
 /// Return the absolute position of the final `@` in the URL authority. An `@`
 /// in the path, query, or fragment is not userinfo.
 ///
-/// Best-effort only — this is the fallback for URLs the client cannot parse.
-/// A schemeless address has no `://` to anchor on, but its authority still
-/// starts at byte 0, since `ServerAddr::from_str` prepends `nats://`.
+/// Only ever called on a URL that `url::Url` has already serialized, where the
+/// form is canonical — exactly one `//` before the authority, and `@ / ? #`
+/// percent-encoded inside userinfo — so the authority window is exact. Do not
+/// point it at raw user input: on input the same scan is a guess, and a wrong
+/// guess prints a password.
 fn url_userinfo_delimiter(url: &str) -> Option<usize> {
     let authority_start = url.find("://").map_or(0, |scheme_end| scheme_end + 3);
     let rest = &url[authority_start..];
@@ -245,6 +243,25 @@ fn scheme_security(addr: &ServerAddr) -> SchemeSecurity {
 /// records neither a username nor a password for it.
 fn has_url_userinfo(addr: &ServerAddr) -> bool {
     addr.username().is_some() || addr.password().is_some()
+}
+
+/// Whether a TCP address carries data in a component the client never reads.
+///
+/// A `nats://`/`tls://` endpoint is a host and a port: the connector resolves
+/// those and opens a socket, and nothing consults the path, query or fragment.
+/// Anything sitting there is therefore either a typo or a secret someone put in
+/// the URL — and both end up in the connector's `server = ?addr` log, which
+/// renders the whole `url::Url`. A single missing character is enough:
+/// `nats//user:pass@broker` parses with the host `nats` and the entire
+/// credentialled authority in the path, so the no-host check cannot see it.
+///
+/// Websockets are the exception and are not passed to this: `as_url_str()` goes
+/// straight to the websocket handshake, so there the path and query are the
+/// address.
+fn has_ignored_url_components(addr: &ServerAddr) -> bool {
+    let url = addr.clone().into_inner();
+    let carries_path = !matches!(url.path(), "" | "/");
+    carries_path || url.query().is_some() || url.fragment().is_some()
 }
 
 /// Reject transport/auth combinations that would silently discard TLS options
@@ -951,6 +968,88 @@ mod tests {
                 "password leaked into Debug: {debugged}"
             );
         }
+    }
+
+    /// A TCP NATS endpoint is host and port; the connector never reads the
+    /// path, query or fragment of a `nats://`/`tls://` URL. So anything there
+    /// is either a typo or a secret someone put in the URL — and either way it
+    /// is rendered into the connector's `server = ?addr` log. A missing colon
+    /// is enough to put a whole credentialled authority in the path while the
+    /// host still resolves, which the no-host check cannot see.
+    #[test]
+    fn a_tcp_url_carrying_a_path_query_or_fragment_is_rejected() {
+        for url in [
+            "nats//alice:sentinel-password@broker.example.com:4222",
+            "nats://al/ice:sentinel-password@broker.example.com",
+            "nats://broker.example.com:4222/?token=sentinel-password",
+            "tls://broker.example.com:4222#sentinel-password",
+        ] {
+            let cfg = NatsConfig::new(url);
+            let err = validate_transport_security(&cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{url} puts data where the client ignores it"));
+            assert!(
+                !err.to_string().contains("sentinel-password"),
+                "credential leaked into the error for {url}: {err}"
+            );
+            assert!(
+                !format!("{cfg:?}").contains("sentinel-password"),
+                "credential leaked into Debug for {url}"
+            );
+        }
+    }
+
+    /// A bare host, with or without the trailing slash a URL parser adds, is
+    /// not "carrying a path".
+    #[test]
+    fn a_bare_tcp_endpoint_is_not_treated_as_carrying_a_path() {
+        for url in [
+            "nats://broker.example.com:4222",
+            "nats://broker.example.com:4222/",
+            "tls://broker.example.com:4222/",
+            "broker.example.com:4222",
+        ] {
+            assert!(
+                validate_transport_security(&NatsConfig::new(url)).is_ok(),
+                "{url} is a plain endpoint and must validate"
+            );
+        }
+    }
+
+    /// Websocket endpoints are the exception: the client sends the path and
+    /// query to the server, so they are part of the address and must survive.
+    #[test]
+    fn websocket_urls_keep_their_route() {
+        for url in [
+            "wss://broker.example.com/nats-ws",
+            "wss://broker.example.com/nats-ws?tenant=acme",
+        ] {
+            assert!(
+                validate_transport_security(&NatsConfig::new(url)).is_ok(),
+                "{url} is a real websocket route and must validate"
+            );
+        }
+    }
+
+    /// When the client cannot parse a URL, the textual scan cannot tell which
+    /// side of an `@` is the secret — so it must hide the endpoint rather than
+    /// guess. An `@` inside the userinfo of an otherwise-unparseable URL made
+    /// it guess wrong and echo the password.
+    #[test]
+    fn an_unparseable_url_is_hidden_rather_than_guessed_at() {
+        // `aB3` is not a port, so this does not parse. The `@` in the username
+        // makes a first-slash-terminated authority scan pick the wrong `@`.
+        let cfg =
+            NatsConfig::new("nats://alice@corp.example.com:aB3/sentinel-password@broker:4222");
+        assert!(
+            validate_transport_security(&cfg).is_err(),
+            "an unparseable URL must be rejected"
+        );
+        let debugged = format!("{cfg:?}");
+        assert!(
+            !debugged.contains("sentinel-password"),
+            "password leaked into Debug: {debugged}"
+        );
     }
 
     /// Half of a `nats://${USER}:${PASS}@host` template with only the *user*
