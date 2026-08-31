@@ -93,8 +93,8 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Environment variable that turns this executable into an isolated RSS-probe
-/// child for the given consumer count. Set only by [`probe_child`]; a normal
-/// `cargo bench` invocation never has it.
+/// child for the [`Probe`] shape it names. Set only by [`probe_child`]; a
+/// normal `cargo bench` invocation never has it.
 const RSS_CHILD_ENV: &str = "SHOVE_BENCH_RSS_CONSUMERS";
 
 // ── Topic & message ─────────────────────────────────────────────────────────
@@ -129,7 +129,10 @@ define_topic!(
 /// construction, because the warm-up publishes an amount it discovers as it
 /// goes. Every wait re-checks the counter it is waiting on, so a `notify_one`
 /// permit left behind by a milestone that was already met costs one extra loop
-/// turn rather than releasing a wait early.
+/// turn rather than releasing a wait early. Each gate is disarmed again the
+/// moment its wait returns, so it is armed only while someone is parked on it —
+/// otherwise a met milestone would keep firing `notify_one` on every later
+/// delivery, which is exactly the traffic the timed round must not carry.
 struct Gates {
     /// Deliveries handled by every instance in the group, together.
     seen: AtomicU64,
@@ -173,10 +176,19 @@ impl Gates {
             .saturating_sub(self.polled_instances.load(Ordering::SeqCst))
     }
 
-    /// Waits until `published` deliveries have been handled.
+    /// Waits until `published` deliveries have been handled, then disarms.
+    ///
+    /// Disarming is part of the measurement, not tidiness. `seen` is cumulative
+    /// and never reset, so a target left behind stays satisfied for every later
+    /// delivery: each message of the timed round would then fire `notify_one`
+    /// on this shared `Notify`, whose no-waiter path is still a
+    /// compare-exchange on one cache line. With up to 256 consumer tasks that
+    /// is a contended atomic per message, added to the very region that exists
+    /// to isolate shove's own dispatch cost.
     async fn drain_to(&self, published: u64) {
         self.drain_target.store(published, Ordering::SeqCst);
         self.wait_for(&self.drained, published, "warm-up").await;
+        self.drain_target.store(u64::MAX, Ordering::SeqCst);
     }
 
     /// Arms the timed round at `count` deliveries beyond what has been handled
@@ -189,10 +201,13 @@ impl Gates {
         self.round_target.store(target, Ordering::SeqCst);
     }
 
-    /// Waits until the armed round has been fully handled.
+    /// Waits until the armed round has been fully handled, then disarms — same
+    /// rule as [`Gates::drain_to`]: a gate is armed only while a wait is parked
+    /// on it, so no delivery outside a wait can reach a `notify_one`.
     async fn completed(&self) {
         let target = self.round_target.load(Ordering::SeqCst);
         self.wait_for(&self.done, target, "dispatch").await;
+        self.round_target.store(u64::MAX, Ordering::SeqCst);
     }
 
     /// Waits for `seen` to reach `target`, re-checking the counter on every
@@ -438,10 +453,54 @@ fn current_rss_bytes() -> u64 {
     }
 }
 
+/// What one isolated probe process is asked to build.
+#[derive(Clone, Copy)]
+enum Probe {
+    /// Runtime, broker and declared topology only — no registry, no group.
+    /// Every other shape is measured against this one.
+    Bare,
+    /// One registry and one group holding `n` consumers.
+    ///
+    /// `Group(0)` is a real shape, not a degenerate one: the group is
+    /// registered and started, and spawns no consumer task because
+    /// `min_consumers` is zero. It prices the registry, the group record, the
+    /// tokens and the spawner *directly*, instead of extrapolating them back
+    /// out of a row that also contains consumers.
+    Group(u16),
+}
+
+impl Probe {
+    /// How the parent hands this shape to the child, via [`RSS_CHILD_ENV`].
+    fn spec(self) -> String {
+        match self {
+            Probe::Bare => "bare".to_owned(),
+            Probe::Group(n) => format!("group:{n}"),
+        }
+    }
+
+    fn parse(spec: &str) -> Option<Self> {
+        match spec {
+            "bare" => Some(Probe::Bare),
+            _ => spec
+                .strip_prefix("group:")
+                .and_then(|n| n.parse::<u16>().ok())
+                .map(Probe::Group),
+        }
+    }
+
+    /// Consumer tasks this shape spawns. The bare process has no group at all,
+    /// which is a different thing from a group of none — the table shows both.
+    fn consumers(self) -> u16 {
+        match self {
+            Probe::Bare => 0,
+            Probe::Group(n) => n,
+        }
+    }
+}
+
 /// What one isolated probe process reported.
 struct ProbeSample {
-    /// Consumers live in that process. `0` is the baseline process.
-    consumers: u16,
+    probe: Probe,
     rss_kb: f64,
     idle_cpu_pct: f64,
 }
@@ -468,18 +527,22 @@ struct ProbeSample {
 /// - **`KB/CONSUMER` is a difference between two processes** whose fixed costs
 ///   are identical — same binary, same runtime, same one registry and one
 ///   group — so the registry/group overhead cancels instead of being divided
-///   into the consumer count. The row-1 marginal is against the baseline
-///   process, so it alone still carries the one-time group cost; every later
-///   row's marginal does not.
+///   into the consumer count.
 /// - **No row inherits another row's allocator state.** Each process starts
 ///   with a fresh arena, so nothing is served out of slack a previous
 ///   measurement mapped.
 ///
-/// `GROUP FIXED` below is that separation stated directly: row 1's growth over
-/// the baseline, minus one consumer priced at the largest row's marginal rate.
-/// `RSS KB` is total process RSS; `OVER BASE` subtracts the baseline process,
-/// which carries the runtime, the broker and the declared topology but no
-/// consumer group.
+/// That cancellation covers **every** row including the first, because the
+/// sweep starts from a [`Probe::Group(0)`] process: one registry and one group
+/// that spawns no consumer. So the 1-consumer marginal is `row1 - group0`, one
+/// consumer against an otherwise identical process, not `row1 - bare` with the
+/// whole group cost folded into it.
+///
+/// `GROUP FIXED` is therefore measured rather than estimated — the
+/// zero-consumer group's growth over the bare process, with no assumption that
+/// per-consumer cost stays linear down to `n = 1`. `RSS KB` is total process
+/// RSS; `OVER BASE` subtracts the bare process, which carries the runtime, the
+/// broker and the declared topology but no registry and no group.
 ///
 /// The measured consumers are idle — started, with no traffic — which is what
 /// `IDLE CPU` reports and what makes the RSS figure a resting cost rather than
@@ -490,16 +553,21 @@ fn resource_probe() {
         return;
     }
 
-    let baseline = probe_child(0);
-    let rows: Vec<ProbeSample> = CONSUMER_COUNTS.iter().map(|n| probe_child(*n)).collect();
+    let bare = probe_child(Probe::Bare);
+    let empty_group = probe_child(Probe::Group(0));
+    let rows: Vec<ProbeSample> = CONSUMER_COUNTS
+        .iter()
+        .map(|n| probe_child(Probe::Group(*n)))
+        .collect();
 
     eprintln!();
     eprintln!("consumer resource probe (not a criterion measurement)");
     eprintln!("each row is a separate process holding exactly one registry and one group,");
-    eprintln!("so KB/CONSUMER is a process-to-process difference with the group cost cancelled.");
+    eprintln!("so KB/CONSUMER is a process-to-process difference with the group cost cancelled —");
+    eprintln!("including row 1, which is differenced against the zero-consumer group below it.");
     eprintln!(
-        "baseline process (runtime + broker + topology, no group): {:.1} KB RSS",
-        baseline.rss_kb
+        "bare process (runtime + broker + topology, no registry, no group): {:.1} KB RSS",
+        bare.rss_kb
     );
     eprintln!(
         "{:>10} {:>10} {:>11} {:>14} {:>10}",
@@ -507,9 +575,25 @@ fn resource_probe() {
     );
     eprintln!("{}", "-".repeat(60));
 
-    let mut previous = &baseline;
+    // The zero-consumer group leads the sweep and is what every later row is
+    // differenced from. It spawns no consumer, so it has no KB/CONSUMER of its
+    // own — the dash is the point, not a missing number.
+    eprintln!(
+        "{:>10} {:>10.1} {:>11.1} {:>14} {:>9.1}%",
+        empty_group.probe.consumers(),
+        empty_group.rss_kb,
+        empty_group.rss_kb - bare.rss_kb,
+        "-",
+        empty_group.idle_cpu_pct,
+    );
+
+    let mut previous = &empty_group;
     for row in &rows {
-        let added = f64::from(row.consumers.saturating_sub(previous.consumers));
+        let added = f64::from(
+            row.probe
+                .consumers()
+                .saturating_sub(previous.probe.consumers()),
+        );
         let marginal = if added > 0.0 {
             (row.rss_kb - previous.rss_kb) / added
         } else {
@@ -517,32 +601,22 @@ fn resource_probe() {
         };
         eprintln!(
             "{:>10} {:>10.1} {:>11.1} {:>14.1} {:>9.1}%",
-            row.consumers,
+            row.probe.consumers(),
             row.rss_kb,
-            row.rss_kb - baseline.rss_kb,
+            row.rss_kb - bare.rss_kb,
             marginal,
             row.idle_cpu_pct,
         );
         previous = row;
     }
 
-    // The group's own fixed cost, separated rather than smeared: what row 1
-    // cost over the baseline, minus a single consumer priced at the largest
-    // row's marginal rate (the rate with the least fixed cost in it).
-    let second_last = rows.len().checked_sub(2).and_then(|i| rows.get(i));
-    if let (Some(first), Some(last), Some(second_last)) = (rows.first(), rows.last(), second_last) {
-        let span = f64::from(last.consumers.saturating_sub(second_last.consumers));
-        if span > 0.0 {
-            let per_consumer = (last.rss_kb - second_last.rss_kb) / span;
-            let fixed =
-                (first.rss_kb - baseline.rss_kb) - per_consumer * f64::from(first.consumers);
-            eprintln!(
-                "GROUP FIXED: {fixed:.1} KB — registry + group + tokens + spawner, \
-                 priced out of row 1 at the {}-consumer marginal rate ({per_consumer:.1} KB)",
-                last.consumers,
-            );
-        }
-    }
+    // The group's own fixed cost, measured rather than extrapolated: what a
+    // registry and a started group cost with nothing spawned in them.
+    eprintln!(
+        "GROUP FIXED: {:.1} KB — registry + group + tokens + spawner, measured as the \
+         zero-consumer group's growth over the bare process",
+        empty_group.rss_kb - bare.rss_kb,
+    );
     eprintln!();
 }
 
@@ -553,19 +627,20 @@ fn resource_probe() {
 /// per consumer count into the very table these children are spawned to fill.
 /// Capturing does not discard it: every failure path below reports the child's
 /// stderr, so a probe that dies still says why.
-fn probe_child(consumers: u16) -> ProbeSample {
+fn probe_child(probe: Probe) -> ProbeSample {
+    let spec = probe.spec();
     let exe = std::env::current_exe().expect("locate this bench executable for the RSS probe");
     let output = Command::new(exe)
-        .env(RSS_CHILD_ENV, consumers.to_string())
+        .env(RSS_CHILD_ENV, &spec)
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .unwrap_or_else(|e| panic!("spawn RSS probe child for {consumers} consumers: {e}"));
+        .unwrap_or_else(|e| panic!("spawn RSS probe child `{spec}`: {e}"));
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         panic!(
-            "RSS probe child for {consumers} consumers exited with {}; stderr: {}",
+            "RSS probe child `{spec}` exited with {}; stderr: {}",
             output.status,
             stderr.trim(),
         );
@@ -579,35 +654,35 @@ fn probe_child(consumers: u16) -> ProbeSample {
         .zip(fields.next().and_then(|cpu| cpu.parse::<f64>().ok()));
     let Some((rss_bytes, idle_cpu_pct)) = parsed else {
         panic!(
-            "RSS probe child for {consumers} consumers printed {line:?}, expected `<rss> <cpu>`; \
-             stderr: {}",
+            "RSS probe child `{spec}` printed {line:?}, expected `<rss> <cpu>`; stderr: {}",
             stderr.trim(),
         );
     };
 
     ProbeSample {
-        consumers,
+        probe,
         rss_kb: rss_bytes as f64 / 1024.0,
         idle_cpu_pct,
     }
 }
 
-/// The isolated probe process: build a group of `consumers`, hold it idle for
-/// [`IDLE_SAMPLE`], print `<rss-bytes> <idle-cpu-percent>` and exit.
-///
-/// `consumers == 0` is the baseline: broker and topology, no registry and no
-/// group. It is what every row is measured against.
-fn rss_probe_child(consumers: u16) {
+/// The isolated probe process: build the requested [`Probe`] shape, hold it
+/// idle for [`IDLE_SAMPLE`], print `<rss-bytes> <idle-cpu-percent>` and exit.
+fn rss_probe_child(probe: Probe) {
     let rt = runtime();
     let (rss_bytes, idle_cpu_pct) = rt.block_on(async move {
         let (client, _broker) = fresh_broker().await;
 
-        let live = if consumers > 0 {
-            let mut reg = registry(&client, consumers, &Gates::inert()).await;
-            reg.start_all();
-            Some(reg)
-        } else {
-            None
+        let live = match probe {
+            // Broker and topology only — no registry, no group.
+            Probe::Bare => None,
+            // `Group(0)` registers and starts a group whose `min_consumers` is
+            // zero, so `start_all()` spawns no consumer task.
+            Probe::Group(consumers) => {
+                let mut reg = registry(&client, consumers, &Gates::inert()).await;
+                reg.start_all();
+                Some(reg)
+            }
         };
 
         let cpu_before = current_cpu_secs();
@@ -815,11 +890,10 @@ criterion_main!(benches);
 /// expression before `.configure_from_args()`.
 fn rss_child_gate() -> Criterion {
     if let Some(spec) = std::env::var_os(RSS_CHILD_ENV) {
-        let consumers = spec
-            .to_str()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or_else(|| panic!("{RSS_CHILD_ENV} must be a consumer count, got {spec:?}"));
-        rss_probe_child(consumers);
+        let probe = spec.to_str().and_then(Probe::parse).unwrap_or_else(|| {
+            panic!("{RSS_CHILD_ENV} must be `bare` or `group:<count>`, got {spec:?}")
+        });
+        rss_probe_child(probe);
         std::process::exit(0);
     }
 
