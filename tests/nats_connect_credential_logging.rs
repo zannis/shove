@@ -151,6 +151,23 @@ async fn connect_does_not_log_url_userinfo() {
             format!("{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
             "embeds credentials in the URL",
         ),
+        // One missing colon. The schemeless prepend makes `nats` the host and
+        // puts the whole credentialled authority in the path, so the address
+        // has a host and no userinfo — invisible to both checks above.
+        (
+            format!("nats//{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+            "carries a path, query or fragment",
+        ),
+        // A credential written as a query parameter or a fragment. The client
+        // drops both on connect, but renders them in `server = ?addr` first.
+        (
+            format!("nats://127.0.0.1:{port}/?token={SENTINEL_PASSWORD}"),
+            "carries a path, query or fragment",
+        ),
+        (
+            format!("tls://127.0.0.1:{port}#{SENTINEL_PASSWORD}"),
+            "carries a path, query or fragment",
+        ),
     ];
 
     for (url, expected_rejection) in credential_urls {
@@ -196,6 +213,9 @@ async fn connect_does_not_log_url_userinfo() {
         format!("wss:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
         format!("nats:///{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
         format!("nats://:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+        format!("nats//{SENTINEL_USER}:{SENTINEL_PASSWORD}@127.0.0.1:{port}"),
+        format!("nats://127.0.0.1:{port}/?token={SENTINEL_PASSWORD}"),
+        format!("tls://127.0.0.1:{port}#{SENTINEL_PASSWORD}"),
     ] {
         let rendered = format!("{:?}", NatsConfig::new(url.clone()));
         assert!(

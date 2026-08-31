@@ -75,6 +75,14 @@ and that opt-in no longer re-admits it.
 `nats+tls://` is likewise rejected up front rather than failing inside the
 client; it was never a scheme the client could connect with, so `tls://` is the
 substitution.
+
+A `nats://` or `tls://` URL that carries a path, query or fragment
+(`nats://broker:4222/?token=…`) is now rejected too. A TCP endpoint is a host
+and a port; the client drops everything after the authority on connect, so a
+secret placed there authenticates nothing and is only ever logged. This also
+catches a missing colon — `nats//broker:4222` parses with the host `nats` and
+the real address in the path. `ws://` and `wss://` are unaffected: there the
+path and query are part of the address and are sent to the server.
 :::
 
 ## Declare topology

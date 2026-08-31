@@ -129,7 +129,12 @@ fn redact_url_credentials(url: &str) -> String {
     if let Ok(addr) = parse_server_addr(url)
         && !addr.host().is_empty()
     {
-        return if has_url_userinfo(&addr) {
+        // A TCP address that carries a path, query or fragment is redacted even
+        // when the parse found no userinfo: that tail is precisely where a
+        // credential lands when one missing character pushes the authority out
+        // of the authority (`nats//user:pass@host`), and it is where a token
+        // ends up when someone writes it as a query parameter.
+        return if has_url_userinfo(&addr) || carries_ignored_components(&addr) {
             redacted_endpoint(&addr)
         } else {
             url.to_string()
@@ -149,7 +154,8 @@ fn redact_url_credentials(url: &str) -> String {
     }
 }
 
-/// The endpoint of a parsed address with the userinfo replaced.
+/// The endpoint of a parsed address, safe to show: userinfo replaced, and for a
+/// TCP endpoint everything the client ignores dropped.
 ///
 /// Scans the address's own *serialized* form rather than the caller's input.
 /// Serialization is canonical — exactly one `//` before the authority — so the
@@ -159,16 +165,43 @@ fn redact_url_credentials(url: &str) -> String {
 /// has to stay something the operator can copy back.
 fn redacted_endpoint(addr: &ServerAddr) -> String {
     let serialized = addr.as_url_str();
-    let (Some(scheme_end), Some(at_pos)) =
-        (serialized.find("://"), url_userinfo_delimiter(serialized))
-    else {
-        return serialized.to_string();
+    let authority_start = serialized
+        .find("://")
+        .map_or(0, |scheme_end| scheme_end + 3);
+
+    // A websocket path and query are part of the address and must survive. On
+    // TCP nothing past the authority is read on connect, so showing it can only
+    // disclose — and this is the branch that renders `nats//user:pass@host`,
+    // where the credential sits in the path.
+    let visible_end = if is_websocket(addr) {
+        serialized.len()
+    } else {
+        authority_end(serialized, authority_start)
     };
-    format!(
-        "{}://***@{}",
-        &serialized[..scheme_end],
-        &serialized[at_pos + 1..]
-    )
+    let visible = &serialized[..visible_end];
+
+    match url_userinfo_delimiter(visible) {
+        Some(at_pos) => format!(
+            "{}***@{}",
+            &visible[..authority_start],
+            &visible[at_pos + 1..]
+        ),
+        None => visible.to_string(),
+    }
+}
+
+/// The offset at which the authority ends: the first `/`, `?` or `#` after it,
+/// or the end of the string.
+fn authority_end(url: &str, authority_start: usize) -> usize {
+    url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset)
+}
+
+/// Whether the address connects over a websocket, where the path and query are
+/// part of the address rather than something the client ignores.
+fn is_websocket(addr: &ServerAddr) -> bool {
+    matches!(addr.scheme(), "ws" | "wss")
 }
 
 /// Return the absolute position of the final `@` in the URL authority. An `@`
@@ -181,9 +214,7 @@ fn redacted_endpoint(addr: &ServerAddr) -> String {
 /// guess prints a password.
 fn url_userinfo_delimiter(url: &str) -> Option<usize> {
     let authority_start = url.find("://").map_or(0, |scheme_end| scheme_end + 3);
-    let rest = &url[authority_start..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    rest[..authority_end]
+    url[authority_start..authority_end(url, authority_start)]
         .rfind('@')
         .map(|offset| authority_start + offset)
 }
@@ -255,10 +286,13 @@ fn has_url_userinfo(addr: &ServerAddr) -> bool {
 /// `nats//user:pass@broker` parses with the host `nats` and the entire
 /// credentialled authority in the path, so the no-host check cannot see it.
 ///
-/// Websockets are the exception and are not passed to this: `as_url_str()` goes
+/// Websockets are the exception and always answer `false`: `as_url_str()` goes
 /// straight to the websocket handshake, so there the path and query are the
 /// address.
-fn has_ignored_url_components(addr: &ServerAddr) -> bool {
+fn carries_ignored_components(addr: &ServerAddr) -> bool {
+    if is_websocket(addr) {
+        return false;
+    }
     let url = addr.clone().into_inner();
     let carries_path = !matches!(url.path(), "" | "/");
     carries_path || url.query().is_some() || url.fragment().is_some()
@@ -301,6 +335,25 @@ fn validate_transport_security(config: &NatsConfig) -> Result<()> {
              cannot be connected to — and where credentials in it would be logged \
              verbatim by the client.",
             redact_url_credentials(&config.url)
+        )));
+    }
+
+    // A `nats://`/`tls://` endpoint is a host and a port. Anything past the
+    // authority is dropped on connect, so a URL carrying it is either a typo or
+    // a secret in a place that authenticates nothing and gets logged — and one
+    // missing character is the whole difference: `nats//user:pass@broker`
+    // parses with the host `nats` and the credentialled authority in the path,
+    // where neither the userinfo check nor the host check above can see it.
+    if carries_ignored_components(&addr) {
+        return Err(ShoveError::Connection(format!(
+            "NATS URL '{}' carries a path, query or fragment. A nats:// or tls:// endpoint \
+             is only a host and a port — the client never reads the rest, so it is dropped \
+             on connect, and a credential placed there authenticates nothing while still \
+             being rendered into the client's connection debug logs. Note that a missing \
+             colon after the scheme (nats//broker:4222) puts the whole address in the path. \
+             Set credentials with NatsConfig::username and NatsConfig::password, \
+             NatsConfig::token, or NatsConfig::creds_file instead.",
+            redacted_endpoint(&addr)
         )));
     }
 
@@ -668,11 +721,29 @@ mod tests {
         assert!(validate_transport_security(&cfg).is_ok());
     }
 
+    /// An `@` outside the authority is not userinfo, so the host is never
+    /// replaced by `***` on account of one. The tail it sits in is still
+    /// dropped — on TCP the client ignores it, and shove cannot tell a contact
+    /// address from a token — but that is the ignored-components rule, not a
+    /// misread credential.
     #[test]
     fn at_sign_outside_authority_is_not_treated_as_userinfo() {
         let cfg = NatsConfig::new("nats://broker.example.com/path?contact=ops@example.com");
         assert!(url_userinfo_delimiter(&cfg.url).is_none());
+        assert_eq!(
+            redact_url_credentials(&cfg.url),
+            "nats://broker.example.com",
+            "the host is not userinfo and must stay visible"
+        );
+    }
+
+    /// The websocket counterpart: there the path and query are the address, so
+    /// nothing is dropped and an `@` in the query still is not userinfo.
+    #[test]
+    fn a_websocket_query_is_kept_verbatim() {
+        let cfg = NatsConfig::new("wss://broker.example.com/nats-ws?contact=ops@example.com");
         assert_eq!(redact_url_credentials(&cfg.url), cfg.url);
+        assert!(validate_transport_security(&cfg).is_ok());
     }
 
     /// The full classification matrix, including the schemeless form the
