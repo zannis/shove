@@ -354,9 +354,11 @@ fn resource_probe(rt: &Runtime) {
 
     rt.block_on(async {
         let (client, _broker) = fresh_broker().await;
-        // Every registry stays alive until the sweep ends: dropping or
-        // shutting one down mid-sweep is exactly the reuse this shape exists
-        // to avoid.
+        // One registry per row, all on the same client, rather than one
+        // registry that grows: a registry rejects a second group for a queue
+        // it already carries. Every one stays alive until the sweep ends —
+        // dropping or shutting one down mid-sweep is exactly the reuse this
+        // shape exists to avoid.
         let mut live: Vec<InMemoryConsumerGroupRegistry> = Vec::new();
         let mut previous: u16 = 0;
 
