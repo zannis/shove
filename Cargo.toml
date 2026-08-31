@@ -191,6 +191,16 @@ rdkafka = { version = "0.39", features = [
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
+# Chart rendering for `examples/chartgen.rs`. `default-features = false` with
+# only `svg_backend`/`line_series` is load-bearing, not tidiness: the default
+# set enables `ttf`, which resolves text extents through system fonts. Those
+# differ between a laptop and `ubuntu-latest`, so every label coordinate — and
+# therefore every byte of the SVG — would move, and the chart-staleness CI leg
+# would diff red on a run that changed nothing.
+plotters = { version = "0.3.7", default-features = false, features = [
+  "svg_backend",
+  "line_series",
+] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = [
   "rabbitmq",
@@ -420,3 +430,11 @@ required-features = ["redis-streams"]
 name = "redis_audited_consumer"
 path = "examples/redis/audited_consumer.rs"
 required-features = ["redis-streams", "audit"]
+
+# Reads the committed results document and writes the published SVG charts.
+# Deliberately carries no `required-features`: the chart-staleness CI leg runs
+# it under `--no-default-features`, and a backend feature here would pull
+# librdkafka/libsasl into a job that only reads JSON and writes SVGs.
+[[example]]
+name = "chartgen"
+path = "examples/chartgen.rs"
