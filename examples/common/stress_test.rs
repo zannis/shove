@@ -333,6 +333,30 @@ impl Flow {
             .find(|f| f.as_cli().eq_ignore_ascii_case(s))
     }
 
+    /// How many workers actually share the message stream, which is what the
+    /// deadline must be sized against.
+    ///
+    /// Only the competing-consumer flows divide the work `consumers` ways.
+    /// `run_dlq` is a single loop no matter how many consumers the scenario
+    /// names, a broadcast subscriber receives the whole stream rather than a
+    /// share of it, and the publish flows are one sequential loop. Dividing
+    /// their deadlines by the consumer count made them N× too tight, so a
+    /// slow-but-healthy drain was recorded as a timeout failure.
+    pub fn effective_workers(&self, consumers: u16) -> u16 {
+        match self {
+            Flow::ConsumerGroup
+            | Flow::ConsumeParallel
+            | Flow::ConsumeFifo
+            | Flow::ConsumeBatch
+            | Flow::Supervisor => consumers,
+            Flow::DlqDrain
+            | Flow::Broadcast
+            | Flow::PublishSingle
+            | Flow::PublishBatch
+            | Flow::Autoscaler => 1,
+        }
+    }
+
     /// The chart grouping key. Redundant with the flow for the consume flows
     /// by design — it is what chart family 3 (parallel vs sequenced) groups
     /// on, so `chartgen` never parses a flow name to place a bar.
@@ -567,7 +591,7 @@ fn build_scenarios(cli: &Cli) -> Vec<Scenario> {
                             messages,
                             consumers: c,
                             handler: h,
-                            deadline: scenario_deadline(messages, c, h),
+                            deadline: scenario_deadline(messages, flow.effective_workers(c), h),
                             concurrent: cli.concurrent,
                             prefetch: cli.prefetch,
                             flow,
@@ -1131,6 +1155,12 @@ where
 {
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
+    // Purge *before* declaring, not after. Several backends' purge closures
+    // drop the whole topology object rather than just its messages (NATS
+    // deletes the stream, Kafka deletes the topics), so purging after the
+    // declare left every flow that does not re-declare — the publish-only and
+    // supervisor paths — publishing into something that no longer existed.
+    (hcfg.purge)().await;
     broker
         .topology()
         .declare::<StressTestTopic>()
@@ -1140,7 +1170,6 @@ where
         .publisher()
         .await
         .map_err(|e| format!("publisher: {e}"))?;
-    (hcfg.purge)().await;
 
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
@@ -1231,6 +1260,12 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
+    // Purge *before* declaring, not after. Several backends' purge closures
+    // drop the whole topology object rather than just its messages (NATS
+    // deletes the stream, Kafka deletes the topics), so purging after the
+    // declare left every flow that does not re-declare — the publish-only and
+    // supervisor paths — publishing into something that no longer existed.
+    (hcfg.purge)().await;
     if fifo {
         broker
             .topology()
@@ -1248,7 +1283,6 @@ where
         .publisher()
         .await
         .map_err(|e| format!("publisher: {e}"))?;
-    (hcfg.purge)().await;
 
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
@@ -1346,6 +1380,12 @@ where
 {
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
+    // Purge *before* declaring, not after. Several backends' purge closures
+    // drop the whole topology object rather than just its messages (NATS
+    // deletes the stream, Kafka deletes the topics), so purging after the
+    // declare left every flow that does not re-declare — the publish-only and
+    // supervisor paths — publishing into something that no longer existed.
+    (hcfg.purge)().await;
     broker
         .topology()
         .declare::<StressBroadcastTopic>()
@@ -1459,7 +1499,6 @@ where
         .publisher()
         .await
         .map_err(|e| format!("publisher: {e}"))?;
-    (hcfg.purge)().await;
 
     let fill_epoch = Instant::now();
     let rejected = Arc::new(AtomicU64::new(0));
@@ -1565,6 +1604,12 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
+    // Purge *before* declaring, not after. Several backends' purge closures
+    // drop the whole topology object rather than just its messages (NATS
+    // deletes the stream, Kafka deletes the topics), so purging after the
+    // declare left every flow that does not re-declare — the publish-only and
+    // supervisor paths — publishing into something that no longer existed.
+    (hcfg.purge)().await;
     broker
         .topology()
         .declare::<StressTestTopic>()
@@ -1574,7 +1619,6 @@ where
         .publisher()
         .await
         .map_err(|e| format!("publisher: {e}"))?;
-    (hcfg.purge)().await;
 
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
@@ -1636,6 +1680,12 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
+    // Purge *before* declaring, not after. Several backends' purge closures
+    // drop the whole topology object rather than just its messages (NATS
+    // deletes the stream, Kafka deletes the topics), so purging after the
+    // declare left every flow that does not re-declare — the publish-only and
+    // supervisor paths — publishing into something that no longer existed.
+    (hcfg.purge)().await;
     if fifo {
         broker
             .topology()
@@ -1653,7 +1703,6 @@ where
         .publisher()
         .await
         .map_err(|e| format!("publisher: {e}"))?;
-    (hcfg.purge)().await;
 
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
@@ -2856,6 +2905,45 @@ mod tests {
         for u in &unsupported {
             assert!(!measured.contains(&u.flow), "{} appears in both", u.flow);
         }
+    }
+
+    #[test]
+    fn a_single_loop_flow_is_not_given_an_n_times_tighter_deadline() {
+        // `run_dlq` drains on one loop whatever the consumer count is, so
+        // sizing its deadline as if 8 consumers shared the work turned a slow
+        // but perfectly healthy drain into a recorded timeout.
+        for flow in [
+            Flow::DlqDrain,
+            Flow::Broadcast,
+            Flow::PublishSingle,
+            Flow::PublishBatch,
+        ] {
+            assert_eq!(flow.effective_workers(32), 1, "{flow}");
+        }
+        for flow in [
+            Flow::ConsumerGroup,
+            Flow::ConsumeParallel,
+            Flow::ConsumeFifo,
+        ] {
+            assert_eq!(flow.effective_workers(32), 32, "{flow}");
+        }
+    }
+
+    #[test]
+    fn dlq_drain_gets_a_longer_deadline_than_the_group_flow_at_the_same_size() {
+        let mk = |flow: &str| {
+            build_scenarios(&cli_args(&[
+                "--tier",
+                "moderate",
+                "--handler",
+                "fast",
+                "--flow",
+                flow,
+                "--consumers",
+                "8",
+            ]))[0]
+        };
+        assert!(mk("dlq-drain").deadline > mk("consumer-group").deadline);
     }
 
     // ── Unsupported flows are filtered out, not failed ──
