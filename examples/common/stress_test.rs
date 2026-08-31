@@ -1902,14 +1902,31 @@ fn rust_version() -> String {
 }
 
 fn first_field(content: &str, keys: &[&str]) -> Option<String> {
-    for line in content.lines() {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let k = k.trim();
-        if keys.iter().any(|want| k.eq_ignore_ascii_case(want)) {
+    first_field_where(content, keys, |_| true)
+}
+
+/// The first non-empty value whose key is in `keys` and whose value `accept`s.
+///
+/// Scans in **key priority order, not file order**: `keys` is a preference
+/// list, so an earlier key wins even when a later key's line comes first in the
+/// file. `/proc/cpuinfo` opens with `processor : 0` and only then names the
+/// `model name`, so file order would hand every caller the fallback spelling it
+/// listed last.
+fn first_field_where(
+    content: &str,
+    keys: &[&str],
+    accept: impl Fn(&str) -> bool,
+) -> Option<String> {
+    for want in keys {
+        for line in content.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            if !k.trim().eq_ignore_ascii_case(want) {
+                continue;
+            }
             let v = v.trim();
-            if !v.is_empty() {
+            if !v.is_empty() && accept(v) {
                 return Some(v.to_string());
             }
         }
@@ -1917,13 +1934,30 @@ fn first_field(content: &str, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// The CPU model out of `/proc/cpuinfo`, or `None` when the kernel does not
+/// name one.
+///
+/// aarch64 kernels expose no `model name`, so several spellings are tried. The
+/// last of them, `Processor`, collides case-insensitively with the per-core
+/// `processor : 0` index line every architecture emits — which published
+/// `"cpu": "0"` as hardware provenance. A model string is never a bare
+/// integer, so rejecting one distinguishes the index line from the genuine
+/// old-ARM `Processor : ARMv7 Processor rev 3` spelling without dropping it.
+#[cfg(target_os = "linux")]
+fn cpu_model(cpuinfo: &str) -> Option<String> {
+    first_field_where(
+        cpuinfo,
+        &["model name", "Model", "Hardware", "Processor"],
+        |v| v.parse::<u64>().is_err(),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn detect_hardware() -> Hardware {
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    // aarch64 kernels expose neither `model name` nor `cpu cores`, so fall
-    // through several spellings before giving up honestly.
-    let cpu = first_field(&cpuinfo, &["model name", "Model", "Hardware", "Processor"])
-        .unwrap_or_else(|| "unknown".to_string());
+    // The architecture is the honest floor: it is always true, and it beats
+    // "unknown" in a chart caption that exists to date and place a number.
+    let cpu = cpu_model(&cpuinfo).unwrap_or_else(|| std::env::consts::ARCH.to_string());
 
     let physical_cores = first_field(&cpuinfo, &["cpu cores"])
         .and_then(|v| v.parse::<u32>().ok())
@@ -3061,6 +3095,45 @@ mod tests {
         // available_parallelism is a guaranteed fallback on both supported
         // platforms, so a zero here means detection silently failed.
         assert!(hw.physical_cores > 0, "physical_cores not detected");
+        // A bare integer is a core index, never a CPU model. See
+        // `cpu_model_never_reports_a_core_index` for how that happened.
+        assert!(
+            hw.cpu.parse::<u64>().is_err(),
+            "cpu reported as a bare number: {}",
+            hw.cpu
+        );
+    }
+
+    #[test]
+    fn cpu_model_never_reports_a_core_index() {
+        // An aarch64 /proc/cpuinfo carries no `model name`, and its per-core
+        // `processor : 0` index line matched the `Processor` key
+        // case-insensitively — so a real run published `"cpu": "0"` as the
+        // hardware provenance. A model string is never a bare integer.
+        let aarch64 = "processor\t: 0\nBogoMIPS\t: 50.00\nCPU part\t: 0xd0c\n";
+        assert_eq!(cpu_model(aarch64), None);
+
+        // The legitimate old-ARM spelling still has to survive the guard.
+        let armv7 = "Processor\t: ARMv7 Processor rev 3 (v7l)\nprocessor\t: 0\n";
+        assert_eq!(
+            cpu_model(armv7).as_deref(),
+            Some("ARMv7 Processor rev 3 (v7l)")
+        );
+
+        let x86 = "processor\t: 0\nmodel name\t: AMD EPYC 7R13\n";
+        assert_eq!(cpu_model(x86).as_deref(), Some("AMD EPYC 7R13"));
+    }
+
+    #[test]
+    fn field_keys_are_a_preference_list_not_a_file_order_scan() {
+        // `/proc/cpuinfo` names the fallback spelling on line 1 and the
+        // preferred one further down, so a file-order scan returns whichever
+        // the caller ranked *last*.
+        let content = "Hardware\t: Generic ARM\nmodel name\t: AMD EPYC 7R13\n";
+        assert_eq!(
+            first_field(content, &["model name", "Hardware"]).as_deref(),
+            Some("AMD EPYC 7R13")
+        );
     }
 
     // ── Results document ──
