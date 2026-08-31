@@ -1143,6 +1143,31 @@ fn finish(
 /// Publish-only flows. There is no consumer, so `dispatch_*`/`e2e_*` record
 /// the latency of the publish call itself — a real measurement rather than a
 /// zero standing in for one.
+/// Bring the broker to a clean, declared state for topic `T`.
+///
+/// The order is the point, and it is the same for every scenario driver, which
+/// is why this is one function rather than a comment repeated six times.
+///
+/// Purge **before** declaring. Several backends' purge closures drop the whole
+/// topology object rather than just its messages — NATS deletes the stream,
+/// Kafka deletes the topics — so purging afterwards leaves every flow that does
+/// not re-declare (the publish-only and supervisor paths) talking to something
+/// that no longer exists. Skipping the purge entirely is worse and quieter: the
+/// previous scenario's leftovers are counted as this one's, which is how a
+/// `dlq_drain` number gets measured against a queue it did not fill.
+async fn purge_then_declare<B, T>(hcfg: &HarnessConfig<B>, broker: &Broker<B>) -> Result<(), String>
+where
+    B: Backend,
+    T: Topic,
+{
+    (hcfg.purge)().await;
+    broker
+        .topology()
+        .declare::<T>()
+        .await
+        .map_err(|e| format!("declare: {e}"))
+}
+
 async fn run_scenario_publish<B, Connect, Fut>(
     hcfg: &HarnessConfig<B>,
     scenario: &Scenario,
@@ -1155,17 +1180,7 @@ where
 {
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    // Purge *before* declaring, not after. Several backends' purge closures
-    // drop the whole topology object rather than just its messages (NATS
-    // deletes the stream, Kafka deletes the topics), so purging after the
-    // declare left every flow that does not re-declare — the publish-only and
-    // supervisor paths — publishing into something that no longer existed.
-    (hcfg.purge)().await;
-    broker
-        .topology()
-        .declare::<StressTestTopic>()
-        .await
-        .map_err(|e| format!("declare: {e}"))?;
+    purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
     let publisher = broker
         .publisher()
         .await
@@ -1260,24 +1275,10 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    // Purge *before* declaring, not after. Several backends' purge closures
-    // drop the whole topology object rather than just its messages (NATS
-    // deletes the stream, Kafka deletes the topics), so purging after the
-    // declare left every flow that does not re-declare — the publish-only and
-    // supervisor paths — publishing into something that no longer existed.
-    (hcfg.purge)().await;
     if fifo {
-        broker
-            .topology()
-            .declare::<StressSeqTopic>()
-            .await
-            .map_err(|e| format!("declare: {e}"))?;
+        purge_then_declare::<B, StressSeqTopic>(hcfg, &broker).await?;
     } else {
-        broker
-            .topology()
-            .declare::<StressTestTopic>()
-            .await
-            .map_err(|e| format!("declare: {e}"))?;
+        purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
     }
     let publisher = broker
         .publisher()
@@ -1380,17 +1381,7 @@ where
 {
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    // Purge *before* declaring, not after. Several backends' purge closures
-    // drop the whole topology object rather than just its messages (NATS
-    // deletes the stream, Kafka deletes the topics), so purging after the
-    // declare left every flow that does not re-declare — the publish-only and
-    // supervisor paths — publishing into something that no longer existed.
-    (hcfg.purge)().await;
-    broker
-        .topology()
-        .declare::<StressBroadcastTopic>()
-        .await
-        .map_err(|e| format!("declare: {e}"))?;
+    purge_then_declare::<B, StressBroadcastTopic>(hcfg, &broker).await?;
     let publisher = broker
         .publisher()
         .await
@@ -1490,11 +1481,11 @@ where
     // ── Phase 1: fill the DLQ (unmeasured) ──
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    broker
-        .topology()
-        .declare::<StressTestTopic>()
-        .await
-        .map_err(|e| format!("declare: {e}"))?;
+    // This driver needs the purge more than any other: it measures the drain of
+    // a queue it filled itself, so a leftover DLQ entry from the previous
+    // scenario is counted as one of this scenario's N and the drain finishes
+    // against messages it never published.
+    purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
     let publisher = broker
         .publisher()
         .await
@@ -1604,17 +1595,7 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    // Purge *before* declaring, not after. Several backends' purge closures
-    // drop the whole topology object rather than just its messages (NATS
-    // deletes the stream, Kafka deletes the topics), so purging after the
-    // declare left every flow that does not re-declare — the publish-only and
-    // supervisor paths — publishing into something that no longer existed.
-    (hcfg.purge)().await;
-    broker
-        .topology()
-        .declare::<StressTestTopic>()
-        .await
-        .map_err(|e| format!("declare: {e}"))?;
+    purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
     let publisher = broker
         .publisher()
         .await
@@ -1680,24 +1661,10 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    // Purge *before* declaring, not after. Several backends' purge closures
-    // drop the whole topology object rather than just its messages (NATS
-    // deletes the stream, Kafka deletes the topics), so purging after the
-    // declare left every flow that does not re-declare — the publish-only and
-    // supervisor paths — publishing into something that no longer existed.
-    (hcfg.purge)().await;
     if fifo {
-        broker
-            .topology()
-            .declare::<StressSeqTopic>()
-            .await
-            .map_err(|e| format!("declare: {e}"))?;
+        purge_then_declare::<B, StressSeqTopic>(hcfg, &broker).await?;
     } else {
-        broker
-            .topology()
-            .declare::<StressTestTopic>()
-            .await
-            .map_err(|e| format!("declare: {e}"))?;
+        purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
     }
     let publisher = broker
         .publisher()
@@ -2059,18 +2026,30 @@ fn merge_results_file(
     run: BackendRun,
     hardware_label: Option<&str>,
 ) -> Result<(), String> {
-    let mut existing: Vec<BackendRun> =
-        match std::fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str::<BenchResults>(&content)
-                .map_err(|e| {
-                    format!(
-                        "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
-                    )
-                })?
-                .runs,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(format!("read {path}: {e}")),
-        };
+    let mut existing: Vec<BackendRun> = match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let doc = serde_json::from_str::<BenchResults>(&content).map_err(|e| {
+                format!(
+                    "{path} exists but is not a v{RESULTS_SCHEMA_VERSION} results document: {e}"
+                )
+            })?;
+            // A future version's document is shape-compatible enough to
+            // deserialize, so without this it would be silently rewritten with
+            // a v1 header and whatever fields this binary does not know about
+            // dropped. Refuse instead: the six backend binaries accumulate into
+            // one file, and a downgrade would corrupt the other five's rows.
+            if doc.schema_version != RESULTS_SCHEMA_VERSION {
+                return Err(format!(
+                    "{path} is a v{} results document; this harness writes v{RESULTS_SCHEMA_VERSION}. \
+                     Merging would silently downgrade it — move it aside first.",
+                    doc.schema_version
+                ));
+            }
+            doc.runs
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("read {path}: {e}")),
+    };
 
     existing.retain(|r| r.backend != run.backend);
     existing.push(run);
@@ -2284,6 +2263,7 @@ fn finalize_report<B: Backend>(
 ) {
     compute_scaling(&mut results);
 
+    let mut results_file_failed = false;
     if let Some(path) = cli.results_file.as_deref() {
         let run = BackendRun {
             backend: hcfg.backend_name.to_string(),
@@ -2295,7 +2275,10 @@ fn finalize_report<B: Backend>(
         };
         match merge_results_file(path, run, cli.hardware_label.as_deref()) {
             Ok(()) => eprintln!("wrote results to {path}"),
-            Err(e) => eprintln!("failed to write results to {path}: {e}"),
+            Err(e) => {
+                eprintln!("failed to write results to {path}: {e}");
+                results_file_failed = true;
+            }
         }
     }
 
@@ -2312,6 +2295,16 @@ fn finalize_report<B: Backend>(
         OutputFormat::Table => {
             print_table(&report);
         }
+    }
+
+    // The table is printed first so the run's numbers are never lost to the
+    // exit, but a results file the caller asked for and did not get has to be
+    // a red run. Task 5's chart-staleness leg regenerates SVGs from this file;
+    // exiting 0 with it missing or stale is exactly how a benchmark silently
+    // publishes yesterday's numbers. Only reachable when `--results-file` was
+    // passed, so no existing invocation changes its exit code.
+    if results_file_failed {
+        std::process::exit(1);
     }
 }
 
@@ -3199,6 +3192,30 @@ mod tests {
         assert_eq!(doc.schema_version, RESULTS_SCHEMA_VERSION);
         assert_eq!(doc.shove_version, env!("CARGO_PKG_VERSION"));
         assert!(!doc.rust_version.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn merging_into_a_future_schema_version_refuses_instead_of_downgrading() {
+        let path = temp_path("schema-version");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(&p, sample_run("redis"), None).expect("first write");
+        // Six backend binaries accumulate into one file. A newer one bumping
+        // the version must not have its rows silently rewritten with a v1
+        // header by an older binary that ran afterwards.
+        let bumped = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace("\"schema_version\": 1", "\"schema_version\": 2");
+        std::fs::write(&path, &bumped).expect("write bumped");
+
+        let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
+        assert!(err.contains("v2"), "{err}");
+
+        // The refusal must leave the file untouched, not half-written.
+        assert_eq!(std::fs::read_to_string(&path).expect("re-read"), bumped);
 
         let _ = std::fs::remove_file(&path);
     }
