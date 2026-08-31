@@ -586,11 +586,11 @@ fn resource_probe() {
 
 /// Run one isolated probe process and read back its sample.
 ///
-/// The child's stderr is captured rather than inherited. Criterion greets
-/// every start-up with a gnuplot notice, so inheriting would print one notice
-/// per consumer count into the very table these children are spawned to fill.
-/// Capturing does not discard it: every failure path below reports the child's
-/// stderr, so a probe that dies still says why.
+/// The child's stderr is captured rather than inherited so that a probe which
+/// dies still says why: every failure path below quotes it, where an inherited
+/// stream would have scrolled past above the table this fills. On success it is
+/// empty — the child exits from [`rss_child_gate`] before `Criterion` is ever
+/// constructed, so none of criterion's own start-up output can reach it.
 fn probe_child(consumers: u16) -> ProbeSample {
     let exe = std::env::current_exe().expect("locate this bench executable for the RSS probe");
     let output = Command::new(exe)
