@@ -150,6 +150,13 @@ define_topic!(
 /// re-checks the counter, so a `notify_one` permit left behind by a milestone
 /// that was already met costs one extra loop turn rather than releasing a wait
 /// early.
+///
+/// Its unarmed sentinel does double duty as the phase marker: `u64::MAX` means
+/// no round is armed, which is the same thing as "the warm-up owns the group".
+/// [`BenchHandler::handle`] already loads that word to find the round's end, so
+/// testing it costs a register comparison and lets the per-instance readiness
+/// accounting be skipped outright on every timed delivery instead of running
+/// disarmed.
 struct Gates {
     /// Deliveries handled by every instance in the group, together.
     seen: AtomicU64,
@@ -189,10 +196,15 @@ impl Gates {
     }
 
     /// Arms the timed round at `count` deliveries beyond what has been handled
-    /// so far.
+    /// so far, and with it ends the warm-up phase for
+    /// [`BenchHandler::handle`], which reads readiness accounting off this same
+    /// word.
     ///
-    /// Callers must have settled the warm-up first: `seen` is read here, so a
-    /// delivery still in flight would arm the gate past the end of the round.
+    /// Callers must have settled the warm-up first, on both counts: `seen` is
+    /// read here, so a delivery still in flight would arm the gate past the end
+    /// of the round *and* would be the first delivery of an instance whose
+    /// readiness no longer gets recorded. [`settle`] is what makes both
+    /// impossible, rather than unlikely.
     fn arm_round(&self, count: u64) {
         let target = self.seen.load(Ordering::SeqCst).saturating_add(count);
         self.round_target.store(target, Ordering::SeqCst);
@@ -306,34 +318,38 @@ impl MessageHandler<OverheadTopic> for BenchHandler {
     type Context = ();
 
     async fn handle(&self, _msg: BenchMsg, _meta: MessageMetadata, _ctx: &()) -> Outcome {
-        // Readiness accounting. `polled` is this instance's own flag, unshared
-        // and write-once, so after that instance's first delivery this is a
-        // relaxed load of an uncontended line and a branch that always falls
-        // the same way — the same codegen as reading a plain `bool` field, with
-        // no fence and no bus lock. It cannot be hoisted out of the timed round
-        // because the same handler instances serve both phases, and it is what
-        // the warm-up's per-instance barrier is built from. The `swap` still
-        // decides the increment, so two deliveries racing here on the same
-        // instance (prefetch is greater than one) still increment the tally
-        // exactly once; the flag only ever goes false -> true, so a stale load
-        // costs at most one extra swap and can neither double-count nor miss.
-        if !self.polled.load(Ordering::Relaxed) && !self.polled.swap(true, Ordering::SeqCst) {
-            // Wrapping is unreachable: one increment per instance, and the
-            // group is bounded by `u16::MAX` consumers.
-            self.gates.polled_instances.fetch_add(1, Ordering::SeqCst);
-        }
-
-        // The round gate is the only milestone checked here, and it is the one
-        // the timed round itself needs. The warm-up's milestone is not checked
-        // on this path at all — `settle` polls the counters from the driver
-        // rather than having the handler test and signal a second gate that is
-        // dead for the whole timed round.
+        // What a timed delivery pays, in full: one read-modify-write the round
+        // needs in order to know when it ends, and one load of the word that
+        // says when that is. No warm-up gate is tested here — `settle` polls
+        // its milestone from the driver.
         let seen = self
             .gates
             .seen
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        if seen >= self.gates.round_target.load(Ordering::SeqCst) {
+        let target = self.gates.round_target.load(Ordering::SeqCst);
+
+        // That same load decides the phase, so readiness accounting adds no
+        // memory traffic of its own: `round_target` holds `u64::MAX` exactly
+        // while no round is armed, which is exactly while the warm-up owns the
+        // group. Inside the timed round this is a comparison against a value
+        // already in a register, and the block below does not execute at all —
+        // skipped, not merely disarmed. Measured at 256 consumers: 0 entries
+        // across the round's 512 deliveries, against 512 when it ran
+        // unconditionally.
+        if target == u64::MAX {
+            // Warm-up only. The `swap` decides the increment, so two deliveries
+            // racing here on the same instance (prefetch is greater than one)
+            // still increment the tally exactly once; the relaxed load only
+            // short-circuits after this instance's first delivery, and the flag
+            // goes false -> true and no further, so a stale read costs one extra
+            // swap and can neither double-count nor miss.
+            if !self.polled.load(Ordering::Relaxed) && !self.polled.swap(true, Ordering::SeqCst) {
+                // Wrapping is unreachable: one increment per instance, and the
+                // group is bounded by `u16::MAX` consumers.
+                self.gates.polled_instances.fetch_add(1, Ordering::SeqCst);
+            }
+        } else if seen >= target {
             self.gates.done.notify_one();
         }
         Outcome::Ack
