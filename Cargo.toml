@@ -217,10 +217,23 @@ name = "autoscaler"
 harness = false
 required-features = ["rabbitmq"]
 
+# Tier A — consumer-count scaling over the in-process backend. No Docker.
 [[bench]]
 name = "consumer_overhead"
 harness = false
-required-features = ["rabbitmq"]
+required-features = ["inmemory"]
+
+# Tier A — the flow coverage matrix over the in-process backend. No Docker.
+[[bench]]
+name = "inmemory_flows"
+harness = false
+required-features = ["inmemory"]
+
+# Tier A — broker-free paths. Deliberately ungated: this target is what proves
+# the bench code builds under `--no-default-features`.
+[[bench]]
+name = "pure_paths"
+harness = false
 
 [[bench]]
 name = "publish_throughput"
