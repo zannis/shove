@@ -288,13 +288,23 @@ let registry = SchemaRegistry::builder("https://schema-registry:8081")
     .build();
 ```
 
-`SchemaRegistry::builder(url)` accepts any `http://` or `https://` base URL. Auth options are:
+`SchemaRegistry::builder(url)` accepts any `http://` or `https://` base URL, with or without `user:pass@` userinfo. Auth options are:
 
 - `SchemaRegistryAuth::None` — no authentication (default)
 - `SchemaRegistryAuth::Bearer(token)` — `Authorization: Bearer <token>`
 - `SchemaRegistryAuth::Basic { user, pass }` — HTTP Basic auth
 
-Credentials require TLS. Combining any auth other than `None` with an `http://` base URL makes `build()` panic, because the token or password would be sent in cleartext on every schema fetch. An unauthenticated `http://` registry is unaffected. For a registry that is genuinely unreachable from an untrusted network — a local development stack — opt in explicitly:
+Credentials require TLS. Configuring any credential against a base URL that is not `https://` makes `build()` panic, because the secret would be sent in cleartext on every schema fetch. Three things count as a credential:
+
+- any `SchemaRegistryAuth` other than `None`;
+- `user:pass@` userinfo in the base URL — the HTTP client lifts it out and replays it as an `Authorization: Basic` header, so it is a credential even with `SchemaRegistryAuth::None`;
+- any header set with `.header(...)`, whose value is assumed to be a secret. Use `.non_secret_header(...)` for one that is not.
+
+The base URL is parsed before it is judged, so alternate spellings of a plaintext scheme — `http:registry:8081`, `http:/registry:8081` — are refused too rather than slipping past a prefix check. A base URL that does not parse is treated as plaintext.
+
+A credential-bearing client also stops following redirects. A schema registry has no legitimate reason to redirect, and a `302` would otherwise replay a custom secret header to whatever host and scheme the `Location` names. An unauthenticated client is unaffected.
+
+An unauthenticated `http://` registry is unaffected. For a registry that is genuinely unreachable from an untrusted network — a local development stack — opt in explicitly:
 
 ```rust,no_run
 use shove::schema_registry::{SchemaRegistry, SchemaRegistryAuth};
