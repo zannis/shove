@@ -12,9 +12,11 @@
 //!
 //! Requires Docker.
 
+mod common;
+
 use std::time::Duration;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use serde::{Deserialize, Serialize};
 use shove::rabbitmq::*;
 use shove::*;
@@ -22,7 +24,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq;
 use tokio::runtime::Runtime;
 
-const PAYLOAD_BYTES: usize = 256;
+use common::{PAYLOAD_SIZES, payload};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct BenchMsg {
@@ -62,21 +64,28 @@ fn bench_publish(c: &mut Criterion) {
         (container, publisher)
     });
 
-    let payload = "x".repeat(PAYLOAD_BYTES);
-
     let mut group = c.benchmark_group("rabbitmq_publish");
     group.throughput(Throughput::Elements(1));
     group.measurement_time(Duration::from_secs(10));
-    group.bench_function("single_publish", |b| {
-        b.to_async(&rt).iter(|| {
-            let payload = payload.clone();
-            let publisher = &publisher;
-            async move {
-                let msg = BenchMsg { id: 0, payload };
-                publisher.publish::<PublishBenchTopic>(&msg).await.unwrap();
-            }
-        });
-    });
+    // Payload is a benchmark input, not a constant: message size is the
+    // dominant serde-and-wire lever, and a single hardcoded size hides it.
+    for bytes in PAYLOAD_SIZES {
+        let body = payload(bytes);
+        group.bench_with_input(
+            BenchmarkId::new("single_publish", bytes),
+            &body,
+            |b, body| {
+                b.to_async(&rt).iter(|| {
+                    let payload = body.clone();
+                    let publisher = &publisher;
+                    async move {
+                        let msg = BenchMsg { id: 0, payload };
+                        publisher.publish::<PublishBenchTopic>(&msg).await.unwrap();
+                    }
+                });
+            },
+        );
+    }
     group.finish();
 
     // testcontainers' ContainerAsync runs an async destructor; drop it inside
