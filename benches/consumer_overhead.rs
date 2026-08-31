@@ -81,6 +81,24 @@ const WARMUP_PAYLOAD_BYTES: usize = 64;
 /// How long the resource probe samples idle CPU for, in each child process.
 const IDLE_SAMPLE: Duration = Duration::from_secs(2);
 
+/// Isolated processes sampled per probe shape.
+///
+/// One process per shape cannot support the subtractions this table is made
+/// of. RSS is reported in 4 KiB pages, and process start-up and allocator
+/// jitter move it a page either way, so a single-sample difference the size of
+/// a page says nothing — sampled once per shape, this probe printed
+/// `GROUP FIXED: -20.0 KB`, a negative fixed cost. Sampling each shape in
+/// several processes and differencing medians gives a figure that repeats, and
+/// the spread across those processes gives the floor below which a difference
+/// must not be read as a cost at all. Odd, so the median is an observed sample
+/// rather than an interpolation between two. Each sample costs one process and
+/// one [`IDLE_SAMPLE`], so this multiplies the probe's wall-clock by itself.
+const PROBE_REPEATS: usize = 5;
+
+// Both properties are load-bearing above: even counts have no observed median,
+// and zero repeats would leave every figure empty.
+const _: () = assert!(PROBE_REPEATS > 0 && PROBE_REPEATS % 2 == 1);
+
 /// Ceiling on the wait for a dispatch round to complete. Nothing should come
 /// close; it exists so a lost delivery fails the run rather than hanging it.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -500,13 +518,75 @@ impl Probe {
 
 /// What one isolated probe process reported.
 struct ProbeSample {
-    probe: Probe,
     rss_kb: f64,
     idle_cpu_pct: f64,
 }
 
-/// Sample RSS-per-consumer and idle CPU **in isolated processes**, one per
-/// consumer count, and print a table to stderr.
+/// What one probe shape reported across [`PROBE_REPEATS`] processes.
+struct ProbeStats {
+    probe: Probe,
+    /// Median process RSS — the median rather than the mean, so one process
+    /// that happened to map an extra arena moves the row by nothing.
+    rss_kb: f64,
+    /// `max - min` across this shape's own processes: how far the identical
+    /// measurement moved when nothing about it changed.
+    rss_spread_kb: f64,
+    /// Median idle CPU.
+    idle_cpu_pct: f64,
+}
+
+/// Sample one shape in [`PROBE_REPEATS`] separate processes.
+fn probe_shape(probe: Probe) -> ProbeStats {
+    let samples: Vec<ProbeSample> = (0..PROBE_REPEATS).map(|_| probe_child(probe)).collect();
+
+    let mut rss: Vec<f64> = samples.iter().map(|s| s.rss_kb).collect();
+    let mut idle_cpu: Vec<f64> = samples.iter().map(|s| s.idle_cpu_pct).collect();
+    let rss_kb = median(&mut rss);
+
+    ProbeStats {
+        probe,
+        rss_kb,
+        // `median` left `rss` sorted, so the ends are the min and the max.
+        rss_spread_kb: match (rss.first(), rss.last()) {
+            (Some(min), Some(max)) => max - min,
+            _ => f64::NAN,
+        },
+        idle_cpu_pct: median(&mut idle_cpu),
+    }
+}
+
+/// Median of `values`. Sorts in place, so a caller that wants the extremes can
+/// read them off the ends afterwards.
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    // The const assert on `PROBE_REPEATS` is what makes the index land.
+    values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+/// A difference between two shapes, printed as a number only when it clears
+/// the probe's resolution floor. Below the floor the honest reading is "closer
+/// together than this probe can see", not a signed quantity.
+fn resolved_delta(delta_kb: f64, floor_kb: f64) -> String {
+    if delta_kb.abs() > floor_kb {
+        format!("{delta_kb:.1}")
+    } else {
+        format!("<{floor_kb:.1}")
+    }
+}
+
+/// The same difference spread over the consumers a row added. An unresolved
+/// row-to-row difference still bounds the per-consumer cost — by the floor
+/// divided over those consumers, which is the number worth printing.
+fn resolved_per_consumer(delta_kb: f64, added: f64, floor_kb: f64) -> String {
+    if delta_kb.abs() > floor_kb {
+        format!("{:.1}", delta_kb / added)
+    } else {
+        format!("<{:.1}", floor_kb / added)
+    }
+}
+
+/// Sample RSS-per-consumer and idle CPU **in isolated processes**,
+/// [`PROBE_REPEATS`] per consumer count, and print a table to stderr.
 ///
 /// # Why a child process per row
 ///
@@ -544,6 +624,24 @@ struct ProbeSample {
 /// RSS; `OVER BASE` subtracts the bare process, which carries the runtime, the
 /// broker and the declared topology but no registry and no group.
 ///
+/// # Why several processes per shape
+///
+/// A process-to-process difference is only as good as the reproducibility of
+/// each side, and one sample per side has none to show. RSS moves by whole
+/// 4 KiB pages on start-up jitter alone, so two single samples can differ by a
+/// page for no reason — sampled that way this probe printed
+/// `GROUP FIXED: -20.0 KB`, a fixed cost with a negative sign, which is jitter
+/// wearing a number's clothes.
+///
+/// Every shape is therefore sampled in [`PROBE_REPEATS`] processes and the
+/// table reports each row's **median** and its own **spread** (`max - min`
+/// over that shape's processes). The largest spread on the table is its
+/// resolution floor: a difference that does not clear the floor is printed as
+/// `<floor` rather than as a number, in `OVER BASE`, in `KB/CONSUMER` and in
+/// `GROUP FIXED` alike. So a reader can tell a cost from noise without
+/// re-running anything, and a regression has to exceed the observed jitter
+/// before this probe will claim one.
+///
 /// The measured consumers are idle — started, with no traffic — which is what
 /// `IDLE CPU` reports and what makes the RSS figure a resting cost rather than
 /// a working-set peak.
@@ -553,36 +651,56 @@ fn resource_probe() {
         return;
     }
 
-    let bare = probe_child(Probe::Bare);
-    let empty_group = probe_child(Probe::Group(0));
-    let rows: Vec<ProbeSample> = CONSUMER_COUNTS
+    let bare = probe_shape(Probe::Bare);
+    let empty_group = probe_shape(Probe::Group(0));
+    let rows: Vec<ProbeStats> = CONSUMER_COUNTS
         .iter()
-        .map(|n| probe_child(Probe::Group(*n)))
+        .map(|n| probe_shape(Probe::Group(*n)))
         .collect();
+
+    // The resolution floor: the widest any one shape moved across its own
+    // processes. Nothing narrower than this is a difference between shapes.
+    let floor_kb = std::iter::once(&bare)
+        .chain(std::iter::once(&empty_group))
+        .chain(rows.iter())
+        .map(|s| s.rss_spread_kb)
+        .fold(0.0_f64, f64::max);
 
     eprintln!();
     eprintln!("consumer resource probe (not a criterion measurement)");
-    eprintln!("each row is a separate process holding exactly one registry and one group,");
-    eprintln!("so KB/CONSUMER is a process-to-process difference with the group cost cancelled —");
-    eprintln!("including row 1, which is differenced against the zero-consumer group below it.");
     eprintln!(
-        "bare process (runtime + broker + topology, no registry, no group): {:.1} KB RSS",
-        bare.rss_kb
+        "each row is the median of {PROBE_REPEATS} separate processes, each holding exactly one"
+    );
+    eprintln!("registry and one group, so KB/CONSUMER is a process-to-process difference with the");
+    eprintln!("group cost cancelled — including row 1, which is differenced against the");
+    eprintln!("zero-consumer group below it.");
+    eprintln!(
+        "SPREAD is a row's own max-min: the identical shape re-measured. The widest of them is"
     );
     eprintln!(
-        "{:>10} {:>10} {:>11} {:>14} {:>10}",
-        "CONSUMERS", "RSS KB", "OVER BASE", "KB/CONSUMER", "IDLE CPU"
+        "this probe's resolution floor ({floor_kb:.1} KB); a difference that does not clear it is"
     );
-    eprintln!("{}", "-".repeat(60));
+    eprintln!("jitter, and prints as `<floor` instead of as a number.");
+    eprintln!(
+        "bare process (runtime + broker + topology, no registry, no group): {:.1} KB RSS \
+         (spread {:.1} KB)",
+        bare.rss_kb, bare.rss_spread_kb,
+    );
+    eprintln!(
+        "{:>10} {:>10} {:>8} {:>11} {:>14} {:>10}",
+        "CONSUMERS", "RSS KB", "SPREAD", "OVER BASE", "KB/CONSUMER", "IDLE CPU"
+    );
+    eprintln!("{}", "-".repeat(69));
 
     // The zero-consumer group leads the sweep and is what every later row is
     // differenced from. It spawns no consumer, so it has no KB/CONSUMER of its
     // own — the dash is the point, not a missing number.
     eprintln!(
-        "{:>10} {:>10.1} {:>11.1} {:>14} {:>9.1}%",
+        "{:>10} {:>10.1} {:>8.1} {:>11} {:>14} {:>9.1}%",
         empty_group.probe.consumers(),
         empty_group.rss_kb,
-        empty_group.rss_kb - bare.rss_kb,
+        empty_group.rss_spread_kb,
+        resolved_delta(empty_group.rss_kb - bare.rss_kb, floor_kb),
         "-",
         empty_group.idle_cpu_pct,
     );
@@ -595,15 +713,16 @@ fn resource_probe() {
                 .saturating_sub(previous.probe.consumers()),
         );
         let marginal = if added > 0.0 {
-            (row.rss_kb - previous.rss_kb) / added
+            resolved_per_consumer(row.rss_kb - previous.rss_kb, added, floor_kb)
         } else {
-            f64::NAN
+            "-".to_owned()
         };
         eprintln!(
-            "{:>10} {:>10.1} {:>11.1} {:>14.1} {:>9.1}%",
+            "{:>10} {:>10.1} {:>8.1} {:>11} {:>14} {:>9.1}%",
             row.probe.consumers(),
             row.rss_kb,
-            row.rss_kb - bare.rss_kb,
+            row.rss_spread_kb,
+            resolved_delta(row.rss_kb - bare.rss_kb, floor_kb),
             marginal,
             row.idle_cpu_pct,
         );
@@ -613,9 +732,10 @@ fn resource_probe() {
     // The group's own fixed cost, measured rather than extrapolated: what a
     // registry and a started group cost with nothing spawned in them.
     eprintln!(
-        "GROUP FIXED: {:.1} KB — registry + group + tokens + spawner, measured as the \
-         zero-consumer group's growth over the bare process",
-        empty_group.rss_kb - bare.rss_kb,
+        "GROUP FIXED: {} KB — registry + group + tokens + spawner, measured as the \
+         zero-consumer group's growth over the bare process, each the median of \
+         {PROBE_REPEATS} processes",
+        resolved_delta(empty_group.rss_kb - bare.rss_kb, floor_kb),
     );
     eprintln!();
 }
@@ -660,7 +780,6 @@ fn probe_child(probe: Probe) -> ProbeSample {
     };
 
     ProbeSample {
-        probe,
         rss_kb: rss_bytes as f64 / 1024.0,
         idle_cpu_pct,
     }
