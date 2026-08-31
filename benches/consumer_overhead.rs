@@ -505,11 +505,23 @@ struct ProbeSample {
 /// not yet allocated the machinery it receives on, so sampling one would
 /// understate what a live consumer costs.
 ///
-/// Its price is disclosed rather than removed: each row's RSS also carries the
-/// allocator slack its own warm-up traffic left behind. That traffic is sized
-/// by the number of instances still to be woken, so it scales with the row and
-/// lands in `KB/CONSUMER` — it is part of what a consumer costs here, not a
-/// fixed cost smeared across the rows.
+/// Its price is disclosed rather than removed, and measured rather than
+/// asserted. Waking every instance is a coupon-collect against a prefetching
+/// group, so the warm-up publishes far more than one message per instance —
+/// 6.8x the instance count at 16 consumers, 17x at 256, 26x at 1024 — and the
+/// allocator slack that traffic leaves behind stays in the row's RSS while the
+/// baseline row, which publishes nothing, pays none of it.
+///
+/// That residue was sized by replaying the same volume in the same round sizes
+/// once the group is already warm, so the replay adds traffic and no new task
+/// state: it accounts for roughly 30% of what the warm-up adds at 256
+/// consumers (268 KB of 904 KB) and 41% at 1024. The remaining majority is
+/// consumer state that exists only once a task has been polled — the part an
+/// unwarmed sample misses. Because the replay reuses arena the warm-up already
+/// mapped, treat that share as a floor.
+///
+/// So `KB/CONSUMER` is an upper bound on a consumer's resting cost: honest
+/// about the machinery, carrying some warm-up residue on top.
 fn resource_probe() {
     // Listing benchmark ids must not fork the process 5 times.
     if std::env::args().any(|arg| arg == "--list") {
