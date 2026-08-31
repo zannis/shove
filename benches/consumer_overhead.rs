@@ -50,9 +50,12 @@ use criterion::{
     BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
 };
 use serde::{Deserialize, Serialize};
-use shove::inmemory::{InMemoryBroker, InMemoryConsumerGroupConfig, InMemoryConsumerGroupRegistry};
+use shove::inmemory::{
+    BrokerStatsProvider, InMemoryBroker, InMemoryConsumerGroupConfig,
+    InMemoryConsumerGroupRegistry, InMemoryQueueStatsProvider,
+};
 use shove::{
-    Broker, InMemory, MessageHandler, MessageMetadata, Outcome, Publisher, TopologyBuilder,
+    Broker, InMemory, MessageHandler, MessageMetadata, Outcome, Publisher, Topic, TopologyBuilder,
     define_topic,
 };
 use tokio::runtime::Runtime;
@@ -92,6 +95,16 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 /// forever.
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often [`settle`] re-reads the counters it is waiting on.
+///
+/// Polled rather than notified on purpose: a notification would have to be
+/// raised by [`BenchHandler::handle`], which is the one place this benchmark
+/// cannot afford instrumentation that outlives the warm-up. Everything
+/// [`settle`] waits on is already published by the counters, and it only ever
+/// runs outside a timed region, so the poll costs wall-clock nobody measures
+/// instead of atomics on the dispatch path.
+const SETTLE_POLL: Duration = Duration::from_millis(1);
+
 /// Environment variable that turns this executable into an isolated RSS-probe
 /// child for the given consumer count. Set only by [`probe_child`]; a normal
 /// `cargo bench` invocation never has it.
@@ -114,7 +127,7 @@ define_topic!(
 // ── Handler ─────────────────────────────────────────────────────────────────
 
 /// State one consumer group's handler instances share: the delivery tally, the
-/// per-instance readiness tally, and the two milestone gates the driver waits
+/// per-instance readiness tally, and the one milestone gate the driver waits
 /// on.
 ///
 /// `polled_instances` is what makes the dispatch warm-up a real readiness
@@ -125,11 +138,18 @@ define_topic!(
 /// has been polled and has run a handler to completion — not merely that some
 /// subset drained the burst.
 ///
-/// The two message gates are armed by the driver rather than fixed at
-/// construction, because the warm-up publishes an amount it discovers as it
-/// goes. Every wait re-checks the counter it is waiting on, so a `notify_one`
-/// permit left behind by a milestone that was already met costs one extra loop
-/// turn rather than releasing a wait early.
+/// There is deliberately **one** gate, not one per phase. The timed round is
+/// the only thing that needs waking the instant its last delivery lands, so it
+/// is the only thing that gets a `Notify` fired from the handler; the warm-up
+/// waits by polling in [`settle`] instead. A second gate would mean a second
+/// atomic load and branch inside [`BenchHandler::handle`] on every timed
+/// delivery, serving a phase that is already over.
+///
+/// `round_target` is armed by the driver rather than fixed at construction,
+/// because the warm-up publishes an amount it discovers as it goes. The wait
+/// re-checks the counter, so a `notify_one` permit left behind by a milestone
+/// that was already met costs one extra loop turn rather than releasing a wait
+/// early.
 struct Gates {
     /// Deliveries handled by every instance in the group, together.
     seen: AtomicU64,
@@ -138,23 +158,18 @@ struct Gates {
     /// Consumer instances the group was configured with. `u64::MAX` on a
     /// group whose readiness is never waited on.
     instances: u64,
-    /// `seen` value that completes the warm-up drain. `u64::MAX` when unarmed.
-    drain_target: AtomicU64,
-    drained: Notify,
     /// `seen` value that completes the timed round. `u64::MAX` when unarmed.
     round_target: AtomicU64,
     done: Notify,
 }
 
 impl Gates {
-    /// Gates for a group of `instances` consumers, both milestones unarmed.
+    /// Gates for a group of `instances` consumers, the round unarmed.
     fn for_group(instances: u64) -> Arc<Self> {
         Arc::new(Self {
             seen: AtomicU64::new(0),
             polled_instances: AtomicU64::new(0),
             instances,
-            drain_target: AtomicU64::new(u64::MAX),
-            drained: Notify::new(),
             round_target: AtomicU64::new(u64::MAX),
             done: Notify::new(),
         })
@@ -173,53 +188,98 @@ impl Gates {
             .saturating_sub(self.polled_instances.load(Ordering::SeqCst))
     }
 
-    /// Waits until `published` deliveries have been handled, then disarms the
-    /// gate again.
-    ///
-    /// The disarm is what keeps warm-up accounting out of the timed round.
-    /// `seen` is monotonic across both phases and one [`Gates`] serves both, so
-    /// a `drain_target` left behind at the warm-up total stays satisfied for
-    /// the rest of the iteration: every timed delivery would go on calling
-    /// `notify_one` on a gate nobody is waiting on, inside the region
-    /// [`bench_dispatch`] exists to measure.
-    async fn drain_to(&self, published: u64) {
-        self.drain_target.store(published, Ordering::SeqCst);
-        self.wait_for(&self.drained, published, "warm-up").await;
-        self.drain_target.store(u64::MAX, Ordering::SeqCst);
-    }
-
     /// Arms the timed round at `count` deliveries beyond what has been handled
     /// so far.
     ///
-    /// Callers must have drained the warm-up first: `seen` is read here, so a
+    /// Callers must have settled the warm-up first: `seen` is read here, so a
     /// delivery still in flight would arm the gate past the end of the round.
     fn arm_round(&self, count: u64) {
         let target = self.seen.load(Ordering::SeqCst).saturating_add(count);
         self.round_target.store(target, Ordering::SeqCst);
     }
 
-    /// Waits until the armed round has been fully handled.
-    async fn completed(&self) {
-        let target = self.round_target.load(Ordering::SeqCst);
-        self.wait_for(&self.done, target, "dispatch").await;
-    }
-
-    /// Waits for `seen` to reach `target`, re-checking the counter on every
-    /// wake so the wait cannot end early on a stale permit.
+    /// Waits until the armed round has been fully handled, re-checking `seen`
+    /// on every wake so the wait cannot end early on a stale permit.
+    ///
+    /// Notified rather than polled — unlike [`settle`], this wait *is* inside
+    /// the timed region, so the wake latency it saves is latency the dispatch
+    /// number would otherwise carry.
     ///
     /// Bounded so a lost delivery fails the run instead of hanging it: an
     /// unbounded wait here is `cargo bench` producing no further output until
     /// CI kills the job, which reads as "slow" rather than "broken".
-    async fn wait_for(&self, gate: &Notify, target: u64, phase: &str) {
+    async fn completed(&self) {
+        let target = self.round_target.load(Ordering::SeqCst);
         while self.seen.load(Ordering::SeqCst) < target {
-            if timeout(COMPLETION_TIMEOUT, gate.notified()).await.is_err() {
+            if timeout(COMPLETION_TIMEOUT, self.done.notified())
+                .await
+                .is_err()
+            {
                 panic!(
-                    "{phase}: handlers saw {} of {target} messages in {COMPLETION_TIMEOUT:?}: \
+                    "dispatch: handlers saw {} of {target} messages in {COMPLETION_TIMEOUT:?}: \
                      a delivery was lost",
                     self.seen.load(Ordering::SeqCst),
                 );
             }
         }
+    }
+}
+
+/// Waits until the group has genuinely gone quiet: every one of `published`
+/// warm-up deliveries handled, the queue empty, and the framework's own
+/// in-flight tally back at zero.
+///
+/// **The handler count alone is not a drain barrier.** [`BenchHandler::handle`]
+/// bumps `seen` and returns `Outcome::Ack`; everything the consumer loop does
+/// with that outcome — joining the handler task, routing the outcome,
+/// decrementing the queue's in-flight tally, going back around for more —
+/// necessarily runs *after* the count has already moved. Waiting on the count
+/// proves `handle` was called, not that the group settled, and on a 256-consumer
+/// group at prefetch 10 that residue is exactly what would land inside
+/// [`bench_dispatch`]'s timer or [`rss_probe_child`]'s idle sample.
+///
+/// `messages_in_flight` is the backend's own counter, incremented when an
+/// envelope is picked up and decremented on the ack path, so it observes the
+/// part `seen` cannot.
+///
+/// **The two conditions are ordered, not combined.** The consumer loop pops an
+/// envelope off the buffer *before* it increments the in-flight tally, so a
+/// stats read taken while messages are still being picked up can see both
+/// counters at zero with deliveries live. Confirming `seen` first rules that
+/// window out: once `seen` has reached `published`, every one of those messages
+/// has already been popped and handled, so nothing can still be in the gap when
+/// the stats read happens.
+async fn settle(stats: &BrokerStatsProvider, gates: &Gates, published: u64) {
+    let queue = OverheadTopic::topology().queue();
+    let started = Instant::now();
+
+    while gates.seen.load(Ordering::SeqCst) < published {
+        if started.elapsed() >= COMPLETION_TIMEOUT {
+            panic!(
+                "warm-up: handlers saw {} of {published} messages in {COMPLETION_TIMEOUT:?}: \
+                 a delivery was lost",
+                gates.seen.load(Ordering::SeqCst),
+            );
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+
+    loop {
+        let stats = stats
+            .get_queue_stats(queue)
+            .await
+            .expect("read bench queue stats");
+        if stats.messages_ready == 0 && stats.messages_in_flight == 0 {
+            return;
+        }
+        if started.elapsed() >= COMPLETION_TIMEOUT {
+            panic!(
+                "warm-up: {} ready and {} in flight on {queue} {COMPLETION_TIMEOUT:?} after \
+                 {published} messages were handled: the group never went quiet",
+                stats.messages_ready, stats.messages_in_flight,
+            );
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
     }
 }
 
@@ -246,12 +306,16 @@ impl MessageHandler<OverheadTopic> for BenchHandler {
     type Context = ();
 
     async fn handle(&self, _msg: BenchMsg, _meta: MessageMetadata, _ctx: &()) -> Outcome {
-        // The relaxed load short-circuits every delivery after this instance's
-        // first, so readiness accounting costs one plain load rather than a
-        // read-modify-write on the timed dispatch path. The `swap` still
+        // Readiness accounting. `polled` is this instance's own flag, unshared
+        // and write-once, so after that instance's first delivery this is a
+        // relaxed load of an uncontended line and a branch that always falls
+        // the same way — the same codegen as reading a plain `bool` field, with
+        // no fence and no bus lock. It cannot be hoisted out of the timed round
+        // because the same handler instances serve both phases, and it is what
+        // the warm-up's per-instance barrier is built from. The `swap` still
         // decides the increment, so two deliveries racing here on the same
         // instance (prefetch is greater than one) still increment the tally
-        // exactly once. The flag only ever goes false -> true, so a stale load
+        // exactly once; the flag only ever goes false -> true, so a stale load
         // costs at most one extra swap and can neither double-count nor miss.
         if !self.polled.load(Ordering::Relaxed) && !self.polled.swap(true, Ordering::SeqCst) {
             // Wrapping is unreachable: one increment per instance, and the
@@ -259,14 +323,16 @@ impl MessageHandler<OverheadTopic> for BenchHandler {
             self.gates.polled_instances.fetch_add(1, Ordering::SeqCst);
         }
 
+        // The round gate is the only milestone checked here, and it is the one
+        // the timed round itself needs. The warm-up's milestone is not checked
+        // on this path at all — `settle` polls the counters from the driver
+        // rather than having the handler test and signal a second gate that is
+        // dead for the whole timed round.
         let seen = self
             .gates
             .seen
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        if seen >= self.gates.drain_target.load(Ordering::SeqCst) {
-            self.gates.drained.notify_one();
-        }
         if seen >= self.gates.round_target.load(Ordering::SeqCst) {
             self.gates.done.notify_one();
         }
@@ -335,10 +401,18 @@ async fn registry(
 /// so it converges on the readiness tally itself rather than on a burst size
 /// assumed to be sufficient.
 ///
-/// It returns only when `polled_instances == instances` and nothing is in
-/// flight, which is the precondition [`Gates::arm_round`] needs. It panics
-/// with the tally if the group has not converged inside [`READINESS_TIMEOUT`].
-async fn warm_up(publisher: &Publisher<InMemory>, body: &str, gates: &Gates) {
+/// It returns only when `polled_instances == instances` and the group has
+/// settled — which [`settle`] establishes against the backend's own in-flight
+/// tally, not against the handler count, because a handler that has returned is
+/// not a delivery the framework has finished with. That is the precondition
+/// [`Gates::arm_round`] needs. It panics with the tally if the group has not
+/// converged inside [`READINESS_TIMEOUT`].
+async fn warm_up(
+    publisher: &Publisher<InMemory>,
+    stats: &BrokerStatsProvider,
+    body: &str,
+    gates: &Gates,
+) {
     let started = Instant::now();
     let mut published: u64 = 0;
 
@@ -358,7 +432,7 @@ async fn warm_up(publisher: &Publisher<InMemory>, body: &str, gates: &Gates) {
 
         publish_n(publisher, body, missing).await;
         published = published.saturating_add(missing);
-        gates.drain_to(published).await;
+        settle(stats, gates, published).await;
     }
 }
 
@@ -659,9 +733,12 @@ fn rss_probe_child(consumers: u16) {
             // whatever it allocates on the way into its receive loop — would
             // land inside the sample window below, billed as idle CPU and
             // missing from the RSS figure. `warm_up` returns only once every
-            // instance has handled a delivery and that traffic has drained, so
-            // the sample sees a group that is fully up and doing nothing.
-            warm_up(&publisher, &payload(WARMUP_PAYLOAD_BYTES), &gates).await;
+            // instance has handled a delivery *and* the backend reports nothing
+            // ready and nothing in flight, so the ack-side work the last warm-up
+            // deliveries leave behind has finished before `cpu_before` is read
+            // rather than being sampled as idle.
+            let stats = BrokerStatsProvider::new(client.clone());
+            warm_up(&publisher, &stats, &payload(WARMUP_PAYLOAD_BYTES), &gates).await;
 
             Some(reg)
         } else {
@@ -778,8 +855,10 @@ fn bench_shutdown(c: &mut Criterion) {
 /// The timed region is a *live* publish of `DISPATCH_MESSAGES` and the wait
 /// for the last of them to reach a handler. Everything else is outside it:
 /// the group is started and then warmed by [`warm_up`], which returns only
-/// once every consumer instance has handled a delivery and nothing is in
-/// flight. Two reasons the warm-up is not optional:
+/// once every consumer instance has handled a delivery and the backend itself
+/// reports nothing ready and nothing in flight — see [`settle`] for why the
+/// handler count is not on its own enough to claim that. Two reasons the
+/// warm-up is not optional:
 ///
 /// - It keeps consumer-task startup out of this measurement. Timing
 ///   `start_all()` here would make a pure startup regression show up in both
@@ -833,9 +912,13 @@ fn bench_dispatch(c: &mut Criterion) {
 
                                 // Outside the timer: returns only once every
                                 // consumer instance has handled a delivery and
-                                // the warm-up traffic has drained, so no task's
-                                // first poll can land inside the timed region.
-                                warm_up(&publisher, &warmup_body, &gates).await;
+                                // the backend reports the warm-up traffic fully
+                                // settled — nothing ready, nothing in flight —
+                                // so neither a task's first poll nor the ack
+                                // work trailing the last warm-up delivery can
+                                // land inside the timed region.
+                                let stats = BrokerStatsProvider::new(client.clone());
+                                warm_up(&publisher, &stats, &warmup_body, &gates).await;
 
                                 gates.arm_round(DISPATCH_MESSAGES);
                                 let start = Instant::now();
