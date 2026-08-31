@@ -547,19 +547,27 @@ fn resource_probe() {
 }
 
 /// Run one isolated probe process and read back its sample.
+///
+/// The child's stderr is captured rather than inherited. Criterion greets
+/// every start-up with a gnuplot notice, so inheriting would print one notice
+/// per consumer count into the very table these children are spawned to fill.
+/// Capturing does not discard it: every failure path below reports the child's
+/// stderr, so a probe that dies still says why.
 fn probe_child(consumers: u16) -> ProbeSample {
     let exe = std::env::current_exe().expect("locate this bench executable for the RSS probe");
     let output = Command::new(exe)
         .env(RSS_CHILD_ENV, consumers.to_string())
         .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .output()
         .unwrap_or_else(|e| panic!("spawn RSS probe child for {consumers} consumers: {e}"));
 
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         panic!(
-            "RSS probe child for {consumers} consumers exited with {}",
-            output.status
+            "RSS probe child for {consumers} consumers exited with {}; stderr: {}",
+            output.status,
+            stderr.trim(),
         );
     }
 
@@ -571,7 +579,9 @@ fn probe_child(consumers: u16) -> ProbeSample {
         .zip(fields.next().and_then(|cpu| cpu.parse::<f64>().ok()));
     let Some((rss_bytes, idle_cpu_pct)) = parsed else {
         panic!(
-            "RSS probe child for {consumers} consumers printed {line:?}, expected `<rss> <cpu>`"
+            "RSS probe child for {consumers} consumers printed {line:?}, expected `<rss> <cpu>`; \
+             stderr: {}",
+            stderr.trim(),
         );
     };
 
