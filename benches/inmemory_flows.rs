@@ -55,6 +55,7 @@ use shove::{
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use common::{PAYLOAD_SIZES, payload};
@@ -78,6 +79,13 @@ const CHUNK_BYTE_BUDGET: usize = 16 << 20;
 /// How long a consumer is given to drain after its shutdown token fires.
 /// Teardown happens outside every timed region.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling on any wait for messages to arrive somewhere.
+///
+/// Nothing here should come close: a timed iteration moves 256 in-process
+/// messages in single-digit milliseconds. It exists so that a *lost* message
+/// fails the run instead of hanging it — see [`CountingHandler::completed`].
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Publishes per broker for `payload_bytes`-sized messages.
 ///
@@ -202,8 +210,26 @@ impl CountingHandler {
     ///
     /// `Notify::notify_one` stores a permit when no waiter is parked, so this
     /// cannot miss a completion that lands before the await.
+    ///
+    /// Bounded on purpose. Every consume-side group blocks here, and the
+    /// counter only moves while something is delivering: the consumer-group,
+    /// supervisor and broadcast drivers all stop on their own after
+    /// `DRAIN_TIMEOUT` of idleness, so a single lost delivery would leave this
+    /// awaiting a count that can never move again. Unbounded, that is
+    /// `cargo bench` hanging silently until CI kills the job — a failure that
+    /// reads as "slow" rather than "broken". Failing here names the flow and
+    /// the count it reached instead.
     async fn completed(&self) {
-        self.done.notified().await;
+        if timeout(COMPLETION_TIMEOUT, self.done.notified())
+            .await
+            .is_err()
+        {
+            panic!(
+                "handler saw {} of {} messages in {COMPLETION_TIMEOUT:?}: a delivery was lost",
+                self.seen.load(Ordering::Relaxed),
+                self.target,
+            );
+        }
     }
 
     fn record(&self) {
@@ -280,15 +306,23 @@ async fn publish_n<T: Topic<Message = BenchMsg>>(
 /// Used where a flow's setup is only complete once messages have physically
 /// landed — the DLQ drain cannot be timed honestly while the last reject is
 /// still in flight.
+///
+/// Bounded for the same reason [`CountingHandler::completed`] is: a message
+/// that never routes would spin this loop forever.
 async fn wait_for_depth(client: &InMemoryBroker, queue: &str, expected: u64) {
     let stats = BrokerStatsProvider::new(client.clone());
-    loop {
-        if let Ok(s) = stats.get_queue_stats(queue).await
-            && s.messages_ready >= expected
-        {
-            return;
+    let poll = async {
+        loop {
+            if let Ok(s) = stats.get_queue_stats(queue).await
+                && s.messages_ready >= expected
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
+    };
+    if timeout(COMPLETION_TIMEOUT, poll).await.is_err() {
+        panic!("queue '{queue}' did not reach {expected} ready messages in {COMPLETION_TIMEOUT:?}");
     }
 }
 
@@ -583,7 +617,6 @@ fn bench_supervisor(c: &mut Criterion) {
                     let mut supervisor = broker.consumer_supervisor();
                     let shutdown = supervisor.cancellation_token();
 
-                    let start = Instant::now();
                     supervisor
                         .register::<SupTopicA, CountingHandler>(
                             handler.clone(),
@@ -609,7 +642,10 @@ fn bench_supervisor(c: &mut Criterion) {
                         )
                         .expect("register supervisor topic d");
 
+                    // Registration is setup, not dispatch: the timer starts
+                    // where every other consume group's does, at the driver.
                     let stop = CancellationToken::new();
+                    let start = Instant::now();
                     let task = tokio::spawn(
                         supervisor.run_until_timeout(stop.clone().cancelled_owned(), DRAIN_TIMEOUT),
                     );
@@ -678,9 +714,17 @@ fn bench_broadcast(c: &mut Criterion) {
                     // Deliver-new: the subscription is registered by the
                     // spawned delivery task, so publishing before it exists
                     // would drop messages and hang the wait below.
-                    while client.broadcast_subscriber_count(BroadcastTopic::topology().queue()) == 0
-                    {
-                        tokio::task::yield_now().await;
+                    let subscribed = async {
+                        while client.broadcast_subscriber_count(BroadcastTopic::topology().queue())
+                            == 0
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    };
+                    if timeout(COMPLETION_TIMEOUT, subscribed).await.is_err() {
+                        panic!(
+                            "broadcast subscription was not registered in {COMPLETION_TIMEOUT:?}"
+                        );
                     }
 
                     let start = Instant::now();

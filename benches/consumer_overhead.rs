@@ -53,6 +53,7 @@ use shove::{
 };
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
+use tokio::time::timeout;
 
 use common::{PAYLOAD_SIZES, payload};
 
@@ -70,6 +71,10 @@ const DISPATCH_MESSAGES: u64 = 512;
 
 /// How long the resource probe samples idle CPU for.
 const IDLE_SAMPLE: Duration = Duration::from_secs(2);
+
+/// Ceiling on the wait for a dispatch round to complete. Nothing should come
+/// close; it exists so a lost delivery fails the run rather than hanging it.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Topic & message ─────────────────────────────────────────────────────────
 
@@ -107,8 +112,21 @@ impl BenchHandler {
 
     /// Resolves once `target` messages have been handled. `notify_one` stores
     /// a permit when no waiter is parked, so a completion cannot be missed.
+    ///
+    /// Bounded so a lost delivery fails the run instead of hanging it: an
+    /// unbounded wait here is `cargo bench` producing no further output until
+    /// CI kills the job, which reads as "slow" rather than "broken".
     async fn completed(&self) {
-        self.done.notified().await;
+        if timeout(COMPLETION_TIMEOUT, self.done.notified())
+            .await
+            .is_err()
+        {
+            panic!(
+                "handler saw {} of {} messages in {COMPLETION_TIMEOUT:?}: a delivery was lost",
+                self.seen.load(Ordering::Relaxed),
+                self.target,
+            );
+        }
     }
 }
 
