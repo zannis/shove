@@ -1,0 +1,19 @@
+.github/workflows/publish.yml
+  s_0543e24843eca6::t_aaf7e45f3abc82 46,120,122,124,140,143
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5cd215d8479a861d17fb8da2459406602d722ac6",
+  "prompts": {},
+  "sessions": {
+    "s_0543e24843eca6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83b42429-bf3f-4e9a-a742-3416fde2ea47",
+        "model": "claude-fable-5"
+      },
+      "human_author": null
+    }
+  }
+}
