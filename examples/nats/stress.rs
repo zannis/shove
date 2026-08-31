@@ -10,15 +10,19 @@
 mod harness;
 
 use async_nats::jetstream;
-use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
-use shove::{Broker, Nats};
+use shove::nats::{NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
+use shove::{Backend, Nats};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
-use harness::{HarnessConfig, run_all_scenarios};
+use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 
 const STREAM_NAME: &str = "shove-stress-bench";
+
+/// Image tag started by `testcontainers_modules::nats`, recorded in the
+/// results provenance so a reader knows which server produced the numbers.
+const NATS_VERSION: &str = "2.10";
 
 #[tokio::main]
 async fn main() {
@@ -52,13 +56,25 @@ async fn main() {
         })
     });
 
-    let hcfg = HarnessConfig::<Nats>::new("nats").with_purge(purge);
+    // The drain shares the fill phase's client, so it reads the DLQ the fill
+    // just populated instead of racing a second connection against it.
+    let dlq_drain: DlqDrainFn<Nats> = Box::new(|client, handler| {
+        Box::pin(async move {
+            let consumer = NatsConsumer::new(client);
+            let _ = consumer.run_dlq::<StressTestTopic, _>(handler, ()).await;
+        })
+    });
+
+    let hcfg = HarnessConfig::<Nats>::new("nats")
+        .with_purge(purge)
+        .with_broker("NATS JetStream", NATS_VERSION, "docker single-node")
+        .with_dlq_drain(dlq_drain);
     run_all_scenarios(
         hcfg,
         || {
             let url = url.clone();
             async move {
-                Broker::<Nats>::new(NatsConfig::new(&url))
+                <Nats as Backend>::connect(NatsConfig::new(&url))
                     .await
                     .expect("connect NATS")
             }

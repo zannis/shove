@@ -15,14 +15,18 @@ use std::time::Duration;
 use lapin::options::QueuePurgeOptions;
 use lapin::{Connection, ConnectionProperties};
 use shove::rabbitmq as rmq;
-use shove::{Broker, RabbitMq};
+use shove::{Backend, RabbitMq};
 use testcontainers::core::ExecCommand;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::rabbitmq::RabbitMq as RabbitMqImage;
 
-use harness::{HarnessConfig, run_all_scenarios};
+use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 
 const QUEUE_NAME: &str = "shove-stress-bench";
+
+/// Image tag started by `testcontainers_modules::rabbitmq`, recorded in the
+/// results provenance so a reader knows which server produced the numbers.
+const RABBITMQ_VERSION: &str = "3";
 
 #[tokio::main]
 async fn main() {
@@ -67,13 +71,25 @@ async fn main() {
         })
     });
 
-    let hcfg = HarnessConfig::<RabbitMq>::new("rabbitmq").with_purge(purge);
+    // An AMQP delivery must be settled on the channel it arrived on, so the
+    // drain runs on the fill phase's own client rather than a fresh one.
+    let dlq_drain: DlqDrainFn<RabbitMq> = Box::new(|client, handler| {
+        Box::pin(async move {
+            let consumer = rmq::RabbitMqConsumer::new(client);
+            let _ = consumer.run_dlq::<StressTestTopic, _>(handler, ()).await;
+        })
+    });
+
+    let hcfg = HarnessConfig::<RabbitMq>::new("rabbitmq")
+        .with_purge(purge)
+        .with_broker("RabbitMQ", RABBITMQ_VERSION, "docker single-node")
+        .with_dlq_drain(dlq_drain);
     run_all_scenarios(
         hcfg,
         || {
             let uri = uri.clone();
             async move {
-                Broker::<RabbitMq>::new(rmq::RabbitMqConfig::new(&uri))
+                <RabbitMq as Backend>::connect(rmq::RabbitMqConfig::new(&uri))
                     .await
                     .expect("connect RabbitMQ")
             }

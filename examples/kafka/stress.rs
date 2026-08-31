@@ -15,15 +15,19 @@ use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use shove::kafka::{KafkaConfig, KafkaConsumerGroupConfig};
-use shove::{Broker, Kafka};
+use shove::kafka::{BatchConsumerOptions, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig};
+use shove::{Backend, Kafka};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
-use harness::{HarnessConfig, run_all_scenarios};
+use harness::{BatchConsumeFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 
 const TOPIC_NAME: &str = "shove-stress-bench";
 const DLQ_NAME: &str = "shove-stress-bench-dlq";
+
+/// Image tag started by `testcontainers_modules::kafka::apache`, recorded in
+/// the results provenance so a reader knows which broker produced the numbers.
+const KAFKA_VERSION: &str = "3.9";
 
 #[tokio::main]
 async fn main() {
@@ -69,13 +73,36 @@ async fn main() {
         })
     });
 
-    let hcfg = HarnessConfig::<Kafka>::new("kafka").with_purge(purge);
+    let dlq_drain: DlqDrainFn<Kafka> = Box::new(|client, handler| {
+        Box::pin(async move {
+            let consumer = KafkaConsumer::new(client);
+            let _ = consumer.run_dlq::<StressTestTopic, _>(handler, ()).await;
+        })
+    });
+
+    // Kafka is the only backend that has `run_batch` at all, which is why it
+    // is the only wrapper supplying this closure — and why `consume_batch`
+    // lands in every other backend's `unsupported[]` instead of being faked.
+    let batch_consume: BatchConsumeFn<Kafka> = Box::new(|client, handler| {
+        Box::pin(async move {
+            let consumer = KafkaConsumer::new(client);
+            let _ = consumer
+                .run_batch::<StressTestTopic, _>(handler, (), BatchConsumerOptions::new())
+                .await;
+        })
+    });
+
+    let hcfg = HarnessConfig::<Kafka>::new("kafka")
+        .with_purge(purge)
+        .with_broker("Apache Kafka", KAFKA_VERSION, "docker single-node (KRaft)")
+        .with_dlq_drain(dlq_drain)
+        .with_batch_consume(batch_consume);
     run_all_scenarios(
         hcfg,
         || {
             let bootstrap = bootstrap.clone();
             async move {
-                Broker::<Kafka>::new(KafkaConfig::new(&bootstrap))
+                <Kafka as Backend>::connect(KafkaConfig::new(&bootstrap))
                     .await
                     .expect("connect Kafka")
             }

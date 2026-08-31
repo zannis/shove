@@ -10,13 +10,13 @@
 #[path = "../common/stress_test.rs"]
 mod harness;
 
-use shove::sns::SnsConfig;
-use shove::{Broker, ConsumerOptions, Sqs};
+use shove::sns::{SnsConfig, SqsConsumer};
+use shove::{Backend, ConsumerOptions, Sqs};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::localstack::LocalStack;
 
-use harness::{HarnessConfig, run_supervisor_scenarios};
+use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_supervisor_scenarios};
 
 /// SQS caps `ReceiveMessage` batches at 10.
 const SQS_PREFETCH_CAP: u16 = 10;
@@ -89,10 +89,27 @@ async fn main() {
         })
     });
 
+    let dlq_drain: DlqDrainFn<Sqs> = Box::new(|client, handler| {
+        Box::pin(async move {
+            let consumer: SqsConsumer = <Sqs as Backend>::make_consumer(&client);
+            let _ = consumer.run_dlq::<StressTestTopic, _>(handler, ()).await;
+        })
+    });
+
     let hcfg = HarnessConfig::<Sqs>::new("sqs")
         .with_prefetch_cap(SQS_PREFETCH_CAP)
         .with_publish_chunk_size(SQS_PUBLISH_CHUNK)
-        .with_purge(purge);
+        .with_purge(purge)
+        .with_broker(
+            "AWS SQS (LocalStack)",
+            "localstack latest",
+            "docker localstack",
+        )
+        // The decisive flag: these numbers measure LocalStack, not AWS, so
+        // they must never be published as an absolute SQS throughput claim.
+        // Enforcing it here rather than in prose is the point.
+        .not_representative()
+        .with_dlq_drain(dlq_drain);
 
     run_supervisor_scenarios(
         hcfg,
@@ -102,7 +119,11 @@ async fn main() {
                 region: Some("us-east-1".into()),
                 endpoint_url: Some(endpoint),
             };
-            async move { Broker::<Sqs>::new(cfg).await.expect("connect SNS/SQS") }
+            async move {
+                <Sqs as Backend>::connect(cfg)
+                    .await
+                    .expect("connect SNS/SQS")
+            }
         },
         |prefetch, concurrent| {
             ConsumerOptions::<Sqs>::new()

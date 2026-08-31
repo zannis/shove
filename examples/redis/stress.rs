@@ -10,15 +10,19 @@
 mod harness;
 
 use redis::AsyncCommands;
-use shove::redis::{RedisConfig, RedisConsumerGroupConfig, RedisMode};
-use shove::{Broker, Redis};
+use shove::redis::{RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode};
+use shove::{Backend, Redis};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisImage};
 
-use harness::{HarnessConfig, run_all_scenarios};
+use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 
 const STREAM_KEY: &str = "shove-stress-bench";
+
+/// Image tag pinned by the `.with_tag("7.0")` call below, recorded in the
+/// results provenance so a reader knows which server produced the numbers.
+const REDIS_VERSION: &str = "7.0";
 
 #[tokio::main]
 async fn main() {
@@ -52,13 +56,25 @@ async fn main() {
         })
     });
 
-    let hcfg = HarnessConfig::<Redis>::new("redis").with_purge(purge);
+    // Same client for fill and drain: a second connection would race the
+    // first rather than read what it produced.
+    let dlq_drain: DlqDrainFn<Redis> = Box::new(|client, handler| {
+        Box::pin(async move {
+            let consumer = RedisConsumer::new(client);
+            let _ = consumer.run_dlq::<StressTestTopic, _>(handler, ()).await;
+        })
+    });
+
+    let hcfg = HarnessConfig::<Redis>::new("redis")
+        .with_purge(purge)
+        .with_broker("Redis Streams", REDIS_VERSION, "docker single-node")
+        .with_dlq_drain(dlq_drain);
     run_all_scenarios(
         hcfg,
         || {
             let url = url.clone();
             async move {
-                Broker::<Redis>::new(RedisConfig::new(RedisMode::Standalone { url }))
+                <Redis as Backend>::connect(RedisConfig::new(RedisMode::Standalone { url }))
                     .await
                     .expect("connect Redis")
             }
