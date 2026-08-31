@@ -7,9 +7,11 @@
 //! Metrics:
 //!   - **Startup** — registering `n` consumers and starting them.
 //!   - **Shutdown** — `shutdown_all()` wall-clock duration.
-//!   - **Dispatch** — publish-to-handler throughput with consumers
-//!     pre-started and a fixed message count, so there is no backlog.
-//!   - **RSS per consumer** — incremental memory cost of each consumer.
+//!   - **Dispatch** — live publish-to-handler latency: the consumers are
+//!     started *and warmed* before the timer, then a fixed message count is
+//!     published inside it. No startup and no pre-built backlog in the number.
+//!   - **RSS per consumer** — marginal memory cost of each added consumer,
+//!     measured on a cumulative sweep.
 //!   - **Idle CPU** — CPU usage with consumers running but no messages flowing.
 //!
 //! The first three go through criterion. The last two do not: criterion
@@ -69,6 +71,18 @@ const CONSUMER_COUNTS: [u16; 4] = [1, 16, 64, 256];
 /// Messages per dispatch iteration.
 const DISPATCH_MESSAGES: u64 = 512;
 
+/// Payload used by the dispatch warm-up burst. The warm-up exists to prove
+/// the group is live, so it carries the cheapest payload in the set rather
+/// than the round's own — its cost is pure overhead outside the timer.
+const WARMUP_PAYLOAD_BYTES: usize = 64;
+
+/// Warm-up deliveries before a dispatch round is timed: one per consumer, so
+/// the burst scales with the group rather than being a fixed number that is
+/// generous at 1 consumer and thin at 256.
+fn warmup_messages(consumers: u16) -> u64 {
+    u64::from(consumers).max(1)
+}
+
 /// How long the resource probe samples idle CPU for.
 const IDLE_SAMPLE: Duration = Duration::from_secs(2);
 
@@ -92,39 +106,64 @@ define_topic!(
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 
-/// Counts deliveries and signals once `target` have arrived. Does no work of
+/// Counts deliveries and signals at two milestones: `warm_target` (the group
+/// is live and draining) and `target` (the round is finished). Does no work of
 /// its own, so the groups below report framework cost only.
+///
+/// Two separate gates rather than one re-armable counter, because each
+/// milestone is an exact `==` on a value produced by a unique atomic
+/// increment: each fires once, so a stored `notify_one` permit can never be
+/// left behind to satisfy the *other* wait early.
 #[derive(Clone)]
 struct BenchHandler {
     seen: Arc<AtomicU64>,
+    warm_target: u64,
     target: u64,
+    warm: Arc<Notify>,
     done: Arc<Notify>,
 }
 
 impl BenchHandler {
+    /// A handler with no warm-up milestone. `0` is unreachable — the first
+    /// delivery is already `1` — so [`BenchHandler::warmed`] must not be
+    /// called on one of these.
     fn new(target: u64) -> Self {
+        Self::with_warmup(0, target)
+    }
+
+    fn with_warmup(warm_target: u64, target: u64) -> Self {
         Self {
             seen: Arc::new(AtomicU64::new(0)),
+            warm_target,
             target,
+            warm: Arc::new(Notify::new()),
             done: Arc::new(Notify::new()),
         }
     }
 
-    /// Resolves once `target` messages have been handled. `notify_one` stores
-    /// a permit when no waiter is parked, so a completion cannot be missed.
+    /// Resolves once the warm-up burst has been fully handled.
+    async fn warmed(&self) {
+        self.reached(&self.warm, self.warm_target, "warm-up").await;
+    }
+
+    /// Resolves once `target` messages have been handled.
+    async fn completed(&self) {
+        self.reached(&self.done, self.target, "dispatch").await;
+    }
+
+    /// Waits on one milestone gate. `notify_one` stores a permit when no
+    /// waiter is parked, so a milestone reached before the wait is entered
+    /// cannot be missed.
     ///
     /// Bounded so a lost delivery fails the run instead of hanging it: an
     /// unbounded wait here is `cargo bench` producing no further output until
     /// CI kills the job, which reads as "slow" rather than "broken".
-    async fn completed(&self) {
-        if timeout(COMPLETION_TIMEOUT, self.done.notified())
-            .await
-            .is_err()
-        {
+    async fn reached(&self, gate: &Notify, target: u64, phase: &str) {
+        if timeout(COMPLETION_TIMEOUT, gate.notified()).await.is_err() {
             panic!(
-                "handler saw {} of {} messages in {COMPLETION_TIMEOUT:?}: a delivery was lost",
+                "{phase}: handler saw {} of {target} messages in {COMPLETION_TIMEOUT:?}: \
+                 a delivery was lost",
                 self.seen.load(Ordering::Relaxed),
-                self.target,
             );
         }
     }
@@ -134,7 +173,11 @@ impl MessageHandler<OverheadTopic> for BenchHandler {
     type Context = ();
 
     async fn handle(&self, _msg: BenchMsg, _meta: MessageMetadata, _ctx: &()) -> Outcome {
-        if self.seen.fetch_add(1, Ordering::Relaxed).saturating_add(1) == self.target {
+        let seen = self.seen.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if seen == self.warm_target {
+            self.warm.notify_one();
+        }
+        if seen == self.target {
             self.done.notify_one();
         }
         Outcome::Ack
@@ -276,29 +319,59 @@ fn current_rss_bytes() -> u64 {
     }
 }
 
-/// Sample RSS-per-consumer and idle CPU, once per consumer count, and print a
-/// table to stderr.
+/// Sample marginal RSS-per-consumer and idle CPU across the consumer-count
+/// sweep, and print a table to stderr.
 ///
-/// Process RSS does not shrink after consumers are torn down, so only the
-/// first allocation at each count is real — averaging across repeated rounds
-/// would be meaningless, which is why this is a single-shot probe and not a
-/// criterion group.
+/// **The sweep is cumulative.** Each row registers only the consumers the
+/// previous row did not have, keeps every earlier consumer alive and running,
+/// and divides the RSS growth by the number *added*. Tearing each round down
+/// before the next — the obvious shape — makes every row after the first
+/// understate: process RSS does not shrink on teardown, so the freed pages
+/// stay resident and the allocator serves the next, larger round out of them.
+/// The delta shrinks while the true cost does not. Nothing is freed between
+/// rows here, so each delta is memory the added consumers actually caused.
+///
+/// Two limits survive and are why this stays a single-shot stderr table rather
+/// than a criterion measurement:
+///
+/// - The first row also carries the process's one-time consumer machinery, so
+///   it is an upper bound, not a per-consumer cost.
+/// - Any row can still be served partly out of arena slack the allocator had
+///   already mapped, which no in-process probe can subtract.
+///
+/// `CONSUMERS` is the live total after the row's additions; `RSS KB/ADDED`
+/// divides that row's growth by its own additions only.
 fn resource_probe(rt: &Runtime) {
     eprintln!();
     eprintln!("consumer resource probe (not a criterion measurement)");
+    eprintln!("cumulative sweep: consumers accumulate across rows, so no row is");
+    eprintln!("measured against pages an earlier row freed.");
     eprintln!(
-        "{:>10} {:>14} {:>12}",
-        "CONSUMERS", "RSS KB/CONSUMER", "IDLE CPU"
+        "{:>10} {:>8} {:>14} {:>12}",
+        "CONSUMERS", "ADDED", "RSS KB/ADDED", "IDLE CPU"
     );
-    eprintln!("{}", "-".repeat(40));
+    eprintln!("{}", "-".repeat(48));
 
-    for consumers in CONSUMER_COUNTS {
-        let (rss_per_consumer_kb, idle_cpu_pct) = rt.block_on(async move {
-            let (client, _broker) = fresh_broker().await;
-            let handler = BenchHandler::new(u64::MAX);
+    rt.block_on(async {
+        let (client, _broker) = fresh_broker().await;
+        // Every registry stays alive until the sweep ends: dropping or
+        // shutting one down mid-sweep is exactly the reuse this shape exists
+        // to avoid.
+        let mut live: Vec<InMemoryConsumerGroupRegistry> = Vec::new();
+        let mut previous: u16 = 0;
+
+        for consumers in CONSUMER_COUNTS {
+            let added = consumers.checked_sub(previous).filter(|added| *added > 0);
+            let Some(added) = added else {
+                panic!(
+                    "CONSUMER_COUNTS must be strictly ascending for a cumulative sweep, \
+                     got {consumers} after {previous}"
+                );
+            };
+            previous = consumers;
 
             let rss_before = current_rss_bytes();
-            let mut registry = registry(&client, consumers, handler).await;
+            let mut registry = registry(&client, added, BenchHandler::new(u64::MAX)).await;
             registry.start_all();
 
             let cpu_before = current_cpu_secs();
@@ -306,20 +379,25 @@ fn resource_probe(rt: &Runtime) {
             tokio::time::sleep(IDLE_SAMPLE).await;
             let wall = wall_start.elapsed().as_secs_f64();
             let cpu_delta = current_cpu_secs() - cpu_before;
-
             let rss_delta_kb = current_rss_bytes().saturating_sub(rss_before) as f64 / 1024.0;
-            registry.shutdown_all().await;
+
+            live.push(registry);
 
             let idle_cpu_pct = if wall > 0.0 {
                 cpu_delta / wall * 100.0
             } else {
                 0.0
             };
-            (rss_delta_kb / f64::from(consumers), idle_cpu_pct)
-        });
+            // `added` is non-zero by the guard above.
+            let rss_per_added_kb = rss_delta_kb / f64::from(added);
 
-        eprintln!("{consumers:>10} {rss_per_consumer_kb:>14.1} {idle_cpu_pct:>11.1}%");
-    }
+            eprintln!("{consumers:>10} {added:>8} {rss_per_added_kb:>14.1} {idle_cpu_pct:>11.1}%");
+        }
+
+        for registry in live.iter_mut() {
+            registry.shutdown_all().await;
+        }
+    });
     eprintln!();
 }
 
@@ -405,10 +483,30 @@ fn bench_shutdown(c: &mut Criterion) {
 
 // ── Dispatch ────────────────────────────────────────────────────────────────
 
-/// Publish-to-handler dispatch through a pre-started group of `n` consumers.
+/// Live publish-to-handler latency through a pre-started group of `n`
+/// consumers.
 ///
-/// Consumers are up and the messages are already queued before the timer
-/// starts, so this is dispatch cost with no startup and no backlog build-up.
+/// The timed region is a *live* publish of `DISPATCH_MESSAGES` and the wait
+/// for the last of them to reach a handler. Everything else is outside it:
+/// the group is started and then warmed with [`warmup_messages`] deliveries
+/// that must all be handled before the timer starts. Two reasons the warm-up
+/// is not optional:
+///
+/// - It keeps consumer-task startup out of this measurement. Timing
+///   `start_all()` here would make a pure startup regression show up in both
+///   this group and `consumer_overhead_startup`, and leave live publish
+///   latency — the thing this group exists to isolate — with no signal of
+///   its own.
+/// - Publishing the whole round *before* starting the consumers would measure
+///   the drain of a pre-built backlog, which is a different quantity: the
+///   publisher never competes with the handlers for the runtime.
+///
+/// What the warm-up guarantees is that the group is live and draining before
+/// the timer starts, not that every individual consumer task has polled —
+/// which message lands on which consumer is the backend's to decide. It uses
+/// the smallest payload regardless of the round's own size, because its job
+/// is liveness, not allocation shape.
+///
 /// Parameterized over consumer count *and* payload size, because the two
 /// interact: more consumers only help until per-message serde dominates.
 fn bench_dispatch(c: &mut Criterion) {
@@ -419,32 +517,49 @@ fn bench_dispatch(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(15));
 
+    let warmup_body = payload(WARMUP_PAYLOAD_BYTES);
+
     for consumers in CONSUMER_COUNTS {
+        let warmup = warmup_messages(consumers);
         for bytes in PAYLOAD_SIZES {
             let body = payload(bytes);
+            let warmup_body = warmup_body.clone();
             group.bench_with_input(
                 BenchmarkId::new(format!("consumers_{consumers}"), bytes),
                 &body,
                 |b, body| {
-                    b.to_async(&rt).iter_custom(|iters| async move {
-                        let mut elapsed = Duration::ZERO;
-                        for _ in 0..iters {
-                            let (client, broker) = fresh_broker().await;
-                            let publisher = broker.publisher().await.expect("publisher");
-                            publish_n(&publisher, body, DISPATCH_MESSAGES).await;
+                    let warmup_body = warmup_body.clone();
+                    b.to_async(&rt).iter_custom(|iters| {
+                        let warmup_body = warmup_body.clone();
+                        async move {
+                            let mut elapsed = Duration::ZERO;
+                            for _ in 0..iters {
+                                let (client, broker) = fresh_broker().await;
+                                let publisher = broker.publisher().await.expect("publisher");
 
-                            let handler = BenchHandler::new(DISPATCH_MESSAGES);
-                            let signal = handler.clone();
-                            let mut reg = registry(&client, consumers, handler).await;
+                                let handler = BenchHandler::with_warmup(
+                                    warmup,
+                                    warmup.saturating_add(DISPATCH_MESSAGES),
+                                );
+                                let signal = handler.clone();
+                                let mut reg = registry(&client, consumers, handler).await;
+                                reg.start_all();
 
-                            let start = Instant::now();
-                            reg.start_all();
-                            signal.completed().await;
-                            elapsed = elapsed.saturating_add(start.elapsed());
+                                // Outside the timer: the wait returns only once
+                                // the group has drained the whole burst, so the
+                                // consumers are demonstrably live below.
+                                publish_n(&publisher, &warmup_body, warmup).await;
+                                signal.warmed().await;
 
-                            reg.shutdown_all().await;
+                                let start = Instant::now();
+                                publish_n(&publisher, body, DISPATCH_MESSAGES).await;
+                                signal.completed().await;
+                                elapsed = elapsed.saturating_add(start.elapsed());
+
+                                reg.shutdown_all().await;
+                            }
+                            elapsed
                         }
-                        elapsed
                     });
                 },
             );
