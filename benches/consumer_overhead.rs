@@ -792,14 +792,13 @@ fn resource_probe() {
         "own floor, carrying the jitter of both independently sampled sides, so a noisy shape"
     );
     eprintln!(
-        "cannot raise the bar for a comparison it is not part of, and never below one page \
-         ({:.1} KB),",
+        "cannot raise the bar for a comparison it is not part of. That floor never drops below"
+    );
+    eprintln!(
+        "one page ({:.1} KB), the unit RSS moves in. A difference that does not clear it prints",
         rss_quantum_kb()
     );
-    eprintln!("the unit RSS moves in. A difference");
-    eprintln!(
-        "that does not clear its floor prints with a leading `~`: the value observed, flagged"
-    );
+    eprintln!("with a leading `~`: the value observed, flagged");
     eprintln!(
         "as indistinguishable from zero here. `~` is not an upper bound — {PROBE_REPEATS} samples \
          give none."
