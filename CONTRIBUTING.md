@@ -225,12 +225,27 @@ bash .github/scripts/check-action-pins.test.sh   # the checker's own tests
 
 It reads the workflows line by line rather than with a YAML parser, so a missing
 `yq` can never turn the gate into a skip. The price is that it insists on block
-style: a flow mapping, a flow sequence holding a mapping, an explicit `? key`,
-an anchored key, or a quoted key containing an escape are all rejected as
-unreadable rather than passed over. That is deliberate — they are the spellings
-a `uses:` key can hide in — and the fix is to write the entry as an ordinary
-`key: value` mapping. A flow sequence of plain scalars (`branches: [main]`) and
-a `${{ }}` expression are both fine.
+style: a non-empty flow mapping, a flow sequence holding a mapping, an explicit
+`? key`, an anchor or tag in key or value position, and a quoted key containing
+an escape are all rejected as unreadable rather than passed over. That is
+deliberate — they are the spellings a `uses:` key can hide in — and the fix is
+to write the entry as an ordinary `key: value` mapping.
+
+What stays readable is anything whose *form* rules a hidden key out, which is
+most of what a workflow is made of:
+
+| Accepted | Why |
+|---|---|
+| `branches: [main]`, `tags: ["v*"]` | a flow sequence of scalars holds no key |
+| `permissions: {}` | an empty flow mapping holds no key either |
+| `PAYLOAD: '{"safe":true}'` | a quoted scalar is a scalar, braces and all |
+| `TEMPLATE: prefix-{0}` | a plain scalar cannot open a flow collection |
+| `matrix: ${{ fromJSON('{"os":["a"]}') }}` | a GitHub expression, not YAML flow |
+
+One shape worth knowing about: a quoted value has to close its quote on the same
+line. A quoted scalar continued onto the next line is rejected, because the
+scanner would otherwise be reading those lines out of context — use a `|` or `>`
+block scalar for anything that long.
 
 One thing pinning does **not** cover, worth knowing before relying on it:
 `cargo binstall` fetches a prebuilt binary from the upstream project's GitHub

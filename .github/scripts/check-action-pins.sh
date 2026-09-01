@@ -49,6 +49,17 @@
 # scanner can read literally. That is what makes the promise above true rather
 # than aspirational; it also means an exotic-but-valid workflow gets a "rewrite
 # this" error, which is the trade this gate exists to make.
+#
+# The same reasoning runs the other way for the value, and the symmetry matters
+# because the two errors are not equally cheap. Whether a value can hold a key
+# at all is decided by what the value *is* -- a flow collection, a quoted
+# scalar, a plain scalar -- and never by which characters appear somewhere in
+# it. Searching the raw line for a `{` both rejects `PAYLOAD: '{"safe":true}'`,
+# where the brace is a character inside a scalar, and misses
+# `steps: ["uses":actions/checkout@v6]`, where a quoted key needs no space
+# before its `:` because YAML allows the JSON spelling inside flow. Reading the
+# value's form instead gets both right: quoted scalars are stepped over whole,
+# and a flow collection is walked with its quotes honoured.
 
 set -uo pipefail
 
@@ -110,15 +121,67 @@ scan() {
       return out s
     }
 
-    function flow_balance(s,   i, c, n, depth) {
+    # The position of the quote closing the scalar that starts at `i`, or 0
+    # when it is never closed on this line. `'"'"''"'"'` inside a single-quoted scalar
+    # and a backslash escape inside a double-quoted one do not close it.
+    function quoted_end(s, i,   q, n, c) {
+      q = substr(s, i, 1)
+      n = length(s)
+      i++
+      while (i <= n) {
+        c = substr(s, i, 1)
+        if (q == "'"'"'") {
+          if (c == "'"'"'") {
+            if (substr(s, i + 1, 1) != "'"'"'") return i
+            i += 2
+            continue
+          }
+        } else {
+          if (c == "\\") { i += 2; continue }
+          if (c == "\"") return i
+        }
+        i++
+      }
+      return 0
+    }
+
+    # Walk a flow collection, stepping over quoted scalars whole. Flow is the
+    # one value form on a line that can carry a key of its own, and `:` is how
+    # it spells one -- with no space after it required when the key is quoted,
+    # since YAML allows the JSON spelling inside flow. That is what makes
+    # `["uses":actions/checkout@v6]` a step while looking like a list of one
+    # string. Returns "" when the line is readable, else why it is not.
+    function flow_probe(s,   i, n, c, prev, depth, e, j) {
       depth = 0
       n = length(s)
       for (i = 1; i <= n; i++) {
         c = substr(s, i, 1)
-        if (c == "[" || c == "{") depth++
+        prev = " "
+        if (i > 1) prev = substr(s, i - 1, 1)
+        # A `#` only opens a comment after a space, so `[a#b]` keeps its hash.
+        if (c == "#" && (prev == " " || prev == "\t")) break
+        if (c == "\"" || c == "'"'"'") {
+          e = quoted_end(s, i)
+          if (e == 0) return "open"
+          i = e
+          continue
+        }
+        if (c == "{") {
+          # `permissions: {}` is the recommended way to drop every token
+          # scope, and an empty mapping demonstrably holds no key. Any other
+          # mapping does, and this scanner cannot read one.
+          j = i + 1
+          while (substr(s, j, 1) == " " || substr(s, j, 1) == "\t") j++
+          if (substr(s, j, 1) != "}") return "mapping"
+          i = j
+          continue
+        }
+        if (c == ":") return "mapping"
+        if (c == "[") depth++
         else if (c == "]" || c == "}") depth--
       }
-      return depth
+      if (depth != 0) return "open"
+      return ""
     }
 
     BEGIN { in_skip = 0; skip_indent = 0 }
@@ -149,14 +212,6 @@ scan() {
 
     # Whole-line comments.
     /^[ ]*#/ { next }
-
-    # Flow style. `- {uses: actions/checkout@v6}` is valid, Actions runs it,
-    # and a line scanner cannot follow it. Fail closed rather than skip.
-    /[{,][ \t]*("uses"|'"'"'uses'"'"'|uses)[ \t]*:/ ||
-    /^[ ]*-[ ]*[[{]/ {
-      violation("unrecognised form: this line uses YAML flow style, which this checker cannot read. Rewrite it as a block mapping.")
-      next
-    }
 
     # An action reference: `uses` as a key, optionally quoted, at a position
     # where YAML can start one. Covers step entries, `- uses:`, and a job-level
@@ -269,20 +324,58 @@ scan() {
       }
 
       value = strip_expressions(value)
-      if (match(value, /[ \t]+#/)) value = substr(value, 1, RSTART - 1)
+      sub(/^[ \t]+/, "", value)
 
-      # A flow mapping can hold a `uses` key, and so can a flow sequence: YAML
-      # lets a single-pair mapping appear in one with no braces at all, which
-      # makes `steps: [uses: actions/checkout@v6]` a step. A flow sequence of
-      # scalars -- `branches: [main]` -- carries no key and stays readable.
-      if (index(value, "{") > 0 || (index(value, "[") > 0 && key_colon(value) > 0)) {
-        violation("unrecognised form: this line uses YAML flow style, which this checker cannot read. Rewrite it as a block mapping.")
+      # No value on this line: it is nested on the lines below, and those are
+      # scanned on their own terms.
+      if (value == "" || substr(value, 1, 1) == "#") next
+
+      # An anchor, alias or tag in value position hides the node behind it from
+      # a line scanner, exactly as one in key position does.
+      if (value ~ /^[&*!]/) {
+        violation("unrecognised form: an anchor, alias or tag in value position, which this checker cannot resolve. Write the value literally.")
         next
       }
-      if (flow_balance(value) != 0) {
-        violation("unrecognised form: a flow collection left open across lines, which this checker cannot read. Rewrite it as a block mapping.")
+
+      # What the value *is* decides this, not which characters it contains. A
+      # quoted scalar is a scalar however much punctuation it holds, so its
+      # braces and colons are characters rather than structure -- testing the
+      # raw line for a `{` rejects `PAYLOAD: '"'"'{"safe":true}'"'"'`, an ordinary
+      # value. The acceptance is only sound because the closing quote is found
+      # on this line: a quote left open continues onto lines read out of
+      # context, which is the one thing this scanner must not answer clean for.
+      vc = substr(value, 1, 1)
+      if (vc == "\"" || vc == "'"'"'") {
+        e = quoted_end(value, 1)
+        if (e == 0) {
+          violation("unrecognised form: a quoted value left open across lines, which this checker cannot read. Close it on one line, or use a `|` or `>` block scalar.")
+          next
+        }
+        rest = substr(value, e + 1)
+        sub(/^[ \t]+/, "", rest)
+        if (rest != "" && substr(rest, 1, 1) != "#") {
+          violation("unrecognised form: this checker could not read the value on this line. Write it as a single plain or quoted scalar.")
+        }
         next
       }
+
+      # A flow collection is the only value form left that can hold a key --
+      # a mapping, or a sequence, which YAML lets hold a single-pair mapping
+      # with no braces at all, making `steps: [uses: actions/checkout@v6]` a
+      # step. A sequence of scalars -- `branches: [main]` -- holds no key.
+      if (vc == "[" || vc == "{") {
+        why = flow_probe(value)
+        if (why == "mapping") {
+          violation("unrecognised form: this line uses YAML flow style, which this checker cannot read. Rewrite it as a block mapping.")
+        } else if (why == "open") {
+          violation("unrecognised form: a flow collection left open across lines, which this checker cannot read. Rewrite it as a block mapping.")
+        }
+        next
+      }
+
+      # A plain scalar. It cannot open a flow collection -- that needs a `[` or
+      # a `{` in first position, handled above -- and block style forbids `: `
+      # inside one, so there is no key for this scanner to have misread.
       next
     }
   ' < "$1"

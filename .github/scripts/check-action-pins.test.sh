@@ -408,6 +408,97 @@ YAML
 )"
 expect_message 1 "unrecognised" "rejects a flow collection spanning several lines" "$f"
 
+# Inside a flow collection a quoted key needs no space before its `:` -- YAML
+# allows the JSON spelling there, unlike in block style. So the same hidden
+# step can be written with the colon adjacent, which no rule keyed on `: `
+# sees at all.
+f="$(fixture flow_seq_adjacent.yml <<'YAML'
+jobs:
+  build:
+    steps: ["uses":actions/checkout@v6]
+YAML
+)"
+expect_message 1 "unrecognised" "rejects an adjacent quoted key in a flow sequence" "$f"
+
+f="$(fixture flow_map_adjacent.yml <<'YAML'
+jobs:
+  build:
+    steps: [{"uses":actions/checkout@v6}]
+YAML
+)"
+expect_message 1 "unrecognised" "rejects an adjacent quoted key in a flow mapping" "$f"
+
+# A quote that never closes leaves the rest of the value on another line, so
+# the scanner cannot know what the value ends up being.
+f="$(fixture open_quote.yml <<'YAML'
+jobs:
+  build:
+    env:
+      PAYLOAD: "still going
+        and going"
+YAML
+)"
+expect_message 1 "unrecognised" "rejects a quoted value left open across lines" "$f"
+
+# --- accepted: braces and colons inside ordinary scalars -----------------
+
+# The flow rules must look at what the value *is*, not at which characters it
+# contains. A quoted scalar is a scalar however much punctuation it holds, and
+# rejecting these makes the gate unusable on workflows that pass JSON around.
+f="$(fixture scalar_punctuation.yml <<YAML
+on:
+  push:
+    branches: [main] # only: the default branch
+env:
+  PAYLOAD: '{"safe":true}'
+  SHELL_SNIPPET: "for f in *; do echo \${f}; done # not a comment"
+  COLONS: "a: b"
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@${SHA} # v6.1.0
+YAML
+)"
+expect_exit 0 "accepts braces, colons and hashes inside quoted scalars" "$f"
+
+# A plain scalar cannot open a flow collection -- that needs a \`[\` or \`{\` in
+# the first position -- so punctuation later in one is just punctuation.
+f="$(fixture plain_scalar_braces.yml <<YAML
+env:
+  TEMPLATE: prefix-{0}-suffix
+  GLOB: src/**/[abc].rs
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@${SHA} # v6.1.0
+YAML
+)"
+expect_exit 0 "accepts a plain scalar containing flow punctuation" "$f"
+
+# \`permissions: {}\` is the recommended way to drop every token scope, so a gate
+# that rejects it argues against the hardening it exists to enforce. An empty
+# flow mapping is the one that provably holds no key.
+f="$(fixture empty_flow_map.yml <<YAML
+permissions: {}
+jobs:
+  build:
+    permissions: { }
+    steps:
+      - uses: actions/checkout@${SHA} # v6.1.0
+YAML
+)"
+expect_exit 0 "accepts an empty flow mapping" "$f"
+
+f="$(fixture nonempty_flow_map.yml <<YAML
+jobs:
+  build:
+    permissions: {contents: read}
+    steps:
+      - uses: actions/checkout@${SHA} # v6.1.0
+YAML
+)"
+expect_message 1 "unrecognised" "rejects a non-empty flow mapping value" "$f"
+
 # --- job-level reusable workflow calls ----------------------------------
 
 f="$(fixture reusable_bad.yml <<'YAML'
