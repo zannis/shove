@@ -93,11 +93,19 @@ const IDLE_SAMPLE: Duration = Duration::from_secs(2);
 /// must not be read as a cost at all. Odd, so the median is an observed sample
 /// rather than an interpolation between two. Each sample costs one process and
 /// one [`IDLE_SAMPLE`], so this multiplies the probe's wall-clock by itself.
+///
+/// Five is also the smallest count that lets [`inner_range`] do its job: it
+/// drops the highest and the lowest sample before measuring how far a shape
+/// moved, so one aberrant process cannot set the bar for every comparison that
+/// shape takes part in, and three samples have to survive that trim for the
+/// range left over to mean anything.
 const PROBE_REPEATS: usize = 5;
 
 // Both properties are load-bearing above: even counts have no observed median,
-// and zero repeats would leave every figure empty.
-const _: () = assert!(PROBE_REPEATS > 0 && PROBE_REPEATS % 2 == 1);
+// and at four or fewer, [`inner_range`] is left with one sample or none — a
+// range of zero however far the processes actually moved, which would mark
+// every difference resolved.
+const _: () = assert!(PROBE_REPEATS >= 5 && PROBE_REPEATS % 2 == 1);
 
 /// Ceiling on the wait for a dispatch round to complete. Nothing should come
 /// close; it exists so a lost delivery fails the run rather than hanging it.
@@ -461,7 +469,7 @@ fn current_rss_bytes() -> u64 {
             && let Some(rss_pages) = content.split_whitespace().nth(1)
             && let Ok(pages) = rss_pages.parse::<u64>()
         {
-            return pages.saturating_mul(4096);
+            return pages.saturating_mul(page_bytes());
         }
         0
     }
@@ -528,8 +536,13 @@ struct ProbeStats {
     /// Median process RSS — the median rather than the mean, so one process
     /// that happened to map an extra arena moves the row by nothing.
     rss_kb: f64,
-    /// `max - min` across this shape's own processes: how far the identical
-    /// measurement moved when nothing about it changed.
+    /// How far the identical measurement moved when nothing about it changed:
+    /// the range of this shape's own processes **after the highest and the
+    /// lowest are dropped** ([`inner_range`]). Trimmed rather than `max - min`
+    /// because this number is a floor other figures are judged against, and a
+    /// plain range is set by its single worst sample — one aberrant process in
+    /// the bare shape would otherwise raise the bar under every `OVER BASE`
+    /// cell and under `GROUP FIXED` at once.
     rss_spread_kb: f64,
     /// Median idle CPU.
     idle_cpu_pct: f64,
@@ -546,11 +559,8 @@ fn probe_shape(probe: Probe) -> ProbeStats {
     ProbeStats {
         probe,
         rss_kb,
-        // `median` left `rss` sorted, so the ends are the min and the max.
-        rss_spread_kb: match (rss.first(), rss.last()) {
-            (Some(min), Some(max)) => max - min,
-            _ => f64::NAN,
-        },
+        // `median` left `rss` sorted, which is what `inner_range` reads.
+        rss_spread_kb: inner_range(&rss),
         idle_cpu_pct: median(&mut idle_cpu),
     }
 }
@@ -563,8 +573,32 @@ fn median(values: &mut [f64]) -> f64 {
     values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
-/// The resolution floor for a difference between two shapes: the wider of the
-/// two shapes' own spreads.
+/// How far `sorted` moved, ignoring its single highest and single lowest
+/// value: the range of what is left. With [`PROBE_REPEATS`] at 5 that is the
+/// range of the middle three samples.
+///
+/// A plain `max - min` is decided by one sample at each end, and this number
+/// is a **floor** — every difference it takes part in has to clear it. One
+/// process that mapped an extra arena would set the bar for all of them; on
+/// the bare shape, whose spread floors every `OVER BASE` cell and
+/// `GROUP FIXED` alike, that one sample suppresses the whole baseline column
+/// of the table, however tightly the other four processes agreed. Trimming
+/// each end is what makes a shape's floor a property of its processes rather
+/// than of its worst one. It buys tolerance for one aberrant process per
+/// shape, not two: this is a range over samples, not a robust estimator, and
+/// [`PROBE_REPEATS`] is what bounds how much of it can be thrown away.
+fn inner_range(sorted: &[f64]) -> f64 {
+    // Fewer than three samples leaves nothing between the two dropped ends;
+    // NAN then marks every difference unresolved, which is the safe direction.
+    let highest_inner = sorted.len().saturating_sub(2);
+    match (sorted.get(1), sorted.get(highest_inner)) {
+        (Some(low), Some(high)) if highest_inner >= 1 => high - low,
+        _ => f64::NAN,
+    }
+}
+
+/// The resolution floor for a difference between two shapes: the two shapes'
+/// own spreads **added**.
 ///
 /// Local to the pair on purpose. A single floor taken across the whole table —
 /// the widest spread anywhere on it — lets one noisy shape set the bar for
@@ -574,8 +608,53 @@ fn median(values: &mut [f64]) -> f64 {
 /// suppress a real difference between two shapes that were both perfectly
 /// stable. A difference can only be obscured by the noise on its own two
 /// sides, so that is the only noise it is judged against.
+///
+/// Added rather than `max`, because the quantity being judged is a
+/// *difference* between two shapes sampled in **independent** processes, and
+/// each side carries its own jitter into it. Take two shapes whose samples
+/// each span a page: `A` over `[1000, 1020]` with median 1000, `B` over
+/// `[1010, 1030]` with median 1030. The medians differ by 30 and each spread
+/// is 20, so `max` calls 30 resolved — while `B`'s lowest process actually
+/// came in *below* `A`'s highest, a difference of -10 in the opposite
+/// direction. Two sample sets that overlap have not shown this probe a
+/// difference at all. Their sum, 40, is the width of the difference's own
+/// admissible range (`B_max - A_min` down to `B_min - A_max`), and clearing it
+/// is what "the two shapes did not overlap" amounts to.
+/// Never below one page either. Trimming can leave a shape's spread at zero —
+/// three of its five processes reporting the identical RSS is ordinary, since
+/// RSS moves in whole pages — and a floor of zero would call a single page of
+/// movement a resolved cost. One page is the unit this instrument reports in,
+/// so it is the smallest difference it can be asked to stand behind.
 fn pair_floor(a: &ProbeStats, b: &ProbeStats) -> f64 {
-    a.rss_spread_kb.max(b.rss_spread_kb)
+    // The const assert on `PROBE_REPEATS` keeps both spreads real numbers here;
+    // `inner_range` only yields NAN below three samples.
+    (a.rss_spread_kb + b.rss_spread_kb).max(rss_quantum_kb())
+}
+
+/// One page in KB: the step process RSS moves in, and so the finest difference
+/// this probe could observe at all.
+fn rss_quantum_kb() -> f64 {
+    page_bytes() as f64 / 1024.0
+}
+
+/// The kernel's page size, asked for rather than assumed.
+///
+/// `/proc/self/statm` counts pages, not bytes, and 4 KiB is not universal — an
+/// arm64 kernel can be built with 16 KiB or 64 KiB pages. Reading the size back
+/// keeps the RSS figures, and the resolution floor built out of them, in the
+/// same units as the kernel that produced them.
+#[cfg(unix)]
+fn page_bytes() -> u64 {
+    // SAFETY: `sysconf` reads a numeric limit by id and returns a `long`. No
+    // pointers cross the boundary. A negative return (the id is unsupported)
+    // fails the conversion and falls back to the near-universal 4 KiB.
+    let reported = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(reported).unwrap_or(4096)
+}
+
+#[cfg(not(unix))]
+fn page_bytes() -> u64 {
+    4096
 }
 
 /// A difference between two shapes, printed with a `~` when it does not clear
@@ -583,7 +662,7 @@ fn pair_floor(a: &ProbeStats, b: &ProbeStats) -> f64 {
 ///
 /// The marked form still prints the observed difference, because that is the
 /// measurement; the `~` says this probe cannot tell it apart from zero. It is
-/// deliberately not `<floor`. The floor is the max-min spread of
+/// deliberately not `<floor`. The floor is built out of the observed spread of
 /// [`PROBE_REPEATS`] samples, not a confidence interval, so it supports no
 /// claim about where the true difference lies — and at `delta == floor`, which
 /// is unremarkable when both are whole 4 KiB pages, `<floor` prints a strict
@@ -657,14 +736,24 @@ fn resolved_per_consumer(delta_kb: f64, added: f64, floor_kb: f64) -> String {
 /// wearing a number's clothes.
 ///
 /// Every shape is therefore sampled in [`PROBE_REPEATS`] processes and the
-/// table reports each row's **median** and its own **spread** (`max - min`
-/// over that shape's processes).
+/// table reports each row's **median** and its own **spread** — how far that
+/// shape's processes moved once the highest and the lowest are dropped
+/// ([`inner_range`]), so a shape's floor is not decided by its one worst
+/// process. That matters most on the bare shape, which is a side of every
+/// `OVER BASE` cell and of `GROUP FIXED`: untrimmed, one aberrant bare process
+/// raises the bar under the entire baseline column at once.
 ///
 /// Each difference is then judged against **its own** floor — [`pair_floor`],
-/// the wider of the two shapes it is taken between — rather than against one
-/// floor shared by the whole table. Sharing one would let a single noisy shape
-/// raise the bar for every unrelated comparison. A difference that does not
-/// clear its floor is printed with a leading `~`, in `OVER BASE`, in
+/// the two shapes' spreads added — rather than against one floor shared by the
+/// whole table. Sharing one would let a single noisy shape raise the bar for
+/// every unrelated comparison; adding the pair's two is what makes the floor
+/// the uncertainty of the *difference*, which carries the jitter of both
+/// independently sampled sides rather than of the noisier one. That sum is
+/// held to a minimum of one page, the unit RSS moves in, so a trim that leaves
+/// both sides at zero spread cannot turn a single page of movement into a
+/// resolved cost.
+///
+/// A difference that does not clear its floor is printed with a leading `~`, in `OVER BASE`, in
 /// `KB/CONSUMER` and in `GROUP FIXED` alike: the value observed, flagged as
 /// indistinguishable from zero at this probe's resolution. It is not reported
 /// as a bound on the true difference — [`PROBE_REPEATS`] samples support no
@@ -696,15 +785,18 @@ fn resource_probe() {
     eprintln!("registry and one group, so KB/CONSUMER is a process-to-process difference with the");
     eprintln!("group cost cancelled — including row 1, which is differenced against the");
     eprintln!("zero-consumer group below it.");
+    eprintln!("SPREAD is how far a row moved when re-measured, over its own processes with the");
+    eprintln!("highest and lowest dropped, so one aberrant process cannot set a row's bar. Every");
+    eprintln!("difference is judged against the SUM of the two SPREADs it is taken between — its");
     eprintln!(
-        "SPREAD is a row's own max-min: the identical shape re-measured. Every difference is"
+        "own floor, carrying the jitter of both independently sampled sides, so a noisy shape"
     );
     eprintln!(
-        "judged against the wider of the two SPREADs it is taken between — its own floor, so"
+        "cannot raise the bar for a comparison it is not part of, and never below one page \
+         ({:.1} KB),",
+        rss_quantum_kb()
     );
-    eprintln!(
-        "a noisy shape cannot raise the bar for a comparison it is not part of. A difference"
-    );
+    eprintln!("the unit RSS moves in. A difference");
     eprintln!(
         "that does not clear its floor prints with a leading `~`: the value observed, flagged"
     );
