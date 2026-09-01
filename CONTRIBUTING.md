@@ -211,12 +211,19 @@ Update the trailing comment in the same edit — a SHA whose comment names the
 wrong release is worse than no comment.
 
 [`.github/scripts/check-action-pins.sh`](.github/scripts/check-action-pins.sh)
-enforces both halves of that rule, so it is a gate rather than a convention. It
-rejects a bare SHA with no comment as well as an unpinned ref — an opaque hex
-string nobody can review is not much better than a tag. It runs over every file
-in `.github/workflows/` on each pull request via
+checks both halves of that rule, so a broken pin is caught rather than merely
+discouraged. It rejects a bare SHA with no comment as well as an unpinned ref —
+an opaque hex string nobody can review is not much better than a tag. It runs
+over every file in `.github/workflows/` on each pull request via
 [`action-pins.yml`](.github/workflows/action-pins.yml), and again inside the
-publish job against the ref actually being released. Run it yourself with:
+publish job against the ref actually being released.
+
+The two copies bite differently, and it is worth knowing which you have hit. On
+a pull request the check is **advisory**: it goes red and names the file and
+line, but branch protection does not list it among the required checks, so it
+does not block a merge by itself. Inside the publish job it is **blocking** — a
+failed check fails the release before any other action runs. Run it yourself
+with:
 
 ```sh
 .github/scripts/check-action-pins.sh .github/workflows/*.yml
