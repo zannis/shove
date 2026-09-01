@@ -25,7 +25,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 use harness::{
-    BatchConsumeFn, BatchTopologyFn, DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios,
+    BatchConsumeFn, ConsumeTopologyFn, DlqDrainFn, HarnessConfig, StressTestTopic,
+    run_all_scenarios,
 };
 
 /// Image tag started by `testcontainers_modules::kafka::apache` (its pinned
@@ -199,7 +200,7 @@ async fn main() {
     // The generic declare creates the topic with Kafka's default partition
     // count; a batch scenario claiming N consumers needs at least N
     // partitions or the extra consumers sit idle while the row counts them.
-    let batch_topology: BatchTopologyFn<Kafka> = Box::new(|client, consumers| {
+    let consume_topology: ConsumeTopologyFn<Kafka> = Box::new(|client, consumers| {
         Box::pin(async move {
             KafkaTopologyDeclarer::new(client)
                 .with_min_partitions(consumers as i32)
@@ -214,7 +215,7 @@ async fn main() {
         .with_broker("Apache Kafka", KAFKA_VERSION, "docker single-node (KRaft)")
         .with_dlq_drain(dlq_drain)
         .with_batch_consume(batch_consume)
-        .with_batch_topology(batch_topology)
+        .with_consume_topology(consume_topology)
         // Kafka runs a single FIFO task over every assigned partition —
         // there is no per-shard worker set here, so a fifo row must claim
         // one worker, not the shard count.

@@ -1410,11 +1410,23 @@ pub type DlqDrainFn<B> = Box<
 pub type DlqDepthFn =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send>> + Send + Sync>;
 
-/// Declare [`StressTestTopic`] for a batch-consume scenario, sized for the
-/// scenario's consumer count. Kafka needs this: the generic declare creates
-/// the topic with its default partition count, and batch consumers past that
-/// count would sit idle while the row claimed them as workers.
-pub type BatchTopologyFn<B> = Box<
+/// Declare [`StressTestTopic`] sized for a scenario's consumer count.
+///
+/// Kafka needs this: the generic declare creates the topic with its default
+/// partition count (8), and any consumer past that count is assigned no
+/// partition at all — it polls forever and receives nothing, while the row
+/// counts it as a worker.
+///
+/// Used by **both** the batch and the supervisor drivers. It was originally
+/// batch-only, which left `consume_parallel` at 16 consumers running 8 real
+/// workers behind a row that claimed 16. Nothing surfaced that until the
+/// readiness barrier refused to start a window with half the group unassigned;
+/// before it, the eight idle pollers were invisible and their absence was
+/// simply folded into the throughput number.
+///
+/// The consumer-group driver does not need it: registering a group declares
+/// with partitions sized to the config's `max_consumers`.
+pub type ConsumeTopologyFn<B> = Box<
     dyn Fn(<B as Backend>::Client, u16) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
@@ -1453,9 +1465,9 @@ pub struct HarnessConfig<B: Backend> {
     /// asynchronous (SQS).
     pub dlq_depth: Option<DlqDepthFn>,
     pub batch_consume: Option<BatchConsumeFn<B>>,
-    /// See [`BatchTopologyFn`] — required only where the generic declare
+    /// See [`ConsumeTopologyFn`] — required only where the generic declare
     /// under-partitions for the consumer count (Kafka).
-    pub batch_topology: Option<BatchTopologyFn<B>>,
+    pub consume_topology: Option<ConsumeTopologyFn<B>>,
     /// How many workers this backend actually runs for the FIFO flow. Most
     /// backends spawn one worker per routing shard ([`SEQ_SHARDS`]); Kafka
     /// runs a single FIFO task over every assigned partition, so its
@@ -1482,7 +1494,7 @@ impl<B: Backend> HarnessConfig<B> {
             dlq_drain: None,
             dlq_depth: None,
             batch_consume: None,
-            batch_topology: None,
+            consume_topology: None,
             fifo_workers: SEQ_SHARDS,
             _backend: std::marker::PhantomData,
         }
@@ -1533,8 +1545,8 @@ impl<B: Backend> HarnessConfig<B> {
         self
     }
 
-    pub fn with_batch_topology(mut self, f: BatchTopologyFn<B>) -> Self {
-        self.batch_topology = Some(f);
+    pub fn with_consume_topology(mut self, f: ConsumeTopologyFn<B>) -> Self {
+        self.consume_topology = Some(f);
         self
     }
 
@@ -1862,6 +1874,38 @@ where
         .declare::<T>()
         .await
         .map_err(|e| format!("declare: {e}"))
+}
+
+/// [`purge_then_declare`] for [`StressTestTopic`], but sized so every worker the
+/// scenario claims can actually be assigned work.
+///
+/// The generic declare under-partitions Kafka's topic for the consumer count: a
+/// plain declare takes the backend default (8 partitions), so a 16-consumer
+/// scenario leaves 8 members assigned nothing. They poll, receive nothing, and
+/// the row still counts them. Where the backend supplies a
+/// [`ConsumeTopologyFn`] this declares with the scenario's consumer count
+/// instead; where it does not (every backend but Kafka, none of which
+/// partitions this way) it falls back to the generic path.
+async fn purge_then_declare_sized<B>(
+    hcfg: &HarnessConfig<B>,
+    broker: &Broker<B>,
+    client: &B::Client,
+    consumers: u16,
+) -> Result<(), String>
+where
+    B: Backend,
+{
+    match &hcfg.consume_topology {
+        Some(prepare) => {
+            (hcfg.purge)(StressTestTopic::topology())
+                .await
+                .map_err(|e| format!("purge: {e}"))?;
+            prepare(client.clone(), consumers)
+                .await
+                .map_err(|e| format!("declare: {e}"))
+        }
+        None => purge_then_declare::<B, StressTestTopic>(hcfg, broker).await,
+    }
 }
 
 async fn run_scenario_publish<B, Connect, Fut>(
@@ -2457,22 +2501,7 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    // The generic declare under-partitions Kafka's topic for the consumer
-    // count (the group path sizes partitions to `max_consumers`; a plain
-    // declare uses the default). A supplied `batch_topology` declares with
-    // the scenario's consumer count instead, so every claimed worker can
-    // actually be assigned a partition.
-    match &hcfg.batch_topology {
-        Some(prepare) => {
-            (hcfg.purge)(StressTestTopic::topology())
-                .await
-                .map_err(|e| format!("purge: {e}"))?;
-            prepare(client.clone(), scenario.consumers)
-                .await
-                .map_err(|e| format!("declare: {e}"))?;
-        }
-        None => purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?,
-    }
+    purge_then_declare_sized::<B>(hcfg, &broker, &client, scenario.consumers).await?;
     let publisher = broker
         .publisher()
         .await
@@ -2585,7 +2614,10 @@ where
     if fifo {
         purge_then_declare::<B, StressSeqTopic>(hcfg, &broker).await?;
     } else {
-        purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
+        // Sized, not generic: this flow runs `scenario.consumers` independent
+        // supervisors against one shared group, so it needs at least that many
+        // partitions for the same reason the batch flow does.
+        purge_then_declare_sized::<B>(hcfg, &broker, &client, scenario.consumers).await?;
     }
     let publisher = broker
         .publisher()
@@ -4902,6 +4934,66 @@ mod tests {
         assert!(
             rows[0].setup_secs.is_some(),
             "setup_secs must reach the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_flow_declares_a_topology_sized_for_its_workers() {
+        // `consume_parallel` runs N independent supervisors against one shared
+        // group, so it needs at least N partitions — exactly like the batch
+        // flow, which had this hook and this flow did not. On Kafka the generic
+        // declare takes the default 8, so a 16-consumer scenario left 8 members
+        // assigned no partition: they polled, received nothing, and the row
+        // counted them anyway. The readiness barrier is what surfaced it —
+        // it refused to open a window with half the group unassigned — and this
+        // pins the fix so the hook cannot quietly go back to batch-only.
+        let asked_for = Arc::new(AtomicU64::new(0));
+        let seen = asked_for.clone();
+        let consume_topology: ConsumeTopologyFn<shove::InMemory> =
+            Box::new(move |client, consumers| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    seen.store(consumers as u64, Ordering::Relaxed);
+                    Broker::<shove::InMemory>::from_client(client)
+                        .topology()
+                        .declare::<StressTestTopic>()
+                        .await
+                        .map_err(|e| format!("declare: {e}"))
+                })
+            });
+
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 10,
+            consumers: 3,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeParallel,
+            payload_bytes: 64,
+        };
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory")
+            .with_consume_topology(consume_topology);
+        let cancel = CancellationToken::new();
+        run_scenario_supervisor(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &default_consumer_options::<shove::InMemory>,
+            &|| async {
+                <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                    .await
+                    .expect("connect InMemory")
+            },
+        )
+        .await
+        .expect("supervisor scenario");
+
+        assert_eq!(
+            asked_for.load(Ordering::Relaxed),
+            scenario.consumers as u64,
+            "the sized declare was skipped, or sized for the wrong worker count"
         );
     }
 
