@@ -10,15 +10,18 @@
 mod harness;
 
 use async_nats::jetstream;
-use shove::nats::{NatsConfig, NatsConsumerGroupConfig};
-use shove::{Broker, Nats};
+use shove::nats::{NatsConfig, NatsConsumer, NatsConsumerGroupConfig};
+use shove::{Backend, Nats};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::nats::{Nats as NatsImage, NatsServerCmd};
 
-use harness::{HarnessConfig, run_all_scenarios};
+use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
 
-const STREAM_NAME: &str = "shove-stress-bench";
+/// Image tag started by `testcontainers_modules::nats` (its pinned default),
+/// recorded in the
+/// results provenance so a reader knows which server produced the numbers.
+const NATS_VERSION: &str = "2.10.14";
 
 #[tokio::main]
 async fn main() {
@@ -37,28 +40,64 @@ async fn main() {
     wait_until_ready(&url).await;
 
     let purge_url = url.clone();
-    let purge: harness::PurgeFn = Box::new(move || {
+    let purge: harness::PurgeFn = Box::new(move |topology| {
         let url = purge_url.clone();
         Box::pin(async move {
-            // Drop the whole stream (and its durable consumer) so the next
-            // scenario creates both fresh with its own config. JetStream
+            // Drop the topology's streams (and their durable consumers) so the
+            // next scenario creates them fresh with its own config. JetStream
             // `create_consumer` upserts, but changing `max_ack_pending` on an
             // existing consumer requires explicit update — cleanest to drop.
-            let Ok(client) = async_nats::connect(&url).await else {
-                return;
-            };
+            //
+            // The DLQ is its own stream (`{queue}-dlq`), not a subject inside
+            // the main one, so it must be dropped by name too — the dlq_drain
+            // flow measures the drain of a queue it filled itself, and a
+            // leftover entry from the previous scenario counts toward this
+            // scenario's N.
+            let client = async_nats::connect(&url)
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
             let js = jetstream::new(client);
-            let _ = js.delete_stream(STREAM_NAME).await;
+            for stream in std::iter::once(topology.queue()).chain(topology.dlq()) {
+                if let Err(e) = js.delete_stream(stream).await {
+                    // Only a stream that does not exist is "nothing to
+                    // purge" — a transport or auth failure here means the
+                    // previous scenario's stream may still hold messages.
+                    let not_found = matches!(
+                        e.kind(),
+                        jetstream::context::DeleteStreamErrorKind::JetStream(ref js_err)
+                            if js_err.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+                    );
+                    if !not_found {
+                        return Err(format!("delete stream {stream}: {e}"));
+                    }
+                }
+            }
+            Ok(())
         })
     });
 
-    let hcfg = HarnessConfig::<Nats>::new("nats").with_purge(purge);
+    // The drain shares the fill phase's client, so it reads the DLQ the fill
+    // just populated instead of racing a second connection against it.
+    let dlq_drain: DlqDrainFn<Nats> = Box::new(|client, handler| {
+        Box::pin(async move {
+            let consumer = NatsConsumer::new(client);
+            consumer
+                .run_dlq::<StressTestTopic, _>(handler, ())
+                .await
+                .map_err(|e| format!("run_dlq: {e}"))
+        })
+    });
+
+    let hcfg = HarnessConfig::<Nats>::new("nats")
+        .with_purge(purge)
+        .with_broker("NATS JetStream", NATS_VERSION, "docker single-node")
+        .with_dlq_drain(dlq_drain);
     run_all_scenarios(
         hcfg,
         || {
             let url = url.clone();
             async move {
-                Broker::<Nats>::new(NatsConfig::new(&url))
+                <Nats as Backend>::connect(NatsConfig::new(&url))
                     .await
                     .expect("connect NATS")
             }
