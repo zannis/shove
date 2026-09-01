@@ -66,9 +66,17 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// Schema version of the emitted results document. Bumped only on a removal
-/// or a semantic change of an existing field; purely additive fields do not
-/// bump it.
-pub const RESULTS_SCHEMA_VERSION: u32 = 1;
+/// or a semantic change of an existing field; a field a consumer can ignore
+/// and still read the document correctly does not bump it.
+///
+/// v2 added `handler_cost` to every result row. It is additive in shape but
+/// not ignorable: it says whether `throughput_msg_per_sec` measures shove or a
+/// simulated sleep amortised over a batch, so a consumer that skips it
+/// misreads a field it already reads. A v1 row cannot be given the marker
+/// after the fact either — the run that produced it is over — so the version
+/// is what makes the mismatch a loud refusal in [`merge_results_file`] rather
+/// than a silent gap in a merged document.
+pub const RESULTS_SCHEMA_VERSION: u32 = 2;
 
 /// The payload sizes that may appear in `payload_bytes`: 64 B, 1 KiB, 64 KiB.
 pub const PAYLOAD_SIZES: [usize; 3] = [64, 1024, 65536];
@@ -403,6 +411,46 @@ impl Mode {
     }
 }
 
+/// What a row's throughput number is actually a measurement *of*.
+///
+/// The handler profiles sleep, and the batch handler sleeps once per batch
+/// while the per-message handler sleeps once per message — the correct model
+/// of a batching sink, but it means the two are not measuring the same thing
+/// under `--handler slow|heavy`. Recording which kind of cell a row is keeps a
+/// consumer of the results document from having to re-derive that from a flow
+/// name and a prose handler label, and keeps a simulated sleep from being
+/// charted as a shove throughput claim.
+///
+/// The string forms are the schema's `handler_cost` values, so they are a
+/// contract in the same way [`Flow::as_str`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerCost {
+    /// The simulated work is negligible, so the number is shove's own cost.
+    /// The only cells that are comparable across flows.
+    Framework,
+    /// A batch-mode flow with a sleeping handler: the sleep is paid once per
+    /// batch, so throughput scales with the batch size rather than with
+    /// anything shove does.
+    HandlerAmortised,
+    /// A non-batch flow with a sleeping handler: the sleep is paid once per
+    /// message, so the number is dominated by the handler but not amortised.
+    HandlerBound,
+    /// A publish-only flow: no consumer is constructed, so no handler runs and
+    /// the profile only selects the message count.
+    NoHandler,
+}
+
+impl HandlerCost {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HandlerCost::Framework => "framework",
+            HandlerCost::HandlerAmortised => "handler_amortised",
+            HandlerCost::HandlerBound => "handler_bound",
+            HandlerCost::NoHandler => "no_handler",
+        }
+    }
+}
+
 // ── Topic & message ─────────────────────────────────────────────────────────
 
 /// The benchmark message.
@@ -516,6 +564,25 @@ impl Scenario {
         match self.flow {
             Flow::Broadcast => self.messages.saturating_mul(self.consumers as u64),
             _ => self.messages,
+        }
+    }
+
+    /// What this scenario's throughput number measures — see [`HandlerCost`].
+    ///
+    /// Derived from the flow and the handler profile together, because neither
+    /// settles it alone: `publish_batch` is a batch-mode flow that runs no
+    /// handler at all, and `consume_batch --handler fast` is a batch-mode flow
+    /// whose number is still framework cost.
+    pub fn handler_cost(&self) -> HandlerCost {
+        match self.flow {
+            Flow::PublishSingle | Flow::PublishBatch => HandlerCost::NoHandler,
+            _ => match self.handler {
+                HandlerProfile::Zero | HandlerProfile::Fast => HandlerCost::Framework,
+                HandlerProfile::Slow | HandlerProfile::Heavy => match self.flow.mode() {
+                    Mode::Batch => HandlerCost::HandlerAmortised,
+                    Mode::Parallel | Mode::Fifo => HandlerCost::HandlerBound,
+                },
+            },
         }
     }
 }
@@ -2279,6 +2346,20 @@ struct ScenarioResult {
     messages: u64,
     consumers: u16,
     handler: String,
+    /// How to read `throughput_msg_per_sec` — see [`HandlerCost`]. Machine
+    /// readable on purpose: the sibling `handler` field is the profile's prose
+    /// label, and a consumer must not have to parse `"heavy (1-5s)"` and a
+    /// flow name to find out that a bar is measuring a simulated sleep.
+    ///
+    /// `default` is not a fallback that hides a missing marker — every row
+    /// this harness writes carries one. It exists so that a v1 document,
+    /// whose rows predate the field, still deserializes far enough for the
+    /// schema-version check in [`merge_results_file`] to refuse it by version
+    /// and say which version it is, rather than failing earlier with a serde
+    /// error about a missing field. The refusal is the same either way; only
+    /// its legibility differs.
+    #[serde(default)]
+    handler_cost: String,
     throughput_msg_per_sec: f64,
     dispatch_p50_ms: f64,
     dispatch_p95_ms: f64,
@@ -2997,6 +3078,7 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         messages: scenario.messages,
         consumers: scenario.consumers,
         handler: scenario.handler.to_string(),
+        handler_cost: scenario.handler_cost().as_str().to_string(),
         throughput_msg_per_sec: m.throughput,
         dispatch_p50_ms: m.latencies.dispatch_p50,
         dispatch_p95_ms: m.latencies.dispatch_p95,
@@ -3758,6 +3840,172 @@ mod tests {
         assert_eq!(Flow::ConsumeFifo.effective_workers(256), SEQ_SHARDS);
     }
 
+    fn scenario_for(flow: Flow, handler: HandlerProfile) -> Scenario {
+        Scenario {
+            tier: "moderate",
+            messages: 100,
+            consumers: 4,
+            handler,
+            deadline: Duration::from_secs(60),
+            concurrent: false,
+            prefetch: None,
+            flow,
+            payload_bytes: 64,
+        }
+    }
+
+    #[test]
+    fn a_batch_row_with_a_simulated_sleep_is_marked_amortised_not_framework() {
+        // `StressBatchHandler::handle_batch` sleeps once per *batch* while the
+        // per-message handler sleeps once per message. That is the right model
+        // of a batching sink, but it means a slow-handler batch row beats a
+        // slow-handler parallel row by roughly the batch size for reasons that
+        // are the simulated sleep, not shove. The row has to say so in a field,
+        // because the alternative is a reader inferring it from a flow name.
+        for handler in [HandlerProfile::Slow, HandlerProfile::Heavy] {
+            assert_eq!(
+                scenario_for(Flow::ConsumeBatch, handler).handler_cost(),
+                HandlerCost::HandlerAmortised,
+                "{handler}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_fast_are_framework_cost_cells_in_every_consume_flow() {
+        // The cells where the simulated work is negligible are the only ones
+        // that measure shove itself, and they are comparable across flows —
+        // which is what makes a batch-vs-parallel chart legitimate at all.
+        for flow in [
+            Flow::ConsumeBatch,
+            Flow::ConsumeParallel,
+            Flow::ConsumeFifo,
+            Flow::ConsumerGroup,
+            Flow::Supervisor,
+            Flow::Broadcast,
+            Flow::DlqDrain,
+        ] {
+            for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+                assert_eq!(
+                    scenario_for(flow, handler).handler_cost(),
+                    HandlerCost::Framework,
+                    "{flow} / {handler}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_slow_non_batch_row_is_handler_bound_not_amortised() {
+        // The distinction a boolean would have lost: a slow parallel row is
+        // also dominated by the sleep, but it pays it once per message, so its
+        // caveat is not the batch row's caveat.
+        for flow in [Flow::ConsumeParallel, Flow::ConsumerGroup, Flow::DlqDrain] {
+            assert_eq!(
+                scenario_for(flow, HandlerProfile::Slow).handler_cost(),
+                HandlerCost::HandlerBound,
+                "{flow}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_batch_mode_flow_can_be_amortised() {
+        for flow in Flow::ALL {
+            for handler in [
+                HandlerProfile::Zero,
+                HandlerProfile::Fast,
+                HandlerProfile::Slow,
+                HandlerProfile::Heavy,
+            ] {
+                if scenario_for(flow, handler).handler_cost() == HandlerCost::HandlerAmortised {
+                    assert_eq!(flow.mode(), Mode::Batch, "{flow} is not a batch-mode flow");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn publish_flows_report_no_handler_whatever_the_profile() {
+        // The publish flows never construct a consumer, so no handler runs and
+        // the profile only picks the message count. Deriving the marker from
+        // `mode()` alone would label `publish_batch --handler heavy` as
+        // amortised work that never executed.
+        for flow in [Flow::PublishSingle, Flow::PublishBatch] {
+            for handler in [
+                HandlerProfile::Zero,
+                HandlerProfile::Fast,
+                HandlerProfile::Slow,
+                HandlerProfile::Heavy,
+            ] {
+                assert_eq!(
+                    scenario_for(flow, handler).handler_cost(),
+                    HandlerCost::NoHandler,
+                    "{flow} / {handler}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_handler_cost_marker_reaches_the_row_and_the_document() {
+        let scenario = scenario_for(Flow::ConsumeBatch, HandlerProfile::Heavy);
+        let mut rows = Vec::new();
+        push_metrics(
+            &mut rows,
+            &scenario,
+            ScenarioMetrics {
+                throughput: 1.0,
+                latencies: LatencyPercentiles::default(),
+                peak_rss_mb: 0.0,
+                cpu_pct: 0.0,
+                duration_secs: 1.0,
+            },
+        );
+        assert_eq!(rows[0].handler_cost, HandlerCost::HandlerAmortised.as_str());
+
+        let path = temp_path("handler-cost");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+        let mut run = sample_run("kafka");
+        run.results = rows;
+        // Kafka is the one backend that measures this flow, so it cannot also
+        // carry the `consume_batch` capability hole the fixture defaults to.
+        run.unsupported.clear();
+        merge_results_file(&p, run, None).expect("write");
+        let doc: BenchResults =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(doc.runs[0].results[0].handler_cost, "handler_amortised");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_v1_document_is_refused_by_version_rather_than_by_a_parse_error() {
+        // v1 rows predate `handler_cost`, and the run that produced them is
+        // over, so no marker can be recovered for them. They must not be
+        // merged with an empty one, and the refusal has to name the version:
+        // "missing field handler_cost" would send a reader looking for a bug
+        // in this binary rather than at a stale file.
+        let path = temp_path("v1-document");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(&p, sample_run("redis"), None).expect("first write");
+        let v1 = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace("\"schema_version\": 2", "\"schema_version\": 1")
+            .replace("\"handler_cost\": \"framework\",", "");
+        assert!(!v1.contains("handler_cost"), "the v1 fixture still has one");
+        std::fs::write(&path, &v1).expect("write v1");
+
+        let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
+        assert!(err.contains("v1"), "{err}");
+        assert!(err.contains("move it aside"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).expect("re-read"), v1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Forwards each delivery to the batch handler as a one-message batch, so
     /// a backend without a batch primitive can still drive
     /// [`StressBatchHandler`] over a real queue.
@@ -4105,6 +4353,7 @@ mod tests {
                 messages: 100,
                 consumers: 1,
                 handler: HandlerProfile::Zero.to_string(),
+                handler_cost: HandlerCost::Framework.as_str().to_string(),
                 throughput_msg_per_sec: 1.0,
                 dispatch_p50_ms: 0.0,
                 dispatch_p95_ms: 0.0,
@@ -4161,15 +4410,15 @@ mod tests {
 
         merge_results_file(&p, sample_run("redis"), None).expect("first write");
         // Six backend binaries accumulate into one file. A newer one bumping
-        // the version must not have its rows silently rewritten with a v1
-        // header by an older binary that ran afterwards.
+        // the version must not have its rows silently rewritten with this
+        // binary's header by an older binary that ran afterwards.
         let bumped = std::fs::read_to_string(&path)
             .expect("read")
-            .replace("\"schema_version\": 1", "\"schema_version\": 2");
+            .replace("\"schema_version\": 2", "\"schema_version\": 3");
         std::fs::write(&path, &bumped).expect("write bumped");
 
         let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
-        assert!(err.contains("v2"), "{err}");
+        assert!(err.contains("v3"), "{err}");
 
         // The refusal must leave the file untouched, not half-written.
         assert_eq!(std::fs::read_to_string(&path).expect("re-read"), bumped);
@@ -4444,8 +4693,10 @@ mod tests {
         ] {
             assert!(obj.contains_key(field), "lost pre-existing field {field}");
         }
-        // 15 pre-existing + exactly the 3 new dimensions.
-        assert_eq!(obj.len(), 18);
+        // 15 pre-existing + the 3 flow/mode/payload dimensions + the
+        // handler-cost marker.
+        assert_eq!(obj.len(), 19);
+        assert!(obj.contains_key("handler_cost"));
     }
 
     #[test]
