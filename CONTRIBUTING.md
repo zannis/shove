@@ -180,3 +180,32 @@ otherwise only ever exercised by a real release.
   (e.g. `feat(nats): ...`, `fix(kafka): ...`, `docs(readme): ...`).
 - There is **no CHANGELOG** — releases are cut with `release: vX.Y.Z` commits.
 - The crate is licensed **MIT**.
+
+### Third-party actions are pinned to a commit SHA
+
+Every `uses:` in `.github/workflows/` names a full 40-character commit SHA with
+the release it corresponds to in a trailing comment:
+
+```yaml
+- uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+```
+
+A tag or a branch is a ref its owner can repoint at any commit, so an action
+reviewed once can execute something else on the next run — including a tag that
+carries a version number, which is a label rather than an immutability
+guarantee. `publish.yml` is the sharpest case, because it holds `contents:write`
+and `id-token:write`, imports the release signing key and mints a crates.io
+token. `ci.yml` and `docs-build.yml` hold only `contents: read`, but they are
+not exempt: they write the `Swatinem/rust-cache` entries that the publish job
+later restores, so an action compromised there reaches the release path through
+the cache.
+
+When adding or upgrading an action, resolve the ref to its commit and pin that:
+
+```sh
+gh api repos/<owner>/<repo>/git/ref/tags/<tag> --jq '.object.sha'   # deref via
+gh api repos/<owner>/<repo>/git/tags/<sha> --jq '.object.sha'       # if annotated
+```
+
+Update the trailing comment in the same edit — a SHA whose comment names the
+wrong release is worse than no comment.

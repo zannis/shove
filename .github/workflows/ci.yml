@@ -38,12 +38,12 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
-      - uses: dtolnay/rust-toolchain@1.91
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt -- --check
       # `--all-targets` so tests/benches/examples are type-checked and linted
       # too. Without it clippy only sees the lib, and a `tests/` file gated on a
@@ -71,12 +71,12 @@ jobs:
   feature-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
-      - uses: dtolnay/rust-toolchain@1.91
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The coverage matrix's sets, plus the two publisher-only SNS builds, which
       # no coverage entry compiles on its own -- they are the sets that decide
       # whether `record_message_size` needs its `dead_code` allow.
@@ -107,24 +107,24 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
-      - uses: dtolnay/rust-toolchain@1.91
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --all-features
       - run: cargo build --no-default-features
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.91
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
       - name: Install cargo-audit
         run: cargo install --locked --quiet cargo-audit
       # cargo-audit re-clones the advisory DB on every run by default; caching
       # it keyed by run id keeps a fresh DB but skips the ~30s git clone.
       - name: Cache RustSec advisory DB
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cargo/advisory-db
           key: cargo-audit-db-${{ runner.os }}-${{ github.run_id }}
@@ -209,16 +209,16 @@ jobs:
             # `metrics_redis_failall` and `metrics_redis_failall_no_dlq`.
             features: redis-streams,metrics,sbe
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - if: startsWith(matrix.name, 'kafka')
         run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
-      - uses: dtolnay/rust-toolchain@1.91
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
       # `matrix.filter` is unset for every entry but kafka-schema-registry,
       # where it expands to empty and the full suite runs as before.
       - run: cargo llvm-cov nextest --features ${{ matrix.features }} ${{ matrix.filter }} --lcov --output-path lcov.info
-      - uses: codecov/codecov-action@v5
+      - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
           use_oidc: true
           slug: ${{ github.repository }}
