@@ -618,8 +618,23 @@ fn inner_range(sorted: &[f64]) -> f64 {
 /// came in *below* `A`'s highest, a difference of -10 in the opposite
 /// direction. Two sample sets that overlap have not shown this probe a
 /// difference at all. Their sum, 40, is the width of the difference's own
-/// admissible range (`B_max - A_min` down to `B_min - A_max`), and clearing it
-/// is what "the two shapes did not overlap" amounts to.
+/// admissible range (`B_max - A_min` down to `B_min - A_max`).
+///
+/// Clearing that width **implies** the two shapes did not overlap, but it is
+/// the stricter of the two tests, not the same one. Since a median sits inside
+/// its own trimmed samples, `delta > spread_a + spread_b` forces
+/// `B_min > A_max` across the trimmed sets; the converse fails. For
+/// `A = [970, 980, 1000, 1000, 1010]` against `B = [1020, 1030, 1030, 1050,
+/// 1060]`, every sample of `A` is below every sample of `B`, yet each trimmed
+/// spread is 20 and the medians differ by only 30, so the difference still
+/// prints `~30.0`. Summing each side's whole spread, rather than only the part
+/// of it facing the other shape, is what costs that resolution.
+///
+/// That error is the affordable one, and the direction is chosen. An extra `~`
+/// leaves the observed number on the page to be judged; the opposite slip
+/// prints an unresolved difference as a settled cost. A floor built from
+/// `max()` did exactly that here before, so this bound stays conservative.
+///
 /// Never below one page either. Trimming can leave a shape's spread at zero —
 /// three of its five processes reporting the identical RSS is ordinary, since
 /// RSS moves in whole pages — and a floor of zero would call a single page of
