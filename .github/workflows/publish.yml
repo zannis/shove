@@ -43,9 +43,35 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      # Every action in this job runs an immutable commit SHA, never a tag or a
+      # branch. This job holds `contents: write` and `id-token: write`, imports
+      # the long-lived release signing key and mints a crates.io publish token,
+      # so any action that executes here can reach all three -- or poison the
+      # runner so a later step signs and publishes something else. A tag and a
+      # branch are both repointable by whoever owns the action repo, which
+      # makes "we reviewed that release" an unenforceable claim; a SHA makes it
+      # a fact. The trailing comment names the release the SHA came from, so
+      # the pin stays readable; `.github/scripts/check-action-pins.sh` requires
+      # both halves and is what keeps this paragraph true.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+
+      # Enforce the paragraph above on the ref actually being released, before
+      # any *other* action executes. `action-pins.yml` already runs this on
+      # every pull request, but a release is dispatched against a ref, not a
+      # PR: this is the copy of the check that runs on the tree being shipped,
+      # including a dispatch from a branch that never opened a PR.
+      #
+      # Two honest limits. It runs after `actions/checkout`, which is how the
+      # script gets here -- checkout is the one action it cannot gate. And
+      # Actions downloads every `uses:` repo during "Set up job", before any
+      # step runs, so this prevents *execution*, not download. It is a
+      # regression guard against an honest edit, not a boundary against someone
+      # who can already commit to this file -- they could delete this step in
+      # the same commit.
+      - name: Require every action in this workflow to be SHA-pinned
+        run: .github/scripts/check-action-pins.sh .github/workflows/publish.yml
 
       # Resolve dispatch inputs once and fail closed. Their declared types and
       # choices constrain the Actions UI, but an API dispatch can still supply

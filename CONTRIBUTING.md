@@ -209,3 +209,22 @@ gh api repos/<owner>/<repo>/git/tags/<sha> --jq '.object.sha'       # if annotat
 
 Update the trailing comment in the same edit — a SHA whose comment names the
 wrong release is worse than no comment.
+
+[`.github/scripts/check-action-pins.sh`](.github/scripts/check-action-pins.sh)
+enforces both halves of that rule, so it is a gate rather than a convention. It
+rejects a bare SHA with no comment as well as an unpinned ref — an opaque hex
+string nobody can review is not much better than a tag. It runs over every file
+in `.github/workflows/` on each pull request via
+[`action-pins.yml`](.github/workflows/action-pins.yml), and again inside the
+publish job against the ref actually being released. Run it yourself with:
+
+```sh
+.github/scripts/check-action-pins.sh .github/workflows/*.yml
+bash .github/scripts/check-action-pins.test.sh   # the checker's own tests
+```
+
+One thing pinning does **not** cover, worth knowing before relying on it:
+`cargo binstall` fetches a prebuilt binary from the upstream project's GitHub
+release assets, which are mutable. `--version` pins which release is fetched,
+not which bytes come back. `cargo install --locked` goes to crates.io, where a
+published version is immutable.
