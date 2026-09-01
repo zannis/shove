@@ -4591,6 +4591,46 @@ mod tests {
     }
 
     #[test]
+    fn a_preserved_row_that_carries_no_marker_at_all_is_refused_by_the_row() {
+        // The other half of the preserved path, and the one the version check
+        // cannot reach: the header still says v2, so nothing upstream objects,
+        // and `#[serde(default)]` turns the absent key into an empty marker
+        // rather than a parse error. Only the row check stands between that
+        // and a re-signed document. Asserted through a real file rather than
+        // an in-memory row, because the empty string is produced by
+        // deserialization here, not by a caller.
+        let path = temp_path("cost-preserved-absent");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(
+            &p,
+            batch_run(Flow::ConsumeBatch, HandlerProfile::Heavy),
+            None,
+        )
+        .expect("first write");
+        let stripped = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace("\"handler_cost\": \"handler_amortised\",", "");
+        assert!(!stripped.contains("handler_cost"), "fixture did not take");
+        assert!(
+            stripped.contains(&format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}")),
+            "the fixture must stay a current-version document"
+        );
+        std::fs::write(&path, &stripped).expect("write stripped");
+
+        let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
+        // Refused for the marker it lacks, naming the one its own flow and
+        // handler derive — not for its version, which is correct.
+        assert!(err.contains("handler_cost"), "{err}");
+        assert!(err.contains("handler_amortised"), "{err}");
+        assert!(err.contains("refusing to rewrite"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).expect("re-read"), stripped);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn an_unknown_handler_label_is_refused() {
         // The cost check reads the row's handler back, so an unparseable
         // handler label must be a refusal rather than a check that quietly
