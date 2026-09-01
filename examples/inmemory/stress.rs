@@ -41,7 +41,10 @@ async fn main() {
     let dlq_drain: DlqDrainFn<InMemory> = Box::new(|client, handler| {
         Box::pin(async move {
             let consumer = InMemoryConsumer::new(client);
-            let _ = consumer.run_dlq::<StressTestTopic, _>(handler, ()).await;
+            consumer
+                .run_dlq::<StressTestTopic, _>(handler, ())
+                .await
+                .map_err(|e| format!("run_dlq: {e}"))
         })
     });
 

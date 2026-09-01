@@ -11,14 +11,12 @@ mod harness;
 
 use redis::AsyncCommands;
 use shove::redis::{RedisConfig, RedisConsumer, RedisConsumerGroupConfig, RedisMode};
-use shove::{Backend, Redis};
+use shove::{Backend, Redis, Topic};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisImage};
 
 use harness::{DlqDrainFn, HarnessConfig, StressTestTopic, run_all_scenarios};
-
-const STREAM_KEY: &str = "shove-stress-bench";
 
 /// Image tag pinned by the `.with_tag("7.0")` call below, recorded in the
 /// results provenance so a reader knows which server produced the numbers.
@@ -40,19 +38,68 @@ async fn main() {
     wait_until_ready(&url).await;
 
     let purge_url = url.clone();
-    let purge: harness::PurgeFn = Box::new(move || {
+    let purge: harness::PurgeFn = Box::new(move |topology| {
         let url = purge_url.clone();
         Box::pin(async move {
-            // Drop the stream itself — the next scenario's topology declare
-            // recreates it together with the consumer group. XGROUP CREATE
-            // uses MKSTREAM so this is safe.
-            let Ok(client) = redis::Client::open(url) else {
-                return;
-            };
-            let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
-                return;
-            };
-            let _: redis::RedisResult<i64> = conn.del(STREAM_KEY).await;
+            // Drop every key the topology owns — the next scenario's declare
+            // recreates them together with the consumer groups. XGROUP CREATE
+            // uses MKSTREAM so this is safe. DEL is idempotent, so absent
+            // keys cost nothing.
+            //
+            // The set is derived from the topology handed in: main stream,
+            // DLQ stream, hold-queue streams and their `:pending` sorted
+            // sets, and for a sequenced topology the per-shard streams plus
+            // their own hold pairs (`src/backends/redis/topology.rs` naming).
+            let mut keys: Vec<String> = vec![topology.queue().to_string()];
+            if let Some(dlq) = topology.dlq() {
+                keys.push(dlq.to_string());
+            }
+            for hq in topology.hold_queues() {
+                keys.push(hq.name().to_string());
+                keys.push(format!("{}:pending", hq.name()));
+            }
+            if let Some(seq) = topology.sequencing() {
+                for shard in 0..seq.routing_shards() {
+                    keys.push(format!("{}-seq-{shard}", topology.queue()));
+                    for hq in topology.shard_hold_queue_names(shard) {
+                        keys.push(hq.name().to_string());
+                        keys.push(format!("{}:pending", hq.name()));
+                    }
+                }
+            }
+
+            let client = redis::Client::open(url).map_err(|e| format!("client: {e}"))?;
+            let mut conn = client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            let _: i64 = conn.del(&keys).await.map_err(|e| format!("DEL: {e}"))?;
+            Ok(())
+        })
+    });
+
+    // The DLQ is a plain stream key, so XLEN is its exact depth. Supplying
+    // the probe makes the fill's completion signal the DLQ population itself
+    // rather than handler-invocation counts, which are hostage to each
+    // backend's retry-gate ordering.
+    let depth_url = url.clone();
+    let dlq_depth: harness::DlqDepthFn = Box::new(move || {
+        let url = depth_url.clone();
+        Box::pin(async move {
+            let dlq = StressTestTopic::topology()
+                .dlq()
+                .ok_or_else(|| "stress topology has no DLQ".to_string())?;
+            let client = redis::Client::open(url).map_err(|e| format!("client: {e}"))?;
+            let mut conn = client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            let depth: u64 = redis::cmd("XLEN")
+                .arg(dlq)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| format!("XLEN {dlq}: {e}"))?;
+            Ok(depth)
         })
     });
 
@@ -61,14 +108,18 @@ async fn main() {
     let dlq_drain: DlqDrainFn<Redis> = Box::new(|client, handler| {
         Box::pin(async move {
             let consumer = RedisConsumer::new(client);
-            let _ = consumer.run_dlq::<StressTestTopic, _>(handler, ()).await;
+            consumer
+                .run_dlq::<StressTestTopic, _>(handler, ())
+                .await
+                .map_err(|e| format!("run_dlq: {e}"))
         })
     });
 
     let hcfg = HarnessConfig::<Redis>::new("redis")
         .with_purge(purge)
         .with_broker("Redis Streams", REDIS_VERSION, "docker single-node")
-        .with_dlq_drain(dlq_drain);
+        .with_dlq_drain(dlq_drain)
+        .with_dlq_depth(dlq_depth);
     run_all_scenarios(
         hcfg,
         || {

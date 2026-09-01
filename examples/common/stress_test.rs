@@ -60,7 +60,7 @@ use shove::{
     // `define_sequenced_topic!` expansion resolves `Self::sequence_key`
     // through it.
     topic::{SequencedTopic as _, Topic},
-    topology::{SequenceFailure, TopologyBuilder},
+    topology::{QueueTopology, SequenceFailure, TopologyBuilder},
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -76,6 +76,10 @@ pub const PAYLOAD_SIZES: [usize; 3] = [64, 1024, 65536];
 /// Routing shards for the sequenced topic. Also the modulus for the sequence
 /// key, so message ids spread evenly across shards.
 const SEQ_SHARDS: u16 = 8;
+
+/// Message id reserved for broadcast readiness sentinels. Corpus ids count up
+/// from zero, so no measured message can carry it.
+const SENTINEL_ID: u64 = u64::MAX;
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -107,10 +111,13 @@ pub struct Cli {
     /// `consume-batch`, `consumer-group`, `supervisor`, `broadcast`,
     /// `dlq-drain`.
     ///
-    /// Defaults to `consumer-group`, which is what this harness measured
-    /// before flows were a dimension.
-    #[arg(long, default_value = "consumer-group")]
-    pub flow: FlowArg,
+    /// When omitted, each entry point selects what this harness measured
+    /// before flows were a dimension: `consumer-group` on coordinated-group
+    /// backends, `supervisor` on SQS. A single hard default of
+    /// `consumer-group` would be filtered out as unsupported on the
+    /// supervisor path and the unchanged SQS invocation would run nothing.
+    #[arg(long)]
+    pub flow: Option<FlowArg>,
 
     /// Payload size(s) in bytes: `all`, or a comma-separated subset of
     /// `64`, `1024`, `65536`.
@@ -342,13 +349,17 @@ impl Flow {
     /// share of it, and the publish flows are one sequential loop. Dividing
     /// their deadlines by the consumer count made them N× too tight, so a
     /// slow-but-healthy drain was recorded as a timeout failure.
+    ///
+    /// FIFO is capped at [`SEQ_SHARDS`]: the sequenced topology has that many
+    /// shards, and consumers past the shard count cannot make independent
+    /// progress, so sizing the deadline by the raw consumer count made a
+    /// 256-consumer slow-handler scenario up to 32× too tight.
     pub fn effective_workers(&self, consumers: u16) -> u16 {
         match self {
-            Flow::ConsumerGroup
-            | Flow::ConsumeParallel
-            | Flow::ConsumeFifo
-            | Flow::ConsumeBatch
-            | Flow::Supervisor => consumers,
+            Flow::ConsumerGroup | Flow::ConsumeParallel | Flow::ConsumeBatch | Flow::Supervisor => {
+                consumers
+            }
+            Flow::ConsumeFifo => consumers.min(SEQ_SHARDS),
             Flow::DlqDrain
             | Flow::Broadcast
             | Flow::PublishSingle
@@ -398,8 +409,10 @@ impl Mode {
 ///
 /// `payload` is ASCII filler of exactly `payload_bytes` characters. The
 /// default [`shove::JsonCodec`] encodes ASCII one byte per character, so the
-/// declared size is the wire size — a `Vec<u8>` would serialize as a JSON
-/// array of decimal integers and inflate 3–4×, making `payload_bytes` a lie.
+/// declared size is the payload's exact wire cost — a `Vec<u8>` would
+/// serialize as a JSON array of decimal integers and inflate 3–4×, making
+/// `payload_bytes` a lie. `payload_bytes` measures the application payload,
+/// not the full encoded body: the envelope below rides on top of it.
 ///
 /// `id` and `published_at_ns` add a fixed envelope of roughly 50 bytes on top
 /// of `payload`, identical across every payload tier.
@@ -548,7 +561,7 @@ fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> 
     Duration::from_millis(deadline_ms as u64)
 }
 
-fn build_scenarios(cli: &Cli) -> Vec<Scenario> {
+fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scenario> {
     let handlers: Vec<HandlerProfile> = match cli.handler {
         HandlerArg::Zero => vec![HandlerProfile::Zero],
         HandlerArg::Fast => vec![HandlerProfile::Fast],
@@ -569,6 +582,11 @@ fn build_scenarios(cli: &Cli) -> Vec<Scenario> {
         TierArg::All => vec![&MODERATE, &HIGH, &EXTREME],
     };
 
+    let flows: Vec<Flow> = match &cli.flow {
+        Some(FlowArg(list)) => list.clone(),
+        None => vec![default_flow],
+    };
+
     let mut scenarios = Vec::new();
     for tier_cfg in &tiers {
         for &h in &handlers {
@@ -583,15 +601,65 @@ fn build_scenarios(cli: &Cli) -> Vec<Scenario> {
                 None => tier_cfg.consumers,
             };
             for &c in consumer_counts {
-                let messages = per_consumer.saturating_mul(c as u64);
-                for &flow in &cli.flow.0 {
+                for &flow in &flows {
+                    // FIFO worker topology is the shard set, not the consumer
+                    // count: every coordinated-group backend pins FIFO
+                    // replicas to 1 and spawns one worker per routing shard,
+                    // so a consumer sweep re-measures the identical topology
+                    // under different labels. Pin the scenario to the actual
+                    // worker count and emit it once per (tier, handler,
+                    // payload).
+                    // Pin flows whose worker topology ignores the consumer
+                    // sweep to the worker count they actually run, and emit
+                    // them once per (tier, handler, payload): FIFO runs the
+                    // backend's shard set (or one task on Kafka), and the DLQ
+                    // drain is a single loop. Sweeping them re-measures one
+                    // topology under many labels — and sizing their corpus by
+                    // the swept count made slow/heavy single-loop scenarios
+                    // arithmetically impossible inside the 600 s deadline
+                    // ceiling (32 × 50 heavy messages through one loop needs
+                    // ≥ 1,600 s).
+                    // The publish flows join the pinned set: they run one
+                    // sequential publisher loop with no consumers, so a
+                    // swept `consumers` label would describe a topology that
+                    // never ran. (Their `handler` column only selects the
+                    // tier's corpus size — no handler executes.)
+                    let consumers = match flow {
+                        Flow::ConsumeFifo => fifo_workers,
+                        Flow::DlqDrain | Flow::PublishSingle | Flow::PublishBatch => 1,
+                        _ => c,
+                    };
+                    if matches!(
+                        flow,
+                        Flow::ConsumeFifo
+                            | Flow::DlqDrain
+                            | Flow::PublishSingle
+                            | Flow::PublishBatch
+                    ) && scenarios.iter().any(|s: &Scenario| {
+                        s.flow == flow && s.tier == tier_cfg.name && s.handler == h
+                    }) {
+                        continue;
+                    }
+                    // Broadcast delivers the whole published stream to every
+                    // subscriber, so the published corpus is already the
+                    // per-worker workload — multiplying it by the subscriber
+                    // count would scale each worker's load with the fan-out
+                    // width instead of holding it constant.
+                    let messages = match flow {
+                        Flow::Broadcast => per_consumer,
+                        _ => per_consumer.saturating_mul(consumers as u64),
+                    };
                     for &payload_bytes in &cli.payload.0 {
                         scenarios.push(Scenario {
                             tier: tier_cfg.name,
                             messages,
-                            consumers: c,
+                            consumers,
                             handler: h,
-                            deadline: scenario_deadline(messages, flow.effective_workers(c), h),
+                            deadline: scenario_deadline(
+                                messages,
+                                flow.effective_workers(consumers),
+                                h,
+                            ),
                             concurrent: cli.concurrent,
                             prefetch: cli.prefetch,
                             flow,
@@ -846,6 +914,18 @@ pub struct StressTestHandler {
     /// unmeasured fill phase of the DLQ-drain flow, which needs every message
     /// to land in the DLQ before the drain is timed.
     reject: bool,
+    /// When set, a message carrying [`SENTINEL_ID`] is a broadcast readiness
+    /// probe: it bumps this counter and is acked immediately — no simulated
+    /// work, no latency record, no `processed` increment — so warmup
+    /// deliveries can never leak into the measurement, even mid-flight.
+    attach: Option<Arc<AtomicU64>>,
+    /// Measure latency from this handler's own `epoch` instead of from the
+    /// message's embedded `published_at_ns`. The DLQ drain needs this: its
+    /// messages were stamped against the fill phase's epoch, so subtracting
+    /// them from a fresh drain-phase clock compares two unrelated `Instant`
+    /// bases and saturates to zero. With the flag, `dispatch` is "drain start →
+    /// handler entry" and `e2e` is "drain start → handler completion".
+    epoch_relative: bool,
 }
 
 impl StressTestHandler {
@@ -861,11 +941,23 @@ impl StressTestHandler {
             recorder,
             profile,
             reject: false,
+            attach: None,
+            epoch_relative: false,
         }
+    }
+
+    fn with_attach_counter(mut self, attach: Arc<AtomicU64>) -> Self {
+        self.attach = Some(attach);
+        self
     }
 
     fn rejecting(mut self) -> Self {
         self.reject = true;
+        self
+    }
+
+    fn epoch_relative(mut self) -> Self {
+        self.epoch_relative = true;
         self
     }
 
@@ -888,10 +980,15 @@ impl StressTestHandler {
     }
 
     fn observe(&self, received_at: u64, published_at_ns: u64) {
+        let base = if self.epoch_relative {
+            0
+        } else {
+            published_at_ns
+        };
         let acked_at = self.epoch.elapsed().as_nanos() as u64;
         self.recorder.record(LatencyRecord {
-            enqueue_to_receive_ns: received_at.saturating_sub(published_at_ns),
-            enqueue_to_ack_ns: acked_at.saturating_sub(published_at_ns),
+            enqueue_to_receive_ns: received_at.saturating_sub(base),
+            enqueue_to_ack_ns: acked_at.saturating_sub(base),
         });
         self.processed.fetch_add(1, Ordering::Relaxed);
     }
@@ -906,6 +1003,12 @@ where
     type Context = ();
 
     async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata, _: &()) -> Outcome {
+        if msg.id == SENTINEL_ID
+            && let Some(attach) = &self.attach
+        {
+            attach.fetch_add(1, Ordering::Relaxed);
+            return Outcome::Ack;
+        }
         let received_at = self.epoch.elapsed().as_nanos() as u64;
         self.simulate_work().await;
         self.observe(received_at, msg.published_at_ns);
@@ -962,12 +1065,25 @@ where
 
 // ── Backend-supplied flow drivers ───────────────────────────────────────────
 
-/// Purge closure — invoked between scenarios to clear the main queue.
-/// Default is a no-op via [`noop_purge`].
-pub type PurgeFn = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+/// Purge closure — invoked between scenarios to clear **the topology the next
+/// scenario will run against**, handed in as the argument. Three topologies
+/// are in play (`StressTestTopic`, `StressSeqTopic`, `StressBroadcastTopic`)
+/// and each owns distinct physical resources — main queue, DLQ, hold queues,
+/// per-shard queues — so a purge hard-wired to one queue name leaves the other
+/// two accumulating leftovers across scenarios. The wrapper derives every
+/// physical name from the topology's accessors (`queue()`, `dlq()`,
+/// `hold_queues()`, `sequencing()`), and returns `Err` when a clean starting
+/// state cannot be established, which fails the scenario rather than measuring
+/// a contaminated one. Default is a no-op via [`noop_purge`] — correct only
+/// for InMemory, where a fresh client per scenario means fresh queues.
+pub type PurgeFn = Box<
+    dyn Fn(&'static QueueTopology) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 pub fn noop_purge() -> PurgeFn {
-    Box::new(|| Box::pin(async {}))
+    Box::new(|_topology| Box::pin(async { Ok(()) }))
 }
 
 /// Drive one backend's DLQ drain.
@@ -977,8 +1093,38 @@ pub fn noop_purge() -> PurgeFn {
 /// struct. The client is handed in rather than captured so the drain runs
 /// against the *same* connection the fill phase used — which is the only way
 /// InMemory works at all, since its queues live inside the client.
+///
+/// The future resolves to `Err` when the drain loop itself fails (connection,
+/// commit, routing), so the scenario reports the real cause instead of
+/// waiting out its whole deadline and calling it a timeout.
 pub type DlqDrainFn<B> = Box<
-    dyn Fn(<B as Backend>::Client, StressTestHandler) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    dyn Fn(
+            <B as Backend>::Client,
+            StressTestHandler,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Report the DLQ's current depth for [`StressTestTopic`].
+///
+/// Needed only where dead-lettering is asynchronous. On every shove-routed
+/// backend a `Reject` publishes to the DLQ before acking, so the fill's
+/// handler-invocation count equals the DLQ population. SQS is different: its
+/// reject path only resets visibility, and the broker-side redrive policy
+/// moves a message after `maxReceiveCount` receives — so the invocation
+/// counter counts *attempts* (with duplicates) while the DLQ still fills.
+/// When this closure is supplied, the fill phase additionally polls it until
+/// the DLQ actually holds the scenario's messages before the drain is timed.
+pub type DlqDepthFn =
+    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send>> + Send + Sync>;
+
+/// Declare [`StressTestTopic`] for a batch-consume scenario, sized for the
+/// scenario's consumer count. Kafka needs this: the generic declare creates
+/// the topic with its default partition count, and batch consumers past that
+/// count would sit idle while the row claimed them as workers.
+pub type BatchTopologyFn<B> = Box<
+    dyn Fn(<B as Backend>::Client, u16) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -986,8 +1132,13 @@ pub type DlqDrainFn<B> = Box<
 /// Drive one backend's batch consume. Supplied by Kafka alone — `run_batch`
 /// exists on no other backend, so the absence of this closure is what makes
 /// `consume_batch` unsupported elsewhere rather than something to fake.
+/// Invoked once per scenario consumer, so the closure must be re-callable.
+/// Errors surface exactly as for [`DlqDrainFn`].
 pub type BatchConsumeFn<B> = Box<
-    dyn Fn(<B as Backend>::Client, StressBatchHandler) -> Pin<Box<dyn Future<Output = ()> + Send>>
+    dyn Fn(
+            <B as Backend>::Client,
+            StressBatchHandler,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -1007,7 +1158,20 @@ pub struct HarnessConfig<B: Backend> {
     /// publish. `false` for SQS on LocalStack, which measures LocalStack.
     pub representative: bool,
     pub dlq_drain: Option<DlqDrainFn<B>>,
+    /// See [`DlqDepthFn`] — required only where dead-lettering is
+    /// asynchronous (SQS).
+    pub dlq_depth: Option<DlqDepthFn>,
     pub batch_consume: Option<BatchConsumeFn<B>>,
+    /// See [`BatchTopologyFn`] — required only where the generic declare
+    /// under-partitions for the consumer count (Kafka).
+    pub batch_topology: Option<BatchTopologyFn<B>>,
+    /// How many workers this backend actually runs for the FIFO flow. Most
+    /// backends spawn one worker per routing shard ([`SEQ_SHARDS`]); Kafka
+    /// runs a single FIFO task over every assigned partition, so its
+    /// wrapper sets 1. The scenario's `consumers`, message volume, and
+    /// deadline are all derived from this so the row describes the topology
+    /// that ran.
+    pub fifo_workers: u16,
     _backend: std::marker::PhantomData<fn() -> B>,
 }
 
@@ -1025,7 +1189,10 @@ impl<B: Backend> HarnessConfig<B> {
             },
             representative: true,
             dlq_drain: None,
+            dlq_depth: None,
             batch_consume: None,
+            batch_topology: None,
+            fifo_workers: SEQ_SHARDS,
             _backend: std::marker::PhantomData,
         }
     }
@@ -1065,8 +1232,23 @@ impl<B: Backend> HarnessConfig<B> {
         self
     }
 
+    pub fn with_dlq_depth(mut self, f: DlqDepthFn) -> Self {
+        self.dlq_depth = Some(f);
+        self
+    }
+
     pub fn with_batch_consume(mut self, f: BatchConsumeFn<B>) -> Self {
         self.batch_consume = Some(f);
+        self
+    }
+
+    pub fn with_batch_topology(mut self, f: BatchTopologyFn<B>) -> Self {
+        self.batch_topology = Some(f);
+        self
+    }
+
+    pub fn with_fifo_workers(mut self, workers: u16) -> Self {
+        self.fifo_workers = workers.max(1);
         self
     }
 }
@@ -1085,17 +1267,46 @@ fn default_prefetch(messages: u64, consumers: u16, cap: u16) -> u16 {
     (messages / consumers as u64).clamp(1, cap as u64) as u16
 }
 
-/// Build the message set for a scenario. `published_at_ns` is stamped at build
-/// time, exactly as before payloads existed.
-fn build_messages(scenario: &Scenario, epoch: Instant) -> Vec<StressTestMsg> {
-    let payload = payload_of(scenario.payload_bytes);
-    (0..scenario.messages)
-        .map(|id| StressTestMsg {
-            id,
-            published_at_ns: epoch.elapsed().as_nanos() as u64,
-            payload: payload.clone(),
-        })
-        .collect()
+/// Lazily build the scenario's messages one publish chunk at a time, so at
+/// most `chunk_size × payload_bytes` is ever resident. Materialising the
+/// whole corpus up front put the moderate 32-consumer 64 KiB scenario at
+/// ~10 GiB before the first publish — an OOM staged inside the measurement
+/// window, with the staging buffer's RSS and allocation time billed to the
+/// backend. `published_at_ns` is stamped once per chunk, after the
+/// chunk's payloads are cloned and immediately before its publish call, so
+/// allocation cost is never measured as queue latency.
+fn message_chunks(
+    messages: u64,
+    payload_bytes: usize,
+    epoch: Instant,
+    chunk_size: usize,
+) -> impl Iterator<Item = Vec<StressTestMsg>> {
+    let payload = payload_of(payload_bytes);
+    let chunk_size = chunk_size.max(1) as u64;
+    let mut next_id = 0u64;
+    std::iter::from_fn(move || {
+        if next_id >= messages {
+            return None;
+        }
+        let end = next_id.saturating_add(chunk_size).min(messages);
+        let mut chunk: Vec<StressTestMsg> = (next_id..end)
+            .map(|id| StressTestMsg {
+                id,
+                published_at_ns: 0,
+                payload: payload.clone(),
+            })
+            .collect();
+        // One stamp for the whole chunk, taken after the payload clones:
+        // stamping per message during construction billed up to a chunk's
+        // worth of allocation (64 MiB at the largest tier) to the earliest
+        // messages as broker dispatch latency.
+        let stamp = epoch.elapsed().as_nanos() as u64;
+        for msg in &mut chunk {
+            msg.published_at_ns = stamp;
+        }
+        next_id = end;
+        Some(chunk)
+    })
 }
 
 /// Wait until `processed` reaches `target`, the deadline expires, or the run
@@ -1122,6 +1333,101 @@ async fn await_completion(
             ));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait until the DLQ actually holds the scenario's messages.
+///
+/// The fill consumers must still be polling while this runs: on SQS a
+/// message moves to the DLQ *during a receive attempt* once its receive
+/// count exceeds the redrive policy's threshold, so stopping the pollers
+/// first freezes the DLQ short of its target forever.
+async fn await_dlq_depth(
+    depth_of: &DlqDepthFn,
+    scenario: &Scenario,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + scenario.deadline;
+    loop {
+        let depth = depth_of().await.map_err(|e| format!("depth check: {e}"))?;
+        if depth >= scenario.messages {
+            return Ok(());
+        }
+        if cancel.is_cancelled() {
+            return Err("interrupted".to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "DLQ holds {depth} / {} after {:?}; broker-side redrive has not \
+                 dead-lettered every message",
+                scenario.messages, scenario.deadline
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Fold a consumer task's join result into the scenario outcome. A worker
+/// that erred, panicked, or timed out its drain ran a degraded topology for
+/// some part of the measurement — recording that as a clean number would be
+/// a lie, so it becomes a scenario failure instead.
+fn check_worker_outcome(
+    joined: Result<shove::SupervisorOutcome, tokio::task::JoinError>,
+) -> Result<(), String> {
+    match joined {
+        Ok(outcome) if outcome.exit_code() == 0 => Ok(()),
+        Ok(outcome) => Err(format!(
+            "consumer ended unclean: {} errors, {} panics{}",
+            outcome.errors,
+            outcome.panics,
+            if outcome.timed_out {
+                ", drain timed out"
+            } else {
+                ""
+            }
+        )),
+        Err(e) if e.is_cancelled() => Ok(()),
+        Err(e) => Err(format!("consumer task panicked: {e}")),
+    }
+}
+
+/// [`await_completion`], but for flows whose consumers run as spawned driver
+/// tasks that can fail (`run_dlq`, `run_batch`). A driver that returns `Err`
+/// fails the scenario immediately with the real cause — without this, a
+/// consumer that dies on its first poll burns the entire deadline and is
+/// reported as a timeout. A driver that returns `Ok` early is left alone: the
+/// processed counter, not task exit, is what completion means.
+async fn await_completion_or_driver_error(
+    processed: &AtomicU64,
+    target: u64,
+    scenario: &Scenario,
+    cancel: &CancellationToken,
+    drivers: &mut tokio::task::JoinSet<Result<(), String>>,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + scenario.deadline;
+    loop {
+        if processed.load(Ordering::Relaxed) >= target {
+            return Ok(());
+        }
+        if cancel.is_cancelled() {
+            return Err("interrupted".to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let done = processed.load(Ordering::Relaxed);
+            return Err(format!(
+                "timeout after {:?}: processed {done} / {target}",
+                scenario.deadline
+            ));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            Some(joined) = drivers.join_next() => match joined {
+                Ok(Err(e)) => return Err(format!("consumer driver failed: {e}")),
+                Ok(Ok(())) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) => return Err(format!("consumer driver panicked: {e}")),
+            },
+        }
     }
 }
 
@@ -1160,7 +1466,9 @@ where
     B: Backend,
     T: Topic,
 {
-    (hcfg.purge)().await;
+    (hcfg.purge)(T::topology())
+        .await
+        .map_err(|e| format!("purge: {e}"))?;
     broker
         .topology()
         .declare::<T>()
@@ -1189,16 +1497,21 @@ where
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
     let sampler = ResourceSampler::start();
-    let messages = build_messages(scenario, epoch);
 
     let start = Instant::now();
     let publish = async {
+        let chunks = message_chunks(
+            scenario.messages,
+            scenario.payload_bytes,
+            epoch,
+            hcfg.publish_chunk_size,
+        );
         match scenario.flow {
             Flow::PublishBatch => {
-                for chunk in messages.chunks(hcfg.publish_chunk_size) {
+                for chunk in chunks {
                     let sent_at = epoch.elapsed().as_nanos() as u64;
                     publisher
-                        .publish_batch::<StressTestTopic>(chunk)
+                        .publish_batch::<StressTestTopic>(&chunk)
                         .await
                         .map_err(|e| format!("publish_batch: {e}"))?;
                     let done_at = epoch.elapsed().as_nanos() as u64;
@@ -1211,17 +1524,19 @@ where
                 }
             }
             _ => {
-                for msg in &messages {
-                    let sent_at = epoch.elapsed().as_nanos() as u64;
-                    publisher
-                        .publish::<StressTestTopic>(msg)
-                        .await
-                        .map_err(|e| format!("publish: {e}"))?;
-                    let done_at = epoch.elapsed().as_nanos() as u64;
-                    recorder.record(LatencyRecord {
-                        enqueue_to_receive_ns: done_at.saturating_sub(sent_at),
-                        enqueue_to_ack_ns: done_at.saturating_sub(sent_at),
-                    });
+                for chunk in chunks {
+                    for msg in &chunk {
+                        let sent_at = epoch.elapsed().as_nanos() as u64;
+                        publisher
+                            .publish::<StressTestTopic>(msg)
+                            .await
+                            .map_err(|e| format!("publish: {e}"))?;
+                        let done_at = epoch.elapsed().as_nanos() as u64;
+                        recorder.record(LatencyRecord {
+                            enqueue_to_receive_ns: done_at.saturating_sub(sent_at),
+                            enqueue_to_ack_ns: done_at.saturating_sub(sent_at),
+                        });
+                    }
                 }
             }
         }
@@ -1329,33 +1644,46 @@ where
 
     let start = Instant::now();
 
-    let messages = build_messages(scenario, epoch);
     let publish = async {
-        for chunk in messages.chunks(hcfg.publish_chunk_size) {
+        let chunks = message_chunks(
+            scenario.messages,
+            scenario.payload_bytes,
+            epoch,
+            hcfg.publish_chunk_size,
+        );
+        for chunk in chunks {
             if fifo {
                 publisher
-                    .publish_batch::<StressSeqTopic>(chunk)
+                    .publish_batch::<StressSeqTopic>(&chunk)
                     .await
                     .map_err(|e| format!("publish_batch: {e}"))?;
             } else {
                 publisher
-                    .publish_batch::<StressTestTopic>(chunk)
+                    .publish_batch::<StressTestTopic>(&chunk)
                     .await
                     .map_err(|e| format!("publish_batch: {e}"))?;
             }
         }
         Ok::<(), String>(())
     };
-    publish.await?;
-
-    let outcome =
-        await_completion(&processed, scenario.expected_processed(), scenario, cancel).await;
+    // A publish failure must still fall through to the teardown below: an
+    // early `?` here would leave the spawned consumer group running, and a
+    // leaked consumer eats the next scenario's messages.
+    let outcome = match publish.await {
+        Ok(()) => {
+            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await
+        }
+        Err(e) => Err(e),
+    };
 
     let duration = start.elapsed();
 
     // Signal the consumer group to stop and wait for the drain to complete.
+    // A worker that erred or panicked mid-run fails the scenario: the target
+    // may still have been reached by the survivors, but on a topology the
+    // row does not describe.
     scenario_stop.cancel();
-    let _ = run_handle.await;
+    let outcome = outcome.and(check_worker_outcome(run_handle.await));
 
     let resources = sampler.stop().await;
     drop(publisher);
@@ -1390,56 +1718,127 @@ where
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
-    let sampler = ResourceSampler::start();
+    // Started inside the setup block, after the readiness barrier: sampling
+    // from here would fold subscriber setup and barrier idle time into
+    // cpu_pct and peak RSS — a resource window that doesn't match the
+    // throughput window.
+    let mut sampler: Option<ResourceSampler> = None;
 
     // Each `BroadcastSubscriber` stands in for one process. Subscriptions are
     // ephemeral, so they must all exist before anything is published —
     // anything published earlier is simply not delivered to them.
+    //
+    // Subscribe and publish inside one fallible block so an error anywhere in
+    // it still reaches the teardown below — an early `?` would leave the
+    // already-spawned subscribers running into the next scenario.
     let scenario_stop = CancellationToken::new();
     let mut handles = Vec::with_capacity(scenario.consumers as usize);
-    for _ in 0..scenario.consumers {
-        let handler =
-            StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler);
-        let mut subscriber = broker.broadcast_subscriber();
-        subscriber
-            .subscribe::<StressBroadcastTopic, _>(handler, ConsumerOptions::new())
-            .map_err(|e| format!("subscribe: {e}"))?;
-        let run_stop = scenario_stop.clone();
-        handles.push(tokio::spawn(async move {
+    // One attach flag per subscriber: the readiness barrier must know that
+    // *each* subscription is live, and a shared total cannot tell one fast
+    // subscriber's ten sentinels from ten subscribers' one. Sentinels touch
+    // only these flags — never `processed`, the recorder, or the simulated
+    // workload — so a straggler completing mid-measurement is invisible.
+    let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(scenario.consumers as usize);
+    let setup_and_publish = async {
+        for _ in 0..scenario.consumers {
+            let attach = Arc::new(AtomicU64::new(0));
+            attach_flags.push(attach.clone());
+            let handler = StressTestHandler::new(
+                epoch,
+                processed.clone(),
+                recorder.clone(),
+                scenario.handler,
+            )
+            .with_attach_counter(attach);
+            let mut subscriber = broker.broadcast_subscriber();
             subscriber
-                .run_until_timeout(
-                    async move { run_stop.cancelled().await },
-                    Duration::from_secs(30),
-                )
+                .subscribe::<StressBroadcastTopic, _>(handler, ConsumerOptions::new())
+                .map_err(|e| format!("subscribe: {e}"))?;
+            let run_stop = scenario_stop.clone();
+            handles.push(tokio::spawn(async move {
+                subscriber
+                    .run_until_timeout(
+                        async move { run_stop.cancelled().await },
+                        Duration::from_secs(30),
+                    )
+                    .await
+            }));
+        }
+
+        // Readiness barrier: publish unmeasured sentinels until every
+        // subscriber has seen one. A fixed sleep raced broker attach —
+        // ephemeral subscriptions receive nothing published before they
+        // attach, so one slow attach made the target unreachable and the
+        // scenario a timeout instead of a measurement.
+        let barrier_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let sentinel = StressTestMsg {
+                id: SENTINEL_ID,
+                published_at_ns: epoch.elapsed().as_nanos() as u64,
+                payload: String::new(),
+            };
+            publisher
+                .publish::<StressBroadcastTopic>(&sentinel)
                 .await
-        }));
-    }
+                .map_err(|e| format!("publish sentinel: {e}"))?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let attached = attach_flags
+                .iter()
+                .filter(|c| c.load(Ordering::Relaxed) > 0)
+                .count();
+            if attached == attach_flags.len() {
+                break;
+            }
+            if tokio::time::Instant::now() >= barrier_deadline {
+                return Err(format!(
+                    "only {attached} of {} broadcast subscribers attached within 30s",
+                    attach_flags.len()
+                ));
+            }
+        }
 
-    // Give every ephemeral subscription time to attach broker-side before the
-    // first publish; otherwise the early messages fan out to fewer than
-    // `consumers` subscribers and the scenario can never reach its target.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+        sampler = Some(ResourceSampler::start());
+        let start = Instant::now();
+        let chunks = message_chunks(
+            scenario.messages,
+            scenario.payload_bytes,
+            epoch,
+            hcfg.publish_chunk_size,
+        );
+        for chunk in chunks {
+            publisher
+                .publish_batch::<StressBroadcastTopic>(&chunk)
+                .await
+                .map_err(|e| format!("publish_batch: {e}"))?;
+        }
+        Ok::<Instant, String>(start)
+    };
 
-    let start = Instant::now();
-    let messages = build_messages(scenario, epoch);
-    for chunk in messages.chunks(hcfg.publish_chunk_size) {
-        publisher
-            .publish_batch::<StressBroadcastTopic>(chunk)
-            .await
-            .map_err(|e| format!("publish_batch: {e}"))?;
-    }
-
-    let outcome =
-        await_completion(&processed, scenario.expected_processed(), scenario, cancel).await;
+    let (start, outcome) = match setup_and_publish.await {
+        Ok(start) => (
+            start,
+            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
+        ),
+        Err(e) => (Instant::now(), Err(e)),
+    };
 
     let duration = start.elapsed();
 
     scenario_stop.cancel();
+    let mut outcome = outcome;
     for handle in handles {
-        let _ = handle.await;
+        outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
-    let resources = sampler.stop().await;
+    let resources = match sampler {
+        Some(sampler) => sampler.stop().await,
+        // Setup failed before the measured window opened; there is nothing
+        // truthful to report.
+        None => ResourceSnapshot {
+            peak_rss_mb: 0.0,
+            cpu_pct: 0.0,
+        },
+    };
     drop(publisher);
     broker.close().await;
     outcome?;
@@ -1495,51 +1894,78 @@ where
     let rejected = Arc::new(AtomicU64::new(0));
     let fill_recorder = Arc::new(LatencyRecorder::new());
 
+    // Register and publish inside one fallible block so an error anywhere in
+    // it still reaches the teardown — an early `?` would leave the spawned
+    // fill consumers running into the next scenario.
     let fill_stop = CancellationToken::new();
     let mut fill_handles = Vec::with_capacity(scenario.consumers as usize);
-    for _ in 0..scenario.consumers {
-        // Zero profile: the fill is setup, so it should cost as little
-        // wall-clock as possible whatever the scenario's handler profile is.
-        let handler = StressTestHandler::new(
-            fill_epoch,
-            rejected.clone(),
-            fill_recorder.clone(),
-            HandlerProfile::Zero,
-        )
-        .rejecting();
-        // `max_retries(0)` so the first `Reject` dead-letters immediately
-        // instead of walking the hold-queue retry chain first.
-        let opts = ConsumerOptions::<B>::new()
-            .with_max_retries(0)
-            .with_prefetch_count(hcfg.prefetch_cap)
-            .with_concurrent_processing(scenario.concurrent);
-        let mut supervisor = broker.consumer_supervisor();
-        supervisor
-            .register::<StressTestTopic, _>(handler, opts)
-            .map_err(|e| e.to_string())?;
-        let run_stop = fill_stop.clone();
-        fill_handles.push(tokio::spawn(async move {
+    let fill = async {
+        for _ in 0..scenario.consumers {
+            // Zero profile: the fill is setup, so it should cost as little
+            // wall-clock as possible whatever the scenario's handler profile is.
+            let handler = StressTestHandler::new(
+                fill_epoch,
+                rejected.clone(),
+                fill_recorder.clone(),
+                HandlerProfile::Zero,
+            )
+            .rejecting();
+            // `max_retries(0)` so a message dead-letters on its first
+            // delivery instead of walking the hold-queue retry chain first.
+            // Which side of the handler that happens on differs per backend
+            // (RabbitMQ's gate fires before the first attempt, so its
+            // handler never runs) — which is why fill completion prefers the
+            // DLQ-depth probe over this handler's invocation count.
+            let opts = ConsumerOptions::<B>::new()
+                .with_max_retries(0)
+                .with_prefetch_count(hcfg.prefetch_cap)
+                .with_concurrent_processing(scenario.concurrent);
+            let mut supervisor = broker.consumer_supervisor();
             supervisor
-                .run_until_timeout(
-                    async move { run_stop.cancelled().await },
-                    Duration::from_secs(30),
-                )
+                .register::<StressTestTopic, _>(handler, opts)
+                .map_err(|e| e.to_string())?;
+            let run_stop = fill_stop.clone();
+            fill_handles.push(tokio::spawn(async move {
+                supervisor
+                    .run_until_timeout(
+                        async move { run_stop.cancelled().await },
+                        Duration::from_secs(30),
+                    )
+                    .await
+            }));
+        }
+
+        let chunks = message_chunks(
+            scenario.messages,
+            scenario.payload_bytes,
+            fill_epoch,
+            hcfg.publish_chunk_size,
+        );
+        for chunk in chunks {
+            publisher
+                .publish_batch::<StressTestTopic>(&chunk)
                 .await
-        }));
-    }
-
-    let messages = build_messages(scenario, fill_epoch);
-    for chunk in messages.chunks(hcfg.publish_chunk_size) {
-        publisher
-            .publish_batch::<StressTestTopic>(chunk)
-            .await
-            .map_err(|e| format!("publish_batch: {e}"))?;
-    }
-
-    let fill_outcome = await_completion(&rejected, scenario.messages, scenario, cancel).await;
+                .map_err(|e| format!("publish_batch: {e}"))?;
+        }
+        Ok::<(), String>(())
+    };
+    let fill_outcome = match fill.await {
+        // Where dead-lettering is asynchronous (SQS redrive), the DLQ itself
+        // is the completion signal, and it only advances while the fill
+        // consumers keep polling — a message moves on a receive attempt, so
+        // this must run *before* the consumers are stopped. The invocation
+        // counter would fire far too early there: it counts attempts,
+        // duplicates included, not dead-letters.
+        Ok(()) => match &hcfg.dlq_depth {
+            Some(depth_of) => await_dlq_depth(depth_of, scenario, cancel).await,
+            None => await_completion(&rejected, scenario.messages, scenario, cancel).await,
+        },
+        Err(e) => Err(e),
+    };
     fill_stop.cancel();
+    let mut fill_outcome = fill_outcome;
     for handle in fill_handles {
-        let _ = handle.await;
+        fill_outcome = fill_outcome.and(check_worker_outcome(handle.await));
     }
     drop(publisher);
     if let Err(e) = fill_outcome {
@@ -1553,20 +1979,33 @@ where
     let processed = Arc::new(AtomicU64::new(0));
     let sampler = ResourceSampler::start();
 
+    // `epoch_relative`: the DLQ'd messages carry `published_at_ns` stamped
+    // against the *fill* phase's epoch, which shares no base with this
+    // phase's clock — subtracting it would produce saturated-to-zero noise.
+    // Drain latency is measured from drain start instead.
     let handler =
-        StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler);
+        StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler)
+            .epoch_relative();
 
     let start = Instant::now();
-    let drain_handle = tokio::spawn(drain(client.clone(), handler));
+    let mut drivers = tokio::task::JoinSet::new();
+    drivers.spawn(drain(client.clone(), handler));
 
-    let outcome = await_completion(&processed, scenario.messages, scenario, cancel).await;
+    let outcome = await_completion_or_driver_error(
+        &processed,
+        scenario.messages,
+        scenario,
+        cancel,
+        &mut drivers,
+    )
+    .await;
     let duration = start.elapsed();
 
     // Abort rather than signal: `run_dlq` takes no shutdown token on several
     // backends (Kafka's stops only when its client closes), so awaiting it
     // would hang. The count is already in `processed`, so nothing is lost.
-    drain_handle.abort();
-    let _ = drain_handle.await;
+    drivers.abort_all();
+    while drivers.join_next().await.is_some() {}
 
     let resources = sampler.stop().await;
     broker.close().await;
@@ -1595,7 +2034,22 @@ where
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
+    // The generic declare under-partitions Kafka's topic for the consumer
+    // count (the group path sizes partitions to `max_consumers`; a plain
+    // declare uses the default). A supplied `batch_topology` declares with
+    // the scenario's consumer count instead, so every claimed worker can
+    // actually be assigned a partition.
+    match &hcfg.batch_topology {
+        Some(prepare) => {
+            (hcfg.purge)(StressTestTopic::topology())
+                .await
+                .map_err(|e| format!("purge: {e}"))?;
+            prepare(client.clone(), scenario.consumers)
+                .await
+                .map_err(|e| format!("declare: {e}"))?;
+        }
+        None => purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?,
+    }
     let publisher = broker
         .publisher()
         .await
@@ -1606,31 +2060,57 @@ where
     let processed = Arc::new(AtomicU64::new(0));
     let sampler = ResourceSampler::start();
 
-    let handler = StressBatchHandler::new(StressTestHandler::new(
-        epoch,
-        processed.clone(),
-        recorder.clone(),
-        scenario.handler,
-    ));
-
     let start = Instant::now();
-    let batch_handle = tokio::spawn(batch(client.clone(), handler));
-
-    let messages = build_messages(scenario, epoch);
-    for chunk in messages.chunks(hcfg.publish_chunk_size) {
-        publisher
-            .publish_batch::<StressTestTopic>(chunk)
-            .await
-            .map_err(|e| format!("publish_batch: {e}"))?;
+    // One batch consumer per scenario consumer, sharing the group — the
+    // scenario's `consumers` field and `effective_workers` both say N, so N
+    // loops must actually run, not one loop wearing N's deadline.
+    let mut drivers = tokio::task::JoinSet::new();
+    for _ in 0..scenario.consumers {
+        let handler = StressBatchHandler::new(StressTestHandler::new(
+            epoch,
+            processed.clone(),
+            recorder.clone(),
+            scenario.handler,
+        ));
+        drivers.spawn(batch(client.clone(), handler));
     }
 
-    let outcome = await_completion(&processed, scenario.messages, scenario, cancel).await;
+    // A publish failure must still fall through to the teardown below rather
+    // than early-return past it and leak the running batch consumers.
+    let publish = async {
+        let chunks = message_chunks(
+            scenario.messages,
+            scenario.payload_bytes,
+            epoch,
+            hcfg.publish_chunk_size,
+        );
+        for chunk in chunks {
+            publisher
+                .publish_batch::<StressTestTopic>(&chunk)
+                .await
+                .map_err(|e| format!("publish_batch: {e}"))?;
+        }
+        Ok::<(), String>(())
+    };
+    let outcome = match publish.await {
+        Ok(()) => {
+            await_completion_or_driver_error(
+                &processed,
+                scenario.messages,
+                scenario,
+                cancel,
+                &mut drivers,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
     let duration = start.elapsed();
 
     // Same reasoning as the DLQ drain: `run_batch` has no shutdown token of
     // its own, so abort rather than await.
-    batch_handle.abort();
-    let _ = batch_handle.await;
+    drivers.abort_all();
+    while drivers.join_next().await.is_some() {}
 
     let resources = sampler.stop().await;
     drop(publisher);
@@ -1686,61 +2166,87 @@ where
     // a single supervisor for the same topic — N supervisors × 1 register
     // gives equivalent parallelism (each spawns its own `consumer.run` task
     // against the shared queue).
+    // Register and publish inside one fallible block so an error anywhere in
+    // it still reaches the teardown below — an early `?` would leave the
+    // already-spawned supervisors running into the next scenario.
     let scenario_stop = CancellationToken::new();
-    let mut supervisor_handles = Vec::with_capacity(scenario.consumers as usize);
-    for _ in 0..scenario.consumers {
-        let handler =
-            StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler);
-        let opts = make_opts(prefetch, scenario.concurrent);
-        let mut supervisor = broker.consumer_supervisor();
-        if fifo {
-            supervisor
-                .register_fifo::<StressSeqTopic, _>(handler, opts)
-                .await
-                .map_err(|e| e.to_string())?;
-        } else {
-            supervisor
-                .register::<StressTestTopic, _>(handler, opts)
-                .map_err(|e| e.to_string())?;
+    // FIFO: one registration — `register_fifo` spawns the whole shard set,
+    // and the scenario's `consumers` already names that shard count. N
+    // registrations would run N replicas of the set, a topology no other
+    // entry point measures under this label.
+    let replicas = if fifo { 1 } else { scenario.consumers };
+    let mut supervisor_handles = Vec::with_capacity(replicas as usize);
+    let setup_and_publish = async {
+        for _ in 0..replicas {
+            let handler = StressTestHandler::new(
+                epoch,
+                processed.clone(),
+                recorder.clone(),
+                scenario.handler,
+            );
+            let opts = make_opts(prefetch, scenario.concurrent);
+            let mut supervisor = broker.consumer_supervisor();
+            if fifo {
+                supervisor
+                    .register_fifo::<StressSeqTopic, _>(handler, opts)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                supervisor
+                    .register::<StressTestTopic, _>(handler, opts)
+                    .map_err(|e| e.to_string())?;
+            }
+            let run_stop = scenario_stop.clone();
+            let handle = tokio::spawn(async move {
+                supervisor
+                    .run_until_timeout(
+                        async move { run_stop.cancelled().await },
+                        Duration::from_secs(30),
+                    )
+                    .await
+            });
+            supervisor_handles.push(handle);
         }
-        let run_stop = scenario_stop.clone();
-        let handle = tokio::spawn(async move {
-            supervisor
-                .run_until_timeout(
-                    async move { run_stop.cancelled().await },
-                    Duration::from_secs(30),
-                )
-                .await
-        });
-        supervisor_handles.push(handle);
-    }
 
-    let start = Instant::now();
+        let start = Instant::now();
 
-    let messages = build_messages(scenario, epoch);
-    for chunk in messages.chunks(hcfg.publish_chunk_size) {
-        if fifo {
-            publisher
-                .publish_batch::<StressSeqTopic>(chunk)
-                .await
-                .map_err(|e| format!("publish_batch: {e}"))?;
-        } else {
-            publisher
-                .publish_batch::<StressTestTopic>(chunk)
-                .await
-                .map_err(|e| format!("publish_batch: {e}"))?;
+        let chunks = message_chunks(
+            scenario.messages,
+            scenario.payload_bytes,
+            epoch,
+            hcfg.publish_chunk_size,
+        );
+        for chunk in chunks {
+            if fifo {
+                publisher
+                    .publish_batch::<StressSeqTopic>(&chunk)
+                    .await
+                    .map_err(|e| format!("publish_batch: {e}"))?;
+            } else {
+                publisher
+                    .publish_batch::<StressTestTopic>(&chunk)
+                    .await
+                    .map_err(|e| format!("publish_batch: {e}"))?;
+            }
         }
-    }
+        Ok::<Instant, String>(start)
+    };
 
-    let outcome =
-        await_completion(&processed, scenario.expected_processed(), scenario, cancel).await;
+    let (start, outcome) = match setup_and_publish.await {
+        Ok(start) => (
+            start,
+            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
+        ),
+        Err(e) => (Instant::now(), Err(e)),
+    };
 
     let duration = start.elapsed();
 
     // Signal every supervisor to stop and wait for all drains to complete.
     scenario_stop.cancel();
+    let mut outcome = outcome;
     for handle in supervisor_handles {
-        let _ = handle.await;
+        outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
     let resources = sampler.stop().await;
@@ -1782,6 +2288,7 @@ struct ScenarioResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FailedResult {
     flow: String,
+    mode: String,
     payload_bytes: usize,
     tier: String,
     messages: u64,
@@ -1910,13 +2417,44 @@ fn first_field_where(
 /// `"cpu": "0"` as hardware provenance. A model string is never a bare
 /// integer, so rejecting one distinguishes the index line from the genuine
 /// old-ARM `Processor : ARMv7 Processor rev 3` spelling without dropping it.
-#[cfg(target_os = "linux")]
+/// A pure parser, compiled on every platform so its tests run everywhere;
+/// only the Linux `detect_hardware` actually feeds it a real `/proc/cpuinfo`.
 fn cpu_model(cpuinfo: &str) -> Option<String> {
     first_field_where(
         cpuinfo,
         &["model name", "Model", "Hardware", "Processor"],
         |v| v.parse::<u64>().is_err(),
     )
+}
+
+/// Total physical cores from `/proc/cpuinfo`, counting unique
+/// `(physical id, core id)` pairs. The per-block `cpu cores` field is
+/// cores-per-socket, so it under-reports every multi-socket host by the
+/// socket count. `None` when the kernel exposes neither id (common on ARM),
+/// in which case the caller falls back to `available_parallelism`.
+fn physical_core_count(cpuinfo: &str) -> Option<u32> {
+    let mut pairs = std::collections::BTreeSet::new();
+    let mut physical: Option<String> = None;
+    let mut core: Option<String> = None;
+    for line in cpuinfo.lines() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        match k.trim() {
+            // Each per-CPU block opens with its `processor` line.
+            "processor" => {
+                physical = None;
+                core = None;
+            }
+            "physical id" => physical = Some(v.trim().to_string()),
+            "core id" => core = Some(v.trim().to_string()),
+            _ => continue,
+        }
+        if let (Some(p), Some(c)) = (&physical, &core) {
+            pairs.insert((p.clone(), c.clone()));
+        }
+    }
+    (!pairs.is_empty()).then_some(pairs.len() as u32)
 }
 
 #[cfg(target_os = "linux")]
@@ -1926,8 +2464,7 @@ fn detect_hardware() -> Hardware {
     // "unknown" in a chart caption that exists to date and place a number.
     let cpu = cpu_model(&cpuinfo).unwrap_or_else(|| std::env::consts::ARCH.to_string());
 
-    let physical_cores = first_field(&cpuinfo, &["cpu cores"])
-        .and_then(|v| v.parse::<u32>().ok())
+    let physical_cores = physical_core_count(&cpuinfo)
         .or_else(|| {
             std::thread::available_parallelism()
                 .ok()
@@ -2021,11 +2558,77 @@ fn detect_hardware() -> Hardware {
 /// This is what lets six single-backend binaries accumulate into the one
 /// `bench-results.json` the schema names. Provenance is refreshed on every
 /// write, so the file's timestamp always describes its newest measurement.
+/// The document's own invariants, checked on every run a merge would write —
+/// preserved and incoming alike. serde only proves the shape; a shape-valid
+/// file with a foreign payload size or a flow in both lists must not be
+/// re-signed as a valid v1 document.
+fn validate_run(run: &BackendRun) -> Result<(), String> {
+    fn check_row(
+        backend: &str,
+        kind: &str,
+        flow: &str,
+        mode: &str,
+        payload_bytes: usize,
+    ) -> Result<(), String> {
+        let Some(known) = Flow::ALL.iter().find(|f| f.as_str() == flow) else {
+            return Err(format!(
+                "run '{backend}' has a {kind} with unknown flow '{flow}'"
+            ));
+        };
+        if known.mode().as_str() != mode {
+            return Err(format!(
+                "run '{backend}' has a {kind} whose mode '{mode}' does not match flow '{flow}'"
+            ));
+        }
+        if !PAYLOAD_SIZES.contains(&payload_bytes) {
+            return Err(format!(
+                "run '{backend}' has a {kind} with payload_bytes {payload_bytes} outside \
+                 {PAYLOAD_SIZES:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    for r in &run.results {
+        check_row(&run.backend, "result", &r.flow, &r.mode, r.payload_bytes)?;
+    }
+    for f in &run.failures {
+        check_row(&run.backend, "failure", &f.flow, &f.mode, f.payload_bytes)?;
+    }
+    let legal_flows: Vec<&str> = Flow::ALL.iter().map(|f| f.as_str()).collect();
+    for u in &run.unsupported {
+        if !legal_flows.contains(&u.flow.as_str()) {
+            return Err(format!(
+                "run '{}' lists an unknown flow '{}' as unsupported",
+                run.backend, u.flow
+            ));
+        }
+        if u.reason.trim().is_empty() {
+            return Err(format!(
+                "run '{}' lists flow '{}' as unsupported without a reason",
+                run.backend, u.flow
+            ));
+        }
+        if run.results.iter().any(|r| r.flow == u.flow) {
+            return Err(format!(
+                "run '{}' lists flow '{}' as both measured and unsupported",
+                run.backend, u.flow
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn merge_results_file(
     path: &str,
     run: BackendRun,
     hardware_label: Option<&str>,
 ) -> Result<(), String> {
+    let mut hardware = detect_hardware();
+    let rust = rust_version();
+    let shove = env!("CARGO_PKG_VERSION");
+
+    let mut existing_label: Option<String> = None;
     let mut existing: Vec<BackendRun> = match std::fs::read_to_string(path) {
         Ok(content) => {
             let doc = serde_json::from_str::<BenchResults>(&content).map_err(|e| {
@@ -2045,26 +2648,74 @@ fn merge_results_file(
                     doc.schema_version
                 ));
             }
+            // Provenance is document-level, so a merge from a different host,
+            // toolchain, or crate build would silently re-attribute every
+            // preserved run to this invocation's environment — the exact
+            // mislabelling the provenance block exists to prevent. Refuse
+            // instead, mirroring the schema-version contract above.
+            let mut mismatches = Vec::new();
+            if doc.shove_version != shove {
+                mismatches.push(format!("shove_version {} != {shove}", doc.shove_version));
+            }
+            if doc.rust_version != rust {
+                mismatches.push(format!("rust_version {} != {rust}", doc.rust_version));
+            }
+            if doc.hardware.cpu != hardware.cpu {
+                mismatches.push(format!("cpu {} != {}", doc.hardware.cpu, hardware.cpu));
+            }
+            if doc.hardware.os != hardware.os {
+                mismatches.push(format!("os {} != {}", doc.hardware.os, hardware.os));
+            }
+            if doc.hardware.physical_cores != hardware.physical_cores {
+                mismatches.push(format!(
+                    "physical_cores {} != {}",
+                    doc.hardware.physical_cores, hardware.physical_cores
+                ));
+            }
+            if doc.hardware.ram_gb != hardware.ram_gb {
+                mismatches.push(format!(
+                    "ram_gb {} != {}",
+                    doc.hardware.ram_gb, hardware.ram_gb
+                ));
+            }
+            if !mismatches.is_empty() {
+                return Err(format!(
+                    "{path} was generated in a different environment ({}); merging would \
+                     re-attribute its runs to this one — move it aside first.",
+                    mismatches.join(", ")
+                ));
+            }
+            existing_label = Some(doc.hardware.label.clone());
+            for preserved in &doc.runs {
+                validate_run(preserved).map_err(|e| {
+                    format!("{path} holds an invalid v1 document ({e}) — refusing to rewrite it")
+                })?;
+            }
             doc.runs
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(format!("read {path}: {e}")),
     };
+    validate_run(&run)?;
 
     existing.retain(|r| r.backend != run.backend);
     existing.push(run);
     existing.sort_by(|a, b| a.backend.cmp(&b.backend));
 
-    let mut hardware = detect_hardware();
+    // An explicit override names the document; without one, a label an
+    // earlier invocation set must survive the merge — resetting it to the
+    // detected default would silently relabel every preserved run.
     if let Some(label) = hardware_label {
         hardware.label = label.to_string();
+    } else if let Some(label) = existing_label {
+        hardware.label = label;
     }
 
     let doc = BenchResults {
         schema_version: RESULTS_SCHEMA_VERSION,
         generated_at: generated_at(),
-        shove_version: env!("CARGO_PKG_VERSION").to_string(),
-        rust_version: rust_version(),
+        shove_version: shove.to_string(),
+        rust_version: rust,
         hardware,
         runs: existing,
     };
@@ -2082,14 +2733,15 @@ fn merge_results_file(
 /// curve — that is, every dimension *except* the consumer count being varied.
 ///
 /// Before flows and payloads existed this was `(tier, messages, handler)`.
-/// Leaving it there would have made a 64 KiB row the baseline for a 64 B one
-/// and reported the payload cost as a scaling collapse.
+/// Flow and payload joined the key so a 64 KiB row cannot baseline a 64 B
+/// one — and `messages` had to leave it: the total scales *with* the swept
+/// consumer count, so keying on it put every row in its own family and the
+/// published `scaling_efficiency` was 1.0 everywhere by construction.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ScalingKey {
     flow: String,
     payload_bytes: usize,
     tier: String,
-    messages: u64,
     handler: String,
 }
 
@@ -2099,7 +2751,6 @@ impl ScalingKey {
             flow: r.flow.clone(),
             payload_bytes: r.payload_bytes,
             tier: r.tier.clone(),
-            messages: r.messages,
             handler: r.handler.clone(),
         }
     }
@@ -2172,6 +2823,7 @@ fn print_table(report: &Report) {
     println!("dispatch = publish → handler entry (queue wait + framework overhead)");
     println!("e2e      = publish → handler completion (dispatch + handler work)");
     println!("publish-only flows report the publish call's own latency in both columns");
+    println!("dlq_drain reports latency relative to drain start, not original publish");
     if !report.failures.is_empty() {
         println!("\nFailed scenarios:");
         for f in &report.failures {
@@ -2260,11 +2912,21 @@ fn finalize_report<B: Backend>(
     hcfg: &HarnessConfig<B>,
     cli: &Cli,
     unsupported: Vec<Unsupported>,
+    interrupted: bool,
 ) {
     compute_scaling(&mut results);
 
     let mut results_file_failed = false;
-    if let Some(path) = cli.results_file.as_deref() {
+    if interrupted && cli.results_file.is_some() {
+        // The merge replaces this backend's whole entry, so a partial sweep
+        // would silently overwrite a complete one and still look
+        // publishable. Print what ran, keep the file untouched, exit red.
+        eprintln!(
+            "interrupted: results file not updated — a partial run must not replace a \
+             complete one"
+        );
+        results_file_failed = true;
+    } else if let Some(path) = cli.results_file.as_deref() {
         let run = BackendRun {
             backend: hcfg.backend_name.to_string(),
             broker: hcfg.broker.clone(),
@@ -2346,6 +3008,7 @@ fn push_failure(failures: &mut Vec<FailedResult>, scenario: &Scenario, error: St
     eprintln!("  -> FAILED: {error}");
     failures.push(FailedResult {
         flow: scenario.flow.as_str().to_string(),
+        mode: scenario.flow.mode().as_str().to_string(),
         payload_bytes: scenario.payload_bytes,
         tier: scenario.tier.to_string(),
         messages: scenario.messages,
@@ -2463,8 +3126,9 @@ fn announce_scenario(i: usize, total: usize, scenario: &Scenario) {
     );
 }
 
-/// Run every selected scenario against a coordinated-group backend (InMemory,
-/// Kafka, NATS, RabbitMQ, Redis). Each binary supplies:
+/// Run every selected scenario against a backend implementing
+/// `HasCoordinatedGroups + HasBroadcast` (the trait docs are the
+/// authoritative list of which backends those are). Each binary supplies:
 ///
 /// * `connect` — builds a fresh `Broker<B>`. Called once per scenario so the
 ///   broker-wide shutdown-token state tripped by `run_until_timeout` does not
@@ -2489,7 +3153,11 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
 
     let cli = Cli::parse();
     let cancel = spawn_ctrlc_watcher();
-    let scenarios = filter_scenarios(&hcfg, build_scenarios(&cli), false);
+    let scenarios = filter_scenarios(
+        &hcfg,
+        build_scenarios(&cli, Flow::ConsumerGroup, hcfg.fifo_workers),
+        false,
+    );
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -2538,7 +3206,14 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
     }
 
     let unsupported = unsupported_for_group_backend(&hcfg);
-    finalize_report(results, failures, &hcfg, &cli, unsupported);
+    finalize_report(
+        results,
+        failures,
+        &hcfg,
+        &cli,
+        unsupported,
+        cancel.is_cancelled(),
+    );
 }
 
 /// Run every selected scenario against a supervisor-only backend (SQS). See
@@ -2557,7 +3232,14 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
 
     let cli = Cli::parse();
     let cancel = spawn_ctrlc_watcher();
-    let scenarios = filter_scenarios(&hcfg, build_scenarios(&cli), true);
+    // `Flow::Supervisor`, not `ConsumerGroup`: the group flow is unsupported
+    // here and would be filtered out, leaving the default invocation running
+    // zero scenarios.
+    let scenarios = filter_scenarios(
+        &hcfg,
+        build_scenarios(&cli, Flow::Supervisor, hcfg.fifo_workers),
+        true,
+    );
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -2595,7 +3277,14 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     }
 
     let unsupported = unsupported_for_supervisor_backend(&hcfg);
-    finalize_report(results, failures, &hcfg, &cli, unsupported);
+    finalize_report(
+        results,
+        failures,
+        &hcfg,
+        &cli,
+        unsupported,
+        cancel.is_cancelled(),
+    );
 }
 
 #[cfg(test)]
@@ -2613,6 +3302,12 @@ mod tests {
         Cli::parse_from(all)
     }
 
+    /// [`build_scenarios`] with the coordinated-group entry point's default
+    /// flow, which is what every pre-existing test in this module assumed.
+    fn build_scenarios_cg(cli: &Cli) -> Vec<Scenario> {
+        build_scenarios(cli, Flow::ConsumerGroup, SEQ_SHARDS)
+    }
+
     // ── Pre-existing scenario-sizing tests ──
     //
     // These four shipped with the harness but never actually ran: Cargo
@@ -2622,7 +3317,7 @@ mod tests {
 
     #[test]
     fn high_fast_at_32c_yields_320_000_messages() {
-        let scenarios = build_scenarios(&cli("high", "fast"));
+        let scenarios = build_scenarios_cg(&cli("high", "fast"));
         let s = scenarios
             .iter()
             .find(|s| s.tier == "high" && s.consumers == 32)
@@ -2632,7 +3327,7 @@ mod tests {
 
     #[test]
     fn moderate_heavy_at_16c_yields_800_messages() {
-        let scenarios = build_scenarios(&cli("moderate", "heavy"));
+        let scenarios = build_scenarios_cg(&cli("moderate", "heavy"));
         let s = scenarios
             .iter()
             .find(|s| s.tier == "moderate" && s.consumers == 16)
@@ -2642,7 +3337,7 @@ mod tests {
 
     #[test]
     fn extreme_fast_at_256c_yields_2_560_000_messages() {
-        let scenarios = build_scenarios(&cli("extreme", "fast"));
+        let scenarios = build_scenarios_cg(&cli("extreme", "fast"));
         let s = scenarios
             .iter()
             .find(|s| s.tier == "extreme" && s.consumers == 256)
@@ -2652,7 +3347,7 @@ mod tests {
 
     #[test]
     fn messages_scale_linearly_with_consumer_count() {
-        let scenarios = build_scenarios(&cli("high", "fast"));
+        let scenarios = build_scenarios_cg(&cli("high", "fast"));
         let at_8 = scenarios
             .iter()
             .find(|s| s.tier == "high" && s.consumers == 8)
@@ -2751,17 +3446,48 @@ mod tests {
     // ── CLI parsing ──
 
     #[test]
-    fn flow_defaults_to_consumer_group_so_existing_invocations_are_unchanged() {
+    fn flow_defaults_per_entry_point_so_existing_invocations_are_unchanged() {
         let c = cli("moderate", "zero");
-        assert_eq!(c.flow.0, vec![Flow::ConsumerGroup]);
+        assert!(c.flow.is_none());
         assert_eq!(c.payload.0, vec![64]);
         assert!(c.results_file.is_none());
+
+        // The group entry point defaults to consumer_group, the supervisor
+        // entry point to supervisor — each is what its harness measured
+        // before flows were a dimension.
+        let group = build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS);
+        assert!(group.iter().all(|s| s.flow == Flow::ConsumerGroup));
+        let sup = build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS);
+        assert!(sup.iter().all(|s| s.flow == Flow::Supervisor));
+    }
+
+    #[test]
+    fn default_invocation_runs_scenarios_on_both_entry_points() {
+        // Regression: a hard default of `consumer-group` was filtered out as
+        // unsupported on the supervisor path, so the unchanged SQS invocation
+        // ran zero scenarios.
+        let c = cli("moderate", "zero");
+        let hcfg = HarnessConfig::<shove::InMemory>::new("any");
+
+        let group = filter_scenarios(
+            &hcfg,
+            build_scenarios(&c, Flow::ConsumerGroup, SEQ_SHARDS),
+            false,
+        );
+        assert!(!group.is_empty(), "group default filtered to nothing");
+
+        let sup = filter_scenarios(
+            &hcfg,
+            build_scenarios(&c, Flow::Supervisor, SEQ_SHARDS),
+            true,
+        );
+        assert!(!sup.is_empty(), "supervisor default filtered to nothing");
     }
 
     #[test]
     fn flow_all_selects_every_variant() {
         let c = cli_args(&["--flow", "all"]);
-        assert_eq!(c.flow.0, Flow::ALL.to_vec());
+        assert_eq!(c.flow.expect("--flow was given").0, Flow::ALL.to_vec());
     }
 
     #[test]
@@ -2787,7 +3513,7 @@ mod tests {
             "--consumers",
             "1,8,32",
         ]);
-        let scenarios = build_scenarios(&c);
+        let scenarios = build_scenarios_cg(&c);
         let counts: std::collections::BTreeSet<u16> =
             scenarios.iter().map(|s| s.consumers).collect();
         assert_eq!(counts, [1, 8, 32].into_iter().collect());
@@ -2803,7 +3529,7 @@ mod tests {
     #[test]
     fn every_scenario_carries_a_schema_legal_payload_size() {
         let c = cli_args(&["--flow", "all", "--payload", "all", "--tier", "moderate"]);
-        let scenarios = build_scenarios(&c);
+        let scenarios = build_scenarios_cg(&c);
         assert!(!scenarios.is_empty());
         for s in &scenarios {
             assert!(
@@ -2817,8 +3543,8 @@ mod tests {
 
     #[test]
     fn flow_and_payload_multiply_the_scenario_count() {
-        let one = build_scenarios(&cli_args(&["--tier", "moderate", "--handler", "zero"]));
-        let many = build_scenarios(&cli_args(&[
+        let one = build_scenarios_cg(&cli_args(&["--tier", "moderate", "--handler", "zero"]));
+        let many = build_scenarios_cg(&cli_args(&[
             "--tier",
             "moderate",
             "--handler",
@@ -2828,10 +3554,62 @@ mod tests {
             "--payload",
             "all",
         ]));
-        assert_eq!(
-            many.len(),
-            one.len() * Flow::ALL.len() * PAYLOAD_SIZES.len()
+        // Every flow multiplies by consumer counts × payloads, except the
+        // pinned flows — FIFO always runs the backend's fixed worker
+        // topology, and the DLQ drain and both publish flows are one loop —
+        // which emit one row per (tier, handler, payload).
+        let swept_flows = Flow::ALL.len() - 4;
+        let pinned_flows = 4;
+        let expected =
+            one.len() * swept_flows * PAYLOAD_SIZES.len() + pinned_flows * PAYLOAD_SIZES.len();
+        assert_eq!(many.len(), expected);
+    }
+
+    #[test]
+    fn fifo_scenarios_are_pinned_to_the_shard_count() {
+        // The consumer sweep is meaningless for FIFO: every coordinated-group
+        // backend runs exactly one worker per shard regardless of the
+        // requested count, so sweeping re-measures one topology under many
+        // labels. One row per (tier, handler, payload), sized to the real
+        // worker count.
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-fifo",
+            "--consumers",
+            "1,8,32",
+        ]));
+        assert_eq!(scenarios.len(), 1);
+        let s = &scenarios[0];
+        assert_eq!(s.consumers, SEQ_SHARDS);
+        assert_eq!(s.messages, 5_000 * SEQ_SHARDS as u64);
+    }
+
+    #[test]
+    fn fifo_scenarios_honor_the_backends_actual_worker_count() {
+        // Kafka runs one FIFO task over every assigned partition, so its
+        // wrapper reports 1 — the row must claim one worker, size one
+        // worker's corpus, and get one worker's deadline.
+        let scenarios = build_scenarios(
+            &cli_args(&[
+                "--tier",
+                "moderate",
+                "--handler",
+                "zero",
+                "--flow",
+                "consume-fifo",
+                "--consumers",
+                "1,8,32",
+            ]),
+            Flow::ConsumerGroup,
+            1,
         );
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].consumers, 1);
+        assert_eq!(scenarios[0].messages, 5_000);
     }
 
     #[test]
@@ -2846,7 +3624,7 @@ mod tests {
             "--consumers",
             "4",
         ]);
-        let s = build_scenarios(&c);
+        let s = build_scenarios_cg(&c);
         let s = s.first().expect("one scenario");
         assert_eq!(s.expected_processed(), s.messages * 4);
     }
@@ -2863,7 +3641,7 @@ mod tests {
             "--consumers",
             "4",
         ]);
-        let s = build_scenarios(&c);
+        let s = build_scenarios_cg(&c);
         let s = s.first().expect("one scenario");
         assert_eq!(s.expected_processed(), s.messages);
     }
@@ -2871,7 +3649,7 @@ mod tests {
     // ── unsupported[] ──
 
     fn dummy_batch_fn() -> BatchConsumeFn<shove::InMemory> {
-        Box::new(|_client, _h| Box::pin(async {}))
+        Box::new(|_client, _h| Box::pin(async { Ok(()) }))
     }
 
     #[test]
@@ -2947,36 +3725,115 @@ mod tests {
         ] {
             assert_eq!(flow.effective_workers(32), 1, "{flow}");
         }
-        for flow in [
-            Flow::ConsumerGroup,
-            Flow::ConsumeParallel,
-            Flow::ConsumeFifo,
-        ] {
+        for flow in [Flow::ConsumerGroup, Flow::ConsumeParallel] {
             assert_eq!(flow.effective_workers(32), 32, "{flow}");
         }
     }
 
     #[test]
-    fn dlq_drain_gets_a_longer_deadline_than_the_group_flow_at_the_same_size() {
-        let mk = |flow: &str| {
-            build_scenarios(&cli_args(&[
+    fn fifo_effective_workers_are_capped_at_the_shard_count() {
+        // The sequenced topology has SEQ_SHARDS shards; consumers past that
+        // cannot make independent progress, so sizing the deadline by the raw
+        // consumer count made large slow-handler scenarios up to 32× too
+        // tight.
+        assert_eq!(Flow::ConsumeFifo.effective_workers(4), 4);
+        assert_eq!(Flow::ConsumeFifo.effective_workers(SEQ_SHARDS), SEQ_SHARDS);
+        assert_eq!(Flow::ConsumeFifo.effective_workers(32), SEQ_SHARDS);
+        assert_eq!(Flow::ConsumeFifo.effective_workers(256), SEQ_SHARDS);
+    }
+
+    #[tokio::test]
+    async fn dlq_drain_latency_is_measured_from_drain_start_not_a_foreign_epoch() {
+        // DLQ'd messages carry `published_at_ns` stamped against the fill
+        // phase's epoch. The drain handler's clock shares no base with it, so
+        // subtracting produced saturated-to-zero (or garbage) latencies. With
+        // `epoch_relative`, latency is elapsed-since-drain-start and a real
+        // duration must be visible.
+        let epoch = Instant::now();
+        let recorder = Arc::new(LatencyRecorder::new());
+        let processed = Arc::new(AtomicU64::new(0));
+        let handler = StressTestHandler::new(
+            epoch,
+            processed.clone(),
+            recorder.clone(),
+            HandlerProfile::Zero,
+        )
+        .epoch_relative();
+
+        std::thread::sleep(Duration::from_millis(5));
+        let msg = StressTestMsg {
+            id: 1,
+            // A fill-epoch-relative stamp far in this clock's future — the
+            // old subtraction saturated it to zero.
+            published_at_ns: u64::MAX / 2,
+            payload: payload_of(64),
+        };
+        let meta = DeadMessageMetadata::builder(MessageMetadata::builder().build()).build();
+        <StressTestHandler as MessageHandler<StressTestTopic>>::handle_dead(
+            &handler,
+            msg,
+            meta,
+            &(),
+        )
+        .await;
+
+        assert_eq!(processed.load(Ordering::Relaxed), 1);
+        let p = recorder.compute_percentiles().await;
+        assert!(
+            p.e2e_p50 >= 4.0,
+            "drain latency must be elapsed-since-drain-start, got {}ms",
+            p.e2e_p50
+        );
+    }
+
+    #[test]
+    fn dlq_drain_scenarios_are_pinned_to_one_consumer() {
+        // The drain is a single loop whatever the sweep says. Sizing its
+        // corpus by the swept count made moderate/heavy/32c need ≥ 1,600 s
+        // of handler time against the 600 s deadline ceiling — a scenario
+        // that could only ever time out.
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "heavy",
+            "--flow",
+            "dlq-drain",
+            "--consumers",
+            "1,8,32",
+        ]));
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].consumers, 1);
+        assert_eq!(scenarios[0].messages, 50);
+    }
+
+    #[test]
+    fn broadcast_publishes_a_constant_per_subscriber_corpus() {
+        // Every subscriber processes the whole published stream, so the
+        // published corpus is already the per-worker workload; scaling it by
+        // the fan-out width made heavy scenarios arithmetically impossible.
+        let mk = |c: &str| {
+            build_scenarios_cg(&cli_args(&[
                 "--tier",
                 "moderate",
                 "--handler",
-                "fast",
+                "heavy",
                 "--flow",
-                flow,
+                "broadcast",
                 "--consumers",
-                "8",
+                c,
             ]))[0]
         };
-        assert!(mk("dlq-drain").deadline > mk("consumer-group").deadline);
+        assert_eq!(mk("1").messages, mk("32").messages);
+        let s = mk("32");
+        assert_eq!(s.messages, 50);
+        assert_eq!(s.expected_processed(), 50 * 32);
     }
 
     // ── Unsupported flows are filtered out, not failed ──
 
     fn all_flow_scenarios() -> Vec<Scenario> {
-        build_scenarios(&cli_args(&[
+        build_scenarios_cg(&cli_args(&[
             "--tier",
             "moderate",
             "--handler",
@@ -3276,6 +4133,163 @@ mod tests {
         assert!(PAYLOAD_SIZES.contains(&bytes));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_rows_carry_flow_mode_and_payload_metadata() {
+        // Failures are per-scenario records in the versioned document too, so
+        // they need the same three dimensions as measured rows.
+        let mut failures = Vec::new();
+        let scenario = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-fifo",
+        ]))[0];
+        push_failure(&mut failures, &scenario, "boom".to_string());
+        let v = serde_json::to_value(&failures[0]).expect("serialize");
+        assert_eq!(v["flow"], "consume_fifo");
+        assert_eq!(v["mode"], "fifo");
+        assert_eq!(v["payload_bytes"], 64);
+        assert_eq!(v["error"], "boom");
+    }
+
+    #[test]
+    fn merging_from_a_different_environment_refuses_instead_of_relabelling() {
+        let path = temp_path("provenance");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(&p, sample_run("redis"), None).expect("first write");
+        // Simulate a document produced by a different toolchain: merging into
+        // it would re-attribute the redis run to this host's provenance.
+        let tampered = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace(&rust_version(), "rustc 0.0.0 (someone-elses-box)");
+        std::fs::write(&path, &tampered).expect("write tampered");
+
+        let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
+        assert!(err.contains("different environment"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).expect("re-read"), tampered);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_sentinel_never_counts_toward_the_measurement() {
+        // Broadcast readiness sentinels run through the same handler as the
+        // corpus; with a heavy profile a mid-flight sentinel used to survive
+        // the warmup window and inflate the measured counter and
+        // percentiles. The sentinel path must bump only the attach flag.
+        let epoch = Instant::now();
+        let recorder = Arc::new(LatencyRecorder::new());
+        let processed = Arc::new(AtomicU64::new(0));
+        let attach = Arc::new(AtomicU64::new(0));
+        let handler = StressTestHandler::new(
+            epoch,
+            processed.clone(),
+            recorder.clone(),
+            HandlerProfile::Heavy,
+        )
+        .with_attach_counter(attach.clone());
+
+        let sentinel = StressTestMsg {
+            id: SENTINEL_ID,
+            published_at_ns: 0,
+            payload: String::new(),
+        };
+        let meta = MessageMetadata::builder().build();
+        let outcome = <StressTestHandler as MessageHandler<StressBroadcastTopic>>::handle(
+            &handler,
+            sentinel,
+            meta,
+            &(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Ack));
+        assert_eq!(attach.load(Ordering::Relaxed), 1);
+        assert_eq!(processed.load(Ordering::Relaxed), 0);
+        let p = recorder.compute_percentiles().await;
+        assert_eq!(p.e2e_p50, 0.0, "sentinel must record no latency");
+    }
+
+    #[test]
+    fn publish_flows_are_pinned_to_one_worker() {
+        // One sequential publisher loop runs regardless of the sweep; a row
+        // labeled 32c would describe a topology that never existed.
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "publish-single,publish-batch",
+            "--consumers",
+            "1,8,32",
+        ]));
+        assert_eq!(scenarios.len(), 2);
+        for s in &scenarios {
+            assert_eq!(s.consumers, 1, "{}", s.flow);
+            assert_eq!(s.messages, 5_000, "{}", s.flow);
+        }
+    }
+
+    #[test]
+    fn merging_refuses_to_resign_an_invalid_v1_document() {
+        let path = temp_path("invalid-v1");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(&p, sample_run("redis"), None).expect("first write");
+        // Shape-valid, semantically illegal: a payload size outside the
+        // schema set must not be rewritten under a fresh v1 header.
+        let tampered = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace("\"payload_bytes\": 1024", "\"payload_bytes\": 128");
+        std::fs::write(&path, &tampered).expect("write tampered");
+
+        let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
+        assert!(err.contains("payload_bytes 128"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).expect("re-read"), tampered);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_hardware_label_survives_merges_that_do_not_override_it() {
+        let path = temp_path("label-survives");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(&p, sample_run("kafka"), Some("bench host A")).expect("first write");
+        merge_results_file(&p, sample_run("nats"), None).expect("second write");
+        let doc: BenchResults =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(doc.hardware.label, "bench host A");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn physical_cores_count_unique_socket_core_pairs() {
+        // Dual-socket, 2 cores each: `cpu cores` says 2, the host has 4.
+        let dual = "processor\t: 0\nphysical id\t: 0\ncore id\t: 0\ncpu cores\t: 2\n\
+                    processor\t: 1\nphysical id\t: 0\ncore id\t: 1\ncpu cores\t: 2\n\
+                    processor\t: 2\nphysical id\t: 1\ncore id\t: 0\ncpu cores\t: 2\n\
+                    processor\t: 3\nphysical id\t: 1\ncore id\t: 1\ncpu cores\t: 2\n";
+        assert_eq!(physical_core_count(dual), Some(4));
+
+        // Hyperthreads share a (physical id, core id) pair and must not
+        // double-count.
+        let ht = "processor\t: 0\nphysical id\t: 0\ncore id\t: 0\n\
+                  processor\t: 1\nphysical id\t: 0\ncore id\t: 0\n";
+        assert_eq!(physical_core_count(ht), Some(1));
+
+        // aarch64 exposes neither id — the caller falls back.
+        let arm = "processor\t: 0\nBogoMIPS\t: 50.00\n";
+        assert_eq!(physical_core_count(arm), None);
     }
 
     #[test]
