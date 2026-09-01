@@ -208,6 +208,28 @@ YAML
 )"
 expect_exit 0 "accepts a pinned reference after a folded scalar on the dash line" "$f"
 
+# The catch-all below must not turn ordinary workflow syntax into a violation.
+# A flow sequence of scalars is readable -- it cannot hold a key -- and `${{ }}`
+# is a GitHub expression, not a flow mapping. Rejecting these would make the
+# gate unusable on the very workflows it guards.
+f="$(fixture flow_scalars.yml <<YAML
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+jobs:
+  build:
+    if: \${{ github.event_name == 'push' && !contains(github.ref, '[x]') }}
+    strategy:
+      matrix: \${{ fromJSON('{"os":["ubuntu-latest"]}') }}
+    steps:
+      - "name": Check the tree
+        run: echo ok
+      - uses: actions/checkout@${SHA} # v6.1.0
+YAML
+)"
+expect_exit 0 "accepts flow sequences of scalars, quoted keys and expressions" "$f"
+
 # --- rejected: mutable refs ---------------------------------------------
 
 f="$(fixture major_tag.yml <<'YAML'
@@ -328,6 +350,64 @@ YAML
 )"
 expect_exit 1 "rejects a quoted mutable ref value" "$f"
 
+# A double-quoted key is not its own characters: YAML decodes `\u0065` to `e`,
+# so GitHub reads the key below as `uses` and runs the mutable ref. Anything
+# that matches the literal characters `uses` is blind to it, which is why a key
+# this scanner cannot read has to be a violation rather than a pass-through.
+f="$(fixture escaped_key.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - "us\u0065s": actions/checkout@v6
+YAML
+)"
+expect_message 1 "unrecognised" "rejects a quoted key holding a YAML escape sequence" "$f"
+
+# Explicit-key syntax: valid YAML, the same mapping, and the key does not share
+# a line with its value at all.
+f="$(fixture explicit_key.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - ? uses
+        : actions/checkout@v6
+YAML
+)"
+expect_message 1 "unrecognised" "rejects an explicit '? key' entry" "$f"
+
+# An anchor sits between the indent and the key, so the key is no longer where
+# a line scanner looks for it.
+f="$(fixture anchored_key.yml <<'YAML'
+jobs:
+  build:
+    steps:
+      - &step uses: actions/checkout@v6
+YAML
+)"
+expect_message 1 "unrecognised" "rejects an anchor in key position" "$f"
+
+# A flow sequence may hold a single-pair mapping with no braces at all: this is
+# one step with a `uses` key, and it carries neither `{` nor a leading `- [`.
+f="$(fixture flow_seq_pair.yml <<'YAML'
+jobs:
+  build:
+    steps: [uses: actions/checkout@v6]
+YAML
+)"
+expect_message 1 "unrecognised" "rejects a mapping hidden in a brace-less flow sequence" "$f"
+
+# A flow collection left open across lines: no single line carries the whole
+# thing, so no per-line rule can read it.
+f="$(fixture flow_multiline.yml <<'YAML'
+jobs:
+  build:
+    steps: [
+      {uses: actions/checkout@v6}
+    ]
+YAML
+)"
+expect_message 1 "unrecognised" "rejects a flow collection spanning several lines" "$f"
+
 # --- job-level reusable workflow calls ----------------------------------
 
 f="$(fixture reusable_bad.yml <<'YAML'
@@ -389,6 +469,36 @@ if [ "$status" -eq 1 ] && case "$out" in *action.yml*) true ;; *) false ;; esac;
 else
   fail "follows a local action reference into its own file" "exit ${status}" "output:" "$out"
 fi
+
+# A local reference is a path, and a path is not a safe thing to hand an
+# argument parser. `./a=b` reaches awk as a variable assignment and `./-setup`
+# as a bundle of options, so awk reads neither file: it scans stdin, finds no
+# reference, and succeeds. Scanning has to fail loudly there, because a scan
+# that produces no records is indistinguishable from a file that is clean.
+for odd in 'a=b' '-setup'; do
+  root="${WORK}/local-odd-${odd}"
+  mkdir -p -- "${root}/${odd}"
+  cat > "${root}/${odd}/action.yml" <<'YAML'
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v6
+YAML
+  cat > "${root}/wf.yml" <<YAML
+jobs:
+  build:
+    steps:
+      - uses: ./${odd}
+YAML
+  out="$( (cd "$root" && "$CHECK" wf.yml) 2>&1 < /dev/null )"
+  status=$?
+  if [ "$status" -ne 0 ] && case "$out" in *actions/checkout@v6*) true ;; *) false ;; esac; then
+    pass "reports the unpinned step inside a local action at ./${odd}"
+  else
+    fail "reports the unpinned step inside a local action at ./${odd}" \
+      "exit ${status}" "output:" "$out"
+  fi
+done
 
 # --- multiple files and usage errors ------------------------------------
 

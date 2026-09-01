@@ -38,6 +38,17 @@
 # appear. That is what keeps a step `name:`, an inline comment or a shell line
 # mentioning the token from being flagged, without the scanner having to
 # understand any of them.
+#
+# Recognising `uses` cannot be the whole of it, though, because a scanner that
+# compares literal characters cannot enumerate the ways YAML spells a key:
+# `"uses":` decodes to the same key, and so do an explicit `? uses` entry,
+# an anchored key and a single-pair mapping inside a flow sequence. Each of
+# those is a line no rule below matches, and matching nothing has to mean
+# rejected rather than accepted. So the burden is inverted by a final catch-all:
+# a line is accepted only once it is shown to hold no key, or to hold one this
+# scanner can read literally. That is what makes the promise above true rather
+# than aspirational; it also means an exotic-but-valid workflow gets a "rewrite
+# this" error, which is the trade this gate exists to make.
 
 set -uo pipefail
 
@@ -66,6 +77,49 @@ scan() {
       return s
     }
     function violation(msg) { printf "VIOLATION\t%d\t%s\n", NR, msg }
+
+    # Position of the `:` that ends a block mapping key: the first one followed
+    # by a space, a tab or the end of the line. 0 when the line has no key at
+    # all, which is what a sequence entry or a scalar continuation looks like.
+    # Spelled out rather than matched so it stays the same under every awk.
+    function key_colon(s,   i, c, n) {
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        if (substr(s, i, 1) != ":") continue
+        c = substr(s, i + 1, 1)
+        if (c == "" || c == " " || c == "\t") return i
+      }
+      return 0
+    }
+
+    # Remove `${{ ... }}` expressions. They are GitHub syntax, not YAML flow
+    # collections, and their bodies routinely carry braces and brackets of
+    # their own -- `fromJSON('"'"'{"os":["a"]}'"'"')` is an ordinary matrix. Scanned to
+    # the closing `}}` rather than matched, so an inner `}` does not end it.
+    function strip_expressions(s,   out, i, j) {
+      out = ""
+      while ((i = index(s, "${{")) > 0) {
+        out = out substr(s, 1, i - 1)
+        s = substr(s, i + 3)
+        j = index(s, "}}")
+        # Unterminated on this line: hand back something the flow rule rejects
+        # rather than quietly swallowing the rest of the value.
+        if (j == 0) return out "{" s
+        s = substr(s, j + 2)
+      }
+      return out s
+    }
+
+    function flow_balance(s,   i, c, n, depth) {
+      depth = 0
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "[" || c == "{") depth++
+        else if (c == "]" || c == "}") depth--
+      }
+      return depth
+    }
 
     BEGIN { in_skip = 0; skip_indent = 0 }
 
@@ -158,7 +212,80 @@ scan() {
       skip_indent = RLENGTH
       next
     }
-  ' "$1"
+
+    # The catch-all, and the rule that makes the promise at the top of this file
+    # true. Everything above recognises a shape; a line reaching here matched
+    # none of them, and "matched nothing" must not mean "accepted". The rules
+    # above cannot be an exhaustive list of the ways YAML spells a key -- the
+    # `uses:` match compares literal characters, so `"us\u0065s":` is the same
+    # key to GitHub and a different string to this scanner. So the burden is
+    # inverted here: a line passes only by being provably unable to introduce a
+    # key that this scanner misread.
+    {
+      head = $0
+      sub(/^[ ]*/, "", head)
+      # Sequence dashes are indentation as far as a key is concerned.
+      while (substr(head, 1, 1) == "-" && \
+             (length(head) == 1 || substr(head, 2, 1) == " " || substr(head, 2, 1) == "\t")) {
+        head = substr(head, 2)
+        sub(/^[ \t]*/, "", head)
+      }
+
+      # `? key` puts the key on a line of its own and its value on another, so
+      # no line-based rule can pair them.
+      if (substr(head, 1, 1) == "?" && \
+          (length(head) == 1 || substr(head, 2, 1) == " " || substr(head, 2, 1) == "\t")) {
+        violation("unrecognised form: an explicit `? key` entry, which this checker cannot read. Rewrite it as a `key: value` mapping.")
+        next
+      }
+      # An anchor, alias or tag sits between the indent and the key, so the key
+      # is no longer where a line scanner looks for it -- and an alias key is
+      # not even present on the line that uses it.
+      if (head ~ /^[&*!%@`]/) {
+        violation("unrecognised form: an anchor, alias or tag in key position, which this checker cannot resolve. Write the key literally.")
+        next
+      }
+      if (head ~ /^[[\]{},]/) {
+        violation("unrecognised form: this line uses YAML flow style, which this checker cannot read. Rewrite it as a block mapping.")
+        next
+      }
+
+      ci = key_colon(head)
+      # No key on this line: a sequence entry, or the continuation of a
+      # multi-line scalar. Neither can be a `uses` key.
+      if (ci == 0) next
+
+      key = substr(head, 1, ci - 1)
+      value = substr(head, ci + 1)
+      sub(/[ \t]+$/, "", key)
+
+      # A plain key is its own characters; a quoted one is only its own
+      # characters while it holds no escape. Either way, the `uses` rule ran
+      # first, so a key this branch can read is a key that is not `uses`.
+      if (key ~ /["'"'"'\\]/ && \
+          key !~ /^"[^"\\]*"$/ && key !~ /^'"'"'[^'"'"']*'"'"'$/) {
+        violation("unrecognised form: this checker could not read the key on this line. Write it as a plain or simply-quoted literal, so a `uses` key cannot hide in an escape.")
+        next
+      }
+
+      value = strip_expressions(value)
+      if (match(value, /[ \t]+#/)) value = substr(value, 1, RSTART - 1)
+
+      # A flow mapping can hold a `uses` key, and so can a flow sequence: YAML
+      # lets a single-pair mapping appear in one with no braces at all, which
+      # makes `steps: [uses: actions/checkout@v6]` a step. A flow sequence of
+      # scalars -- `branches: [main]` -- carries no key and stays readable.
+      if (index(value, "{") > 0 || (index(value, "[") > 0 && key_colon(value) > 0)) {
+        violation("unrecognised form: this line uses YAML flow style, which this checker cannot read. Rewrite it as a block mapping.")
+        next
+      }
+      if (flow_balance(value) != 0) {
+        violation("unrecognised form: a flow collection left open across lines, which this checker cannot read. Rewrite it as a block mapping.")
+        next
+      }
+      next
+    }
+  ' < "$1"
 }
 
 status=0
@@ -179,6 +306,14 @@ while [ "${#queue[@]}" -gt 0 ]; do
 
   if [ ! -f "$file" ]; then
     echo "$0: cannot read '$file'" >&2
+    exit 2
+  fi
+
+  # A scan that fails produces no records, which is exactly what a clean file
+  # produces. Reading the status is the only thing that tells the two apart, so
+  # it is read before the records are looked at rather than after.
+  if ! records="$(scan "$file")"; then
+    echo "$0: failed to scan '$file'" >&2
     exit 2
   fi
 
@@ -206,7 +341,7 @@ while [ "${#queue[@]}" -gt 0 ]; do
         fi
         ;;
     esac
-  done < <(scan "$file")
+  done <<< "$records"
 done
 
 if [ "$status" -eq 0 ]; then

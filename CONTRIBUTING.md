@@ -223,6 +223,15 @@ publish job against the ref actually being released. Run it yourself with:
 bash .github/scripts/check-action-pins.test.sh   # the checker's own tests
 ```
 
+It reads the workflows line by line rather than with a YAML parser, so a missing
+`yq` can never turn the gate into a skip. The price is that it insists on block
+style: a flow mapping, a flow sequence holding a mapping, an explicit `? key`,
+an anchored key, or a quoted key containing an escape are all rejected as
+unreadable rather than passed over. That is deliberate — they are the spellings
+a `uses:` key can hide in — and the fix is to write the entry as an ordinary
+`key: value` mapping. A flow sequence of plain scalars (`branches: [main]`) and
+a `${{ }}` expression are both fine.
+
 One thing pinning does **not** cover, worth knowing before relying on it:
 `cargo binstall` fetches a prebuilt binary from the upstream project's GitHub
 release assets, which are mutable. `--version` pins which release is fetched,
