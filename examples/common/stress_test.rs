@@ -76,7 +76,17 @@ use tokio_util::sync::CancellationToken;
 /// after the fact either — the run that produced it is over — so the version
 /// is what makes the mismatch a loud refusal in [`merge_results_file`] rather
 /// than a silent gap in a merged document.
-pub const RESULTS_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 added `setup_secs` and, with it, changed what `duration_secs` means on
+/// every consume row: it is now the drain alone, because the drivers hold a
+/// readiness barrier before starting the clock. A v2 `duration_secs` on those
+/// rows included the consumer group's join latency — a fixed cost that on the
+/// `zero`/`fast` cells was the whole number — so the two versions' values are
+/// not comparable and must not be charted on one axis. The same change
+/// narrowed `handler_cost`: `framework` now additionally asserts that the
+/// window was a drain, and rows that fail that gained the new `setup_bound`
+/// value. Both are reasons a v2 reader cannot simply ignore the new field.
+pub const RESULTS_SCHEMA_VERSION: u32 = 3;
 
 /// The payload sizes that may appear in `payload_bytes`: 64 B, 1 KiB, 64 KiB.
 pub const PAYLOAD_SIZES: [usize; 3] = [64, 1024, 65536];
@@ -425,9 +435,40 @@ impl Mode {
 /// contract in the same way [`Flow::as_str`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerCost {
-    /// The simulated work is negligible, so the number is shove's own cost.
-    /// The only cells that are comparable across flows.
+    /// The simulated work is negligible **and** the row's measured window is a
+    /// drain, so the number is shove's own cost. The only cells that are
+    /// comparable across flows.
+    ///
+    /// Precisely what this marker guarantees, since a bare "negligible
+    /// handler" is not enough and used to be all it meant:
+    ///
+    /// 1. The driver **separated** fixed setup cost from the drain — it held a
+    ///    readiness barrier until every worker was assigned and polling, took
+    ///    `start` after it, and recorded what it excluded as `setup_secs`. A
+    ///    row whose `setup_secs` is absent did not separate them, so its
+    ///    `duration_secs` may be mostly coordination latency.
+    /// 2. The drain it then timed ran for at least
+    ///    [`MIN_FRAMEWORK_WINDOW_SECS`], so the number is a rate rather than a
+    ///    stopwatch reading over a window too short to hold one.
+    ///
+    /// A `zero`/`fast` row failing either half is [`HandlerCost::SetupBound`],
+    /// not this. It does **not** guarantee anything about the broker's own
+    /// steady state beyond that barrier — a backend whose throughput keeps
+    /// climbing past the first assigned poll is still measured from the first
+    /// one.
     Framework,
+    /// The simulated work is negligible, but the row cannot support the
+    /// [`HandlerCost::Framework`] claim: either the driver never separated
+    /// fixed setup cost from the drain, or the drain window was too short to
+    /// be a rate. The number is some mixture of shove's cost and a one-off
+    /// coordination cost, in an unknown ratio, and must not be charted as a
+    /// shove throughput claim.
+    ///
+    /// This is the marker CAF-667's `zero`/`fast` concurrent consume rows
+    /// should have carried: their windows were ~3.2 s at one consumer and
+    /// ~6.5 s at four and sixteen, invariant across a 32× range of corpus
+    /// size, while the drain inside them was as little as 0.05 s.
+    SetupBound,
     /// A batch-mode flow with a sleeping handler: the sleep is paid once per
     /// batch, so throughput scales with the batch size rather than with
     /// anything shove does.
@@ -440,23 +481,76 @@ pub enum HandlerCost {
     NoHandler,
 }
 
+/// How a driver split the wall-clock it spent on a scenario: what it excluded
+/// as fixed setup cost, and what remained as the drain it actually timed.
+///
+/// Carried into [`HandlerCost::of`] because whether a row measures shove is
+/// not decidable from its flow and handler alone — it also depends on whether
+/// the run separated the two and how much drain was left. Both fields are
+/// recorded on the row, so the derivation stays re-checkable by
+/// [`validate_run`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowSplit {
+    /// Seconds from the first worker being spawned to the readiness barrier
+    /// being satisfied — the fixed coordination cost **excluded** from
+    /// `duration_secs`. `None` means this driver does not separate the two, so
+    /// `duration_secs` may still contain it.
+    pub setup_secs: Option<f64>,
+    /// The measured window, in seconds: the drain, when `setup_secs` is
+    /// `Some`.
+    pub duration_secs: f64,
+}
+
+/// How long a drain has to run before its rate is worth publishing as
+/// [`HandlerCost::Framework`].
+///
+/// Not a correction — the readiness barrier already excludes setup, so setup's
+/// magnitude no longer biases the rate. This is a floor on how much signal the
+/// row has: 5,000 messages through one Kafka consumer drained in 0.048 s in
+/// the CAF-667 sweep, which is a stopwatch reading dominated by prefetch and
+/// first-poll effects, not a steady-state rate. One second is ~20× that, and
+/// is tens of thousands of messages at every payload tier.
+pub const MIN_FRAMEWORK_WINDOW_SECS: f64 = 1.0;
+
 impl HandlerCost {
-    /// The marker a row with this `flow` and `handler` must carry.
+    /// The marker a row with this `flow`, `handler` and measured `window` must
+    /// carry.
     ///
-    /// Derived from the two together, because neither settles it alone:
-    /// `publish_batch` is a batch-mode flow that runs no handler at all, and
-    /// `consume_batch --handler fast` is a batch-mode flow whose number is
-    /// still framework cost.
+    /// `flow` and `handler` together settle what *kind* of cost the number is,
+    /// because neither settles it alone: `publish_batch` is a batch-mode flow
+    /// that runs no handler at all, and `consume_batch --handler fast` is a
+    /// batch-mode flow whose number is still framework cost.
+    ///
+    /// `window` then settles whether a framework-cost cell actually *measured*
+    /// that cost. It has to: a negligible handler says the number is not the
+    /// handler's, which is not the same as saying it is shove's. On the
+    /// `zero`/`fast` concurrent consume cells the window was a fixed group
+    /// join latency, so the row was stamped "shove's own cost" over an
+    /// interval in which shove had barely run — and because the derivation
+    /// took only `(flow, handler)`, [`validate_run`] re-derived the same wrong
+    /// answer and certified it.
     ///
     /// This is the single derivation. [`Scenario::handler_cost`] stamps a row
     /// with it and [`validate_run`] re-derives it to check one, so a row's
     /// marker is verifiable rather than merely present — see the refusal
     /// there for why a row that disagrees is a lie about what was measured.
-    pub fn of(flow: Flow, handler: HandlerProfile) -> HandlerCost {
+    pub fn of(flow: Flow, handler: HandlerProfile, window: WindowSplit) -> HandlerCost {
         match flow {
+            // No consumer is constructed, so there is no worker to wait for
+            // and nothing for a barrier to exclude. The window is irrelevant
+            // to a publish row and is not consulted.
             Flow::PublishSingle | Flow::PublishBatch => HandlerCost::NoHandler,
             _ => match handler {
-                HandlerProfile::Zero | HandlerProfile::Fast => HandlerCost::Framework,
+                HandlerProfile::Zero | HandlerProfile::Fast => match window.setup_secs {
+                    Some(_) if window.duration_secs >= MIN_FRAMEWORK_WINDOW_SECS => {
+                        HandlerCost::Framework
+                    }
+                    _ => HandlerCost::SetupBound,
+                },
+                // A sleeping handler's marker already says the number is the
+                // sleep and not shove, so a setup floor underneath it changes
+                // nothing a reader would conclude. Gating these on the window
+                // too would relabel rows whose caveat is already stated.
                 HandlerProfile::Slow | HandlerProfile::Heavy => match flow.mode() {
                     Mode::Batch => HandlerCost::HandlerAmortised,
                     Mode::Parallel | Mode::Fifo => HandlerCost::HandlerBound,
@@ -468,6 +562,7 @@ impl HandlerCost {
     pub fn as_str(&self) -> &'static str {
         match self {
             HandlerCost::Framework => "framework",
+            HandlerCost::SetupBound => "setup_bound",
             HandlerCost::HandlerAmortised => "handler_amortised",
             HandlerCost::HandlerBound => "handler_bound",
             HandlerCost::NoHandler => "no_handler",
@@ -611,8 +706,13 @@ impl Scenario {
 
     /// What this scenario's throughput number measures — see
     /// [`HandlerCost::of`], which is the derivation.
-    pub fn handler_cost(&self) -> HandlerCost {
-        HandlerCost::of(self.flow, self.handler)
+    ///
+    /// Takes the measured window because the marker is not knowable before the
+    /// scenario runs: whether a negligible-handler cell measured shove depends
+    /// on whether its driver separated setup from drain and on how much drain
+    /// was left to time.
+    pub fn handler_cost(&self, window: WindowSplit) -> HandlerCost {
+        HandlerCost::of(self.flow, self.handler, window)
     }
 }
 
@@ -642,6 +742,72 @@ const EXTREME: TierConfig = TierConfig {
     consumers: &[32, 64, 128, 256],
     messages_per_consumer: (20_000, 10_000, 200, 5),
 };
+
+/// Smallest corpus a framework-cost consume cell is run with, before the byte
+/// cap below applies.
+///
+/// The readiness barrier makes `duration_secs` a drain, but it cannot make a
+/// drain long enough to be worth publishing: at CAF-667's sizes, five of the
+/// six `zero`/`fast` concurrent cells drained in under a second — one of them
+/// in 0.052 s — and [`HandlerCost::of`] now refuses them the `framework`
+/// marker for it. Without a floor the guard is an alarm with no path to green.
+///
+/// Sized from the fastest post-barrier drain rate the CAF-667 rows imply
+/// (~111,000 msg/s at 64 B, sixteen Kafka consumers), so the smallest cell
+/// still clears [`MIN_FRAMEWORK_WINDOW_SECS`] with margin. Faster hardware may
+/// drop back under it — that is the guard reporting a real loss of signal, not
+/// a number to chase here.
+const MIN_FRAMEWORK_CORPUS_MESSAGES: u64 = 150_000;
+
+/// Ceiling on what the floor above may cost in bytes.
+///
+/// Without it the floor multiplies by the payload tier: 150,000 × 64 KiB is a
+/// 9.6 GiB corpus staged through a publisher. The large tiers do not need the
+/// floor anyway — bytes, not message count, bound the drain there, so their
+/// windows are already long — so this caps the floor rather than trading it
+/// off.
+const MAX_FRAMEWORK_CORPUS_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The smallest corpus this cell may run with, or 0 where the floor does not
+/// apply.
+///
+/// Only raises a corpus, never lowers one: a tier that already sizes a cell
+/// above the floor keeps its own number.
+///
+/// The floor is restricted to cells whose drain is bounded by shove rather than
+/// by a simulated sleep, because on a sleeping cell a larger corpus buys
+/// nothing but wall-clock. `zero` never sleeps, so it always qualifies. `fast`
+/// sleeps 1–5 ms per message, which concurrency hides and sequential
+/// processing does not: the sequential `fast` cells drained at ~470 msg/s, so
+/// this floor would turn a 5 s scenario into a 5-minute one — and those cells
+/// are already drain-bound, so they never needed it.
+fn framework_corpus_floor(
+    flow: Flow,
+    handler: HandlerProfile,
+    concurrent: bool,
+    payload_bytes: usize,
+) -> u64 {
+    let negligible_and_not_sleep_bound = match handler {
+        HandlerProfile::Zero => true,
+        HandlerProfile::Fast => concurrent,
+        HandlerProfile::Slow | HandlerProfile::Heavy => false,
+    };
+    // Broadcast is excluded even though it does hold a barrier: its corpus is
+    // the *per-subscriber* workload, so flooring `messages` multiplies by the
+    // fan-out width and a 16-subscriber cell would run 2.4M handler
+    // invocations. The publish flows are excluded because they have no drain.
+    // FIFO and the DLQ drain are excluded because neither separates its setup,
+    // so no corpus makes them `framework`.
+    let barrier_backed_drain = matches!(
+        flow,
+        Flow::ConsumeParallel | Flow::ConsumeBatch | Flow::ConsumerGroup | Flow::Supervisor
+    );
+    if !negligible_and_not_sleep_bound || !barrier_backed_drain {
+        return 0;
+    }
+    let by_bytes = MAX_FRAMEWORK_CORPUS_BYTES / (payload_bytes as u64).max(1);
+    MIN_FRAMEWORK_CORPUS_MESSAGES.min(by_bytes)
+}
 
 fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> Duration {
     let expected_ms = match handler {
@@ -741,11 +907,19 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                     // per-worker workload — multiplying it by the subscriber
                     // count would scale each worker's load with the fan-out
                     // width instead of holding it constant.
-                    let messages = match flow {
+                    let tier_messages = match flow {
                         Flow::Broadcast => per_consumer,
                         _ => per_consumer.saturating_mul(consumers as u64),
                     };
                     for &payload_bytes in &cli.payload.0 {
+                        // Inside the payload loop, because the floor is capped
+                        // by bytes and so differs per tier.
+                        let messages = tier_messages.max(framework_corpus_floor(
+                            flow,
+                            h,
+                            cli.concurrent,
+                            payload_bytes,
+                        ));
                         scenarios.push(Scenario {
                             tier: tier_cfg.name,
                             messages,
@@ -1075,6 +1249,20 @@ impl StressTestHandler {
         }
     }
 
+    /// Whether `id` is a readiness sentinel rather than corpus. Only true when
+    /// this handler is carrying an attach flag: outside a readiness barrier
+    /// there is nowhere to record the probe, and silently dropping a message
+    /// would understate the drain instead of measuring it.
+    fn is_sentinel(&self, id: u64) -> bool {
+        self.attach.is_some() && id == SENTINEL_ID
+    }
+
+    fn note_attached(&self) {
+        if let Some(attach) = &self.attach {
+            attach.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn observe(&self, received_at: u64, published_at_ns: u64) {
         let base = if self.epoch_relative {
             0
@@ -1099,10 +1287,8 @@ where
     type Context = ();
 
     async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata, _: &()) -> Outcome {
-        if msg.id == SENTINEL_ID
-            && let Some(attach) = &self.attach
-        {
-            attach.fetch_add(1, Ordering::Relaxed);
+        if self.is_sentinel(msg.id) {
+            self.note_attached();
             return Outcome::Ack;
         }
         let received_at = self.epoch.elapsed().as_nanos() as u64;
@@ -1153,6 +1339,15 @@ where
         // sleeping per message would measure the sleep rather than batching.
         self.inner.simulate_work().await;
         for (msg, _) in &messages {
+            // Same split as `handle`: a readiness sentinel bumps the attach
+            // flag and nothing else. A batch straddling the barrier is the
+            // normal case — the last warmup round's sentinels and the first
+            // corpus chunk arrive together — so without this the barrier's own
+            // traffic is counted as drained corpus and recorded as latency.
+            if self.inner.is_sentinel(msg.id) {
+                self.inner.note_attached();
+                continue;
+            }
             self.inner.observe(received_at, msg.published_at_ns);
         }
         Outcome::Ack
@@ -1357,6 +1552,9 @@ struct ScenarioMetrics {
     peak_rss_mb: f64,
     cpu_pct: f64,
     duration_secs: f64,
+    /// The fixed setup cost this scenario excluded from `duration_secs`, or
+    /// `None` when its driver does not separate the two. See [`WindowSplit`].
+    setup_secs: Option<f64>,
 }
 
 fn default_prefetch(messages: u64, consumers: u16, cap: u16) -> u16 {
@@ -1530,6 +1728,7 @@ async fn await_completion_or_driver_error(
 fn finish(
     scenario: &Scenario,
     duration: Duration,
+    setup: Option<Duration>,
     resources: ResourceSnapshot,
     latencies: LatencyPercentiles,
 ) -> ScenarioMetrics {
@@ -1539,6 +1738,99 @@ fn finish(
         peak_rss_mb: resources.peak_rss_mb,
         cpu_pct: resources.cpu_pct,
         duration_secs: duration.as_secs_f64(),
+        setup_secs: setup.map(|d| d.as_secs_f64()),
+    }
+}
+
+/// Stop a sampler that is only started once the measured window opens.
+///
+/// `None` means setup failed before that happened, so there is no resource
+/// window to report — zeroes, not a snapshot of the failed setup. The scenario
+/// is being failed anyway; the numbers exist only so the row shape is uniform.
+async fn stop_sampler(sampler: Option<ResourceSampler>) -> ResourceSnapshot {
+    match sampler {
+        Some(sampler) => sampler.stop().await,
+        None => ResourceSnapshot {
+            peak_rss_mb: 0.0,
+            cpu_pct: 0.0,
+        },
+    }
+}
+
+/// How many sentinels a readiness round publishes per worker.
+///
+/// One per worker is not enough on a partitioned backend: a keyless Kafka
+/// record goes to a partition librdkafka picks at random, so a single sentinel
+/// reaches one member of an N-member group. With `OVERSUPPLY × N` per round the
+/// chance a given partition is still uncovered after one round is
+/// `((N-1)/N)^(OVERSUPPLY × N)` — about 1.6% at N = 16 — and the loop simply
+/// publishes another round until every flag is set. Oversupply is cheap
+/// (sentinels carry an empty payload and are never measured) and a missed round
+/// is not, so this is deliberately generous.
+const READINESS_OVERSUPPLY: usize = 4;
+
+/// Block until every worker has handled at least one message, and return the
+/// wall-clock that took.
+///
+/// This is what separates a drain measurement from a group-coordination
+/// measurement. Consumer tasks are spawned and *then* the corpus is published,
+/// so without a barrier the interval from `start` to completion contains the
+/// group's join/rebalance latency — a fixed cost, invariant to corpus size. In
+/// the CAF-667 Kafka sweep that cost was ~3.2 s at one consumer and ~6.5 s at
+/// four and sixteen, and it swamped drains as short as 0.05 s: the published
+/// `throughput` was `corpus / rebalance_delay`, understating the real drain
+/// rate by up to 62×.
+///
+/// A fixed sleep is not a substitute and was rejected for the same reason
+/// `run_scenario_broadcast` rejected it: it either races the slowest join or
+/// costs every scenario the worst case. This waits for the actual event.
+///
+/// One flag per worker, never a shared total: a shared counter cannot tell one
+/// fast worker's ten sentinels from ten workers' one each, which is exactly the
+/// state — a single member holding every partition — that the barrier exists to
+/// rule out. Sentinels bump only these flags, so a straggler's sentinel
+/// arriving mid-measurement is invisible to `processed` and to the recorder.
+async fn await_worker_readiness<B, T>(
+    publisher: &shove::Publisher<B>,
+    epoch: Instant,
+    attach_flags: &[Arc<AtomicU64>],
+) -> Result<(), String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    let per_round = attach_flags
+        .len()
+        .saturating_mul(READINESS_OVERSUPPLY)
+        .max(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let round: Vec<StressTestMsg> = (0..per_round)
+            .map(|_| StressTestMsg {
+                id: SENTINEL_ID,
+                published_at_ns: epoch.elapsed().as_nanos() as u64,
+                payload: String::new(),
+            })
+            .collect();
+        publisher
+            .publish_batch::<T>(&round)
+            .await
+            .map_err(|e| format!("publish readiness sentinels: {e}"))?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let attached = attach_flags
+            .iter()
+            .filter(|c| c.load(Ordering::Relaxed) > 0)
+            .count();
+        if attached == attach_flags.len() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "only {attached} of {} workers were assigned and polling within 30s; \
+                 the drain window cannot be separated from group setup",
+                attach_flags.len()
+            ));
+        }
     }
 }
 
@@ -1660,7 +1952,17 @@ where
     result?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    // `Some(ZERO)`, not `None`: a publish flow constructs no consumer, so there
+    // is no worker startup to wait for and nothing for a barrier to exclude —
+    // the window is the publish loop and nothing else. `None` would claim the
+    // two were never separated, a different and false statement.
+    Ok(finish(
+        scenario,
+        duration,
+        Some(Duration::ZERO),
+        resources,
+        latencies,
+    ))
 }
 
 /// Execute a single coordinated-group scenario. A fresh `Broker<B>` is built
@@ -1700,16 +2002,48 @@ where
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
 
-    let sampler = ResourceSampler::start();
+    // Started after the readiness barrier — see `run_scenario_supervisor`.
+    let mut sampler: Option<ResourceSampler> = None;
 
     let prefetch = scenario.prefetch.unwrap_or_else(|| {
         default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
     });
 
+    // The group calls the factory once per member, from inside the spawned
+    // `run_until_timeout` task — so the flags cannot be *collected* as members
+    // come up: the barrier would read a half-populated vec and conclude that
+    // the two members it can see are the whole group. Create the full set up
+    // front instead, sized to the member count the row is stamped with, and
+    // let each factory call claim one. A group that brings up fewer members
+    // than that leaves a flag at zero and the barrier fails the scenario with
+    // its real count, which is the loud outcome.
+    //
+    // FIFO takes no flags, for the reason spelled out in
+    // `run_scenario_supervisor`.
+    let attach_flags: Vec<Arc<AtomicU64>> = if fifo {
+        Vec::new()
+    } else {
+        (0..scenario.consumers)
+            .map(|_| Arc::new(AtomicU64::new(0)))
+            .collect()
+    };
+    // A std lock, not the tokio one this module imports: the factory is a
+    // plain `Fn`, so it cannot await, and this is claimed once per member at
+    // spawn with no contention worth an async lock.
+    let unclaimed = Arc::new(std::sync::Mutex::new(attach_flags.clone()));
     let pc = processed.clone();
     let rec = recorder.clone();
     let profile = scenario.handler;
-    let factory = move || StressTestHandler::new(epoch, pc.clone(), rec.clone(), profile);
+    let factory = move || {
+        let handler = StressTestHandler::new(epoch, pc.clone(), rec.clone(), profile);
+        match unclaimed.lock().ok().and_then(|mut u| u.pop()) {
+            Some(attach) => handler.with_attach_counter(attach),
+            // FIFO (no flags were made), or a member beyond the stamped count
+            // — a respawn topping the group back up, say. Either way it runs
+            // without a probe rather than being denied a handler.
+            None => handler,
+        }
+    };
 
     let mut group = broker.consumer_group();
     let inner_cfg = make_cfg(scenario.consumers, prefetch, scenario.concurrent);
@@ -1738,9 +2072,19 @@ where
             .await
     });
 
-    let start = Instant::now();
+    let setup_and_publish = async {
+        // Hold until every member is assigned and polling, so the window below
+        // is the drain and not the group's join latency.
+        let setup_started = Instant::now();
+        let setup = if fifo {
+            None
+        } else {
+            await_worker_readiness::<B, StressTestTopic>(&publisher, epoch, &attach_flags).await?;
+            Some(setup_started.elapsed())
+        };
 
-    let publish = async {
+        sampler = Some(ResourceSampler::start());
+        let start = Instant::now();
         let chunks = message_chunks(
             scenario.messages,
             scenario.payload_bytes,
@@ -1760,16 +2104,18 @@ where
                     .map_err(|e| format!("publish_batch: {e}"))?;
             }
         }
-        Ok::<(), String>(())
+        Ok::<(Instant, Option<Duration>), String>((start, setup))
     };
     // A publish failure must still fall through to the teardown below: an
     // early `?` here would leave the spawned consumer group running, and a
-    // leaked consumer eats the next scenario's messages.
-    let outcome = match publish.await {
-        Ok(()) => {
-            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await
-        }
-        Err(e) => Err(e),
+    // leaked consumer eats the next scenario's messages. Same for a barrier
+    // that times out.
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
+            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
+        ),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
 
     let duration = start.elapsed();
@@ -1781,13 +2127,13 @@ where
     scenario_stop.cancel();
     let outcome = outcome.and(check_worker_outcome(run_handle.await));
 
-    let resources = sampler.stop().await;
+    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 /// Broadcast: every subscriber receives every message, so `consumers`
@@ -1866,32 +2212,13 @@ where
         // ephemeral subscriptions receive nothing published before they
         // attach, so one slow attach made the target unreachable and the
         // scenario a timeout instead of a measurement.
-        let barrier_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let sentinel = StressTestMsg {
-                id: SENTINEL_ID,
-                published_at_ns: epoch.elapsed().as_nanos() as u64,
-                payload: String::new(),
-            };
-            publisher
-                .publish::<StressBroadcastTopic>(&sentinel)
-                .await
-                .map_err(|e| format!("publish sentinel: {e}"))?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let attached = attach_flags
-                .iter()
-                .filter(|c| c.load(Ordering::Relaxed) > 0)
-                .count();
-            if attached == attach_flags.len() {
-                break;
-            }
-            if tokio::time::Instant::now() >= barrier_deadline {
-                return Err(format!(
-                    "only {attached} of {} broadcast subscribers attached within 30s",
-                    attach_flags.len()
-                ));
-            }
-        }
+        //
+        // This flow had the barrier first; the shared helper is that loop
+        // generalised, so the other consume flows now get the same guarantee
+        // and the same recorded `setup_secs`.
+        let setup_started = Instant::now();
+        await_worker_readiness::<B, StressBroadcastTopic>(&publisher, epoch, &attach_flags).await?;
+        let setup = setup_started.elapsed();
 
         sampler = Some(ResourceSampler::start());
         let start = Instant::now();
@@ -1907,15 +2234,15 @@ where
                 .await
                 .map_err(|e| format!("publish_batch: {e}"))?;
         }
-        Ok::<Instant, String>(start)
+        Ok::<(Instant, Option<Duration>), String>((start, Some(setup)))
     };
 
-    let (start, outcome) = match setup_and_publish.await {
-        Ok(start) => (
-            start,
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
             await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
         ),
-        Err(e) => (Instant::now(), Err(e)),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
 
     let duration = start.elapsed();
@@ -1926,21 +2253,13 @@ where
         outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
-    let resources = match sampler {
-        Some(sampler) => sampler.stop().await,
-        // Setup failed before the measured window opened; there is nothing
-        // truthful to report.
-        None => ResourceSnapshot {
-            peak_rss_mb: 0.0,
-            cpu_pct: 0.0,
-        },
-    };
+    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 /// DLQ drain, in two phases. The fill (publish, then consume with a rejecting
@@ -2108,7 +2427,15 @@ where
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    // `None`: this window is not separated from the drain consumer's own
+    // startup. The measured phase drains a queue that is *already* full, so
+    // there is no publish path left to carry a readiness sentinel through —
+    // any message this phase published would land in the main queue, not the
+    // DLQ being drained. Saying so demotes this flow's negligible-handler rows
+    // to `HandlerCost::SetupBound` instead of letting them keep a framework
+    // claim the window cannot support. Filed as a follow-up; it needs a
+    // different probe, not this one.
+    Ok(finish(scenario, duration, None, resources, latencies))
 }
 
 /// Batch consume. Kafka-only: the closure exists nowhere else.
@@ -2154,9 +2481,9 @@ where
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
-    let sampler = ResourceSampler::start();
+    // Started after the readiness barrier — see `run_scenario_supervisor`.
+    let mut sampler: Option<ResourceSampler> = None;
 
-    let start = Instant::now();
     // One batch consumer per scenario consumer, sharing the group — the
     // scenario's `consumers` field and `effective_workers` both say N, so N
     // loops must actually run, not one loop wearing N's deadline.
@@ -2168,19 +2495,29 @@ where
     // `effective_workers` still returns the consumer count this flow's row is
     // stamped with.
     let mut drivers = tokio::task::JoinSet::new();
-    for _ in 0..scenario.flow.effective_workers(scenario.consumers) {
-        let handler = StressBatchHandler::new(StressTestHandler::new(
-            epoch,
-            processed.clone(),
-            recorder.clone(),
-            scenario.handler,
-        ));
+    let workers = scenario.flow.effective_workers(scenario.consumers);
+    let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(workers as usize);
+    for _ in 0..workers {
+        let attach = Arc::new(AtomicU64::new(0));
+        attach_flags.push(attach.clone());
+        let handler = StressBatchHandler::new(
+            StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler)
+                .with_attach_counter(attach),
+        );
         drivers.spawn(batch(client.clone(), handler));
     }
 
     // A publish failure must still fall through to the teardown below rather
-    // than early-return past it and leak the running batch consumers.
-    let publish = async {
+    // than early-return past it and leak the running batch consumers. The
+    // readiness barrier joins that block for the same reason: a barrier that
+    // times out must reach the teardown, not early-return past it.
+    let setup_and_publish = async {
+        let setup_started = Instant::now();
+        await_worker_readiness::<B, StressTestTopic>(&publisher, epoch, &attach_flags).await?;
+        let setup = setup_started.elapsed();
+
+        sampler = Some(ResourceSampler::start());
+        let start = Instant::now();
         let chunks = message_chunks(
             scenario.messages,
             scenario.payload_bytes,
@@ -2193,10 +2530,11 @@ where
                 .await
                 .map_err(|e| format!("publish_batch: {e}"))?;
         }
-        Ok::<(), String>(())
+        Ok::<(Instant, Option<Duration>), String>((start, Some(setup)))
     };
-    let outcome = match publish.await {
-        Ok(()) => {
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
             await_completion_or_driver_error(
                 &processed,
                 scenario.messages,
@@ -2204,9 +2542,9 @@ where
                 cancel,
                 &mut drivers,
             )
-            .await
-        }
-        Err(e) => Err(e),
+            .await,
+        ),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
     let duration = start.elapsed();
 
@@ -2215,13 +2553,13 @@ where
     drivers.abort_all();
     while drivers.join_next().await.is_some() {}
 
-    let resources = sampler.stop().await;
+    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 /// Execute a single supervisor scenario (SQS, and the `consume_parallel` /
@@ -2258,7 +2596,11 @@ where
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
 
-    let sampler = ResourceSampler::start();
+    // Started after the readiness barrier, not here: sampling across worker
+    // startup and barrier idle time folds them into cpu_pct and peak RSS, and
+    // the resource window then describes a different interval than the
+    // throughput window does. Same reasoning as `run_scenario_broadcast`.
+    let mut sampler: Option<ResourceSampler> = None;
 
     let prefetch = scenario.prefetch.unwrap_or_else(|| {
         default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
@@ -2279,14 +2621,28 @@ where
     // entry point measures under this label.
     let replicas = if fifo { 1 } else { scenario.consumers };
     let mut supervisor_handles = Vec::with_capacity(replicas as usize);
+    // One attach flag per replica, for the readiness barrier below. FIFO gets
+    // none: its sentinel would route by `id % SEQ_SHARDS`, so one reserved id
+    // reaches exactly one shard and can never prove the rest are polling — and
+    // `register_fifo` takes a single handler for the whole shard set, so there
+    // is no per-worker flag to hang the probe on. That flow therefore keeps an
+    // unseparated window and reports `setup_secs: None`, which downgrades its
+    // negligible-handler rows to `HandlerCost::SetupBound` rather than letting
+    // them keep claiming to measure shove.
+    let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(replicas as usize);
     let setup_and_publish = async {
         for _ in 0..replicas {
-            let handler = StressTestHandler::new(
+            let mut handler = StressTestHandler::new(
                 epoch,
                 processed.clone(),
                 recorder.clone(),
                 scenario.handler,
             );
+            if !fifo {
+                let attach = Arc::new(AtomicU64::new(0));
+                attach_flags.push(attach.clone());
+                handler = handler.with_attach_counter(attach);
+            }
             let opts = make_opts(prefetch, scenario.concurrent);
             let mut supervisor = broker.consumer_supervisor();
             if fifo {
@@ -2311,6 +2667,17 @@ where
             supervisor_handles.push(handle);
         }
 
+        // Hold here until every worker is assigned and polling, so the window
+        // below is the drain and not the group's join latency.
+        let setup_started = Instant::now();
+        let setup = if fifo {
+            None
+        } else {
+            await_worker_readiness::<B, StressTestTopic>(&publisher, epoch, &attach_flags).await?;
+            Some(setup_started.elapsed())
+        };
+
+        sampler = Some(ResourceSampler::start());
         let start = Instant::now();
 
         let chunks = message_chunks(
@@ -2332,15 +2699,15 @@ where
                     .map_err(|e| format!("publish_batch: {e}"))?;
             }
         }
-        Ok::<Instant, String>(start)
+        Ok::<(Instant, Option<Duration>), String>((start, setup))
     };
 
-    let (start, outcome) = match setup_and_publish.await {
-        Ok(start) => (
-            start,
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
             await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
         ),
-        Err(e) => (Instant::now(), Err(e)),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
 
     let duration = start.elapsed();
@@ -2352,13 +2719,13 @@ where
         outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
-    let resources = sampler.stop().await;
+    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 // ── Reporting ───────────────────────────────────────────────────────────────
@@ -2400,7 +2767,27 @@ struct ScenarioResult {
     scaling_efficiency: f64,
     peak_rss_mb: f64,
     cpu_pct: f64,
+    /// The measured window. On every consume flow that holds a readiness
+    /// barrier this is the **drain alone** — see `setup_secs` for what was
+    /// taken out of it, and [`RESULTS_SCHEMA_VERSION`] for why that makes a v2
+    /// value non-comparable.
     duration_secs: f64,
+    /// The fixed setup cost excluded from `duration_secs`: seconds from the
+    /// first worker being spawned to every worker being assigned and polling.
+    ///
+    /// `null` means this flow does not separate the two, so `duration_secs`
+    /// may still contain it — which is why [`HandlerCost::of`] refuses a
+    /// `framework` marker on such a row. Recorded rather than merely
+    /// subtracted because the number is the interesting part of the defect
+    /// this field exists for: it was ~3.2 s at one Kafka consumer and ~6.5 s
+    /// at four and sixteen, against drains as short as 0.05 s.
+    ///
+    /// `default` for the same reason as `handler_cost`: so a v1/v2 document
+    /// reaches the version check and is refused by version rather than by a
+    /// serde error. Absent therefore reads as "not separated", which is the
+    /// truthful reading of a pre-v3 row.
+    #[serde(default)]
+    setup_secs: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2679,8 +3066,8 @@ fn detect_hardware() -> Hardware {
 /// The document's own invariants, checked on every run a merge would write —
 /// preserved and incoming alike. serde only proves the shape; a shape-valid
 /// file with a foreign payload size, a flow in both lists, or a row whose
-/// `handler_cost` is not what its flow and handler measure must not be
-/// re-signed as a valid results document.
+/// `handler_cost` is not what its flow, handler and recorded window measure
+/// must not be re-signed as a valid results document.
 fn validate_run(run: &BackendRun) -> Result<(), String> {
     fn check_row(
         backend: &str,
@@ -2725,14 +3112,24 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 run.backend, r.handler
             ));
         };
-        let expected = HandlerCost::of(flow, handler);
+        let expected = HandlerCost::of(
+            flow,
+            handler,
+            WindowSplit {
+                setup_secs: r.setup_secs,
+                duration_secs: r.duration_secs,
+            },
+        );
         if r.handler_cost != expected.as_str() {
             return Err(format!(
-                "run '{}' has a result for flow '{}' with handler '{}' whose handler_cost \
-                 '{}' is not the '{}' that pair measures",
+                "run '{}' has a result for flow '{}' with handler '{}', setup_secs {:?} and \
+                 duration_secs {} whose handler_cost '{}' is not the '{}' that combination \
+                 measures",
                 run.backend,
                 r.flow,
                 r.handler,
+                r.setup_secs,
+                r.duration_secs,
                 r.handler_cost,
                 expected.as_str()
             ));
@@ -3141,7 +3538,13 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         messages: scenario.messages,
         consumers: scenario.consumers,
         handler: scenario.handler.to_string(),
-        handler_cost: scenario.handler_cost().as_str().to_string(),
+        handler_cost: scenario
+            .handler_cost(WindowSplit {
+                setup_secs: m.setup_secs,
+                duration_secs: m.duration_secs,
+            })
+            .as_str()
+            .to_string(),
         throughput_msg_per_sec: m.throughput,
         dispatch_p50_ms: m.latencies.dispatch_p50,
         dispatch_p95_ms: m.latencies.dispatch_p95,
@@ -3153,6 +3556,7 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         peak_rss_mb: m.peak_rss_mb,
         cpu_pct: m.cpu_pct,
         duration_secs: m.duration_secs,
+        setup_secs: m.setup_secs,
     });
 }
 
@@ -3510,6 +3914,118 @@ mod tests {
             .find(|s| s.tier == "high" && s.consumers == 64)
             .expect("high/64c present");
         assert_eq!(at_64.messages, at_8.messages * 8);
+    }
+
+    // ── Framework-cost corpus floor ──
+
+    #[test]
+    fn a_framework_cell_too_small_to_drain_for_a_second_is_floored() {
+        // `moderate` sizes `zero` at 5,000 messages per consumer, so the
+        // one-consumer cell published 5,000 — which drained in 0.052 s on
+        // Kafka. The barrier makes that window honest; it cannot make it
+        // informative. The floor is what gives the cell a drain long enough to
+        // earn the `framework` marker instead of being downgraded forever.
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consumer-group",
+            "--consumers",
+            "1,4,16,32",
+            "--payload",
+            "64",
+        ]));
+        let at = |c: u16| {
+            scenarios
+                .iter()
+                .find(|s| s.consumers == c)
+                .unwrap_or_else(|| panic!("{c}c present"))
+                .messages
+        };
+        // Raised: the tier's own sizing is below the floor.
+        assert_eq!(at(1), MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(at(4), MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(at(16), MIN_FRAMEWORK_CORPUS_MESSAGES);
+        // Untouched: 32 × 5,000 already clears it. The floor only ever raises,
+        // so the tiers keep their own shape wherever they are big enough — the
+        // per-consumer scaling above the floor is not flattened.
+        assert_eq!(at(32), 160_000);
+        assert!(at(32) > MIN_FRAMEWORK_CORPUS_MESSAGES);
+    }
+
+    #[test]
+    fn the_corpus_floor_is_capped_by_bytes_not_just_messages() {
+        // 150,000 × 64 KiB would stage a 9.6 GiB corpus through the publisher
+        // to buy a window the payload size already provides. The cap is what
+        // keeps the floor from multiplying by the payload tier.
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeParallel, HandlerProfile::Zero, true, 64),
+            MIN_FRAMEWORK_CORPUS_MESSAGES,
+            "the smallest payload is bounded by message count"
+        );
+        for payload_bytes in [1024, 65536] {
+            let floor = framework_corpus_floor(
+                Flow::ConsumeParallel,
+                HandlerProfile::Zero,
+                true,
+                payload_bytes,
+            );
+            assert!(
+                floor < MIN_FRAMEWORK_CORPUS_MESSAGES,
+                "{payload_bytes} B: floor {floor} was not capped"
+            );
+            assert!(
+                floor * payload_bytes as u64 <= MAX_FRAMEWORK_CORPUS_BYTES,
+                "{payload_bytes} B: floor {floor} exceeds the byte cap"
+            );
+        }
+    }
+
+    #[test]
+    fn the_corpus_floor_spares_cells_a_bigger_corpus_would_only_slow_down() {
+        // A sleeping handler's drain is the sleep, so a 30× corpus buys
+        // wall-clock and no signal — and `fast` run sequentially drained at
+        // ~470 msg/s, where the floor would turn a 5 s scenario into a 5-minute
+        // one. Concurrency hides that sleep, which is why `fast` qualifies
+        // there and only there.
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeParallel, HandlerProfile::Fast, false, 64),
+            0,
+            "sequential fast must not be floored"
+        );
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeParallel, HandlerProfile::Fast, true, 64),
+            MIN_FRAMEWORK_CORPUS_MESSAGES,
+            "concurrent fast is drain-bound and must be floored"
+        );
+        for handler in [HandlerProfile::Slow, HandlerProfile::Heavy] {
+            for concurrent in [false, true] {
+                assert_eq!(
+                    framework_corpus_floor(Flow::ConsumeParallel, handler, concurrent, 64),
+                    0,
+                    "{handler} / concurrent={concurrent}"
+                );
+            }
+        }
+        // And the flows for which no corpus produces a `framework` row: the
+        // two that cannot separate their setup, the two with no drain at all,
+        // and broadcast, whose corpus is per-subscriber so a floor multiplies
+        // by the fan-out width.
+        for flow in [
+            Flow::ConsumeFifo,
+            Flow::DlqDrain,
+            Flow::PublishSingle,
+            Flow::PublishBatch,
+            Flow::Broadcast,
+        ] {
+            assert_eq!(
+                framework_corpus_floor(flow, HandlerProfile::Zero, true, 64),
+                0,
+                "{flow}"
+            );
+        }
     }
 
     // ── Payload ──
@@ -3917,6 +4433,15 @@ mod tests {
         }
     }
 
+    /// A window that can carry a framework claim: setup was separated out, and
+    /// the drain left behind ran long enough to be a rate.
+    fn drain_bound() -> WindowSplit {
+        WindowSplit {
+            setup_secs: Some(3.2),
+            duration_secs: 30.0,
+        }
+    }
+
     #[test]
     fn a_batch_row_with_a_simulated_sleep_is_marked_amortised_not_framework() {
         // `StressBatchHandler::handle_batch` sleeps once per *batch* while the
@@ -3927,7 +4452,7 @@ mod tests {
         // because the alternative is a reader inferring it from a flow name.
         for handler in [HandlerProfile::Slow, HandlerProfile::Heavy] {
             assert_eq!(
-                scenario_for(Flow::ConsumeBatch, handler).handler_cost(),
+                scenario_for(Flow::ConsumeBatch, handler).handler_cost(drain_bound()),
                 HandlerCost::HandlerAmortised,
                 "{handler}"
             );
@@ -3950,11 +4475,158 @@ mod tests {
         ] {
             for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
                 assert_eq!(
-                    scenario_for(flow, handler).handler_cost(),
+                    scenario_for(flow, handler).handler_cost(drain_bound()),
                     HandlerCost::Framework,
                     "{flow} / {handler}"
                 );
             }
+        }
+    }
+
+    /// Every flow that runs a handler, so a marker gate has to hold for all of
+    /// them rather than for the two the defect was found on.
+    const CONSUME_FLOWS: [Flow; 7] = [
+        Flow::ConsumeBatch,
+        Flow::ConsumeParallel,
+        Flow::ConsumeFifo,
+        Flow::ConsumerGroup,
+        Flow::Supervisor,
+        Flow::Broadcast,
+        Flow::DlqDrain,
+    ];
+
+    #[test]
+    fn a_negligible_handler_alone_does_not_earn_the_framework_marker() {
+        // The defect this gate exists for. `handler_cost` was a pure function
+        // of `(flow, handler)`, so `zero`/`fast` meant `framework`
+        // unconditionally — and `validate_run` re-derived the same answer, so
+        // the row was certified rather than caught. A negligible handler says
+        // the number is not the *handler's* cost; it does not say the number is
+        // shove's. Without a separated window it is neither.
+        for flow in CONSUME_FLOWS {
+            for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+                assert_eq!(
+                    HandlerCost::of(
+                        flow,
+                        handler,
+                        WindowSplit {
+                            setup_secs: None,
+                            // Generous on purpose: length cannot rescue a
+                            // window whose composition is unknown.
+                            duration_secs: 600.0,
+                        }
+                    ),
+                    HandlerCost::SetupBound,
+                    "{flow} / {handler}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_caf_667_consume_windows_would_no_longer_be_stamped_framework() {
+        // The measured (setup, drain) pairs from the Kafka sweep that produced
+        // the mislabelled rows, taken as `duration - dispatch_p50` per cell:
+        // 5,000 messages through one consumer drained in 0.052 s behind a
+        // 3.17 s group join, and 80,000 through sixteen drained in 1.12 s
+        // behind 5.52 s. Every one of them was published as `framework`, i.e.
+        // as shove's own cost, and the worst understated the real drain rate by
+        // 62×.
+        // Five of the six fall below the floor even with the barrier in place,
+        // because the corpus they drained was too small to occupy one. The
+        // sixth — 80,000 messages through sixteen consumers — genuinely drained
+        // for 1.122 s and *does* qualify once the setup is out of the window:
+        // it was a real ~71,000 msg/s measurement all along, published as
+        // 12,045 because the window was six times too long. The gate is not
+        // "CAF-667 was worthless", it is "five of these six rows had no
+        // measurement in them".
+        for (handler, setup, drain, expected) in [
+            (HandlerProfile::Zero, 3.17, 0.052, HandlerCost::SetupBound),
+            (HandlerProfile::Zero, 6.04, 0.441, HandlerCost::SetupBound),
+            (HandlerProfile::Zero, 5.52, 1.122, HandlerCost::Framework),
+            (HandlerProfile::Fast, 3.18, 0.048, HandlerCost::SetupBound),
+            (HandlerProfile::Fast, 6.13, 0.384, HandlerCost::SetupBound),
+            (HandlerProfile::Fast, 5.80, 0.779, HandlerCost::SetupBound),
+        ] {
+            assert_eq!(
+                HandlerCost::of(
+                    Flow::ConsumeBatch,
+                    handler,
+                    WindowSplit {
+                        setup_secs: Some(setup),
+                        duration_secs: drain,
+                    }
+                ),
+                expected,
+                "{handler}: a {drain}s drain behind a {setup}s setup"
+            );
+        }
+    }
+
+    #[test]
+    fn framework_needs_both_a_separated_setup_and_a_window_worth_measuring() {
+        // The gate is two-sided, and the boundary is the interesting part: a
+        // drain exactly at the floor qualifies, one just under it does not.
+        // Pinning both directions stops the threshold from being quietly
+        // widened into a no-op later.
+        let separated = |duration_secs| WindowSplit {
+            setup_secs: Some(4.0),
+            duration_secs,
+        };
+        for flow in CONSUME_FLOWS {
+            for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+                assert_eq!(
+                    HandlerCost::of(flow, handler, separated(MIN_FRAMEWORK_WINDOW_SECS)),
+                    HandlerCost::Framework,
+                    "{flow} / {handler} at the floor"
+                );
+                assert_eq!(
+                    HandlerCost::of(
+                        flow,
+                        handler,
+                        separated(MIN_FRAMEWORK_WINDOW_SECS - f64::EPSILON.max(1e-9))
+                    ),
+                    HandlerCost::SetupBound,
+                    "{flow} / {handler} just under the floor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sleeping_handlers_marker_does_not_depend_on_the_window() {
+        // `handler_bound` and `handler_amortised` already tell a reader the
+        // number is the simulated sleep and not shove, so a setup floor
+        // underneath changes nothing they would conclude. Gating these too
+        // would relabel rows whose caveat is already stated — and would lose
+        // the batch-vs-parallel distinction the markers exist to carry.
+        for window in [
+            WindowSplit {
+                setup_secs: None,
+                duration_secs: 0.001,
+            },
+            WindowSplit {
+                setup_secs: Some(600.0),
+                duration_secs: 0.001,
+            },
+        ] {
+            assert_eq!(
+                HandlerCost::of(Flow::ConsumeBatch, HandlerProfile::Slow, window),
+                HandlerCost::HandlerAmortised,
+                "{window:?}"
+            );
+            assert_eq!(
+                HandlerCost::of(Flow::ConsumeParallel, HandlerProfile::Heavy, window),
+                HandlerCost::HandlerBound,
+                "{window:?}"
+            );
+            // And a publish row consults the window not at all: it builds no
+            // consumer, so there is no worker startup for a barrier to exclude.
+            assert_eq!(
+                HandlerCost::of(Flow::PublishBatch, HandlerProfile::Zero, window),
+                HandlerCost::NoHandler,
+                "{window:?}"
+            );
         }
     }
 
@@ -3965,7 +4637,7 @@ mod tests {
         // caveat is not the batch row's caveat.
         for flow in [Flow::ConsumeParallel, Flow::ConsumerGroup, Flow::DlqDrain] {
             assert_eq!(
-                scenario_for(flow, HandlerProfile::Slow).handler_cost(),
+                scenario_for(flow, HandlerProfile::Slow).handler_cost(drain_bound()),
                 HandlerCost::HandlerBound,
                 "{flow}"
             );
@@ -3981,7 +4653,9 @@ mod tests {
                 HandlerProfile::Slow,
                 HandlerProfile::Heavy,
             ] {
-                if scenario_for(flow, handler).handler_cost() == HandlerCost::HandlerAmortised {
+                if scenario_for(flow, handler).handler_cost(drain_bound())
+                    == HandlerCost::HandlerAmortised
+                {
                     assert_eq!(flow.mode(), Mode::Batch, "{flow} is not a batch-mode flow");
                 }
             }
@@ -4002,7 +4676,7 @@ mod tests {
                 HandlerProfile::Heavy,
             ] {
                 assert_eq!(
-                    scenario_for(flow, handler).handler_cost(),
+                    scenario_for(flow, handler).handler_cost(drain_bound()),
                     HandlerCost::NoHandler,
                     "{flow} / {handler}"
                 );
@@ -4023,6 +4697,7 @@ mod tests {
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
                 duration_secs: 1.0,
+                setup_secs: Some(0.5),
             },
         );
         assert_eq!(rows[0].handler_cost, HandlerCost::HandlerAmortised.as_str());
@@ -4056,7 +4731,10 @@ mod tests {
         merge_results_file(&p, sample_run("redis"), None).expect("first write");
         let v1 = std::fs::read_to_string(&path)
             .expect("read")
-            .replace("\"schema_version\": 2", "\"schema_version\": 1")
+            .replace(
+                &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+                "\"schema_version\": 1",
+            )
             .replace("\"handler_cost\": \"framework\",", "");
         assert!(!v1.contains("handler_cost"), "the v1 fixture still has one");
         std::fs::write(&path, &v1).expect("write v1");
@@ -4150,6 +4828,80 @@ mod tests {
             rows[0].consumers as u64, ran,
             "the row claims {} workers but {ran} ran",
             rows[0].consumers
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_flows_measured_window_excludes_worker_startup() {
+        // The defect, end to end. The batch consumers are spawned and *then*
+        // the corpus is published, so before the readiness barrier the measured
+        // window contained however long the workers took to come up — a fixed
+        // cost, invariant to corpus size, which on Kafka was ~3.2 s at one
+        // consumer against drains as short as 0.05 s.
+        //
+        // The stand-in for that cost here is an explicit delay before each
+        // consumer starts polling, which is deterministic where a real
+        // rebalance is not. What must hold: the delay lands in `setup_secs`,
+        // and `duration_secs` is the drain that happened after it.
+        const STARTUP: Duration = Duration::from_millis(700);
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 20,
+            consumers: 2,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+        };
+
+        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler| {
+            Box::pin(async move {
+                tokio::time::sleep(STARTUP).await;
+                InMemoryConsumer::new(client)
+                    .run::<StressTestTopic, _>(
+                        OneMessageBatches(handler),
+                        (),
+                        ConsumerOptions::new(),
+                    )
+                    .await
+                    .map_err(|e| format!("run: {e}"))
+            })
+        });
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        let metrics = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        let setup = metrics
+            .setup_secs
+            .expect("the barrier must record what it excluded");
+        assert!(
+            setup >= STARTUP.as_secs_f64(),
+            "setup_secs {setup} did not cover the {STARTUP:?} the workers took to start"
+        );
+        assert!(
+            metrics.duration_secs < STARTUP.as_secs_f64(),
+            "duration_secs {} still contains worker startup; a 20-message drain \
+             cannot take longer than {STARTUP:?}",
+            metrics.duration_secs
+        );
+
+        // And the row it produces claims to measure shove only if that drain
+        // was long enough to be a rate — which a 20-message one is not.
+        let mut rows = Vec::new();
+        push_metrics(&mut rows, &scenario, metrics);
+        assert_eq!(rows[0].handler_cost, HandlerCost::SetupBound.as_str());
+        assert!(
+            rows[0].setup_secs.is_some(),
+            "setup_secs must reach the row"
         );
     }
 
@@ -4427,7 +5179,8 @@ mod tests {
                 scaling_efficiency: 1.0,
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
-                duration_secs: 1.0,
+                duration_secs: drain_bound().duration_secs,
+                setup_secs: drain_bound().setup_secs,
             }],
             failures: vec![],
             unsupported: vec![Unsupported {
@@ -4475,13 +5228,15 @@ mod tests {
         // Six backend binaries accumulate into one file. A newer one bumping
         // the version must not have its rows silently rewritten with this
         // binary's header by an older binary that ran afterwards.
-        let bumped = std::fs::read_to_string(&path)
-            .expect("read")
-            .replace("\"schema_version\": 2", "\"schema_version\": 3");
+        let next = RESULTS_SCHEMA_VERSION + 1;
+        let bumped = std::fs::read_to_string(&path).expect("read").replace(
+            &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+            &format!("\"schema_version\": {next}"),
+        );
         std::fs::write(&path, &bumped).expect("write bumped");
 
         let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
-        assert!(err.contains("v3"), "{err}");
+        assert!(err.contains(&format!("v{next}")), "{err}");
 
         // The refusal must leave the file untouched, not half-written.
         assert_eq!(std::fs::read_to_string(&path).expect("re-read"), bumped);
@@ -4504,10 +5259,42 @@ mod tests {
                 latencies: LatencyPercentiles::default(),
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
-                duration_secs: 1.0,
+                // A window that supports a framework claim, so a row's marker
+                // here is decided by its flow and handler rather than by a
+                // too-short drain — that gate has its own tests.
+                duration_secs: drain_bound().duration_secs,
+                setup_secs: drain_bound().setup_secs,
             },
         );
         run
+    }
+
+    #[test]
+    fn a_framework_claim_its_own_recorded_window_cannot_support_is_refused() {
+        // The re-derivation is what makes the marker verifiable rather than
+        // merely present, and it now has to consult the window — otherwise a
+        // row can record a 0.05 s drain behind an unseparated setup and still
+        // be certified as "shove's own cost", which is precisely the state
+        // CAF-667's published rows were in.
+        for (setup_secs, duration_secs, why) in [
+            (None, 30.0, "setup never separated from the drain"),
+            (Some(6.2), 0.05, "drain far too short to be a rate"),
+        ] {
+            let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
+            run.results[0].setup_secs = setup_secs;
+            run.results[0].duration_secs = duration_secs;
+            // What the row would have been stamped, pre-fix.
+            run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+
+            let err = validate_run(&run).expect_err(&format!("must refuse: {why}"));
+            assert!(err.contains("handler_cost"), "{why}: {err}");
+            assert!(err.contains("setup_bound"), "{why}: {err}");
+
+            // And the honest marker for the same row passes, so the refusal is
+            // about the claim and not about the row's shape.
+            run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
+            validate_run(&run).unwrap_or_else(|e| panic!("{why}: honest marker refused: {e}"));
+        }
     }
 
     #[test]
@@ -4798,6 +5585,61 @@ mod tests {
         assert_eq!(p.e2e_p50, 0.0, "sentinel must record no latency");
     }
 
+    #[tokio::test]
+    async fn the_batch_handler_does_not_count_readiness_sentinels_either() {
+        // The batch flow's readiness barrier publishes its sentinels through
+        // the same topic as the corpus, so `handle_batch` sees them. Without
+        // the same filter `handle` has, every sentinel is counted as a
+        // processed message and recorded as a latency sample — which both
+        // inflates the drain count and lets the barrier's own warmup traffic
+        // satisfy the completion target.
+        let epoch = Instant::now();
+        let recorder = Arc::new(LatencyRecorder::new());
+        let processed = Arc::new(AtomicU64::new(0));
+        let attach = Arc::new(AtomicU64::new(0));
+        let handler = StressBatchHandler::new(
+            StressTestHandler::new(
+                epoch,
+                processed.clone(),
+                recorder.clone(),
+                HandlerProfile::Zero,
+            )
+            .with_attach_counter(attach.clone()),
+        );
+
+        let batch = vec![
+            (
+                StressTestMsg {
+                    id: SENTINEL_ID,
+                    published_at_ns: 0,
+                    payload: String::new(),
+                },
+                MessageMetadata::builder().build(),
+            ),
+            (
+                StressTestMsg {
+                    id: 0,
+                    published_at_ns: 0,
+                    payload: String::new(),
+                },
+                MessageMetadata::builder().build(),
+            ),
+        ];
+        let outcome = <StressBatchHandler as BatchMessageHandler<StressTestTopic>>::handle_batch(
+            &handler,
+            batch,
+            &(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Ack));
+        assert_eq!(
+            processed.load(Ordering::Relaxed),
+            1,
+            "the sentinel leaked into the measured count"
+        );
+        assert_eq!(attach.load(Ordering::Relaxed), 1, "attach flag not bumped");
+    }
+
     #[test]
     fn publish_flows_are_pinned_to_one_worker() {
         // One sequential publisher loop runs regardless of the sweep; a row
@@ -4928,9 +5770,14 @@ mod tests {
             assert!(obj.contains_key(field), "lost pre-existing field {field}");
         }
         // 15 pre-existing + the 3 flow/mode/payload dimensions + the
-        // handler-cost marker.
-        assert_eq!(obj.len(), 19);
+        // handler-cost marker + the setup/drain split.
+        assert_eq!(obj.len(), 20);
         assert!(obj.contains_key("handler_cost"));
+        // Serialized even when `None`, as an explicit `null`: a reader has to
+        // be able to tell "this driver did not separate setup from drain" from
+        // "this document predates the field", and an omitted key conflates
+        // them.
+        assert!(obj.contains_key("setup_secs"));
     }
 
     #[test]
