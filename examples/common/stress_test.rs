@@ -2064,8 +2064,15 @@ where
     // One batch consumer per scenario consumer, sharing the group — the
     // scenario's `consumers` field and `effective_workers` both say N, so N
     // loops must actually run, not one loop wearing N's deadline.
+    //
+    // The count comes from `effective_workers` rather than from
+    // `scenario.consumers` directly so that the loops that run and the
+    // deadline they run against cannot drift apart: they are now the same
+    // expression. That leaves exactly one thing for a test to pin — that
+    // `effective_workers` still returns the consumer count this flow's row is
+    // stamped with.
     let mut drivers = tokio::task::JoinSet::new();
-    for _ in 0..scenario.consumers {
+    for _ in 0..scenario.flow.effective_workers(scenario.consumers) {
         let handler = StressBatchHandler::new(StressTestHandler::new(
             epoch,
             processed.clone(),
@@ -3291,6 +3298,7 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
 mod tests {
     use super::*;
     use clap::Parser;
+    use shove::inmemory::{InMemoryConfig, InMemoryConsumer};
 
     fn cli(tier: &str, handler: &str) -> Cli {
         Cli::parse_from(["stress", "--tier", tier, "--handler", handler])
@@ -3725,7 +3733,15 @@ mod tests {
         ] {
             assert_eq!(flow.effective_workers(32), 1, "{flow}");
         }
-        for flow in [Flow::ConsumerGroup, Flow::ConsumeParallel] {
+        // `ConsumeBatch` belongs in this list, not the one above: its driver
+        // spawns one `run_batch` loop per scenario consumer, and its row is
+        // stamped `consumers: N`. A `1` here would size the deadline for a
+        // topology that is not the one running, and would contradict the row.
+        for flow in [
+            Flow::ConsumerGroup,
+            Flow::ConsumeParallel,
+            Flow::ConsumeBatch,
+        ] {
             assert_eq!(flow.effective_workers(32), 32, "{flow}");
         }
     }
@@ -3740,6 +3756,90 @@ mod tests {
         assert_eq!(Flow::ConsumeFifo.effective_workers(SEQ_SHARDS), SEQ_SHARDS);
         assert_eq!(Flow::ConsumeFifo.effective_workers(32), SEQ_SHARDS);
         assert_eq!(Flow::ConsumeFifo.effective_workers(256), SEQ_SHARDS);
+    }
+
+    /// Forwards each delivery to the batch handler as a one-message batch, so
+    /// a backend without a batch primitive can still drive
+    /// [`StressBatchHandler`] over a real queue.
+    struct OneMessageBatches(StressBatchHandler);
+
+    impl MessageHandler<StressTestTopic> for OneMessageBatches {
+        type Context = ();
+
+        async fn handle(&self, msg: StressTestMsg, meta: MessageMetadata, _: &()) -> Outcome {
+            BatchMessageHandler::<StressTestTopic>::handle_batch(&self.0, vec![(msg, meta)], &())
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_flow_runs_exactly_the_workers_its_row_claims() {
+        // Three things have to agree about a `consume_batch` row's worker
+        // count: the driver that executes it, `effective_workers` (which
+        // sizes the deadline), and the `consumers` field stamped on the row.
+        // They previously did not — one loop ran while both of the others
+        // said N, so the loop was handed N times the messages against a
+        // deadline divided by N, and the published row named a topology that
+        // never existed. Asserting `effective_workers` alone cannot catch
+        // that: only counting the loops that actually start can.
+        let workers: u16 = 3;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 30,
+            consumers: workers,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+        };
+
+        let started = Arc::new(AtomicU64::new(0));
+        let counter = started.clone();
+        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler| {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                InMemoryConsumer::new(client)
+                    .run::<StressTestTopic, _>(
+                        OneMessageBatches(handler),
+                        (),
+                        ConsumerOptions::new(),
+                    )
+                    .await
+                    .map_err(|e| format!("run: {e}"))
+            })
+        });
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        let metrics = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        let ran = started.load(Ordering::Relaxed);
+        assert_eq!(
+            ran, workers as u64,
+            "the driver started {ran} batch loops for a {workers}-consumer scenario"
+        );
+        assert_eq!(
+            Flow::ConsumeBatch.effective_workers(workers),
+            workers,
+            "the deadline is sized for a different worker count than the driver runs"
+        );
+
+        let mut rows = Vec::new();
+        push_metrics(&mut rows, &scenario, metrics);
+        assert_eq!(
+            rows[0].consumers as u64, ran,
+            "the row claims {} workers but {ran} ran",
+            rows[0].consumers
+        );
     }
 
     #[tokio::test]
