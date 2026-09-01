@@ -386,6 +386,41 @@ impl Flow {
         }
     }
 
+    /// Whether this flow's driver holds a readiness barrier, and so can record
+    /// a `setup_secs` separated from its drain at all.
+    ///
+    /// The three answers, and why each one is where it is:
+    ///
+    /// - **Yes** for the four barrier-holding drivers — `run_scenario_batch`,
+    ///   `run_scenario_supervisor` (non-FIFO), `run_scenario_group` (non-FIFO)
+    ///   and `run_scenario_broadcast`. Each waits until every worker has
+    ///   handled a sentinel before taking `start`.
+    /// - **No** for `consume_fifo` and `dlq_drain`: neither has anywhere to
+    ///   hang the probe — a sequenced sentinel routes to exactly one shard, and
+    ///   the DLQ drain's measured phase has no publish path at all — so both
+    ///   drivers emit `setup_secs: None` by construction.
+    /// - **No** for the publish flows and the autoscaler, which construct no
+    ///   consumer, so there is no worker for a barrier to wait on.
+    ///
+    /// [`HandlerCost::of`] consults this so that the `framework` marker's first
+    /// guarantee is checked against the flow and not only against the recorded
+    /// `Option`: a row whose flow can never separate its setup must not be able
+    /// to claim it did by carrying a `setup_secs` value.
+    pub fn holds_readiness_barrier(&self) -> bool {
+        match self {
+            Flow::ConsumeBatch
+            | Flow::ConsumeParallel
+            | Flow::ConsumerGroup
+            | Flow::Supervisor
+            | Flow::Broadcast => true,
+            Flow::ConsumeFifo
+            | Flow::DlqDrain
+            | Flow::PublishSingle
+            | Flow::PublishBatch
+            | Flow::Autoscaler => false,
+        }
+    }
+
     /// The chart grouping key. Redundant with the flow for the consume flows
     /// by design — it is what chart family 3 (parallel vs sequenced) groups
     /// on, so `chartgen` never parses a flow name to place a bar.
@@ -444,9 +479,12 @@ pub enum HandlerCost {
     ///
     /// 1. The driver **separated** fixed setup cost from the drain — it held a
     ///    readiness barrier until every worker was assigned and polling, took
-    ///    `start` after it, and recorded what it excluded as `setup_secs`. A
-    ///    row whose `setup_secs` is absent did not separate them, so its
-    ///    `duration_secs` may be mostly coordination latency.
+    ///    `start` after it, and recorded everything from the first worker being
+    ///    spawned up to that point as `setup_secs`. A row whose `setup_secs` is
+    ///    absent did not separate them, so its `duration_secs` may be mostly
+    ///    coordination latency — and a row whose flow holds no barrier
+    ///    ([`Flow::holds_readiness_barrier`]) cannot have separated them
+    ///    whatever it recorded.
     /// 2. The drain it then timed ran for at least
     ///    [`MIN_FRAMEWORK_WINDOW_SECS`], so the number is a rate rather than a
     ///    stopwatch reading over a window too short to hold one.
@@ -541,8 +579,18 @@ impl HandlerCost {
             // to a publish row and is not consulted.
             Flow::PublishSingle | Flow::PublishBatch => HandlerCost::NoHandler,
             _ => match handler {
+                // Three conditions, and the flow is one of them: a recorded
+                // `setup_secs` is only evidence of a separated window if this
+                // flow's driver holds a barrier at all. `consume_fifo` and
+                // `dlq_drain` always emit `None`, so a `Some` on either is a
+                // value no run of that flow produced — and without the flow
+                // check `validate_run` re-derived `framework` from it and
+                // certified the row.
                 HandlerProfile::Zero | HandlerProfile::Fast => match window.setup_secs {
-                    Some(_) if window.duration_secs >= MIN_FRAMEWORK_WINDOW_SECS => {
+                    Some(_)
+                        if flow.holds_readiness_barrier()
+                            && window.duration_secs >= MIN_FRAMEWORK_WINDOW_SECS =>
+                    {
                         HandlerCost::Framework
                     }
                     _ => HandlerCost::SetupBound,
@@ -721,7 +769,14 @@ struct TierConfig {
     consumers: &'static [u16],
     /// Per-consumer message count per handler profile, ordered
     /// (zero, fast, slow, heavy). Total messages for a scenario is
-    /// `messages_per_consumer.X * scenario.consumers`.
+    /// `messages_per_consumer.X * scenario.consumers`, *unless*
+    /// [`framework_corpus_floor`] raises it: a cell whose tier sizing is too
+    /// small to drain for [`MIN_FRAMEWORK_WINDOW_SECS`] runs the floor's corpus
+    /// instead, so the identity above is a lower bound rather than an
+    /// invariant, and the corpus each cell actually ran is on the row as
+    /// `messages`. The floored cells are the low consumer counts of a
+    /// `zero`/`fast` column, which therefore hold a near-fixed corpus rather
+    /// than one proportional to the consumer count.
     messages_per_consumer: (u64, u64, u64, u64),
 }
 
@@ -792,16 +847,17 @@ fn framework_corpus_floor(
         HandlerProfile::Fast => concurrent,
         HandlerProfile::Slow | HandlerProfile::Heavy => false,
     };
-    // Broadcast is excluded even though it does hold a barrier: its corpus is
-    // the *per-subscriber* workload, so flooring `messages` multiplies by the
-    // fan-out width and a 16-subscriber cell would run 2.4M handler
-    // invocations. The publish flows are excluded because they have no drain.
-    // FIFO and the DLQ drain are excluded because neither separates its setup,
-    // so no corpus makes them `framework`.
-    let barrier_backed_drain = matches!(
-        flow,
-        Flow::ConsumeParallel | Flow::ConsumeBatch | Flow::ConsumerGroup | Flow::Supervisor
-    );
+    // Asked of the flow rather than re-listed here: FIFO, the DLQ drain and the
+    // publish flows are excluded because no corpus can make them `framework`,
+    // and that is the same fact [`Flow::holds_readiness_barrier`] already
+    // carries for [`HandlerCost::of`]. A second hand-maintained list of it
+    // would only drift from the first.
+    //
+    // Broadcast is the one flow subtracted from that set, and not because of
+    // its barrier — it holds one. Its corpus is the *per-subscriber* workload,
+    // so flooring `messages` multiplies by the fan-out width and a
+    // 16-subscriber cell would run 2.4M handler invocations.
+    let barrier_backed_drain = flow.holds_readiness_barrier() && flow != Flow::Broadcast;
     if !negligible_and_not_sleep_bound || !barrier_backed_drain {
         return 0;
     }
@@ -2089,6 +2145,11 @@ where
         }
     };
 
+    // Before the registration that brings the members up, for the reason
+    // spelled out in `run_scenario_batch`: `setup_secs` runs from the first
+    // worker being spawned, and on this flow that is `register`'s own await
+    // plus the spawn of the group's run task.
+    let setup_started = Instant::now();
     let mut group = broker.consumer_group();
     let inner_cfg = make_cfg(scenario.consumers, prefetch, scenario.concurrent);
     if fifo {
@@ -2119,7 +2180,6 @@ where
     let setup_and_publish = async {
         // Hold until every member is assigned and polling, so the window below
         // is the drain and not the group's join latency.
-        let setup_started = Instant::now();
         let setup = if fifo {
             None
         } else {
@@ -2226,6 +2286,10 @@ where
     // workload — so a straggler completing mid-measurement is invisible.
     let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(scenario.consumers as usize);
     let setup_and_publish = async {
+        // Before the subscribe loop, for the reason spelled out in
+        // `run_scenario_batch`: subscribing and spawning N subscribers is part
+        // of the interval `setup_secs` claims to cover.
+        let setup_started = Instant::now();
         for _ in 0..scenario.consumers {
             let attach = Arc::new(AtomicU64::new(0));
             attach_flags.push(attach.clone());
@@ -2260,7 +2324,6 @@ where
         // This flow had the barrier first; the shared helper is that loop
         // generalised, so the other consume flows now get the same guarantee
         // and the same recorded `setup_secs`.
-        let setup_started = Instant::now();
         await_worker_readiness::<B, StressBroadcastTopic>(&publisher, epoch, &attach_flags).await?;
         let setup = setup_started.elapsed();
 
@@ -2526,6 +2589,13 @@ where
     let mut drivers = tokio::task::JoinSet::new();
     let workers = scenario.flow.effective_workers(scenario.consumers);
     let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(workers as usize);
+    // Before the loop, not after it: `setup_secs` is the interval from the
+    // first worker being spawned to the barrier being satisfied, and the loop
+    // below is inside it. Started after the loop, the wall-clock the driver
+    // spends building and spawning N workers landed in neither recorded field —
+    // it preceded `setup_secs` and it preceded the drain `start` — so the two
+    // could not be added back up to the interval they describe.
+    let setup_started = Instant::now();
     for _ in 0..workers {
         let attach = Arc::new(AtomicU64::new(0));
         attach_flags.push(attach.clone());
@@ -2541,7 +2611,6 @@ where
     // readiness barrier joins that block for the same reason: a barrier that
     // times out must reach the teardown, not early-return past it.
     let setup_and_publish = async {
-        let setup_started = Instant::now();
         await_worker_readiness::<B, StressTestTopic>(&publisher, epoch, &attach_flags).await?;
         let setup = setup_started.elapsed();
 
@@ -2663,6 +2732,11 @@ where
     // them keep claiming to measure shove.
     let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(replicas as usize);
     let setup_and_publish = async {
+        // Before the registration loop: `setup_secs` runs from the first worker
+        // being spawned, and registering N supervisors is part of bringing them
+        // up. Started after the loop, that wall-clock fell outside both
+        // recorded fields — see `run_scenario_batch`, which had the same gap.
+        let setup_started = Instant::now();
         for _ in 0..replicas {
             let mut handler = StressTestHandler::new(
                 epoch,
@@ -2701,7 +2775,6 @@ where
 
         // Hold here until every worker is assigned and polling, so the window
         // below is the drain and not the group's join latency.
-        let setup_started = Instant::now();
         let setup = if fifo {
             None
         } else {
@@ -4492,19 +4565,14 @@ mod tests {
     }
 
     #[test]
-    fn zero_and_fast_are_framework_cost_cells_in_every_consume_flow() {
+    fn zero_and_fast_are_framework_cost_cells_in_every_barrier_backed_flow() {
         // The cells where the simulated work is negligible are the only ones
         // that measure shove itself, and they are comparable across flows —
         // which is what makes a batch-vs-parallel chart legitimate at all.
-        for flow in [
-            Flow::ConsumeBatch,
-            Flow::ConsumeParallel,
-            Flow::ConsumeFifo,
-            Flow::ConsumerGroup,
-            Flow::Supervisor,
-            Flow::Broadcast,
-            Flow::DlqDrain,
-        ] {
+        // "Every consume flow" would overstate it: the two flows that hold no
+        // barrier are covered by
+        // `a_flow_whose_driver_holds_no_barrier_can_never_be_framework`.
+        for flow in BARRIER_FLOWS {
             for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
                 assert_eq!(
                     scenario_for(flow, handler).handler_cost(drain_bound()),
@@ -4526,6 +4594,83 @@ mod tests {
         Flow::Broadcast,
         Flow::DlqDrain,
     ];
+
+    /// The consume flows whose driver holds the readiness barrier, and so can
+    /// record a separated `setup_secs` at all.
+    ///
+    /// Spelled out here rather than derived from
+    /// [`Flow::holds_readiness_barrier`] on purpose: a test that asks the code
+    /// under test which flows qualify cannot notice that code changing its
+    /// mind. `a_flows_barrier_claim_matches_the_drivers_that_hold_one` pins the
+    /// two against each other.
+    const BARRIER_FLOWS: [Flow; 5] = [
+        Flow::ConsumeBatch,
+        Flow::ConsumeParallel,
+        Flow::ConsumerGroup,
+        Flow::Supervisor,
+        Flow::Broadcast,
+    ];
+
+    /// The two consume flows that always report `setup_secs: null`, because
+    /// neither has anywhere to hang a readiness probe — see
+    /// `run_scenario_supervisor` (FIFO) and `run_scenario_dlq`.
+    const UNSEPARATED_CONSUME_FLOWS: [Flow; 2] = [Flow::ConsumeFifo, Flow::DlqDrain];
+
+    #[test]
+    fn a_flows_barrier_claim_matches_the_drivers_that_hold_one() {
+        // The predicate decides whether a row may claim `framework`, so it has
+        // to keep naming the flows whose drivers actually hold a barrier. A
+        // flow added later lands in neither list and fails here, rather than
+        // silently inheriting a claim its driver cannot make.
+        for flow in Flow::ALL {
+            assert_eq!(
+                flow.holds_readiness_barrier(),
+                BARRIER_FLOWS.contains(&flow),
+                "{flow}: the barrier-backed flows are {BARRIER_FLOWS:?}"
+            );
+        }
+        for flow in CONSUME_FLOWS {
+            assert!(
+                BARRIER_FLOWS.contains(&flow) != UNSEPARATED_CONSUME_FLOWS.contains(&flow),
+                "{flow} must be in exactly one of the two lists"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flow_whose_driver_holds_no_barrier_can_never_be_framework() {
+        // `setup_secs: Some(_)` is a row's claim that its driver held a
+        // readiness barrier and took `start` after it. Two flows can never make
+        // that claim: `consume_fifo` has no per-worker flag to hang a sentinel
+        // on, and `dlq_drain`'s measured phase drains an already-full queue,
+        // with no publish path to carry one. Both always emit `None`.
+        //
+        // The derivation used to consult only the recorded `Option`, with no
+        // per-flow knowledge of which flows can produce a `Some`. So a row
+        // carrying `flow: consume_fifo`, `setup_secs: 0.0` and a 2 s
+        // `duration_secs` re-derived to `framework`, and `validate_run` then
+        // certified a window no run of that flow could have produced. The
+        // marker's first guarantee is that the driver separated setup from
+        // drain, and a flow with no barrier never did.
+        for flow in UNSEPARATED_CONSUME_FLOWS {
+            for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+                for setup_secs in [Some(0.0), Some(4.0)] {
+                    assert_eq!(
+                        HandlerCost::of(
+                            flow,
+                            handler,
+                            WindowSplit {
+                                setup_secs,
+                                duration_secs: 2.0,
+                            }
+                        ),
+                        HandlerCost::SetupBound,
+                        "{flow} / {handler} / setup {setup_secs:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_negligible_handler_alone_does_not_earn_the_framework_marker() {
@@ -4605,7 +4750,7 @@ mod tests {
             setup_secs: Some(4.0),
             duration_secs,
         };
-        for flow in CONSUME_FLOWS {
+        for flow in BARRIER_FLOWS {
             for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
                 assert_eq!(
                     HandlerCost::of(flow, handler, separated(MIN_FRAMEWORK_WINDOW_SECS)),
@@ -4934,6 +5079,139 @@ mod tests {
         assert!(
             rows[0].setup_secs.is_some(),
             "setup_secs must reach the row"
+        );
+    }
+
+    /// Wall-clock burned synchronously per worker inside a driver's spawn loop,
+    /// standing in for the per-worker registration a real backend pays there.
+    ///
+    /// Blocking rather than `tokio::time::sleep`: an awaited sleep would yield,
+    /// and the loop's cost is precisely the time the driver spends *not*
+    /// yielding between spawning one worker and spawning the next. Nothing else
+    /// has to make progress during it — the barrier that does is held after the
+    /// loop.
+    ///
+    /// Sized so the loop's total cannot be mistaken for barrier time.
+    /// `await_worker_readiness` polls in 200 ms rounds, so two workers at this
+    /// cost are five rounds' worth: a `setup_secs` that covers it is covering
+    /// the spawn loop, not an unlucky number of sentinel rounds. Pre-fix these
+    /// drivers recorded 0.2 s (supervisor) and 0.4 s (batch) here.
+    const PER_WORKER_SPAWN: Duration = Duration::from_millis(500);
+
+    #[tokio::test]
+    async fn the_batch_flows_setup_window_covers_its_spawn_loop() {
+        // `setup_secs` is documented as "seconds from the first worker being
+        // spawned to the readiness barrier being satisfied", and `setup_started`
+        // was taken *after* the spawn loop had already run — so the loop's own
+        // wall-clock fell into neither field. It preceded `setup_secs` and it
+        // preceded the drain `start`, which means the two recorded fields could
+        // not be added back up to the interval they describe, and a backend
+        // whose per-worker registration is slow reported that cost nowhere.
+        let workers: u16 = 2;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 20,
+            consumers: workers,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+        };
+
+        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler| {
+            // Before the future is even constructed, so this is time spent
+            // inside the driver's spawn loop and not inside the spawned task.
+            std::thread::sleep(PER_WORKER_SPAWN);
+            Box::pin(async move {
+                InMemoryConsumer::new(client)
+                    .run::<StressTestTopic, _>(
+                        OneMessageBatches(handler),
+                        (),
+                        ConsumerOptions::new(),
+                    )
+                    .await
+                    .map_err(|e| format!("run: {e}"))
+            })
+        });
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        let metrics = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        let spawn_loop = PER_WORKER_SPAWN.as_secs_f64() * workers as f64;
+        let setup = metrics
+            .setup_secs
+            .expect("the barrier must record what it excluded");
+        assert!(
+            setup >= spawn_loop,
+            "setup_secs {setup} does not cover the {spawn_loop}s the driver spent \
+             spawning {workers} workers"
+        );
+        // And the spawn loop stayed out of the drain, which is the half that
+        // was already right.
+        assert!(
+            metrics.duration_secs < PER_WORKER_SPAWN.as_secs_f64(),
+            "duration_secs {} contains worker startup",
+            metrics.duration_secs
+        );
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_flows_setup_window_covers_its_spawn_loop() {
+        // The same defect in the other flow the issue names, and the reason
+        // both are pinned: the two flows are compared against each other, so a
+        // cost one of them drops and the other keeps would show up as a
+        // difference between backends' throughput. `make_opts` is called once
+        // per replica inside the registration loop, which makes it the hook a
+        // test can hang a measurable per-worker cost on.
+        let replicas: u16 = 2;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 20,
+            consumers: replicas,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeParallel,
+            payload_bytes: 64,
+        };
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let cancel = CancellationToken::new();
+        let make_opts = |prefetch: u16, concurrent: bool| {
+            std::thread::sleep(PER_WORKER_SPAWN);
+            default_consumer_options::<shove::InMemory>(prefetch, concurrent)
+        };
+        let metrics = run_scenario_supervisor(&hcfg, &scenario, &cancel, &make_opts, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("supervisor scenario");
+
+        let spawn_loop = PER_WORKER_SPAWN.as_secs_f64() * replicas as f64;
+        let setup = metrics
+            .setup_secs
+            .expect("the barrier must record what it excluded");
+        assert!(
+            setup >= spawn_loop,
+            "setup_secs {setup} does not cover the {spawn_loop}s the driver spent \
+             registering {replicas} supervisors"
+        );
+        assert!(
+            metrics.duration_secs < PER_WORKER_SPAWN.as_secs_f64(),
+            "duration_secs {} contains worker startup",
+            metrics.duration_secs
         );
     }
 
@@ -5386,6 +5664,33 @@ mod tests {
             // about the claim and not about the row's shape.
             run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
             validate_run(&run).unwrap_or_else(|e| panic!("{why}: honest marker refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_framework_claim_from_a_flow_that_holds_no_barrier_is_refused() {
+        // The document-level half of
+        // `a_flow_whose_driver_holds_no_barrier_can_never_be_framework`: a row
+        // whose `setup_secs` could not have come from its own flow must be
+        // refused, not re-derived into agreement. This is the shape a
+        // hand-edited or mis-generated document takes — every real run of these
+        // two flows writes `null` — and `validate_run` is the check that exists
+        // to catch a marker its row cannot support.
+        for flow in UNSEPARATED_CONSUME_FLOWS {
+            let mut run = batch_run(flow, HandlerProfile::Zero);
+            run.results[0].setup_secs = Some(0.0);
+            run.results[0].duration_secs = 2.0;
+            run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+
+            let err = validate_run(&run)
+                .expect_err(&format!("{flow}: a fabricated setup_secs must be refused"));
+            assert!(err.contains("handler_cost"), "{flow}: {err}");
+            assert!(err.contains("setup_bound"), "{flow}: {err}");
+
+            // The honest marker for the same row passes, so the refusal is
+            // about the claim rather than the row's shape.
+            run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
+            validate_run(&run).unwrap_or_else(|e| panic!("{flow}: honest marker refused: {e}"));
         }
     }
 
