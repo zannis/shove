@@ -441,6 +441,30 @@ pub enum HandlerCost {
 }
 
 impl HandlerCost {
+    /// The marker a row with this `flow` and `handler` must carry.
+    ///
+    /// Derived from the two together, because neither settles it alone:
+    /// `publish_batch` is a batch-mode flow that runs no handler at all, and
+    /// `consume_batch --handler fast` is a batch-mode flow whose number is
+    /// still framework cost.
+    ///
+    /// This is the single derivation. [`Scenario::handler_cost`] stamps a row
+    /// with it and [`validate_run`] re-derives it to check one, so a row's
+    /// marker is verifiable rather than merely present — see the refusal
+    /// there for why a row that disagrees is a lie about what was measured.
+    pub fn of(flow: Flow, handler: HandlerProfile) -> HandlerCost {
+        match flow {
+            Flow::PublishSingle | Flow::PublishBatch => HandlerCost::NoHandler,
+            _ => match handler {
+                HandlerProfile::Zero | HandlerProfile::Fast => HandlerCost::Framework,
+                HandlerProfile::Slow | HandlerProfile::Heavy => match flow.mode() {
+                    Mode::Batch => HandlerCost::HandlerAmortised,
+                    Mode::Parallel | Mode::Fifo => HandlerCost::HandlerBound,
+                },
+            },
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             HandlerCost::Framework => "framework",
@@ -531,6 +555,24 @@ pub enum HandlerProfile {
     Heavy,
 }
 
+impl HandlerProfile {
+    pub const ALL: [HandlerProfile; 4] = [
+        HandlerProfile::Zero,
+        HandlerProfile::Fast,
+        HandlerProfile::Slow,
+        HandlerProfile::Heavy,
+    ];
+
+    /// The inverse of [`Display`](fmt::Display), which is the form a result
+    /// row's `handler` field carries. `None` for a label this harness could
+    /// not have written.
+    pub fn from_label(label: &str) -> Option<HandlerProfile> {
+        HandlerProfile::ALL
+            .into_iter()
+            .find(|p| p.to_string() == label)
+    }
+}
+
 impl fmt::Display for HandlerProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -567,23 +609,10 @@ impl Scenario {
         }
     }
 
-    /// What this scenario's throughput number measures — see [`HandlerCost`].
-    ///
-    /// Derived from the flow and the handler profile together, because neither
-    /// settles it alone: `publish_batch` is a batch-mode flow that runs no
-    /// handler at all, and `consume_batch --handler fast` is a batch-mode flow
-    /// whose number is still framework cost.
+    /// What this scenario's throughput number measures — see
+    /// [`HandlerCost::of`], which is the derivation.
     pub fn handler_cost(&self) -> HandlerCost {
-        match self.flow {
-            Flow::PublishSingle | Flow::PublishBatch => HandlerCost::NoHandler,
-            _ => match self.handler {
-                HandlerProfile::Zero | HandlerProfile::Fast => HandlerCost::Framework,
-                HandlerProfile::Slow | HandlerProfile::Heavy => match self.flow.mode() {
-                    Mode::Batch => HandlerCost::HandlerAmortised,
-                    Mode::Parallel | Mode::Fifo => HandlerCost::HandlerBound,
-                },
-            },
-        }
+        HandlerCost::of(self.flow, self.handler)
     }
 }
 
@@ -2351,13 +2380,14 @@ struct ScenarioResult {
     /// label, and a consumer must not have to parse `"heavy (1-5s)"` and a
     /// flow name to find out that a bar is measuring a simulated sleep.
     ///
-    /// `default` is not a fallback that hides a missing marker — every row
-    /// this harness writes carries one. It exists so that a v1 document,
-    /// whose rows predate the field, still deserializes far enough for the
-    /// schema-version check in [`merge_results_file`] to refuse it by version
-    /// and say which version it is, rather than failing earlier with a serde
-    /// error about a missing field. The refusal is the same either way; only
-    /// its legibility differs.
+    /// `default` is not a fallback that hides a missing marker. It exists so
+    /// that a v1 document, whose rows predate the field, still deserializes
+    /// far enough for the schema-version check in [`merge_results_file`] to
+    /// refuse it by version and say which version it is, rather than failing
+    /// earlier with a serde error about a missing field. The refusal is the
+    /// same either way; only its legibility differs. A v2 row that arrives
+    /// without a marker — or with one that contradicts its own flow and
+    /// handler — is refused by [`validate_run`], which re-derives it.
     #[serde(default)]
     handler_cost: String,
     throughput_msg_per_sec: f64,
@@ -2648,8 +2678,9 @@ fn detect_hardware() -> Hardware {
 /// write, so the file's timestamp always describes its newest measurement.
 /// The document's own invariants, checked on every run a merge would write —
 /// preserved and incoming alike. serde only proves the shape; a shape-valid
-/// file with a foreign payload size or a flow in both lists must not be
-/// re-signed as a valid v1 document.
+/// file with a foreign payload size, a flow in both lists, or a row whose
+/// `handler_cost` is not what its flow and handler measure must not be
+/// re-signed as a valid results document.
 fn validate_run(run: &BackendRun) -> Result<(), String> {
     fn check_row(
         backend: &str,
@@ -2657,7 +2688,7 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
         flow: &str,
         mode: &str,
         payload_bytes: usize,
-    ) -> Result<(), String> {
+    ) -> Result<Flow, String> {
         let Some(known) = Flow::ALL.iter().find(|f| f.as_str() == flow) else {
             return Err(format!(
                 "run '{backend}' has a {kind} with unknown flow '{flow}'"
@@ -2674,13 +2705,42 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                  {PAYLOAD_SIZES:?}"
             ));
         }
-        Ok(())
+        Ok(*known)
     }
 
     for r in &run.results {
-        check_row(&run.backend, "result", &r.flow, &r.mode, r.payload_bytes)?;
+        let flow = check_row(&run.backend, "result", &r.flow, &r.mode, r.payload_bytes)?;
+        // `handler_cost` says what `throughput_msg_per_sec` measures, and it is
+        // fully determined by the row's own flow and handler — so it is
+        // checkable, not merely present. Re-derive it: a `consume_batch` +
+        // `heavy` row stamped `framework` is shape-valid and passes the
+        // schema-version check, and preserving it would re-sign into the
+        // merged document exactly the mislabelling the field exists to
+        // prevent. A missing marker fails here too — `#[serde(default)]` is
+        // there so a v1 document reaches the version check, not so a v2 row
+        // may decline to say what it measured.
+        let Some(handler) = HandlerProfile::from_label(&r.handler) else {
+            return Err(format!(
+                "run '{}' has a result with unknown handler '{}'",
+                run.backend, r.handler
+            ));
+        };
+        let expected = HandlerCost::of(flow, handler);
+        if r.handler_cost != expected.as_str() {
+            return Err(format!(
+                "run '{}' has a result for flow '{}' with handler '{}' whose handler_cost \
+                 '{}' is not the '{}' that pair measures",
+                run.backend,
+                r.flow,
+                r.handler,
+                r.handler_cost,
+                expected.as_str()
+            ));
+        }
     }
     for f in &run.failures {
+        // A failure row records a scenario that produced no number, so it
+        // carries no `handler_cost` to check.
         check_row(&run.backend, "failure", &f.flow, &f.mode, f.payload_bytes)?;
     }
     let legal_flows: Vec<&str> = Flow::ALL.iter().map(|f| f.as_str()).collect();
@@ -2776,7 +2836,10 @@ fn merge_results_file(
             existing_label = Some(doc.hardware.label.clone());
             for preserved in &doc.runs {
                 validate_run(preserved).map_err(|e| {
-                    format!("{path} holds an invalid v1 document ({e}) — refusing to rewrite it")
+                    format!(
+                        "{path} holds an invalid v{RESULTS_SCHEMA_VERSION} document ({e}) — \
+                         refusing to rewrite it"
+                    )
                 })?;
             }
             doc.runs
@@ -4424,6 +4487,137 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("re-read"), bumped);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A one-row Kafka run carrying `flow` × `handler` as `push_metrics` would
+    /// write it. Kafka is the backend that measures `consume_batch`, so it
+    /// cannot also carry the capability hole [`sample_run`] defaults to.
+    fn batch_run(flow: Flow, handler: HandlerProfile) -> BackendRun {
+        let mut run = sample_run("kafka");
+        run.unsupported.clear();
+        run.results.clear();
+        push_metrics(
+            &mut run.results,
+            &scenario_for(flow, handler),
+            ScenarioMetrics {
+                throughput: 1.0,
+                latencies: LatencyPercentiles::default(),
+                peak_rss_mb: 0.0,
+                cpu_pct: 0.0,
+                duration_secs: 1.0,
+            },
+        );
+        run
+    }
+
+    #[test]
+    fn a_handler_cost_that_contradicts_its_row_is_refused_on_the_way_in() {
+        // `handler_cost` is a claim about what the throughput number measures,
+        // and it is fully determined by the row's own `flow` and `handler`. A
+        // row that claims otherwise is not a shape error serde can catch — it
+        // is exactly the mislabelling the field was added to prevent, so it
+        // belongs with the other document invariants rather than being taken
+        // on trust.
+        let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Heavy);
+        assert_eq!(run.results[0].handler_cost, "handler_amortised");
+        run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+
+        let path = temp_path("cost-contradiction");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        let err = merge_results_file(&p, run, None).expect_err("must refuse");
+        assert!(err.contains("handler_cost"), "{err}");
+        assert!(err.contains("framework"), "{err}");
+        assert!(err.contains("handler_amortised"), "{err}");
+        assert!(
+            !path.exists(),
+            "a refused merge must not leave a document behind"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unknown_handler_cost_is_refused_rather_than_defaulted() {
+        // `#[serde(default)]` exists so a v1 document reaches the version
+        // check instead of dying on a missing field. It must not become a
+        // silent accept of a v2 row with no marker: an empty marker and a
+        // typo'd one are both "this row does not say what it measures".
+        for bad in ["", "framework_cost", "FRAMEWORK"] {
+            let mut run = batch_run(Flow::ConsumerGroup, HandlerProfile::Zero);
+            run.results[0].handler_cost = bad.to_string();
+
+            let path = temp_path("cost-unknown");
+            let _ = std::fs::remove_file(&path);
+            let p = path.to_string_lossy().to_string();
+
+            let err = match merge_results_file(&p, run, None) {
+                Ok(()) => panic!("must refuse handler_cost {bad:?}"),
+                Err(e) => e,
+            };
+            assert!(err.contains("handler_cost"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_preserved_row_with_a_false_handler_cost_is_not_re_signed() {
+        // The merge path is where this bites: six backend binaries accumulate
+        // into one file, so a row a stale or buggy producer wrote is read back
+        // and re-signed into the merged document. A v2 header is not evidence
+        // that the rows under it are honest.
+        let path = temp_path("cost-preserved");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(
+            &p,
+            batch_run(Flow::ConsumeBatch, HandlerProfile::Heavy),
+            None,
+        )
+        .expect("first write");
+        let falsified = std::fs::read_to_string(&path).expect("read").replace(
+            "\"handler_cost\": \"handler_amortised\"",
+            "\"handler_cost\": \"framework\"",
+        );
+        assert!(falsified.contains("\"framework\""), "fixture did not take");
+        std::fs::write(&path, &falsified).expect("write falsified");
+
+        let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
+        assert!(err.contains("handler_cost"), "{err}");
+        assert!(err.contains("refusing to rewrite"), "{err}");
+        // The refusal must leave the file untouched, not half-written.
+        assert_eq!(std::fs::read_to_string(&path).expect("re-read"), falsified);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unknown_handler_label_is_refused() {
+        // The cost check reads the row's handler back, so an unparseable
+        // handler label must be a refusal rather than a check that quietly
+        // does not run.
+        let mut run = batch_run(Flow::ConsumerGroup, HandlerProfile::Zero);
+        run.results[0].handler = "brisk (7ms)".to_string();
+
+        let path = temp_path("handler-unknown");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        let err = merge_results_file(&p, run, None).expect_err("must refuse");
+        assert!(err.contains("brisk (7ms)"), "{err}");
+    }
+
+    #[test]
+    fn every_pair_the_harness_writes_survives_its_own_validation() {
+        // The guard above only helps if it agrees with the writer. Every row
+        // `push_metrics` can emit must pass, or a real run would refuse to
+        // record itself.
+        for flow in Flow::ALL {
+            for handler in HandlerProfile::ALL {
+                let run = batch_run(flow, handler);
+                validate_run(&run)
+                    .unwrap_or_else(|e| panic!("{} x {handler} must validate: {e}", flow.as_str()));
+            }
+        }
     }
 
     #[test]
