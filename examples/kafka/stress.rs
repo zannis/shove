@@ -257,14 +257,14 @@ async fn main() {
     // lands in every other backend's `unsupported[]` instead of being faked.
     // The harness invokes it once per scenario consumer; each invocation is
     // an independent group member.
-    let batch_consume: BatchConsumeFn<Kafka> = Box::new(|client, handler, stop| {
+    let batch_consume: BatchConsumeFn<Kafka> = Box::new(|client, handler, opts, stop| {
         Box::pin(async move {
             let consumer = KafkaConsumer::new(client);
             consumer
                 .run_batch::<StressTestTopic, _>(
                     handler,
                     (),
-                    BatchConsumerOptions::new().with_shutdown(stop),
+                    batch_consumer_options(opts).with_shutdown(stop),
                 )
                 .await
                 .map_err(|e| format!("run_batch: {e}"))
@@ -313,6 +313,19 @@ async fn main() {
     .await;
 
     drop(container);
+}
+
+/// Map the scenario's batch knobs onto shove's [`BatchConsumerOptions`].
+///
+/// Named (rather than inlined in the closure) so a test can prove the CLI
+/// values end up inside `BatchConsumerOptions` instead of being parsed and
+/// dropped — the defect this knob's ticket exists to close. Everything except
+/// the two mapped fields stays at shove's defaults, exactly as the previous
+/// hardcoded `BatchConsumerOptions::new()` did.
+fn batch_consumer_options(opts: harness::BatchOptions) -> BatchConsumerOptions {
+    BatchConsumerOptions::new()
+        .with_max_batch_size(opts.max_batch_size.get())
+        .with_max_batch_age(Duration::from_millis(opts.max_batch_age_ms.get()))
 }
 
 /// Poll the broker until a metadata fetch succeeds. Testcontainers' Kafka
@@ -377,3 +390,51 @@ const TOPIC_GONE_POLL: Duration = Duration::from_millis(200);
 
 /// Per-call timeout for the probe's group-list and metadata RPCs.
 const PROBE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Run with: cargo nextest run --features kafka,inmemory --test bench_harness_kafka
+// (or --example kafka_stress; `inmemory` because compiling this file as a test
+// target also compiles the shared harness's test module, which drives
+// everything over `shove::InMemory`.)
+//
+// tests/bench_harness_kafka.rs bridges this module into a real test target,
+// like tests/bench_harness.rs does for the harness's. No CI test leg enables
+// kafka+inmemory together, so in CI the bridge is only type-checked (the
+// `clippy --all-features --all-targets` gate); execution is local. The
+// remaining CI-unexecuted surface is this file's builder-call wiring — the
+// values themselves agree by construction (both sides cite
+// `shove::DEFAULT_KAFKA_MAX_BATCH_SIZE` / `_AGE`), and the getters are covered
+// by src's own `batch_consumer_options_tests`.
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
+    use super::*;
+
+    #[test]
+    fn the_cli_batch_knobs_reach_batch_consumer_options() {
+        // The end of the knob's journey: CLI → `Scenario.batch_options` →
+        // `BatchConsumeFn` (both proven in the harness tests) → here, into
+        // the `BatchConsumerOptions` handed to `run_batch`. Read back through
+        // shove's getters, not inferred from the builder calls.
+        let opts = harness::BatchOptions {
+            max_batch_size: NonZeroUsize::new(50).expect("non-zero"),
+            max_batch_age_ms: NonZeroU64::new(125).expect("non-zero"),
+        };
+        let mapped = batch_consumer_options(opts);
+        assert_eq!(mapped.max_batch_size(), 50);
+        assert_eq!(mapped.max_batch_age(), Duration::from_millis(125));
+    }
+
+    #[test]
+    fn the_default_invocation_measures_exactly_what_it_always_did() {
+        // The harness default and shove's own default must be the same values,
+        // or an un-flagged run would silently measure something new and every
+        // previously recorded 500/250 row would stop being comparable. This is
+        // the test the harness's `BatchOptions::default()` doc comment defers
+        // to.
+        let mapped = batch_consumer_options(harness::BatchOptions::default());
+        let shove_default = BatchConsumerOptions::default();
+        assert_eq!(mapped.max_batch_size(), shove_default.max_batch_size());
+        assert_eq!(mapped.max_batch_age(), shove_default.max_batch_age());
+    }
+}

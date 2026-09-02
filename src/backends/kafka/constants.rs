@@ -4,6 +4,11 @@
 //! a future "expose as `KafkaConfig` knobs" change has a single source of
 //! truth to wire up. Typed `Duration` / `u32` constants only — strings are
 //! formatted at the rdkafka call site.
+//!
+//! One deliberate exception lives elsewhere: the batch consumer's defaults
+//! (`DEFAULT_KAFKA_MAX_BATCH_SIZE` / `DEFAULT_KAFKA_MAX_BATCH_AGE`) are in
+//! `src/consumer.rs`, because the stress harness must cite them from builds
+//! that do not enable the `kafka` feature. Do not re-add them here.
 
 use std::time::Duration;
 
