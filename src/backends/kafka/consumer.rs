@@ -21,7 +21,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
+use crate::backend::batch_consumer::{
+    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, RejectSettlement, TerminalDiscard,
+    batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay, reject_settlement,
+    settle_batch_outcome, validate_batch_topic,
+};
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
+use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
@@ -35,9 +41,15 @@ use crate::routing::{
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
+use crate::{HoldQueue, Kafka, ShoveError};
+// These four are only read back by `batch_consumer_options_tests` below, to
+// pin that `BatchConsumerOptions` (now a `pub type` alias of the generic
+// `BatchConsumerOptions<Kafka>`) still defaults to the same shared constants
+// the type used to hardcode directly.
+#[cfg(test)]
 use crate::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE,
-    DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError,
+    DEFAULT_MAX_MESSAGE_SIZE,
 };
 
 #[cfg(feature = "kafka-msk-iam")]
@@ -709,66 +721,6 @@ impl Completion {
             offset,
             discard: None,
         }
-    }
-}
-
-/// A terminal discard waiting on the commit that retires its message.
-///
-/// Which settle method applies is decided where the outcome is routed, not
-/// where the commit lands, so the choice travels with the pending record.
-enum TerminalDiscard {
-    /// Dead-lettered, or terminal on a topic with no DLQ. Counts only when no
-    /// DLQ exists — with one, the message is still in it.
-    Retired(metrics::PendingDiscard),
-    /// A DLQ was configured and the publish to it failed. Nothing holds a
-    /// copy, so this counts regardless of the topology.
-    Lost(metrics::PendingDiscard),
-}
-
-impl TerminalDiscard {
-    /// The commit landed: the message is genuinely gone.
-    fn confirm(self) {
-        match self {
-            Self::Retired(pending) => pending.confirm(),
-            Self::Lost(pending) => pending.confirm_lost(),
-        }
-    }
-
-    /// The commit did not land, so the message will be redelivered.
-    fn survived(self) {
-        match self {
-            Self::Retired(pending) | Self::Lost(pending) => pending.survived(),
-        }
-    }
-}
-
-/// How a terminally-rejected message's discard must be settled.
-///
-/// Shared by the single-message and batch reject paths so the two cannot drift:
-/// the decision depends only on whether the topology declares a DLQ and whether
-/// this message's publish to it landed, never on which path asked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RejectSettlement {
-    /// It is in the DLQ, so it exists whatever the commit does. Settle now and
-    /// keep the ordinary dead-letter path off the commit round trip.
-    InDlq,
-    /// No DLQ declared: retiring this message drops it. Counts if the commit
-    /// lands.
-    Retired,
-    /// A DLQ was declared and did not receive it. Nothing holds a copy, so this
-    /// is data loss whatever the topology says. Counts if the commit lands.
-    Lost,
-}
-
-/// Classify a rejected message for [`RejectSettlement`].
-///
-/// `reached_dlq` is meaningful only when `has_dlq`; with no DLQ declared there
-/// was no publish to succeed or fail, and the message is simply dropped.
-fn reject_settlement(has_dlq: bool, reached_dlq: bool) -> RejectSettlement {
-    match (has_dlq, reached_dlq) {
-        (false, _) => RejectSettlement::Retired,
-        (true, true) => RejectSettlement::InDlq,
-        (true, false) => RejectSettlement::Lost,
     }
 }
 
@@ -1753,24 +1705,6 @@ const COMMIT_FENCE_TIMEOUT: Duration = Duration::from_secs(60);
 /// failed and every redelivery would escalate to a reconnect.
 const SEEK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// First delay after redelivering an un-acked batch, escalating to
-/// [`BATCH_REDELIVERY_BACKOFF_MAX`] — see `flush_batch`'s non-Ack arm.
-const BATCH_REDELIVERY_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
-
-/// Ceiling on the redelivery delay for a handler that keeps returning non-Ack.
-const BATCH_REDELIVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// Redelivery backoff schedule for a batch the handler did not Ack. Escalates
-/// across *consecutive* non-Ack flushes and is reset on the first Ack, so a
-/// wedged handler backs off instead of spinning the seek-then-recv cycle while
-/// a handler that merely hit one bad batch pays the delay once.
-fn batch_redelivery_backoff() -> Backoff {
-    Backoff::new(
-        BATCH_REDELIVERY_BACKOFF_INITIAL,
-        BATCH_REDELIVERY_BACKOFF_MAX,
-    )
-}
-
 async fn run_with_reconnect<F, Fut>(
     shutdown: &CancellationToken,
     label: &str,
@@ -1835,245 +1769,20 @@ where
 // ---------------------------------------------------------------------------
 
 /// Options for [`KafkaConsumer::run_batch`].
-pub struct BatchConsumerOptions {
-    max_batch_size: usize,
-    max_batch_age: Duration,
-    max_reconnect_attempts: Option<u32>,
-    max_message_size: Option<usize>,
-    handler_timeout: Option<Duration>,
-    handler_timeout_outcome: Option<Outcome>,
-    consumer_group: Option<Arc<str>>,
-    kafka_group_id: Option<Arc<str>>,
-    kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
-    shutdown: CancellationToken,
-    #[cfg(feature = "kafka-schema-registry")]
-    schema_registry: Option<Arc<SchemaRegistry>>,
-    #[cfg(feature = "kafka-schema-registry")]
-    schema_enforcement: SchemaEnforcement,
-    #[cfg(feature = "kafka-schema-registry")]
-    schema_accepted_subjects: Option<Vec<Arc<str>>>,
-}
-
-impl Default for BatchConsumerOptions {
-    fn default() -> Self {
-        Self {
-            max_batch_size: DEFAULT_KAFKA_MAX_BATCH_SIZE,
-            max_batch_age: DEFAULT_KAFKA_MAX_BATCH_AGE,
-            max_reconnect_attempts: None,
-            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
-            // Same default as `ConsumerOptions`. A batch flush is one DB
-            // transaction rather than one row, so 30 s is a different amount of
-            // headroom than it is on the single-message path — a sink whose
-            // flush legitimately takes longer should raise it deliberately
-            // rather than discover the default by having batches retried.
-            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
-            handler_timeout_outcome: None,
-            consumer_group: None,
-            kafka_group_id: None,
-            kafka_auto_offset_reset: None,
-            shutdown: CancellationToken::new(),
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_registry: None,
-            // Matches `ConsumerOptions`: enforcement is opt-out, not opt-in.
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_enforcement: SchemaEnforcement::Enforce,
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_accepted_subjects: None,
-        }
-    }
-}
-
-impl BatchConsumerOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Flush once the batch reaches this many messages. Default
-    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`] (500).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n == 0`.
-    pub fn with_max_batch_size(mut self, n: usize) -> Self {
-        assert!(n > 0, "max_batch_size must be > 0");
-        self.max_batch_size = n;
-        self
-    }
-
-    /// Flush once this long has elapsed since the first message in the
-    /// current batch, even if `max_batch_size` hasn't been reached.
-    /// Default [`DEFAULT_KAFKA_MAX_BATCH_AGE`] (250 ms).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `d` is zero.
-    pub fn with_max_batch_age(mut self, d: Duration) -> Self {
-        assert!(!d.is_zero(), "max_batch_age must be positive");
-        self.max_batch_age = d;
-        self
-    }
-
-    pub fn with_max_reconnect_attempts(mut self, n: u32) -> Self {
-        self.max_reconnect_attempts = Some(n);
-        self
-    }
-
-    pub fn with_max_message_size(mut self, n: usize) -> Self {
-        self.max_message_size = Some(n);
-        self
-    }
-
-    /// Abandon a `handle_batch` call that runs longer than this and treat the
-    /// batch as [`Outcome::Retry`]. Default [`DEFAULT_HANDLER_TIMEOUT`] (30 s).
-    ///
-    /// Same semantics as [`ConsumerOptions::with_handler_timeout`], and it
-    /// matters more here: the batch loop is a single task, so a flush that
-    /// never returns also stops offset commits, rebalance handling and
-    /// shutdown for as long as it hangs.
-    ///
-    /// [`ConsumerOptions::with_handler_timeout`]: crate::ConsumerOptions::with_handler_timeout
-    ///
-    /// # Panics
-    ///
-    /// Panics if `timeout` is zero.
-    pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
-        assert!(!timeout.is_zero(), "handler_timeout must be positive");
-        self.handler_timeout = Some(timeout);
-        self
-    }
-
-    /// The configured flush size — what [`with_max_batch_size`] set, or
-    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`].
-    ///
-    /// [`with_max_batch_size`]: Self::with_max_batch_size
-    pub fn max_batch_size(&self) -> usize {
-        self.max_batch_size
-    }
-
-    /// The configured flush age — what [`with_max_batch_age`] set, or
-    /// [`DEFAULT_KAFKA_MAX_BATCH_AGE`].
-    ///
-    /// [`with_max_batch_age`]: Self::with_max_batch_age
-    pub fn max_batch_age(&self) -> Duration {
-        self.max_batch_age
-    }
-
-    /// Let `handle_batch` run for as long as it likes.
-    ///
-    /// For sinks whose flush has no meaningful upper bound. The cost is that a
-    /// genuinely hung flush wedges the consumer with no recovery — including
-    /// `shutdown.cancel()`, which cannot interrupt an in-flight flush.
-    pub fn without_handler_timeout(mut self) -> Self {
-        self.handler_timeout = None;
-        self
-    }
-
-    /// What a batch handler timeout resolves to, instead of the default
-    /// [`Outcome::Retry`].
-    ///
-    /// The same motivation as
-    /// [`ConsumerOptions::with_handler_timeout_outcome`] — a slow flush is
-    /// usually backpressure, not a poison batch — but **not** the same
-    /// mechanics, because the outcome applies batch-wide and `run_batch` has
-    /// no per-message retry counter:
-    ///
-    /// | Outcome | Effect on the whole batch |
-    /// |---|---|
-    /// | `Retry` (default) | Seek back and redeliver after an escalating delay. Forever, if the handler keeps timing out. |
-    /// | `Defer` | **Identical to `Retry` here.** Same seek-back arm, same backoff. |
-    /// | `Ack` | Commit every offset in the batch. The messages are gone, unprocessed, with no DLQ copy. |
-    /// | `Reject` | Terminal: dead-letter every message (or discard it, with no DLQ declared) and commit. |
-    ///
-    /// The `Retry`/`Defer` distinction that matters on the single-message path
-    /// — spending the retry budget versus not — has no meaning here. There is
-    /// no budget to spend: a batch is never dead-lettered for exhausting one,
-    /// so a timeout can never turn into the silent budget-exhaustion discard
-    /// this option exists to avoid elsewhere. Setting `Defer` over the default
-    /// is therefore a no-op, kept legal only so the two option types read the
-    /// same.
-    ///
-    /// That leaves the real choice as *redeliver forever* (`Retry`/`Defer`)
-    /// versus *give up on this batch* (`Ack`/`Reject`). Both of the latter
-    /// retire messages the handler never finished, so reach for them only when
-    /// a stalled flush genuinely means the payloads are no longer worth
-    /// processing — and prefer `Reject` to `Ack` unless the topology has no
-    /// DLQ, since `Reject` at least preserves them.
-    ///
-    /// [`ConsumerOptions::with_handler_timeout_outcome`]: crate::ConsumerOptions::with_handler_timeout_outcome
-    pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
-        self.handler_timeout_outcome = Some(outcome);
-        self
-    }
-
-    /// Tag this consumer with a group name for metrics labelling, exactly as
-    /// [`ConsumerOptions::with_consumer_group`] does on the single-message
-    /// path. Left unset it surfaces as `consumer_group="default"`.
-    ///
-    /// This is **not** [`with_group_id`](Self::with_group_id). The two are
-    /// deliberately independent: `group_id` is the Kafka `group.id` the broker
-    /// coordinates partition assignment with, while this is the logical group
-    /// name the `consumer_group` metric label reports — the same value every
-    /// other backend reports, so one dashboard query spans all of them. Setting
-    /// only `with_group_id` moves the partitions without moving the label, and
-    /// setting only this one moves the label without moving the partitions.
-    ///
-    /// [`ConsumerOptions::with_consumer_group`]: crate::ConsumerOptions::with_consumer_group
-    pub fn with_consumer_group(mut self, name: impl Into<Arc<str>>) -> Self {
-        self.consumer_group = Some(name.into());
-        self
-    }
-
-    pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
-        self.kafka_group_id = Some(group_id.into());
-        self
-    }
-
-    pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
-        self.kafka_auto_offset_reset = Some(reset);
-        self
-    }
-
-    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
-        self.shutdown = shutdown;
-        self
-    }
-
-    /// Decode batch messages through the Confluent Schema Registry: strip the
-    /// wire frame, gate the resolved subject, then decode the inner payload
-    /// with `T::Codec`.
-    ///
-    /// Same semantics as [`ConsumerOptions::with_schema_registry`] on the
-    /// single-message path, including DLQ routing for frame/subject/decode
-    /// failures. Without a registry the payload is decoded directly by
-    /// `T::Codec`, unchanged.
-    ///
-    /// [`ConsumerOptions::with_schema_registry`]: crate::ConsumerOptions::with_schema_registry
-    #[cfg(feature = "kafka-schema-registry")]
-    pub fn with_schema_registry(mut self, registry: Arc<SchemaRegistry>) -> Self {
-        self.schema_registry = Some(registry);
-        self
-    }
-
-    /// Whether a message whose schema subject is not accepted is routed to the
-    /// DLQ (`Enforce`, the default) or decoded anyway with a warning
-    /// (`Permissive`).
-    #[cfg(feature = "kafka-schema-registry")]
-    pub fn with_schema_enforcement(mut self, enforcement: SchemaEnforcement) -> Self {
-        self.schema_enforcement = enforcement;
-        self
-    }
-
-    /// Subjects this consumer accepts. Defaults to `{queue}-value`.
-    #[cfg(feature = "kafka-schema-registry")]
-    pub fn accept_schema_subjects<I, S>(mut self, subjects: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<Arc<str>>,
-    {
-        self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
-        self
-    }
-}
+///
+/// A `pub type` alias of the generic
+/// [`BatchConsumerOptions<Kafka>`](crate::batch_consumer::BatchConsumerOptions),
+/// not a distinct type: every builder this backend needs already exists on
+/// the generic type, split across two homes. The backend-agnostic ones
+/// (`with_max_batch_size`, `with_max_batch_age`, `with_handler_timeout`,
+/// `with_consumer_group`, `with_shutdown`, ...) live directly on
+/// `BatchConsumerOptions<B>` in `src/batch_consumer.rs`. The Kafka-only ones —
+/// `with_group_id`, `with_auto_offset_reset`, and (under
+/// `kafka-schema-registry`) `with_schema_registry`,
+/// `with_schema_enforcement`, `accept_schema_subjects` — live in that same
+/// file's `#[cfg(feature = "kafka")] impl BatchConsumerOptions<Kafka>` blocks,
+/// gated the same way this type alias only exists under `kafka`.
+pub type BatchConsumerOptions = GenericBatchConsumerOptions<Kafka>;
 
 /// The parts of a batch flush that don't change between flushes.
 struct BatchFlushCtx<'a> {
@@ -2277,7 +1986,9 @@ struct BatchBuffer<T: Topic> {
 impl<T: Topic> BatchBuffer<T> {
     fn new(capacity: usize) -> Self {
         Self {
-            messages: Vec::with_capacity(capacity),
+            // Clamped: `capacity` is `max_batch_size`, which a caller may set
+            // to `usize::MAX` — see `PREALLOC_CAP`'s doc.
+            messages: Vec::with_capacity(capacity.min(PREALLOC_CAP)),
             raw: Vec::new(),
             pending_dlq: Vec::new(),
             dropped: 0,
@@ -2402,15 +2113,17 @@ async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) 
 }
 
 /// Hands the buffered batch to the handler and applies the single returned
-/// `Outcome`:
+/// `Outcome`, via the shared [`settle_batch_outcome`] classifier:
 ///
-/// - `Ack` commits every partition's end offset in one batched commit.
-/// - `Reject` is terminal, exactly as it is on every other consumer path: the
-///   batch is published to the DLQ and its offsets commit.
-/// - `Retry` / `Defer` seek every partition back to the batch's start offset so
-///   the whole batch is re-delivered on the next `recv()` instead of being
-///   silently skipped (offsets were never committed, but this consumer keeps
-///   polling forward without a seek).
+/// - `Ack` (`BatchSettlement::Commit`) commits every partition's end offset in
+///   one batched commit.
+/// - `Reject` (`BatchSettlement::DeadLetter`) is terminal, exactly as it is on
+///   every other consumer path: the batch is published to the DLQ and its
+///   offsets commit.
+/// - `Retry` / `Defer` (`BatchSettlement::Redeliver`) seek every partition
+///   back to the batch's start offset so the whole batch is re-delivered on
+///   the next `recv()` instead of being silently skipped (offsets were never
+///   committed, but this consumer keeps polling forward without a seek).
 ///
 /// The buffer's messages may be empty while its offset span is not: every
 /// message in the span was dropped before the handler (oversize /
@@ -2424,85 +2137,13 @@ async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) 
 ///
 /// The buffer is left empty on every path; the caller only has to disarm the
 /// deadline.
-/// [`invoke_handler`] for a whole batch: same panic containment, same timeout,
-/// same instrumentation — in message units, with one duration observation per
-/// flush rather than per message.
 ///
-/// Without this, `run_batch` was the one handler-invoking path in the crate
-/// with neither guard. A panicking flush unwound the batch task itself, so the
-/// consumer died and stayed dead until an external supervisor noticed; the
-/// single-message path turns the same panic into a redelivery. And because the
-/// batch loop is one task, a flush future that never resolves froze offset
-/// commits, rebalance handling and `shutdown.cancel()` along with it.
-///
-/// Both failures map to [`Outcome::Retry`], which is honest: the batch was not
-/// acked, so its offsets are not committed, and the caller seeks back and
-/// redelivers it. The messages themselves were moved into the abandoned
-/// future — they come back from the broker, not from memory.
-///
-/// The handler future is built by `make_fut` *inside* the guard rather than
-/// passed in ready-made. `BatchMessageHandler::handle_batch` is an ordinary
-/// `fn -> impl Future`, so an implementation may panic while assembling its
-/// future — before any of it is awaited. Constructing at the call site put
-/// that panic outside `catch_unwind`, where it unwound `flush_batch` and
-/// killed `run_batch` instead of resolving to `Retry` as the contract above
-/// promises. This mirrors the single-message path, which never materializes
-/// the handler future outside its own guard.
-async fn invoke_batch_handler<F, Fut>(
-    make_fut: F,
-    timeout: Option<Duration>,
-    timeout_outcome: Option<Outcome>,
-    topic: &str,
-    group: Option<&str>,
-    batch_size: u64,
-) -> Outcome
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Outcome>,
-{
-    use futures_util::FutureExt;
-    use std::panic::AssertUnwindSafe;
-
-    let _inflight = metrics::InflightGuard::from_refs_n(topic, group, batch_size);
-    let started = std::time::Instant::now();
-    let safe_fut = AssertUnwindSafe(async move { make_fut().await }).catch_unwind();
-    let outcome = match timeout {
-        Some(duration) => match tokio::time::timeout(duration, safe_fut).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(_panic)) => {
-                // No `record_failed_n` here: the single-message path emits no
-                // fail metric for a panic either, and `outcome="retry"`
-                // climbing without a matching `outcome="ack"` is the same
-                // wedged-handler signal. Keeping the two paths identical
-                // matters more than the extra label.
-                tracing::warn!(topic, batch_size, "batch handler panicked, redelivering");
-                Outcome::Retry
-            }
-            Err(_) => {
-                let resolved = handler_timeout_outcome(timeout_outcome);
-                tracing::warn!(
-                    topic,
-                    batch_size,
-                    outcome = ?resolved,
-                    "batch handler timed out after {duration:?}"
-                );
-                metrics::record_failed_n(topic, group, metrics::FailReason::Timeout, batch_size);
-                resolved
-            }
-        },
-        None => match safe_fut.await {
-            Ok(o) => o,
-            Err(_panic) => {
-                tracing::warn!(topic, batch_size, "batch handler panicked, redelivering");
-                Outcome::Retry
-            }
-        },
-    };
-    metrics::record_processing_duration(topic, group, &outcome, started.elapsed().as_secs_f64());
-    metrics::record_consumed_n(topic, group, &outcome, batch_size);
-    outcome
-}
-
+/// The handler itself is invoked through
+/// [`invoke_batch_handler`](crate::backend::batch_consumer::invoke_batch_handler) —
+/// shared across every backend with a batch implementation now, not
+/// Kafka-specific — which supplies the panic containment, timeout and
+/// instrumentation this flush relies on. See that function's doc for why the
+/// guard exists and why the handler future is built *inside* it.
 async fn flush_batch<T, H>(
     flush: &BatchFlushCtx<'_>,
     handler: &H,
@@ -2563,8 +2204,11 @@ where
         batch_size as u64,
     )
     .await;
-    match outcome {
-        Outcome::Ack => {
+    // The *selection* of which arm runs is the shared classifier; the
+    // mechanics inside each arm (offset commits, seeks, DLQ publishes) are
+    // Kafka's own and untouched by the move.
+    match settle_batch_outcome(&outcome) {
+        BatchSettlement::Commit => {
             publish_pending_dlq(flush, &buffer.pending_dlq).await;
             commit_batch_end(consumer, queue, &buffer.end).await?;
             *redelivery_backoff = batch_redelivery_backoff();
@@ -2575,7 +2219,7 @@ where
         // it has to mean that here too: routing it through the seek-back arm
         // pins the partition forever (seek, sleep, redeliver, reject, …) with
         // the payloads never reaching a DLQ and the offsets never advancing.
-        Outcome::Reject => {
+        BatchSettlement::DeadLetter => {
             // Same terminal contract the single-message path applies in
             // `route_outcome`, in batch units. The failure is counted now
             // because it already happened; the *discard* is a claim that the
@@ -2643,12 +2287,12 @@ where
             *redelivery_backoff = batch_redelivery_backoff();
             buffer.clear();
         }
-        other => {
-            let delay = redelivery_backoff.next().expect("backoff is infinite");
+        BatchSettlement::Redeliver => {
+            let delay = next_redelivery_delay(redelivery_backoff);
             tracing::warn!(
                 queue,
                 batch_size,
-                outcome = ?other,
+                ?outcome,
                 delay_ms = delay.as_millis() as u64,
                 "batch handler returned a non-Ack outcome, redelivering the whole batch"
             );
@@ -3606,18 +3250,33 @@ impl KafkaConsumer {
         T: NotSequenced,
         H: BatchMessageHandler<T>,
     {
+        self.run_batch_inner::<T, H>(handler, ctx, options.into_inner())
+            .await
+    }
+
+    /// The body of [`run_batch`](Self::run_batch), taking the un-generic
+    /// [`BatchConsumerOptionsInner`] so it can also serve as this backend's
+    /// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl::run_batch)
+    /// implementation. See `run_batch` for the full contract — this method's
+    /// behaviour is unchanged from before the split, only its options type.
+    pub(crate) async fn run_batch_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
         let topology = T::topology();
         let queue = topology.queue();
-        // Mirror of the `run_fifo` guard. `NotSequenced` is the primary gate,
-        // but it is a hand-implementable marker: a topic can claim it while
-        // still carrying sequencing config in its topology. Consuming that in
-        // batches would bypass ordering silently, so fail closed instead.
-        if topology.sequencing().is_some() {
-            return Err(ShoveError::Topology(format!(
-                "run_batch called on {queue}, which declares sequencing config; \
-                 batching and sequencing are mutually exclusive — use run_fifo"
-            )));
-        }
+        // The public `run_batch` delegate above does not pass through
+        // `BatchConsumer::run` (the generic wrapper), so this is its only
+        // guard — not a redundant second check of one `BatchConsumer::run`
+        // already performed. One definition (`validate_batch_topic`), two
+        // call sites; see the trait doc for why both are load-bearing.
+        validate_batch_topic::<T>()?;
         // Same precedence as `run_with_inner`: explicit override, then the
         // topology's fan-out group, then the topic default.
         let group_id = options
@@ -5950,232 +5609,6 @@ mod batch_buffer_tests {
         assert!(!buf.is_empty());
         assert_eq!(buf.end.get(&0), Some(&8));
         assert_eq!(buf.start.get(&0), Some(&7));
-    }
-}
-
-/// [`reject_settlement`]: the terminal-discard decision for a rejected
-/// message.
-///
-/// `messages_discarded_total` promises every increment is a message that no
-/// longer exists, so getting this matrix wrong is either a false data-loss
-/// alert or the silent loss this PR exists to surface. Both the single-message
-/// `route_outcome` and the batch `flush_batch` reject arm route through it, so
-/// the two paths cannot drift the way earlier cross-backend fixes did.
-#[cfg(test)]
-mod reject_settlement_tests {
-    use super::*;
-
-    /// With no DLQ there is nothing to publish to, so a reject drops the
-    /// message. This is the bare-topology shape from CAF-35: the discard has to
-    /// be counted, which is precisely what the batch path used to skip.
-    #[test]
-    fn no_dlq_is_always_a_plain_discard() {
-        assert_eq!(
-            reject_settlement(false, false),
-            RejectSettlement::Retired,
-            "no DLQ declared: the message is dropped and must be counted"
-        );
-    }
-
-    /// `reached_dlq` is meaningless without a DLQ — there was no publish. A
-    /// caller that passes `true` anyway (a batch with no `raw` bytes buffered,
-    /// say) must still get a countable discard rather than a silent `InDlq`.
-    #[test]
-    fn no_dlq_ignores_the_publish_flag() {
-        assert_eq!(reject_settlement(false, true), RejectSettlement::Retired);
-    }
-
-    /// The message exists in the DLQ, so no discard is owed however the commit
-    /// resolves. Counting here would be a false data-loss alert on the
-    /// perfectly ordinary dead-letter path.
-    #[test]
-    fn a_landed_dlq_publish_owes_no_discard() {
-        assert_eq!(reject_settlement(true, true), RejectSettlement::InDlq);
-    }
-
-    /// The case `has_dlq` alone gets wrong: a DLQ was declared, the publish
-    /// failed, and the offsets commit anyway. Nothing holds a copy, so this is
-    /// data loss even though the topology says otherwise — it must settle with
-    /// `confirm_lost`, which counts regardless of `has_dlq`.
-    #[test]
-    fn a_failed_dlq_publish_is_loss_despite_the_topology() {
-        assert_eq!(reject_settlement(true, false), RejectSettlement::Lost);
-    }
-
-    /// Only `InDlq` may skip the commit round trip. The other two are claims
-    /// that a message is gone, and nothing has retired it until the offsets
-    /// actually advance — settling them early is the false-alert-during-an-
-    /// outage failure `PendingDiscard` was introduced to prevent.
-    #[test]
-    fn everything_but_in_dlq_waits_for_the_commit() {
-        for (has_dlq, reached_dlq) in [(false, false), (false, true), (true, false)] {
-            assert_ne!(
-                reject_settlement(has_dlq, reached_dlq),
-                RejectSettlement::InDlq,
-                "has_dlq={has_dlq} reached_dlq={reached_dlq} must wait for the commit"
-            );
-        }
-    }
-}
-
-/// [`invoke_batch_handler`]: a batch flush must not be able to take the
-/// consumer task down with it, and must not be able to hang it forever.
-#[cfg(test)]
-mod batch_handler_isolation_tests {
-    use super::*;
-
-    /// A panicking flush used to unwind `run_batch` itself, killing the
-    /// consumer until something outside the process restarted it. It has to
-    /// become a redelivery, exactly like the single-message path's.
-    #[tokio::test]
-    async fn a_panicking_batch_becomes_retry() {
-        let outcome = invoke_batch_handler(
-            || async { panic!("flush blew up") },
-            Some(Duration::from_secs(5)),
-            None,
-            "topic",
-            None,
-            3,
-        )
-        .await;
-
-        assert!(matches!(outcome, Outcome::Retry));
-    }
-
-    /// The batch loop is a single task, so a flush that never resolves also
-    /// stops commits, rebalance handling and shutdown. The timeout is what
-    /// bounds all three.
-    #[tokio::test(start_paused = true)]
-    async fn a_hung_batch_times_out_into_retry() {
-        let outcome = invoke_batch_handler(
-            || async {
-                tokio::time::sleep(Duration::from_secs(600)).await;
-                Outcome::Ack
-            },
-            Some(Duration::from_secs(30)),
-            None,
-            "topic",
-            None,
-            3,
-        )
-        .await;
-
-        assert!(matches!(outcome, Outcome::Retry));
-    }
-
-    /// Panic containment must not depend on the timeout being set: opting out
-    /// of the timeout is a statement about how long a flush may take, not a
-    /// request to let a panic kill the consumer.
-    #[tokio::test]
-    async fn panics_are_caught_with_no_timeout_configured() {
-        let outcome = invoke_batch_handler(
-            || async { panic!("flush blew up") },
-            None,
-            None,
-            "topic",
-            None,
-            1,
-        )
-        .await;
-
-        assert!(matches!(outcome, Outcome::Retry));
-    }
-
-    /// `BatchMessageHandler::handle_batch` is an ordinary `fn -> impl Future`,
-    /// so an implementation may panic while *building* its future — validating
-    /// an argument, indexing a config map — before returning anything to await.
-    ///
-    /// That panic used to escape containment: the call was evaluated at the
-    /// `flush_batch` call site, outside the `catch_unwind`, so it unwound the
-    /// batch task and killed `run_batch` instead of becoming a redelivery. The
-    /// closure is what moves construction inside the guard, and this test is
-    /// what stops the ready-made-future form coming back — with a plain
-    /// `Future` parameter it does not even compile.
-    #[tokio::test]
-    async fn a_panic_while_building_the_future_is_contained() {
-        fn build_future() -> impl std::future::Future<Output = Outcome> {
-            panic!("handle_batch blew up before returning a future");
-            #[allow(unreachable_code)]
-            async {
-                unreachable!()
-            }
-        }
-
-        let outcome = invoke_batch_handler(
-            build_future,
-            Some(Duration::from_secs(5)),
-            None,
-            "topic",
-            None,
-            3,
-        )
-        .await;
-
-        assert!(matches!(outcome, Outcome::Retry));
-    }
-
-    /// The same, with the deadline disabled — the no-timeout arm has its own
-    /// `catch_unwind` and has to construct inside it too.
-    #[tokio::test]
-    async fn a_panic_while_building_the_future_is_contained_with_no_timeout() {
-        fn build_future() -> impl std::future::Future<Output = Outcome> {
-            panic!("handle_batch blew up before returning a future");
-            #[allow(unreachable_code)]
-            async {
-                unreachable!()
-            }
-        }
-
-        let outcome = invoke_batch_handler(build_future, None, None, "topic", None, 1).await;
-
-        assert!(matches!(outcome, Outcome::Retry));
-    }
-
-    #[tokio::test]
-    async fn a_normal_outcome_passes_through_untouched() {
-        let ack = invoke_batch_handler(
-            || async { Outcome::Ack },
-            Some(Duration::from_secs(5)),
-            None,
-            "topic",
-            None,
-            2,
-        )
-        .await;
-        assert!(matches!(ack, Outcome::Ack));
-
-        let reject = invoke_batch_handler(
-            || async { Outcome::Reject },
-            Some(Duration::from_secs(5)),
-            None,
-            "topic",
-            None,
-            2,
-        )
-        .await;
-        assert!(matches!(reject, Outcome::Reject));
-    }
-
-    /// The batch path has its own timeout arm, so it needs its own proof that
-    /// `handler_timeout_outcome` reaches it. Without this the setter would be
-    /// silently inert for `run_batch` — and a slow flush would keep burning the
-    /// retry budget of every message in the batch.
-    #[tokio::test(start_paused = true)]
-    async fn a_hung_batch_honours_the_configured_timeout_outcome() {
-        let outcome = invoke_batch_handler(
-            || async {
-                tokio::time::sleep(Duration::from_secs(600)).await;
-                Outcome::Ack
-            },
-            Some(Duration::from_secs(30)),
-            Some(Outcome::Defer),
-            "topic",
-            None,
-            3,
-        )
-        .await;
-
-        assert!(matches!(outcome, Outcome::Defer));
     }
 }
 

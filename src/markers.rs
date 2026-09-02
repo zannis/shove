@@ -62,13 +62,35 @@ pub struct RabbitMq;
 /// # }
 /// ```
 ///
-/// The control for the test above. A `compile_fail` doctest passes on *any*
+/// SQS has no batch-consumption implementation either — see
+/// [`HasBatchConsumption`](crate::backend::capability::HasBatchConsumption)
+/// for the authoritative list, where unlike `HasBroadcast` every other row is
+/// *pending* rather than permanently excluded. `batch_consumer()` is
+/// nevertheless a compile error on `Broker<Sqs>` today, same as the other two:
+///
+/// ```compile_fail
+/// # #[cfg(feature = "aws-sns-sqs")]
+/// # async fn _x() -> shove::error::Result<()> {
+/// use shove::{Broker, Sqs};
+/// use shove::sns::SnsConfig;
+///
+/// let broker = Broker::<Sqs>::new(SnsConfig {
+///     region: None,
+///     endpoint_url: None,
+/// }).await?;
+/// // error: no method named `batch_consumer` for `Broker<Sqs>`
+/// let _ = broker.batch_consumer();
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The control for the tests above. A `compile_fail` doctest passes on *any*
 /// compile error (see the note on [`NotSequenced`](crate::topic::NotSequenced)),
-/// so on its own it would keep passing if the imports rotted or `SnsConfig`
+/// so on its own each would keep passing if the imports rotted or `SnsConfig`
 /// changed shape — it would have become a typo test asserting nothing about
 /// capabilities. This twin is byte-identical except for the final method, which
-/// `Broker<Sqs>` *does* have. It compiling is what pins the failure above to
-/// the missing `HasBroadcast` impl and nothing else.
+/// `Broker<Sqs>` *does* have. It compiling is what pins each failure above to
+/// its missing capability trait and nothing else.
 ///
 /// ```rust,no_run
 /// # #[cfg(feature = "aws-sns-sqs")]

@@ -16,8 +16,8 @@
 //!
 //! The manifest in `common::TIER_A_COVERAGE` is printed before the first group
 //! and asserted complete, so a flow cannot go missing without failing the run.
-//! One flow is not measurable here: batch consume (`run_batch`) exists only on
-//! the Kafka backend.
+//! One flow is not wired here: batch consume (`run_batch`) exists on InMemory
+//! too, but this bench harness has no `consume_batch` flow for it yet.
 //!
 //! # Why the shapes differ per group
 //!

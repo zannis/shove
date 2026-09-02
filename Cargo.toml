@@ -90,7 +90,11 @@ kafka-schema-registry = [
 ]
 
 # In-process backend
-inmemory = ["dep:dashmap"]
+# futures-util: `FutureExt::catch_unwind`, to resolve a panicking batch
+# handler to `Outcome::Retry` (see `backend::batch_consumer::invoke_batch_handler`,
+# shared with Kafka's batch consumer). Same feature-edge move as `redis-streams`
+# below — wires up a dependency that was already in the tree.
+inmemory = ["dep:dashmap", "dep:futures-util"]
 
 # Redis Streams pubsub
 # futures-util: `FutureExt::catch_unwind`, to resolve a panicking handler to

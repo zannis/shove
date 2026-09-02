@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, Notify};
@@ -373,6 +373,83 @@ impl InMemoryBroker {
                 }
             }
         }
+    }
+
+    /// Put a whole batch back at the *front* of `queue`, for the batch
+    /// consumer's redelivery path (`run_batch_impl`'s `Redeliver` arm) — the
+    /// closest in-process analogue of Kafka's seek-back.
+    ///
+    /// `envs` is pushed in reverse so the batch's original order is restored
+    /// (each `push_front` puts one envelope ahead of whatever was pushed
+    /// before it, so pushing the batch's *last* envelope first leaves the
+    /// *first* one at the very front).
+    ///
+    /// Capacity is deliberately never re-checked here, unlike [`Self::enqueue`]:
+    /// this only ever puts back a batch this same consumer just popped, but
+    /// by the time it runs, publishers may already have refilled the slots
+    /// each pop's `space.notify_one()` freed — so the buffer can genuinely
+    /// overshoot `capacity` by up to a batch's worth of envelopes. That
+    /// overshoot is deliberate and bounded (by `max_batch_size`, never
+    /// unbounded): waiting for capacity instead would risk deadlock, because
+    /// this consumer is the only task that could ever drain the buffer back
+    /// down, and it would be blocked waiting on itself to do it.
+    pub(super) async fn requeue_front(&self, queue: &QueueState, envs: Vec<Envelope>) {
+        {
+            let mut buf = queue.buffer.lock().await;
+            for env in envs.into_iter().rev() {
+                buf.push_front(env);
+            }
+        }
+        // One wake is enough regardless of how many envelopes came back:
+        // `pop_one` loops and re-checks the buffer directly after each pop,
+        // so it drains the rest without needing a notification per envelope.
+        // `notify_waiters` covers a task already parked in
+        // `notified().await`; the extra `notify_one` leaves a stored permit
+        // for one that checked the (then-empty) buffer and is about to
+        // register as a waiter — the same check-then-register race
+        // `pop_one`'s own doc describes.
+        queue.ready.notify_waiters();
+        queue.ready.notify_one();
+    }
+}
+
+impl QueueState {
+    /// Pop up to `max` envelopes under one buffer-lock acquisition, with the
+    /// pop-side accounting applied atomically with respect to anything else
+    /// that locks the buffer: `in_flight` is incremented **while the guard is
+    /// still held**, so a stats reader that locks the buffer (backlog) and
+    /// then loads `in_flight` can never observe drained envelopes counted in
+    /// neither. One `space` permit per popped envelope is released after the
+    /// guard drops — publishers re-check capacity under their own lock, so
+    /// the wake order does not matter there.
+    ///
+    /// Returns an empty `Vec` (no allocation) when the buffer is empty or
+    /// `max` is zero; never waits. The batch consumer's opportunistic drain
+    /// is the caller; its awaiting single-pop loop (`pop_one` in
+    /// `consumer.rs`) keeps the same triple inline for the one-envelope case
+    /// because its no-await-after-lock tail is load-bearing inside a
+    /// `select!` arm — the two sites cross-reference each other.
+    pub(super) async fn drain_up_to(&self, max: usize) -> Vec<Envelope> {
+        let out = {
+            let mut buf = self.buffer.lock().await;
+            let n = buf.len().min(max);
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                match buf.pop_front() {
+                    Some(env) => out.push(env),
+                    None => break,
+                }
+            }
+            if !out.is_empty() {
+                self.in_flight
+                    .fetch_add(out.len() as u64, Ordering::Release);
+            }
+            out
+        };
+        for _ in 0..out.len() {
+            self.space.notify_one();
+        }
+        out
     }
 }
 
