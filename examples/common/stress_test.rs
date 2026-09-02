@@ -954,8 +954,26 @@ fn framework_corpus_floor(
     MIN_FRAMEWORK_CORPUS_MESSAGES.min(by_bytes)
 }
 
-fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> Duration {
+/// The `zero` drain rate a floored cell's deadline is budgeted at, in messages
+/// per millisecond.
+///
+/// [`framework_corpus_floor`] raises a cell without knowing which backend will
+/// run it, so the deadline that comes with it cannot assume the 40,000 msg/s
+/// the unfloored `zero` deadline does — that figure is the broker the floor was
+/// sized from, and a backend draining a 150,000-message cell at 2,000 msg/s
+/// would fail on the 60 s clamp with nothing wrong. One message per
+/// millisecond budgets 150 s for the floor's corpus, 450 s after the 3× margin
+/// and still inside the 600 s ceiling.
+const FLOORED_ZERO_DRAIN_PER_MS: f64 = 1.0;
+
+fn scenario_deadline(
+    messages: u64,
+    consumers: u16,
+    handler: HandlerProfile,
+    corpus_floored: bool,
+) -> Duration {
     let expected_ms = match handler {
+        HandlerProfile::Zero if corpus_floored => messages as f64 / FLOORED_ZERO_DRAIN_PER_MS,
         HandlerProfile::Zero => messages as f64 / 40.0,
         HandlerProfile::Fast => (messages as f64 * 3.0) / consumers as f64,
         HandlerProfile::Slow => (messages as f64 * 175.0) / consumers as f64,
@@ -1112,8 +1130,12 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                         // intent, parse-bounded by the deadline ceiling) or a
                         // large legal age turns every batch scenario into a false
                         // timeout row.
-                        let mut deadline =
-                            scenario_deadline(messages, flow.effective_workers(consumers), h);
+                        let mut deadline = scenario_deadline(
+                            messages,
+                            flow.effective_workers(consumers),
+                            h,
+                            messages > tier_messages,
+                        );
                         if let Some(opts) = batch_options {
                             deadline = deadline
                                 .saturating_add(Duration::from_millis(opts.max_batch_age_ms.get()));
@@ -4511,6 +4533,52 @@ mod tests {
         // per-consumer scaling above the floor is not flattened.
         assert_eq!(at(32), 160_000);
         assert!(at(32) > MIN_FRAMEWORK_CORPUS_MESSAGES);
+    }
+
+    #[test]
+    fn a_floored_cell_is_given_a_deadline_its_corpus_can_use() {
+        // The floor is applied blind to the backend, so the deadline it comes
+        // with must budget for a slow one: at the 40,000 msg/s the unfloored
+        // `zero` deadline assumes, a 150,000-message cell would keep the 60 s
+        // clamp and any backend draining under ~2,500 msg/s would fail on the
+        // clock instead of producing a row.
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consumer-group",
+            "--consumers",
+            "1,32",
+            "--payload",
+            "64",
+        ]));
+        let at = |c: u16| {
+            scenarios
+                .iter()
+                .find(|s| s.consumers == c)
+                .unwrap_or_else(|| panic!("{c}c present"))
+        };
+        let floored = at(1);
+        assert_eq!(floored.messages, MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(
+            floored.deadline,
+            scenario_deadline(MIN_FRAMEWORK_CORPUS_MESSAGES, 1, HandlerProfile::Zero, true)
+        );
+        assert!(
+            floored.deadline >= Duration::from_secs(450),
+            "a floored 150,000-message cell must be budgeted at the floored rate, got {:?}",
+            floored.deadline
+        );
+        // A cell the tier sizes on its own keeps the deadline it always had.
+        let own = at(32);
+        assert!(own.messages > MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(
+            own.deadline,
+            scenario_deadline(own.messages, 32, HandlerProfile::Zero, false)
+        );
+        assert_eq!(own.deadline, Duration::from_secs(60));
     }
 
     #[test]
