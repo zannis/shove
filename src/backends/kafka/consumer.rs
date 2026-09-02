@@ -35,7 +35,10 @@ use crate::routing::{
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
+use crate::{
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_BATCH_AGE, DEFAULT_MAX_BATCH_SIZE,
+    DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError,
+};
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
@@ -1854,8 +1857,8 @@ pub struct BatchConsumerOptions {
 impl Default for BatchConsumerOptions {
     fn default() -> Self {
         Self {
-            max_batch_size: 500,
-            max_batch_age: Duration::from_millis(250),
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            max_batch_age: DEFAULT_MAX_BATCH_AGE,
             max_reconnect_attempts: None,
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             // Same default as `ConsumerOptions`. A batch flush is one DB
@@ -6289,10 +6292,26 @@ mod batch_consumer_options_tests {
         let opts = BatchConsumerOptions::default();
         assert_eq!(opts.max_batch_size, 500);
         assert_eq!(opts.max_batch_age, Duration::from_millis(250));
+        // The shared constants are the same values — they are what external
+        // tooling (the stress harness) references instead of restating 500/250.
+        assert_eq!(opts.max_batch_size, DEFAULT_MAX_BATCH_SIZE);
+        assert_eq!(opts.max_batch_age, DEFAULT_MAX_BATCH_AGE);
         assert_eq!(opts.max_reconnect_attempts, None);
         assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert_eq!(opts.kafka_group_id, None);
         assert_eq!(opts.kafka_auto_offset_reset, None);
+    }
+
+    /// The getters exist so code outside this module (the stress harness's
+    /// tests) can read back what the builders set; a transposed pair here
+    /// would let a benchmark stamp rows with knobs the run never used.
+    #[test]
+    fn getters_read_back_what_the_builders_set() {
+        let opts = BatchConsumerOptions::new()
+            .with_max_batch_size(7)
+            .with_max_batch_age(Duration::from_millis(9));
+        assert_eq!(opts.max_batch_size(), 7);
+        assert_eq!(opts.max_batch_age(), Duration::from_millis(9));
     }
 
     /// Parity with `ConsumerOptions`: the timeout is opt-*out*, not opt-in.

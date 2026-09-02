@@ -280,8 +280,16 @@ async fn wait_until_ready(bootstrap: &str) {
 // Run with: cargo nextest run --features kafka,inmemory --example kafka_stress
 // (`inmemory` because compiling this example as a test target also compiles
 // the shared harness's test module, which drives everything over
-// `shove::InMemory`.) CI never runs example-target tests — this module, like
-// the harness's, is verified locally or not at all.
+// `shove::InMemory`.)
+//
+// Unlike the harness's module — which tests/bench_harness.rs bridges into a
+// real CI-run test target — this one runs only via the explicit `--example`
+// invocation above: bridging it the same way would need `kafka` and
+// `inmemory` enabled together, a pairing no CI leg builds. What that leaves
+// uncovered in CI is only this file's builder-call wiring; the values
+// themselves agree by construction (both sides cite
+// `shove::DEFAULT_MAX_BATCH_SIZE` / `_AGE`), and the getters are covered by
+// src's own `batch_consumer_options_tests`.
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};

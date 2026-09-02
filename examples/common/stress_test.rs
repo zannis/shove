@@ -615,15 +615,19 @@ pub struct BatchOptions {
 }
 
 impl Default for BatchOptions {
-    /// Mirrors `BatchConsumerOptions::default()` (500 messages / 250 ms) so an
+    /// `BatchConsumerOptions::default()`'s own values, via the shared
+    /// constants both cite (`shove::DEFAULT_MAX_BATCH_SIZE` / `_AGE`) — an
     /// un-flagged invocation measures exactly what the harness always
-    /// measured. The agreement is pinned by a test in the Kafka wrapper that
-    /// maps this default through `BatchConsumerOptions` and reads it back —
-    /// not by this comment.
+    /// measured, and the agreement holds by construction rather than by a
+    /// comment.
     fn default() -> Self {
         Self {
-            max_batch_size: NonZeroUsize::new(500).expect("500 is non-zero"),
-            max_batch_age_ms: NonZeroU64::new(250).expect("250 is non-zero"),
+            max_batch_size: NonZeroUsize::new(shove::DEFAULT_MAX_BATCH_SIZE)
+                .expect("shove's default batch size is non-zero"),
+            max_batch_age_ms: u64::try_from(shove::DEFAULT_MAX_BATCH_AGE.as_millis())
+                .ok()
+                .and_then(NonZeroU64::new)
+                .expect("shove's default batch age is a non-zero number of ms"),
         }
     }
 }
@@ -706,6 +710,16 @@ fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> 
     Duration::from_millis(deadline_ms as u64)
 }
 
+/// The flow set this invocation asked for: `--flow`, or the entry point's
+/// default when the flag is absent. Shared by [`build_scenarios`] and the
+/// batch-flag guards so "what was selected" has exactly one derivation.
+fn selected_flows(cli: &Cli, default_flow: Flow) -> Vec<Flow> {
+    match &cli.flow {
+        Some(FlowArg(list)) => list.clone(),
+        None => vec![default_flow],
+    }
+}
+
 fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scenario> {
     let handlers: Vec<HandlerProfile> = match cli.handler {
         HandlerArg::Zero => vec![HandlerProfile::Zero],
@@ -727,9 +741,14 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
         TierArg::All => vec![&MODERATE, &HIGH, &EXTREME],
     };
 
-    let flows: Vec<Flow> = match &cli.flow {
-        Some(FlowArg(list)) => list.clone(),
-        None => vec![default_flow],
+    let flows = selected_flows(cli, default_flow);
+
+    // CLI-invariant, so derived once here with the other CLI bindings: the
+    // knobs every `consume_batch` scenario runs with (and stamps on its row).
+    let defaults = BatchOptions::default();
+    let batch_options = BatchOptions {
+        max_batch_size: cli.batch_max_size.unwrap_or(defaults.max_batch_size),
+        max_batch_age_ms: cli.batch_max_age_ms.unwrap_or(defaults.max_batch_age_ms),
     };
 
     let mut scenarios = Vec::new();
@@ -794,17 +813,29 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                         Flow::Broadcast => per_consumer,
                         _ => per_consumer.saturating_mul(consumers as u64),
                     };
+                    // A batch flushes on size or on age — with a corpus
+                    // smaller than the batch size, age is the only trigger, so
+                    // the run legitimately takes up to `max_batch_age` beyond
+                    // what the handler-time model predicts. Fold the age into
+                    // the deadline (above any clamp: the knob is explicit user
+                    // intent, not a derived workload) or a large legal age
+                    // turns every batch scenario into a false timeout row.
+                    let deadline = match flow {
+                        Flow::ConsumeBatch => {
+                            scenario_deadline(messages, flow.effective_workers(consumers), h)
+                                .saturating_add(Duration::from_millis(
+                                    batch_options.max_batch_age_ms.get(),
+                                ))
+                        }
+                        _ => scenario_deadline(messages, flow.effective_workers(consumers), h),
+                    };
                     for &payload_bytes in &cli.payload.0 {
                         scenarios.push(Scenario {
                             tier: tier_cfg.name,
                             messages,
                             consumers,
                             handler: h,
-                            deadline: scenario_deadline(
-                                messages,
-                                flow.effective_workers(consumers),
-                                h,
-                            ),
+                            deadline,
                             concurrent: cli.concurrent,
                             prefetch: cli.prefetch,
                             flow,
@@ -812,14 +843,7 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                             // Only the flow with a batch to size carries the
                             // knobs; stamping a default on any other row
                             // would claim options a run never had.
-                            batch_options: (flow == Flow::ConsumeBatch).then(|| BatchOptions {
-                                max_batch_size: cli
-                                    .batch_max_size
-                                    .unwrap_or(BatchOptions::default().max_batch_size),
-                                max_batch_age_ms: cli
-                                    .batch_max_age_ms
-                                    .unwrap_or(BatchOptions::default().max_batch_age_ms),
-                            }),
+                            batch_options: (flow == Flow::ConsumeBatch).then_some(batch_options),
                         });
                     }
                 }
@@ -2912,9 +2936,9 @@ fn merge_results_file(
                 )
             })?;
             // A future version's document is shape-compatible enough to
-            // deserialize, so without this it would be silently rewritten with
-            // a v1 header and whatever fields this binary does not know about
-            // dropped. Refuse instead: the six backend binaries accumulate into
+            // deserialize, so without this it would be silently rewritten
+            // under this binary's older header, with whatever fields this
+            // binary does not know about dropped. Refuse instead: the six backend binaries accumulate into
             // one file, and a downgrade would corrupt the other five's rows.
             if doc.schema_version != RESULTS_SCHEMA_VERSION {
                 return Err(format!(
@@ -3379,29 +3403,87 @@ fn filter_scenarios<B: Backend>(
     kept
 }
 
-/// Why an invocation that passed a batch flag must be refused outright, or
-/// `None` to proceed. `Some` exactly when a flag was given and no
-/// `consume_batch` scenario survived selection and capability filtering:
-/// every remaining scenario would ignore the knob, so continuing is the
-/// parsed-and-dropped defect at invocation level — the run would exit green
-/// having measured nothing the flag described.
-fn refused_batch_flags(cli: &Cli, scenarios: &[Scenario]) -> Option<String> {
-    let flags: Vec<&str> = [
+/// The batch flags this invocation passed, by name — empty when none was.
+fn passed_batch_flags(cli: &Cli) -> Vec<&'static str> {
+    [
         cli.batch_max_size.map(|_| "--batch-max-size"),
         cli.batch_max_age_ms.map(|_| "--batch-max-age-ms"),
     ]
     .into_iter()
     .flatten()
-    .collect();
-    if flags.is_empty() || scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch) {
+    .collect()
+}
+
+/// Why an invocation that passed a batch flag must be refused outright, or
+/// `None` to proceed. `Some` exactly when a flag was given and the *selected*
+/// flow set contains no `consume-batch`: whatever the backend, nothing this
+/// invocation could ever run reads the knob, so continuing is the
+/// parsed-and-dropped defect at invocation level — the run would exit green
+/// having measured nothing the flag described. The caller can always fix
+/// this invocation (select the flow or drop the flag), which is what makes a
+/// hard refusal right here and wrong for a capability gap — that case is
+/// [`inert_batch_flags_note`].
+fn refused_batch_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
+    let flags = passed_batch_flags(cli);
+    if flags.is_empty() || selected.contains(&Flow::ConsumeBatch) {
         return None;
     }
     Some(format!(
-        "{} was passed but no consume-batch scenario will run — the knob applies to \
-         nothing. Select the flow (`--flow consume-batch`) on a backend that supports \
-         it, or drop the flag.",
-        flags.join(" / ")
+        "{} was passed but the selected flows ({}) do not include consume-batch, so \
+         the knob applies to nothing. Add `--flow consume-batch`, or drop the flag.",
+        flags.join(" / "),
+        selected
+            .iter()
+            .map(Flow::as_cli)
+            .collect::<Vec<_>>()
+            .join(","),
     ))
+}
+
+/// The capability half of the guard: `consume-batch` *was* selected and a
+/// batch flag passed, but this backend cannot run the flow, so filtering
+/// dropped it (with its own announcement). Killing the run here would break
+/// the documented six-binary sweep — one flag set accumulating one results
+/// file across every backend — so follow the flow's own precedent instead:
+/// say the knob is inert on this backend and continue with the other flows.
+/// No row lies either way, because no `consume_batch` row is produced at all.
+fn inert_batch_flags_note(cli: &Cli, selected: &[Flow], scenarios: &[Scenario]) -> Option<String> {
+    let flags = passed_batch_flags(cli);
+    if flags.is_empty()
+        || !selected.contains(&Flow::ConsumeBatch)
+        || scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch)
+    {
+        return None;
+    }
+    Some(format!(
+        "note: {} is inert on this backend — consume-batch was selected but is \
+         unsupported here (see the skip above), so no scenario reads the knob",
+        flags.join(" / "),
+    ))
+}
+
+/// Build, capability-filter, and guard the scenario list — the one selection
+/// step every entry point goes through, so no runner can wire the flows in
+/// while forgetting the flag guards. `Err` is a refusal to run at all.
+fn select_scenarios<B: Backend>(
+    cli: &Cli,
+    hcfg: &HarnessConfig<B>,
+    default_flow: Flow,
+    supervisor_only: bool,
+) -> Result<Vec<Scenario>, String> {
+    let selected = selected_flows(cli, default_flow);
+    if let Some(reason) = refused_batch_flags(cli, &selected) {
+        return Err(reason);
+    }
+    let scenarios = filter_scenarios(
+        hcfg,
+        build_scenarios(cli, default_flow, hcfg.fifo_workers),
+        supervisor_only,
+    );
+    if let Some(note) = inert_batch_flags_note(cli, &selected, &scenarios) {
+        eprintln!("{note}");
+    }
+    Ok(scenarios)
 }
 
 /// The default `ConsumerOptions` factory for the `consume_parallel` flow on a
@@ -3464,15 +3546,13 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
 
     let cli = Cli::parse();
     let cancel = spawn_ctrlc_watcher();
-    let scenarios = filter_scenarios(
-        &hcfg,
-        build_scenarios(&cli, Flow::ConsumerGroup, hcfg.fifo_workers),
-        false,
-    );
-    if let Some(reason) = refused_batch_flags(&cli, &scenarios) {
-        eprintln!("{reason}");
-        std::process::exit(2);
-    }
+    let scenarios = match select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false) {
+        Ok(scenarios) => scenarios,
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
+    };
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -3550,15 +3630,13 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     // `Flow::Supervisor`, not `ConsumerGroup`: the group flow is unsupported
     // here and would be filtered out, leaving the default invocation running
     // zero scenarios.
-    let scenarios = filter_scenarios(
-        &hcfg,
-        build_scenarios(&cli, Flow::Supervisor, hcfg.fifo_workers),
-        true,
-    );
-    if let Some(reason) = refused_batch_flags(&cli, &scenarios) {
-        eprintln!("{reason}");
-        std::process::exit(2);
-    }
+    let scenarios = match select_scenarios(&cli, &hcfg, Flow::Supervisor, true) {
+        Ok(scenarios) => scenarios,
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
+    };
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -4070,6 +4148,19 @@ mod tests {
         assert_eq!(Flow::ConsumeFifo.effective_workers(256), SEQ_SHARDS);
     }
 
+    /// The placeholder metrics every document-shape test pushes through
+    /// `push_metrics` — one definition, so a `ScenarioMetrics` field change
+    /// is a one-line fixture edit.
+    fn dummy_metrics() -> ScenarioMetrics {
+        ScenarioMetrics {
+            throughput: 1.0,
+            latencies: LatencyPercentiles::default(),
+            peak_rss_mb: 0.0,
+            cpu_pct: 0.0,
+            duration_secs: 1.0,
+        }
+    }
+
     fn scenario_for(flow: Flow, handler: HandlerProfile) -> Scenario {
         Scenario {
             tier: "moderate",
@@ -4184,17 +4275,7 @@ mod tests {
     fn the_handler_cost_marker_reaches_the_row_and_the_document() {
         let scenario = scenario_for(Flow::ConsumeBatch, HandlerProfile::Heavy);
         let mut rows = Vec::new();
-        push_metrics(
-            &mut rows,
-            &scenario,
-            ScenarioMetrics {
-                throughput: 1.0,
-                latencies: LatencyPercentiles::default(),
-                peak_rss_mb: 0.0,
-                cpu_pct: 0.0,
-                duration_secs: 1.0,
-            },
-        );
+        push_metrics(&mut rows, &scenario, dummy_metrics());
         assert_eq!(rows[0].handler_cost, HandlerCost::HandlerAmortised.as_str());
 
         let path = temp_path("handler-cost");
@@ -4677,13 +4758,7 @@ mod tests {
         push_metrics(
             &mut run.results,
             &scenario_for(flow, handler),
-            ScenarioMetrics {
-                throughput: 1.0,
-                latencies: LatencyPercentiles::default(),
-                peak_rss_mb: 0.0,
-                cpu_pct: 0.0,
-                duration_secs: 1.0,
-            },
+            dummy_metrics(),
         );
         run
     }
@@ -4771,7 +4846,8 @@ mod tests {
     #[test]
     fn a_preserved_row_that_carries_no_marker_at_all_is_refused_by_the_row() {
         // The other half of the preserved path, and the one the version check
-        // cannot reach: the header still says v2, so nothing upstream objects,
+        // cannot reach: the header still says the current version, so nothing
+        // upstream objects,
         // and `#[serde(default)]` turns the absent key into an empty marker
         // rather than a parse error. Only the row check stands between that
         // and a re-signed document. Asserted through a real file rather than
@@ -5005,7 +5081,8 @@ mod tests {
 
         merge_results_file(&p, sample_run("redis"), None).expect("first write");
         // Shape-valid, semantically illegal: a payload size outside the
-        // schema set must not be rewritten under a fresh v1 header.
+        // schema set must not be re-signed under a fresh current-version
+        // header.
         let tampered = std::fs::read_to_string(&path)
             .expect("read")
             .replace("\"payload_bytes\": 1024", "\"payload_bytes\": 128");
@@ -5106,9 +5183,20 @@ mod tests {
             assert!(obj.contains_key(field), "lost pre-existing field {field}");
         }
         // 15 pre-existing + the 3 flow/mode/payload dimensions + the
-        // handler-cost marker.
+        // handler-cost marker. The v3 batch keys are absent here — this is a
+        // `consumer_group` row, where absent means elided, not null.
         assert_eq!(obj.len(), 19);
         assert!(obj.contains_key("handler_cost"));
+
+        // The same row shape on the one flow that has a batch carries exactly
+        // the two extra keys.
+        let batch =
+            serde_json::to_value(&batch_run(Flow::ConsumeBatch, HandlerProfile::Zero).results[0])
+                .expect("serialize");
+        let batch = batch.as_object().expect("object");
+        assert_eq!(batch.len(), 21);
+        assert!(batch.contains_key("max_batch_size"));
+        assert!(batch.contains_key("max_batch_age_ms"));
     }
 
     #[test]
@@ -5161,8 +5249,11 @@ mod tests {
             "4",
             "--batch-max-size",
             "50",
+            // Deliberately NOT the 250 default: a flag value equal to the
+            // default cannot distinguish "threaded through" from "parsed and
+            // dropped", which is the defect this test exists to catch.
             "--batch-max-age-ms",
-            "250",
+            "99",
         ]));
         let (batch, rest): (Vec<_>, Vec<_>) = scenarios
             .into_iter()
@@ -5170,7 +5261,7 @@ mod tests {
         assert!(!batch.is_empty(), "no consume_batch scenario was built");
         assert!(!rest.is_empty(), "no non-batch scenario was built");
         for s in &batch {
-            assert_eq!(s.batch_options, Some(nz_batch(50, 250)), "{}", s.flow);
+            assert_eq!(s.batch_options, Some(nz_batch(50, 99)), "{}", s.flow);
         }
         for s in &rest {
             assert_eq!(s.batch_options, None, "{} has no batch to size", s.flow);
@@ -5201,7 +5292,7 @@ mod tests {
         // internally, so the closure can only see the knobs if the driver
         // hands them over. Capture what arrives rather than trusting the
         // plumbing.
-        let configured = nz_batch(50, 250);
+        let configured = nz_batch(50, 125);
         let scenario = Scenario {
             batch_options: Some(configured),
             messages: 10,
@@ -5273,27 +5364,11 @@ mod tests {
         let mut rows = Vec::new();
         let mut batch_scenario = scenario_for(Flow::ConsumeBatch, HandlerProfile::Zero);
         batch_scenario.batch_options = Some(nz_batch(50, 250));
-        push_metrics(
-            &mut rows,
-            &batch_scenario,
-            ScenarioMetrics {
-                throughput: 1.0,
-                latencies: LatencyPercentiles::default(),
-                peak_rss_mb: 0.0,
-                cpu_pct: 0.0,
-                duration_secs: 1.0,
-            },
-        );
+        push_metrics(&mut rows, &batch_scenario, dummy_metrics());
         push_metrics(
             &mut rows,
             &scenario_for(Flow::ConsumerGroup, HandlerProfile::Zero),
-            ScenarioMetrics {
-                throughput: 1.0,
-                latencies: LatencyPercentiles::default(),
-                peak_rss_mb: 0.0,
-                cpu_pct: 0.0,
-                duration_secs: 1.0,
-            },
+            dummy_metrics(),
         );
         assert_eq!(rows[0].max_batch_size, Some(50));
         assert_eq!(rows[0].max_batch_age_ms, Some(250));
@@ -5407,8 +5482,13 @@ mod tests {
             .replace("\"max_batch_size\": 500,\n", "")
             .replace("\"max_batch_age_ms\": 250,\n", "");
         // A v2 doc both says 2 and carries no batch keys; anything less is
-        // testing a mongrel document no producer ever wrote.
+        // testing a mongrel document no producer ever wrote — so every strip
+        // is asserted to have taken, like the sibling v1 fixture's.
         assert!(v2.contains("\"schema_version\": 2"), "fixture did not take");
+        assert!(
+            !v2.contains("max_batch_size") && !v2.contains("max_batch_age_ms"),
+            "the v2 fixture still carries v3's batch keys"
+        );
         assert!(
             v2.contains("handler_cost"),
             "fixture stripped v2's own field"
@@ -5424,29 +5504,130 @@ mod tests {
     }
 
     #[test]
-    fn batch_flags_on_an_invocation_with_no_batch_scenario_are_refused() {
-        // `--batch-max-size 50` with `--flow consumer-group` (or on a backend
-        // whose filter drops `consume-batch`) is the parsed-and-dropped defect
-        // at invocation level: the run would exit green having measured
-        // nothing the flag described.
+    fn batch_flags_on_a_selection_without_the_batch_flow_are_refused() {
+        // `--batch-max-size 50` with `--flow consumer-group` is the
+        // parsed-and-dropped defect at invocation level: nothing the
+        // invocation could ever run reads the knob, and the caller can always
+        // fix it (select the flow or drop the flag), so it refuses outright.
         let cli = cli_args(&["--flow", "consumer-group", "--batch-max-size", "50"]);
-        let scenarios = build_scenarios_cg(&cli);
-        let reason = refused_batch_flags(&cli, &scenarios).expect("must refuse a dead batch flag");
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        let reason = refused_batch_flags(&cli, &selected).expect("must refuse a dead batch flag");
         assert!(reason.contains("--batch-max-size"), "{reason}");
         assert!(reason.contains("consume-batch"), "{reason}");
 
-        // The age flag alone is refused the same way.
-        let cli = cli_args(&["--flow", "consumer-group", "--batch-max-age-ms", "99"]);
-        let scenarios = build_scenarios_cg(&cli);
-        assert!(refused_batch_flags(&cli, &scenarios).is_some());
+        // The age flag alone is refused the same way, and the entry point's
+        // default flow (no --flow at all) never includes consume-batch.
+        let cli = cli_args(&["--batch-max-age-ms", "99"]);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        assert!(refused_batch_flags(&cli, &selected).is_some());
 
-        // With the flow present the flags are live; without flags there is
+        // With the flow selected the flags are live; without flags there is
         // nothing to drop.
         let cli = cli_args(&["--flow", "consume-batch", "--batch-max-size", "50"]);
-        let scenarios = build_scenarios_cg(&cli);
-        assert_eq!(refused_batch_flags(&cli, &scenarios), None);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        assert_eq!(refused_batch_flags(&cli, &selected), None);
         let cli = cli_args(&["--flow", "consumer-group"]);
-        let scenarios = build_scenarios_cg(&cli);
-        assert_eq!(refused_batch_flags(&cli, &scenarios), None);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        assert_eq!(refused_batch_flags(&cli, &selected), None);
+    }
+
+    #[test]
+    fn batch_flags_on_a_backend_without_the_flow_are_inert_not_fatal() {
+        // The capability half: consume-batch was selected and the flags are
+        // meaningful, but this backend supplies no batch closure, so the flow
+        // is filtered out (with its own announcement). One flag set must be
+        // able to drive the documented six-binary sweep, so the run continues
+        // — with a note, never silently — instead of dying five times out of
+        // six.
+        let cli = cli_args(&[
+            "--flow",
+            "consume-batch,consumer-group",
+            "--batch-max-size",
+            "50",
+        ]);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        // No refusal: the selection includes the flow.
+        assert_eq!(refused_batch_flags(&cli, &selected), None);
+
+        // A backend with no batch closure drops the flow — note, not None.
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let scenarios =
+            select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        assert!(
+            !scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch),
+            "the closure-less backend kept a batch scenario"
+        );
+        let note =
+            inert_batch_flags_note(&cli, &selected, &scenarios).expect("must note the inert flag");
+        assert!(note.contains("--batch-max-size"), "{note}");
+        assert!(note.contains("inert"), "{note}");
+
+        // A backend that has the closure runs the flow — no note.
+        let hcfg =
+            HarnessConfig::<shove::InMemory>::new("kafka").with_batch_consume(dummy_batch_fn());
+        let scenarios =
+            select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        assert!(scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch));
+        assert_eq!(inert_batch_flags_note(&cli, &selected, &scenarios), None);
+
+        // No flags → nothing to note, whatever the filter did.
+        let bare = cli_args(&["--flow", "consume-batch,consumer-group"]);
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let scenarios =
+            select_scenarios(&bare, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        assert_eq!(inert_batch_flags_note(&bare, &selected, &scenarios), None);
+    }
+
+    #[test]
+    fn select_scenarios_refuses_a_dead_batch_flag_on_both_entry_paths() {
+        // The refusal lives inside the one selection step every entry point
+        // calls, so a runner cannot wire the flows in while forgetting the
+        // guard. Both the group and supervisor paths go through it.
+        let cli = cli_args(&["--flow", "consumer-group", "--batch-max-size", "50"]);
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false)
+            .expect_err("group path must refuse");
+        assert!(err.contains("--batch-max-size"), "{err}");
+
+        let cli = cli_args(&["--flow", "supervisor", "--batch-max-age-ms", "99"]);
+        let hcfg = HarnessConfig::<shove::InMemory>::new("sqs");
+        let err = select_scenarios(&cli, &hcfg, Flow::Supervisor, true)
+            .expect_err("supervisor path must refuse");
+        assert!(err.contains("--batch-max-age-ms"), "{err}");
+    }
+
+    #[test]
+    fn the_batch_age_is_folded_into_the_scenario_deadline() {
+        // With a corpus smaller than the batch size, age is the only flush
+        // trigger, so a run legitimately takes up to the age beyond the
+        // handler-time model. A deadline that ignores the knob turns a legal
+        // `--batch-max-age-ms 120000` into a guaranteed timeout row blamed on
+        // the backend.
+        let age_ms: u64 = 120_000;
+        let with_age = build_scenarios_cg(&cli_args(&[
+            "--flow",
+            "consume-batch",
+            "--batch-max-age-ms",
+            &age_ms.to_string(),
+        ]));
+        let baseline = build_scenarios_cg(&cli_args(&["--flow", "consume-batch"]));
+        for (s, b) in with_age.iter().zip(baseline.iter()) {
+            assert_eq!(
+                s.deadline,
+                b.deadline - Duration::from_millis(250) + Duration::from_millis(age_ms),
+                "the deadline must absorb exactly the configured age"
+            );
+        }
+
+        // Non-batch flows are untouched by the knob's deadline extension —
+        // built without flags because a foreign flow plus a batch flag is the
+        // hard-refusal case, not a runnable invocation.
+        let group = build_scenarios_cg(&cli_args(&["--flow", "consumer-group"]));
+        for s in &group {
+            assert!(
+                s.deadline <= Duration::from_millis(600_000),
+                "a non-batch deadline exceeded the ceiling"
+            );
+        }
     }
 }
