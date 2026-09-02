@@ -1938,6 +1938,22 @@ impl BatchConsumerOptions {
         self
     }
 
+    /// The configured flush size — what [`with_max_batch_size`] set, or the
+    /// default 500.
+    ///
+    /// [`with_max_batch_size`]: Self::with_max_batch_size
+    pub fn max_batch_size(&self) -> usize {
+        self.max_batch_size
+    }
+
+    /// The configured flush age — what [`with_max_batch_age`] set, or the
+    /// default 250 ms.
+    ///
+    /// [`with_max_batch_age`]: Self::with_max_batch_age
+    pub fn max_batch_age(&self) -> Duration {
+        self.max_batch_age
+    }
+
     /// Let `handle_batch` run for as long as it likes.
     ///
     /// For sinks whose flush has no meaningful upper bound. The cost is that a
