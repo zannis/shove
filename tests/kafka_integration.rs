@@ -3098,7 +3098,6 @@ shove::define_topic!(
 #[tokio::test]
 async fn autoscaling_scales_up_and_drains_clean() {
     use shove::AutoscalerConfig;
-    use std::sync::atomic::AtomicUsize;
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -3108,7 +3107,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
         .await
         .unwrap();
 
-    let processed = Arc::new(AtomicUsize::new(0));
+    let processed = WaitableCounter::new();
 
     let mut group = broker.consumer_group();
     {
@@ -3120,7 +3119,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
                 ),
                 move || {
                     #[derive(Clone)]
-                    struct SlowHandler(Arc<AtomicUsize>);
+                    struct SlowHandler(WaitableCounter);
                     impl MessageHandler<AutoscalingTopic> for SlowHandler {
                         type Context = ();
                         async fn handle(
@@ -3130,7 +3129,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
                             _: &(),
                         ) -> Outcome {
                             tokio::time::sleep(Duration::from_millis(200)).await;
-                            self.0.fetch_add(1, Ordering::Relaxed);
+                            self.0.increment();
                             Outcome::Ack
                         }
                     }
@@ -3154,7 +3153,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
     }
 
     // Fast autoscaler config: short poll + hysteresis so scale-up fires
-    // within the first second of the test window.
+    // within the first second after the group gets an assignment.
     let cfg = AutoscalerConfig {
         poll_interval: Duration::from_millis(200),
         scale_up_multiplier: 1.5,
@@ -3163,9 +3162,17 @@ async fn autoscaling_scales_up_and_drains_clean() {
         cooldown_duration: Duration::from_millis(400),
     };
 
-    // Run for 8 s — enough time for autoscaler to scale up and drain the
-    // 20-message backlog through 4 max consumers at 200 ms each.
-    let signal = tokio::time::sleep(Duration::from_millis(8000));
+    // Shut down on the observable — all 20 messages handled — not on a fixed
+    // wall-clock window: on a loaded runner, group join + coordinator
+    // discovery + the first rebalance alone can outlast any "reasonable"
+    // fixed budget (an 8 s window flaked in CI with zero messages handled).
+    // The 60 s ceiling is a failure bound, not the expected duration; once
+    // the group has an assignment the drain itself takes ~1-2 s.
+    let counter = processed.clone();
+    let signal = async move {
+        counter.wait_for(20, Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     let outcome = group
         .enable_autoscaling(cfg)
         .run_until_timeout(signal, Duration::from_secs(15))
@@ -3175,10 +3182,16 @@ async fn autoscaling_scales_up_and_drains_clean() {
         outcome.is_clean(),
         "autoscaling group must drain cleanly; outcome: {outcome:?}"
     );
+    // Scale-up itself is not observable from out here (no public API exposes
+    // the active consumer count — see the note on the inmemory twin of this
+    // test); what the count distinguishes is *why* a drain missed: 0 handled
+    // means the group never obtained an assignment inside the ceiling, while
+    // 1..=19 means it was assigned but drained too slowly.
+    let handled = processed.get();
     assert_eq!(
-        processed.load(Ordering::Relaxed),
-        20,
-        "all 20 published messages must be handled before the group drains"
+        handled, 20,
+        "all 20 published messages must be handled before the group drains \
+         (handled {handled}/20; 0 = never got an assignment, 1-19 = drain stalled)"
     );
 
     broker.close().await;
