@@ -77,7 +77,13 @@ use tokio_util::sync::CancellationToken;
 /// after the fact either — the run that produced it is over — so the version
 /// is what makes the mismatch a loud refusal in [`merge_results_file`] rather
 /// than a silent gap in a merged document.
-pub const RESULTS_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 added `max_batch_size` / `max_batch_age_ms` to every `consume_batch`
+/// row (and to no other flow's rows), for the same non-ignorable reason: the
+/// knobs became configurable, so without them a 50-message-batch row and a
+/// 500-message-batch row are byte-identical, and a v2 batch row cannot be
+/// stamped after the fact — nothing records what its run used.
+pub const RESULTS_SCHEMA_VERSION: u32 = 3;
 
 /// The payload sizes that may appear in `payload_bytes`: 64 B, 1 KiB, 64 KiB.
 pub const PAYLOAD_SIZES: [usize; 3] = [64, 1024, 65536];
@@ -803,7 +809,17 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                             prefetch: cli.prefetch,
                             flow,
                             payload_bytes,
-                            batch_options: None,
+                            // Only the flow with a batch to size carries the
+                            // knobs; stamping a default on any other row
+                            // would claim options a run never had.
+                            batch_options: (flow == Flow::ConsumeBatch).then(|| BatchOptions {
+                                max_batch_size: cli
+                                    .batch_max_size
+                                    .unwrap_or(BatchOptions::default().max_batch_size),
+                                max_batch_age_ms: cli
+                                    .batch_max_age_ms
+                                    .unwrap_or(BatchOptions::default().max_batch_age_ms),
+                            }),
                         });
                     }
                 }
@@ -2174,6 +2190,12 @@ where
         .batch_consume
         .as_ref()
         .ok_or_else(|| "backend supplied no batch_consume closure".to_string())?;
+    // No default here: a batch scenario that lost its options is a harness
+    // bug, and absorbing it would stamp the row with values the run never
+    // used.
+    let batch_options = scenario
+        .batch_options
+        .ok_or_else(|| "consume_batch scenario carries no batch options".to_string())?;
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
@@ -2222,7 +2244,7 @@ where
             recorder.clone(),
             scenario.handler,
         ));
-        drivers.spawn(batch(client.clone(), handler, BatchOptions::default()));
+        drivers.spawn(batch(client.clone(), handler, batch_options));
     }
 
     // A publish failure must still fall through to the teardown below rather
@@ -2742,6 +2764,10 @@ fn detect_hardware() -> Hardware {
 /// `handler_cost` is not what its flow and handler measure must not be
 /// re-signed as a valid results document.
 fn validate_run(run: &BackendRun) -> Result<(), String> {
+    fn fmt_opt<T: fmt::Display>(v: Option<T>) -> String {
+        v.map_or_else(|| "absent".to_string(), |v| v.to_string())
+    }
+
     fn check_row(
         backend: &str,
         kind: &str,
@@ -2796,6 +2822,47 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 r.handler_cost,
                 expected.as_str()
             ));
+        }
+        // Like `handler_cost`, presence is re-derived from the row's own
+        // flow: `consume_batch` is the one flow that runs a sized batch, so
+        // its rows must say which size — the knobs are configurable, and
+        // without them a 50-row and a 500-row are byte-identical — and no
+        // other flow may claim batch knobs its run never had. The values
+        // themselves are free (that is the knob), except zero, which shove's
+        // own builders refuse at construction: a zero row describes a run
+        // that cannot exist.
+        match (flow, r.max_batch_size, r.max_batch_age_ms) {
+            (Flow::ConsumeBatch, Some(size), Some(age)) if size == 0 || age == 0 => {
+                return Err(format!(
+                    "run '{}' has a consume_batch result with a zero batch option \
+                     (max_batch_size {size}, max_batch_age_ms {age}); shove refuses zero at \
+                     construction, so no run can have produced this row",
+                    run.backend,
+                ));
+            }
+            (Flow::ConsumeBatch, Some(_), Some(_)) => {}
+            (Flow::ConsumeBatch, size, age) => {
+                return Err(format!(
+                    "run '{}' has a consume_batch result missing its batch options \
+                     (max_batch_size {}, max_batch_age_ms {}); without them this row is \
+                     indistinguishable from one measured with different knobs",
+                    run.backend,
+                    fmt_opt(size),
+                    fmt_opt(age),
+                ));
+            }
+            (_, None, None) => {}
+            (_, size, age) => {
+                return Err(format!(
+                    "run '{}' has a result for flow '{}' carrying batch options \
+                     (max_batch_size {}, max_batch_age_ms {}) — that flow runs no batch, \
+                     so the row claims knobs its run never had",
+                    run.backend,
+                    r.flow,
+                    fmt_opt(size),
+                    fmt_opt(age),
+                ));
+            }
         }
     }
     for f in &run.failures {
@@ -3202,8 +3269,8 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         consumers: scenario.consumers,
         handler: scenario.handler.to_string(),
         handler_cost: scenario.handler_cost().as_str().to_string(),
-        max_batch_size: None,
-        max_batch_age_ms: None,
+        max_batch_size: scenario.batch_options.map(|o| o.max_batch_size.get()),
+        max_batch_age_ms: scenario.batch_options.map(|o| o.max_batch_age_ms.get()),
         throughput_msg_per_sec: m.throughput,
         dispatch_p50_ms: m.latencies.dispatch_p50,
         dispatch_p95_ms: m.latencies.dispatch_p95,
@@ -3319,8 +3386,22 @@ fn filter_scenarios<B: Backend>(
 /// parsed-and-dropped defect at invocation level — the run would exit green
 /// having measured nothing the flag described.
 fn refused_batch_flags(cli: &Cli, scenarios: &[Scenario]) -> Option<String> {
-    let _ = (cli, scenarios);
-    None
+    let flags: Vec<&str> = [
+        cli.batch_max_size.map(|_| "--batch-max-size"),
+        cli.batch_max_age_ms.map(|_| "--batch-max-age-ms"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if flags.is_empty() || scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch) {
+        return None;
+    }
+    Some(format!(
+        "{} was passed but no consume-batch scenario will run — the knob applies to \
+         nothing. Select the flow (`--flow consume-batch`) on a backend that supports \
+         it, or drop the flag.",
+        flags.join(" / ")
+    ))
 }
 
 /// The default `ConsumerOptions` factory for the `consume_parallel` flow on a
@@ -3337,8 +3418,12 @@ fn announce_scenario(i: usize, total: usize, scenario: &Scenario) {
         .prefetch
         .map(|p| format!(" | pf={p}"))
         .unwrap_or_default();
+    let batch_str = scenario
+        .batch_options
+        .map(|o| format!(" | batch={}msg/{}ms", o.max_batch_size, o.max_batch_age_ms))
+        .unwrap_or_default();
     eprintln!(
-        "[{}/{}] {} | {}B | {} | {}msg | {}c{} | {} ...",
+        "[{}/{}] {} | {}B | {} | {}msg | {}c{}{} | {} ...",
         i + 1,
         total,
         scenario.flow,
@@ -3347,6 +3432,7 @@ fn announce_scenario(i: usize, total: usize, scenario: &Scenario) {
         scenario.messages,
         scenario.consumers,
         prefetch_str,
+        batch_str,
         scenario.handler,
     );
 }
@@ -3383,6 +3469,10 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
         build_scenarios(&cli, Flow::ConsumerGroup, hcfg.fifo_workers),
         false,
     );
+    if let Some(reason) = refused_batch_flags(&cli, &scenarios) {
+        eprintln!("{reason}");
+        std::process::exit(2);
+    }
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -3465,6 +3555,10 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
         build_scenarios(&cli, Flow::Supervisor, hcfg.fifo_workers),
         true,
     );
+    if let Some(reason) = refused_batch_flags(&cli, &scenarios) {
+        eprintln!("{reason}");
+        std::process::exit(2);
+    }
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -4132,8 +4226,9 @@ mod tests {
         merge_results_file(&p, sample_run("redis"), None).expect("first write");
         let v1 = std::fs::read_to_string(&path)
             .expect("read")
-            .replace("\"schema_version\": 2", "\"schema_version\": 1")
+            .replace("\"schema_version\": 3", "\"schema_version\": 1")
             .replace("\"handler_cost\": \"framework\",", "");
+        assert!(v1.contains("\"schema_version\": 1"), "fixture did not take");
         assert!(!v1.contains("handler_cost"), "the v1 fixture still has one");
         std::fs::write(&path, &v1).expect("write v1");
 
@@ -4556,11 +4651,15 @@ mod tests {
         // binary's header by an older binary that ran afterwards.
         let bumped = std::fs::read_to_string(&path)
             .expect("read")
-            .replace("\"schema_version\": 2", "\"schema_version\": 3");
+            .replace("\"schema_version\": 3", "\"schema_version\": 4");
+        assert!(
+            bumped.contains("\"schema_version\": 4"),
+            "fixture did not take"
+        );
         std::fs::write(&path, &bumped).expect("write bumped");
 
         let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
-        assert!(err.contains("v3"), "{err}");
+        assert!(err.contains("v4"), "{err}");
 
         // The refusal must leave the file untouched, not half-written.
         assert_eq!(std::fs::read_to_string(&path).expect("re-read"), bumped);
