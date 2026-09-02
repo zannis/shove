@@ -38,7 +38,10 @@ fn document(runs: &str) -> String {
     )
 }
 
-/// A v4 row with an explicit `handler_cost` marker and setup window.
+/// A v4 row with an explicit `handler_cost` marker.
+///
+/// The extra keys (tier, messages, percentiles, `setup_secs`, …) exist only
+/// to mirror the harness's real output shape; chartgen does not read them.
 fn scenario_with_cost(
     flow: &str,
     mode: &str,
@@ -46,7 +49,6 @@ fn scenario_with_cost(
     consumers: u32,
     throughput: f64,
     handler_cost: &str,
-    setup_secs: &str,
 ) -> String {
     // Since v3 every `consume_batch` row carries its batch knobs, and no
     // other flow's row may carry them.
@@ -61,7 +63,7 @@ fn scenario_with_cost(
           "tier": "moderate", "messages": 5000, "consumers": {consumers},
           "handler": "zero (no-op)",
           "handler_cost": "{handler_cost}",
-          "setup_secs": {setup_secs},
+          "setup_secs": 0.4,
           {batch_knobs}
           "throughput_msg_per_sec": {throughput},
           "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
@@ -77,12 +79,12 @@ fn scenario_with_cost(
 /// `dlq_drain`, `autoscaler`) carry `setup_bound`, everything else is a
 /// `framework` row with a separated window.
 fn scenario(flow: &str, mode: &str, payload: u64, consumers: u32, throughput: f64) -> String {
-    let (cost, setup) = match flow {
-        "publish_single" | "publish_batch" => ("no_handler", "null"),
-        "consume_fifo" | "dlq_drain" | "autoscaler" => ("setup_bound", "null"),
-        _ => ("framework", "0.4"),
+    let cost = match flow {
+        "publish_single" | "publish_batch" => "no_handler",
+        "consume_fifo" | "dlq_drain" | "autoscaler" => "setup_bound",
+        _ => "framework",
     };
-    scenario_with_cost(flow, mode, payload, consumers, throughput, cost, setup)
+    scenario_with_cost(flow, mode, payload, consumers, throughput, cost)
 }
 
 /// An in-process run covering the slices every chart family reads.
@@ -196,8 +198,7 @@ fn an_unknown_handler_cost_is_rejected_and_blocks_every_chart() {
             1024,
             1,
             10_000.0,
-            "warp_speed",
-            "0.4"
+            "warp_speed"
         )
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
@@ -263,8 +264,7 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
             1024,
             1,
             424_242.0,
-            "setup_bound",
-            "null"
+            "setup_bound"
         ),
         scenario_with_cost(
             "consume_parallel",
@@ -272,8 +272,7 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
             64,
             1,
             434_343.0,
-            "setup_bound",
-            "null"
+            "setup_bound"
         )
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
@@ -357,8 +356,7 @@ fn a_sleeping_handler_row_never_reaches_a_throughput_chart() {
             1024,
             1,
             30_000.0,
-            "framework",
-            "0.4"
+            "framework"
         ),
         scenario_with_cost(
             "consume_parallel",
@@ -366,8 +364,7 @@ fn a_sleeping_handler_row_never_reaches_a_throughput_chart() {
             1024,
             1,
             9_876_543.0,
-            "handler_bound",
-            "0.4"
+            "handler_bound"
         )
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
@@ -529,8 +526,10 @@ fn a_supported_but_unmeasured_flow_is_named_not_dropped() {
     )
     .expect("chart should render");
 
+    // Slice-scoped on purpose: "not measured in this run" was a false claim
+    // for a flow measured at coordinates outside the chart's slice.
     assert!(
-        svg.contains("not measured in this run"),
+        svg.contains("no number in this slice"),
         "supported-but-unmeasured flows are dropped without a word"
     );
     assert!(
@@ -743,7 +742,7 @@ fn charts_paint_no_background_and_no_near_black_ink() {
 // ── Layout: nothing may run off the canvas ──────────────────────────────────
 
 /// Every `<text>` in the file, as (x, y, font-size, content).
-fn texts(svg: &str) -> Vec<(i32, i32, f64, String)> {
+fn texts(svg: &str) -> Vec<(f64, f64, f64, String)> {
     let mut out = Vec::new();
     for chunk in svg.split("<text ").skip(1) {
         let Some(end) = chunk.find("</text>") else {
@@ -757,8 +756,18 @@ fn texts(svg: &str) -> Vec<(i32, i32, f64, String)> {
             let stop = rest.find('"')?;
             rest.get(..stop).map(str::to_string)
         };
-        let x = attr("x").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
-        let y = attr("y").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+        // f64 with a loud failure: an unparseable coordinate silently
+        // becoming 0 would vacuously pass every overflow assertion built on
+        // this helper.
+        let parse_coord = |v: Option<String>| -> f64 {
+            v.map(|v| {
+                v.parse::<f64>()
+                    .unwrap_or_else(|_| panic!("unparseable coordinate {v:?}"))
+            })
+            .unwrap_or(0.0)
+        };
+        let x = parse_coord(attr("x"));
+        let y = parse_coord(attr("y"));
         let size = attr("font-size")
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
@@ -792,18 +801,18 @@ fn no_text_runs_off_the_canvas() {
     for (family, svg) in render_all(&doc) {
         for (x, y, size, content) in texts(&svg) {
             assert!(
-                (0..=560).contains(&y),
+                (0.0..=560.0).contains(&y),
                 "{family:?}: text baseline y={y} is outside the canvas: {content:?}"
             );
             // A start-anchored run of text must end inside the canvas. 0.55em
             // per character over-estimates a proportional face, so this is the
             // conservative direction.
             let width = content.chars().count() as f64 * size * 0.55;
-            if x == 24 {
+            if x == 24.0 {
                 assert!(
-                    x as f64 + width <= 960.0,
+                    x + width <= 960.0,
                     "{family:?}: text runs to {:.0}px, past the 960px edge: {content:?}",
-                    x as f64 + width
+                    x + width
                 );
             }
         }
@@ -1280,18 +1289,11 @@ fn the_legend_never_leaves_the_canvas() {
     )));
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
         .expect("chart should render");
-    for line in svg.lines().filter(|l| l.contains("<text")) {
-        if let Some(x) = line
-            .split("x=\"")
-            .nth(1)
-            .and_then(|r| r.split('\"').next())
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            assert!(
-                x < 960.0,
-                "a text element starts beyond the canvas edge (x={x}): {line}"
-            );
-        }
+    for (x, _, _, content) in texts(&svg) {
+        assert!(
+            x < 960.0,
+            "a text element starts beyond the canvas edge (x={x}): {content}"
+        );
     }
 }
 
@@ -1309,17 +1311,159 @@ fn an_unbreakable_token_in_a_reason_is_split_not_overflowed() {
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
     let svg =
         chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
-    for line in svg.lines().filter(|l| l.contains("<text")) {
-        let text = line
-            .split('>')
-            .nth(1)
-            .and_then(|r| r.split('<').next())
-            .unwrap_or("");
+    for (_, _, _, content) in texts(&svg) {
         assert!(
-            text.chars().count() <= 120,
-            "a caption line was not wrapped ({} chars): {text}",
-            text.chars().count()
+            content.chars().count() <= 120,
+            "a caption line was not wrapped ({} chars): {content}",
+            content.chars().count()
         );
+    }
+}
+
+// ── Round-5 guards ───────────────────────────────────────────────────────────
+
+#[test]
+fn the_document_level_failure_count_reaches_every_caption() {
+    // Failures in flows no family charts (the committed broadcast timeouts)
+    // must not be invisible on every published artifact.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}],
+          "failures": [{{
+            "flow": "broadcast", "mode": "parallel", "payload_bytes": 65536,
+            "tier": "moderate", "messages": 5000, "consumers": 8,
+            "handler": "zero (no-op)", "error": "timeout after 60s"
+          }}],
+          "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    for (family, svg) in render_all(&doc) {
+        assert!(
+            svg.contains("1 recorded failure(s) in the dataset"),
+            "{family:?} hides the document-level failure count"
+        );
+    }
+}
+
+#[test]
+fn an_unsupported_entry_without_a_reason_is_rejected() {
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_batch", "reason": "  " }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("without a reason"), "{what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_flow_both_measured_and_declared_unsupported_is_rejected() {
+    // A document contradicting itself would render the bar while the
+    // declaration silently vanished.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_parallel", "reason": "declared and measured" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("carries measured rows"), "{what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_line_never_bridges_a_category_with_no_publishable_value() {
+    // kafka has framework rows at 64 B and 64 KiB and a setup-bound 1 KiB
+    // between them: a single polyline would assert an interpolated value at
+    // exactly the withheld category.
+    let rows = format!(
+        "{},{},{}",
+        scenario("consume_parallel", "parallel", 64, 1, 50_000.0),
+        scenario_with_cost(
+            "consume_parallel",
+            "parallel",
+            1024,
+            1,
+            57_800.0,
+            "setup_bound"
+        ),
+        scenario("consume_parallel", "parallel", 65536, 1, 8_000.0)
+    );
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{rows}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ThroughputVsPayload).expect("chart should render");
+    // Three categories sit ~316px apart; a segment bridging the withheld
+    // middle category spans two steps (~630px). No polyline segment may span
+    // more than one category step.
+    for chunk in svg.split("<polyline").skip(1) {
+        let Some(points) = chunk
+            .split("points=\"")
+            .nth(1)
+            .and_then(|r| r.split('\"').next())
+        else {
+            continue;
+        };
+        let xs: Vec<f64> = points
+            .split_whitespace()
+            .filter_map(|p| p.split(',').next())
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        for pair in xs.windows(2) {
+            assert!(
+                (pair[1] - pair[0]).abs() < 400.0,
+                "a polyline segment bridges a withheld category: {points}"
+            );
+        }
+    }
+    assert!(
+        svg.contains("partial — setup-bound cells"),
+        "the withheld cell must still be named in the caption"
+    );
+}
+
+#[test]
+fn a_subnormal_throughput_cannot_render_a_corrupt_overhead_chart() {
+    // 1e9 / 1e-300 = +inf: an infinite axis maps every coordinate to NaN and
+    // plotters completes the render — a clean-exiting corrupt SVG.
+    let raw = document(&inmemory_run(true)).replace(
+        r#""throughput_msg_per_sec": 50000"#,
+        r#""throughput_msg_per_sec": 1e-300"#,
+    );
+    let doc = parse(&raw);
+    if chartgen::validate(&doc).is_err() {
+        // Fine too — rejected before any render.
+        return;
+    }
+    for family in Family::ALL {
+        if let Ok(svg) = chartgen::render_to_string(&doc, family) {
+            assert!(
+                !svg.contains("NaN"),
+                "{family:?} rendered NaN coordinates from a subnormal throughput"
+            );
+        }
     }
 }
 

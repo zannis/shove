@@ -45,9 +45,15 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt -- --check
+<<<<<<< Updated upstream
       # `--all-targets` so tests/benches/examples are type-checked and linted
       # too. Without it clippy only sees the lib, and a `tests/` file gated on a
       # feature no coverage entry enables can rot silently.
+=======
+      # `--all-targets` so tests, benches and examples are linted too. Without
+      # it clippy sees only the lib, and a test file behind a feature no other
+      # job enables can stop compiling without CI noticing.
+>>>>>>> Stashed changes
       - run: cargo clippy -q --all-features --all-targets -- -D warnings
       - run: cargo clippy -q --no-default-features --all-targets -- -D warnings
       - run: cargo test --no-default-features
@@ -177,6 +183,7 @@ jobs:
             # kafka-msk-iam + test-support compile and run the MSK IAM tests,
             # including the OAUTHBEARER admin integration test (local Kafka
             # container + unsecured JWT; no AWS/LocalStack needed).
+<<<<<<< Updated upstream
             # `metrics` asserted by `metrics_kafka_failall` and
             # `metrics_kafka_failall_no_dlq`.
             # `env-config` runs the `KafkaTopicTuning` tests.
@@ -208,21 +215,46 @@ jobs:
             # consumer. The job was green because it ran 13 tests, not because
             # those 31 passed.
             filter: -E 'binary(/^kafka_schema_registry/) + test(/^schema_registry::/)'
+=======
+            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,sbe
+          - name: kafka-schema-registry
+            # Its own leg rather than extra features on `kafka`: the suites
+            # stand up cp-kafka + cp-schema-registry (slow JVM startup) and a
+            # Redpanda container, so running them in parallel with the `kafka`
+            # leg keeps either one's wall clock bounded. `protobuf` is required
+            # for the ProtobufCodec scenarios in these files.
+            features: kafka,kafka-schema-registry,protobuf
+            # Restrict to the schema-registry binaries; enabling `kafka` here
+            # would otherwise re-run the whole Kafka suite the `kafka` leg
+            # already covers. The three suites use distinct fixed host ports
+            # (cp 29092/18082, Redpanda 19092/18081) so they are safe to run
+            # concurrently under the default nextest runner.
+            filter: -E 'binary(/^kafka_schema_registry/)'
+>>>>>>> Stashed changes
           - name: redis-streams
             # Asserted by `metrics_redis_sequenced`, `metrics_redis_malformed`,
             # `metrics_redis_failall` and `metrics_redis_failall_no_dlq`.
             features: redis-streams,metrics,sbe
     steps:
+<<<<<<< Updated upstream
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+=======
+      - uses: actions/checkout@v6
+>>>>>>> Stashed changes
       - if: startsWith(matrix.name, 'kafka')
         run: sudo apt-get update && sudo apt-get install -y librdkafka-dev libsasl2-dev
       - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo install -q cargo-llvm-cov cargo-nextest --locked
+<<<<<<< Updated upstream
       # `matrix.filter` is unset for every entry but kafka-schema-registry,
       # where it expands to empty and the full suite runs as before.
       - run: cargo llvm-cov nextest --features ${{ matrix.features }} ${{ matrix.filter }} --lcov --output-path lcov.info
       - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+=======
+      - run: cargo llvm-cov nextest --features ${{ matrix.features }} ${{ matrix.filter }} --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+>>>>>>> Stashed changes
         with:
           use_oidc: true
           slug: ${{ github.repository }}

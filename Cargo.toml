@@ -12,14 +12,15 @@ documentation = "https://docs.rs/shove"
 keywords = ["messaging", "rabbitmq", "pubsub", "consumer-groups", "autoscaling"]
 categories = ["asynchronous"]
 
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
+# This list must live in [package] to have any packaging effect: it
+# previously sat below the docs.rs metadata table header, where TOML scoped
+# it to that table and cargo silently ignored it — the docs site and repo
+# tooling shipped in the crate despite it.
 exclude = [
   "docs/",
   "benches/results/",
   "tests/chartgen.rs",
+  ".pr-body.md",
   "package.json",
   "package-lock.json",
   "tsconfig.json",
@@ -30,6 +31,10 @@ exclude = [
   ".github/workflows/docs-preview.yml",
   "node_modules/",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.clippy]
 absolute-paths = "deny"

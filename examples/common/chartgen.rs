@@ -5,9 +5,9 @@
 //!
 //! This module is the library half of `examples/chartgen.rs`; the example is a
 //! thin CLI over it. It is pulled in with `#[path]` from two targets — the
-//! example, and `tests/chartgen.rs`, which is what actually runs the
-//! `#[cfg(test)]` module below. Cargo defaults `[[example]]` targets to
-//! `test = false`, so tests living only in the example would never execute.
+//! example, and `tests/chartgen.rs`, which holds the test functions. Cargo
+//! defaults `[[example]]` targets to `test = false`, so tests living in the
+//! example target would never execute.
 //!
 //! ## Output must be byte-deterministic
 //!
@@ -173,12 +173,11 @@ pub struct BackendRun {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Broker {
+    /// The only broker field the charts read: it names the deployment in the
+    /// shape-only caveat. The writer's version/deployment fields stay in the
+    /// document for provenance but are not consumed here.
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub deployment: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -454,6 +453,29 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                 return malformed("a non-batch row carries batch knobs");
             }
         }
+        // The unsupported[] invariants the writer also enforces: a blank
+        // reason renders an unexplained absence, and a flow both measured
+        // and declared unsupported is a document contradicting itself — the
+        // bar would render while the declaration silently vanished. (An
+        // *unknown* flow name is deliberately tolerated: a future additive
+        // flow may be declared before this reader learns its name.)
+        for u in &run.unsupported {
+            if u.reason.trim().is_empty() {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: u.flow.clone(),
+                    what: "declared unsupported without a reason".to_string(),
+                });
+            }
+            if run.results.iter().any(|r| r.flow == u.flow) {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: u.flow.clone(),
+                    what: "declared unsupported but carries measured rows for the same flow"
+                        .to_string(),
+                });
+            }
+        }
         if !run.results.is_empty() {
             continue;
         }
@@ -531,8 +553,9 @@ impl Family {
         Family::FrameworkOverhead,
     ];
 
-    /// The filenames are a contract with the docs and README that embed them;
-    /// they are pinned in the `chart-manifest` document and must not drift.
+    /// The filenames are deliberately stable: the docs and README pages that
+    /// embed these charts reference them by name, so a rename here is a
+    /// breaking change to those pages, not a refactor.
     pub fn filename(self) -> &'static str {
         match self {
             Self::ThroughputVsConsumers => "throughput-vs-consumers.svg",
@@ -722,7 +745,7 @@ fn unsupported_reason(run: &BackendRun, flow: &str) -> Option<String> {
 /// Two lines of provenance, rendered into every chart. A chart without a date
 /// is the problem this whole thing exists to fix, so this is not optional and
 /// not per-family.
-fn provenance(doc: &Document) -> (String, String) {
+fn provenance(doc: &Document) -> Vec<String> {
     let first = format!(
         "Generated {} — shove {} — {}",
         doc.generated_at, doc.shove_version, doc.hardware.label
@@ -758,11 +781,26 @@ fn provenance(doc: &Document) -> (String, String) {
         let joined = handlers.into_iter().collect::<Vec<_>>().join(", ");
         parts.push(format!("handler: {joined}"));
     }
-    (first, parts.join(" — "))
+    // The document-level failure count. Per-slice captions name failures a
+    // chart lost cells to, but a failure in a flow no family charts (the
+    // committed document's broadcast timeouts, for instance) would otherwise
+    // be invisible on every published artifact — silence indistinguishable
+    // from a clean run.
+    let mut lines = vec![first, parts.join(" — ")];
+    let failed: usize = doc.runs.iter().map(|r| r.failures.len()).sum();
+    if failed > 0 {
+        lines.push(format!(
+            "{failed} recorded failure(s) in the dataset — see failures[]"
+        ));
+    }
+    lines.retain(|l| !l.is_empty());
+    lines
 }
 
 fn fmt_count(v: f64) -> String {
-    if v >= 1_000_000.0 {
+    // 999,500+ rounds to "1000k" in the k branch; hand it to the M branch
+    // instead so an axis tick never reads "1000k".
+    if v >= 999_500.0 {
         format!("{:.1}M", v / 1_000_000.0)
     } else if v >= 1_000.0 {
         format!("{:.0}k", v / 1_000.0)
@@ -813,8 +851,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             for chunk in chars.chunks(width) {
                 lines.push(chunk.iter().collect());
             }
-            // The last chunk starts a fresh line rather than being joined
-            // onto by the next word, keeping the split purely mechanical.
+            // The final chunk becomes the current line, so a following
+            // word may join it when it fits — only the full-width chunks
+            // are committed as lines.
             if let Some(last) = lines.pop() {
                 current = last;
             }
@@ -862,11 +901,9 @@ fn frame<'b>(
     root.draw_text(subtitle, &ink(LABEL_PX), (GUTTER, 48))
         .map_err(render)?;
 
-    let (line1, line2) = provenance(doc);
     let mut footer: Vec<String> = notes.iter().flat_map(|n| wrap(n, NOTE_WRAP)).collect();
-    footer.extend(wrap(&line1, NOTE_WRAP));
-    if !line2.is_empty() {
-        footer.extend(wrap(&line2, NOTE_WRAP));
+    for line in provenance(doc) {
+        footer.extend(wrap(&line, NOTE_WRAP));
     }
 
     // Lay the block out upward from a fixed bottom, so the last baseline plus
@@ -902,9 +939,14 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
     let mut notes = Vec::new();
     for (backend, presence) in presences {
         match presence {
-            Presence::Unsupported(reason) => {
-                notes.push(format!("{backend}: {}", unsupported_text(reason)))
-            }
+            // The document's own reason, verbatim, with no prefix of ours:
+            // the harness's capability holes are self-describing ("SQS does
+            // not implement HasCoordinatedGroups…"), and a hand-declared
+            // entry whose reason says "not measured in this document" must
+            // not be promoted into a "not supported" library claim by
+            // caption prose. The axis n/s marker is the rule-3 marker; the
+            // reason carries the classification.
+            Presence::Unsupported(reason) => notes.push(format!("{backend}: {reason}")),
             // Deliberately NOT "not supported": this variant means the
             // capability exists and this document simply carries no row for
             // the slice. Publishing it as a capability hole would be a false
@@ -927,18 +969,6 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
         }
     }
     notes
-}
-
-/// The caption text for a flow declared in `unsupported[]`: the document's
-/// own reason, verbatim, with no prefix of ours. The harness's capability
-/// holes are self-describing ("SQS does not implement HasCoordinatedGroups
-/// …", "run_batch is implemented only for the Kafka backend …"), and a
-/// hand-declared entry whose reason says "not measured in this document"
-/// must not be promoted into a "not supported" claim about the library by
-/// caption prose — the axis `n/s` marker is the rule-3 marker; the reason
-/// carries the classification.
-fn unsupported_text(reason: &str) -> String {
-    reason.to_string()
 }
 
 /// The shared "supported but absent" caption text — a claim about the run,
@@ -998,6 +1028,29 @@ where
         Some(a) if a.throughput_msg_per_sec >= r.throughput_msg_per_sec => Some(a),
         _ => Some(r),
     })
+}
+
+/// Split a sorted point series into runs of *adjacent* category indices.
+///
+/// A line segment drawn across a missing category asserts an interpolated
+/// value at exactly the x where no publishable number exists (the committed
+/// kafka payload sweep had framework rows at 64 B and 64 KiB with a
+/// setup-bound 1 KiB between them — the bridging segment read as ~30k msg/s
+/// off an absolute axis). Only adjacent categories may be connected; a gap
+/// breaks the line, and the dots carry the isolated points.
+fn contiguous_runs(points: &[(f64, f64)]) -> Vec<&[(f64, f64)]> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for i in 1..points.len() {
+        if points[i].0 - points[i - 1].0 > 1.5 {
+            runs.push(&points[start..i]);
+            start = i;
+        }
+    }
+    if start < points.len() {
+        runs.push(&points[start..]);
+    }
+    runs
 }
 
 /// The absolute y-range, taken only from series that are safe to publish.
@@ -1330,9 +1383,11 @@ fn line_chart(
         let colour = backend_colour(backend);
         match presence {
             Presence::Absolute { points, .. } => {
-                chart
-                    .draw_series(LineSeries::new(points.iter().copied(), stroke(colour, 3)))
-                    .map_err(render)?;
+                for run_pts in contiguous_runs(points) {
+                    chart
+                        .draw_series(LineSeries::new(run_pts.iter().copied(), stroke(colour, 3)))
+                        .map_err(render)?;
+                }
                 let dot = ShapeStyle {
                     color: colour.to_rgba(),
                     filled: true,
@@ -1350,14 +1405,17 @@ fn line_chart(
             }
             Presence::ShapeOnly(points) => {
                 // Fractions mapped onto the visible box: the curve's shape is
-                // preserved, the magnitude is not recoverable.
+                // preserved, the magnitude is not recoverable. Gaps break the
+                // line here too — a bridged gap fabricates shape.
                 let mapped: Vec<(f64, f64)> = points
                     .iter()
                     .map(|(x, f)| (*x, y_lo + (y_hi - y_lo) * f))
                     .collect();
-                chart
-                    .draw_series(LineSeries::new(mapped.iter().copied(), stroke(colour, 2)))
-                    .map_err(render)?;
+                for run_pts in contiguous_runs(&mapped) {
+                    chart
+                        .draw_series(LineSeries::new(run_pts.iter().copied(), stroke(colour, 2)))
+                        .map_err(render)?;
+                }
                 legend.push((format!("{backend} (shape only)"), colour));
             }
             Presence::Unsupported(_) | Presence::NotMeasured | Presence::SetupBoundOnly => {}
@@ -1435,6 +1493,15 @@ fn bar_chart(
     let mut peak = 0.0f64;
     for g in groups.iter().filter(|g| !g.shape_only) {
         for b in g.bars.iter().flatten() {
+            if !b.value.is_finite() {
+                // A subnormal throughput turns 1e9/tp into +inf; an infinite
+                // axis maps every coordinate to NaN and the render completes
+                // as a clean-looking corrupt SVG. Refuse loudly instead.
+                return Err(ChartError::Render(format!(
+                    "group `{}` holds a non-finite bar value",
+                    g.label
+                )));
+            }
             if b.value > peak {
                 peak = b.value;
             }
@@ -1674,10 +1741,9 @@ fn render_parallel_vs_sequenced(
                     // Explain the n/s marker: the declared capability hole
                     // when the document names one, and a supported-but-absent
                     // gap otherwise — never "not supported" for a mere gap.
-                    let text = match unsupported_reason(run, flow) {
-                        Some(reason) => unsupported_text(&reason),
-                        None => gap_text().to_string(),
-                    };
+                    // Verbatim reason, no prefix — see notes_for.
+                    let text =
+                        unsupported_reason(run, flow).unwrap_or_else(|| gap_text().to_string());
                     missing
                         .entry((mi, text))
                         .or_default()
@@ -1825,7 +1891,7 @@ fn render_dispatch_latency(
         root,
         doc,
         Family::DispatchLatency.title(),
-        "no publishable measurement in this document — see caption",
+        "v4's dispatch percentiles are not publishable as latency — see caption",
         &notes,
     )?;
     root.draw_text(
@@ -1861,30 +1927,45 @@ fn render_framework_overhead(
     let mut notes = Vec::new();
     let mut unmeasured: Vec<&str> = Vec::new();
     let mut setup_bound: Vec<&str> = Vec::new();
+    let mut pinned_workers: Vec<String> = Vec::new();
     for flow in KNOWN_FLOWS {
-        let in_slice = |r: &&ScenarioResult| {
-            r.flow == *flow
-                && r.payload_bytes == OVERHEAD_PAYLOAD
-                && r.consumers == BASE_CONSUMERS
-                && r.throughput_msg_per_sec > 0.0
-        };
+        // Each flow is charted at its own least-parallel measurement, the
+        // same policy as family 3: fifo pins its workers to the shard count,
+        // so requiring the global BASE_CONSUMERS here mislabelled a flow
+        // measured in every run as "not measured". Non-1 counts are named.
+        let in_flow = |r: &&ScenarioResult| r.flow == *flow && r.payload_bytes == OVERHEAD_PAYLOAD;
         // "What shove itself costs" is only what the marker certifies as
         // shove: a drain-windowed framework row, or a publish row (no handler
         // exists to contaminate it). A setup-bound row would *over-state* the
         // cost — ns/msg is the reciprocal of an under-stated rate — so those
         // flows are named in the caption instead of charted too high.
-        // Best observed cost per message — the highest throughput, since
-        // ns/msg is its reciprocal: the floor is the framework's own cost,
-        // anything above it is scheduling noise.
-        let measured = best_by_throughput(
-            run.results
-                .iter()
-                .filter(in_slice)
-                .filter(|r| r.is_framework() || r.handler_cost == COST_NO_HANDLER),
-        );
+        let publishable =
+            |r: &&ScenarioResult| r.is_framework() || r.handler_cost == COST_NO_HANDLER;
+        let min_workers = run
+            .results
+            .iter()
+            .filter(in_flow)
+            .filter(publishable)
+            .map(|r| r.consumers)
+            .min();
+        // Best observed cost per message at that worker count — the highest
+        // throughput, since ns/msg is its reciprocal: the floor is the
+        // framework's own cost, anything above it is scheduling noise.
+        let measured = min_workers.and_then(|min| {
+            best_by_throughput(
+                run.results
+                    .iter()
+                    .filter(in_flow)
+                    .filter(publishable)
+                    .filter(|r| r.consumers == min),
+            )
+        });
 
         match measured {
             Some(row) => {
+                if row.consumers != BASE_CONSUMERS {
+                    pinned_workers.push(format!("{flow} at {} workers", row.consumers));
+                }
                 // A published batch number states its knobs (non-ignorable
                 // since v3): without them the bar has no stated batch size.
                 if let (Some(size), Some(age)) = (row.max_batch_size, row.max_batch_age_ms) {
@@ -1901,7 +1982,7 @@ fn render_framework_overhead(
             None if run
                 .results
                 .iter()
-                .filter(in_slice)
+                .filter(in_flow)
                 .any(|r| r.is_setup_bound()) =>
             {
                 setup_bound.push(flow);
@@ -1913,7 +1994,7 @@ fn render_framework_overhead(
                         bars: vec![None],
                         shape_only: false,
                     });
-                    notes.push(format!("{flow}: {}", unsupported_text(&reason)));
+                    notes.push(format!("{flow}: {reason}"));
                 }
                 // Neither measured nor declared. Inventing a column would
                 // imply a capability hole that does not exist, but dropping it
@@ -1932,9 +2013,34 @@ fn render_framework_overhead(
         ));
     }
     if !unmeasured.is_empty() {
+        // Slice-scoped on purpose: "not measured in this run" would be a
+        // false claim for a flow measured at coordinates outside this
+        // chart's slice.
         notes.push(format!(
-            "not measured in this run (supported, no number here): {}",
+            "no number in this slice (supported — a gap, not a capability \
+             hole): {}",
             unmeasured.join(", ")
+        ));
+    }
+    if !pinned_workers.is_empty() {
+        notes.push(format!(
+            "measured at a pinned worker count: {}",
+            pinned_workers.join(", ")
+        ));
+    }
+    // A flow outside KNOWN_FLOWS would fall out of the column loop above and
+    // vanish without a bar or a word — name it instead, the same additive
+    // tolerance family 3 applies to unknown modes.
+    let unknown_flows: BTreeSet<&str> = run
+        .results
+        .iter()
+        .filter(|r| r.payload_bytes == OVERHEAD_PAYLOAD && !KNOWN_FLOWS.contains(&r.flow.as_str()))
+        .map(|r| r.flow.as_str())
+        .collect();
+    if !unknown_flows.is_empty() {
+        notes.push(format!(
+            "measured but not charted here (flow unknown to this chart): {}",
+            unknown_flows.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
 
