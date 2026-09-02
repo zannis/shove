@@ -6009,16 +6009,22 @@ async fn publisher_single_channel_pool_does_not_serialize_concurrent_publishes()
 /// Autoscaling lifecycle via the generic `ConsumerGroup::enable_autoscaling` API.
 ///
 /// Exercises:
-/// - `HasCoordinatedGroups::spawn_autoscaler` for RabbitMQ (infallible bridge path)
-/// - `RabbitMqConsumerGroup::retiring` drain path after scale-down — via the
-///   post-drain linger, when the autoscaler scales back down over an empty
-///   queue (exercised, not asserted)
-/// - Clean drain: all published messages processed, no DLQ messages
+/// - `HasCoordinatedGroups::spawn_autoscaler` for RabbitMQ (infallible bridge
+///   path) and its scale-up decision over real management-API stats
+/// - Clean drain: every published message handled (distinct-body count
+///   reaches 20) with a bounded redelivery allowance; DLQ contents are not
+///   inspected here
+///
+/// Scale-down and the `RabbitMqConsumerGroup::retiring` drain are pinned by
+/// that module's own `scale_down_*` unit tests (e.g.
+/// `scale_down_handle_is_drained_not_detached`) rather than exercised here:
+/// the management API's stats refresh lag — the reason for the pre-run sleep
+/// below — makes any bounded post-drain wait for ScaleDown load-sensitive,
+/// which is the defect class this test was rewritten to remove.
 #[tokio::test]
 async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     let ctx = TestContext::new().await;
 
@@ -6033,16 +6039,17 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
         .unwrap();
 
     // AMQP is at-least-once (a consumer cancelled by scale-down requeues its
-    // unacked in-flight delivery), so count distinct message bodies rather
+    // unacked in-flight delivery), so gate on distinct message bodies rather
     // than deliveries: a raw delivery counter could both overshoot 20 and
     // trip the shutdown signal on 20 - K distinct + K duplicate deliveries.
+    // The raw count is still recorded to bound redelivery below.
     let seen = Arc::new(StdMutex::new(HashSet::new()));
-    let distinct = Arc::new(AtomicUsize::new(0));
+    let deliveries = Arc::new(AtomicU32::new(0));
 
     let mut group = broker.consumer_group();
     {
         let seen = seen.clone();
-        let distinct = distinct.clone();
+        let deliveries = deliveries.clone();
         group
             .register::<ConsumerGroupAutoscalingTopic, _>(
                 ConsumerGroupConfig::new(
@@ -6052,7 +6059,7 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
                     #[derive(Clone)]
                     struct SlowHandler {
                         seen: Arc<StdMutex<HashSet<String>>>,
-                        distinct: Arc<AtomicUsize>,
+                        deliveries: Arc<AtomicU32>,
                     }
                     impl MessageHandler<ConsumerGroupAutoscalingTopic> for SlowHandler {
                         type Context = ();
@@ -6063,15 +6070,14 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
                             _: &(),
                         ) -> Outcome {
                             tokio::time::sleep(Duration::from_millis(200)).await;
-                            if self.seen.lock().unwrap().insert(msg.body) {
-                                self.distinct.fetch_add(1, Ordering::Relaxed);
-                            }
+                            self.deliveries.fetch_add(1, Ordering::Relaxed);
+                            self.seen.lock().unwrap().insert(msg.body);
                             Outcome::Ack
                         }
                     }
                     SlowHandler {
                         seen: seen.clone(),
-                        distinct: distinct.clone(),
+                        deliveries: deliveries.clone(),
                     }
                 },
             )
@@ -6107,22 +6113,20 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
     // management-API lag the pre-sleep above absorbs can outlast any
     // "reasonable" fixed budget (the Kafka twin flaked in CI exactly this
     // way). The 60 s ceiling is a failure bound, not the expected duration.
-    let drained_in_time = Arc::new(AtomicBool::new(false));
+    // The count is checked before the deadline each pass, so a success landing
+    // in the final poll interval still registers; `at_ceiling` samples the
+    // count when the signal ends, so a straggler handled during the shutdown
+    // drain below cannot blur which side of the ceiling the drain finished on.
+    let at_ceiling = Arc::new(AtomicU32::new(0));
     let signal = {
-        let distinct = distinct.clone();
-        let drained_in_time = drained_in_time.clone();
+        let seen = seen.clone();
+        let at_ceiling = at_ceiling.clone();
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            while tokio::time::Instant::now() < deadline {
-                if distinct.load(Ordering::Relaxed) >= 20 {
-                    drained_in_time.store(true, Ordering::Relaxed);
-                    // Post-drain linger: with the queue empty the autoscaler's
-                    // next poll (300 ms) + hysteresis (300 ms) fires ScaleDown,
-                    // pushing consumers through the retiring drain path this
-                    // test's doc claims to exercise. In-process timers plus one
-                    // management-API poll, so 2 s is slack, not a
-                    // load-sensitive gate.
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+            loop {
+                let n = seen.lock().unwrap().len();
+                if n >= 20 || tokio::time::Instant::now() >= deadline {
+                    at_ceiling.store(n as u32, Ordering::SeqCst);
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -6136,16 +6140,25 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
 
     // Count first, cleanliness second: on the no-delivery failure path the
     // handled count is the diagnostic and an unclean shutdown in that same
-    // state must not mask it.
-    let handled = distinct.load(Ordering::Relaxed);
+    // state must not mask it (the outcome rides along in the message).
+    let reached = at_ceiling.load(Ordering::SeqCst);
+    let handled = seen.lock().unwrap().len();
     assert!(
-        drained_in_time.load(Ordering::Relaxed),
+        reached >= 20,
         "all 20 published messages must be handled within the 60 s ceiling \
-         (handled {handled}/20; 0 = never started consuming, 1-19 = drain stalled)"
+         (distinct handled: {reached}/20 at the ceiling, {handled}/20 after \
+         the shutdown drain; 0 at the ceiling = the group never started \
+         consuming, 1-19 = the drain stalled; outcome: {outcome:?})"
     );
     assert!(
         outcome.is_clean(),
         "autoscaling group must drain cleanly (handled {handled}/20); outcome: {outcome:?}"
+    );
+    let total = deliveries.load(Ordering::Relaxed);
+    assert!(
+        total <= 40,
+        "{total} deliveries for 20 published messages — at-least-once \
+         tolerates a few requeue redeliveries, not systematic redelivery"
     );
 
     broker.close().await;

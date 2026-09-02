@@ -3100,16 +3100,24 @@ shove::define_topic!(
 /// Autoscaling lifecycle: slow handlers + burst → `enable_autoscaling` →
 /// clean drain. Mirrors `autoscaling_scales_up_under_backlog_then_drains_clean`
 /// from `inmemory_integration.rs` but exercises the Kafka backend's
-/// `spawn_autoscaler`, and — via the post-drain linger, when the autoscaler
-/// scales back down over an empty backlog — the `KafkaConsumerGroup::retiring`
-/// drain path (exercised, not asserted; neither is reachable through the
-/// generic `ConsumerGroup<B>` wrapper).
+/// `spawn_autoscaler` scale-up path against a real broker (a single consumer
+/// needs ~4 s for the backlog while scale-up fires well under 1 s in, so
+/// every healthy run scales up before it drains). Scale-up is exercised, not
+/// asserted — the generic `ConsumerGroup<B>` wrapper does not surface the
+/// backend registry's `active_consumers()`; decision logic is covered by the
+/// `src/autoscaler.rs` unit tests and, at the registry level, by inmemory's
+/// `autoscaler_scales_up_under_backlog`. Scale-down and the
+/// `KafkaConsumerGroup::retiring` drain are pinned by that module's own
+/// `scale_down_*` unit tests (e.g. `scale_down_handle_is_drained_not_detached`)
+/// rather than exercised here: reaching ScaleDown after the drain needs the
+/// async-commit flush, stats round-trips, cooldown and hysteresis to line up
+/// inside a fixed post-drain window — exactly the load-sensitive wait this
+/// test exists to remove.
 #[tokio::test]
 async fn autoscaling_scales_up_and_drains_clean() {
     use shove::AutoscalerConfig;
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::AtomicBool;
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -3127,11 +3135,14 @@ async fn autoscaling_scales_up_and_drains_clean() {
     // distinct message ids instead.
     let seen = Arc::new(StdMutex::new(HashSet::new()));
     let distinct = WaitableCounter::new();
+    // Raw delivery count, duplicates included — bounds redelivery below.
+    let deliveries = Arc::new(AtomicU32::new(0));
 
     let mut group = broker.consumer_group();
     {
         let seen = seen.clone();
         let distinct = distinct.clone();
+        let deliveries = deliveries.clone();
         group
             .register::<AutoscalingTopic, _>(
                 ConsumerGroupConfig::new(
@@ -3142,6 +3153,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
                     struct SlowHandler {
                         seen: Arc<StdMutex<HashSet<String>>>,
                         distinct: WaitableCounter,
+                        deliveries: Arc<AtomicU32>,
                     }
                     impl MessageHandler<AutoscalingTopic> for SlowHandler {
                         type Context = ();
@@ -3152,6 +3164,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
                             _: &(),
                         ) -> Outcome {
                             tokio::time::sleep(Duration::from_millis(200)).await;
+                            self.deliveries.fetch_add(1, Ordering::Relaxed);
                             if self.seen.lock().unwrap().insert(msg.id) {
                                 self.distinct.increment();
                             }
@@ -3161,6 +3174,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
                     SlowHandler {
                         seen: seen.clone(),
                         distinct: distinct.clone(),
+                        deliveries: deliveries.clone(),
                     }
                 },
             )
@@ -3195,23 +3209,19 @@ async fn autoscaling_scales_up_and_drains_clean() {
     // discovery + the first rebalance alone can outlast any "reasonable"
     // fixed budget (an 8 s window flaked in CI with zero messages handled).
     // The 60 s ceiling is a failure bound, not the expected duration; once
-    // the group has an assignment the drain itself takes ~1-2 s.
-    let drained_in_time = Arc::new(AtomicBool::new(false));
+    // the group has an assignment the drain itself takes ~1-2 s. No settle
+    // sleep after the count: the shutdown drain acquires every prefetch
+    // permit and issues a final sync commit, so in-flight settlement is
+    // already guaranteed. `at_ceiling` samples the count when the signal
+    // ends, so a straggler handled during the shutdown drain below cannot
+    // blur which side of the ceiling the drain finished on.
+    let at_ceiling = Arc::new(AtomicU32::new(0));
     let signal = {
         let distinct = distinct.clone();
-        let drained_in_time = drained_in_time.clone();
+        let at_ceiling = at_ceiling.clone();
         async move {
-            if distinct.wait_for(20, Duration::from_secs(60)).await {
-                drained_in_time.store(true, Ordering::Relaxed);
-                // Post-drain linger. In-flight settlement needs no grace here
-                // — the shutdown drain acquires every prefetch permit and
-                // issues a final sync commit — but with the backlog at zero
-                // the autoscaler's next poll (200 ms) + hysteresis (200 ms)
-                // fires ScaleDown, pushing consumers through the retiring
-                // drain path this test's doc claims to exercise. In-process
-                // timers only, so 2 s is slack, not a load-sensitive gate.
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+            distinct.wait_for(20, Duration::from_secs(60)).await;
+            at_ceiling.store(distinct.get(), Ordering::SeqCst);
         }
     };
     let outcome = group
@@ -3221,19 +3231,26 @@ async fn autoscaling_scales_up_and_drains_clean() {
 
     // Count first, cleanliness second: in the never-got-an-assignment failure
     // this test exists to catch, the handled count is the diagnostic and an
-    // unclean shutdown in that same state must not mask it. Scale-up itself
-    // is exercised but not asserted — the generic `ConsumerGroup<B>` wrapper
-    // does not surface the backend registry's `active_consumers()`; see the
-    // equivalent note on the inmemory twin.
+    // unclean shutdown in that same state must not mask it (the outcome rides
+    // along in the message either way).
+    let reached = at_ceiling.load(Ordering::SeqCst);
     let handled = distinct.get();
     assert!(
-        drained_in_time.load(Ordering::Relaxed),
+        reached >= 20,
         "all 20 published messages must be handled within the 60 s ceiling \
-         (handled {handled}/20; 0 = never got an assignment, 1-19 = drain stalled)"
+         (distinct handled: {reached}/20 at the ceiling, {handled}/20 after \
+         the shutdown drain; 0 at the ceiling = the group never got an \
+         assignment, 1-19 = the drain stalled; outcome: {outcome:?})"
     );
     assert!(
         outcome.is_clean(),
         "autoscaling group must drain cleanly (handled {handled}/20); outcome: {outcome:?}"
+    );
+    let total = deliveries.load(Ordering::Relaxed);
+    assert!(
+        total <= 40,
+        "{total} deliveries for 20 published messages — at-least-once \
+         tolerates a few rebalance redeliveries, not systematic redelivery"
     );
 
     broker.close().await;
