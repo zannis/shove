@@ -3,7 +3,7 @@
 Framework overhead per message
 </text>
 <text x="24" y="48" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-in-process backend — 64 B payload — 1 consumer — what shove itself costs, broker removed — lower is better
+in-process — 64 B payload — least-parallel per flow — what shove itself costs, broker removed — lower is better
 </text>
 <text x="24" y="363" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 consume_batch: run_batch is implemented only for the Kafka backend; no other backend exposes a batch consume
@@ -18,7 +18,7 @@ setup-bound in this run (window includes coordination cost; no framework number 
 broadcast, dlq_drain
 </text>
 <text x="24" y="439" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-no number in this slice (supported — a gap, not a capability hole): supervisor, autoscaler
+no measurement for this slice in this run (supported — a gap, not a capability hole): supervisor
 </text>
 <text x="24" y="458" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 measured at a pinned worker count: consumer_group at 2 workers
@@ -150,19 +150,19 @@ nanoseconds / message
 </text>
 <polyline fill="none" opacity="1" stroke="#9AA1AA" stroke-width="1" points="84,318 89,318 "/>
 <text x="80" y="295" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-2k
+2.0k
 </text>
 <polyline fill="none" opacity="1" stroke="#9AA1AA" stroke-width="1" points="84,295 89,295 "/>
 <text x="80" y="272" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-4k
+4.0k
 </text>
 <polyline fill="none" opacity="1" stroke="#9AA1AA" stroke-width="1" points="84,272 89,272 "/>
 <text x="80" y="249" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-6k
+6.0k
 </text>
 <polyline fill="none" opacity="1" stroke="#9AA1AA" stroke-width="1" points="84,249 89,249 "/>
 <text x="80" y="225" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-8k
+8.0k
 </text>
 <polyline fill="none" opacity="1" stroke="#9AA1AA" stroke-width="1" points="84,225 89,225 "/>
 <text x="80" y="202" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">

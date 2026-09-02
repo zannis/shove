@@ -86,35 +86,16 @@ pub const COST_SETUP_BOUND: &str = "setup_bound";
 /// throughput and there is no setup window to separate.
 pub const COST_NO_HANDLER: &str = "no_handler";
 
-/// The closed flow set from the schema contract.
-///
-/// Used only to decide whether a backend with no results has *declared* every
-/// flow unsupported (legitimate) or has silently measured nothing (a failed
-/// run). It is deliberately **not** used to reject unknown flows: the contract
+/// The closed flow set from the schema contract — the nine flows the
+/// harness's merge validation resolves rows and `unsupported[]` entries
+/// through, i.e. the only flows a mergeable document can carry. (The
+/// harness has further entry points, but their rows never reach a results
+/// file.) Used for the empty-run declaration rule and the framework-overhead
+/// columns; deliberately **not** used to reject unknown flows — the contract
 /// bumps `schema_version` only on removal or semantic change, so a future
-/// additive flow must keep rendering rather than hard-fail here.
+/// additive flow must keep rendering (and be named in captions) rather than
+/// hard-fail here.
 pub const KNOWN_FLOWS: &[&str] = &[
-    "publish_single",
-    "publish_batch",
-    "consume_parallel",
-    "consume_fifo",
-    "consume_batch",
-    "consumer_group",
-    "supervisor",
-    "broadcast",
-    "dlq_drain",
-    "autoscaler",
-];
-
-/// The flows an empty run can — and therefore must — declare unsupported.
-///
-/// Deliberately the harness's `Flow::ALL` set, not [`KNOWN_FLOWS`]:
-/// `autoscaler` rows exist (the flow has its own entry point), but the
-/// harness's merge validation only accepts `unsupported[]` entries drawn from
-/// its nine-flow table. Requiring a tenth declaration here would demand a
-/// document `merge_results_file` refuses to merge into — a validator
-/// deadlock where no document satisfies both the writer and the reader.
-pub const DECLARABLE_FLOWS: &[&str] = &[
     "publish_single",
     "publish_batch",
     "consume_parallel",
@@ -222,6 +203,14 @@ pub struct ScenarioResult {
     #[serde(default)]
     pub max_batch_age_ms: Option<u64>,
     pub throughput_msg_per_sec: f64,
+    /// Read solely for one cross-check: a `framework` marker asserts the
+    /// window was a drain behind a readiness barrier, and a barrier always
+    /// records the setup it excluded — so `framework` with no `setup_secs`
+    /// is a row the harness cannot produce (a hand-edit or corruption), and
+    /// publishing it as an absolute drain rate is exactly the mislabel the
+    /// marker system exists to refuse.
+    #[serde(default)]
+    pub setup_secs: Option<f64>,
 }
 
 impl ScenarioResult {
@@ -439,6 +428,13 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             if row.handler.is_empty() {
                 return malformed("the handler label is empty");
             }
+            // See the field doc: `framework` without a recorded setup window
+            // is unproducible by the harness and unpublishable here.
+            if row.handler_cost == COST_FRAMEWORK
+                && !row.setup_secs.is_some_and(|v| v.is_finite() && v >= 0.0)
+            {
+                return malformed("a framework row carries no recorded setup window");
+            }
             // Since v3 the batch knobs are present on every `consume_batch`
             // row and no other — a knob-less batch bar has no stated batch
             // size, and knobs on a non-batch row caption a batch that never
@@ -446,6 +442,12 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             let has_knobs = row.max_batch_size.is_some() && row.max_batch_age_ms.is_some();
             if row.flow == "consume_batch" && !has_knobs {
                 return malformed("a consume_batch row is missing its batch knobs");
+            }
+            // Zero is unrepresentable in the writer (its builders assert
+            // > 0), so a zero here is a corrupt row that would caption
+            // "up to 0 messages per batch".
+            if row.max_batch_size == Some(0) || row.max_batch_age_ms == Some(0) {
+                return malformed("a batch knob is zero, which no run can produce");
             }
             if row.flow != "consume_batch"
                 && (row.max_batch_size.is_some() || row.max_batch_age_ms.is_some())
@@ -487,7 +489,7 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             continue;
         }
         let declared: BTreeSet<&str> = run.unsupported.iter().map(|u| u.flow.as_str()).collect();
-        let missing: Vec<String> = DECLARABLE_FLOWS
+        let missing: Vec<String> = KNOWN_FLOWS
             .iter()
             .filter(|flow| !declared.contains(*flow))
             .map(|flow| (*flow).to_string())
@@ -554,7 +556,7 @@ impl Family {
     ];
 
     /// The filenames are deliberately stable: the docs and README pages that
-    /// embed these charts reference them by name, so a rename here is a
+    /// will embed these charts reference them by name, so a rename here is a
     /// breaking change to those pages, not a refactor.
     pub fn filename(self) -> &'static str {
         match self {
@@ -802,8 +804,12 @@ fn fmt_count(v: f64) -> String {
     // instead so an axis tick never reads "1000k".
     if v >= 999_500.0 {
         format!("{:.1}M", v / 1_000_000.0)
-    } else if v >= 1_000.0 {
+    } else if v >= 10_000.0 {
         format!("{:.0}k", v / 1_000.0)
+    } else if v >= 1_000.0 {
+        // One decimal in the 1k-10k band: whole-thousand rounding renders
+        // consecutive ticks (1200, 1400, …) as the same "1k" label.
+        format!("{:.1}k", v / 1_000.0)
     } else if v >= 10.0 {
         format!("{v:.0}")
     } else {
@@ -912,10 +918,12 @@ fn frame<'b>(
     let top_of_footer = bottom - LINE * (footer.len() as i32 - 1);
     // Past this point the block would squeeze the chart body below its own
     // internal margins — plotters then draws the plot over the legend and
-    // subtitle band rather than erroring. 190 leaves the body at least
-    // ~120px under the 70px title band; a document pathological enough to
-    // get here gets a loud refusal instead of a garbage chart.
-    if top_of_footer < 190 {
+    // subtitle band rather than erroring (verified at 24 footer lines). 170
+    // still leaves ~90px of mesh under the title band; a document
+    // pathological enough to get here gets a loud refusal instead of a
+    // garbage chart. The refusal panel's sentence sits at y=140, above any
+    // footer top this guard permits.
+    if top_of_footer < 170 {
         return Err(ChartError::Render(format!(
             "the caption block ({} lines) leaves no room for the chart body",
             footer.len()
@@ -957,8 +965,15 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
                  coordination cost, so no drain rate is published for this slice"
             )),
             Presence::ShapeOnly(_) => {
-                if let Some(run) = doc.runs.iter().find(|r| &r.backend == backend) {
-                    notes.push(shape_only_note(run));
+                // The fallback arm exists so the caveat cannot silently
+                // vanish if the map key ever diverges from run.backend — a
+                // normalised series with no caption would read as absolute.
+                match doc.runs.iter().find(|r| &r.backend == backend) {
+                    Some(run) => notes.push(shape_only_note(run)),
+                    None => notes.push(format!(
+                        "{backend}: shape only — not representative; magnitudes \
+                         are not published"
+                    )),
                 }
             }
             Presence::Absolute { partial: true, .. } => notes.push(format!(
@@ -1282,25 +1297,21 @@ where
             slice: slice_desc,
         });
     }
-    let idx: BTreeMap<K, f64> = keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (*k, i as f64))
-        .collect();
-
     let presences = presences(
         doc,
         flows_for_support,
         |run| {
-            // `idx` iterates in key order, so the points come out sorted.
-            idx.iter()
-                .filter_map(|(k, x)| {
+            // Positions come straight from the sorted key list, so the
+            // points are sorted by construction.
+            keys.iter()
+                .enumerate()
+                .filter_map(|(i, k)| {
                     best_by_throughput(
                         run.results
                             .iter()
                             .filter(|r| in_slice(r) && r.is_framework() && key_of(r) == *k),
                     )
-                    .map(|r| (*x, r.throughput_msg_per_sec))
+                    .map(|r| (i as f64, r.throughput_msg_per_sec))
                 })
                 .collect()
         },
@@ -1404,18 +1415,30 @@ fn line_chart(
                 legend.push((label, colour));
             }
             Presence::ShapeOnly(points) => {
-                // Fractions mapped onto the visible box: the curve's shape is
-                // preserved, the magnitude is not recoverable. Gaps break the
-                // line here too — a bridged gap fabricates shape.
+                // Fractions mapped onto the lower half of the box: the
+                // curve's shape is preserved, the magnitude is not
+                // recoverable — and a normalised peak drawn at the very top
+                // would tower over every real measurement. Gaps break the
+                // line here too (a bridged gap fabricates shape), and the
+                // dots keep a single-point series visible: a 1-point
+                // polyline renders nothing.
                 let mapped: Vec<(f64, f64)> = points
                     .iter()
-                    .map(|(x, f)| (*x, y_lo + (y_hi - y_lo) * f))
+                    .map(|(x, f)| (*x, y_lo + (y_hi - y_lo) * 0.45 * f))
                     .collect();
                 for run_pts in contiguous_runs(&mapped) {
                     chart
                         .draw_series(LineSeries::new(run_pts.iter().copied(), stroke(colour, 2)))
                         .map_err(render)?;
                 }
+                let dot = ShapeStyle {
+                    color: colour.to_rgba(),
+                    filled: true,
+                    stroke_width: 0,
+                };
+                chart
+                    .draw_series(mapped.iter().map(|(x, y)| Circle::new((*x, *y), 3, dot)))
+                    .map_err(render)?;
                 legend.push((format!("{backend} (shape only)"), colour));
             }
             Presence::Unsupported(_) | Presence::NotMeasured | Presence::SetupBoundOnly => {}
@@ -1491,17 +1514,22 @@ fn bar_chart(
     // participate: they are drawn at their value, and an axis scaled by an
     // under-statement never over-claims.
     let mut peak = 0.0f64;
-    for g in groups.iter().filter(|g| !g.shape_only) {
+    for g in groups.iter() {
         for b in g.bars.iter().flatten() {
+            // A subnormal throughput turns 1e9/tp into +inf; an infinite
+            // scaling peak maps coordinates to NaN and the render completes
+            // as a clean-looking corrupt SVG. Shape-only groups feed their
+            // own scaling peak, so they are guarded too.
             if !b.value.is_finite() {
-                // A subnormal throughput turns 1e9/tp into +inf; an infinite
-                // axis maps every coordinate to NaN and the render completes
-                // as a clean-looking corrupt SVG. Refuse loudly instead.
                 return Err(ChartError::Render(format!(
                     "group `{}` holds a non-finite bar value",
                     g.label
                 )));
             }
+        }
+    }
+    for g in groups.iter().filter(|g| !g.shape_only) {
+        for b in g.bars.iter().flatten() {
             if b.value > peak {
                 peak = b.value;
             }
@@ -1575,9 +1603,14 @@ fn bar_chart(
             let centre = (left + right) / 2.0;
             match group.bars.get(si).copied().flatten() {
                 Some(bar) => {
+                    // 0.45, not ~1.0: a shape-only bar drawn to the top of
+                    // an axis scaled by the representative peak would read
+                    // as the tallest measurement in the chart. Mid-height
+                    // keeps the relative shape while staying visually
+                    // subordinate to every published absolute.
                     let height = if group.shape_only {
                         if local_peak > 0.0 {
-                            y_hi * 0.92 * (bar.value / local_peak)
+                            y_hi * 0.45 * (bar.value / local_peak)
                         } else {
                             0.0
                         }
@@ -1672,6 +1705,36 @@ fn render_parallel_vs_sequenced(
         // would lose the sequenced bar it exists to show. Sleeping-handler
         // rows (`handler_bound` / `handler_amortised`) never reach either arm:
         // their number is the simulated sleep, not shove.
+        // One worker count per backend, shared by every mode it measured:
+        // the modes pin different counts (fifo to the shard count, batch to
+        // its configured set), and comparing a 1-worker parallel bar against
+        // an 8-worker fifo bar inverted the ordering-cost story on four of
+        // five committed backends. The least-parallel count every measured
+        // mode shares is the honest common ground; when no shared count
+        // exists, each mode falls back to its own minimum and the caption
+        // names the counts.
+        let mode_counts: Vec<BTreeSet<u32>> = MODES
+            .iter()
+            .map(|(mode, _, _)| {
+                run.results
+                    .iter()
+                    .filter(|r| {
+                        r.mode == *mode
+                            && CONSUME_FLOWS.contains(&r.flow.as_str())
+                            && r.payload_bytes == HEADLINE_PAYLOAD
+                            && (r.is_framework() || r.is_setup_bound())
+                    })
+                    .map(|r| r.consumers)
+                    .collect()
+            })
+            .collect();
+        let common_count: Option<u32> = mode_counts
+            .iter()
+            .filter(|c| !c.is_empty())
+            .cloned()
+            .reduce(|a, b| a.intersection(&b).copied().collect())
+            .and_then(|shared| shared.into_iter().next());
+
         let bars: Vec<Option<Bar>> = MODES
             .iter()
             .enumerate()
@@ -1681,12 +1744,6 @@ fn render_parallel_vs_sequenced(
                         && CONSUME_FLOWS.contains(&r.flow.as_str())
                         && r.payload_bytes == HEADLINE_PAYLOAD
                 };
-                // Each mode is measured at its own worker count: fifo pins
-                // its workers to the shard count and batch to its configured
-                // set, so requiring the global BASE_CONSUMERS here would
-                // erase the fifo bar on every backend that measured it. Take
-                // the mode's least-parallel measurement, and say so in the
-                // caption when that count is not 1.
                 let arm = |lower_bound: bool| -> Option<(Bar, &ScenarioResult)> {
                     let is_arm = |r: &&ScenarioResult| {
                         if lower_bound {
@@ -1695,19 +1752,22 @@ fn render_parallel_vs_sequenced(
                             r.is_framework()
                         }
                     };
-                    let min = run
-                        .results
-                        .iter()
-                        .filter(in_mode)
-                        .filter(is_arm)
-                        .map(|r| r.consumers)
-                        .min()?;
+                    let at = match common_count {
+                        Some(c) if mode_counts[mi].contains(&c) => c,
+                        _ => run
+                            .results
+                            .iter()
+                            .filter(in_mode)
+                            .filter(is_arm)
+                            .map(|r| r.consumers)
+                            .min()?,
+                    };
                     best_by_throughput(
                         run.results
                             .iter()
                             .filter(in_mode)
                             .filter(is_arm)
-                            .filter(|r| r.consumers == min),
+                            .filter(|r| r.consumers == at),
                     )
                     .map(|r| {
                         (
@@ -1784,8 +1844,8 @@ fn render_parallel_vs_sequenced(
     for ((mi, count), backends) in &workers {
         let label = MODES[*mi].2;
         notes.push(format!(
-            "{} / {label}: measured at {count} workers (this mode pins its \
-             own worker count)",
+            "{} / {label}: measured at {count} workers (the least-parallel \
+             count the measured modes share)",
             backends.join(", ")
         ));
     }
@@ -1815,21 +1875,27 @@ fn render_parallel_vs_sequenced(
     // and vanish without a bar or a word — the same silent omission an
     // unknown handler_cost is refused for. New modes are additive (no schema
     // bump), so they are named rather than refused.
-    let unknown_modes: BTreeSet<&str> = doc
-        .runs
-        .iter()
-        .flat_map(|run| run.results.iter())
-        .filter(|r| {
-            CONSUME_FLOWS.contains(&r.flow.as_str())
-                && r.payload_bytes == HEADLINE_PAYLOAD
-                && !MODES.iter().any(|(mode, _, _)| r.mode == *mode)
-        })
-        .map(|r| r.mode.as_str())
-        .collect();
-    if !unknown_modes.is_empty() {
+    let mut uncharted: BTreeSet<&str> = BTreeSet::new();
+    for r in doc.runs.iter().flat_map(|run| run.results.iter()) {
+        if r.payload_bytes != HEADLINE_PAYLOAD {
+            continue;
+        }
+        let known_mode = MODES.iter().any(|(mode, _, _)| r.mode == *mode);
+        if CONSUME_FLOWS.contains(&r.flow.as_str()) && !known_mode {
+            uncharted.insert(r.mode.as_str());
+        }
+        // A consume-mode row of a flow outside both this chart's slice and
+        // the schema's known set is a future additive flow: name it rather
+        // than let it vanish. Known flows outside CONSUME_FLOWS (the publish
+        // pair, consumer_group, …) are scoped to other charts on purpose.
+        if known_mode && !KNOWN_FLOWS.contains(&r.flow.as_str()) {
+            uncharted.insert(r.flow.as_str());
+        }
+    }
+    if !uncharted.is_empty() {
         notes.push(format!(
-            "measured but not charted here (mode unknown to this chart): {}",
-            unknown_modes.into_iter().collect::<Vec<_>>().join(", ")
+            "measured but not charted here (unknown to this chart): {}",
+            uncharted.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
 
@@ -1897,7 +1963,9 @@ fn render_dispatch_latency(
     root.draw_text(
         "no publishable dispatch-latency measurement in this document",
         &centred_label(),
-        (WIDTH as i32 / 2, HEIGHT as i32 / 2 - 60),
+        // y=140: below the subtitle band, above the lowest footer top the
+        // frame guard permits, so the sentence can never be overprinted.
+        (WIDTH as i32 / 2, 140),
     )
     .map_err(render)?;
     Ok(())
@@ -2013,14 +2081,8 @@ fn render_framework_overhead(
         ));
     }
     if !unmeasured.is_empty() {
-        // Slice-scoped on purpose: "not measured in this run" would be a
-        // false claim for a flow measured at coordinates outside this
-        // chart's slice.
-        notes.push(format!(
-            "no number in this slice (supported — a gap, not a capability \
-             hole): {}",
-            unmeasured.join(", ")
-        ));
+        // The one slice-scoped gap wording, with the flows appended.
+        notes.push(format!("{}: {}", gap_text(), unmeasured.join(", ")));
     }
     if !pinned_workers.is_empty() {
         notes.push(format!(
@@ -2044,17 +2106,18 @@ fn render_framework_overhead(
         ));
     }
 
+    // Any worker count: the bars are taken at each flow's least-parallel
+    // measurement, so pinning this to one count would publish a failed cell
+    // as a benign gap.
     notes.extend(failure_notes(std::slice::from_ref(run), |f| {
-        KNOWN_FLOWS.contains(&f.flow.as_str())
-            && f.payload_bytes == OVERHEAD_PAYLOAD
-            && f.consumers == BASE_CONSUMERS
+        KNOWN_FLOWS.contains(&f.flow.as_str()) && f.payload_bytes == OVERHEAD_PAYLOAD
     }));
 
     if groups.is_empty() {
         return Err(ChartError::NoDataForChart {
             family: "framework-overhead",
             slice: format!(
-                "{IN_PROCESS_BACKEND} @ {} / {BASE_CONSUMERS} consumer",
+                "{IN_PROCESS_BACKEND} @ {} (least-parallel per flow)",
                 fmt_payload(OVERHEAD_PAYLOAD)
             ),
         });
@@ -2071,8 +2134,8 @@ fn render_framework_overhead(
         root,
         Family::FrameworkOverhead.title(),
         &format!(
-            "in-process backend — {} payload — {BASE_CONSUMERS} consumer — \
-             what shove itself costs, broker removed — lower is better",
+            "in-process — {} payload — least-parallel per flow — what shove \
+             itself costs, broker removed — lower is better",
             fmt_payload(OVERHEAD_PAYLOAD)
         ),
         "nanoseconds / message",

@@ -76,12 +76,12 @@ fn scenario_with_cost(
 
 /// A v4 row whose marker is what the harness would derive for a zero handler:
 /// publish flows carry `no_handler`, the barrier-less flows (`consume_fifo`,
-/// `dlq_drain`, `autoscaler`) carry `setup_bound`, everything else is a
+/// `dlq_drain`) carry `setup_bound`, everything else is a
 /// `framework` row with a separated window.
 fn scenario(flow: &str, mode: &str, payload: u64, consumers: u32, throughput: f64) -> String {
     let cost = match flow {
         "publish_single" | "publish_batch" => "no_handler",
-        "consume_fifo" | "dlq_drain" | "autoscaler" => "setup_bound",
+        "consume_fifo" | "dlq_drain" => "setup_bound",
         _ => "framework",
     };
     scenario_with_cost(flow, mode, payload, consumers, throughput, cost)
@@ -516,7 +516,7 @@ fn unsupported_flow_is_marked_not_zeroed_and_not_dropped() {
 
 #[test]
 fn a_supported_but_unmeasured_flow_is_named_not_dropped() {
-    // `autoscaler` is supported on every backend and is not in the fixture's
+    // `supervisor` is supported on every backend and is not in the fixture's
     // `unsupported[]`. Drawing an "n/s" column would claim a capability hole
     // that does not exist; dropping it without a word is the omission the
     // marker rule exists to prevent. It must be named in the caption.
@@ -529,11 +529,11 @@ fn a_supported_but_unmeasured_flow_is_named_not_dropped() {
     // Slice-scoped on purpose: "not measured in this run" was a false claim
     // for a flow measured at coordinates outside the chart's slice.
     assert!(
-        svg.contains("no number in this slice"),
+        svg.contains("no measurement for this slice in this run"),
         "supported-but-unmeasured flows are dropped without a word"
     );
     assert!(
-        svg.contains("autoscaler"),
+        svg.contains("supervisor"),
         "the unmeasured flow is not named"
     );
 }
@@ -687,10 +687,25 @@ fn output_carries_no_wall_clock_and_no_external_reference() {
     // raw.githubusercontent's `default-src 'none'` CSP.
     let doc = parse(&document(&inmemory_run(true)));
     for (family, svg) in render_all(&doc) {
-        assert!(
-            !svg.contains("2026-09") && !svg.contains("2026-10"),
-            "{family:?} looks like it rendered a wall-clock date"
-        );
+        // Every date-shaped token in the file must be the fixture's own
+        // generated_at — a calendar-window check ("no 2026-09") would stop
+        // guarding the day the calendar passed it.
+        for (i, _) in svg.match_indices("20") {
+            let token: String = svg[i..].chars().take(10).collect();
+            let bytes = token.as_bytes();
+            let is_date = token.len() == 10
+                && bytes[..4].iter().all(u8::is_ascii_digit)
+                && bytes[4] == b'-'
+                && bytes[5..7].iter().all(u8::is_ascii_digit)
+                && bytes[7] == b'-'
+                && bytes[8..10].iter().all(u8::is_ascii_digit);
+            if is_date {
+                assert!(
+                    doc.generated_at.starts_with(&token),
+                    "{family:?} rendered a date that is not the document's: {token}"
+                );
+            }
+        }
         // The SVG namespace declaration is the one legitimate URI in the file:
         // it names the dialect, it is never fetched. Everything else that could
         // pull a byte over the network is banned, because under
@@ -1053,8 +1068,7 @@ fn a_pathological_caption_block_is_a_loud_error_not_a_garbage_chart() {
                     {{ "flow": "consumer_group", "reason": "{filler}-f{i}" }},
                     {{ "flow": "supervisor", "reason": "{filler}-g{i}" }},
                     {{ "flow": "broadcast", "reason": "{filler}-h{i}" }},
-                    {{ "flow": "dlq_drain", "reason": "{filler}-i{i}" }},
-                    {{ "flow": "autoscaler", "reason": "{filler}-j{i}" }}
+                    {{ "flow": "dlq_drain", "reason": "{filler}-i{i}" }}
                   ]
                 }}"#
             )
@@ -1464,6 +1478,115 @@ fn a_subnormal_throughput_cannot_render_a_corrupt_overhead_chart() {
                 "{family:?} rendered NaN coordinates from a subnormal throughput"
             );
         }
+    }
+}
+
+// ── Round-6 guards ───────────────────────────────────────────────────────────
+
+#[test]
+fn a_zero_batch_knob_is_rejected() {
+    // The writer's builders assert > 0, so a zero knob is a corrupt row that
+    // would caption "up to 0 messages per batch".
+    let zeroed = scenario("consume_batch", "batch", 64, 1, 1_000.0)
+        .replace(r#""max_batch_size": 500"#, r#""max_batch_size": 0"#);
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{zeroed}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("batch knob is zero"), "{what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_framework_row_without_a_setup_window_is_rejected() {
+    // The barrier always records what it excluded; framework with no
+    // setup_secs is a row the harness cannot produce.
+    let raw = document(&inmemory_run(true)).replace(r#""setup_secs": 0.4,"#, "");
+    let doc = parse(&raw);
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("no recorded setup window"), "{what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_shape_only_group_cannot_launder_a_non_finite_bar() {
+    // The finiteness guard must cover shape-only groups too: their values
+    // feed the scaling peak, and inf/inf renders NaN geometry.
+    let raw = document(&inmemory_run(false)).replace(
+        r#""throughput_msg_per_sec": 50000"#,
+        r#""throughput_msg_per_sec": 1e-300"#,
+    );
+    let doc = parse(&raw);
+    if chartgen::validate(&doc).is_err() {
+        return;
+    }
+    for family in Family::ALL {
+        if let Ok(svg) = chartgen::render_to_string(&doc, family) {
+            assert!(
+                !svg.contains("NaN"),
+                "{family:?} rendered NaN coordinates from a subnormal throughput"
+            );
+        }
+    }
+}
+
+#[test]
+fn family3_compares_modes_at_a_shared_worker_count() {
+    // parallel measured at 1 and 8 workers, fifo only at 8: the bars must
+    // both come from the 8-worker cells — a 1-worker parallel bar against an
+    // 8-worker fifo bar inverted the ordering-cost story.
+    let rows = format!(
+        "{},{},{}",
+        scenario("consume_parallel", "parallel", 64, 1, 33_333.0),
+        scenario("consume_parallel", "parallel", 64, 8, 88_888.0),
+        scenario_with_cost("consume_fifo", "fifo", 64, 8, 44_444.0, "setup_bound")
+    );
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{rows}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    assert!(
+        !svg.contains("33.3k") && !svg.contains("33333"),
+        "the 1-worker parallel magnitude must not be charted when 8 is the shared count"
+    );
+    assert!(
+        svg.contains("measured at 8 workers"),
+        "the shared non-1 worker count must be stated"
+    );
+}
+
+#[test]
+fn the_lockfile_carries_no_font_stack() {
+    // Byte-determinism rests on plotters resolving without `ttf`: text
+    // extents would otherwise come from host fonts and every label
+    // coordinate would move between machines. Feature unification (e.g. a
+    // criterion bump) could re-enable it without any diff in our Cargo.toml,
+    // so pin the resolved graph, not the declaration.
+    let lock = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+    )
+    .expect("read Cargo.lock");
+    for font_dep in ["ttf-parser", "font-kit", "ab_glyph", "rusttype"] {
+        assert!(
+            !lock.contains(&format!("name = \"{font_dep}\"")),
+            "Cargo.lock resolves {font_dep}: plotters' ttf feature got re-enabled \
+             and rendered text extents are now host-dependent"
+        );
     }
 }
 

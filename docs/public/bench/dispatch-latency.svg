@@ -32,7 +32,7 @@ aarch64 — 8 cores — 15 GB RAM — Ubuntu 24.04.4 LTS — rustc 1.91.1 (ed61e
 <text x="24" y="534" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 10 recorded failure(s) in the dataset — see failures[]
 </text>
-<text x="480" y="220" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+<text x="480" y="140" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 no publishable dispatch-latency measurement in this document
 </text>
 </svg>
