@@ -1230,10 +1230,18 @@ pub type BatchTopologyFn<B> = Box<
 /// `consume_batch` unsupported elsewhere rather than something to fake.
 /// Invoked once per scenario consumer, so the closure must be re-callable.
 /// Errors surface exactly as for [`DlqDrainFn`].
+///
+/// The token is the scenario's stop signal: the closure must return promptly
+/// once it fires, shutting its consumer down cleanly. On Kafka a clean close
+/// sends the group's LeaveGroup at once, where an aborted member lingers in
+/// the group until the session timeout and poisons the next scenario's purge.
+/// The harness only falls back to aborting a driver that ignores the token
+/// past a grace period.
 pub type BatchConsumeFn<B> = Box<
     dyn Fn(
             <B as Backend>::Client,
             StressBatchHandler,
+            CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
@@ -1570,6 +1578,74 @@ where
         .declare::<T>()
         .await
         .map_err(|e| format!("declare: {e}"))
+}
+
+/// Block until `fetch_undrained` reports nothing pending, polling every
+/// `poll` up to `deadline`. Each returned entry describes one thing still in
+/// the way — a consumer group with members attached, a topic a delete has not
+/// finished removing, a failed observation ("membership list failed: …") —
+/// and an entry keeps the wait alive exactly like a pending resource does, so
+/// a transient fetch failure is retried rather than treated as either "clean"
+/// or a hard error. At the deadline every entry from the final round is named
+/// in the error, the lingering resources alongside any fetch failure; neither
+/// may mask the other, because "16 members never left" and "the broker
+/// stopped answering" send an operator down different roads.
+///
+/// Waiting on the observable instead of retrying a fixed number of times is
+/// the point: a fixed budget loses deterministically once enough members
+/// linger (a 16-member batch cell held `NonEmptyGroup` past a 10 × 500 ms
+/// budget on every repetition), while a drain returns the moment the broker
+/// reports clean and only pays its ceiling when something is genuinely stuck.
+///
+/// Runs on blocking primitives (`thread::sleep`) — call it from
+/// `spawn_blocking`.
+pub fn await_drain(
+    mut fetch_undrained: impl FnMut() -> Vec<String>,
+    deadline: Duration,
+    poll: Duration,
+) -> Result<(), String> {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        let undrained = fetch_undrained();
+        if undrained.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= end {
+            return Err(format!(
+                "still pending {}s after the wait began: {}",
+                deadline.as_secs(),
+                undrained.join(", ")
+            ));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Why `group` is not yet deletable on Kafka, or `None` if it is.
+///
+/// Kafka's `DeleteGroups` only accepts a group with no members in a settled
+/// state, and an absent group is simply missing from the list response, so
+/// the caller never invokes this for it. For a listed group, zero members is
+/// necessary but not sufficient: a group can report zero members while still
+/// in `PreparingRebalance`/`CompletingRebalance` (the last member left
+/// mid-rebalance), and a coordinator that could not answer yields an entry
+/// with zero members and an empty state string — rdkafka exposes no per-group
+/// error field to tell that apart from "clean". Both must read as "keep
+/// waiting", not "drained": treating the error shape as clean is exactly the
+/// path back to `NonEmptyGroup`.
+///
+/// Lives here rather than in the Kafka wrapper so `tests/bench_harness.rs`
+/// actually executes its tests — an example target's `#[cfg(test)]` module is
+/// never compiled into a test binary (Cargo defaults examples to
+/// `test = false`).
+pub fn kafka_group_undrained(group: &str, members: usize, state: &str) -> Option<String> {
+    if members > 0 {
+        return Some(format!("group {group}: {members} member(s), state {state}"));
+    }
+    match state {
+        "Empty" | "Dead" => None,
+        other => Some(format!("group {group}: 0 members but state '{other}'")),
+    }
 }
 
 async fn run_scenario_publish<B, Connect, Fut>(
@@ -2167,6 +2243,7 @@ where
     // expression. That leaves exactly one thing for a test to pin — that
     // `effective_workers` still returns the consumer count this flow's row is
     // stamped with.
+    let batch_stop = CancellationToken::new();
     let mut drivers = tokio::task::JoinSet::new();
     for _ in 0..scenario.flow.effective_workers(scenario.consumers) {
         let handler = StressBatchHandler::new(StressTestHandler::new(
@@ -2175,7 +2252,7 @@ where
             recorder.clone(),
             scenario.handler,
         ));
-        drivers.spawn(batch(client.clone(), handler));
+        drivers.spawn(batch(client.clone(), handler, batch_stop.clone()));
     }
 
     // A publish failure must still fall through to the teardown below rather
@@ -2210,10 +2287,21 @@ where
     };
     let duration = start.elapsed();
 
-    // Same reasoning as the DLQ drain: `run_batch` has no shutdown token of
-    // its own, so abort rather than await.
-    drivers.abort_all();
-    while drivers.join_next().await.is_some() {}
+    // Signal the drivers to stop and wait for them to close their consumers.
+    // A clean close leaves the consumer group immediately; an aborted member
+    // lingers in the group until the session timeout, which is what used to
+    // make the next scenario's purge race group membership. Grace-capped: a
+    // driver stuck ignoring the token falls back to the old abort, and the
+    // purge's membership drain absorbs the lingering member it leaves.
+    batch_stop.cancel();
+    let graceful = async { while drivers.join_next().await.is_some() {} };
+    if tokio::time::timeout(Duration::from_secs(10), graceful)
+        .await
+        .is_err()
+    {
+        drivers.abort_all();
+        while drivers.join_next().await.is_some() {}
+    }
 
     let resources = sampler.stop().await;
     drop(publisher);
@@ -3799,10 +3887,181 @@ mod tests {
         assert_eq!(s.expected_processed(), s.messages);
     }
 
+    // ── await_drain / kafka_group_undrained (the purge's group-drain wait) ──
+
+    /// The defect the drain replaces: a fixed 10-attempt budget gave up on a
+    /// group whose members simply had not finished leaving yet. The drain
+    /// must keep polling well past ten rounds as long as the deadline allows.
+    #[test]
+    fn drain_outlasts_a_fixed_retry_budget() {
+        let mut polls = 0u32;
+        let result = await_drain(
+            || {
+                polls += 1;
+                // A 16-member group that only finishes leaving on the 30th
+                // poll — three times the old 10-attempt budget.
+                if polls < 30 {
+                    vec!["group g: 16 member(s), state Stable".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(polls >= 30, "drained after only {polls} polls");
+    }
+
+    /// The common clean case (nothing pending on the first look) must return
+    /// without sleeping a single poll interval — the purge runs at every
+    /// scenario boundary, so a mandatory poll-length pause would tax the
+    /// whole matrix.
+    #[test]
+    fn drain_returns_at_once_when_nothing_is_pending() {
+        let started = Instant::now();
+        let result = await_drain(Vec::new, Duration::from_secs(10), Duration::from_secs(10));
+        assert_eq!(result, Ok(()));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a clean first poll must not pay the poll interval (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// At the deadline, every entry from the final round is named — the
+    /// lingering group AND a failed observation. Neither may mask the other:
+    /// "16 members never left" and "the broker stopped answering" send an
+    /// operator down different roads.
+    #[test]
+    fn drain_deadline_error_names_every_pending_entry() {
+        let result = await_drain(
+            || {
+                vec![
+                    "group g-consumer: 16 member(s), state Stable".to_string(),
+                    "group g-fifo: membership list failed: timed out".to_string(),
+                ]
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        );
+        let err = result.expect_err("a never-draining group must error");
+        assert!(
+            err.contains("g-consumer") && err.contains("16"),
+            "error must name the lingering group and member count: {err}"
+        );
+        assert!(
+            err.contains("g-fifo") && err.contains("timed out"),
+            "error must also carry the failed observation: {err}"
+        );
+    }
+
+    /// Transient observation failures (broker mid-rebalance, metadata
+    /// timeout) are pending entries like any other: retried, not fatal.
+    #[test]
+    fn drain_retries_past_transient_fetch_failures() {
+        let mut polls = 0u32;
+        let result = await_drain(
+            || {
+                polls += 1;
+                if polls < 3 {
+                    vec!["membership list failed: transient timeout".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    /// The drain's answer to "is this group deletable?" must not equate zero
+    /// members with clean: `DeleteGroups` also rejects a group that is
+    /// mid-rebalance, and a coordinator that could not answer yields the same
+    /// zero-member shape with an empty state string.
+    #[test]
+    fn kafka_group_policy_gates_on_state_not_just_member_count() {
+        // Members attached — not deletable, and the description carries the
+        // count the operator needs.
+        let desc = kafka_group_undrained("g", 16, "Stable").expect("members must block");
+        assert!(desc.contains("16"), "{desc}");
+
+        // Settled empty states are deletable.
+        assert_eq!(kafka_group_undrained("g", 0, "Empty"), None);
+        assert_eq!(kafka_group_undrained("g", 0, "Dead"), None);
+
+        // Zero members mid-rebalance: DeleteGroups would still refuse it.
+        assert!(kafka_group_undrained("g", 0, "PreparingRebalance").is_some());
+        assert!(kafka_group_undrained("g", 0, "CompletingRebalance").is_some());
+
+        // The error placeholder a coordinator failure produces (rdkafka has
+        // no per-group error accessor, so an empty state is all we see) must
+        // read as "keep waiting", not "clean".
+        assert!(kafka_group_undrained("g", 0, "").is_some());
+    }
+
+    /// The batch teardown asks its drivers to stop and waits for them —
+    /// a driver that honours the token is joined on the graceful path, not
+    /// aborted mid-close. The driver double flags the cooperative exit; an
+    /// abort would drop the future before it could.
+    #[tokio::test]
+    async fn batch_teardown_stops_drivers_gracefully() {
+        let workers: u16 = 4;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 40,
+            consumers: workers,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+        };
+
+        let clean_exits = Arc::new(AtomicU64::new(0));
+        let exits = clean_exits.clone();
+        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler, stop| {
+            let exits = exits.clone();
+            Box::pin(async move {
+                let consumer = InMemoryConsumer::new(client);
+                let run = consumer.run::<StressTestTopic, _>(
+                    OneMessageBatches(handler),
+                    (),
+                    ConsumerOptions::new(),
+                );
+                tokio::select! {
+                    result = run => result.map_err(|e| format!("run: {e}")),
+                    () = stop.cancelled() => {
+                        exits.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                }
+            })
+        });
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        assert_eq!(
+            clean_exits.load(Ordering::Relaxed),
+            workers as u64,
+            "every driver must be stopped via its token, not aborted"
+        );
+    }
+
     // ── unsupported[] ──
 
     fn dummy_batch_fn() -> BatchConsumeFn<shove::InMemory> {
-        Box::new(|_client, _h| Box::pin(async { Ok(()) }))
+        Box::new(|_client, _h, _stop| Box::pin(async { Ok(()) }))
     }
 
     #[test]
@@ -4108,18 +4367,24 @@ mod tests {
 
         let started = Arc::new(AtomicU64::new(0));
         let counter = started.clone();
-        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler| {
+        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler, stop| {
             let counter = counter.clone();
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::Relaxed);
-                InMemoryConsumer::new(client)
-                    .run::<StressTestTopic, _>(
-                        OneMessageBatches(handler),
-                        (),
-                        ConsumerOptions::new(),
-                    )
-                    .await
-                    .map_err(|e| format!("run: {e}"))
+                // Honour the stop token the way a real driver must: return
+                // promptly when it fires. Without this, the teardown's
+                // graceful wait would burn its whole grace period before
+                // falling back to the abort path.
+                let consumer = InMemoryConsumer::new(client);
+                let run = consumer.run::<StressTestTopic, _>(
+                    OneMessageBatches(handler),
+                    (),
+                    ConsumerOptions::new(),
+                );
+                tokio::select! {
+                    result = run => result.map_err(|e| format!("run: {e}")),
+                    () = stop.cancelled() => Ok(()),
+                }
             })
         });
 
