@@ -39,6 +39,31 @@ use shove::{BatchConsumerOptions, define_topic};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Poll `long_enough` until it reports true or `timeout` elapses, waking on
+/// every `signal` notification in between rather than busy-polling. Shared
+/// tail for every recording handler's `wait_for_*` method below — each of
+/// them differs only in *what* "long enough" means (a `Mutex<Vec<_>>`'s
+/// length against a target count, or an `AtomicUsize`'s), not in how the wait
+/// itself is driven.
+async fn wait_for(
+    signal: &Notify,
+    timeout: Duration,
+    mut long_enough: impl FnMut() -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if long_enough() {
+            return true;
+        }
+        tokio::select! {
+            _ = signal.notified() => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                return long_enough();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct BatchMessage {
     seq: u32,
@@ -128,6 +153,26 @@ define_topic!(
     BatchMessage,
     TopologyBuilder::new("inmem-batch-inflight").build()
 );
+define_topic!(
+    BrokerCloseBackoffTopic,
+    BatchMessage,
+    TopologyBuilder::new("inmem-batch-broker-close-backoff").build()
+);
+const REDELIVERY_ORDER_QUEUE: &str = "inmem-batch-redelivery-order";
+const REDELIVERY_ORDER_DLQ: &str = "inmem-batch-redelivery-order-dlq";
+
+define_topic!(
+    RedeliveryOrderTopic,
+    BatchMessage,
+    TopologyBuilder::new(REDELIVERY_ORDER_QUEUE)
+        .dlq_named(REDELIVERY_ORDER_DLQ)
+        .build()
+);
+define_topic!(
+    DeliveryCountTopic,
+    BatchMessage,
+    TopologyBuilder::new("inmem-batch-delivery-count").build()
+);
 
 // The pre-handler-drop pair: `DropTopic` is the batch consumer's own view
 // (JSON-decoded `BatchMessage`); `DropRawTopic` publishes the exact same
@@ -209,18 +254,10 @@ impl RecordingBatchHandler {
     }
 
     async fn wait_for_batches(&self, n: usize, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.batches.lock().unwrap().len() >= n {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.batches.lock().unwrap().len() >= n;
-                }
-            }
-        }
+        wait_for(&self.signal, timeout, || {
+            self.batches.lock().unwrap().len() >= n
+        })
+        .await
     }
 }
 
@@ -253,7 +290,77 @@ impl_recording_for!(
     ShutdownTopic,
     InFlightTopic,
     DropTopic,
+    BrokerCloseBackoffTopic,
+    RedeliveryOrderTopic,
 );
+
+// ---------------------------------------------------------------------------
+// Delivery-count recording batch handler — for F2 (redelivery marks every
+// requeued envelope, batch-wide) coverage.
+// ---------------------------------------------------------------------------
+
+/// `(seq, delivery_count)` for one message.
+type SeqAndDeliveryCount = (u32, Option<u32>);
+
+/// Records `(seq, delivery_count)` for every message in every batch, so a
+/// test can tell a first delivery from a redelivery. Scripts outcomes the
+/// same way [`RecordingBatchHandler`] does.
+#[derive(Clone)]
+struct DeliveryCountRecordingHandler {
+    batches: Arc<Mutex<Vec<Vec<SeqAndDeliveryCount>>>>,
+    scripted: Arc<Mutex<VecDeque<Outcome>>>,
+    signal: Arc<Notify>,
+}
+
+impl DeliveryCountRecordingHandler {
+    fn new() -> Self {
+        Self {
+            batches: Arc::new(Mutex::new(Vec::new())),
+            scripted: Arc::new(Mutex::new(VecDeque::new())),
+            signal: Arc::new(Notify::new()),
+        }
+    }
+
+    fn scripting(self, outcomes: impl IntoIterator<Item = Outcome>) -> Self {
+        *self.scripted.lock().unwrap() = outcomes.into_iter().collect();
+        self
+    }
+
+    fn batches(&self) -> Vec<Vec<SeqAndDeliveryCount>> {
+        self.batches.lock().unwrap().clone()
+    }
+
+    async fn wait_for_batches(&self, n: usize, timeout: Duration) -> bool {
+        wait_for(&self.signal, timeout, || {
+            self.batches.lock().unwrap().len() >= n
+        })
+        .await
+    }
+}
+
+impl BatchMessageHandler<DeliveryCountTopic> for DeliveryCountRecordingHandler {
+    type Context = ();
+    async fn handle_batch(
+        &self,
+        messages: Vec<(BatchMessage, MessageMetadata)>,
+        _: &(),
+    ) -> Outcome {
+        self.batches.lock().unwrap().push(
+            messages
+                .iter()
+                .map(|(m, meta)| (m.seq, meta.delivery_count))
+                .collect(),
+        );
+        let outcome = self
+            .scripted
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Outcome::Ack);
+        self.signal.notify_waiters();
+        outcome
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Misbehaving batch handler — panics or hangs
@@ -306,18 +413,10 @@ impl MisbehavingBatchHandler {
     }
 
     async fn wait_for_calls(&self, n: usize, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.calls.lock().unwrap().len() >= n {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.calls.lock().unwrap().len() >= n;
-                }
-            }
-        }
+        wait_for(&self.signal, timeout, || {
+            self.calls.lock().unwrap().len() >= n
+        })
+        .await
     }
 }
 
@@ -363,18 +462,10 @@ impl FutureBuildPanicHandler {
     }
 
     async fn wait_for_calls(&self, n: usize, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.calls.load(Ordering::SeqCst) >= n {
-                return true;
-            }
-            tokio::select! {
-                _ = self.signal.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => {
-                    return self.calls.load(Ordering::SeqCst) >= n;
-                }
-            }
-        }
+        wait_for(&self.signal, timeout, || {
+            self.calls.load(Ordering::SeqCst) >= n
+        })
+        .await
     }
 }
 
@@ -1343,6 +1434,246 @@ async fn in_flight_balance_after_retry_then_ack() {
         Some(0.0),
         "in_flight must return to zero: every pop's increment must be matched \
          by exactly one decrement on whichever settlement resolved it"
+    );
+    broker.close().await;
+}
+
+/// `broker.close()` must cut the `Redeliver` arm's backoff sleep short, the
+/// same way the per-consumer `shutdown` token already does — not stall the
+/// drain for the (possibly escalated) remainder of the delay. Two
+/// consecutive `Retry`s escalate the backoff from the 1s initial delay to 2s,
+/// so "the run merely finished inside a generous timeout" cannot pass by
+/// accident: only actually cutting the sleep short gets under the assertion
+/// below.
+#[tokio::test]
+async fn broker_close_cuts_the_redelivery_backoff_short() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("connect inmemory");
+    broker
+        .topology()
+        .declare::<BrokerCloseBackoffTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<BrokerCloseBackoffTopic>(&publisher, 0..3).await;
+
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Retry, Outcome::Retry]);
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<BrokerCloseBackoffTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(3)
+                        .with_max_batch_age(Duration::from_secs(30))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    // First flush returns `Retry`: the batch is now sleeping the 1s initial
+    // backoff, about to redeliver and flush a second time, escalating to 2s.
+    assert!(handler.wait_for_batches(1, TIMEOUT).await);
+
+    // Closing the broker here — never the per-consumer `shutdown` token —
+    // must be enough on its own. Whichever backoff sleep is in flight when
+    // this lands (1s or the escalated 2s), the consumer must stop promptly
+    // rather than sleeping it out: the redelivery itself still happens
+    // (unconditionally, after the race), only the delay is cut.
+    let closed_at = Instant::now();
+    broker.close().await;
+
+    tokio::time::timeout(Duration::from_millis(500), handle)
+        .await
+        .expect(
+            "broker close must cut the redelivery backoff short, not stall \
+             the consumer for the rest of the (up to 2s) escalated delay",
+        )
+        .expect("consumer task must not panic")
+        .ok();
+
+    assert!(
+        closed_at.elapsed() < Duration::from_millis(500),
+        "broker close took {:?} to take effect",
+        closed_at.elapsed()
+    );
+}
+
+/// Every envelope requeued by `Redeliver` must be marked redelivered —
+/// mirroring the single-message `Defer` nak-in-place convention — so
+/// `MessageMetadata::delivery_count` actually climbs across a batch-wide
+/// redelivery instead of reading `Some(1)` forever.
+#[tokio::test]
+async fn redelivery_increments_delivery_count_for_every_envelope() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("connect inmemory");
+    broker
+        .topology()
+        .declare::<DeliveryCountTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+    publish_seq::<DeliveryCountTopic>(&publisher, 0..2).await;
+
+    let handler = DeliveryCountRecordingHandler::new().scripting([Outcome::Retry]);
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<DeliveryCountTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(2)
+                        .with_max_batch_age(Duration::from_secs(30))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    assert!(handler.wait_for_batches(2, TIMEOUT).await);
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let batches = handler.batches();
+    assert_eq!(batches.len(), 2, "got {batches:?}");
+
+    let mut first = batches[0].clone();
+    first.sort_by_key(|(seq, _)| *seq);
+    assert_eq!(
+        first,
+        vec![(0, Some(1)), (1, Some(1))],
+        "the first delivery must report delivery_count == 1"
+    );
+
+    let mut second = batches[1].clone();
+    second.sort_by_key(|(seq, _)| *seq);
+    assert_eq!(
+        second,
+        vec![(0, Some(2)), (1, Some(2))],
+        "every envelope in a redelivered batch must have delivery_count \
+         incremented, not stuck at 1"
+    );
+    broker.close().await;
+}
+
+/// A pre-handler drop with a DLQ configured is *parked*, not destroyed, and
+/// must travel with the rest of the batch through a `Retry` in true arrival
+/// order. The pre-fix redelivery order was `[handled..][parked..]`
+/// unconditionally, so poison that arrived *first* would permanently drop
+/// behind messages that arrived after it.
+///
+/// Detected by re-consuming the redelivered queue with a `max_batch_size`
+/// small enough that where poison sits changes which handled message shares
+/// its flush: with poison correctly in front, it consumes one of the two
+/// size-cap slots in the very next flush, leaving only `seq=0` in it. With
+/// poison wrongly shoved to the back, both handled messages fill that flush
+/// together and poison is deferred to one of its own.
+#[tokio::test]
+async fn poison_keeps_its_arrival_position_across_a_retry() {
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("connect inmemory");
+    broker
+        .topology()
+        .declare::<RedeliveryOrderTopic>()
+        .await
+        .unwrap();
+    let publisher = broker.publisher().await.unwrap();
+
+    // Poison arrives first — oversized under the `with_max_message_size`
+    // both consumer phases below set, so it is parked (not decoded) on every
+    // pop, forever.
+    let poison = BatchMessage {
+        seq: 999,
+        padding: "x".repeat(4096),
+    };
+    publisher
+        .publish::<RedeliveryOrderTopic>(&poison)
+        .await
+        .unwrap();
+    publish_seq::<RedeliveryOrderTopic>(&publisher, 0..2).await;
+
+    // Phase 1: gather all three (poison + seq 0 + seq 1) into one flush and
+    // force exactly one whole-batch redelivery.
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Retry]);
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<RedeliveryOrderTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(3)
+                        .with_max_batch_age(Duration::from_secs(30))
+                        .with_max_message_size(512)
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    assert!(handler.wait_for_batches(1, TIMEOUT).await);
+    assert_eq!(sorted(&handler.batches()[0]), vec![0, 1]);
+    // The redelivery always happens regardless of when `shutdown` fires (see
+    // `flush_inmemory_batch`'s `Redeliver` arm: the requeue is unconditional
+    // after the backoff race) — cancelling here stops this consumer before
+    // it re-pops the just-requeued batch itself, so phase 2 below observes
+    // the redelivered queue order fresh.
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    // Phase 2: a fresh consumer with `max_batch_size(2)` re-reads the
+    // redelivered queue. Correct order (poison, seq0, seq1) spends one slot
+    // on poison, so the first flush the handler sees is `[0]` alone.
+    let handler2 = RecordingBatchHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = broker.batch_consumer();
+    let handle2 = tokio::spawn({
+        let handler2 = handler2.clone();
+        let shutdown2 = shutdown2.clone();
+        async move {
+            consumer2
+                .run::<RedeliveryOrderTopic, _>(
+                    handler2,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(2)
+                        .with_max_batch_age(Duration::from_millis(300))
+                        .with_max_message_size(512)
+                        .with_shutdown(shutdown2),
+                )
+                .await
+        }
+    });
+
+    assert!(handler2.wait_for_batches(1, TIMEOUT).await);
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
+
+    assert_eq!(
+        handler2.batches()[0],
+        vec![0],
+        "poison must keep its front-of-queue arrival position across the \
+         retry: the first post-redelivery flush should spend one of its two \
+         size-cap slots on poison, leaving seq=0 alone in it, got {:?}",
+        handler2.batches()
     );
     broker.close().await;
 }

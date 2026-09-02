@@ -26,12 +26,22 @@
 //!
 //! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
 //! "inmemory"))]`: both backends now have a batch-consumption implementation
-//! and share this settlement machinery. The gate widens per-backend as
-//! T2–T5 land in turn — NATS, RabbitMQ, Redis, SQS each add their own
-//! feature to the list the moment their `BatchConsumerImpl` exists, exactly
-//! as `broadcast.rs`'s gate widened backend by backend. `kafka` itself must
-//! never leave the list while it stands, per the single-message dependency
-//! noted above.
+//! and share the flush-invoking/backoff machinery
+//! ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
+//! [`BATCH_REDELIVERY_BACKOFF_MAX`]). The gate widens per-backend as T2–T5
+//! land in turn — NATS, RabbitMQ, Redis, SQS each add their own feature to
+//! the list the moment their `BatchConsumerImpl` exists, exactly as
+//! `broadcast.rs`'s gate widened backend by backend.
+//!
+//! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
+//! narrower still: `#[cfg(feature = "kafka")]` *inside* that `any(kafka,
+//! inmemory)` module, because InMemory settles a reject the instant its DLQ
+//! hand-off resolves (see `backends::inmemory::consumer::resolve_reject`) and
+//! has no later commit that could still fail — it never needed the
+//! held-until-confirmed shape this trio exists for. This is deferred-
+//! settlement machinery, kafka-only until a deferred-settlement backend
+//! (NATS, RabbitMQ or Redis, in T2–T4) lands and widens it — and even then,
+//! per the module doc above, never below `kafka`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -235,6 +245,12 @@ mod settling {
     /// Which settle method applies is decided where the outcome is routed,
     /// not where the commit lands, so the choice travels with the pending
     /// record.
+    ///
+    /// `kafka`-only: deferred settlement exists because Kafka's offset commit
+    /// is the one point in either backend's batch path where the retirement
+    /// can still fail after the terminal decision is made. See the module
+    /// doc's gating note.
+    #[cfg(feature = "kafka")]
     pub(crate) enum TerminalDiscard {
         /// Dead-lettered, or terminal on a topic with no DLQ. Counts only
         /// when no DLQ exists — with one, the message is still in it.
@@ -244,6 +260,7 @@ mod settling {
         Lost(metrics::PendingDiscard),
     }
 
+    #[cfg(feature = "kafka")]
     impl TerminalDiscard {
         /// The commit landed: the message is genuinely gone.
         pub(crate) fn confirm(self) {
@@ -254,13 +271,6 @@ mod settling {
         }
 
         /// The commit did not land, so the message will be redelivered.
-        ///
-        /// Kafka-only in practice: its offset commit is the one settlement
-        /// point in either backend's batch path that can fail after the
-        /// terminal decision is made. InMemory retires a rejected message the
-        /// instant its DLQ hand-off resolves — there is no later commit that
-        /// could still fail — so under `inmemory` alone this has no caller.
-        #[allow(dead_code)]
         pub(crate) fn survived(self) {
             match self {
                 Self::Retired(pending) | Self::Lost(pending) => pending.survived(),
@@ -274,6 +284,9 @@ mod settling {
     /// drift: the decision depends only on whether the topology declares a
     /// DLQ and whether this message's publish to it landed, never on which
     /// path asked.
+    ///
+    /// `kafka`-only: see [`TerminalDiscard`]'s doc for why.
+    #[cfg(feature = "kafka")]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum RejectSettlement {
         /// It is in the DLQ, so it exists whatever the commit does. Settle
@@ -294,6 +307,7 @@ mod settling {
     /// `reached_dlq` is meaningful only when `has_dlq`; with no DLQ declared
     /// there was no publish to succeed or fail, and the message is simply
     /// dropped.
+    #[cfg(feature = "kafka")]
     pub(crate) fn reject_settlement(has_dlq: bool, reached_dlq: bool) -> RejectSettlement {
         match (has_dlq, reached_dlq) {
             (false, _) => RejectSettlement::Retired,
@@ -307,8 +321,10 @@ mod settling {
     const BATCH_REDELIVERY_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 
     /// Ceiling on the redelivery delay for a handler that keeps returning
-    /// non-Ack.
-    const BATCH_REDELIVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+    /// non-Ack. Exposed (`pub(crate)`) so a backend's own `Redeliver` arm can
+    /// fall back to it instead of stranding a second copy of the literal —
+    /// see `backends::inmemory::consumer::flush_inmemory_batch`.
+    pub(crate) const BATCH_REDELIVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
     /// Redelivery backoff schedule for a batch the handler did not Ack.
     /// Escalates across *consecutive* non-Ack flushes and is reset on the
@@ -419,7 +435,7 @@ mod settling {
     /// single-message `route_outcome` and the batch `flush_batch` reject arm
     /// route through it, so the two paths cannot drift the way earlier
     /// cross-backend fixes did.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "kafka"))]
     mod reject_settlement_tests {
         use super::*;
 
@@ -646,7 +662,12 @@ mod settling {
 }
 
 #[cfg(any(feature = "kafka", feature = "inmemory"))]
-pub(crate) use settling::{
-    RejectSettlement, TerminalDiscard, batch_redelivery_backoff, invoke_batch_handler,
-    reject_settlement,
-};
+pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler};
+
+// Only InMemory's `Redeliver` arm reaches for the constant directly; Kafka
+// gets its ceiling through `batch_redelivery_backoff()` instead.
+#[cfg(feature = "inmemory")]
+pub(crate) use settling::BATCH_REDELIVERY_BACKOFF_MAX;
+
+#[cfg(feature = "kafka")]
+pub(crate) use settling::{RejectSettlement, TerminalDiscard, reject_settlement};

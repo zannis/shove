@@ -280,5 +280,126 @@ async fn batch_metrics_match_the_documented_contract() {
         "message_size must sample every popped message, oversized ones included"
     );
 
+    // This topology declares a DLQ, so the oversized pre-handler drop is
+    // parked and dead-lettered rather than discarded — `pending_discard`'s
+    // `confirm()` must be a no-op here. Pinning this alongside the no-DLQ
+    // case below is what proves the `has_dlq` branch, not just the discard
+    // path in isolation.
+    assert_eq!(
+        counter(
+            &snapshot,
+            "shove_messages_discarded_total",
+            &[("topic", QUEUE), ("reason", "oversize")],
+        ),
+        0,
+        "a topic with a DLQ must not count its pre-handler drop as discarded"
+    );
+
+    broker.close().await;
+}
+
+const NO_DLQ_QUEUE: &str = "inmem-metrics-batch-no-dlq";
+
+define_topic!(
+    MetricsBatchNoDlqTopic,
+    BatchMessage,
+    TopologyBuilder::new(NO_DLQ_QUEUE).build()
+);
+
+/// F3: a pre-handler drop (oversize, in this case) on a topology with **no**
+/// DLQ must move `shove_messages_discarded_total` exactly once, the same
+/// contract `metrics.rs` documents InMemory as completing (pre-handler drops
+/// included, unlike Kafka's terminal-outcome-only lower bound). Before the
+/// fix, a no-DLQ pre-handler drop in the batch path recorded the failure but
+/// never touched the discard counter at all — a silent gap in exactly the
+/// data-loss signal this metric exists to surface.
+#[tokio::test(flavor = "current_thread")]
+async fn no_dlq_pre_handler_drop_is_discarded_exactly_once() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter: Snapshotter = recorder.snapshotter();
+    recorder.install().expect("install debugging recorder");
+
+    let broker = Broker::<InMemory>::new(InMemoryConfig::default())
+        .await
+        .expect("connect inmemory");
+    broker
+        .topology()
+        .declare::<MetricsBatchNoDlqTopic>()
+        .await
+        .expect("declare");
+
+    let publisher = broker.publisher().await.expect("publisher");
+    publisher
+        .publish::<MetricsBatchNoDlqTopic>(&BatchMessage {
+            seq: 0,
+            padding: String::new(),
+        })
+        .await
+        .expect("publish");
+    publisher
+        .publish::<MetricsBatchNoDlqTopic>(&BatchMessage {
+            seq: 1,
+            padding: "x".repeat(4096),
+        })
+        .await
+        .expect("publish");
+
+    #[derive(Clone)]
+    struct AckHandler;
+    impl BatchMessageHandler<MetricsBatchNoDlqTopic> for AckHandler {
+        type Context = ();
+        async fn handle_batch(
+            &self,
+            _messages: Vec<(BatchMessage, MessageMetadata)>,
+            _: &(),
+        ) -> Outcome {
+            Outcome::Ack
+        }
+    }
+
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<MetricsBatchNoDlqTopic, _>(
+                    AckHandler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(2)
+                        .with_max_batch_age(Duration::from_millis(200))
+                        .with_max_message_size(512)
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    shutdown.cancel();
+    handle.await.unwrap().ok();
+
+    let snapshot = snapshotter.snapshot().into_hashmap();
+
+    assert_eq!(
+        counter(
+            &snapshot,
+            "shove_messages_failed_total",
+            &[("topic", NO_DLQ_QUEUE), ("reason", "oversize")],
+        ),
+        1,
+        "the oversized message must be recorded as failed"
+    );
+    assert_eq!(
+        counter(
+            &snapshot,
+            "shove_messages_discarded_total",
+            &[("topic", NO_DLQ_QUEUE), ("reason", "oversize")],
+        ),
+        1,
+        "a no-DLQ pre-handler drop must be counted as discarded exactly once"
+    );
+
     broker.close().await;
 }

@@ -382,28 +382,34 @@ impl InMemoryBroker {
     /// `envs` is pushed in reverse so the batch's original order is restored
     /// (each `push_front` puts one envelope ahead of whatever was pushed
     /// before it, so pushing the batch's *last* envelope first leaves the
-    /// *first* one at the very front). `ready` is notified once per envelope
-    /// rather than once total: a consumer parked on an empty buffer holds at
-    /// most one `Notify` permit, so restoring N messages with a single
-    /// `notify_one()` would only wake the pop loop for the first of them.
+    /// *first* one at the very front).
     ///
     /// Capacity is deliberately never re-checked here, unlike [`Self::enqueue`]:
-    /// every one of `envs` already held a buffer slot before `run_batch_impl`
-    /// popped it, so putting them back can only return the buffer to a size it
-    /// already reached once. Waiting for capacity instead would risk deadlock
-    /// if the queue filled back up to its cap while the batch was in flight —
-    /// there would be nothing left to redeliver the batch behind.
+    /// this only ever puts back a batch this same consumer just popped, but
+    /// by the time it runs, publishers may already have refilled the slots
+    /// each pop's `space.notify_one()` freed — so the buffer can genuinely
+    /// overshoot `capacity` by up to a batch's worth of envelopes. That
+    /// overshoot is deliberate and bounded (by `max_batch_size`, never
+    /// unbounded): waiting for capacity instead would risk deadlock, because
+    /// this consumer is the only task that could ever drain the buffer back
+    /// down, and it would be blocked waiting on itself to do it.
     pub(super) async fn requeue_front(&self, queue: &QueueState, envs: Vec<Envelope>) {
-        let count = envs.len();
         {
             let mut buf = queue.buffer.lock().await;
             for env in envs.into_iter().rev() {
                 buf.push_front(env);
             }
         }
-        for _ in 0..count {
-            queue.ready.notify_one();
-        }
+        // One wake is enough regardless of how many envelopes came back:
+        // `pop_one` loops and re-checks the buffer directly after each pop,
+        // so it drains the rest without needing a notification per envelope.
+        // `notify_waiters` covers a task already parked in
+        // `notified().await`; the extra `notify_one` leaves a stored permit
+        // for one that checked the (then-empty) buffer and is about to
+        // register as a waiter — the same check-then-register race
+        // `pop_one`'s own doc describes.
+        queue.ready.notify_waiters();
+        queue.ready.notify_one();
     }
 }
 
