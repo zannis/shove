@@ -49,10 +49,13 @@ async fn main() {
     // One metadata probe and one admin client serve the readiness wait and
     // every purge. Building them once avoids paying a client construction
     // (threads, TCP connect, bootstrap metadata) at every scenario boundary.
-    // The probe deliberately sets no `group.id`: it is never polled, and a
-    // group-configured rdkafka consumer redirects broker events onto a
-    // consumer queue nothing here would serve — a slow leak inside the very
-    // process whose RSS the bench reports.
+    // The probe deliberately sets no `group.id`: it is never subscribed, so a
+    // group would only add coordinator state for the purges to clean up.
+    // rdkafka still queues error/log events on the client's main queue and
+    // metadata fetches never serve it, so each purge drains it (before the
+    // topic wait below) — otherwise broker-flap noise would accumulate for
+    // the process lifetime inside the very process whose RSS the bench
+    // reports.
     let probe: Arc<BaseConsumer> = Arc::new(
         ClientConfig::new()
             .set("bootstrap.servers", &bootstrap)
@@ -117,36 +120,61 @@ async fn main() {
             // quietly resurrect one after the topics-are-gone check passed.
             // A group still refused at the deadline fails the purge loudly,
             // topics untouched, naming what the broker last reported.
+            //
+            // Only refusals that can still improve ride the deadline:
+            // `NonEmptyGroup` (the wait this loop exists for) and the
+            // coordinator-transient codes a broker answers with while it is
+            // still settling. Anything else — authorization, invalid group,
+            // unsupported API — would answer identically at the deadline, so
+            // it fails the purge immediately. Request-level failures do wait:
+            // this process owns the broker it started, so one that stops
+            // answering ends the run regardless, and a transient blip must
+            // not cost a scenario its matrix cell.
+            //
+            // Each admin RPC is capped so the deadline bounds this loop's
+            // actual wall clock — with no request timeout an admin call
+            // blocks up to librdkafka's 60 s `socket.timeout.ms` default
+            // against a hung broker, tripling the ceiling it promises.
+            let admin_opts = || AdminOptions::new().request_timeout(Some(ADMIN_RPC_TIMEOUT));
             let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
             let settle_started = std::time::Instant::now();
             loop {
-                let refused: Vec<String> =
-                    match admin.delete_groups(&group_refs, &AdminOptions::new()).await {
-                        Ok(results) => results
-                            .into_iter()
-                            .filter_map(|result| match result {
-                                Ok(_) => None,
-                                Err((_, RDKafkaErrorCode::GroupIdNotFound)) => None,
-                                Err((group, code)) => Some(format!("{group}: {code}")),
-                            })
-                            .collect(),
-                        Err(e) => vec![format!("delete request failed: {e}")],
-                    };
-                if refused.is_empty() {
+                let mut waiting: Vec<String> = Vec::new();
+                match admin.delete_groups(&group_refs, &admin_opts()).await {
+                    Ok(results) => {
+                        for result in results {
+                            match result {
+                                Ok(_) | Err((_, RDKafkaErrorCode::GroupIdNotFound)) => {}
+                                Err((
+                                    group,
+                                    code @ (RDKafkaErrorCode::NonEmptyGroup
+                                    | RDKafkaErrorCode::CoordinatorLoadInProgress
+                                    | RDKafkaErrorCode::CoordinatorNotAvailable
+                                    | RDKafkaErrorCode::NotCoordinator),
+                                )) => waiting.push(format!("{group}: {code}")),
+                                Err((group, code)) => {
+                                    return Err(format!("delete group {group}: {code}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => waiting.push(format!("delete request failed: {e}")),
+                }
+                if waiting.is_empty() {
                     break;
                 }
                 if settle_started.elapsed() >= GROUP_SETTLE_DEADLINE {
                     return Err(format!(
                         "delete groups: still refused after {:?}: {}",
                         settle_started.elapsed(),
-                        refused.join(", ")
+                        waiting.join(", ")
                     ));
                 }
                 tokio::time::sleep(GROUP_SETTLE_POLL).await;
             }
 
             let results = admin
-                .delete_topics(&topics, &AdminOptions::new())
+                .delete_topics(&topics, &admin_opts())
                 .await
                 .map_err(|e| format!("delete_topics: {e}"))?;
             for result in results {
@@ -165,6 +193,11 @@ async fn main() {
             let topic_probe = Arc::clone(&probe);
             let names: Vec<String> = topics.iter().map(|t| t.to_string()).collect();
             tokio::task::spawn_blocking(move || {
+                // Serve the probe's event queue while we are here: nothing
+                // else ever polls this consumer, so error/log events rdkafka
+                // queued during a broker flap would otherwise sit on it for
+                // the life of the process.
+                while topic_probe.poll(Duration::ZERO).is_some() {}
                 harness::await_drain(
                     || match topic_probe.fetch_metadata(None, PROBE_RPC_TIMEOUT) {
                         Ok(md) => md
@@ -294,6 +327,13 @@ const GROUP_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Poll interval of the purge's group-delete wait.
 const GROUP_SETTLE_POLL: Duration = Duration::from_millis(500);
+
+/// Per-request ceiling on the purge's admin RPCs. Without one, an admin call
+/// against a hung broker blocks up to librdkafka's `socket.timeout.ms`
+/// default (60 s) before the settle loop's deadline is even checked. Generous
+/// next to `PROBE_RPC_TIMEOUT` because a delete carries coordinator work a
+/// metadata fetch does not.
+const ADMIN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for the broker to answer its first metadata fetch at startup.
 const READY_DEADLINE: Duration = Duration::from_secs(60);

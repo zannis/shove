@@ -1619,11 +1619,14 @@ pub fn await_drain(
 }
 
 /// How long a scenario teardown waits for its consumer drivers to observe the
-/// stop signal and close cleanly before falling back to aborting them. An
-/// honest driver closes in well under a second; one still running after this
-/// is not going to honour the signal, and the purge's group-delete wait
-/// absorbs the member an abort leaves behind.
-const DRIVER_STOP_GRACE: Duration = Duration::from_secs(2);
+/// stop signal and close cleanly before falling back to aborting them. Sized
+/// for the slowest cooperative shutdown, not the common case: a batch driver
+/// cancelled with a redelivered residual buffer first flushes it through the
+/// handler (a heavy profile pays seconds there), and aborting that driver
+/// mid-close loses the LeaveGroup the graceful path exists to send. A driver
+/// still running past this is not going to honour the signal, and the purge's
+/// group-delete wait absorbs the member an abort leaves behind.
+const DRIVER_STOP_GRACE: Duration = Duration::from_secs(10);
 
 async fn run_scenario_publish<B, Connect, Fut>(
     hcfg: &HarnessConfig<B>,
@@ -2155,21 +2158,18 @@ where
     let resources = sampler.stop().await;
     let latencies = recorder.compute_percentiles().await;
 
-    // `run_dlq` takes no per-call shutdown token, but on Kafka it stops when
-    // its client shuts down — which is exactly what `broker.close()` does. So
-    // close first, then wait for the driver to exit and close its consumer
-    // cleanly (leaving its group at once) instead of aborting a live member
-    // into the next scenario's purge wait. A driver that ignores the close is
-    // aborted after the grace period; the count is already in `processed`, so
-    // nothing is lost either way.
+    // `run_dlq` takes no per-call shutdown token, and what stops it varies by
+    // backend: Kafka's exits when its client closes, while Redis's is
+    // documented to run until its task is aborted and cannot observe a close
+    // at all (a library gap — Kafka's `run_dlq_with_inner` likewise discards
+    // the `ConsumerOptions` shutdown token a caller supplies). With no
+    // portable stop signal, a grace period would be a guaranteed dead wait on
+    // the backends that cannot see it, so abort: the count is already in
+    // `processed`, nothing is lost, and the group member a Kafka abort leaves
+    // behind is exactly what the purge's group-delete wait absorbs.
+    drivers.abort_all();
+    while drivers.join_next().await.is_some() {}
     broker.close().await;
-    let graceful = async { while drivers.join_next().await.is_some() {} };
-    if tokio::time::timeout(DRIVER_STOP_GRACE, graceful)
-        .await
-        .is_err()
-    {
-        drivers.shutdown().await;
-    }
     outcome?;
 
     Ok(finish(scenario, duration, resources, latencies))
@@ -2287,8 +2287,21 @@ where
     // make the next scenario's purge race group membership. Grace-capped: a
     // driver stuck ignoring the token falls back to the old abort, and the
     // purge's group-delete wait absorbs the lingering member it leaves.
+    //
+    // The row's numbers are already snapshotted, so a driver error surfacing
+    // this late cannot fail the scenario — but it must not vanish either: the
+    // cooperative path is the first place a shutdown flush or final commit
+    // can fail (the identical failure a moment earlier fails the row).
     batch_stop.cancel();
-    let graceful = async { while drivers.join_next().await.is_some() {} };
+    let graceful = async {
+        while let Some(joined) = drivers.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("  warning: batch driver failed during teardown: {e}"),
+                Err(e) => eprintln!("  warning: batch driver panicked during teardown: {e}"),
+            }
+        }
+    };
     if tokio::time::timeout(DRIVER_STOP_GRACE, graceful)
         .await
         .is_err()
@@ -3986,9 +3999,7 @@ mod tests {
             payload_bytes: 64,
         };
 
-        let started = Arc::new(AtomicU64::new(0));
-        let clean_exits = Arc::new(AtomicU64::new(0));
-        let batch = counting_batch_fn(started, clean_exits.clone());
+        let (batch, _started, clean_exits) = counting_batch_fn();
 
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
         let cancel = CancellationToken::new();
@@ -4008,18 +4019,23 @@ mod tests {
     }
 
     /// A batch driver that honours the scenario stop token through the same
-    /// `ConsumerOptions::with_shutdown` mechanism real backends use, bumping
-    /// `started` on entry and `clean_exits` after its run returns. The short
-    /// post-run pause is the discriminator: a teardown that aborts instead of
-    /// joining kills the future inside the pause, so the exit never counts —
-    /// merely firing the token before an abort cannot fake a graceful join.
-    fn counting_batch_fn(
-        started: Arc<AtomicU64>,
-        clean_exits: Arc<AtomicU64>,
-    ) -> BatchConsumeFn<shove::InMemory> {
-        Box::new(move |client, handler, stop| {
-            let started = started.clone();
-            let clean_exits = clean_exits.clone();
+    /// `ConsumerOptions::with_shutdown` mechanism real backends use, returned
+    /// with the counters it owns: `started` bumps on entry, `clean_exits`
+    /// after its run returns. The short post-run pause is the discriminator:
+    /// a teardown that aborts instead of joining kills the future inside the
+    /// pause, so the exit never counts — merely firing the token before an
+    /// abort cannot fake a graceful join.
+    fn counting_batch_fn() -> (
+        BatchConsumeFn<shove::InMemory>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let started = Arc::new(AtomicU64::new(0));
+        let clean_exits = Arc::new(AtomicU64::new(0));
+        let (started_in, clean_exits_in) = (started.clone(), clean_exits.clone());
+        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler, stop| {
+            let started = started_in.clone();
+            let clean_exits = clean_exits_in.clone();
             Box::pin(async move {
                 started.fetch_add(1, Ordering::Relaxed);
                 let result = InMemoryConsumer::new(client)
@@ -4034,7 +4050,8 @@ mod tests {
                 clean_exits.fetch_add(1, Ordering::Relaxed);
                 result
             })
-        })
+        });
+        (batch, started, clean_exits)
     }
 
     // ── unsupported[] ──
@@ -4344,8 +4361,7 @@ mod tests {
             payload_bytes: 64,
         };
 
-        let started = Arc::new(AtomicU64::new(0));
-        let batch = counting_batch_fn(started.clone(), Arc::new(AtomicU64::new(0)));
+        let (batch, started, _clean_exits) = counting_batch_fn();
 
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
         let cancel = CancellationToken::new();
