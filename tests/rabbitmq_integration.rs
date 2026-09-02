@@ -6015,12 +6015,12 @@ async fn publisher_single_channel_pool_does_not_serialize_concurrent_publishes()
 ///   reaches 20) with a bounded redelivery allowance; DLQ contents are not
 ///   inspected here
 ///
-/// Scale-down and the `RabbitMqConsumerGroup::retiring` drain are pinned by
-/// that module's own `scale_down_*` unit tests (e.g.
-/// `scale_down_handle_is_drained_not_detached`) rather than exercised here:
-/// the management API's stats refresh lag — the reason for the pre-run sleep
-/// below — makes any bounded post-drain wait for ScaleDown load-sensitive,
-/// which is the defect class this test was rewritten to remove.
+/// Scale-down is not reached here at all: the management API's stats refresh
+/// lag — the reason for the pre-run sleep below — makes any bounded
+/// post-drain wait for ScaleDown load-sensitive, which is the defect class
+/// this test was rewritten to remove. The retiring bookkeeping it would
+/// drive is pinned by this backend's `scale_down_*` unit tests; real-broker
+/// scale-down coverage is tracked separately.
 #[tokio::test]
 async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
     use std::collections::HashSet;

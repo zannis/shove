@@ -3162,17 +3162,17 @@ shove::define_topic!(
 
 /// Autoscaling lifecycle: slow handlers + burst → `enable_autoscaling` →
 /// clean drain. Mirrors `autoscaling_scales_up_and_drains_clean` from
-/// `kafka_integration.rs` but exercises the NATS backend's `spawn_autoscaler`
-/// scale-up path against a real broker (a single consumer needs ~4 s for the
-/// backlog, while on a typical run scale-up fires within ~1 s of the first
-/// successful stats poll). Scale-up is exercised,
-/// not asserted — the generic `ConsumerGroup<B>` wrapper does not surface
-/// the backend registry's `active_consumers()`. Scale-down and the
-/// `NatsConsumerGroup::retiring` drain are pinned by that module's own
-/// `scale_down_*` unit tests (e.g. `scale_down_handle_is_drained_not_detached`)
-/// rather than exercised here: reaching ScaleDown after the drain needs
-/// stats round-trips, cooldown and hysteresis to line up inside a fixed
-/// post-drain window — the load-sensitive wait this test exists to remove.
+/// `kafka_integration.rs` but drives the NATS backend's `spawn_autoscaler`
+/// against a real broker: the backlog is 20 messages of 200 ms handler time
+/// behind one starting consumer — sustained pressure the autoscaler reacts
+/// to well before the drain can complete. Scale-up is exercised, not
+/// asserted — the generic `ConsumerGroup<B>` wrapper does not surface the
+/// backend registry's `active_consumers()`. Scale-down is not reached here
+/// at all: it would need stats round-trips, cooldown and hysteresis to line
+/// up inside a fixed post-drain window — the load-sensitive wait this test
+/// exists to remove. The retiring bookkeeping it would drive is pinned by
+/// this backend's `scale_down_*` unit tests; real-broker scale-down coverage
+/// is tracked separately.
 #[tokio::test]
 async fn autoscaling_scales_up_and_drains_clean() {
     use shove::AutoscalerConfig;
