@@ -46,24 +46,31 @@ async fn main() {
         .expect("failed to read Kafka port");
     let bootstrap = format!("127.0.0.1:{port}");
 
-    wait_until_ready(&bootstrap).await;
-
-    // One probe serves every purge's group-list and metadata polls: neither
-    // call subscribes, so the client never joins a group, and building it
-    // once avoids paying a client construction (threads, TCP connect,
-    // bootstrap metadata) at every scenario boundary.
-    let purge_probe: Arc<BaseConsumer> = Arc::new(
+    // One metadata probe and one admin client serve the readiness wait and
+    // every purge. Building them once avoids paying a client construction
+    // (threads, TCP connect, bootstrap metadata) at every scenario boundary.
+    // The probe deliberately sets no `group.id`: it is never polled, and a
+    // group-configured rdkafka consumer redirects broker events onto a
+    // consumer queue nothing here would serve — a slow leak inside the very
+    // process whose RSS the bench reports.
+    let probe: Arc<BaseConsumer> = Arc::new(
         ClientConfig::new()
             .set("bootstrap.servers", &bootstrap)
-            .set("group.id", "shove-stress-purge-probe")
             .create()
-            .expect("build purge probe consumer"),
+            .expect("build metadata probe consumer"),
+    );
+    let admin: Arc<AdminClient<DefaultClientContext>> = Arc::new(
+        ClientConfig::new()
+            .set("bootstrap.servers", &bootstrap)
+            .create()
+            .expect("build admin client"),
     );
 
-    let purge_bootstrap = bootstrap.clone();
+    wait_until_ready(&probe).await;
+
     let purge: harness::PurgeFn = Box::new(move |topology| {
-        let bootstrap = purge_bootstrap.clone();
-        let probe = Arc::clone(&purge_probe);
+        let probe = Arc::clone(&probe);
+        let admin = Arc::clone(&admin);
         Box::pin(async move {
             // Delete the topology's topics AND the consumer groups derived
             // from them. The topic delete on its own resets storage and lets
@@ -78,11 +85,6 @@ async fn main() {
             // Every name is derived from the topology handed in, so the seq
             // and broadcast topologies get purged too — not just the main
             // topic this wrapper happens to name in a constant.
-            let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
-                .set("bootstrap.servers", &bootstrap)
-                .create()
-                .map_err(|e| format!("build admin client: {e}"))?;
-
             let mut topics: Vec<&str> = vec![topology.queue()];
             // `{queue}-consumer` / `{queue}-fifo` mirror shove's derived
             // group ids (src/backends/kafka/constants.rs).
@@ -95,55 +97,53 @@ async fn main() {
                 groups.push(format!("{dlq}-consumer"));
             }
 
-            // Wait for the previous scenario's members to leave this
-            // topology's groups before touching anything else. The order
-            // matters twice over: `DeleteGroups` below refuses a group that
-            // still has members (`NonEmptyGroup`), and a member that still
-            // exists is subscribed by name to the topics about to be deleted
-            // — a named metadata fetch auto-creates topics on this broker's
-            // defaults, so deleting topics first would let a lingering member
-            // quietly resurrect one after the "topics are gone" check passed.
+            // Delete the groups first, waiting out membership through the
+            // delete itself: `DeleteGroups` refuses a group that still has
+            // members (`NonEmptyGroup`), which makes the broker the authority
+            // on "have they left" — no hand-modelled group-state predicate to
+            // drift out of sync with it. Members normally leave the moment
+            // their scenario tears down (drivers are stopped cleanly now); one
+            // that lost its LeaveGroup ages out at the 10 s consumer session
+            // timeout (`SESSION_TIMEOUT_MS`, src/backends/kafka/constants.rs),
+            // so a deadline is what the old fixed retry count was not: sized
+            // to the failure mode, and paid only when something actually
+            // lingers. `GroupIdNotFound` is the common clean case — most
+            // scenarios never create the fifo or DLQ groups at all.
             //
-            // The batch teardown now stops its drivers cleanly, so the common
-            // case sees every group already settled on the first poll. The
-            // drain pays real time only when a LeaveGroup was lost — that
-            // member ages out at the 10 s consumer session timeout
-            // (`SESSION_TIMEOUT_MS`, src/backends/kafka/constants.rs) — or a
-            // consumer genuinely leaked, which never drains and is why the
-            // ceiling stays tight rather than generous.
-            //
-            // A drain failure is carried into the delete below instead of
-            // aborting the purge: the delete tolerates an absent group, so a
-            // drain that failed only because the broker would not answer the
-            // list call must not fail a purge the delete would complete.
-            let drain_probe = Arc::clone(&probe);
-            let drain_names = groups.clone();
-            let drain_result = tokio::task::spawn_blocking(move || {
-                harness::await_drain(
-                    || match drain_probe.fetch_group_list(None, PROBE_RPC_TIMEOUT) {
-                        Ok(list) => drain_names
-                            .iter()
-                            .filter_map(|group| {
-                                list.groups()
-                                    .iter()
-                                    .find(|g| g.name() == group.as_str())
-                                    .and_then(|g| {
-                                        harness::kafka_group_undrained(
-                                            group,
-                                            g.members().len(),
-                                            g.state(),
-                                        )
-                                    })
+            // This runs before the topic delete on purpose: a member that
+            // still exists is subscribed by name to the topics below, and a
+            // named metadata fetch auto-creates topics on this broker's
+            // defaults — deleting topics first would let a lingering member
+            // quietly resurrect one after the topics-are-gone check passed.
+            // A group still refused at the deadline fails the purge loudly,
+            // topics untouched, naming what the broker last reported.
+            let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
+            let settle_started = std::time::Instant::now();
+            loop {
+                let refused: Vec<String> =
+                    match admin.delete_groups(&group_refs, &AdminOptions::new()).await {
+                        Ok(results) => results
+                            .into_iter()
+                            .filter_map(|result| match result {
+                                Ok(_) => None,
+                                Err((_, RDKafkaErrorCode::GroupIdNotFound)) => None,
+                                Err((group, code)) => Some(format!("{group}: {code}")),
                             })
                             .collect(),
-                        Err(e) => vec![format!("membership list failed: {e}")],
-                    },
-                    GROUP_DRAIN_DEADLINE,
-                    GROUP_DRAIN_POLL,
-                )
-            })
-            .await
-            .map_err(|e| format!("group drain task: {e}"))?;
+                        Err(e) => vec![format!("delete request failed: {e}")],
+                    };
+                if refused.is_empty() {
+                    break;
+                }
+                if settle_started.elapsed() >= GROUP_SETTLE_DEADLINE {
+                    return Err(format!(
+                        "delete groups: still refused after {:?}: {}",
+                        settle_started.elapsed(),
+                        refused.join(", ")
+                    ));
+                }
+                tokio::time::sleep(GROUP_SETTLE_POLL).await;
+            }
 
             let results = admin
                 .delete_topics(&topics, &AdminOptions::new())
@@ -183,46 +183,7 @@ async fn main() {
             .await
             .map_err(|e| format!("purge probe task: {e}"))?
             .map_err(|e| format!("topic delete: {e}"))?;
-            // Leftover group state (offsets, rebalance epoch, dead members)
-            // skews the next scenario, so a failed delete is a dirty
-            // boundary, not a shrug. The drain normally saw every group
-            // settle before the topics were touched; this bounded retry is
-            // the final arbiter, kept at full size because it also backstops
-            // what the drain cannot see — rdkafka's group list carries no
-            // per-group error field, so a coordinator error placeholder can
-            // slip a not-actually-clean group through to here.
-            let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
-            let mut last_err = None;
-            for attempt in 0..10 {
-                match admin.delete_groups(&group_refs, &AdminOptions::new()).await {
-                    Ok(results) => {
-                        let failed: Vec<String> = results
-                            .into_iter()
-                            .filter_map(|result| match result {
-                                Ok(_) => None,
-                                Err((_, RDKafkaErrorCode::GroupIdNotFound)) => None,
-                                Err((group, code)) => Some(format!("{group}: {code}")),
-                            })
-                            .collect();
-                        if failed.is_empty() {
-                            last_err = None;
-                            break;
-                        }
-                        last_err = Some(failed.join(", "));
-                    }
-                    Err(e) => last_err = Some(e.to_string()),
-                }
-                if attempt + 1 < 10 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-            match (last_err, drain_result) {
-                (None, _) => Ok(()),
-                (Some(delete), Ok(())) => Err(format!("delete groups: {delete}")),
-                (Some(delete), Err(drain)) => Err(format!(
-                    "delete groups: {delete} (membership drain: {drain})"
-                )),
-            }
+            Ok(())
         })
     });
 
@@ -304,36 +265,41 @@ async fn main() {
 /// the broker may still be coming up internally and reject the first
 /// connection attempts. Without this wait, the first scenario eats the
 /// startup latency inside its measurement window.
-async fn wait_until_ready(bootstrap: &str) {
-    let probe: BaseConsumer = ClientConfig::new()
-        .set("bootstrap.servers", bootstrap)
-        .set("group.id", "shove-stress-probe")
-        .create()
-        .expect("build Kafka probe consumer");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        match probe.fetch_metadata(None, Duration::from_secs(2)) {
-            Ok(md) if !md.brokers().is_empty() => return,
-            _ if std::time::Instant::now() >= deadline => {
-                panic!("Kafka broker did not become ready within 60s")
-            }
-            _ => tokio::time::sleep(Duration::from_millis(200)).await,
-        }
-    }
+async fn wait_until_ready(probe: &Arc<BaseConsumer>) {
+    let probe = Arc::clone(probe);
+    tokio::task::spawn_blocking(move || {
+        harness::await_drain(
+            || match probe.fetch_metadata(None, PROBE_RPC_TIMEOUT) {
+                Ok(md) if !md.brokers().is_empty() => Vec::new(),
+                Ok(_) => vec!["no brokers in metadata yet".to_string()],
+                Err(e) => vec![format!("metadata fetch failed: {e}")],
+            },
+            READY_DEADLINE,
+            READY_POLL,
+        )
+    })
+    .await
+    .expect("readiness probe task")
+    .unwrap_or_else(|e| panic!("Kafka broker did not become ready: {e}"));
 }
 
-/// Ceiling on the purge's group-membership drain. The drain returns the
-/// moment every group reports settled, so this bounds pathology only: a lost
+/// Ceiling on the purge's group-delete wait. The wait ends the moment the
+/// broker accepts every delete, so this bounds pathology only: a lost
 /// LeaveGroup ages out at the 10 s consumer session timeout
 /// (`SESSION_TIMEOUT_MS` in `src/backends/kafka/constants.rs`), covered here
 /// three times over, while a genuinely leaked consumer keeps heartbeating and
-/// can never drain — a tight ceiling is what stops one leak from stalling
+/// can never settle — a tight ceiling is what stops one leak from stalling
 /// every remaining scenario for minutes.
-const GROUP_DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+const GROUP_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Poll interval of the group-membership drain.
-const GROUP_DRAIN_POLL: Duration = Duration::from_millis(500);
+/// Poll interval of the purge's group-delete wait.
+const GROUP_SETTLE_POLL: Duration = Duration::from_millis(500);
+
+/// Deadline for the broker to answer its first metadata fetch at startup.
+const READY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Poll interval of the startup readiness wait.
+const READY_POLL: Duration = Duration::from_millis(200);
 
 /// Deadline for deleted topics to actually disappear — topic deletion is
 /// asynchronous broker-side, the admin response only accepts the request.
