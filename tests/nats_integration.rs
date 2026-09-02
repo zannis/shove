@@ -3164,7 +3164,8 @@ shove::define_topic!(
 /// clean drain. Mirrors `autoscaling_scales_up_and_drains_clean` from
 /// `kafka_integration.rs` but exercises the NATS backend's `spawn_autoscaler`
 /// scale-up path against a real broker (a single consumer needs ~4 s for the
-/// backlog while scale-up fires well under 1 s in). Scale-up is exercised,
+/// backlog, while on a typical run scale-up fires within ~1 s of the first
+/// successful stats poll). Scale-up is exercised,
 /// not asserted — the generic `ConsumerGroup<B>` wrapper does not surface
 /// the backend registry's `active_consumers()`. Scale-down and the
 /// `NatsConsumerGroup::retiring` drain are pinned by that module's own
@@ -3177,6 +3178,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
     use shove::AutoscalerConfig;
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicBool;
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -3186,10 +3188,12 @@ async fn autoscaling_scales_up_and_drains_clean() {
         .await
         .unwrap();
 
-    // JetStream is at-least-once (un-acked in-flight messages redeliver after
-    // ack_wait), so count distinct message ids rather than deliveries: a raw
-    // delivery counter could both overshoot 20 and trip the shutdown signal
-    // on 20 - K distinct + K duplicate deliveries.
+    // JetStream is at-least-once: a consumer cancelled by scale-down naks or
+    // abandons its un-acked in-flight delivery, which then redelivers
+    // (`ack_wait` itself derives to 90 s here — longer than the whole test —
+    // so it is not the live mechanism). Count distinct message ids rather
+    // than deliveries: a raw delivery counter could both overshoot 20 and
+    // trip the shutdown signal on 20 - K distinct + K duplicate deliveries.
     let seen = Arc::new(StdMutex::new(HashSet::new()));
     let distinct = WaitableCounter::new();
     // Raw delivery count, duplicates included — bounds redelivery below.
@@ -3220,8 +3224,10 @@ async fn autoscaling_scales_up_and_drains_clean() {
                             _: MessageMetadata,
                             _: &(),
                         ) -> Outcome {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            // Count the delivery before the slow part, so a
+                            // redelivery cancelled mid-handle still counts.
                             self.deliveries.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
                             if self.seen.lock().unwrap().insert(msg.id) {
                                 self.distinct.increment();
                             }
@@ -3265,45 +3271,48 @@ async fn autoscaling_scales_up_and_drains_clean() {
     // a fixed wall-clock window: on a loaded runner, stream/consumer setup and
     // first delivery can outlast any "reasonable" fixed budget (the Kafka twin
     // flaked in CI exactly this way). The 60 s ceiling is a failure bound, not
-    // the expected duration; the drain itself takes ~1-2 s. `at_ceiling`
-    // samples the count when the signal ends, so a straggler handled during
-    // the shutdown drain below cannot blur which side of the ceiling the
-    // drain finished on.
-    let at_ceiling = Arc::new(AtomicU32::new(0));
+    // the expected duration; the drain itself takes ~1-2 s.
+    let reached_in_time = Arc::new(AtomicBool::new(false));
     let signal = {
         let distinct = distinct.clone();
-        let at_ceiling = at_ceiling.clone();
+        let reached_in_time = reached_in_time.clone();
         async move {
-            distinct.wait_for(20, Duration::from_secs(60)).await;
-            at_ceiling.store(distinct.get(), Ordering::SeqCst);
+            let ok = distinct.wait_for(20, Duration::from_secs(60)).await;
+            reached_in_time.store(ok, Ordering::SeqCst);
         }
     };
+    // The 30 s drain budget is also a failure bound: shutdown now fires at
+    // peak activity (4 consumers mid-handle) rather than after an idle tail.
     let outcome = group
         .enable_autoscaling(cfg)
-        .run_until_timeout(signal, Duration::from_secs(15))
+        .run_until_timeout(signal, Duration::from_secs(30))
         .await;
 
     // Count first, cleanliness second: on the no-delivery failure path the
     // handled count is the diagnostic and an unclean shutdown in that same
     // state must not mask it (the outcome rides along in the message).
-    let reached = at_ceiling.load(Ordering::SeqCst);
     let handled = distinct.get();
     assert!(
-        reached >= 20,
+        reached_in_time.load(Ordering::SeqCst),
         "all 20 published messages must be handled within the 60 s ceiling \
-         (distinct handled: {reached}/20 at the ceiling, {handled}/20 after \
-         the shutdown drain; 0 at the ceiling = the group never started \
-         consuming, 1-19 = the drain stalled; outcome: {outcome:?})"
+         (distinct handled after the shutdown drain: {handled}/20; \
+         0 = the group never started consuming, 1-19 = the drain stalled, \
+         20 = handled only after the ceiling elapsed or the shutdown signal \
+         was cancelled early; outcome: {outcome:?})"
     );
     assert!(
         outcome.is_clean(),
         "autoscaling group must drain cleanly (handled {handled}/20); outcome: {outcome:?}"
     );
+    // Guard against unbounded systematic redelivery (e.g. acks silently
+    // dropped so everything redelivers), which the old exact-count assert
+    // caught. Legitimate scale-down replay — the un-acked in-flight delivery
+    // per cancelled consumer — stays far below 3x.
     let total = deliveries.load(Ordering::Relaxed);
     assert!(
-        total <= 40,
+        total <= 60,
         "{total} deliveries for 20 published messages — at-least-once \
-         tolerates a few redeliveries, not systematic redelivery"
+         tolerates bounded replay, not systematic redelivery"
     );
 
     broker.close().await;

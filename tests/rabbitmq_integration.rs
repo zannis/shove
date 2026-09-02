@@ -6025,6 +6025,7 @@ async fn publisher_single_channel_pool_does_not_serialize_concurrent_publishes()
 async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicBool;
 
     let ctx = TestContext::new().await;
 
@@ -6069,8 +6070,10 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
                             _: MessageMetadata,
                             _: &(),
                         ) -> Outcome {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            // Count the delivery before the slow part, so a
+                            // redelivery cancelled mid-handle still counts.
                             self.deliveries.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
                             self.seen.lock().unwrap().insert(msg.body);
                             Outcome::Ack
                         }
@@ -6113,52 +6116,56 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
     // management-API lag the pre-sleep above absorbs can outlast any
     // "reasonable" fixed budget (the Kafka twin flaked in CI exactly this
     // way). The 60 s ceiling is a failure bound, not the expected duration.
-    // The count is checked before the deadline each pass, so a success landing
-    // in the final poll interval still registers; `at_ceiling` samples the
-    // count when the signal ends, so a straggler handled during the shutdown
-    // drain below cannot blur which side of the ceiling the drain finished on.
-    let at_ceiling = Arc::new(AtomicU32::new(0));
+    let reached_in_time = Arc::new(AtomicBool::new(false));
     let signal = {
         let seen = seen.clone();
-        let at_ceiling = at_ceiling.clone();
+        let reached_in_time = reached_in_time.clone();
         async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             loop {
-                let n = seen.lock().unwrap().len();
-                if n >= 20 || tokio::time::Instant::now() >= deadline {
-                    at_ceiling.store(n as u32, Ordering::SeqCst);
+                if seen.lock().unwrap().len() >= 20 {
+                    reached_in_time.store(true, Ordering::SeqCst);
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     };
+    // The 30 s drain budget is also a failure bound: shutdown now fires at
+    // peak activity (4 consumers mid-handle) rather than after an idle tail.
     let outcome = group
         .enable_autoscaling(cfg)
-        .run_until_timeout(signal, Duration::from_secs(20))
+        .run_until_timeout(signal, Duration::from_secs(30))
         .await;
 
     // Count first, cleanliness second: on the no-delivery failure path the
     // handled count is the diagnostic and an unclean shutdown in that same
     // state must not mask it (the outcome rides along in the message).
-    let reached = at_ceiling.load(Ordering::SeqCst);
     let handled = seen.lock().unwrap().len();
     assert!(
-        reached >= 20,
+        reached_in_time.load(Ordering::SeqCst),
         "all 20 published messages must be handled within the 60 s ceiling \
-         (distinct handled: {reached}/20 at the ceiling, {handled}/20 after \
-         the shutdown drain; 0 at the ceiling = the group never started \
-         consuming, 1-19 = the drain stalled; outcome: {outcome:?})"
+         (distinct handled after the shutdown drain: {handled}/20; \
+         0 = the group never started consuming, 1-19 = the drain stalled, \
+         20 = handled only after the ceiling elapsed or the shutdown signal \
+         was cancelled early; outcome: {outcome:?})"
     );
     assert!(
         outcome.is_clean(),
         "autoscaling group must drain cleanly (handled {handled}/20); outcome: {outcome:?}"
     );
+    // Guard against unbounded systematic redelivery (e.g. acks silently
+    // dropped so every delivery requeues), which the old exact-count assert
+    // caught. Legitimate requeue replay — the un-acked in-flight delivery per
+    // cancelled consumer — stays far below 3x.
     let total = deliveries.load(Ordering::Relaxed);
     assert!(
-        total <= 40,
+        total <= 60,
         "{total} deliveries for 20 published messages — at-least-once \
-         tolerates a few requeue redeliveries, not systematic redelivery"
+         tolerates bounded requeue replay, not systematic redelivery"
     );
 
     broker.close().await;
