@@ -26,7 +26,6 @@ use futures_util::StreamExt;
 use redis::aio::MultiplexedConnection;
 use serde::{Deserialize, Serialize};
 use testcontainers::ImageExt;
-use testcontainers::core::ContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis as RedisContainer};
 use tokio::sync::Notify;
@@ -41,7 +40,7 @@ use shove::markers::Redis;
 use shove::metadata::MessageMetadata;
 use shove::outcome::Outcome;
 use shove::publisher::Publisher;
-use shove::redis::{RedisConfig, RedisMode, spawn_reaper};
+use shove::redis::{RedisClient, RedisConfig, RedisMode, spawn_reaper};
 use shove::topic::{NotSequenced, Topic};
 use shove::topology::{QueueTopology, SequenceFailure, TopologyBuilder};
 use shove::{Backend, BatchConsumerOptions, Broker, define_topic};
@@ -154,7 +153,7 @@ async fn raw_conn(url: &str) -> MultiplexedConnection {
     unreachable!()
 }
 
-async fn connect_client_with_retry(url: &str, group: &str) -> shove::redis::RedisClient {
+async fn connect_client_with_retry(url: &str, group: &str) -> RedisClient {
     for attempt in 0u32..5 {
         let cfg = RedisConfig::new(RedisMode::Standalone {
             url: url.to_owned(),
@@ -973,6 +972,19 @@ async fn defer_redelivers_like_retry() {
 async fn rejected_batch_with_dlq_lands_every_message_and_continues() {
     let broker = make_broker("batch-reject-dlq-grp").await;
     broker.topology().declare::<RejectDlqTopic>().await.unwrap();
+    // Declare the DLQ-drain consumer's group BEFORE anything is rejected:
+    // `XGROUP CREATE ... $` anchors the group's cursor at the stream's tail
+    // *at creation time*, so creating it after the reject already landed
+    // would miss those entries — they'd sit below the group's start id
+    // forever. Declaring it here, against an empty DLQ stream, means every
+    // later XADD is visible via `>` regardless of when the drain actually
+    // starts reading.
+    let dlq_group = make_broker("batch-reject-dlq-drain-grp").await;
+    dlq_group
+        .topology()
+        .declare::<RejectDlqDrainTopic>()
+        .await
+        .unwrap();
     let publisher = broker.publisher().await.unwrap();
     publish_seq::<RejectDlqTopic>(&publisher, 0..3).await;
     publish_seq::<RejectDlqTopic>(&publisher, 100..101).await;
@@ -1014,12 +1026,6 @@ async fn rejected_batch_with_dlq_lands_every_message_and_continues() {
     );
 
     let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    let dlq_group = make_broker("batch-reject-dlq-drain-grp").await;
-    dlq_group
-        .topology()
-        .declare::<RejectDlqDrainTopic>()
-        .await
-        .unwrap();
     let mut dlq = dlq_group.consumer_supervisor();
     dlq.register::<RejectDlqDrainTopic, _>(
         RawRecorder {
@@ -1277,6 +1283,15 @@ async fn handler_timeout_outcome_ack_makes_the_batch_gone() {
 async fn oversize_and_undecodable_never_reach_the_handler_and_dlq_once_each() {
     let broker = make_broker("batch-drop-grp").await;
     broker.topology().declare::<DropTopic>().await.unwrap();
+    // See `rejected_batch_with_dlq_lands_every_message_and_continues`'s
+    // comment: the DLQ-drain group must be declared before anything is
+    // dead-lettered, or `XGROUP CREATE ... $` anchors it past those entries.
+    let dlq_group = make_broker("batch-drop-dlq-drain-grp").await;
+    dlq_group
+        .topology()
+        .declare::<DropDlqRawTopic>()
+        .await
+        .unwrap();
 
     let publisher = broker.publisher().await.unwrap();
     publisher
@@ -1335,12 +1350,6 @@ async fn oversize_and_undecodable_never_reach_the_handler_and_dlq_once_each() {
     );
 
     let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    let dlq_group = make_broker("batch-drop-dlq-drain-grp").await;
-    dlq_group
-        .topology()
-        .declare::<DropDlqRawTopic>()
-        .await
-        .unwrap();
     let mut dlq = dlq_group.consumer_supervisor();
     dlq.register::<DropDlqRawTopic, _>(
         RawRecorder {

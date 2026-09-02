@@ -17,16 +17,16 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    RegistryImpl, TopologyImpl,
-    capability::{HasBroadcast, HasCoordinatedGroups},
+    AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
+    ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBatchConsumption, HasBroadcast, HasCoordinatedGroups},
     sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::Redis;
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 
 use super::autoscaler::{RedisAutoscalerBackend, XlenStatsProvider};
 use super::client::{RedisClient, RedisConfig};
@@ -112,6 +112,31 @@ impl BroadcastImpl for RedisConsumer {
         H: MessageHandler<T>,
     {
         RedisConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+}
+
+impl HasBatchConsumption for Redis {
+    // Same consumer type as every other Redis path — the batch loop needs no
+    // state the group/broadcast loops don't already carry.
+    type BatchConsumerImpl = RedisConsumer;
+
+    fn make_batch_consumer(client: &Self::Client) -> Self::BatchConsumerImpl {
+        RedisConsumer::new(client.clone())
+    }
+}
+
+impl BatchConsumerImpl for RedisConsumer {
+    async fn run_batch<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        RedisConsumer::run_batch_with_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

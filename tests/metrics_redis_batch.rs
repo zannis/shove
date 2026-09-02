@@ -14,8 +14,18 @@
 //!   `reason="rejected"` for the terminal retirement — **per message**.
 //! - `shove_message_size_bytes` samples every popped message, including one
 //!   the oversize gate drops before the handler ever sees it.
-//! - a no-DLQ pre-handler drop moves `shove_messages_discarded_total` exactly
-//!   once (the same F3 contract InMemory pins).
+//! - **Deviation from InMemory's F3 contract**: on Redis, a pre-handler drop
+//!   (oversize / undecodable / missing-payload) is settled through
+//!   `route_to_dlq` — reused verbatim from the single-message path, with or
+//!   without a DLQ declared — and neither of its branches ever touches
+//!   `shove_messages_discarded_total`; only `shove_messages_failed_total`
+//!   is recorded. That is pre-existing single-message behaviour (Redis's
+//!   pre-handler drops have never counted as a "discard", unlike InMemory's),
+//!   and the batch path correctly inherits it by reusing the same function
+//!   rather than reimplementing the write-back. So `discarded_total` for a
+//!   pre-handler drop is `0` in BOTH the with-DLQ and no-DLQ cases here —
+//!   the second test below pins that this holds without a DLQ too, not just
+//!   with one.
 //!
 //! Uses `metrics-util::debugging::DebuggingRecorder`, which takes the global
 //! recorder slot — keep this in its own integration binary, install it
@@ -187,9 +197,11 @@ async fn batch_metrics_match_the_documented_contract() {
                     handler,
                     (),
                     BatchConsumerOptions::new()
-                        // flush_len (2 decoded + 1 dropped) reaches this
-                        // exactly once — no second flush to confuse the count.
-                        .with_max_batch_size(3)
+                        // Unlike InMemory, a pre-handler drop (the oversized
+                        // message) settles immediately and never joins the
+                        // batch, so it does not count toward the size
+                        // trigger here — only the 2 decoded messages do.
+                        .with_max_batch_size(2)
                         .with_max_batch_age(Duration::from_secs(30))
                         .with_max_message_size(512)
                         .with_handler_timeout(Duration::from_millis(300))
@@ -316,10 +328,14 @@ impl BatchMessageHandler<MetricsBatchNoDlqTopic> for AckHandler {
     }
 }
 
-/// F3: a pre-handler drop (oversize) on a topology with **no** DLQ must move
-/// `shove_messages_discarded_total` exactly once.
+/// Deviation from InMemory's F3 contract (see the module doc): on Redis, a
+/// pre-handler drop settles through `route_to_dlq`, whose no-DLQ branch —
+/// reused verbatim from the single-message path — records
+/// `shove_messages_failed_total` but never `shove_messages_discarded_total`.
+/// This pins that the no-DLQ case behaves exactly like the with-DLQ case
+/// (both `0` on the discard counter), not like InMemory's fuller accounting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_dlq_pre_handler_drop_is_discarded_exactly_once() {
+async fn no_dlq_pre_handler_drop_records_failed_but_not_discarded() {
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();
     recorder.install().expect("install debugging recorder");
@@ -387,7 +403,8 @@ async fn no_dlq_pre_handler_drop_is_discarded_exactly_once() {
             "shove_messages_discarded_total",
             &[("topic", NO_DLQ_QUEUE), ("reason", "oversize")]
         ),
-        1,
-        "a no-DLQ pre-handler drop must be counted as discarded exactly once"
+        0,
+        "Redis's route_to_dlq never records a discard for a pre-handler drop, \
+         with or without a DLQ — this must match the with-DLQ case, not InMemory's F3 contract"
     );
 }

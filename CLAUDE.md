@@ -60,11 +60,11 @@ surprises.
   plus an SNS subscription whose lifecycle shove does not manage, and a leaked
   queue costs money forever.
 - `HasBatchConsumption` gates `Broker::batch_consumer` /
-  `BatchConsumer<B>::run`. Kafka and InMemory implement it today; every other
-  backend is pending, not excluded — each gets the capability the moment its
-  own `BatchConsumerImpl` lands. The primitive exists for **handler
-  amortisation** (one flush per N messages instead of one call per message),
-  nothing else.
+  `BatchConsumer<B>::run`. Kafka, InMemory and Redis implement it today; every
+  other backend is pending, not excluded — each gets the capability the
+  moment its own `BatchConsumerImpl` lands. The primitive exists for
+  **handler amortisation** (one flush per N messages instead of one call per
+  message), nothing else.
 
 The trait's own doc comment is the authoritative per-backend list — update it
 there rather than restating the table in a third place.

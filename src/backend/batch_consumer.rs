@@ -25,11 +25,11 @@
 //! and `settle_broadcast_outcome` already make.
 //!
 //! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory"))]`: both backends now have a batch-consumption implementation
-//! and share the flush-invoking/backoff machinery
-//! ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
+//! "inmemory", feature = "redis-streams"))]`: all three backends now have a
+//! batch-consumption implementation and share the flush-invoking/backoff
+//! machinery ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
 //! [`next_redelivery_delay`]). The gate widens per-backend as T2–T5
-//! land in turn — NATS, RabbitMQ, Redis, SQS each add their own feature to
+//! land in turn — NATS, RabbitMQ, SQS each add their own feature to
 //! the list the moment their `BatchConsumerImpl` exists, exactly as
 //! `broadcast.rs`'s gate widened backend by backend.
 //!
@@ -163,7 +163,7 @@ pub(crate) fn validate_batch_topic<T: Topic>() -> Result<()> {
 /// |---|---|---|
 /// | `Ack` | `Commit` | Every message in the batch retires; offsets/positions advance. |
 /// | `Reject` | `DeadLetter` | Terminal: every message is dead-lettered (or discarded, with no DLQ configured) and retires. |
-/// | `Retry` | `Redeliver` | The whole batch is returned to the backend's redelivery mechanism — a seek-back / re-buffer, not a republish. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless. Kafka and InMemory currently redeliver indefinitely — see each backend's own docs for that stronger, backend-specific guarantee. |
+/// | `Retry` | `Redeliver` | The whole batch is returned to the backend's redelivery mechanism — a seek-back / re-buffer, not a republish. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless. Kafka, InMemory and Redis currently redeliver indefinitely (streams have no delivery cap) — see each backend's own docs for that stronger, backend-specific guarantee. |
 /// | `Defer` | `Redeliver` | **Identical to `Retry` here.** A batch-wide outcome carries no sequence key, so the `Retry`/`Defer` distinction that matters on the single-message path — spending the retry budget versus not — has no meaning: there is no per-batch budget to spend either way. |
 ///
 /// See [`settle_broadcast_outcome`](crate::backend::broadcast::settle_broadcast_outcome)
@@ -231,12 +231,13 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory)` — see the module doc's "Gating" section. Named
-// `settling` rather than after either backend: it houses the settlement
-// classifier + panic/timeout invariant surface both backends' batch loops
-// route through, plus the terminal-discard machinery Kafka's single-message
-// path also depends on (see the module doc's `kafka` note).
-#[cfg(any(feature = "kafka", feature = "inmemory"))]
+// Gated `any(kafka, inmemory, redis-streams)` — see the module doc's "Gating"
+// section. Named `settling` rather than after any one backend: it houses the
+// settlement classifier + panic/timeout invariant surface every one of these
+// backends' batch loops route through, plus the terminal-discard machinery
+// Kafka's single-message path also depends on (see the module doc's `kafka`
+// note).
+#[cfg(any(feature = "kafka", feature = "inmemory", feature = "redis-streams"))]
 mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
@@ -690,7 +691,7 @@ mod settling {
     }
 }
 
-#[cfg(any(feature = "kafka", feature = "inmemory"))]
+#[cfg(any(feature = "kafka", feature = "inmemory", feature = "redis-streams"))]
 pub(crate) use settling::{
     PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
 };
