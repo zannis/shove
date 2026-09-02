@@ -1861,10 +1861,14 @@ async fn registry_default_handler_timeout_triggers_retry() {
 
 /// Total records appended to `__consumer_offsets` so far, summed over its
 /// partitions' high watermarks. Every OffsetCommit request the broker accepts
-/// appends one record per partition it covers, so the delta across a consume
-/// run counts the commits a consumer actually issued — independent of build
-/// profile, host load, or how fast the coordinator happened to answer.
-/// Returns 0 while the topic does not exist yet (nothing has committed).
+/// appends one record per partition it covers (and compaction never lowers a
+/// high watermark), so the delta across a consume run counts the commits a
+/// consumer actually issued — independent of build profile, host load, or how
+/// fast the coordinator happened to answer.
+///
+/// Returns 0 while the topic does not exist yet (nothing has committed); any
+/// actual fetch failure panics rather than returning 0, because a silently
+/// zeroed instrument would let the commit-count assertion pass vacuously.
 fn offsets_topic_records(brokers: &str) -> u64 {
     use rdkafka::consumer::{BaseConsumer, Consumer};
 
@@ -1873,9 +1877,9 @@ fn offsets_topic_records(brokers: &str) -> u64 {
         .set("bootstrap.servers", brokers)
         .create()
         .expect("probe consumer");
-    let Ok(metadata) = probe.fetch_metadata(Some(OFFSETS_TOPIC), Duration::from_secs(10)) else {
-        return 0;
-    };
+    let metadata = probe
+        .fetch_metadata(Some(OFFSETS_TOPIC), Duration::from_secs(10))
+        .expect("fetch __consumer_offsets metadata");
     metadata
         .topics()
         .iter()
@@ -1885,7 +1889,12 @@ fn offsets_topic_records(brokers: &str) -> u64 {
             probe
                 .fetch_watermarks(OFFSETS_TOPIC, p.id(), Duration::from_secs(10))
                 .map(|(_, high)| high.max(0) as u64)
-                .unwrap_or(0)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "fetch_watermarks(__consumer_offsets, {}) failed: {e}",
+                        p.id()
+                    )
+                })
         })
         .sum()
 }
@@ -1908,9 +1917,17 @@ fn offsets_topic_records(brokers: &str) -> u64 {
 /// a vacuous guard here. The red/green driver is instead the number of
 /// commits *issued*, counted as records appended to `__consumer_offsets`:
 /// the ungated loop writes on the order of one record per message, the
-/// interval-gated loop two per `ASYNC_COMMIT_INTERVAL` window per partition
-/// at most. The wall-clock bound stays as the symptom-level backstop —
-/// on any broker slow enough to pile commits, the broken loop blows it.
+/// interval-gated loop one commit round (≤ one record per partition) per
+/// `ASYNC_COMMIT_INTERVAL`. The wall-clock bound stays as the symptom-level
+/// backstop — on any broker slow enough to pile commits, the broken loop
+/// blows it.
+///
+/// Known residual: the red power needs genuine handler/loop concurrency. On
+/// a badly starved runner the scheduler can serialize handlers the way the
+/// current-thread runtime does, batching completions and keeping even the
+/// ungated loop's commit count low — the test then passes on broken code.
+/// It cannot false-fail that way (the fixed path's count only shrinks); the
+/// deterministic red venue is any host with a few free cores.
 // Multi-thread runtime, deliberately: on the default current-thread runtime
 // the spawned handlers only run when the receive loop yields, so completions
 // arrive in prefetch-sized batches and the loop commits once per ~100
@@ -1920,12 +1937,14 @@ fn offsets_topic_records(brokers: &str) -> u64 {
 async fn post_cancel_drain_is_bounded_after_a_large_fast_corpus() {
     const CORPUS: u64 = 150_000;
     const PUBLISH_CHUNK: u64 = 10_000;
-    const DRAIN_BOUND: Duration = Duration::from_millis(2_500);
-    // Measured on this test at this corpus: the gated loop wrote 35 records
-    // (~13 s of consuming), the ungated loop 79,818 and 117,106 across two
-    // runs. The bound sits ~57x above the fixed path and ~40x below the
-    // broken one, so neither direction can flake across host-load noise.
-    const COMMIT_RECORD_BOUND: u64 = 2_000;
+    // Wide enough that a loaded host's LeaveGroup + close handshake cannot
+    // trip it on healthy code (fixed path measured ~0.1-0.2 s), while the
+    // broken pile-up measured 23.8-34.5 s at this corpus.
+    const DRAIN_BOUND: Duration = Duration::from_secs(10);
+    // 8 cores, ~11.5k msg/s in the unoptimized test profile locally; a
+    // coverage-instrumented run on a starved CI runner can be several times
+    // slower, so the budget is generous rather than calibrated tight.
+    const CONSUME_BUDGET: Duration = Duration::from_secs(300);
 
     #[derive(Clone)]
     struct InstantAck(Arc<AtomicU64>);
@@ -1983,11 +2002,11 @@ async fn post_cancel_drain_is_bounded_after_a_large_fast_corpus() {
     let sup_handle =
         tokio::spawn(supervisor.run_until_timeout(std::future::pending(), Duration::from_secs(30)));
 
-    let consume_deadline = Instant::now() + Duration::from_secs(120);
+    let consume_deadline = Instant::now() + CONSUME_BUDGET;
     while processed.load(Ordering::Relaxed) < CORPUS {
         assert!(
             Instant::now() < consume_deadline,
-            "consumed only {} of {CORPUS} within 120s",
+            "consumed only {} of {CORPUS} within {CONSUME_BUDGET:?}",
             processed.load(Ordering::Relaxed)
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1996,27 +2015,53 @@ async fn post_cancel_drain_is_bounded_after_a_large_fast_corpus() {
     let cancelled_at = Instant::now();
     let consume_took = consume_started.elapsed();
     token.cancel();
-    let outcome = sup_handle.await.unwrap();
+    // Hard cap on the join: a regressed pile-up makes rdkafka's close drain
+    // in-flight commits for however long they take (unbounded on a slow
+    // coordinator), and the supervisor's abort cannot preempt the blocking
+    // FFI — without this the test hangs instead of failing.
+    let outcome = tokio::time::timeout(Duration::from_secs(120), sup_handle)
+        .await
+        .expect("supervisor did not shut down within 120s of cancel — consumer close is stuck draining in-flight offset commits")
+        .unwrap();
     let drain = cancelled_at.elapsed();
-    let commit_records = offsets_topic_records(tb.client.brokers()) - commit_records_before;
+
+    let commit_records_after = offsets_topic_records(tb.client.brokers());
+    assert!(
+        commit_records_after >= commit_records_before,
+        "__consumer_offsets high watermarks went backwards \
+         ({commit_records_before} -> {commit_records_after}); the instrument is broken"
+    );
+    let commit_records = commit_records_after - commit_records_before;
+    // The gated loop issues at most one commit round (<= 8 partition records)
+    // per ASYNC_COMMIT_INTERVAL (500ms), so the fixed path's record count
+    // scales with consume duration: bound it that way rather than with a
+    // constant a slow run could legitimately cross. Measured here: gated 32-35
+    // records over ~13s (budget ~1400); ungated 79,818 and 117,106 — two
+    // orders of magnitude over any admissible duration's budget.
+    let commit_record_bound = 1_000 + 32 * consume_took.as_secs();
     eprintln!(
         "consumed {CORPUS} in {consume_took:?} ({:.0} msg/s); post-cancel drain {drain:?}; \
-         {commit_records} offset-commit records written",
+         {commit_records} offset-commit records written (bound {commit_record_bound})",
         CORPUS as f64 / consume_took.as_secs_f64()
     );
 
-    assert!(outcome.is_clean(), "outcome: {outcome:?}");
     assert!(
-        commit_records < COMMIT_RECORD_BOUND,
-        "consumer wrote {commit_records} offset-commit records for a {CORPUS}-message corpus \
-         (bound {COMMIT_RECORD_BOUND}); the receive loop is committing per iteration instead \
-         of on the ASYNC_COMMIT_INTERVAL gate, which piles up in-flight commits that consumer \
-         close then waits out (measured ungated: 79,818 and 117,106 records; gated: 35)"
+        commit_records > 0,
+        "no offset-commit records observed at all — the instrument is measuring nothing"
     );
     assert!(
+        commit_records < commit_record_bound,
+        "consumer wrote {commit_records} offset-commit records for a {CORPUS}-message corpus \
+         (bound {commit_record_bound}); the receive loop is committing per iteration instead \
+         of on the ASYNC_COMMIT_INTERVAL gate, which piles up in-flight commits that consumer \
+         close then waits out (measured ungated: 79,818 and 117,106 records; gated: 32-35)"
+    );
+    assert!(outcome.is_clean(), "outcome: {outcome:?}");
+    assert!(
         drain < DRAIN_BOUND,
-        "post-cancel drain took {drain:?} (bound {DRAIN_BOUND:?}); in-flight offset commits \
-         are stacking up and consumer close waits them out"
+        "post-cancel drain took {drain:?} (bound {DRAIN_BOUND:?}); either in-flight offset \
+         commits are stacking up and consumer close is waiting them out (check the \
+         commit-record count above), or the broker/host is badly starved"
     );
     broker.close().await;
 }

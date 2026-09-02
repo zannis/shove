@@ -66,11 +66,15 @@ use super::consumer_group::KafkaAutoOffsetReset;
 /// Must be >= 2: at 1 this degenerates into "clear on the first quiet tick",
 /// which resets a genuinely wedged partition's streak on every iteration and
 /// stops it ever reaching `COMMIT_FENCE_TIMEOUT`. At 2, the tolerated window
-/// is at least `ASYNC_COMMIT_INTERVAL` while traffic flows (the commit gate
-/// holds every drain back that long after the drain that re-offered) and
-/// 2 × `HOUSEKEEPING_INTERVAL` on an idle topic — either way comfortably
-/// longer than a commit round trip, and far inside the fence threshold, so a
-/// wedged partition still trips it on schedule.
+/// is at least `ASYNC_COMMIT_INTERVAL` while traffic flows (the re-offering
+/// drain always issues a commit and so marks the gate, holding the *first*
+/// quiet drain back a full interval; the second may follow one iteration
+/// later) and 2 × `HOUSEKEEPING_INTERVAL` on an idle topic. Both windows
+/// comfortably exceed a healthy commit round trip (sub-ms here), so a wedged
+/// partition still trips the fence on schedule — though a coordinator whose
+/// rejection RTT exceeds the interval under continuous traffic can still
+/// out-age the streak; the pre-gate window was two loop iterations
+/// (microseconds), so this is strictly tighter, not a regression.
 const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 
 /// Minimum spacing between offset commits issued by the concurrent receive
@@ -84,10 +88,13 @@ const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
 /// be aborted) waits for every one of them before terminating: measured
 /// 5.5–20.2 s after a fast 150k-message corpus, intermittently blowing a 30 s
 /// shutdown budget. Spacing commits well above a coordinator round trip keeps
-/// the in-flight count O(1), so close stays prompt. The cost is a wider
-/// crash-redelivery window (which at-least-once semantics already promise),
-/// matching the spirit of Kafka's own 5 s auto-commit default while staying
-/// 10x tighter.
+/// the in-flight count O(1), so close stays prompt. Two costs, both accepted:
+/// a wider crash-redelivery window (which at-least-once semantics already
+/// promise), matching the spirit of Kafka's own 5 s auto-commit default while
+/// staying 10x tighter; and the tracker's `completed` set now buffers up to
+/// one window of completions between drains — memory bounded by consume rate
+/// × this interval (≈6k offsets at 12k msg/s), where it was bounded by
+/// `prefetch_count` before.
 const ASYNC_COMMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Rate gate for the receive loop's offset commits: `due` says whether the
@@ -123,13 +130,21 @@ impl AsyncCommitGate {
         self.last = Some(now);
     }
 
-    /// When the gate next becomes due: `now` when nothing was ever committed,
-    /// `last + interval` otherwise (which may already be past). The receive
-    /// loop's wake arm sleeps until this, so gated commit work never waits on
-    /// an unrelated wake.
+    /// When the gate next becomes due: `last + interval`, which may already
+    /// be past. The receive loop's wake arm sleeps until this, so gated
+    /// commit work never waits on an unrelated wake.
+    ///
+    /// The `None` branch returns `now + interval` rather than `now`,
+    /// deliberately: with no commit ever issued the gate is due, so the
+    /// loop's top-of-iteration drain handles the work before the wake arm
+    /// matters — the branch is unreachable while anything is committable.
+    /// If a future refactor ever breaks that invariant (skipping the drain,
+    /// resetting the gate), a stale-`now` deadline would make the wake arm
+    /// ready on construction forever — a hot spin. `now + interval` degrades
+    /// to a bounded wake instead.
     fn deadline(&self, now: Instant) -> Instant {
         match self.last {
-            None => now,
+            None => now + self.interval,
             Some(last) => last + self.interval,
         }
     }
@@ -1679,12 +1694,6 @@ fn create_stream_consumer(
         // blocking dwell so the broker doesn't hold the connection open.
         .set("fetch.min.bytes", FETCH_MIN_BYTES.to_string())
         .set("fetch.wait.max.ms", FETCH_WAIT_MAX_MS.to_string());
-    // CAF-729 repro instrumentation (uncommitted): surface librdkafka's own
-    // debug logs for the close-phase investigation.
-    if let Ok(dbg) = std::env::var("SHOVE_KAFKA_DEBUG") {
-        base.set("debug", &dbg);
-    }
-
     #[cfg(feature = "kafka-msk-iam")]
     if let Some(ctx) = msk_context {
         let ctx = RebalanceContext {
@@ -1774,10 +1783,7 @@ where
     loop {
         let started = tokio::time::Instant::now();
         match f().await {
-            Ok(()) => {
-                eprintln!("[drain-probe] consumer future resolved (drop/close done)");
-                return Ok(());
-            }
+            Ok(()) => return Ok(()),
             Err(e) => {
                 if started.elapsed() >= RECONNECT_RESET_AFTER {
                     attempts = 0;
@@ -3091,47 +3097,48 @@ impl KafkaConsumer {
                     // corpus). `drain_committable` is only *called* when due, so
                     // its side effects (dirty/quiet-drain accounting, pending
                     // discards) stay tied to actual commit offers. Only a drain
-                    // that offered a commit consumes the window.
-                    if commit_gate.due(now) {
-                        if let Some((tpl, discards)) = tracker.drain_committable() {
-                            commit_gate.mark(now);
-                            if discards.is_empty() {
-                                consumer
-                                    .commit(&tpl, CommitMode::Async)
-                                    .map_err(|e| map_kafka_error("commit failed", e))?;
-                            } else {
-                                // This batch retires messages that a no-DLQ topic
-                                // will never see again, and `messages_discarded_total`
-                                // may only move once that is true. `Sync` waits for
-                                // the broker to finish the commit, which is the
-                                // positive signal the async path cannot give.
-                                let committed = consumer.commit(&tpl, CommitMode::Sync);
-                                match &committed {
-                                    Ok(()) => {
-                                        for discard in discards {
-                                            discard.confirm();
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // Ambiguous: the message may or may not be
-                                        // retired, so do not claim it was.
-                                        for discard in discards {
-                                            discard.survived();
-                                        }
+                    // that offered a commit consumes the window — and `mark`
+                    // runs *after* the commit call with a fresh instant, so a
+                    // slow `Sync` round trip on the discard path cannot eat the
+                    // window and turn these back into back-to-back blocking
+                    // commits.
+                    if commit_gate.due(now)
+                        && let Some((tpl, discards)) = tracker.drain_committable()
+                    {
+                        if discards.is_empty() {
+                            consumer
+                                .commit(&tpl, CommitMode::Async)
+                                .map_err(|e| map_kafka_error("commit failed", e))?;
+                        } else {
+                            // This batch retires messages that a no-DLQ topic
+                            // will never see again, and `messages_discarded_total`
+                            // may only move once that is true. `Sync` waits for
+                            // the broker to finish the commit, which is the
+                            // positive signal the async path cannot give.
+                            let committed = consumer.commit(&tpl, CommitMode::Sync);
+                            match &committed {
+                                Ok(()) => {
+                                    for discard in discards {
+                                        discard.confirm();
                                     }
                                 }
-                                committed.map_err(|e| map_kafka_error("commit failed", e))?;
+                                Err(_) => {
+                                    // Ambiguous: the message may or may not be
+                                    // retired, so do not claim it was.
+                                    for discard in discards {
+                                        discard.survived();
+                                    }
+                                }
                             }
+                            committed.map_err(|e| map_kafka_error("commit failed", e))?;
                         }
+                        commit_gate.mark(Instant::now());
                     }
 
                     tokio::select! {
                         _ = shutdown.cancelled() => {
-                            let drain_probe = std::time::Instant::now();
-                            eprintln!("[drain-probe] shutdown arm entered");
                             tracing::info!(queue, "shutdown signal received, draining in-flight tasks");
                             let _ = semaphore.acquire_many(prefetch_count as u32).await;
-                            eprintln!("[drain-probe] permits acquired +{:?}", drain_probe.elapsed());
                             // Final commit
                             while let Ok(completion) = completion_rx.try_recv() {
                                 tracker.mark_complete(completion);
@@ -3152,17 +3159,6 @@ impl KafkaConsumer {
                                     }
                                 }
                             }
-                            eprintln!(
-                                "[drain-probe] final commit done +{:?} (consumer Arc strong_count={})",
-                                drain_probe.elapsed(),
-                                Arc::strong_count(&consumer)
-                            );
-                            let close_probe = std::time::Instant::now();
-                            drop(consumer);
-                            eprintln!(
-                                "[drain-probe] consumer dropped/closed +{:?}",
-                                close_probe.elapsed()
-                            );
                             return Ok(());
                         }
                         // Falls through to the top-of-loop drain — see the
@@ -3178,9 +3174,14 @@ impl KafkaConsumer {
                         // when nothing is committable, so an idle consumer does
                         // not wake every interval; no busy-spin when past due,
                         // because the top-of-loop drain then commits and
-                        // `mark` pushes the deadline forward. The `Sleep` is
-                        // re-created per select pass, which is a plain timer
-                        // registration on iterations where work is pending.
+                        // `mark` pushes the deadline forward. Cost note:
+                        // select! evaluates this expression (a `Sleep`
+                        // construct-and-drop plus the `has_committable` scan)
+                        // on every pass, even when the precondition disables
+                        // the arm; the timer only registers when the arm is
+                        // enabled, and the whole thing displaced a per-message
+                        // commit FFI call — the e2e cell's throughput went UP
+                        // ~26k -> ~30.5k msg/s with the gate in place.
                         _ = tokio::time::sleep_until(commit_gate.deadline(now)),
                             if tracker.has_committable() => {}
                         // Handler completions must wake the loop even when no new
@@ -5693,9 +5694,11 @@ mod async_commit_gate_tests {
         assert!(gate.due(now), "first commit must not wait out an interval");
         assert_eq!(
             gate.deadline(now),
-            now,
-            "the None branch pins 'no commit yet' to 'wake now', not one \
-             interval from now"
+            now + INTERVAL,
+            "the None branch is unreachable from the wake arm (a due gate \
+             means the drain already ran), so it pins a bounded future wake \
+             rather than a ready-now deadline that could hot-spin if a \
+             refactor ever skips the drain"
         );
     }
 
