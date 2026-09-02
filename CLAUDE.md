@@ -84,8 +84,17 @@ there rather than restating the table in a third place.
 ## Build / test / lint commands
 
 - **Fast path** (no Docker, no secrets): `cargo nextest run --no-default-features`
-  runs unit + in-memory tests. (CI uses `cargo test --no-default-features`; this
-  repo's convention is `cargo nextest run`.)
+  runs the lib unit tests only. `default = []` in `Cargo.toml`, and every
+  in-memory test file is gated on `feature = "inmemory"`, so under this flag
+  those binaries compile empty and report green having run nothing. (CI's
+  `check` job uses `cargo test --no-default-features` — the same unit-only
+  set; this repo's convention is `cargo nextest run`.)
+- **In-memory tests, still Docker-free**:
+  `cargo nextest run --features inmemory,metrics,sbe,env-config` — the CI
+  `coverage` matrix's `inmemory` feature set (authoritative copy in
+  `.github/workflows/ci.yml`). `metrics` and `env-config` are load-bearing:
+  the `tests/metrics_inmemory_*.rs` and env-schema tests are gated on them
+  and compile to zero tests without them.
 - **Integration tests** require Docker (real brokers via `testcontainers`). The
   AWS/MSK tests additionally require `LOCALSTACK_AUTH_TOKEN`, supplied via
   `dotenvx run -- cargo nextest run --features <set>`. See `CONTRIBUTING.md`
