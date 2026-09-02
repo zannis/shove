@@ -1115,12 +1115,15 @@ async fn route_reject(
         .insert(X_DEATH_REASON.to_string(), reason.to_string());
     env.headers
         .insert(X_ORIGINAL_QUEUE.to_string(), topology.queue().to_string());
+    // Saturating: the header rides in on the wire, so an inbound message can
+    // claim any count — a forged u32::MAX must pin at the ceiling, not panic
+    // the delivery loop.
     let count = env
         .headers
         .get(X_DEATH_COUNT)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0)
-        + 1;
+        .saturating_add(1);
     env.headers
         .insert(X_DEATH_COUNT.to_string(), count.to_string());
 
