@@ -1,0 +1,21 @@
+examples/common/stress_test.rs
+  s_05c6521fd0e770::t_b3939233000e68 1509-1526,1563-1565,1593,1649-1653,1873-1874,1876-1879,1881-1883,1886-1889,1913,1916,1922-1932,1937-1960,1962-1972,2257-2264,2406-2415,2614-2615,2704-2711,2880-2887,3327-3345,5145-5242,5868,5874-5925,5933-5951,5969-5970,5973,5975,5977-5983
+examples/kafka/stress.rs
+  s_05c6521fd0e770::t_c6c2533fab349d 18,20,30-31,215-258,265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "768e4d82b3b2223afc8dd241e43bfc77fe1e4cdc",
+  "prompts": {},
+  "sessions": {
+    "s_05c6521fd0e770": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6aaa3b81-7095-474a-9d9b-0d942a8598e8",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
