@@ -38,9 +38,9 @@
 //!   the rest are excluded by the same compile-time gate until their
 //!   implementation lands.
 //! - [`HasBatchConsumption`] separately gates [`Broker::batch_consumer`], for
-//!   handler amortisation — buffering up to N messages before one flush.
-//!   Kafka and InMemory implement it today; every other backend is pending
-//!   (not permanently excluded — see that trait for the authoritative list).
+//!   handler amortisation — buffering up to N messages before one flush. See
+//!   that trait for which backends implement it today; the rest are excluded
+//!   by the same compile-time gate until their implementation lands.
 //!
 //! # Feature flags
 //!

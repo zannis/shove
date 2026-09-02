@@ -28,7 +28,7 @@
 //! "inmemory"))]`: both backends now have a batch-consumption implementation
 //! and share the flush-invoking/backoff machinery
 //! ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
-//! [`BATCH_REDELIVERY_BACKOFF_MAX`]). The gate widens per-backend as T2–T5
+//! [`next_redelivery_delay`]). The gate widens per-backend as T2–T5
 //! land in turn — NATS, RabbitMQ, Redis, SQS each add their own feature to
 //! the list the moment their `BatchConsumerImpl` exists, exactly as
 //! `broadcast.rs`'s gate widened backend by backend.
@@ -113,6 +113,15 @@ pub(crate) struct BatchConsumerOptionsInner {
 /// `dead_code` is expected there and the per-trait allow avoids polluting
 /// those builds with warnings, exactly as [`ConsumerImpl`](crate::backend::ConsumerImpl)
 /// does for the single-message trait.
+///
+/// # Who runs the sequencing guard
+///
+/// [`BatchConsumer::run`](crate::batch_consumer::BatchConsumer::run) calls
+/// [`validate_batch_topic`] before delegating, so an implementation reachable
+/// only through it must not repeat the check (InMemory does not). A backend
+/// that also exposes its **own public** batch entry point bypasses that
+/// wrapper and must call the guard itself — Kafka's `run_batch_inner` is the
+/// model, covering the public `KafkaConsumer::run_batch`.
 #[allow(dead_code)]
 pub(crate) trait BatchConsumerImpl: Send + Sync {
     fn run_batch<T, H>(
@@ -321,10 +330,8 @@ mod settling {
     const BATCH_REDELIVERY_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 
     /// Ceiling on the redelivery delay for a handler that keeps returning
-    /// non-Ack. Exposed (`pub(crate)`) so a backend's own `Redeliver` arm can
-    /// fall back to it instead of stranding a second copy of the literal —
-    /// see `backends::inmemory::consumer::flush_inmemory_batch`.
-    pub(crate) const BATCH_REDELIVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+    /// non-Ack.
+    const BATCH_REDELIVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
     /// Redelivery backoff schedule for a batch the handler did not Ack.
     /// Escalates across *consecutive* non-Ack flushes and is reset on the
@@ -336,6 +343,15 @@ mod settling {
             BATCH_REDELIVERY_BACKOFF_INITIAL,
             BATCH_REDELIVERY_BACKOFF_MAX,
         )
+    }
+
+    /// Draw the next redelivery delay from `backoff` — the one place every
+    /// backend's `Redeliver` arm gets its pacing, so the impossible-`None`
+    /// handling cannot drift per backend (`Backoff`'s iterator never ends;
+    /// the fallback exists only so no `Redeliver` arm carries a panic or a
+    /// stranded copy of the ceiling if that ever changed).
+    pub(crate) fn next_redelivery_delay(backoff: &mut Backoff) -> Duration {
+        backoff.next().unwrap_or(BATCH_REDELIVERY_BACKOFF_MAX)
     }
 
     /// [`invoke_handler`] for a whole batch: same panic containment, same
@@ -662,12 +678,7 @@ mod settling {
 }
 
 #[cfg(any(feature = "kafka", feature = "inmemory"))]
-pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler};
-
-// Only InMemory's `Redeliver` arm reaches for the constant directly; Kafka
-// gets its ceiling through `batch_redelivery_backoff()` instead.
-#[cfg(feature = "inmemory")]
-pub(crate) use settling::BATCH_REDELIVERY_BACKOFF_MAX;
+pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay};
 
 #[cfg(feature = "kafka")]
 pub(crate) use settling::{RejectSettlement, TerminalDiscard, reject_settlement};

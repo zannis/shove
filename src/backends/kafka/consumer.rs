@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backend::batch_consumer::{
     BatchConsumerOptionsInner, BatchSettlement, RejectSettlement, TerminalDiscard,
-    batch_redelivery_backoff, invoke_batch_handler, reject_settlement, settle_batch_outcome,
-    validate_batch_topic,
+    batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay, reject_settlement,
+    settle_batch_outcome, validate_batch_topic,
 };
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
 use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
@@ -2286,7 +2286,7 @@ where
             buffer.clear();
         }
         BatchSettlement::Redeliver => {
-            let delay = redelivery_backoff.next().expect("backoff is infinite");
+            let delay = next_redelivery_delay(redelivery_backoff);
             tracing::warn!(
                 queue,
                 batch_size,

@@ -206,12 +206,17 @@ define_topic!(
 // Recording batch handler
 // ---------------------------------------------------------------------------
 
-/// Records the `seq` of every message in every batch it is handed, and
-/// returns outcomes from a scripted queue (defaulting to `Ack` once the
-/// script is exhausted).
+/// `(seq, delivery_count)` for one message.
+type SeqAndDeliveryCount = (u32, Option<u32>);
+
+/// Records `(seq, delivery_count)` for every message in every batch it is
+/// handed, and returns outcomes from a scripted queue (defaulting to `Ack`
+/// once the script is exhausted). Most tests read the `seq`-only projection
+/// via [`Self::batches`]; the redelivery-metadata test reads the full pairs
+/// via [`Self::batches_with_delivery_counts`].
 #[derive(Clone)]
 struct RecordingBatchHandler {
-    batches: Arc<Mutex<Vec<Vec<u32>>>>,
+    batches: Arc<Mutex<Vec<Vec<SeqAndDeliveryCount>>>>,
     scripted: Arc<Mutex<VecDeque<Outcome>>>,
     signal: Arc<Notify>,
 }
@@ -231,10 +236,12 @@ impl RecordingBatchHandler {
     }
 
     fn record(&self, batch: &[(BatchMessage, MessageMetadata)]) -> Outcome {
-        self.batches
-            .lock()
-            .unwrap()
-            .push(batch.iter().map(|(m, _)| m.seq).collect());
+        self.batches.lock().unwrap().push(
+            batch
+                .iter()
+                .map(|(m, meta)| (m.seq, meta.delivery_count))
+                .collect(),
+        );
         let outcome = self
             .scripted
             .lock()
@@ -246,6 +253,13 @@ impl RecordingBatchHandler {
     }
 
     fn batches(&self) -> Vec<Vec<u32>> {
+        self.batches_with_delivery_counts()
+            .into_iter()
+            .map(|batch| batch.into_iter().map(|(seq, _)| seq).collect())
+            .collect()
+    }
+
+    fn batches_with_delivery_counts(&self) -> Vec<Vec<SeqAndDeliveryCount>> {
         self.batches.lock().unwrap().clone()
     }
 
@@ -292,75 +306,8 @@ impl_recording_for!(
     DropTopic,
     BrokerCloseBackoffTopic,
     RedeliveryOrderTopic,
+    DeliveryCountTopic,
 );
-
-// ---------------------------------------------------------------------------
-// Delivery-count recording batch handler — for F2 (redelivery marks every
-// requeued envelope, batch-wide) coverage.
-// ---------------------------------------------------------------------------
-
-/// `(seq, delivery_count)` for one message.
-type SeqAndDeliveryCount = (u32, Option<u32>);
-
-/// Records `(seq, delivery_count)` for every message in every batch, so a
-/// test can tell a first delivery from a redelivery. Scripts outcomes the
-/// same way [`RecordingBatchHandler`] does.
-#[derive(Clone)]
-struct DeliveryCountRecordingHandler {
-    batches: Arc<Mutex<Vec<Vec<SeqAndDeliveryCount>>>>,
-    scripted: Arc<Mutex<VecDeque<Outcome>>>,
-    signal: Arc<Notify>,
-}
-
-impl DeliveryCountRecordingHandler {
-    fn new() -> Self {
-        Self {
-            batches: Arc::new(Mutex::new(Vec::new())),
-            scripted: Arc::new(Mutex::new(VecDeque::new())),
-            signal: Arc::new(Notify::new()),
-        }
-    }
-
-    fn scripting(self, outcomes: impl IntoIterator<Item = Outcome>) -> Self {
-        *self.scripted.lock().unwrap() = outcomes.into_iter().collect();
-        self
-    }
-
-    fn batches(&self) -> Vec<Vec<SeqAndDeliveryCount>> {
-        self.batches.lock().unwrap().clone()
-    }
-
-    async fn wait_for_batches(&self, n: usize, timeout: Duration) -> bool {
-        wait_for(&self.signal, timeout, || {
-            self.batches.lock().unwrap().len() >= n
-        })
-        .await
-    }
-}
-
-impl BatchMessageHandler<DeliveryCountTopic> for DeliveryCountRecordingHandler {
-    type Context = ();
-    async fn handle_batch(
-        &self,
-        messages: Vec<(BatchMessage, MessageMetadata)>,
-        _: &(),
-    ) -> Outcome {
-        self.batches.lock().unwrap().push(
-            messages
-                .iter()
-                .map(|(m, meta)| (m.seq, meta.delivery_count))
-                .collect(),
-        );
-        let outcome = self
-            .scripted
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or(Outcome::Ack);
-        self.signal.notify_waiters();
-        outcome
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Misbehaving batch handler — panics or hangs
@@ -1523,7 +1470,7 @@ async fn redelivery_increments_delivery_count_for_every_envelope() {
     let publisher = broker.publisher().await.unwrap();
     publish_seq::<DeliveryCountTopic>(&publisher, 0..2).await;
 
-    let handler = DeliveryCountRecordingHandler::new().scripting([Outcome::Retry]);
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Retry]);
     let shutdown = CancellationToken::new();
     let consumer = broker.batch_consumer();
     let handle = tokio::spawn({
@@ -1547,7 +1494,7 @@ async fn redelivery_increments_delivery_count_for_every_envelope() {
     shutdown.cancel();
     handle.await.unwrap().ok();
 
-    let batches = handler.batches();
+    let batches = handler.batches_with_delivery_counts();
     assert_eq!(batches.len(), 2, "got {batches:?}");
 
     let mut first = batches[0].clone();

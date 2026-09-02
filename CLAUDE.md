@@ -14,8 +14,8 @@ consumer groups, broadcast, topology, autoscaling) works across every backend.
 
 - **Generic layer** lives directly in `src/`: `broker.rs`, `publisher.rs`,
   `consumer.rs`, `consumer_group.rs`, `consumer_supervisor.rs`, `broadcast.rs`,
-  `autoscaler.rs`, `topology.rs`, `topology_declarer.rs`. These are
-  backend-agnostic wrappers around `Broker<B>`.
+  `batch_consumer.rs`, `autoscaler.rs`, `topology.rs`, `topology_declarer.rs`.
+  These are backend-agnostic wrappers around `Broker<B>`.
 - **Per-backend implementations** live in `src/backends/<name>/`. Each backend
   has the same file layout: `backend.rs`, `client.rs`, `consumer.rs`,
   `consumer_group.rs`, `publisher.rs`, `topology.rs`, `autoscaler.rs`, plus

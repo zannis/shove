@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, Notify};
@@ -410,6 +410,46 @@ impl InMemoryBroker {
         // `pop_one`'s own doc describes.
         queue.ready.notify_waiters();
         queue.ready.notify_one();
+    }
+}
+
+impl QueueState {
+    /// Pop up to `max` envelopes under one buffer-lock acquisition, with the
+    /// pop-side accounting applied atomically with respect to anything else
+    /// that locks the buffer: `in_flight` is incremented **while the guard is
+    /// still held**, so a stats reader that locks the buffer (backlog) and
+    /// then loads `in_flight` can never observe drained envelopes counted in
+    /// neither. One `space` permit per popped envelope is released after the
+    /// guard drops — publishers re-check capacity under their own lock, so
+    /// the wake order does not matter there.
+    ///
+    /// Returns an empty `Vec` (no allocation) when the buffer is empty or
+    /// `max` is zero; never waits. The batch consumer's opportunistic drain
+    /// is the caller; its awaiting single-pop loop (`pop_one` in
+    /// `consumer.rs`) keeps the same triple inline for the one-envelope case
+    /// because its no-await-after-lock tail is load-bearing inside a
+    /// `select!` arm — the two sites cross-reference each other.
+    pub(super) async fn drain_up_to(&self, max: usize) -> Vec<Envelope> {
+        let out = {
+            let mut buf = self.buffer.lock().await;
+            let n = buf.len().min(max);
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                match buf.pop_front() {
+                    Some(env) => out.push(env),
+                    None => break,
+                }
+            }
+            if !out.is_empty() {
+                self.in_flight
+                    .fetch_add(out.len() as u64, Ordering::Release);
+            }
+            out
+        };
+        for _ in 0..out.len() {
+            self.space.notify_one();
+        }
+        out
     }
 }
 

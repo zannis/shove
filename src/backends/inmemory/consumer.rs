@@ -14,8 +14,8 @@ use super::constants::{
 use super::topology::InMemoryTopologyDeclarer;
 use crate::backend::ConsumerOptionsInner;
 use crate::backend::batch_consumer::{
-    BATCH_REDELIVERY_BACKOFF_MAX, BatchConsumerOptionsInner, BatchSettlement,
-    batch_redelivery_backoff, invoke_batch_handler, settle_batch_outcome,
+    BatchConsumerOptionsInner, BatchSettlement, batch_redelivery_backoff, invoke_batch_handler,
+    next_redelivery_delay, settle_batch_outcome,
 };
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
@@ -1152,6 +1152,12 @@ async fn route_reject(
 /// this future at an `.await` point, so once the lock is held there is no
 /// window where a pop is torn down half-applied (buffer emptied but
 /// `in_flight` never incremented, or vice versa).
+///
+/// The bulk counterpart is `QueueState::drain_up_to` (client.rs), which the
+/// opportunistic drain uses; it applies the same accounting under one lock
+/// for many envelopes. This single-pop loop stays inline because the
+/// no-await-after-lock tail above is what a shared awaiting helper could not
+/// promise — the two sites cross-reference each other.
 async fn pop_one(queue: &QueueState) -> Envelope {
     loop {
         let notified = queue.ready.notified();
@@ -1178,7 +1184,7 @@ struct InMemoryBatch<T: Topic> {
     /// Index-parallel with `messages`. Each entry also carries the arrival
     /// ordinal this envelope was popped under (see `next_ordinal`), so
     /// `Redeliver` can restore true arrival order across the handled/parked
-    /// split — see `merge_by_ordinal`.
+    /// split with one sort by ordinal.
     envelopes: Vec<(u64, Envelope)>,
     /// Pre-handler drops with an envelope worth keeping — only when the
     /// topology declares a DLQ, mirroring Kafka's `retain_raw` gate
@@ -1196,6 +1202,10 @@ struct InMemoryBatch<T: Topic> {
     /// envelope arrived so a later `Redeliver` can put the batch back in the
     /// order it was popped, rather than handled-then-parked.
     next_ordinal: u64,
+    /// `max_batch_size`, kept so [`Self::take_messages`] /
+    /// [`Self::take_envelopes`] can install a correctly pre-sized
+    /// replacement for the `Vec` they move out.
+    cap: usize,
 }
 
 impl<T: Topic> InMemoryBatch<T> {
@@ -1206,6 +1216,7 @@ impl<T: Topic> InMemoryBatch<T> {
             parked: Vec::new(),
             dropped: 0,
             next_ordinal: 0,
+            cap: max_batch_size,
         }
     }
 
@@ -1241,69 +1252,30 @@ impl<T: Topic> InMemoryBatch<T> {
     }
 
     /// Take the handled messages for the handler call, refilling with a
-    /// fresh `cap`-capacity `Vec` rather than the zero-capacity default
-    /// `mem::take` would leave behind — the next batch's `push` calls would
-    /// otherwise re-grow from empty every single flush.
-    fn take_messages(&mut self, cap: usize) -> Vec<(T::Message, MessageMetadata)> {
-        std::mem::replace(&mut self.messages, Vec::with_capacity(cap))
+    /// fresh pre-sized `Vec` rather than the zero-capacity default
+    /// `mem::take` would leave behind — the taken `Vec` is genuinely moved
+    /// into the handler, and the next batch's `push` calls would otherwise
+    /// re-grow from empty every single flush.
+    fn take_messages(&mut self) -> Vec<(T::Message, MessageMetadata)> {
+        std::mem::replace(&mut self.messages, Vec::with_capacity(self.cap))
     }
 
     /// Take the handled envelopes for a terminal or redelivery settlement,
     /// same re-sizing rationale as [`Self::take_messages`].
-    fn take_envelopes(&mut self, cap: usize) -> Vec<(u64, Envelope)> {
-        std::mem::replace(&mut self.envelopes, Vec::with_capacity(cap))
+    fn take_envelopes(&mut self) -> Vec<(u64, Envelope)> {
+        std::mem::replace(&mut self.envelopes, Vec::with_capacity(self.cap))
     }
 
-    fn clear(&mut self, cap: usize) {
-        self.messages = Vec::with_capacity(cap);
-        self.envelopes = Vec::with_capacity(cap);
+    /// Reset for the next batch, in place: `Vec::clear` retains whatever
+    /// capacity each list already holds (either the original pre-sizing or a
+    /// `take_*` replacement), so a flush never pays a reallocation here.
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.envelopes.clear();
         self.parked.clear();
         self.dropped = 0;
         self.next_ordinal = 0;
     }
-}
-
-/// Merge two ordinal-sorted envelope lists into one arrival-order list.
-///
-/// `handled` and `parked` are each already sorted by ordinal (both only ever
-/// grow by appending the next-popped envelope), so a two-pointer merge
-/// restores the single order they were popped in — the same shape as any
-/// merge-sort merge step. Used by `Redeliver` so poison parked behind a
-/// handled envelope does not permanently move behind messages that arrived
-/// after it.
-fn merge_by_ordinal(handled: Vec<(u64, Envelope)>, parked: Vec<(u64, Envelope)>) -> Vec<Envelope> {
-    let mut out = Vec::with_capacity(handled.len() + parked.len());
-    let mut handled = handled.into_iter();
-    let mut parked = parked.into_iter();
-    let mut next_handled = handled.next();
-    let mut next_parked = parked.next();
-    loop {
-        match (next_handled, next_parked) {
-            (Some((h, henv)), Some((p, penv))) => {
-                if h <= p {
-                    out.push(henv);
-                    next_handled = handled.next();
-                    next_parked = Some((p, penv));
-                } else {
-                    out.push(penv);
-                    next_parked = parked.next();
-                    next_handled = Some((h, henv));
-                }
-            }
-            (Some((_, henv)), None) => {
-                out.push(henv);
-                next_handled = handled.next();
-                next_parked = None;
-            }
-            (None, Some((_, penv))) => {
-                out.push(penv);
-                next_parked = parked.next();
-                next_handled = None;
-            }
-            (None, None) => break,
-        }
-    }
-    out
 }
 
 /// Fields `flush_inmemory_batch` needs that do not change across flushes —
@@ -1319,13 +1291,12 @@ struct InMemoryFlushCtx<'a> {
     /// Broker-wide shutdown, separate from `shutdown` (the per-consumer
     /// token `options.shutdown` set): `broker.close()` cancels this one, and
     /// the `Redeliver` arm's backoff sleep must race it too, or a broker
-    /// close during an escalated backoff stalls the drain for up to
-    /// [`BATCH_REDELIVERY_BACKOFF_MAX`] instead of cutting the delay short
-    /// the way the outer loop's own `broker_shutdown` arm already does.
+    /// close during an escalated backoff stalls the drain for up to the
+    /// backoff ceiling instead of cutting the delay short the way the outer
+    /// loop's own `broker_shutdown` arm already does.
     broker_shutdown: &'a CancellationToken,
     handler_timeout: Option<Duration>,
     handler_timeout_outcome: Option<Outcome>,
-    max_batch_size: usize,
 }
 
 /// Prepare one freshly-popped envelope and either push it into the batch or
@@ -1402,7 +1373,7 @@ async fn finish_terminal_flush<T: Topic>(
     publish_parked(flush, &mut batch.parked).await;
     release_in_flight(flush.queue, flush_len as u64);
     *redelivery_backoff = batch_redelivery_backoff();
-    batch.clear(flush.max_batch_size);
+    batch.clear();
 }
 
 /// Hands the buffered batch to the handler and applies the single returned
@@ -1423,7 +1394,7 @@ async fn finish_terminal_flush<T: Topic>(
 ///   uses, then the parked pre-handler drops are published the same way
 ///   `Commit` publishes them.
 /// - `Redeliver`: the whole batch — handled envelopes plus parked ones,
-///   merged back into arrival order (see `merge_by_ordinal`) — goes back to
+///   sorted back into arrival order by pop ordinal — goes back to
 ///   the front of the queue via `InMemoryBroker::requeue_front`, so the next
 ///   pop sees it again instead of it being silently skipped. Retry counters
 ///   are **not** incremented: this models Kafka's seek-back, not a
@@ -1463,11 +1434,11 @@ async fn flush_inmemory_batch<T, H>(
     if batch_size == 0 {
         publish_parked(flush, &mut batch.parked).await;
         release_in_flight(flush.queue, flush_len as u64);
-        batch.clear(flush.max_batch_size);
+        batch.clear();
         return;
     }
 
-    let messages = batch.take_messages(flush.max_batch_size);
+    let messages = batch.take_messages();
     let outcome = invoke_batch_handler(
         || handler.handle_batch(messages, ctx),
         flush.handler_timeout,
@@ -1484,7 +1455,7 @@ async fn flush_inmemory_batch<T, H>(
         }
         BatchSettlement::DeadLetter => {
             let has_dlq = flush.topology.dlq().is_some();
-            let envelopes = batch.take_envelopes(flush.max_batch_size);
+            let envelopes = batch.take_envelopes();
             for (_ordinal, envelope) in envelopes {
                 let pending = metrics::record_terminal(
                     flush.topic,
@@ -1505,11 +1476,7 @@ async fn flush_inmemory_batch<T, H>(
             finish_terminal_flush(flush, batch, flush_len, redelivery_backoff).await;
         }
         BatchSettlement::Redeliver => {
-            // `Backoff::next()` never returns `None` (see its doc) — the
-            // fallback exists only so this cannot panic if that ever changed.
-            let delay = redelivery_backoff
-                .next()
-                .unwrap_or(BATCH_REDELIVERY_BACKOFF_MAX);
+            let delay = next_redelivery_delay(redelivery_backoff);
             tracing::warn!(
                 queue = flush.topology.queue(),
                 batch_size,
@@ -1518,39 +1485,51 @@ async fn flush_inmemory_batch<T, H>(
                 "batch handler returned a non-Ack outcome, redelivering the whole batch"
             );
 
-            let handled = batch.take_envelopes(flush.max_batch_size);
-            let parked: Vec<(u64, Envelope)> = batch
-                .parked
-                .drain(..)
-                .map(|(ordinal, env, _reason)| (ordinal, env))
-                .collect();
-            batch.clear(flush.max_batch_size);
-
-            let mut to_requeue = merge_by_ordinal(handled, parked);
+            // Restore arrival order across the handled/parked split: both
+            // lists carry the pop ordinal, and ordinals are unique, so one
+            // sort puts poison parked mid-batch back in its true position
+            // instead of permanently behind messages that arrived after it.
+            let mut tagged = batch.take_envelopes();
+            tagged.extend(
+                batch
+                    .parked
+                    .drain(..)
+                    .map(|(ordinal, env, _reason)| (ordinal, env)),
+            );
+            tagged.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+            batch.clear();
+            let mut to_requeue: Vec<Envelope> = tagged.into_iter().map(|(_, env)| env).collect();
             for env in &mut to_requeue {
                 env.mark_redelivery();
             }
 
-            // Shutdown cuts only the delay, not the redelivery itself: a
-            // wedged handler must not add the full backoff to every stop, but
-            // the batch must still make it back to the queue rather than
-            // being silently dropped. The broker's own shutdown joins the
-            // race too — a `broker.close()` mid-backoff must not stall the
-            // drain path for up to the escalated delay either.
+            // Requeue BEFORE the backoff sleep: from here on the batch lives
+            // in the queue again, so aborting this task mid-backoff (a
+            // JoinHandle::abort, a timeout around `run`, an outer select)
+            // cannot destroy it — only the microscopic window inside
+            // `requeue_front`'s own lock acquisition remains, which is
+            // inherent to an in-process consumer owning its envelopes.
+            // Requeue also precedes the `in_flight` release: releasing first
+            // would open a window where the queue reports zero backlog and
+            // zero in-flight while the batch sits in a local Vec, nowhere a
+            // depth sampler or autoscaler can see it; releasing after
+            // briefly overstates `in_flight` instead, the safe direction for
+            // a scaler to be wrong in.
+            flush.broker.requeue_front(flush.queue, to_requeue).await;
+            release_in_flight(flush.queue, flush_len as u64);
+
+            // The sleep still paces THIS consumer — its next pop happens
+            // after the delay — but no longer holds the batch hostage; a
+            // sibling consumer on the same queue may pick the messages up
+            // meanwhile, exactly as a Kafka rebalance may reassign a
+            // seeked-back partition. Shutdown (either token) cuts only the
+            // delay: a wedged handler must not add the full escalated
+            // backoff to every stop.
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
                 () = flush.shutdown.cancelled() => {}
                 () = flush.broker_shutdown.cancelled() => {}
             }
-
-            // Requeue before releasing `in_flight`: releasing first would
-            // open a window where the queue reports zero backlog and zero
-            // in-flight while the batch is still sitting in `to_requeue`,
-            // nowhere a depth sampler or autoscaler can see it. Releasing
-            // after briefly overstates `in_flight` instead, which is the
-            // safe direction for a scaler to be wrong in.
-            flush.broker.requeue_front(flush.queue, to_requeue).await;
-            release_in_flight(flush.queue, flush_len as u64);
         }
     }
 }
@@ -1595,6 +1574,18 @@ async fn flush_inmemory_batch<T, H>(
 /// `BatchConsumerOptionsInner` for trait-shape parity with Kafka, but there is
 /// nothing to reconnect to for an in-process broker, exactly as on every
 /// other InMemory consumer path.
+///
+/// # A full DLQ can stall a `DeadLetter` flush
+///
+/// DLQ publishes go through the same `route_reject` → `enqueue` path every
+/// InMemory reject uses, and `enqueue` waits for DLQ capacity racing only the
+/// *broker* shutdown token — a pre-existing property of that shared path, not
+/// something this loop adds. What the batch path changes is scale: one
+/// `DeadLetter` flush can need up to `max_batch_size` DLQ slots back-to-back,
+/// so a DLQ sized below the batch, with nothing draining it, wedges the flush
+/// until `broker.close()`. Size the DLQ at or above `max_batch_size`, or run
+/// a DLQ drain, when using `Outcome::Reject` (or a `Reject` timeout outcome)
+/// with batches.
 pub(crate) async fn run_batch_impl<T, H>(
     broker: InMemoryBroker,
     handler: H,
@@ -1635,7 +1626,6 @@ where
         broker_shutdown: &broker_shutdown,
         handler_timeout,
         handler_timeout_outcome,
-        max_batch_size,
     };
 
     let has_dlq = topology.dlq().is_some();
@@ -1701,33 +1691,15 @@ where
                 // right now — up to the remaining size headroom — under one
                 // lock acquisition rather than looping back through the outer
                 // `select!` (and its `Notify` round trip) once per envelope.
-                // No `.await` happens while the lock is held: the pops below
-                // are synchronous `VecDeque::pop_front` calls, so this cannot
-                // be torn down mid-drain the way `pop_one`'s own doc explains
-                // for its single pop. The deadline and size cap are still
+                // `drain_up_to` sizes its allocation after locking (an empty
+                // buffer costs nothing) and applies the `in_flight` increment
+                // while still holding the guard, so a stats reader can never
+                // observe the drained envelopes counted in neither backlog
+                // nor in-flight. The deadline and size cap are still
                 // re-checked at the top of the next iteration either way.
                 let headroom = max_batch_size.saturating_sub(batch.flush_len());
-                if headroom > 0 {
-                    let drained: Vec<Envelope> = {
-                        let mut buf = queue.buffer.lock().await;
-                        let mut out = Vec::with_capacity(headroom);
-                        while out.len() < headroom {
-                            match buf.pop_front() {
-                                Some(env) => out.push(env),
-                                None => break,
-                            }
-                        }
-                        out
-                    };
-                    if !drained.is_empty() {
-                        queue.in_flight.fetch_add(drained.len() as u64, Ordering::Release);
-                        for _ in 0..drained.len() {
-                            queue.space.notify_one();
-                        }
-                        for env in drained {
-                            ingest_envelope::<T>(&mut batch, env, max_message_size, &topic, group.as_deref(), has_dlq);
-                        }
-                    }
+                for env in queue.drain_up_to(headroom).await {
+                    ingest_envelope::<T>(&mut batch, env, max_message_size, &topic, group.as_deref(), has_dlq);
                 }
             }
         }
