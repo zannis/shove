@@ -26,10 +26,10 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 ///
 /// Used by [`BatchConsumerOptions`](crate::batch_consumer::BatchConsumerOptions)
 /// on every backend implementing
-/// [`HasBatchConsumption`](crate::backend::capability::HasBatchConsumption).
-/// A future batch primitive with its own natural default (SQS receive caps at
-/// 10, say) is free to pick a different one; this is just the shared
-/// starting point.
+/// [`HasBatchConsumption`](crate::backend::capability::HasBatchConsumption) —
+/// see that trait's doc for the per-backend list. A future batch primitive
+/// with its own natural default is free to pick a different one; this is
+/// just the shared starting point.
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 500;
 
 /// Default flush age for the generic batch consumer: 250 ms. See

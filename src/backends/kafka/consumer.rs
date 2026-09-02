@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::ConsumerOptionsInner as ConsumerOptions;
 use crate::backend::batch_consumer::{
-    BatchConsumerOptionsInner, BatchSettlement, RejectSettlement, TerminalDiscard,
+    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, RejectSettlement, TerminalDiscard,
     batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay, reject_settlement,
     settle_batch_outcome, validate_batch_topic,
 };
@@ -1986,7 +1986,9 @@ struct BatchBuffer<T: Topic> {
 impl<T: Topic> BatchBuffer<T> {
     fn new(capacity: usize) -> Self {
         Self {
-            messages: Vec::with_capacity(capacity),
+            // Clamped: `capacity` is `max_batch_size`, which a caller may set
+            // to `usize::MAX` — see `PREALLOC_CAP`'s doc.
+            messages: Vec::with_capacity(capacity.min(PREALLOC_CAP)),
             raw: Vec::new(),
             pending_dlq: Vec::new(),
             dropped: 0,

@@ -14,8 +14,8 @@ use super::constants::{
 use super::topology::InMemoryTopologyDeclarer;
 use crate::backend::ConsumerOptionsInner;
 use crate::backend::batch_consumer::{
-    BatchConsumerOptionsInner, BatchSettlement, batch_redelivery_backoff, invoke_batch_handler,
-    next_redelivery_delay, settle_batch_outcome,
+    BatchConsumerOptionsInner, BatchSettlement, PREALLOC_CAP, batch_redelivery_backoff,
+    invoke_batch_handler, next_redelivery_delay, settle_batch_outcome,
 };
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
@@ -1202,21 +1202,24 @@ struct InMemoryBatch<T: Topic> {
     /// envelope arrived so a later `Redeliver` can put the batch back in the
     /// order it was popped, rather than handled-then-parked.
     next_ordinal: u64,
-    /// `max_batch_size`, kept so [`Self::take_messages`] /
-    /// [`Self::take_envelopes`] can install a correctly pre-sized
-    /// replacement for the `Vec` they move out.
+    /// The pre-allocation size [`Self::take_messages`] installs as its
+    /// replacement `Vec` — `max_batch_size` clamped to [`PREALLOC_CAP`], not
+    /// the raw value: `with_max_batch_size` only asserts `n > 0`, so a caller
+    /// may pass `usize::MAX`, and sizing this to the real cap would abort on
+    /// `Vec::with_capacity`'s overflow check.
     cap: usize,
 }
 
 impl<T: Topic> InMemoryBatch<T> {
     fn new(max_batch_size: usize) -> Self {
+        let prealloc = max_batch_size.min(PREALLOC_CAP);
         Self {
-            messages: Vec::with_capacity(max_batch_size),
-            envelopes: Vec::with_capacity(max_batch_size),
+            messages: Vec::with_capacity(prealloc),
+            envelopes: Vec::with_capacity(prealloc),
             parked: Vec::new(),
             dropped: 0,
             next_ordinal: 0,
-            cap: max_batch_size,
+            cap: prealloc,
         }
     }
 
@@ -1260,15 +1263,11 @@ impl<T: Topic> InMemoryBatch<T> {
         std::mem::replace(&mut self.messages, Vec::with_capacity(self.cap))
     }
 
-    /// Take the handled envelopes for a terminal or redelivery settlement,
-    /// same re-sizing rationale as [`Self::take_messages`].
-    fn take_envelopes(&mut self) -> Vec<(u64, Envelope)> {
-        std::mem::replace(&mut self.envelopes, Vec::with_capacity(self.cap))
-    }
-
     /// Reset for the next batch, in place: `Vec::clear` retains whatever
-    /// capacity each list already holds (either the original pre-sizing or a
-    /// `take_*` replacement), so a flush never pays a reallocation here.
+    /// capacity each list already holds (either the original pre-sizing or
+    /// `take_messages`'s replacement, or — for `envelopes`/`parked` — the
+    /// capacity `drain` always leaves behind), so a flush never pays a
+    /// reallocation here.
     fn clear(&mut self) {
         self.messages.clear();
         self.envelopes.clear();
@@ -1343,7 +1342,8 @@ fn ingest_envelope<T: Topic>(
 /// entry whose in-flight publish lost the race against that same
 /// per-consumer token — see [`route_reject_or_park`]'s doc for why only that
 /// token needs racing here (the broker token already races inside
-/// `enqueue`). The caller requeues this remainder rather than losing it.
+/// `enqueue`). The caller folds this into the same requeue a `Redeliver`
+/// flush uses, rather than losing the message.
 async fn publish_parked(
     flush: &InMemoryFlushCtx<'_>,
     parked: &mut Vec<(u64, Envelope, metrics::FailReason)>,
@@ -1428,14 +1428,15 @@ async fn requeue_unpublished(flush: &InMemoryFlushCtx<'_>, mut unpublished: Vec<
     flush.broker.requeue_front(flush.queue, envs).await;
 }
 
-/// Shared tail for `Commit` and `DeadLetter`: publish whatever pre-handler
-/// drops are still parked, requeue anything that publish could not land
-/// because shutdown won the race (folded together with `already_unpublished`,
-/// which `DeadLetter` uses to pass in its own handled-envelope remainder),
-/// release the flush's `in_flight` slots, reset the redelivery backoff (this
-/// flush retired cleanly enough to reach here, so the next `Redeliver` starts
-/// escalating from the beginning again), and clear the batch for the next
-/// one. `Redeliver` keeps its own ending — no backoff reset, and it requeues
+/// Shared tail for `Commit`, `DeadLetter` and the all-dropped empty-batch
+/// case: publish whatever pre-handler drops are still parked, requeue
+/// anything that publish could not land because shutdown won the race
+/// (folded together with `already_unpublished`, which `DeadLetter` uses to
+/// pass in its own handled-envelope remainder), release the flush's
+/// `in_flight` slots, reset the redelivery backoff (this flush retired
+/// cleanly enough to reach here, so the next `Redeliver` starts escalating
+/// from the beginning again), and clear the batch for the next one.
+/// `Redeliver` keeps its own ending — no backoff reset, and it requeues
 /// unconditionally instead of only on a shutdown race.
 async fn finish_terminal_flush<T: Topic>(
     flush: &InMemoryFlushCtx<'_>,
@@ -1513,12 +1514,7 @@ async fn flush_inmemory_batch<T, H>(
     // need publishing, and every popped envelope still needs its in-flight
     // slot released.
     if batch_size == 0 {
-        let unpublished = publish_parked(flush, &mut batch.parked).await;
-        if !unpublished.is_empty() {
-            requeue_unpublished(flush, unpublished).await;
-        }
-        release_in_flight(flush.queue, flush_len as u64);
-        batch.clear();
+        finish_terminal_flush(flush, batch, flush_len, redelivery_backoff, Vec::new()).await;
         return;
     }
 
@@ -1540,8 +1536,7 @@ async fn flush_inmemory_batch<T, H>(
         BatchSettlement::DeadLetter => {
             let has_dlq = flush.topology.dlq().is_some();
             let mut unpublished: Vec<(u64, Envelope)> = Vec::new();
-            let envelopes = batch.take_envelopes();
-            for (ordinal, envelope) in envelopes {
+            for (ordinal, envelope) in batch.envelopes.drain(..) {
                 // The per-consumer or broker shutdown token may already have
                 // fired between envelopes — stop attempting new publishes
                 // rather than starting one only to lose the race anyway, but
@@ -1588,14 +1583,21 @@ async fn flush_inmemory_batch<T, H>(
             // lists carry the pop ordinal, and ordinals are unique, so one
             // sort puts poison parked mid-batch back in its true position
             // instead of permanently behind messages that arrived after it.
-            let mut tagged = batch.take_envelopes();
+            // Skipped when nothing was parked — the common clean-`Retry`
+            // case — because `envelopes` is already in arrival order on its
+            // own: `push` only ever appends, so with no interleaved
+            // `drop_message` calls there is no gap for a sort to close.
+            let parked_was_empty = batch.parked.is_empty();
+            let mut tagged: Vec<(u64, Envelope)> = batch.envelopes.drain(..).collect();
             tagged.extend(
                 batch
                     .parked
                     .drain(..)
                     .map(|(ordinal, env, _reason)| (ordinal, env)),
             );
-            tagged.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+            if !parked_was_empty {
+                tagged.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+            }
             batch.clear();
             let mut to_requeue: Vec<Envelope> = tagged.into_iter().map(|(_, env)| env).collect();
             for env in &mut to_requeue {
@@ -1646,9 +1648,13 @@ async fn flush_inmemory_batch<T, H>(
 /// *before* selecting, so a size-triggered flush doesn't wait on the next
 /// event) and otherwise `select!`s over shutdown, the broker's own shutdown,
 /// the armed age deadline, and [`pop_one`] — which itself awaits only when
-/// the buffer is genuinely empty (see its doc). At most one envelope is
-/// popped per iteration, so the deadline and size cap are both re-checked
-/// between pops rather than racing a batch of unbounded size past either.
+/// the buffer is genuinely empty (see its doc). The deadline and size cap are
+/// re-checked between iterations; one select wake may ingest more than the
+/// single popped envelope, since [`pop_one`] winning the race is immediately
+/// followed by an opportunistic drain of up to the remaining size headroom
+/// (see that code's own comment) — but never past the size cap, which the
+/// next iteration's `flush_len() >= max_batch_size` check enforces before
+/// selecting again.
 ///
 /// # `in_flight` balance
 ///
@@ -1715,7 +1721,6 @@ where
     let broker_shutdown = broker.shutdown_token().clone();
     let shutdown = options.shutdown.clone();
     let group = options.consumer_group.clone();
-    let topic: Arc<str> = Arc::from(queue_name);
     let max_batch_size = options.max_batch_size.max(1);
     let max_batch_age = options.max_batch_age;
     let max_message_size = options.max_message_size;
@@ -1726,7 +1731,7 @@ where
         broker: &broker,
         topology,
         queue: &queue,
-        topic: topic.as_ref(),
+        topic: queue_name,
         group: group.as_deref(),
         shutdown: &shutdown,
         broker_shutdown: &broker_shutdown,
@@ -1790,7 +1795,7 @@ where
                 if deadline.is_none() {
                     deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
                 }
-                ingest_envelope::<T>(&mut batch, env, max_message_size, &topic, group.as_deref(), has_dlq);
+                ingest_envelope::<T>(&mut batch, env, max_message_size, queue_name, group.as_deref(), has_dlq);
 
                 // Opportunistic drain: now that this task is already awake and
                 // holding no lock, grab whatever else is sitting in the buffer
@@ -1803,9 +1808,17 @@ where
                 // observe the drained envelopes counted in neither backlog
                 // nor in-flight. The deadline and size cap are still
                 // re-checked at the top of the next iteration either way.
+                //
+                // Gated on `headroom > 0`: the pop above may already have
+                // filled the batch exactly (`max_batch_size == 1`, or the
+                // last slot), and `drain_up_to` still takes the buffer lock
+                // even when it has nothing to do — a lock this iteration has
+                // no other reason to pay for.
                 let headroom = max_batch_size.saturating_sub(batch.flush_len());
-                for env in queue.drain_up_to(headroom).await {
-                    ingest_envelope::<T>(&mut batch, env, max_message_size, &topic, group.as_deref(), has_dlq);
+                if headroom > 0 {
+                    for env in queue.drain_up_to(headroom).await {
+                        ingest_envelope::<T>(&mut batch, env, max_message_size, queue_name, group.as_deref(), has_dlq);
+                    }
                 }
             }
         }

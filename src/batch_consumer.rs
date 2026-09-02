@@ -321,7 +321,7 @@ impl<B: HasBatchConsumption> BatchConsumer<B> {
     /// |---|---|
     /// | `Ack` | Every message in the batch retires. |
     /// | `Reject` | Terminal: every message is dead-lettered (or discarded, with no DLQ configured) and retires. |
-    /// | `Retry` | The whole batch is redelivered. There is no per-batch retry budget, so a handler stuck returning `Retry` redelivers forever — see `messages_consumed_total{outcome="retry"}` climbing with no matching `outcome="ack"` as the alertable signal. |
+    /// | `Retry` | The whole batch is returned to the backend's redelivery mechanism. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless — see `messages_consumed_total{outcome="retry"}` climbing with no matching `outcome="ack"` as the alertable signal on a backend without such a cap. |
     /// | `Defer` | **Identical to `Retry` here.** A batch-wide outcome carries no sequence key, so the `Retry`/`Defer` distinction that matters on the single-message path has no meaning for a batch. |
     ///
     /// `T` is bound by [`NotSequenced`] at compile time — a topic from

@@ -163,7 +163,7 @@ pub(crate) fn validate_batch_topic<T: Topic>() -> Result<()> {
 /// |---|---|---|
 /// | `Ack` | `Commit` | Every message in the batch retires; offsets/positions advance. |
 /// | `Reject` | `DeadLetter` | Terminal: every message is dead-lettered (or discarded, with no DLQ configured) and retires. |
-/// | `Retry` | `Redeliver` | The whole batch is redelivered — a seek-back / re-buffer, not a republish. There is no per-batch retry budget, so a handler stuck returning `Retry` redelivers forever. |
+/// | `Retry` | `Redeliver` | The whole batch is returned to the backend's redelivery mechanism — a seek-back / re-buffer, not a republish. Shove itself imposes no per-batch retry budget, but a backend-declared delivery cap (NATS `MaxDeliver`, RabbitMQ's quorum delivery-limit, SQS's `maxReceiveCount`) may terminate redelivery per that backend's own semantics regardless. Kafka and InMemory currently redeliver indefinitely — see each backend's own docs for that stronger, backend-specific guarantee. |
 /// | `Defer` | `Redeliver` | **Identical to `Retry` here.** A batch-wide outcome carries no sequence key, so the `Retry`/`Defer` distinction that matters on the single-message path — spending the retry budget versus not — has no meaning: there is no per-batch budget to spend either way. |
 ///
 /// See [`settle_broadcast_outcome`](crate::backend::broadcast::settle_broadcast_outcome)
@@ -324,6 +324,19 @@ mod settling {
             (true, false) => RejectSettlement::Lost,
         }
     }
+
+    /// Ceiling on the up-front `Vec` reservation a batch buffer makes for
+    /// its decoded messages, independent of the configured `max_batch_size`.
+    /// `BatchConsumerOptions::with_max_batch_size` only asserts `n > 0`, so a
+    /// caller is free to pass `usize::MAX`; sizing the initial allocation to
+    /// the real cap would then abort the consumer task on
+    /// `Vec::with_capacity`'s overflow check before a single message ever
+    /// arrives. Both backends' batch buffers clamp their initial reservation
+    /// to `max_batch_size.min(PREALLOC_CAP)` instead — growth still reaches
+    /// the real `max_batch_size` for a sane size, so this only bounds the
+    /// up-front allocation, an amortisation nicety rather than a correctness
+    /// requirement.
+    pub(crate) const PREALLOC_CAP: usize = 4096;
 
     /// First delay after redelivering an un-acked batch, escalating to
     /// [`BATCH_REDELIVERY_BACKOFF_MAX`] — see `flush_batch`'s non-Ack arm.
@@ -678,7 +691,9 @@ mod settling {
 }
 
 #[cfg(any(feature = "kafka", feature = "inmemory"))]
-pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay};
+pub(crate) use settling::{
+    PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
+};
 
 #[cfg(feature = "kafka")]
 pub(crate) use settling::{RejectSettlement, TerminalDiscard, reject_settlement};
