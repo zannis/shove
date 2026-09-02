@@ -15,11 +15,12 @@ in the last section so the door is not nailed shut, but it should not be built
 without a caller.
 
 **2026-09-02:** the batch-consumption entry point is now generic —
-`Broker::batch_consumer()`, gated on `HasBatchConsumption` (Kafka and InMemory
-implement it today; others land per-backend) — rather than Kafka-only
-`KafkaConsumer::run_batch`. The exclusion this document argues for is
-unchanged and applies identically on the generic path: `NotSequenced` is the
-compile-time bound, backed by the same runtime guard, on every backend.
+`Broker::batch_consumer()`, gated on `HasBatchConsumption` (see that trait's
+own doc comment in `src/backend/capability.rs` for the current per-backend
+list, which is the authoritative copy — not restated here) — rather than
+Kafka-only `KafkaConsumer::run_batch`. The exclusion this document argues for
+is unchanged and applies identically on the generic path: `NotSequenced` is
+the compile-time bound, backed by the same runtime guard, on every backend.
 
 ## Why
 
