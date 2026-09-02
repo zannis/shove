@@ -18,15 +18,27 @@ crate locally so your change passes CI on the first try.
 
 ## Fast feedback loop (no Docker, no secrets)
 
-The unit tests plus the in-memory-backed tests run without Docker or any
-credentials:
+The lib unit tests run without any features:
 
 ```sh
 cargo nextest run --no-default-features
 ```
 
-(CI runs the equivalent `cargo test --no-default-features`; both work. This
-repo's convention is `cargo nextest run`.)
+This runs the unit tests **only**. The crate's `default` feature set is empty
+and the in-memory test files are all gated on the `inmemory` feature, so under
+`--no-default-features` those binaries compile to zero tests and report green
+without having run anything.
+
+The in-memory-backed tests are also Docker-free and secret-free — run them
+with the `inmemory` row of the feature-set table below:
+
+```sh
+cargo nextest run --features inmemory,metrics,sbe,env-config
+```
+
+(CI runs the equivalent `cargo test --no-default-features` in the `check` job —
+equally unit-only — and covers the in-memory suite via the `coverage` matrix's
+`inmemory` entry. This repo's convention is `cargo nextest run`.)
 
 ## Running integration tests
 
