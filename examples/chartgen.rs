@@ -30,7 +30,7 @@ use clap::Parser;
     about = "Render benchmark charts from a versioned results document"
 )]
 struct Cli {
-    /// Path to the results document (`bench-schema` v1).
+    /// Path to the results document (`bench-schema` v4).
     #[arg(long)]
     input: PathBuf,
 
