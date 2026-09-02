@@ -50,27 +50,38 @@ use crate::schema_registry::{SchemaEnforcement, SchemaRegistry};
 /// `Arc`, make blind cloning a footgun on a one-consumer-per-call API — the
 /// same reason `shove::kafka::BatchConsumerOptions` is not `Clone` today.
 /// Parity with that sibling type wins over parity with `ConsumerOptions`.
+///
+/// # Field visibility
+///
+/// Fields are `pub(crate)`, not private: `shove::kafka::BatchConsumerOptions`
+/// is a `pub type` alias of `BatchConsumerOptions<Kafka>` (see
+/// `backends::kafka::consumer`), and that backend's own white-box unit tests
+/// — defined in `backends::kafka::consumer`, a sibling module rather than a
+/// descendant of this one — read these fields directly rather than through
+/// the builders' getters. Plain private would hide them from that sibling
+/// module; `pub(crate)` stops at the crate boundary either way, so nothing
+/// external gains access that a private field would have hidden from it.
 pub struct BatchConsumerOptions<B: Backend> {
-    max_batch_size: usize,
-    max_batch_age: Duration,
-    handler_timeout: Option<Duration>,
-    handler_timeout_outcome: Option<Outcome>,
-    consumer_group: Option<Arc<str>>,
-    max_message_size: Option<usize>,
-    max_reconnect_attempts: Option<u32>,
-    shutdown: CancellationToken,
+    pub(crate) max_batch_size: usize,
+    pub(crate) max_batch_age: Duration,
+    pub(crate) handler_timeout: Option<Duration>,
+    pub(crate) handler_timeout_outcome: Option<Outcome>,
+    pub(crate) consumer_group: Option<Arc<str>>,
+    pub(crate) max_message_size: Option<usize>,
+    pub(crate) max_reconnect_attempts: Option<u32>,
+    pub(crate) shutdown: CancellationToken,
 
     #[cfg(feature = "kafka")]
-    kafka_group_id: Option<Arc<str>>,
+    pub(crate) kafka_group_id: Option<Arc<str>>,
     #[cfg(feature = "kafka")]
-    kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
+    pub(crate) kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
 
     #[cfg(feature = "kafka-schema-registry")]
-    schema_registry: Option<Arc<SchemaRegistry>>,
+    pub(crate) schema_registry: Option<Arc<SchemaRegistry>>,
     #[cfg(feature = "kafka-schema-registry")]
-    schema_enforcement: SchemaEnforcement,
+    pub(crate) schema_enforcement: SchemaEnforcement,
     #[cfg(feature = "kafka-schema-registry")]
-    schema_accepted_subjects: Option<Vec<Arc<str>>>,
+    pub(crate) schema_accepted_subjects: Option<Vec<Arc<str>>>,
 
     _backend: PhantomData<fn() -> B>,
 }

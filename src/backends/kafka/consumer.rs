@@ -27,6 +27,7 @@ use crate::backend::batch_consumer::{
     validate_batch_topic,
 };
 use crate::backend::broadcast::{BROADCAST_DEFER_DELAY, BroadcastAction, settle_broadcast_outcome};
+use crate::batch_consumer::BatchConsumerOptions as GenericBatchConsumerOptions;
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::Result;
@@ -40,9 +41,15 @@ use crate::routing::{
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
+use crate::{HoldQueue, Kafka, ShoveError};
+// These four are only read back by `batch_consumer_options_tests` below, to
+// pin that `BatchConsumerOptions` (now a `pub type` alias of the generic
+// `BatchConsumerOptions<Kafka>`) still defaults to the same shared constants
+// the type used to hardcode directly.
+#[cfg(test)]
 use crate::{
     DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE,
-    DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError,
+    DEFAULT_MAX_MESSAGE_SIZE,
 };
 
 #[cfg(feature = "kafka-msk-iam")]
@@ -1762,270 +1769,20 @@ where
 // ---------------------------------------------------------------------------
 
 /// Options for [`KafkaConsumer::run_batch`].
-pub struct BatchConsumerOptions {
-    max_batch_size: usize,
-    max_batch_age: Duration,
-    max_reconnect_attempts: Option<u32>,
-    max_message_size: Option<usize>,
-    handler_timeout: Option<Duration>,
-    handler_timeout_outcome: Option<Outcome>,
-    consumer_group: Option<Arc<str>>,
-    kafka_group_id: Option<Arc<str>>,
-    kafka_auto_offset_reset: Option<KafkaAutoOffsetReset>,
-    shutdown: CancellationToken,
-    #[cfg(feature = "kafka-schema-registry")]
-    schema_registry: Option<Arc<SchemaRegistry>>,
-    #[cfg(feature = "kafka-schema-registry")]
-    schema_enforcement: SchemaEnforcement,
-    #[cfg(feature = "kafka-schema-registry")]
-    schema_accepted_subjects: Option<Vec<Arc<str>>>,
-}
-
-impl Default for BatchConsumerOptions {
-    fn default() -> Self {
-        Self {
-            max_batch_size: DEFAULT_KAFKA_MAX_BATCH_SIZE,
-            max_batch_age: DEFAULT_KAFKA_MAX_BATCH_AGE,
-            max_reconnect_attempts: None,
-            max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
-            // Same default as `ConsumerOptions`. A batch flush is one DB
-            // transaction rather than one row, so 30 s is a different amount of
-            // headroom than it is on the single-message path — a sink whose
-            // flush legitimately takes longer should raise it deliberately
-            // rather than discover the default by having batches retried.
-            handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
-            handler_timeout_outcome: None,
-            consumer_group: None,
-            kafka_group_id: None,
-            kafka_auto_offset_reset: None,
-            shutdown: CancellationToken::new(),
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_registry: None,
-            // Matches `ConsumerOptions`: enforcement is opt-out, not opt-in.
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_enforcement: SchemaEnforcement::Enforce,
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_accepted_subjects: None,
-        }
-    }
-}
-
-impl BatchConsumerOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Flush once the batch reaches this many messages. Default
-    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`] (500).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n == 0`.
-    pub fn with_max_batch_size(mut self, n: usize) -> Self {
-        assert!(n > 0, "max_batch_size must be > 0");
-        self.max_batch_size = n;
-        self
-    }
-
-    /// Flush once this long has elapsed since the first message in the
-    /// current batch, even if `max_batch_size` hasn't been reached.
-    /// Default [`DEFAULT_KAFKA_MAX_BATCH_AGE`] (250 ms).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `d` is zero.
-    pub fn with_max_batch_age(mut self, d: Duration) -> Self {
-        assert!(!d.is_zero(), "max_batch_age must be positive");
-        self.max_batch_age = d;
-        self
-    }
-
-    pub fn with_max_reconnect_attempts(mut self, n: u32) -> Self {
-        self.max_reconnect_attempts = Some(n);
-        self
-    }
-
-    pub fn with_max_message_size(mut self, n: usize) -> Self {
-        self.max_message_size = Some(n);
-        self
-    }
-
-    /// Abandon a `handle_batch` call that runs longer than this and treat the
-    /// batch as [`Outcome::Retry`]. Default [`DEFAULT_HANDLER_TIMEOUT`] (30 s).
-    ///
-    /// Same semantics as [`ConsumerOptions::with_handler_timeout`], and it
-    /// matters more here: the batch loop is a single task, so a flush that
-    /// never returns also stops offset commits, rebalance handling and
-    /// shutdown for as long as it hangs.
-    ///
-    /// [`ConsumerOptions::with_handler_timeout`]: crate::ConsumerOptions::with_handler_timeout
-    ///
-    /// # Panics
-    ///
-    /// Panics if `timeout` is zero.
-    pub fn with_handler_timeout(mut self, timeout: Duration) -> Self {
-        assert!(!timeout.is_zero(), "handler_timeout must be positive");
-        self.handler_timeout = Some(timeout);
-        self
-    }
-
-    /// The configured flush size — what [`with_max_batch_size`] set, or
-    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`].
-    ///
-    /// [`with_max_batch_size`]: Self::with_max_batch_size
-    pub fn max_batch_size(&self) -> usize {
-        self.max_batch_size
-    }
-
-    /// The configured flush age — what [`with_max_batch_age`] set, or
-    /// [`DEFAULT_KAFKA_MAX_BATCH_AGE`].
-    ///
-    /// [`with_max_batch_age`]: Self::with_max_batch_age
-    pub fn max_batch_age(&self) -> Duration {
-        self.max_batch_age
-    }
-
-    /// Let `handle_batch` run for as long as it likes.
-    ///
-    /// For sinks whose flush has no meaningful upper bound. The cost is that a
-    /// genuinely hung flush wedges the consumer with no recovery — including
-    /// `shutdown.cancel()`, which cannot interrupt an in-flight flush.
-    pub fn without_handler_timeout(mut self) -> Self {
-        self.handler_timeout = None;
-        self
-    }
-
-    /// What a batch handler timeout resolves to, instead of the default
-    /// [`Outcome::Retry`].
-    ///
-    /// The same motivation as
-    /// [`ConsumerOptions::with_handler_timeout_outcome`] — a slow flush is
-    /// usually backpressure, not a poison batch — but **not** the same
-    /// mechanics, because the outcome applies batch-wide and `run_batch` has
-    /// no per-message retry counter:
-    ///
-    /// | Outcome | Effect on the whole batch |
-    /// |---|---|
-    /// | `Retry` (default) | Seek back and redeliver after an escalating delay. Forever, if the handler keeps timing out. |
-    /// | `Defer` | **Identical to `Retry` here.** Same seek-back arm, same backoff. |
-    /// | `Ack` | Commit every offset in the batch. The messages are gone, unprocessed, with no DLQ copy. |
-    /// | `Reject` | Terminal: dead-letter every message (or discard it, with no DLQ declared) and commit. |
-    ///
-    /// The `Retry`/`Defer` distinction that matters on the single-message path
-    /// — spending the retry budget versus not — has no meaning here. There is
-    /// no budget to spend: a batch is never dead-lettered for exhausting one,
-    /// so a timeout can never turn into the silent budget-exhaustion discard
-    /// this option exists to avoid elsewhere. Setting `Defer` over the default
-    /// is therefore a no-op, kept legal only so the two option types read the
-    /// same.
-    ///
-    /// That leaves the real choice as *redeliver forever* (`Retry`/`Defer`)
-    /// versus *give up on this batch* (`Ack`/`Reject`). Both of the latter
-    /// retire messages the handler never finished, so reach for them only when
-    /// a stalled flush genuinely means the payloads are no longer worth
-    /// processing — and prefer `Reject` to `Ack` unless the topology has no
-    /// DLQ, since `Reject` at least preserves them.
-    ///
-    /// [`ConsumerOptions::with_handler_timeout_outcome`]: crate::ConsumerOptions::with_handler_timeout_outcome
-    pub fn with_handler_timeout_outcome(mut self, outcome: Outcome) -> Self {
-        self.handler_timeout_outcome = Some(outcome);
-        self
-    }
-
-    /// Tag this consumer with a group name for metrics labelling, exactly as
-    /// [`ConsumerOptions::with_consumer_group`] does on the single-message
-    /// path. Left unset it surfaces as `consumer_group="default"`.
-    ///
-    /// This is **not** [`with_group_id`](Self::with_group_id). The two are
-    /// deliberately independent: `group_id` is the Kafka `group.id` the broker
-    /// coordinates partition assignment with, while this is the logical group
-    /// name the `consumer_group` metric label reports — the same value every
-    /// other backend reports, so one dashboard query spans all of them. Setting
-    /// only `with_group_id` moves the partitions without moving the label, and
-    /// setting only this one moves the label without moving the partitions.
-    ///
-    /// [`ConsumerOptions::with_consumer_group`]: crate::ConsumerOptions::with_consumer_group
-    pub fn with_consumer_group(mut self, name: impl Into<Arc<str>>) -> Self {
-        self.consumer_group = Some(name.into());
-        self
-    }
-
-    pub fn with_group_id(mut self, group_id: impl Into<Arc<str>>) -> Self {
-        self.kafka_group_id = Some(group_id.into());
-        self
-    }
-
-    pub fn with_auto_offset_reset(mut self, reset: KafkaAutoOffsetReset) -> Self {
-        self.kafka_auto_offset_reset = Some(reset);
-        self
-    }
-
-    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
-        self.shutdown = shutdown;
-        self
-    }
-
-    /// Decode batch messages through the Confluent Schema Registry: strip the
-    /// wire frame, gate the resolved subject, then decode the inner payload
-    /// with `T::Codec`.
-    ///
-    /// Same semantics as [`ConsumerOptions::with_schema_registry`] on the
-    /// single-message path, including DLQ routing for frame/subject/decode
-    /// failures. Without a registry the payload is decoded directly by
-    /// `T::Codec`, unchanged.
-    ///
-    /// [`ConsumerOptions::with_schema_registry`]: crate::ConsumerOptions::with_schema_registry
-    #[cfg(feature = "kafka-schema-registry")]
-    pub fn with_schema_registry(mut self, registry: Arc<SchemaRegistry>) -> Self {
-        self.schema_registry = Some(registry);
-        self
-    }
-
-    /// Whether a message whose schema subject is not accepted is routed to the
-    /// DLQ (`Enforce`, the default) or decoded anyway with a warning
-    /// (`Permissive`).
-    #[cfg(feature = "kafka-schema-registry")]
-    pub fn with_schema_enforcement(mut self, enforcement: SchemaEnforcement) -> Self {
-        self.schema_enforcement = enforcement;
-        self
-    }
-
-    /// Subjects this consumer accepts. Defaults to `{queue}-value`.
-    #[cfg(feature = "kafka-schema-registry")]
-    pub fn accept_schema_subjects<I, S>(mut self, subjects: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<Arc<str>>,
-    {
-        self.schema_accepted_subjects = Some(subjects.into_iter().map(Into::into).collect());
-        self
-    }
-
-    /// Lower to the internal options struct for passing across the
-    /// [`BatchConsumerImpl`](crate::backend::BatchConsumerImpl) trait
-    /// boundary. Every field maps 1:1 — this type's fields *are*
-    /// `BatchConsumerOptionsInner`'s, just behind builders.
-    pub(crate) fn into_inner(self) -> BatchConsumerOptionsInner {
-        BatchConsumerOptionsInner {
-            max_batch_size: self.max_batch_size,
-            max_batch_age: self.max_batch_age,
-            handler_timeout: self.handler_timeout,
-            handler_timeout_outcome: self.handler_timeout_outcome,
-            shutdown: self.shutdown,
-            consumer_group: self.consumer_group,
-            max_message_size: self.max_message_size,
-            max_reconnect_attempts: self.max_reconnect_attempts,
-            kafka_group_id: self.kafka_group_id,
-            kafka_auto_offset_reset: self.kafka_auto_offset_reset,
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_registry: self.schema_registry,
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_enforcement: self.schema_enforcement,
-            #[cfg(feature = "kafka-schema-registry")]
-            schema_accepted_subjects: self.schema_accepted_subjects,
-        }
-    }
-}
+///
+/// A `pub type` alias of the generic
+/// [`BatchConsumerOptions<Kafka>`](crate::batch_consumer::BatchConsumerOptions),
+/// not a distinct type: every builder this backend needs already exists on
+/// the generic type, split across two homes. The backend-agnostic ones
+/// (`with_max_batch_size`, `with_max_batch_age`, `with_handler_timeout`,
+/// `with_consumer_group`, `with_shutdown`, ...) live directly on
+/// `BatchConsumerOptions<B>` in `src/batch_consumer.rs`. The Kafka-only ones —
+/// `with_group_id`, `with_auto_offset_reset`, and (under
+/// `kafka-schema-registry`) `with_schema_registry`,
+/// `with_schema_enforcement`, `accept_schema_subjects` — live in that same
+/// file's `#[cfg(feature = "kafka")] impl BatchConsumerOptions<Kafka>` blocks,
+/// gated the same way this type alias only exists under `kafka`.
+pub type BatchConsumerOptions = GenericBatchConsumerOptions<Kafka>;
 
 /// The parts of a batch flush that don't change between flushes.
 struct BatchFlushCtx<'a> {
