@@ -180,7 +180,11 @@ jobs:
             # `metrics` asserted by `metrics_kafka_failall` and
             # `metrics_kafka_failall_no_dlq`.
             # `env-config` runs the `KafkaTopicTuning` tests.
-            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config
+            # `inmemory` makes tests/bench_harness_kafka.rs (gated on
+            # kafka+inmemory) an executable target here, so the stress
+            # harness's Kafka batch-knob wiring tests actually run in CI
+            # instead of only type-checking under the clippy gate.
+            features: kafka,kafka-ssl,kafka-msk-iam,test-support,audit,metrics,sbe,env-config,inmemory
           - name: kafka-schema-registry
             # Split out from the `kafka` entry rather than folded into it: the
             # two schema-registry suites each pin FIXED host ports (cp stack
