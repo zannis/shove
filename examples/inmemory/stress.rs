@@ -38,7 +38,9 @@ async fn main() {
     // The drain runs on the client the fill phase used. For this backend that
     // is not an optimisation but a correctness requirement: InMemory's queues
     // live inside the client, so a second client would drain an empty DLQ.
-    let dlq_drain: DlqDrainFn<InMemory> = Box::new(|client, handler| {
+    let dlq_drain: DlqDrainFn<InMemory> = Box::new(|client, handler, _stop| {
+        // This backend's `run_dlq` exits when the teardown closes the client;
+        // the stop token is for backends without that path (see `DlqDrainFn`).
         Box::pin(async move {
             let consumer = InMemoryConsumer::new(client);
             consumer
