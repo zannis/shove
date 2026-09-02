@@ -197,7 +197,7 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 # only `svg_backend`/`line_series` is load-bearing, not tidiness: the default
 # set enables `ttf`, which resolves text extents through system fonts. Those
 # differ between a laptop and `ubuntu-latest`, so every label coordinate — and
-# therefore every byte of the SVG — would move, and the chart-staleness CI leg
+# therefore every byte of the SVG — would move, and the committed-SVG byte-compare
 # would diff red on a run that changed nothing.
 plotters = { version = "0.3.7", default-features = false, features = [
   "svg_backend",
@@ -434,7 +434,7 @@ path = "examples/redis/audited_consumer.rs"
 required-features = ["redis-streams", "audit"]
 
 # Reads the committed results document and writes the published SVG charts.
-# Deliberately carries no `required-features`: the chart-staleness CI leg runs
+# Deliberately carries no `required-features`: chart regeneration runs
 # it under `--no-default-features`, and a backend feature here would pull
 # librdkafka/libsasl into a job that only reads JSON and writes SVGs.
 [[example]]

@@ -11,8 +11,9 @@
 //!
 //! ## Output must be byte-deterministic
 //!
-//! The chart-staleness CI leg regenerates these SVGs and diffs them against the
-//! committed ones, so identical input must produce identical bytes on any host.
+//! The committed-artifact test byte-compares a fresh render of every family
+//! against the committed SVGs (and the epic's CI staleness leg will diff them
+//! the same way), so identical input must produce identical bytes on any host.
 //! Three rules follow, and every one of them is load-bearing:
 //!
 //! - **No wall clock.** Every rendered timestamp comes from the document's
@@ -222,15 +223,6 @@ pub struct ScenarioResult {
     #[serde(default)]
     pub max_batch_age_ms: Option<u64>,
     pub throughput_msg_per_sec: f64,
-    /// `Option` rather than a zero default: a percentile that is *absent* must
-    /// be a loud refusal in the latency family, not a spectacular 0 ms bar on
-    /// an absolute axis.
-    #[serde(default)]
-    pub dispatch_p50_ms: Option<f64>,
-    #[serde(default)]
-    pub dispatch_p95_ms: Option<f64>,
-    #[serde(default)]
-    pub dispatch_p99_ms: Option<f64>,
 }
 
 impl ScenarioResult {
@@ -243,26 +235,6 @@ impl ScenarioResult {
     /// throughput is a lower bound on the drain rate, never the rate itself.
     fn is_setup_bound(&self) -> bool {
         self.handler_cost == COST_SETUP_BOUND
-    }
-
-    /// The three dispatch percentiles — present, finite and non-negative — or
-    /// `None`. The latency family refuses a row without them rather than
-    /// defaulting anything to a 0 ms bar.
-    fn percentiles(&self) -> Option<(f64, f64, f64)> {
-        match (
-            self.dispatch_p50_ms,
-            self.dispatch_p95_ms,
-            self.dispatch_p99_ms,
-        ) {
-            (Some(p50), Some(p95), Some(p99))
-                if [p50, p95, p99].iter().all(|p| p.is_finite() && *p >= 0.0)
-                    && p50 <= p95
-                    && p95 <= p99 =>
-            {
-                Some((p50, p95, p99))
-            }
-            _ => None,
-        }
     }
 }
 
@@ -300,12 +272,6 @@ pub enum ChartError {
         backend: String,
         flow: String,
         what: String,
-    },
-    /// The latency family's selected row carries no usable percentiles. A
-    /// `#[serde(default)]` zero here would publish a ~0 ms bar on an absolute
-    /// axis — the clean-looking chart the contract forbids.
-    MissingPercentiles {
-        backend: String,
     },
     /// Two runs share a backend key. The charts key on that name, so the
     /// duplicates would silently overwrite each other in some families and
@@ -371,12 +337,6 @@ impl fmt::Display for ChartError {
                  per-row invariant of this schema version: {what}. Rendering \
                  it would mislabel the number; skipping it would be a silent \
                  omission."
-            ),
-            Self::MissingPercentiles { backend } => write!(
-                f,
-                "backend `{backend}`'s selected latency row carries no usable \
-                 dispatch percentiles. Refusing to render rather than \
-                 publishing a 0 ms bar on an absolute axis."
             ),
             Self::DuplicateBackendRun { backend } => write!(
                 f,
@@ -1825,109 +1785,51 @@ fn render_parallel_vs_sequenced(
 
 // ── Family 4: dispatch latency percentiles ──────────────────────────────────
 
+/// Publishes an explicit refusal panel, not bars — for now.
+///
+/// The v4 rows' dispatch percentiles measure publish-timestamp →
+/// handler-entry while the driver publishes the whole corpus concurrently
+/// with the drain. Under a saturated backlog that quantity is queue
+/// residency: the median is ≈ half the drain window (four of five committed
+/// backends show exactly that — rabbitmq: 104.8 s window, 53,515 ms p50),
+/// a function of corpus size and the publish/drain rate ratio rather than
+/// of anything shove does per message. Kafka's publish path overlaps the
+/// drain differently, so its 18 ms is not even the same quantity. One
+/// "lower is better" axis over both would publish a false cross-backend
+/// comparison — the same class of defect the `handler_cost` markers exist
+/// to refuse. The bars return when the harness records dispatch latency
+/// under matched load; the panel keeps the file present, provenanced and
+/// byte-deterministic so the staleness contract is unaffected.
 fn render_dispatch_latency(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
-    let series: Vec<(String, RGBColor)> = vec![
-        ("p50".to_string(), palette_colour(0)),
-        ("p95".to_string(), palette_colour(1)),
-        ("p99".to_string(), palette_colour(3)),
+    let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    let notes = vec![
+        "the v4 dispatch percentiles time publish → handler entry while the whole corpus \
+         is published concurrently with the drain: under a saturated backlog that is queue \
+         residency (median ≈ half the drain window), which scales with corpus size and the \
+         publish/drain rate ratio — not a per-message dispatch cost, and not comparable \
+         across backends"
+            .to_string(),
+        "bars will be published once the harness measures dispatch latency under matched \
+         load"
+            .to_string(),
     ];
-
-    let mut groups = Vec::new();
-    let mut notes = Vec::new();
-    for run in &doc.runs {
-        // Percentiles are per-message, so unlike a throughput they survive an
-        // unseparated window — but only under a negligible handler. A sleeping
-        // handler queues every message behind the sleeps before it, which
-        // makes the tail percentiles the handler's, not shove's. Prefer the
-        // framework row; fall back to a setup-bound one with a caption note,
-        // since its early messages may still have queued behind the group
-        // join.
-        let in_slice = |r: &&ScenarioResult| {
-            r.flow == HEADLINE_FLOW
-                && r.payload_bytes == HEADLINE_PAYLOAD
-                && r.consumers == BASE_CONSUMERS
-        };
-        let row = run
-            .results
-            .iter()
-            .filter(in_slice)
-            .find(|r| r.is_framework())
-            .or_else(|| {
-                run.results
-                    .iter()
-                    .filter(in_slice)
-                    .find(|r| r.is_setup_bound())
-            });
-        match row {
-            Some(r) => {
-                // A selected row without usable percentiles is a refusal, not
-                // a zero: `#[serde(default)]` zeros here would publish a ~0 ms
-                // bar on an absolute axis scaled by the other backends.
-                let (p50, p95, p99) =
-                    r.percentiles()
-                        .ok_or_else(|| ChartError::MissingPercentiles {
-                            backend: run.backend.clone(),
-                        })?;
-                if !run.representative {
-                    notes.push(shape_only_note(run));
-                }
-                if r.is_setup_bound() && run.representative {
-                    notes.push(format!(
-                        "{}: setup-bound window — early messages may include \
-                         coordination queueing in these percentiles",
-                        run.backend
-                    ));
-                }
-                groups.push(BarGroup {
-                    label: run.backend.clone(),
-                    bars: vec![
-                        Some(Bar::absolute(p50)),
-                        Some(Bar::absolute(p95)),
-                        Some(Bar::absolute(p99)),
-                    ],
-                    shape_only: !run.representative,
-                });
-            }
-            None => {
-                // The backend stays on the axis as explicit n/s markers; the
-                // note then says whether that is a declared hole or a gap.
-                let note = match unsupported_reason(run, HEADLINE_FLOW) {
-                    Some(reason) => format!("{}: {}", run.backend, unsupported_text(&reason)),
-                    None => format!("{}: {}", run.backend, gap_text()),
-                };
-                notes.push(note);
-                groups.push(BarGroup {
-                    label: run.backend.clone(),
-                    bars: vec![None, None, None],
-                    shape_only: false,
-                });
-            }
-        }
-    }
-
-    notes.extend(failure_notes(&doc.runs, |f| {
-        f.flow == HEADLINE_FLOW
-            && f.payload_bytes == HEADLINE_PAYLOAD
-            && f.consumers == BASE_CONSUMERS
-    }));
-
-    bar_chart(
-        doc,
+    frame(
         root,
+        doc,
         Family::DispatchLatency.title(),
-        &format!(
-            "{HEADLINE_FLOW} — {} payload — {BASE_CONSUMERS} consumer — lower is better",
-            fmt_payload(HEADLINE_PAYLOAD)
-        ),
-        "milliseconds",
-        "backend",
-        &series,
-        &groups,
+        "no publishable measurement in this document — see caption",
         &notes,
+    )?;
+    root.draw_text(
+        "no publishable dispatch-latency measurement in this document",
+        &centred_label(),
+        (WIDTH as i32 / 2, HEIGHT as i32 / 2 - 60),
     )
+    .map_err(render)?;
+    Ok(())
 }
 
 // ── Family 5: framework overhead, ns/msg per flow ───────────────────────────

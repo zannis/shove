@@ -7,9 +7,9 @@
 //! integration-test target — is what makes these run.
 //!
 //! Deliberately **not** feature-gated. `chartgen` carries no
-//! `required-features` because the chart-staleness CI leg runs it under
-//! `--no-default-features`; gating this file would mean the enforcement rules
-//! go untested in exactly the configuration CI uses.
+//! `required-features` because chart regeneration needs no backend and runs
+//! under `--no-default-features`; gating this file would mean the enforcement
+//! rules go untested in exactly the configuration CI uses.
 
 #[path = "../examples/common/chartgen.rs"]
 mod chartgen;
@@ -435,6 +435,15 @@ fn non_representative_backend_never_plots_an_absolute_value() {
             );
             continue;
         }
+        if family == Family::DispatchLatency {
+            // The refusal panel publishes no run at all, so there is no bar
+            // to label; the magnitude-leak assertions above still hold.
+            assert!(
+                svg.contains("no publishable dispatch-latency measurement"),
+                "the latency panel must state its refusal"
+            );
+            continue;
+        }
 
         assert!(
             svg.contains("shape only") && svg.contains("not representative"),
@@ -537,7 +546,8 @@ fn a_backend_absent_from_a_slice_is_named_rather_than_omitted() {
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), sparse)));
 
-    let svg = chartgen::render_to_string(&doc, Family::DispatchLatency).expect("should render");
+    let svg =
+        chartgen::render_to_string(&doc, Family::ThroughputVsConsumers).expect("should render");
     // The wording matters as much as the mention: this is a gap in the run,
     // and captioning it "not supported" would publish a false capability
     // claim about the library on the chart's face.
@@ -652,7 +662,7 @@ fn framework_overhead_requires_the_in_process_run() {
     );
 }
 
-// ── Determinism: the chart-staleness CI leg depends on it ───────────────────
+// ── Determinism: the committed-artifact byte-compare depends on it ──────────
 
 #[test]
 fn rendering_twice_produces_identical_bytes() {
@@ -921,21 +931,6 @@ fn batch_knobs_must_match_the_row_flow_in_both_directions() {
     }
 }
 
-#[test]
-fn a_latency_row_without_percentiles_is_a_hard_error() {
-    // serde-defaulted percentiles would render a spectacular ~0 ms bar on an
-    // absolute axis. The refusal names the backend instead.
-    let raw = document(&inmemory_run(true)).replace(
-        r#""dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,"#,
-        "",
-    );
-    let doc = parse(&raw);
-    match chartgen::render_to_string(&doc, Family::DispatchLatency) {
-        Err(ChartError::MissingPercentiles { backend }) => assert_eq!(backend, "inmemory"),
-        other => panic!("expected MissingPercentiles, got {other:?}"),
-    }
-}
-
 // ── Failed cells are named, never silently absent ────────────────────────────
 
 #[test]
@@ -1141,17 +1136,29 @@ fn empty_provenance_fields_are_rejected() {
 }
 
 #[test]
-fn unordered_percentiles_are_refused_not_rendered() {
-    // A harness bug that swaps p50/p99 must not publish a latency chart
-    // whose tail is faster than its median.
-    let raw = document(&inmemory_run(true)).replace(
-        r#""dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,"#,
-        r#""dispatch_p50_ms": 9.0, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 1.5,"#,
+fn the_latency_family_publishes_a_refusal_panel_not_bars() {
+    // The v4 dispatch percentiles are queue residency under a saturated
+    // drain (and not even that on every backend); publishing them as
+    // comparable per-backend latency bars would be a false chart. The family
+    // renders a provenanced refusal panel instead until the harness measures
+    // under matched load.
+    let svg = chartgen::render_to_string(
+        &parse(&document(&inmemory_run(true))),
+        Family::DispatchLatency,
+    )
+    .expect("the panel should render");
+    assert!(
+        svg.contains("no publishable dispatch-latency measurement"),
+        "the panel must state the refusal on its face"
     );
-    match chartgen::render_to_string(&parse(&raw), Family::DispatchLatency) {
-        Err(ChartError::MissingPercentiles { backend }) => assert_eq!(backend, "inmemory"),
-        other => panic!("expected MissingPercentiles, got {other:?}"),
-    }
+    assert!(
+        svg.contains("queue"),
+        "the caption must say what the field actually measures"
+    );
+    assert!(
+        !svg.contains("<rect") || !svg.contains("opacity=\"1\""),
+        "no bars may be drawn from the unpublishable field"
+    );
 }
 
 #[test]

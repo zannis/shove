@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Declared with **no `required-features`** and no backend dependency on
-//! purpose: the chart-staleness CI leg only reads a JSON file and writes SVGs,
+//! purpose: regenerating the charts only reads a JSON file and writes SVGs,
 //! and gating this on a backend would drag `librdkafka-dev`/`libsasl2-dev` and
 //! a full broker build into that job.
 //!
