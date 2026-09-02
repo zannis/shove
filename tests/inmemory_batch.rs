@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -173,6 +174,16 @@ define_topic!(
     BatchMessage,
     TopologyBuilder::new("inmem-batch-delivery-count").build()
 );
+const SHUTDOWN_DLQ_STALL_QUEUE: &str = "inmem-batch-shutdown-dlq-stall";
+const SHUTDOWN_DLQ_STALL_DLQ: &str = "inmem-batch-shutdown-dlq-stall-dlq";
+
+define_topic!(
+    ShutdownDlqStallTopic,
+    BatchMessage,
+    TopologyBuilder::new(SHUTDOWN_DLQ_STALL_QUEUE)
+        .dlq_named(SHUTDOWN_DLQ_STALL_DLQ)
+        .build()
+);
 
 // The pre-handler-drop pair: `DropTopic` is the batch consumer's own view
 // (JSON-decoded `BatchMessage`); `DropRawTopic` publishes the exact same
@@ -307,6 +318,7 @@ impl_recording_for!(
     BrokerCloseBackoffTopic,
     RedeliveryOrderTopic,
     DeliveryCountTopic,
+    ShutdownDlqStallTopic,
 );
 
 // ---------------------------------------------------------------------------
@@ -1622,5 +1634,146 @@ async fn poison_keeps_its_arrival_position_across_a_retry() {
          size-cap slots on poison, leaving seq=0 alone in it, got {:?}",
         handler2.batches()
     );
+    broker.close().await;
+}
+
+/// `with_shutdown` must not be inert against a `DeadLetter` flush wedged
+/// behind a full DLQ.
+///
+/// `route_reject`'s DLQ `enqueue` only races the *broker* shutdown token
+/// internally, so before this fix a DLQ sized below the rejected batch, with
+/// nothing draining it, left the per-consumer `shutdown` token with no way
+/// to unblock the flush — `run()` would hang until `broker.close()`, and a
+/// cooperative-stop wrapper timing that out would `abort()` mid-flush,
+/// destroying whatever envelopes were still waiting to be published rather
+/// than merely delaying them.
+///
+/// The DLQ's capacity is the same `default_capacity` knob as every other
+/// queue (`InMemoryConfig` has no per-queue override), so this sets it small
+/// (2) and publishes a bigger batch (5) concurrently with the consumer: the
+/// main queue only ever needs to hold up to capacity at once, since the
+/// consumer keeps draining it into its own unbounded in-memory batch buffer
+/// as messages arrive.
+#[tokio::test]
+async fn shutdown_unblocks_a_dead_letter_flush_wedged_on_a_full_dlq() {
+    let broker = Broker::<InMemory>::new(
+        InMemoryConfig::default()
+            .with_default_capacity(NonZeroUsize::new(2).expect("2 is non-zero")),
+    )
+    .await
+    .expect("connect inmemory");
+    broker
+        .topology()
+        .declare::<ShutdownDlqStallTopic>()
+        .await
+        .unwrap();
+
+    let publisher = broker.publisher().await.unwrap();
+    // Publish concurrently with the consumer spawned below: the shared
+    // capacity (2) cannot hold all 5 messages at once, so these calls only
+    // complete as the consumer drains them out of the queue.
+    let publish_handle = tokio::spawn({
+        let publisher = publisher.clone();
+        async move {
+            publish_seq::<ShutdownDlqStallTopic>(&publisher, 0..5).await;
+        }
+    });
+
+    let handler = RecordingBatchHandler::new().scripting([Outcome::Reject]);
+    let shutdown = CancellationToken::new();
+    let consumer = broker.batch_consumer();
+    let handle = tokio::spawn({
+        let handler = handler.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            consumer
+                .run::<ShutdownDlqStallTopic, _>(
+                    handler,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(5)
+                        .with_max_batch_age(Duration::from_secs(30))
+                        .with_shutdown(shutdown),
+                )
+                .await
+        }
+    });
+
+    publish_handle
+        .await
+        .expect("publishing task must not panic");
+    assert!(
+        handler.wait_for_batches(1, TIMEOUT).await,
+        "the full batch must reach the handler before the DeadLetter arm wedges on the DLQ"
+    );
+
+    // Give the DeadLetter arm time to land the two publishes the DLQ's
+    // capacity allows and then genuinely block on the third — nothing drains
+    // the DLQ in this test.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !handle.is_finished(),
+        "the flush should still be wedged behind the full DLQ at this point"
+    );
+
+    let cancelled_at = Instant::now();
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect(
+            "cancelling the per-consumer shutdown token must unblock a DeadLetter flush \
+             wedged behind a full DLQ, not hang until broker.close()",
+        )
+        .expect("consumer task must not panic")
+        .ok();
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?} to take effect",
+        cancelled_at.elapsed()
+    );
+
+    // The three envelopes that never reached the DLQ must survive — requeued
+    // onto the main queue rather than lost — with delivery_count bumped,
+    // proving `mark_redelivery` ran on the unpublished remainder. Re-consume
+    // with a fresh consumer that just Acks everything.
+    let handler2 = RecordingBatchHandler::new();
+    let shutdown2 = CancellationToken::new();
+    let consumer2 = broker.batch_consumer();
+    let handle2 = tokio::spawn({
+        let handler2 = handler2.clone();
+        let shutdown2 = shutdown2.clone();
+        async move {
+            consumer2
+                .run::<ShutdownDlqStallTopic, _>(
+                    handler2,
+                    (),
+                    BatchConsumerOptions::new()
+                        .with_max_batch_size(10)
+                        .with_max_batch_age(Duration::from_millis(300))
+                        .with_shutdown(shutdown2),
+                )
+                .await
+        }
+    });
+
+    assert!(handler2.wait_for_batches(1, TIMEOUT).await);
+    shutdown2.cancel();
+    handle2.await.unwrap().ok();
+
+    let remaining = handler2.batches_with_delivery_counts();
+    assert_eq!(remaining.len(), 1, "got {remaining:?}");
+    assert_eq!(
+        remaining[0].len(),
+        3,
+        "exactly the envelopes that never reached the DLQ must survive on the \
+         main queue instead of being lost, got {:?}",
+        remaining[0]
+    );
+    assert!(
+        remaining[0].iter().all(|(_, dc)| *dc == Some(2)),
+        "every requeued envelope must be marked redelivered, got {:?}",
+        remaining[0]
+    );
+
     broker.close().await;
 }

@@ -1337,15 +1337,69 @@ fn ingest_envelope<T: Topic>(
 /// the topology, and `reached_dlq=false` (a DLQ enqueue failure) is real data
 /// loss regardless — the same [`resolve_reject`] settling used by the
 /// `DeadLetter` arm and every other reject path.
+///
+/// Returns whatever entries never got a publish attempt because the
+/// per-consumer or broker shutdown token was already cancelled, plus any
+/// entry whose in-flight publish lost the race against that same
+/// per-consumer token — see [`route_reject_or_park`]'s doc for why only that
+/// token needs racing here (the broker token already races inside
+/// `enqueue`). The caller requeues this remainder rather than losing it.
 async fn publish_parked(
     flush: &InMemoryFlushCtx<'_>,
     parked: &mut Vec<(u64, Envelope, metrics::FailReason)>,
-) {
-    for (_ordinal, envelope, reason) in parked.drain(..) {
+) -> Vec<(u64, Envelope)> {
+    let mut unpublished = Vec::new();
+    for (ordinal, envelope, reason) in parked.drain(..) {
+        if flush.shutdown.is_cancelled() || flush.broker_shutdown.is_cancelled() {
+            unpublished.push((ordinal, envelope));
+            continue;
+        }
         let pending = metrics::pending_discard(flush.topic, flush.group, reason, true);
-        let reached_dlq =
-            route_reject(flush.broker, flush.topology, envelope, reason.as_label()).await;
-        resolve_reject(reached_dlq, pending);
+        if let Some(entry) =
+            route_reject_or_park(flush, ordinal, envelope, reason.as_label(), pending).await
+        {
+            unpublished.push(entry);
+        }
+    }
+    unpublished
+}
+
+/// Route one terminal envelope to the DLQ, racing the *per-consumer*
+/// shutdown token against the publish so a full DLQ with nothing draining it
+/// cannot wedge a cancelled consumer's flush indefinitely.
+///
+/// The *broker* token needs no race here: `route_reject` → `enqueue` already
+/// races it internally, so a broker close unblocks this on its own. Only the
+/// per-consumer token lacks that escape hatch — `enqueue` has never heard of
+/// it — which is exactly what left `with_shutdown` inert for a `DeadLetter`
+/// or parked-drop flush stuck behind a full DLQ: the per-consumer token could
+/// fire all day and this publish would keep waiting.
+///
+/// Returns `None` when the publish completed (landed in the DLQ, or was lost
+/// to a DLQ-enqueue failure — either way [`resolve_reject`] already settled
+/// `pending`). Returns `Some((ordinal, envelope))` when the per-consumer
+/// token won the race instead: the failure is already counted (`pending` was
+/// created before this call), but the message itself never reached the DLQ,
+/// so it survives to be re-rejected after restart rather than being lost —
+/// `pending.survived()` records that, and the original envelope (not the
+/// clone handed to the abandoned publish) comes back for the caller to
+/// requeue.
+async fn route_reject_or_park(
+    flush: &InMemoryFlushCtx<'_>,
+    ordinal: u64,
+    envelope: Envelope,
+    reason: &str,
+    pending: metrics::PendingDiscard,
+) -> Option<(u64, Envelope)> {
+    tokio::select! {
+        reached_dlq = route_reject(flush.broker, flush.topology, envelope.clone(), reason) => {
+            resolve_reject(reached_dlq, pending);
+            None
+        }
+        () = flush.shutdown.cancelled() => {
+            pending.survived();
+            Some((ordinal, envelope))
+        }
     }
 }
 
@@ -1358,19 +1412,43 @@ fn release_in_flight(queue: &QueueState, n: u64) {
     }
 }
 
+/// Put terminal-settlement envelopes that never reached the DLQ (shutdown won
+/// the race in [`route_reject_or_park`]) back onto the main queue instead of
+/// losing them — the same requeue-then-release ordering `Redeliver` uses (see
+/// its own comment): every entry is marked redelivered and restored to
+/// arrival order first, then handed to `requeue_front` before the caller
+/// releases the flush's `in_flight` slots, so a consumer cancelled mid-flush
+/// never has a window where the message is counted nowhere.
+async fn requeue_unpublished(flush: &InMemoryFlushCtx<'_>, mut unpublished: Vec<(u64, Envelope)>) {
+    unpublished.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+    let mut envs: Vec<Envelope> = unpublished.into_iter().map(|(_, env)| env).collect();
+    for env in &mut envs {
+        env.mark_redelivery();
+    }
+    flush.broker.requeue_front(flush.queue, envs).await;
+}
+
 /// Shared tail for `Commit` and `DeadLetter`: publish whatever pre-handler
-/// drops are still parked, release the flush's `in_flight` slots, reset the
-/// redelivery backoff (this flush retired cleanly, so the next `Redeliver`
-/// starts escalating from the beginning again), and clear the batch for the
-/// next one. `Redeliver` keeps its own ending — no backoff reset, and it
-/// requeues instead of just releasing.
+/// drops are still parked, requeue anything that publish could not land
+/// because shutdown won the race (folded together with `already_unpublished`,
+/// which `DeadLetter` uses to pass in its own handled-envelope remainder),
+/// release the flush's `in_flight` slots, reset the redelivery backoff (this
+/// flush retired cleanly enough to reach here, so the next `Redeliver` starts
+/// escalating from the beginning again), and clear the batch for the next
+/// one. `Redeliver` keeps its own ending — no backoff reset, and it requeues
+/// unconditionally instead of only on a shutdown race.
 async fn finish_terminal_flush<T: Topic>(
     flush: &InMemoryFlushCtx<'_>,
     batch: &mut InMemoryBatch<T>,
     flush_len: usize,
     redelivery_backoff: &mut Backoff,
+    mut already_unpublished: Vec<(u64, Envelope)>,
 ) {
-    publish_parked(flush, &mut batch.parked).await;
+    let parked_unpublished = publish_parked(flush, &mut batch.parked).await;
+    already_unpublished.extend(parked_unpublished);
+    if !already_unpublished.is_empty() {
+        requeue_unpublished(flush, already_unpublished).await;
+    }
     release_in_flight(flush.queue, flush_len as u64);
     *redelivery_backoff = batch_redelivery_backoff();
     batch.clear();
@@ -1392,7 +1470,10 @@ async fn finish_terminal_flush<T: Topic>(
 ///   *handled* message is individually routed to the DLQ (or discarded) via
 ///   [`resolve_reject`], the same settling every other InMemory reject path
 ///   uses, then the parked pre-handler drops are published the same way
-///   `Commit` publishes them.
+///   `Commit` publishes them. Either loop can be cut short by the
+///   per-consumer shutdown token racing a publish stuck on a full DLQ (see
+///   [`route_reject_or_park`]); whatever that leaves unpublished is requeued
+///   rather than lost — see [`finish_terminal_flush`].
 /// - `Redeliver`: the whole batch — handled envelopes plus parked ones,
 ///   sorted back into arrival order by pop ordinal — goes back to
 ///   the front of the queue via `InMemoryBroker::requeue_front`, so the next
@@ -1432,7 +1513,10 @@ async fn flush_inmemory_batch<T, H>(
     // need publishing, and every popped envelope still needs its in-flight
     // slot released.
     if batch_size == 0 {
-        publish_parked(flush, &mut batch.parked).await;
+        let unpublished = publish_parked(flush, &mut batch.parked).await;
+        if !unpublished.is_empty() {
+            requeue_unpublished(flush, unpublished).await;
+        }
         release_in_flight(flush.queue, flush_len as u64);
         batch.clear();
         return;
@@ -1451,29 +1535,44 @@ async fn flush_inmemory_batch<T, H>(
 
     match settle_batch_outcome(&outcome) {
         BatchSettlement::Commit => {
-            finish_terminal_flush(flush, batch, flush_len, redelivery_backoff).await;
+            finish_terminal_flush(flush, batch, flush_len, redelivery_backoff, Vec::new()).await;
         }
         BatchSettlement::DeadLetter => {
             let has_dlq = flush.topology.dlq().is_some();
+            let mut unpublished: Vec<(u64, Envelope)> = Vec::new();
             let envelopes = batch.take_envelopes();
-            for (_ordinal, envelope) in envelopes {
+            for (ordinal, envelope) in envelopes {
+                // The per-consumer or broker shutdown token may already have
+                // fired between envelopes — stop attempting new publishes
+                // rather than starting one only to lose the race anyway, but
+                // still walk the remainder so every one of them is collected
+                // for the requeue below instead of silently vanishing.
+                if flush.shutdown.is_cancelled() || flush.broker_shutdown.is_cancelled() {
+                    unpublished.push((ordinal, envelope));
+                    continue;
+                }
                 let pending = metrics::record_terminal(
                     flush.topic,
                     flush.group,
                     metrics::FailReason::Rejected,
                     has_dlq,
                 );
-                let reached_dlq =
-                    route_reject(flush.broker, flush.topology, envelope, "rejected").await;
                 // InMemory owns the envelope outright and retires it the
-                // instant `route_reject` returns — there is no separate
-                // broker ack that could still fail, so the discard settles
-                // now instead of waiting on one. Same rationale as
+                // instant the publish resolves — there is no separate broker
+                // ack that could still fail, so the discard settles now
+                // instead of waiting on one. Same rationale as
                 // `settle_broadcast_outcome`'s immediate confirm
-                // (`src/backend/broadcast.rs:134-142`).
-                resolve_reject(reached_dlq, pending);
+                // (`src/backend/broadcast.rs:134-142`). Racing the
+                // per-consumer shutdown token here is what keeps
+                // `with_shutdown` from being inert against a full DLQ — see
+                // `route_reject_or_park`'s doc.
+                if let Some(entry) =
+                    route_reject_or_park(flush, ordinal, envelope, "rejected", pending).await
+                {
+                    unpublished.push(entry);
+                }
             }
-            finish_terminal_flush(flush, batch, flush_len, redelivery_backoff).await;
+            finish_terminal_flush(flush, batch, flush_len, redelivery_backoff, unpublished).await;
         }
         BatchSettlement::Redeliver => {
             let delay = next_redelivery_delay(redelivery_backoff);
@@ -1578,14 +1677,21 @@ async fn flush_inmemory_batch<T, H>(
 /// # A full DLQ can stall a `DeadLetter` flush
 ///
 /// DLQ publishes go through the same `route_reject` → `enqueue` path every
-/// InMemory reject uses, and `enqueue` waits for DLQ capacity racing only the
-/// *broker* shutdown token — a pre-existing property of that shared path, not
-/// something this loop adds. What the batch path changes is scale: one
-/// `DeadLetter` flush can need up to `max_batch_size` DLQ slots back-to-back,
-/// so a DLQ sized below the batch, with nothing draining it, wedges the flush
-/// until `broker.close()`. Size the DLQ at or above `max_batch_size`, or run
-/// a DLQ drain, when using `Outcome::Reject` (or a `Reject` timeout outcome)
-/// with batches.
+/// InMemory reject uses, and `enqueue` itself only waits for DLQ capacity
+/// racing the *broker* shutdown token — a pre-existing property of that
+/// shared path, not something this loop adds. What the batch path changes is
+/// scale: one `DeadLetter` flush (or a `Commit`/empty-batch flush with
+/// parked pre-handler drops) can need up to `max_batch_size` DLQ slots
+/// back-to-back, so a DLQ sized below the batch, with nothing draining it,
+/// wedges the flush. `route_reject_or_park` closes the other half of that:
+/// it races the *per-consumer* `shutdown` token around each publish, so
+/// cancelling this one consumer unblocks it without needing
+/// `broker.close()` — whatever the wedge left unpublished is requeued (see
+/// [`finish_terminal_flush`]) rather than destroyed by, say, a cooperative-
+/// stop wrapper's `abort()` timing out on this flush. Size the DLQ at or
+/// above `max_batch_size`, or run a DLQ drain, when using `Outcome::Reject`
+/// (or a `Reject` timeout outcome) with batches — this only bounds how the
+/// wedge ends, not whether one happens.
 pub(crate) async fn run_batch_impl<T, H>(
     broker: InMemoryBroker,
     handler: H,
