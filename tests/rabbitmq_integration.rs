@@ -6010,11 +6010,15 @@ async fn publisher_single_channel_pool_does_not_serialize_concurrent_publishes()
 ///
 /// Exercises:
 /// - `HasCoordinatedGroups::spawn_autoscaler` for RabbitMQ (infallible bridge path)
-/// - `RabbitMqConsumerGroup::retiring` drain path after scale-down
+/// - `RabbitMqConsumerGroup::retiring` drain path after scale-down — via the
+///   post-drain linger, when the autoscaler scales back down over an empty
+///   queue (exercised, not asserted)
 /// - Clean drain: all published messages processed, no DLQ messages
 #[tokio::test]
 async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
-    use std::sync::atomic::AtomicUsize;
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     let ctx = TestContext::new().await;
 
@@ -6028,11 +6032,17 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
         .await
         .unwrap();
 
-    let processed = Arc::new(AtomicUsize::new(0));
+    // AMQP is at-least-once (a consumer cancelled by scale-down requeues its
+    // unacked in-flight delivery), so count distinct message bodies rather
+    // than deliveries: a raw delivery counter could both overshoot 20 and
+    // trip the shutdown signal on 20 - K distinct + K duplicate deliveries.
+    let seen = Arc::new(StdMutex::new(HashSet::new()));
+    let distinct = Arc::new(AtomicUsize::new(0));
 
     let mut group = broker.consumer_group();
     {
-        let processed = processed.clone();
+        let seen = seen.clone();
+        let distinct = distinct.clone();
         group
             .register::<ConsumerGroupAutoscalingTopic, _>(
                 ConsumerGroupConfig::new(
@@ -6040,21 +6050,29 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
                 ),
                 move || {
                     #[derive(Clone)]
-                    struct SlowHandler(Arc<AtomicUsize>);
+                    struct SlowHandler {
+                        seen: Arc<StdMutex<HashSet<String>>>,
+                        distinct: Arc<AtomicUsize>,
+                    }
                     impl MessageHandler<ConsumerGroupAutoscalingTopic> for SlowHandler {
                         type Context = ();
                         async fn handle(
                             &self,
-                            _: SimpleMessage,
+                            msg: SimpleMessage,
                             _: MessageMetadata,
                             _: &(),
                         ) -> Outcome {
                             tokio::time::sleep(Duration::from_millis(200)).await;
-                            self.0.fetch_add(1, Ordering::Relaxed);
+                            if self.seen.lock().unwrap().insert(msg.body) {
+                                self.distinct.fetch_add(1, Ordering::Relaxed);
+                            }
                             Outcome::Ack
                         }
                     }
-                    SlowHandler(processed.clone())
+                    SlowHandler {
+                        seen: seen.clone(),
+                        distinct: distinct.clone(),
+                    }
                 },
             )
             .await
@@ -6084,22 +6102,50 @@ async fn consumer_group_autoscaling_scales_up_and_drains_clean() {
         cooldown_duration: Duration::from_millis(500),
     };
 
-    // Run for 12 s — enough time for autoscaler to scale up and drain the
-    // 20-message backlog (20 * 200 ms / 4 consumers = ~1 s when at max).
-    let signal = tokio::time::sleep(Duration::from_millis(12_000));
+    // Shut down on the observable — all 20 distinct messages handled — not on
+    // a fixed wall-clock window: on a loaded runner, connection setup plus the
+    // management-API lag the pre-sleep above absorbs can outlast any
+    // "reasonable" fixed budget (the Kafka twin flaked in CI exactly this
+    // way). The 60 s ceiling is a failure bound, not the expected duration.
+    let drained_in_time = Arc::new(AtomicBool::new(false));
+    let signal = {
+        let distinct = distinct.clone();
+        let drained_in_time = drained_in_time.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while tokio::time::Instant::now() < deadline {
+                if distinct.load(Ordering::Relaxed) >= 20 {
+                    drained_in_time.store(true, Ordering::Relaxed);
+                    // Post-drain linger: with the queue empty the autoscaler's
+                    // next poll (300 ms) + hysteresis (300 ms) fires ScaleDown,
+                    // pushing consumers through the retiring drain path this
+                    // test's doc claims to exercise. In-process timers plus one
+                    // management-API poll, so 2 s is slack, not a
+                    // load-sensitive gate.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
     let outcome = group
         .enable_autoscaling(cfg)
         .run_until_timeout(signal, Duration::from_secs(20))
         .await;
 
+    // Count first, cleanliness second: on the no-delivery failure path the
+    // handled count is the diagnostic and an unclean shutdown in that same
+    // state must not mask it.
+    let handled = distinct.load(Ordering::Relaxed);
+    assert!(
+        drained_in_time.load(Ordering::Relaxed),
+        "all 20 published messages must be handled within the 60 s ceiling \
+         (handled {handled}/20; 0 = never started consuming, 1-19 = drain stalled)"
+    );
     assert!(
         outcome.is_clean(),
-        "autoscaling group must drain cleanly; outcome: {outcome:?}"
-    );
-    assert_eq!(
-        processed.load(Ordering::Relaxed),
-        20,
-        "all 20 published messages must be handled before the group drains"
+        "autoscaling group must drain cleanly (handled {handled}/20); outcome: {outcome:?}"
     );
 
     broker.close().await;

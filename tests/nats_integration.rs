@@ -62,11 +62,17 @@ impl WaitableCounter {
     async fn wait_for(&self, target: u32, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
+            // Register the waiter before checking the count: `notify_waiters`
+            // stores no permit, so an increment landing between an
+            // unregistered check and the await would otherwise be lost,
+            // parking this task until the deadline.
+            let mut notified = std::pin::pin!(self.signal.notified());
+            notified.as_mut().enable();
             if self.get() >= target {
                 return true;
             }
             tokio::select! {
-                _ = self.signal.notified() => {}
+                _ = &mut notified => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     return self.get() >= target;
                 }
@@ -3156,12 +3162,16 @@ shove::define_topic!(
 
 /// Autoscaling lifecycle: slow handlers + burst → `enable_autoscaling` →
 /// clean drain. Mirrors `autoscaling_scales_up_and_drains_clean` from
-/// `kafka_integration.rs` but exercises the NATS backend's `spawn_autoscaler`
-/// and `NatsConsumerGroup::retiring` drain path.
+/// `kafka_integration.rs` but exercises the NATS backend's `spawn_autoscaler`,
+/// and — via the post-drain linger, when the autoscaler scales back down over
+/// an empty backlog — the `NatsConsumerGroup::retiring` drain path (exercised,
+/// not asserted).
 #[tokio::test]
 async fn autoscaling_scales_up_and_drains_clean() {
     use shove::AutoscalerConfig;
-    use std::sync::atomic::AtomicUsize;
+    use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicBool;
 
     let tb = TestBroker::start().await;
     let broker = tb.broker();
@@ -3171,11 +3181,17 @@ async fn autoscaling_scales_up_and_drains_clean() {
         .await
         .unwrap();
 
-    let processed = Arc::new(AtomicUsize::new(0));
+    // JetStream is at-least-once (un-acked in-flight messages redeliver after
+    // ack_wait), so count distinct message ids rather than deliveries: a raw
+    // delivery counter could both overshoot 20 and trip the shutdown signal
+    // on 20 - K distinct + K duplicate deliveries.
+    let seen = Arc::new(StdMutex::new(HashSet::new()));
+    let distinct = WaitableCounter::new();
 
     let mut group = broker.consumer_group();
     {
-        let processed = processed.clone();
+        let seen = seen.clone();
+        let distinct = distinct.clone();
         group
             .register::<AutoscalingTopic, _>(
                 ConsumerGroupConfig::new(
@@ -3183,21 +3199,29 @@ async fn autoscaling_scales_up_and_drains_clean() {
                 ),
                 move || {
                     #[derive(Clone)]
-                    struct SlowHandler(Arc<AtomicUsize>);
+                    struct SlowHandler {
+                        seen: Arc<StdMutex<HashSet<String>>>,
+                        distinct: WaitableCounter,
+                    }
                     impl MessageHandler<AutoscalingTopic> for SlowHandler {
                         type Context = ();
                         async fn handle(
                             &self,
-                            _: SimpleMessage,
+                            msg: SimpleMessage,
                             _: MessageMetadata,
                             _: &(),
                         ) -> Outcome {
                             tokio::time::sleep(Duration::from_millis(200)).await;
-                            self.0.fetch_add(1, Ordering::Relaxed);
+                            if self.seen.lock().unwrap().insert(msg.id) {
+                                self.distinct.increment();
+                            }
                             Outcome::Ack
                         }
                     }
-                    SlowHandler(processed.clone())
+                    SlowHandler {
+                        seen: seen.clone(),
+                        distinct: distinct.clone(),
+                    }
                 },
             )
             .await
@@ -3217,7 +3241,7 @@ async fn autoscaling_scales_up_and_drains_clean() {
     }
 
     // Fast autoscaler config: short poll + hysteresis so scale-up fires
-    // within the first second of the test window.
+    // within the first second after the group starts consuming.
     let cfg = AutoscalerConfig {
         poll_interval: Duration::from_millis(200),
         scale_up_multiplier: 1.5,
@@ -3226,22 +3250,44 @@ async fn autoscaling_scales_up_and_drains_clean() {
         cooldown_duration: Duration::from_millis(400),
     };
 
-    // Run for 8 s — enough time for autoscaler to scale up and drain the
-    // 20-message backlog through 4 max consumers at 200 ms each.
-    let signal = tokio::time::sleep(Duration::from_millis(8000));
+    // Shut down on the observable — all 20 distinct messages handled — not on
+    // a fixed wall-clock window: on a loaded runner, stream/consumer setup and
+    // first delivery can outlast any "reasonable" fixed budget (the Kafka twin
+    // flaked in CI exactly this way). The 60 s ceiling is a failure bound, not
+    // the expected duration; the drain itself takes ~1-2 s.
+    let drained_in_time = Arc::new(AtomicBool::new(false));
+    let signal = {
+        let distinct = distinct.clone();
+        let drained_in_time = drained_in_time.clone();
+        async move {
+            if distinct.wait_for(20, Duration::from_secs(60)).await {
+                drained_in_time.store(true, Ordering::Relaxed);
+                // Post-drain linger: with the backlog at zero the autoscaler's
+                // next poll (200 ms) + hysteresis (200 ms) fires ScaleDown,
+                // pushing consumers through the retiring drain path this
+                // test's doc claims to exercise. In-process timers only, so
+                // 2 s is slack, not a load-sensitive gate.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
     let outcome = group
         .enable_autoscaling(cfg)
         .run_until_timeout(signal, Duration::from_secs(15))
         .await;
 
+    // Count first, cleanliness second: on the no-delivery failure path the
+    // handled count is the diagnostic and an unclean shutdown in that same
+    // state must not mask it.
+    let handled = distinct.get();
+    assert!(
+        drained_in_time.load(Ordering::Relaxed),
+        "all 20 published messages must be handled within the 60 s ceiling \
+         (handled {handled}/20; 0 = never started consuming, 1-19 = drain stalled)"
+    );
     assert!(
         outcome.is_clean(),
-        "autoscaling group must drain cleanly; outcome: {outcome:?}"
-    );
-    assert_eq!(
-        processed.load(Ordering::Relaxed),
-        20,
-        "all 20 published messages must be handled before the group drains"
+        "autoscaling group must drain cleanly (handled {handled}/20); outcome: {outcome:?}"
     );
 
     broker.close().await;
