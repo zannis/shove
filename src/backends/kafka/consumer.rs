@@ -35,7 +35,10 @@ use crate::routing::{
 };
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
-use crate::{DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError};
+use crate::{
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE,
+    DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError,
+};
 
 #[cfg(feature = "kafka-msk-iam")]
 use super::msk_iam::MskIamContext;
@@ -66,10 +69,89 @@ use super::consumer_group::KafkaAutoOffsetReset;
 /// Must be >= 2: at 1 this degenerates into "clear on the first quiet tick",
 /// which resets a genuinely wedged partition's streak on every iteration and
 /// stops it ever reaching `COMMIT_FENCE_TIMEOUT`. At 2, the tolerated window
-/// is 2 × `HOUSEKEEPING_INTERVAL` — comfortably longer than a commit round
-/// trip, and far inside the fence threshold, so a wedged partition still
-/// trips it on schedule.
+/// is at least `ASYNC_COMMIT_INTERVAL` while traffic flows (the re-offering
+/// drain always issues a commit and so marks the gate, holding the *first*
+/// quiet drain back a full interval; the second may follow one iteration
+/// later) and 2 × `HOUSEKEEPING_INTERVAL` on an idle topic. Both windows
+/// comfortably exceed a healthy commit round trip (sub-ms here), so a wedged
+/// partition still trips the fence on schedule — though a coordinator whose
+/// rejection RTT exceeds the interval under continuous traffic can still
+/// out-age the streak; the pre-gate window was two loop iterations
+/// (microseconds), so this is strictly tighter, not a regression.
 const QUIET_DRAINS_TO_RESOLVE: u32 = 2;
+
+/// Minimum spacing between offset commits issued by the concurrent receive
+/// loop.
+///
+/// The loop used to fire one fire-and-forget `commit(Async)` on every
+/// iteration that advanced any offset. At high consume rates that issues
+/// commits an order of magnitude faster than the group coordinator answers
+/// them, so tens of thousands pile up in flight — and
+/// `rd_kafka_consumer_close` (which runs inside `Drop`, blocking, and cannot
+/// be aborted) waits for every one of them before terminating: measured
+/// 5.5–20.2 s after a fast 150k-message corpus, intermittently blowing a 30 s
+/// shutdown budget. Spacing commits well above a coordinator round trip keeps
+/// the in-flight count O(1), so close stays prompt. Two costs, both accepted:
+/// a wider crash-redelivery window (which at-least-once semantics already
+/// promise), matching the spirit of Kafka's own 5 s auto-commit default while
+/// staying 10x tighter; and the tracker's `completed` set now buffers up to
+/// one window of completions between drains — memory bounded by consume rate
+/// × this interval (≈6k offsets at 12k msg/s), where it was bounded by
+/// `prefetch_count` before.
+const ASYNC_COMMIT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Rate gate for the receive loop's offset commits: `due` says whether the
+/// commit drain may run now, `mark` records that a commit was issued.
+///
+/// Only *issued* commits consume the window — a drain that found nothing to
+/// commit leaves the gate due, so the next completion is committed as soon
+/// as the interval since the last real commit has passed.
+struct AsyncCommitGate {
+    interval: Duration,
+    last: Option<Instant>,
+}
+
+impl AsyncCommitGate {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    /// True when no commit has been issued yet, or the last one is at least
+    /// `interval` old. Read-only: asking does not advance the window.
+    fn due(&self, now: Instant) -> bool {
+        match self.last {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= self.interval,
+        }
+    }
+
+    /// Records a commit issued at `now`, opening a fresh window.
+    fn mark(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
+    /// When the gate next becomes due: `last + interval`, which may already
+    /// be past. The receive loop's wake arm sleeps until this, so gated
+    /// commit work never waits on an unrelated wake.
+    ///
+    /// The `None` branch returns `now + interval` rather than `now`,
+    /// deliberately: with no commit ever issued the gate is due, so the
+    /// loop's top-of-iteration drain handles the work before the wake arm
+    /// matters — the branch is unreachable while anything is committable.
+    /// If a future refactor ever breaks that invariant (skipping the drain,
+    /// resetting the gate), a stale-`now` deadline would make the wake arm
+    /// ready on construction forever — a hot spin. `now + interval` degrades
+    /// to a bounded wake instead.
+    fn deadline(&self, now: Instant) -> Instant {
+        match self.last {
+            None => now + self.interval,
+            Some(last) => last + self.interval,
+        }
+    }
+}
 
 struct PartitionTracker {
     /// Next offset to commit (exclusive — Kafka convention).
@@ -223,6 +305,18 @@ impl PartitionTracker {
         self.dirty_since
             .map(|since| now.saturating_duration_since(since))
     }
+
+    /// Whether a drain right now would offer a commit: a rejected commit is
+    /// waiting to be re-offered, or the next offset to commit has completed.
+    ///
+    /// Read-only twin of `drain_committable`'s `progressed || retry`
+    /// condition — the receive loop's wake arm uses it to decide whether the
+    /// commit gate's deadline is worth waking for. Completions that are not
+    /// contiguous with `next_to_commit` (a gap is still in flight) do not
+    /// count, exactly as they would not commit.
+    fn has_committable(&self) -> bool {
+        self.dirty || self.completed.contains(&self.next_to_commit)
+    }
 }
 
 struct OffsetTracker {
@@ -286,6 +380,14 @@ impl OffsetTracker {
         if let Some(tracker) = self.partitions.get_mut(&partition) {
             tracker.mark_dirty(now);
         }
+    }
+
+    /// Whether any partition has commit work pending (see
+    /// `PartitionTracker::has_committable`).
+    fn has_committable(&self) -> bool {
+        self.partitions
+            .values()
+            .any(PartitionTracker::has_committable)
     }
 
     /// Applies all queued rebalance/commit-failure events from librdkafka's
@@ -1595,7 +1697,6 @@ fn create_stream_consumer(
         // blocking dwell so the broker doesn't hold the connection open.
         .set("fetch.min.bytes", FETCH_MIN_BYTES.to_string())
         .set("fetch.wait.max.ms", FETCH_WAIT_MAX_MS.to_string());
-
     #[cfg(feature = "kafka-msk-iam")]
     if let Some(ctx) = msk_context {
         let ctx = RebalanceContext {
@@ -1756,8 +1857,8 @@ pub struct BatchConsumerOptions {
 impl Default for BatchConsumerOptions {
     fn default() -> Self {
         Self {
-            max_batch_size: 500,
-            max_batch_age: Duration::from_millis(250),
+            max_batch_size: DEFAULT_KAFKA_MAX_BATCH_SIZE,
+            max_batch_age: DEFAULT_KAFKA_MAX_BATCH_AGE,
             max_reconnect_attempts: None,
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             // Same default as `ConsumerOptions`. A batch flush is one DB
@@ -1787,7 +1888,8 @@ impl BatchConsumerOptions {
         Self::default()
     }
 
-    /// Flush once the batch reaches this many messages. Default 500.
+    /// Flush once the batch reaches this many messages. Default
+    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`] (500).
     ///
     /// # Panics
     ///
@@ -1800,7 +1902,7 @@ impl BatchConsumerOptions {
 
     /// Flush once this long has elapsed since the first message in the
     /// current batch, even if `max_batch_size` hasn't been reached.
-    /// Default 250ms.
+    /// Default [`DEFAULT_KAFKA_MAX_BATCH_AGE`] (250 ms).
     ///
     /// # Panics
     ///
@@ -1838,6 +1940,22 @@ impl BatchConsumerOptions {
         assert!(!timeout.is_zero(), "handler_timeout must be positive");
         self.handler_timeout = Some(timeout);
         self
+    }
+
+    /// The configured flush size — what [`with_max_batch_size`] set, or
+    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`].
+    ///
+    /// [`with_max_batch_size`]: Self::with_max_batch_size
+    pub fn max_batch_size(&self) -> usize {
+        self.max_batch_size
+    }
+
+    /// The configured flush age — what [`with_max_batch_age`] set, or
+    /// [`DEFAULT_KAFKA_MAX_BATCH_AGE`].
+    ///
+    /// [`with_max_batch_age`]: Self::with_max_batch_age
+    pub fn max_batch_age(&self) -> Duration {
+        self.max_batch_age
     }
 
     /// Let `handle_batch` run for as long as it likes.
@@ -2959,6 +3077,7 @@ impl KafkaConsumer {
                 // reads, and the loop body only runs when a select arm
                 // completes. A no-op when nothing is pending.
                 let mut housekeeping = tokio::time::interval(HOUSEKEEPING_INTERVAL);
+                let mut commit_gate = AsyncCommitGate::new(ASYNC_COMMIT_INTERVAL);
 
                 loop {
                     // Drain completed offsets, then apply any partition
@@ -2990,7 +3109,22 @@ impl KafkaConsumer {
                              {COMMIT_FENCE_TIMEOUT:?} with no resolving rebalance"
                         )));
                     }
-                    if let Some((tpl, discards)) = tracker.drain_committable() {
+                    // The gate spaces commits out (see `ASYNC_COMMIT_INTERVAL`):
+                    // ungated, this drain committed on nearly every iteration —
+                    // roughly once per message at speed — piling up in-flight
+                    // async commits that `rd_kafka_consumer_close` later drains
+                    // one reply at a time (tens of seconds after a large fast
+                    // corpus). `drain_committable` is only *called* when due, so
+                    // its side effects (dirty/quiet-drain accounting, pending
+                    // discards) stay tied to actual commit offers. Only a drain
+                    // that offered a commit consumes the window — and `mark`
+                    // runs *after* the commit call with a fresh instant, so a
+                    // slow `Sync` round trip on the discard path cannot eat the
+                    // window and turn these back into back-to-back blocking
+                    // commits.
+                    if commit_gate.due(now)
+                        && let Some((tpl, discards)) = tracker.drain_committable()
+                    {
                         if discards.is_empty() {
                             consumer
                                 .commit(&tpl, CommitMode::Async)
@@ -3018,6 +3152,7 @@ impl KafkaConsumer {
                             }
                             committed.map_err(|e| map_kafka_error("commit failed", e))?;
                         }
+                        commit_gate.mark(Instant::now());
                     }
 
                     tokio::select! {
@@ -3049,6 +3184,26 @@ impl KafkaConsumer {
                         // Falls through to the top-of-loop drain — see the
                         // comment on `housekeeping` above.
                         _ = housekeeping.tick() => {}
+                        // Wakes the loop when the commit gate's window expires
+                        // with commit work pending, so a gated commit lands
+                        // within ~ASYNC_COMMIT_INTERVAL even on a topic gone
+                        // idle — without this arm it would wait for the next
+                        // housekeeping tick, regressing the idle-topic
+                        // redelivery bound (see the completion arm below) from
+                        // the gate interval to HOUSEKEEPING_INTERVAL. Disabled
+                        // when nothing is committable, so an idle consumer does
+                        // not wake every interval; no busy-spin when past due,
+                        // because the top-of-loop drain then commits and
+                        // `mark` pushes the deadline forward. Cost note:
+                        // select! evaluates this expression (a `Sleep`
+                        // construct-and-drop plus the `has_committable` scan)
+                        // on every pass, even when the precondition disables
+                        // the arm; the timer only registers when the arm is
+                        // enabled, and the whole thing displaced a per-message
+                        // commit FFI call — the e2e cell's throughput went UP
+                        // ~26k -> ~30.5k msg/s with the gate in place.
+                        _ = tokio::time::sleep_until(commit_gate.deadline(now)),
+                            if tracker.has_committable() => {}
                         // Handler completions must wake the loop even when no new
                         // message arrives: with only the recv() arm, the offsets of
                         // the last in-flight batch sat uncommitted until the *next*
@@ -5511,6 +5666,98 @@ mod offset_tracker_tests {
             "a genuinely wedged partition still trips the fence, timed from t1"
         );
     }
+
+    /// The wake-arm predicate mirrors `drain_committable`'s
+    /// `progressed || retry`: nothing pending on a fresh tracker, pending
+    /// when the next offset to commit completed, NOT pending when only a
+    /// gapped completion exists (exactly as it would not commit), pending
+    /// again while a rejected commit awaits re-offer.
+    #[test]
+    fn has_committable_mirrors_drain_conditions() {
+        let mut tracker = OffsetTracker::new("q".to_string());
+        assert!(!tracker.has_committable(), "empty tracker");
+
+        tracker.track_received(0, 0);
+        assert!(!tracker.has_committable(), "received, nothing completed");
+
+        tracker.mark_complete(Completion::plain(0, 1));
+        assert!(
+            !tracker.has_committable(),
+            "only a gapped completion (offset 0 still in flight)"
+        );
+
+        tracker.mark_complete(Completion::plain(0, 0));
+        assert!(tracker.has_committable(), "contiguous completion pending");
+
+        drain_tpl(&mut tracker).expect("gap filled, commit offered");
+        assert!(!tracker.has_committable(), "drained clean");
+
+        tracker.mark_dirty(0, Instant::now());
+        assert!(tracker.has_committable(), "rejected commit awaits re-offer");
+    }
+}
+
+/// The receive loop's commit rate gate. What these pin down: an ungated loop
+/// committed once per iteration that advanced any offset — roughly once per
+/// message at speed — and consumer close then drained tens of thousands of
+/// in-flight commits for tens of seconds (CAF: post-cancel drain timeouts).
+#[cfg(test)]
+mod async_commit_gate_tests {
+    use super::*;
+
+    const INTERVAL: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn due_immediately_when_nothing_ever_committed() {
+        let gate = AsyncCommitGate::new(INTERVAL);
+        let now = Instant::now();
+        assert!(gate.due(now), "first commit must not wait out an interval");
+        assert_eq!(
+            gate.deadline(now),
+            now + INTERVAL,
+            "the None branch is unreachable from the wake arm (a due gate \
+             means the drain already ran), so it pins a bounded future wake \
+             rather than a ready-now deadline that could hot-spin if a \
+             refactor ever skips the drain"
+        );
+    }
+
+    #[test]
+    fn mark_closes_the_window_and_the_interval_reopens_it() {
+        let mut gate = AsyncCommitGate::new(INTERVAL);
+        let t0 = Instant::now();
+        gate.mark(t0);
+        assert!(!gate.due(t0));
+        assert!(!gate.due(t0 + INTERVAL / 2));
+        assert!(gate.due(t0 + INTERVAL));
+        assert!(gate.due(t0 + INTERVAL * 3), "an old window stays open");
+    }
+
+    /// A denied `due` must not push the window back: it is anchored to the
+    /// last *issued* commit, however often the loop polls it.
+    #[test]
+    fn asking_does_not_advance_the_window() {
+        let mut gate = AsyncCommitGate::new(INTERVAL);
+        let t0 = Instant::now();
+        gate.mark(t0);
+        for tenths in 1..=9u32 {
+            assert!(!gate.due(t0 + INTERVAL * tenths / 10));
+        }
+        assert!(gate.due(t0 + INTERVAL));
+    }
+
+    #[test]
+    fn deadline_is_anchored_to_the_last_commit() {
+        let mut gate = AsyncCommitGate::new(INTERVAL);
+        let t0 = Instant::now();
+        gate.mark(t0);
+        assert_eq!(gate.deadline(t0), t0 + INTERVAL);
+        assert_eq!(
+            gate.deadline(t0 + INTERVAL * 2),
+            t0 + INTERVAL,
+            "past due, the deadline stays anchored rather than chasing `now`"
+        );
+    }
 }
 
 /// The batch path's rebalance handling: which events invalidate an in-flight
@@ -6046,10 +6293,26 @@ mod batch_consumer_options_tests {
         let opts = BatchConsumerOptions::default();
         assert_eq!(opts.max_batch_size, 500);
         assert_eq!(opts.max_batch_age, Duration::from_millis(250));
+        // The shared constants are the same values — they are what external
+        // tooling (the stress harness) references instead of restating 500/250.
+        assert_eq!(opts.max_batch_size, DEFAULT_KAFKA_MAX_BATCH_SIZE);
+        assert_eq!(opts.max_batch_age, DEFAULT_KAFKA_MAX_BATCH_AGE);
         assert_eq!(opts.max_reconnect_attempts, None);
         assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert_eq!(opts.kafka_group_id, None);
         assert_eq!(opts.kafka_auto_offset_reset, None);
+    }
+
+    /// The getters exist so code outside this module (the stress harness's
+    /// tests) can read back what the builders set; a transposed pair here
+    /// would let a benchmark stamp rows with knobs the run never used.
+    #[test]
+    fn getters_read_back_what_the_builders_set() {
+        let opts = BatchConsumerOptions::new()
+            .with_max_batch_size(7)
+            .with_max_batch_age(Duration::from_millis(9));
+        assert_eq!(opts.max_batch_size(), 7);
+        assert_eq!(opts.max_batch_age(), Duration::from_millis(9));
     }
 
     /// Parity with `ConsumerOptions`: the timeout is opt-*out*, not opt-in.

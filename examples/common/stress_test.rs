@@ -36,6 +36,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -76,7 +77,23 @@ use tokio_util::sync::CancellationToken;
 /// after the fact either — the run that produced it is over — so the version
 /// is what makes the mismatch a loud refusal in [`merge_results_file`] rather
 /// than a silent gap in a merged document.
-pub const RESULTS_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 added `max_batch_size` / `max_batch_age_ms` to every `consume_batch`
+/// row (and to no other flow's rows), for the same non-ignorable reason: the
+/// knobs became configurable, so without them a 50-message-batch row and a
+/// 500-message-batch row are byte-identical, and a v2 batch row cannot be
+/// stamped after the fact — nothing records what its run used.
+///
+/// v4 added `setup_secs` and, with it, changed what `duration_secs` means on
+/// every consume row: it is now the drain alone, because the drivers hold a
+/// readiness barrier before starting the clock. A v3 `duration_secs` on those
+/// rows included the consumer group's join latency — a fixed cost that on the
+/// `zero`/`fast` cells was the whole number — so the two versions' values are
+/// not comparable and must not be charted on one axis. The same change
+/// narrowed `handler_cost`: `framework` now additionally asserts that the
+/// window was a drain, and rows that fail that gained the new `setup_bound`
+/// value. Both are reasons a v3 reader cannot simply ignore the new field.
+pub const RESULTS_SCHEMA_VERSION: u32 = 4;
 
 /// The payload sizes that may appear in `payload_bytes`: 64 B, 1 KiB, 64 KiB.
 pub const PAYLOAD_SIZES: [usize; 3] = [64, 1024, 65536];
@@ -137,6 +154,21 @@ pub struct Cli {
     #[arg(long)]
     pub consumers: Option<ConsumersArg>,
 
+    /// Override `max_batch_size` for the `consume-batch` flow (default 500,
+    /// shove's own default). Only meaningful when that flow runs; an
+    /// invocation where it cannot is refused rather than silently measuring
+    /// the default.
+    #[arg(long)]
+    pub batch_max_size: Option<NonZeroUsize>,
+
+    /// Override `max_batch_age` in milliseconds for the `consume-batch` flow
+    /// (default 250, shove's own default). Same reachability rule as
+    /// `--batch-max-size`. Bounded at parse time by the per-scenario deadline
+    /// ceiling, so no `Cli` value can exist that the deadline fold must be
+    /// trusted not to honour.
+    #[arg(long, value_parser = parse_batch_age_ms)]
+    pub batch_max_age_ms: Option<NonZeroU64>,
+
     /// Also write the versioned results document to this path, merging into
     /// any existing file by backend key. Never written to stdout.
     #[arg(long)]
@@ -190,10 +222,9 @@ impl FromStr for FlowArg {
                 continue;
             }
             let flow = Flow::from_cli(part).ok_or_else(|| {
-                let names: Vec<&str> = Flow::ALL.iter().map(|f| f.as_cli()).collect();
                 format!(
                     "unknown flow '{part}'; expected `all` or one of: {}",
-                    names.join(", ")
+                    flow_list(&Flow::ALL)
                 )
             })?;
             if !flows.contains(&flow) {
@@ -274,6 +305,26 @@ impl FromStr for ConsumersArg {
         }
         Ok(ConsumersArg(counts))
     }
+}
+
+/// Parse `--batch-max-age-ms`: positive, and no larger than
+/// [`DEADLINE_CEILING_MS`]. The deadline fold in `build_scenarios`
+/// deliberately raises a batch deadline past the derived clamp, so an
+/// unbounded age would let a units mistake (`120000000` intending 120 s) give
+/// every batch scenario a ~33-hour deadline. Checked at parse time like
+/// `ConsumersArg` and `PayloadArg`, so an illegal value can never reach a
+/// `Scenario`.
+fn parse_batch_age_ms(s: &str) -> Result<NonZeroU64, String> {
+    let n: NonZeroU64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a positive integer of milliseconds"))?;
+    if n.get() > DEADLINE_CEILING_MS {
+        return Err(format!(
+            "{n} ms exceeds the {DEADLINE_CEILING_MS} ms per-scenario deadline ceiling \
+             (the value is in milliseconds)"
+        ));
+    }
+    Ok(n)
 }
 
 // ── Flow & mode ─────────────────────────────────────────────────────────────
@@ -376,6 +427,41 @@ impl Flow {
         }
     }
 
+    /// Whether this flow's driver holds a readiness barrier, and so can record
+    /// a `setup_secs` separated from its drain at all.
+    ///
+    /// The three answers, and why each one is where it is:
+    ///
+    /// - **Yes** for the four barrier-holding drivers — `run_scenario_batch`,
+    ///   `run_scenario_supervisor` (non-FIFO), `run_scenario_group` (non-FIFO)
+    ///   and `run_scenario_broadcast`. Each waits until every worker has
+    ///   handled a sentinel before taking `start`.
+    /// - **No** for `consume_fifo` and `dlq_drain`: neither has anywhere to
+    ///   hang the probe — a sequenced sentinel routes to exactly one shard, and
+    ///   the DLQ drain's measured phase has no publish path at all — so both
+    ///   drivers emit `setup_secs: None` by construction.
+    /// - **No** for the publish flows and the autoscaler, which construct no
+    ///   consumer, so there is no worker for a barrier to wait on.
+    ///
+    /// [`HandlerCost::of`] consults this so that the `framework` marker's first
+    /// guarantee is checked against the flow and not only against the recorded
+    /// `Option`: a row whose flow can never separate its setup must not be able
+    /// to claim it did by carrying a `setup_secs` value.
+    pub fn holds_readiness_barrier(&self) -> bool {
+        match self {
+            Flow::ConsumeBatch
+            | Flow::ConsumeParallel
+            | Flow::ConsumerGroup
+            | Flow::Supervisor
+            | Flow::Broadcast => true,
+            Flow::ConsumeFifo
+            | Flow::DlqDrain
+            | Flow::PublishSingle
+            | Flow::PublishBatch
+            | Flow::Autoscaler => false,
+        }
+    }
+
     /// The chart grouping key. Redundant with the flow for the consume flows
     /// by design — it is what chart family 3 (parallel vs sequenced) groups
     /// on, so `chartgen` never parses a flow name to place a bar.
@@ -425,9 +511,43 @@ impl Mode {
 /// contract in the same way [`Flow::as_str`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerCost {
-    /// The simulated work is negligible, so the number is shove's own cost.
-    /// The only cells that are comparable across flows.
+    /// The simulated work is negligible **and** the row's measured window is a
+    /// drain, so the number is shove's own cost. The only cells that are
+    /// comparable across flows.
+    ///
+    /// Precisely what this marker guarantees, since a bare "negligible
+    /// handler" is not enough and used to be all it meant:
+    ///
+    /// 1. The driver **separated** fixed setup cost from the drain — it held a
+    ///    readiness barrier until every worker was assigned and polling, took
+    ///    `start` after it, and recorded everything from the first worker being
+    ///    spawned up to that point as `setup_secs`. A row whose `setup_secs` is
+    ///    absent did not separate them, so its `duration_secs` may be mostly
+    ///    coordination latency — and a row whose flow holds no barrier
+    ///    ([`Flow::holds_readiness_barrier`]) cannot have separated them
+    ///    whatever it recorded.
+    /// 2. The drain it then timed ran for at least
+    ///    [`MIN_FRAMEWORK_WINDOW_SECS`], so the number is a rate rather than a
+    ///    stopwatch reading over a window too short to hold one.
+    ///
+    /// A `zero`/`fast` row failing either half is [`HandlerCost::SetupBound`],
+    /// not this. It does **not** guarantee anything about the broker's own
+    /// steady state beyond that barrier — a backend whose throughput keeps
+    /// climbing past the first assigned poll is still measured from the first
+    /// one.
     Framework,
+    /// The simulated work is negligible, but the row cannot support the
+    /// [`HandlerCost::Framework`] claim: either the driver never separated
+    /// fixed setup cost from the drain, or the drain window was too short to
+    /// be a rate. The number is some mixture of shove's cost and a one-off
+    /// coordination cost, in an unknown ratio, and must not be charted as a
+    /// shove throughput claim.
+    ///
+    /// This is the marker CAF-667's `zero`/`fast` concurrent consume rows
+    /// should have carried: their windows were ~3.2 s at one consumer and
+    /// ~6.5 s at four and sixteen, invariant across a 32× range of corpus
+    /// size, while the drain inside them was as little as 0.05 s.
+    SetupBound,
     /// A batch-mode flow with a sleeping handler: the sleep is paid once per
     /// batch, so throughput scales with the batch size rather than with
     /// anything shove does.
@@ -440,23 +560,91 @@ pub enum HandlerCost {
     NoHandler,
 }
 
+/// How a driver split the wall-clock it spent on a scenario: what it excluded
+/// as fixed setup cost, and what remained as the drain it actually timed.
+///
+/// Carried into [`HandlerCost::of`] because whether a row measures shove is
+/// not decidable from its flow and handler alone — it also depends on whether
+/// the run separated the two and how much drain was left. Both fields are
+/// recorded on the row, so the derivation stays re-checkable by
+/// [`validate_run`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowSplit {
+    /// Seconds from the first worker being spawned to the readiness barrier
+    /// being satisfied — the fixed coordination cost **excluded** from
+    /// `duration_secs`. `None` means this driver does not separate the two, so
+    /// `duration_secs` may still contain it.
+    pub setup_secs: Option<f64>,
+    /// The measured window, in seconds: the drain, when `setup_secs` is
+    /// `Some`.
+    pub duration_secs: f64,
+}
+
+/// How long a drain has to run before its rate is worth publishing as
+/// [`HandlerCost::Framework`].
+///
+/// Not a correction — the readiness barrier already excludes setup, so setup's
+/// magnitude no longer biases the rate. This is a floor on how much signal the
+/// row has: 5,000 messages through one Kafka consumer drained in 0.048 s in
+/// the CAF-667 sweep, which is a stopwatch reading dominated by prefetch and
+/// first-poll effects, not a steady-state rate. One second is ~20× that, and
+/// is tens of thousands of messages at every payload tier.
+pub const MIN_FRAMEWORK_WINDOW_SECS: f64 = 1.0;
+
 impl HandlerCost {
-    /// The marker a row with this `flow` and `handler` must carry.
+    /// The marker a row with this `flow`, `handler` and measured `window` must
+    /// carry.
     ///
-    /// Derived from the two together, because neither settles it alone:
-    /// `publish_batch` is a batch-mode flow that runs no handler at all, and
-    /// `consume_batch --handler fast` is a batch-mode flow whose number is
-    /// still framework cost.
+    /// `flow` and `handler` together settle what *kind* of cost the number is,
+    /// because neither settles it alone: `publish_batch` is a batch-mode flow
+    /// that runs no handler at all, and `consume_batch --handler fast` is a
+    /// batch-mode flow whose number is still framework cost.
+    ///
+    /// `window` then settles whether a framework-cost cell actually *measured*
+    /// that cost. It has to: a negligible handler says the number is not the
+    /// handler's, which is not the same as saying it is shove's. On the
+    /// `zero`/`fast` concurrent consume cells the window was a fixed group
+    /// join latency, so the row was stamped "shove's own cost" over an
+    /// interval in which shove had barely run — and because the derivation
+    /// took only `(flow, handler)`, [`validate_run`] re-derived the same wrong
+    /// answer and certified it.
     ///
     /// This is the single derivation. [`Scenario::handler_cost`] stamps a row
     /// with it and [`validate_run`] re-derives it to check one, so a row's
     /// marker is verifiable rather than merely present — see the refusal
     /// there for why a row that disagrees is a lie about what was measured.
-    pub fn of(flow: Flow, handler: HandlerProfile) -> HandlerCost {
+    pub fn of(flow: Flow, handler: HandlerProfile, window: WindowSplit) -> HandlerCost {
         match flow {
+            // No consumer is constructed, so there is no worker to wait for
+            // and nothing for a barrier to exclude. The window is irrelevant
+            // to a publish row and is not consulted.
             Flow::PublishSingle | Flow::PublishBatch => HandlerCost::NoHandler,
             _ => match handler {
-                HandlerProfile::Zero | HandlerProfile::Fast => HandlerCost::Framework,
+                // Three conditions, and the flow is one of them: a recorded
+                // `setup_secs` is only evidence of a separated window if this
+                // flow's driver holds a barrier at all. `consume_fifo` and
+                // `dlq_drain` always emit `None`, so a `Some` on either is a
+                // value no run of that flow produced — and without the flow
+                // check `validate_run` re-derived `framework` from it and
+                // certified the row.
+                HandlerProfile::Zero | HandlerProfile::Fast => match window.setup_secs {
+                    // A finite, non-negative interval is the only value a
+                    // barrier can have measured; anything else on a row is not
+                    // evidence of a separated window.
+                    Some(setup)
+                        if setup.is_finite()
+                            && setup >= 0.0
+                            && flow.holds_readiness_barrier()
+                            && window.duration_secs >= MIN_FRAMEWORK_WINDOW_SECS =>
+                    {
+                        HandlerCost::Framework
+                    }
+                    _ => HandlerCost::SetupBound,
+                },
+                // A sleeping handler's marker already says the number is the
+                // sleep and not shove, so a setup floor underneath it changes
+                // nothing a reader would conclude. Gating these on the window
+                // too would relabel rows whose caveat is already stated.
                 HandlerProfile::Slow | HandlerProfile::Heavy => match flow.mode() {
                     Mode::Batch => HandlerCost::HandlerAmortised,
                     Mode::Parallel | Mode::Fifo => HandlerCost::HandlerBound,
@@ -468,6 +656,7 @@ impl HandlerCost {
     pub fn as_str(&self) -> &'static str {
         match self {
             HandlerCost::Framework => "framework",
+            HandlerCost::SetupBound => "setup_bound",
             HandlerCost::HandlerAmortised => "handler_amortised",
             HandlerCost::HandlerBound => "handler_bound",
             HandlerCost::NoHandler => "no_handler",
@@ -584,6 +773,42 @@ impl fmt::Display for HandlerProfile {
     }
 }
 
+/// The two `run_batch` knobs a `consume_batch` scenario runs with, and the
+/// values its result row records. Zero is unrepresentable by construction —
+/// shove's own `BatchConsumerOptions` builders assert `> 0`, so a scenario
+/// carrying a zero would describe a run that cannot exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchOptions {
+    pub max_batch_size: NonZeroUsize,
+    pub max_batch_age_ms: NonZeroU64,
+}
+
+impl BatchOptions {
+    /// `BatchConsumerOptions::default()`'s own values, via the shared
+    /// constants both cite (`shove::DEFAULT_KAFKA_MAX_BATCH_SIZE` / `_AGE`) —
+    /// an un-flagged invocation measures exactly what the harness always
+    /// measured, and the agreement holds by construction. Evaluated at
+    /// compile time, so an upstream default this struct cannot represent
+    /// fails the build instead of a bench run.
+    const DEFAULT: Self = {
+        let age_ms = shove::DEFAULT_KAFKA_MAX_BATCH_AGE.as_millis();
+        // The truncation guard; non-zeroness is the `expect`s' job.
+        assert!(age_ms <= u64::MAX as u128);
+        Self {
+            max_batch_size: NonZeroUsize::new(shove::DEFAULT_KAFKA_MAX_BATCH_SIZE)
+                .expect("shove's default batch size is non-zero"),
+            max_batch_age_ms: NonZeroU64::new(age_ms as u64)
+                .expect("shove's default batch age is non-zero"),
+        }
+    };
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Scenario {
     pub tier: &'static str,
@@ -595,6 +820,11 @@ pub struct Scenario {
     pub prefetch: Option<u16>,
     pub flow: Flow,
     pub payload_bytes: usize,
+    /// `Some` on every `consume_batch` scenario — the knobs it runs with —
+    /// and `None` on every other flow, which has no batch to size. Stamped
+    /// onto the result row by `push_metrics`, so the row's provenance and the
+    /// options the driver hands the backend cannot drift apart.
+    pub batch_options: Option<BatchOptions>,
 }
 
 impl Scenario {
@@ -611,8 +841,13 @@ impl Scenario {
 
     /// What this scenario's throughput number measures — see
     /// [`HandlerCost::of`], which is the derivation.
-    pub fn handler_cost(&self) -> HandlerCost {
-        HandlerCost::of(self.flow, self.handler)
+    ///
+    /// Takes the measured window because the marker is not knowable before the
+    /// scenario runs: whether a negligible-handler cell measured shove depends
+    /// on whether its driver separated setup from drain and on how much drain
+    /// was left to time.
+    pub fn handler_cost(&self, window: WindowSplit) -> HandlerCost {
+        HandlerCost::of(self.flow, self.handler, window)
     }
 }
 
@@ -621,7 +856,14 @@ struct TierConfig {
     consumers: &'static [u16],
     /// Per-consumer message count per handler profile, ordered
     /// (zero, fast, slow, heavy). Total messages for a scenario is
-    /// `messages_per_consumer.X * scenario.consumers`.
+    /// `messages_per_consumer.X * scenario.consumers`, *unless*
+    /// [`framework_corpus_floor`] raises it: a cell whose tier sizing is too
+    /// small to drain for [`MIN_FRAMEWORK_WINDOW_SECS`] runs the floor's corpus
+    /// instead, so the identity above is a lower bound rather than an
+    /// invariant, and the corpus each cell actually ran is on the row as
+    /// `messages`. The floored cells are the low consumer counts of a
+    /// `zero`/`fast` column, which therefore hold a near-fixed corpus rather
+    /// than one proportional to the consumer count.
     messages_per_consumer: (u64, u64, u64, u64),
 }
 
@@ -643,18 +885,133 @@ const EXTREME: TierConfig = TierConfig {
     messages_per_consumer: (20_000, 10_000, 200, 5),
 };
 
-fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> Duration {
+/// Smallest corpus a framework-cost consume cell is run with, before the byte
+/// cap below applies.
+///
+/// The readiness barrier makes `duration_secs` a drain, but it cannot make a
+/// drain long enough to be worth publishing: at CAF-667's sizes, five of the
+/// six `zero`/`fast` concurrent cells drained in under a second — one of them
+/// in 0.052 s — and [`HandlerCost::of`] now refuses them the `framework`
+/// marker for it. Without a floor the guard is an alarm with no path to green.
+///
+/// Sized from the fastest post-barrier drain rate the CAF-667 rows imply
+/// (~111,000 msg/s at 64 B, sixteen Kafka consumers), so the smallest cell
+/// still clears [`MIN_FRAMEWORK_WINDOW_SECS`] with margin. Faster hardware may
+/// drop back under it — that is the guard reporting a real loss of signal, not
+/// a number to chase here.
+const MIN_FRAMEWORK_CORPUS_MESSAGES: u64 = 150_000;
+
+/// Ceiling on what the floor above may cost in bytes.
+///
+/// Without it the floor multiplies by the payload tier: 150,000 × 64 KiB is a
+/// 9.6 GiB corpus staged through a publisher. The large tiers do not need the
+/// floor anyway — bytes, not message count, bound the drain there, so their
+/// windows are already long — so this caps the floor rather than trading it
+/// off.
+const MAX_FRAMEWORK_CORPUS_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The smallest corpus this cell may run with, or 0 where the floor does not
+/// apply.
+///
+/// Only raises a corpus, never lowers one: a tier that already sizes a cell
+/// above the floor keeps its own number.
+///
+/// The floor is restricted to cells whose drain is bounded by shove rather than
+/// by a simulated sleep, because on a sleeping cell a larger corpus buys
+/// nothing but wall-clock. `zero` never sleeps, so it always qualifies. `fast`
+/// sleeps 1–5 ms per message, which concurrency hides and sequential
+/// processing does not: the sequential `fast` cells drained at ~470 msg/s, so
+/// this floor would turn a 5 s scenario into a 5-minute one — and those cells
+/// are already drain-bound, so they never needed it. Batch mode is the
+/// exception: it pays the sleep once per batch, so its `fast` cells are
+/// drain-bound with or without `--concurrent`.
+fn framework_corpus_floor(
+    flow: Flow,
+    handler: HandlerProfile,
+    concurrent: bool,
+    payload_bytes: usize,
+) -> u64 {
+    let negligible_and_not_sleep_bound = match handler {
+        HandlerProfile::Zero => true,
+        HandlerProfile::Fast => concurrent || flow.mode() == Mode::Batch,
+        HandlerProfile::Slow | HandlerProfile::Heavy => false,
+    };
+    // Asked of the flow rather than re-listed here: FIFO, the DLQ drain and the
+    // publish flows are excluded because no corpus can make them `framework`,
+    // and that is the same fact [`Flow::holds_readiness_barrier`] already
+    // carries for [`HandlerCost::of`]. A second hand-maintained list of it
+    // would only drift from the first.
+    //
+    // Broadcast is the one flow subtracted from that set, and not because of
+    // its barrier — it holds one. Its corpus is the *per-subscriber* workload,
+    // so flooring `messages` multiplies by the fan-out width and a
+    // 16-subscriber cell would run 2.4M handler invocations.
+    let barrier_backed_drain = flow.holds_readiness_barrier() && flow != Flow::Broadcast;
+    if !negligible_and_not_sleep_bound || !barrier_backed_drain {
+        return 0;
+    }
+    let by_bytes = MAX_FRAMEWORK_CORPUS_BYTES / (payload_bytes as u64).max(1);
+    MIN_FRAMEWORK_CORPUS_MESSAGES.min(by_bytes)
+}
+
+/// The `zero` drain rate a floored cell's deadline is budgeted at, in messages
+/// per millisecond.
+///
+/// [`framework_corpus_floor`] raises a cell without knowing which backend will
+/// run it, so the deadline that comes with it cannot assume the 40,000 msg/s
+/// the unfloored `zero` deadline does — that figure is the broker the floor was
+/// sized from, and a backend draining a 150,000-message cell at 2,000 msg/s
+/// would fail on the 60 s clamp with nothing wrong. One message per
+/// millisecond budgets 150 s for the floor's corpus, 450 s after the 3× margin
+/// and still inside the 600 s ceiling.
+const FLOORED_ZERO_DRAIN_PER_MS: f64 = 1.0;
+
+fn scenario_deadline(
+    messages: u64,
+    consumers: u16,
+    handler: HandlerProfile,
+    corpus_floored: bool,
+) -> Duration {
     let expected_ms = match handler {
+        HandlerProfile::Zero if corpus_floored => messages as f64 / FLOORED_ZERO_DRAIN_PER_MS,
         HandlerProfile::Zero => messages as f64 / 40.0,
         HandlerProfile::Fast => (messages as f64 * 3.0) / consumers as f64,
         HandlerProfile::Slow => (messages as f64 * 175.0) / consumers as f64,
         HandlerProfile::Heavy => (messages as f64 * 3000.0) / consumers as f64,
     };
     // 3× expected to absorb steady-state variance and scheduling jitter; 60 s
-    // floor keeps short scenarios from racing broker setup; 600 s ceiling
+    // floor keeps short scenarios from racing broker setup; the ceiling
     // prevents any single scenario from blocking the whole sweep.
-    let deadline_ms = (expected_ms * 3.0).clamp(60_000.0, 600_000.0);
+    let deadline_ms = (expected_ms * 3.0).clamp(60_000.0, DEADLINE_CEILING_MS as f64);
     Duration::from_millis(deadline_ms as u64)
+}
+
+/// The per-scenario deadline ceiling for *derived* workloads. A batch
+/// scenario may additionally claim its user-declared `--batch-max-age-ms` on
+/// top (the fold in `build_scenarios`), and the flag is parse-bounded by this
+/// same value, so the absolute worst case is 2× this ceiling — bounded and
+/// explicitly asked for, unlike the ~33-hour deadline an unbounded units
+/// mistake (`120000000` intending 120 s) used to be able to produce.
+const DEADLINE_CEILING_MS: u64 = 600_000;
+
+/// The flow set this invocation asked for: `--flow`, or the entry point's
+/// default when the flag is absent. [`build_scenarios`] and the batch-flag
+/// guards both derive through this one definition (each from the same
+/// inputs), so they cannot disagree about what was selected.
+fn selected_flows(cli: &Cli, default_flow: Flow) -> Vec<Flow> {
+    match &cli.flow {
+        Some(FlowArg(list)) => list.clone(),
+        None => vec![default_flow],
+    }
+}
+
+/// The CLI spellings of a flow list, rendered the way `--flow` accepts them.
+fn flow_list(flows: &[Flow]) -> String {
+    flows
+        .iter()
+        .map(Flow::as_cli)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scenario> {
@@ -678,9 +1035,14 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
         TierArg::All => vec![&MODERATE, &HIGH, &EXTREME],
     };
 
-    let flows: Vec<Flow> = match &cli.flow {
-        Some(FlowArg(list)) => list.clone(),
-        None => vec![default_flow],
+    let flows = selected_flows(cli, default_flow);
+
+    // CLI-invariant, so derived once here with the other CLI bindings: the
+    // knobs every `consume_batch` scenario runs with (and stamps on its row).
+    let defaults = BatchOptions::default();
+    let batch_options = BatchOptions {
+        max_batch_size: cli.batch_max_size.unwrap_or(defaults.max_batch_size),
+        max_batch_age_ms: cli.batch_max_age_ms.unwrap_or(defaults.max_batch_age_ms),
     };
 
     let mut scenarios = Vec::new();
@@ -741,25 +1103,54 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                     // per-worker workload — multiplying it by the subscriber
                     // count would scale each worker's load with the fan-out
                     // width instead of holding it constant.
-                    let messages = match flow {
+                    let tier_messages = match flow {
                         Flow::Broadcast => per_consumer,
                         _ => per_consumer.saturating_mul(consumers as u64),
                     };
+                    // Only the flow with a batch to size carries the knobs;
+                    // stamping a default on any other row would claim options
+                    // a run never had. One binding drives both the deadline
+                    // fold and the row stamp, so the two cannot disagree
+                    // about which scenarios are batch scenarios.
+                    let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
                     for &payload_bytes in &cli.payload.0 {
+                        // Inside the payload loop, because the floor is capped
+                        // by bytes and so differs per tier.
+                        let messages = tier_messages.max(framework_corpus_floor(
+                            flow,
+                            h,
+                            cli.concurrent,
+                            payload_bytes,
+                        ));
+                        // A batch flushes on size or on age — with a corpus
+                        // smaller than the batch size, age is the only trigger, so
+                        // the run legitimately takes up to `max_batch_age` beyond
+                        // what the handler-time model predicts. Fold the age into
+                        // the deadline (above the clamp: the knob is explicit user
+                        // intent, parse-bounded by the deadline ceiling) or a
+                        // large legal age turns every batch scenario into a false
+                        // timeout row.
+                        let mut deadline = scenario_deadline(
+                            messages,
+                            flow.effective_workers(consumers),
+                            h,
+                            messages > tier_messages,
+                        );
+                        if let Some(opts) = batch_options {
+                            deadline = deadline
+                                .saturating_add(Duration::from_millis(opts.max_batch_age_ms.get()));
+                        }
                         scenarios.push(Scenario {
                             tier: tier_cfg.name,
                             messages,
                             consumers,
                             handler: h,
-                            deadline: scenario_deadline(
-                                messages,
-                                flow.effective_workers(consumers),
-                                h,
-                            ),
+                            deadline,
                             concurrent: cli.concurrent,
                             prefetch: cli.prefetch,
                             flow,
                             payload_bytes,
+                            batch_options,
                         });
                     }
                 }
@@ -1075,6 +1466,20 @@ impl StressTestHandler {
         }
     }
 
+    /// Whether `id` is a readiness sentinel rather than corpus. Only true when
+    /// this handler is carrying an attach flag: outside a readiness barrier
+    /// there is nowhere to record the probe, and silently dropping a message
+    /// would understate the drain instead of measuring it.
+    fn is_sentinel(&self, id: u64) -> bool {
+        self.attach.is_some() && id == SENTINEL_ID
+    }
+
+    fn note_attached(&self) {
+        if let Some(attach) = &self.attach {
+            attach.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn observe(&self, received_at: u64, published_at_ns: u64) {
         let base = if self.epoch_relative {
             0
@@ -1099,10 +1504,8 @@ where
     type Context = ();
 
     async fn handle(&self, msg: StressTestMsg, _meta: MessageMetadata, _: &()) -> Outcome {
-        if msg.id == SENTINEL_ID
-            && let Some(attach) = &self.attach
-        {
-            attach.fetch_add(1, Ordering::Relaxed);
+        if self.is_sentinel(msg.id) {
+            self.note_attached();
             return Outcome::Ack;
         }
         let received_at = self.epoch.elapsed().as_nanos() as u64;
@@ -1148,12 +1551,31 @@ where
         _: &(),
     ) -> Outcome {
         let received_at = self.inner.epoch.elapsed().as_nanos() as u64;
+        // Same split as `handle`: a readiness sentinel bumps the attach flag
+        // and nothing else. A batch straddling the barrier is the normal case
+        // — the last warmup round's sentinels and the first corpus chunk
+        // arrive together — so without this the barrier's own traffic is
+        // counted as drained corpus and recorded as latency. Settled before
+        // the simulated work so a sentinel-only batch pays none of it.
+        let mut corpus = 0usize;
+        for (msg, _) in &messages {
+            if self.inner.is_sentinel(msg.id) {
+                self.inner.note_attached();
+            } else {
+                corpus = corpus.saturating_add(1);
+            }
+        }
+        if corpus == 0 {
+            return Outcome::Ack;
+        }
         // One simulated unit of work per batch, not per message: a batch
         // handler exists precisely so the per-message cost is amortised, and
         // sleeping per message would measure the sleep rather than batching.
         self.inner.simulate_work().await;
         for (msg, _) in &messages {
-            self.inner.observe(received_at, msg.published_at_ns);
+            if !self.inner.is_sentinel(msg.id) {
+                self.inner.observe(received_at, msg.published_at_ns);
+            }
         }
         Outcome::Ack
     }
@@ -1193,10 +1615,20 @@ pub fn noop_purge() -> PurgeFn {
 /// The future resolves to `Err` when the drain loop itself fails (connection,
 /// commit, routing), so the scenario reports the real cause instead of
 /// waiting out its whole deadline and calling it a timeout.
+///
+/// The token is the scenario's stop signal. `run_dlq` takes no per-call
+/// shutdown token on any backend, and what actually stops it varies: most
+/// exit when their client closes (which the teardown does), but Redis's is
+/// documented to run until its task is aborted and cannot observe a close at
+/// all. A closure whose backend has no close-driven exit selects on the
+/// token; one that stops on close may ignore it. Either way the driver must
+/// return promptly once the teardown fires both signals — the harness only
+/// falls back to aborting a driver that responds to neither.
 pub type DlqDrainFn<B> = Box<
     dyn Fn(
             <B as Backend>::Client,
             StressTestHandler,
+            CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
@@ -1215,12 +1647,42 @@ pub type DlqDrainFn<B> = Box<
 pub type DlqDepthFn =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send>> + Send + Sync>;
 
-/// Declare [`StressTestTopic`] for a batch-consume scenario, sized for the
-/// scenario's consumer count. Kafka needs this: the generic declare creates
-/// the topic with its default partition count, and batch consumers past that
-/// count would sit idle while the row claimed them as workers.
-pub type BatchTopologyFn<B> = Box<
+/// Declare [`StressTestTopic`] sized for a scenario's consumer count.
+///
+/// Kafka needs this: the generic declare creates the topic with its default
+/// partition count (8), and any consumer past that count is assigned no
+/// partition at all — it polls forever and receives nothing, while the row
+/// counts it as a worker.
+///
+/// Used by **both** the batch and the supervisor drivers. It was originally
+/// batch-only, which left `consume_parallel` at 16 consumers running 8 real
+/// workers behind a row that claimed 16. Nothing surfaced that until the
+/// readiness barrier refused to start a window with half the group unassigned;
+/// before it, the eight idle pollers were invisible and their absence was
+/// simply folded into the throughput number.
+///
+/// The consumer-group driver does not need it: registering a group declares
+/// with partitions sized to the config's `max_consumers`.
+pub type ConsumeTopologyFn<B> = Box<
     dyn Fn(<B as Backend>::Client, u16) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Deliver one encoded readiness sentinel to every worker of `topic` in a way
+/// the generic publisher cannot.
+///
+/// Called once per barrier round with the topic's queue name and the sentinel
+/// already encoded by the topic's own codec, so the backend only decides
+/// *where* it goes. Kafka needs this: its publisher submits a round
+/// concurrently and librdkafka sticks every null-key record of that round to a
+/// single partition, so a round reaches one member of the group rather than a
+/// random spread, and covering N members takes on the order of N·log N rounds.
+/// The Kafka probe writes one sentinel to every partition instead, which
+/// reaches every assigned member in one round. Backends whose queue dispatches
+/// to competing consumers need no probe.
+pub type ReadinessProbeFn = Box<
+    dyn Fn(&'static str, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -1229,11 +1691,22 @@ pub type BatchTopologyFn<B> = Box<
 /// exists on no other backend, so the absence of this closure is what makes
 /// `consume_batch` unsupported elsewhere rather than something to fake.
 /// Invoked once per scenario consumer, so the closure must be re-callable.
-/// Errors surface exactly as for [`DlqDrainFn`].
+/// The [`BatchOptions`] are the scenario's — the wrapper must hand them to
+/// the backend's batch primitive, not re-derive its own. Errors surface
+/// exactly as for [`DlqDrainFn`].
+///
+/// The token is the scenario's stop signal: the closure must return promptly
+/// once it fires, shutting its consumer down cleanly. On Kafka a clean close
+/// sends the group's LeaveGroup at once, where an aborted member lingers in
+/// the group until the session timeout and poisons the next scenario's purge.
+/// The harness only falls back to aborting a driver that ignores the token
+/// past a grace period.
 pub type BatchConsumeFn<B> = Box<
     dyn Fn(
             <B as Backend>::Client,
             StressBatchHandler,
+            BatchOptions,
+            CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
@@ -1258,9 +1731,12 @@ pub struct HarnessConfig<B: Backend> {
     /// asynchronous (SQS).
     pub dlq_depth: Option<DlqDepthFn>,
     pub batch_consume: Option<BatchConsumeFn<B>>,
-    /// See [`BatchTopologyFn`] — required only where the generic declare
+    /// See [`ConsumeTopologyFn`] — required only where the generic declare
     /// under-partitions for the consumer count (Kafka).
-    pub batch_topology: Option<BatchTopologyFn<B>>,
+    pub consume_topology: Option<ConsumeTopologyFn<B>>,
+    /// See [`ReadinessProbeFn`] — required only where the generic publisher
+    /// cannot spread a round across the group's workers (Kafka).
+    pub readiness_probe: Option<ReadinessProbeFn>,
     /// How many workers this backend actually runs for the FIFO flow. Most
     /// backends spawn one worker per routing shard ([`SEQ_SHARDS`]); Kafka
     /// runs a single FIFO task over every assigned partition, so its
@@ -1287,7 +1763,8 @@ impl<B: Backend> HarnessConfig<B> {
             dlq_drain: None,
             dlq_depth: None,
             batch_consume: None,
-            batch_topology: None,
+            consume_topology: None,
+            readiness_probe: None,
             fifo_workers: SEQ_SHARDS,
             _backend: std::marker::PhantomData,
         }
@@ -1338,8 +1815,13 @@ impl<B: Backend> HarnessConfig<B> {
         self
     }
 
-    pub fn with_batch_topology(mut self, f: BatchTopologyFn<B>) -> Self {
-        self.batch_topology = Some(f);
+    pub fn with_consume_topology(mut self, f: ConsumeTopologyFn<B>) -> Self {
+        self.consume_topology = Some(f);
+        self
+    }
+
+    pub fn with_readiness_probe(mut self, f: ReadinessProbeFn) -> Self {
+        self.readiness_probe = Some(f);
         self
     }
 
@@ -1357,6 +1839,9 @@ struct ScenarioMetrics {
     peak_rss_mb: f64,
     cpu_pct: f64,
     duration_secs: f64,
+    /// The fixed setup cost this scenario excluded from `duration_secs`, or
+    /// `None` when its driver does not separate the two. See [`WindowSplit`].
+    setup_secs: Option<f64>,
 }
 
 fn default_prefetch(messages: u64, consumers: u16, cap: u16) -> u16 {
@@ -1530,6 +2015,7 @@ async fn await_completion_or_driver_error(
 fn finish(
     scenario: &Scenario,
     duration: Duration,
+    setup: Option<Duration>,
     resources: ResourceSnapshot,
     latencies: LatencyPercentiles,
 ) -> ScenarioMetrics {
@@ -1539,6 +2025,125 @@ fn finish(
         peak_rss_mb: resources.peak_rss_mb,
         cpu_pct: resources.cpu_pct,
         duration_secs: duration.as_secs_f64(),
+        setup_secs: setup.map(|d| d.as_secs_f64()),
+    }
+}
+
+/// Stop a sampler that is only started once the measured window opens.
+///
+/// `None` means setup failed before that happened, so there is no resource
+/// window to report — zeroes, not a snapshot of the failed setup. The scenario
+/// is being failed anyway; the numbers exist only so the row shape is uniform.
+async fn stop_sampler(sampler: Option<ResourceSampler>) -> ResourceSnapshot {
+    match sampler {
+        Some(sampler) => sampler.stop().await,
+        None => ResourceSnapshot {
+            peak_rss_mb: 0.0,
+            cpu_pct: 0.0,
+        },
+    }
+}
+
+/// How many sentinels a readiness round publishes per worker, on the generic
+/// path.
+///
+/// One per worker is not enough where delivery is not strictly fair: a
+/// competing-consumer queue hands a round to whichever workers poll first, so
+/// a single sentinel per worker can leave a slower worker unproven. With
+/// `OVERSUPPLY × N` per round the loop usually completes in one, and it simply
+/// publishes another round until every flag is set. Oversupply is cheap
+/// (sentinels carry an empty payload and are never measured) and a missed
+/// round is not, so this is deliberately generous. Partitioned backends do not
+/// rely on this — see [`ReadinessProbeFn`].
+const READINESS_OVERSUPPLY: usize = 4;
+
+/// How long the readiness barrier may take, publishes included, before the
+/// scenario is failed instead of measured.
+const READINESS_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Block until every worker has handled at least one message, and return the
+/// wall-clock that took.
+///
+/// This is what separates a drain measurement from a group-coordination
+/// measurement. Consumer tasks are spawned and *then* the corpus is published,
+/// so without a barrier the interval from `start` to completion contains the
+/// group's join/rebalance latency — a fixed cost, invariant to corpus size. In
+/// the CAF-667 Kafka sweep that cost was ~3.2 s at one consumer and ~6.5 s at
+/// four and sixteen, and it swamped drains as short as 0.05 s: the published
+/// `throughput` was `corpus / rebalance_delay`, understating the real drain
+/// rate by up to 62×.
+///
+/// A fixed sleep is not a substitute and was rejected for the same reason
+/// `run_scenario_broadcast` rejected it: it either races the slowest join or
+/// costs every scenario the worst case. This waits for the actual event.
+///
+/// One flag per worker, never a shared total: a shared counter cannot tell one
+/// fast worker's ten sentinels from ten workers' one each, which is exactly the
+/// state — a single member holding every partition — that the barrier exists to
+/// rule out. Sentinels bump only these flags, so a straggler's sentinel
+/// arriving mid-measurement is invisible to `processed` and to the recorder.
+async fn await_worker_readiness<B, T>(
+    publisher: &shove::Publisher<B>,
+    probe: Option<&ReadinessProbeFn>,
+    epoch: Instant,
+    attach_flags: &[Arc<AtomicU64>],
+    deadline: Duration,
+) -> Result<(), String>
+where
+    B: Backend,
+    T: Topic<Message = StressTestMsg>,
+{
+    let attached = || {
+        attach_flags
+            .iter()
+            .filter(|c| c.load(Ordering::Relaxed) > 0)
+            .count()
+    };
+    let sentinel = |epoch: Instant| StressTestMsg {
+        id: SENTINEL_ID,
+        published_at_ns: epoch.elapsed().as_nanos() as u64,
+        payload: String::new(),
+    };
+    let per_round = attach_flags
+        .len()
+        .saturating_mul(READINESS_OVERSUPPLY)
+        .max(1);
+    let rounds = async {
+        loop {
+            match probe {
+                Some(probe) => {
+                    let payload =
+                        <T::Codec as shove::Codec<StressTestMsg>>::encode(&sentinel(epoch))
+                            .map_err(|e| format!("encode readiness sentinel: {e}"))?;
+                    probe(T::topology().queue(), payload)
+                        .await
+                        .map_err(|e| format!("probe readiness sentinels: {e}"))?;
+                }
+                None => {
+                    let round: Vec<StressTestMsg> =
+                        (0..per_round).map(|_| sentinel(epoch)).collect();
+                    publisher
+                        .publish_batch::<T>(&round)
+                        .await
+                        .map_err(|e| format!("publish readiness sentinels: {e}"))?;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if attached() == attach_flags.len() {
+                return Ok::<(), String>(());
+            }
+        }
+    };
+    // The deadline bounds the whole barrier, a stalled publish included, and a
+    // worker first seen after it does not turn the failure into a success.
+    match tokio::time::timeout(deadline, rounds).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "only {} of {} workers were assigned and polling within {deadline:?}; \
+             the drain window cannot be separated from group setup",
+            attached(),
+            attach_flags.len()
+        )),
     }
 }
 
@@ -1570,6 +2175,126 @@ where
         .declare::<T>()
         .await
         .map_err(|e| format!("declare: {e}"))
+}
+
+/// Block until `fetch_undrained` reports nothing pending, polling every
+/// `poll` up to `deadline`. Each returned entry describes one thing still in
+/// the way — a topic a delete has not finished removing, a broker that has
+/// not answered its first metadata fetch, a failed observation — and an entry
+/// keeps the wait alive exactly like a pending resource does, so a transient
+/// fetch failure is retried rather than treated as either "clean" or a hard
+/// error. At the deadline every entry from the final round is named in the
+/// error: what was pending and what could not be observed send an operator
+/// down different roads, so neither may mask the other.
+///
+/// The error reports the wait actually paid (which can overshoot `deadline`
+/// by one poll plus one fetch), not the configured budget — a sub-second
+/// deadline must not read as "0s".
+///
+/// Runs on blocking primitives (`thread::sleep`) — call it from
+/// `spawn_blocking`.
+pub fn await_drain(
+    mut fetch_undrained: impl FnMut() -> Vec<String>,
+    deadline: Duration,
+    poll: Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        let undrained = fetch_undrained();
+        if undrained.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= deadline {
+            return Err(format!(
+                "still pending after {:?}: {}",
+                started.elapsed(),
+                undrained.join(", ")
+            ));
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// How long a scenario teardown waits for its consumer drivers to observe the
+/// stop signal and close cleanly before falling back to aborting them. Sized
+/// for the slowest cooperative shutdown, not the common case: a batch driver
+/// cancelled with a redelivered residual buffer first flushes it through the
+/// handler (a heavy profile pays seconds there), and aborting that driver
+/// mid-close loses the LeaveGroup the graceful path exists to send. A driver
+/// still running past this is not going to honour the signal, and the purge's
+/// group-delete wait absorbs the member an abort leaves behind.
+const DRIVER_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Join a scenario's stopped consumer drivers, reporting — never swallowing —
+/// any error or panic one surfaces on the way out. The row's numbers are
+/// already snapshotted when this runs, so a late failure cannot fail the
+/// scenario, but the cooperative path is the first place a shutdown flush or
+/// final commit can fail, and the identical failure a moment earlier fails
+/// the row. A driver still running once [`DRIVER_STOP_GRACE`] expires is
+/// aborted, loudly: a silent fallback would make a disconnected stop signal
+/// read as "this backend is slow" instead of pointing at the wiring. The
+/// caller fires its stop signal(s) first; this only waits.
+async fn stop_drivers_with_grace(
+    drivers: &mut tokio::task::JoinSet<Result<(), String>>,
+    what: &str,
+) {
+    fn report(what: &str, joined: Result<Result<(), String>, tokio::task::JoinError>) {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("  warning: {what} driver failed during teardown: {e}"),
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => eprintln!("  warning: {what} driver panicked during teardown: {e}"),
+        }
+    }
+    let graceful = async {
+        while let Some(joined) = drivers.join_next().await {
+            report(what, joined);
+        }
+    };
+    if tokio::time::timeout(DRIVER_STOP_GRACE, graceful)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "  warning: {what} driver(s) ignored the stop signal for {DRIVER_STOP_GRACE:?}, aborting"
+        );
+        drivers.abort_all();
+        while let Some(joined) = drivers.join_next().await {
+            report(what, joined);
+        }
+    }
+}
+
+/// [`purge_then_declare`] for [`StressTestTopic`], but sized so every worker the
+/// scenario claims can actually be assigned work.
+///
+/// The generic declare under-partitions Kafka's topic for the consumer count: a
+/// plain declare takes the backend default (8 partitions), so a 16-consumer
+/// scenario leaves 8 members assigned nothing. They poll, receive nothing, and
+/// the row still counts them. Where the backend supplies a
+/// [`ConsumeTopologyFn`] this declares with the scenario's consumer count
+/// instead; where it does not (every backend but Kafka, none of which
+/// partitions this way) it falls back to the generic path.
+async fn purge_then_declare_sized<B>(
+    hcfg: &HarnessConfig<B>,
+    broker: &Broker<B>,
+    client: &B::Client,
+    consumers: u16,
+) -> Result<(), String>
+where
+    B: Backend,
+{
+    match &hcfg.consume_topology {
+        Some(prepare) => {
+            (hcfg.purge)(StressTestTopic::topology())
+                .await
+                .map_err(|e| format!("purge: {e}"))?;
+            prepare(client.clone(), consumers)
+                .await
+                .map_err(|e| format!("declare: {e}"))
+        }
+        None => purge_then_declare::<B, StressTestTopic>(hcfg, broker).await,
+    }
 }
 
 async fn run_scenario_publish<B, Connect, Fut>(
@@ -1660,7 +2385,17 @@ where
     result?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    // `Some(ZERO)`, not `None`: a publish flow constructs no consumer, so there
+    // is no worker startup to wait for and nothing for a barrier to exclude —
+    // the window is the publish loop and nothing else. `None` would claim the
+    // two were never separated, a different and false statement.
+    Ok(finish(
+        scenario,
+        duration,
+        Some(Duration::ZERO),
+        resources,
+        latencies,
+    ))
 }
 
 /// Execute a single coordinated-group scenario. A fresh `Broker<B>` is built
@@ -1700,17 +2435,54 @@ where
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
 
-    let sampler = ResourceSampler::start();
+    // Started after the readiness barrier — see `run_scenario_supervisor`.
+    let mut sampler: Option<ResourceSampler> = None;
 
     let prefetch = scenario.prefetch.unwrap_or_else(|| {
         default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
     });
 
+    // The group calls the factory once per member, from inside the spawned
+    // `run_until_timeout` task — so the flags cannot be *collected* as members
+    // come up: the barrier would read a half-populated vec and conclude that
+    // the two members it can see are the whole group. Create the full set up
+    // front instead, sized to the member count the row is stamped with, and
+    // let each factory call claim one. A group that brings up fewer members
+    // than that leaves a flag at zero and the barrier fails the scenario with
+    // its real count, which is the loud outcome.
+    //
+    // FIFO takes no flags, for the reason spelled out in
+    // `run_scenario_supervisor`.
+    let attach_flags: Vec<Arc<AtomicU64>> = if fifo {
+        Vec::new()
+    } else {
+        (0..scenario.consumers)
+            .map(|_| Arc::new(AtomicU64::new(0)))
+            .collect()
+    };
+    // A std lock, not the tokio one this module imports: the factory is a
+    // plain `Fn`, so it cannot await, and this is claimed once per member at
+    // spawn with no contention worth an async lock.
+    let unclaimed = Arc::new(std::sync::Mutex::new(attach_flags.clone()));
     let pc = processed.clone();
     let rec = recorder.clone();
     let profile = scenario.handler;
-    let factory = move || StressTestHandler::new(epoch, pc.clone(), rec.clone(), profile);
+    let factory = move || {
+        let handler = StressTestHandler::new(epoch, pc.clone(), rec.clone(), profile);
+        match unclaimed.lock().ok().and_then(|mut u| u.pop()) {
+            Some(attach) => handler.with_attach_counter(attach),
+            // FIFO (no flags were made), or a member beyond the stamped count
+            // — a respawn topping the group back up, say. Either way it runs
+            // without a probe rather than being denied a handler.
+            None => handler,
+        }
+    };
 
+    // Before the registration that brings the members up, for the reason
+    // spelled out in `run_scenario_batch`: `setup_secs` runs from the first
+    // worker being spawned, and on this flow that is `register`'s own await
+    // plus the spawn of the group's run task.
+    let setup_started = Instant::now();
     let mut group = broker.consumer_group();
     let inner_cfg = make_cfg(scenario.consumers, prefetch, scenario.concurrent);
     if fifo {
@@ -1738,9 +2510,25 @@ where
             .await
     });
 
-    let start = Instant::now();
+    let setup_and_publish = async {
+        // Hold until every member is assigned and polling, so the window below
+        // is the drain and not the group's join latency.
+        let setup = if fifo {
+            None
+        } else {
+            await_worker_readiness::<B, StressTestTopic>(
+                &publisher,
+                hcfg.readiness_probe.as_ref(),
+                epoch,
+                &attach_flags,
+                READINESS_DEADLINE,
+            )
+            .await?;
+            Some(setup_started.elapsed())
+        };
 
-    let publish = async {
+        sampler = Some(ResourceSampler::start());
+        let start = Instant::now();
         let chunks = message_chunks(
             scenario.messages,
             scenario.payload_bytes,
@@ -1760,19 +2548,23 @@ where
                     .map_err(|e| format!("publish_batch: {e}"))?;
             }
         }
-        Ok::<(), String>(())
+        Ok::<(Instant, Option<Duration>), String>((start, setup))
     };
     // A publish failure must still fall through to the teardown below: an
     // early `?` here would leave the spawned consumer group running, and a
-    // leaked consumer eats the next scenario's messages.
-    let outcome = match publish.await {
-        Ok(()) => {
-            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await
-        }
-        Err(e) => Err(e),
+    // leaked consumer eats the next scenario's messages. Same for a barrier
+    // that times out.
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
+            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
+        ),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
 
     let duration = start.elapsed();
+    // Stopped with the window — see `run_scenario_batch`.
+    let resources = stop_sampler(sampler).await;
 
     // Signal the consumer group to stop and wait for the drain to complete.
     // A worker that erred or panicked mid-run fails the scenario: the target
@@ -1781,13 +2573,12 @@ where
     scenario_stop.cancel();
     let outcome = outcome.and(check_worker_outcome(run_handle.await));
 
-    let resources = sampler.stop().await;
     drop(publisher);
     broker.close().await;
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 /// Broadcast: every subscriber receives every message, so `consumers`
@@ -1836,6 +2627,10 @@ where
     // workload — so a straggler completing mid-measurement is invisible.
     let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(scenario.consumers as usize);
     let setup_and_publish = async {
+        // Before the subscribe loop, for the reason spelled out in
+        // `run_scenario_batch`: subscribing and spawning N subscribers is part
+        // of the interval `setup_secs` claims to cover.
+        let setup_started = Instant::now();
         for _ in 0..scenario.consumers {
             let attach = Arc::new(AtomicU64::new(0));
             attach_flags.push(attach.clone());
@@ -1866,32 +2661,21 @@ where
         // ephemeral subscriptions receive nothing published before they
         // attach, so one slow attach made the target unreachable and the
         // scenario a timeout instead of a measurement.
-        let barrier_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let sentinel = StressTestMsg {
-                id: SENTINEL_ID,
-                published_at_ns: epoch.elapsed().as_nanos() as u64,
-                payload: String::new(),
-            };
-            publisher
-                .publish::<StressBroadcastTopic>(&sentinel)
-                .await
-                .map_err(|e| format!("publish sentinel: {e}"))?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let attached = attach_flags
-                .iter()
-                .filter(|c| c.load(Ordering::Relaxed) > 0)
-                .count();
-            if attached == attach_flags.len() {
-                break;
-            }
-            if tokio::time::Instant::now() >= barrier_deadline {
-                return Err(format!(
-                    "only {attached} of {} broadcast subscribers attached within 30s",
-                    attach_flags.len()
-                ));
-            }
-        }
+        //
+        // This flow had the barrier first; the shared helper is that loop
+        // generalised, so the other consume flows now get the same guarantee
+        // and the same recorded `setup_secs`.
+        // No probe: an ephemeral subscriber receives every message, so a
+        // single generic round reaches every worker on every backend.
+        await_worker_readiness::<B, StressBroadcastTopic>(
+            &publisher,
+            None,
+            epoch,
+            &attach_flags,
+            READINESS_DEADLINE,
+        )
+        .await?;
+        let setup = setup_started.elapsed();
 
         sampler = Some(ResourceSampler::start());
         let start = Instant::now();
@@ -1907,18 +2691,20 @@ where
                 .await
                 .map_err(|e| format!("publish_batch: {e}"))?;
         }
-        Ok::<Instant, String>(start)
+        Ok::<(Instant, Option<Duration>), String>((start, Some(setup)))
     };
 
-    let (start, outcome) = match setup_and_publish.await {
-        Ok(start) => (
-            start,
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
             await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
         ),
-        Err(e) => (Instant::now(), Err(e)),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
 
     let duration = start.elapsed();
+    // Stopped with the window — see `run_scenario_batch`.
+    let resources = stop_sampler(sampler).await;
 
     scenario_stop.cancel();
     let mut outcome = outcome;
@@ -1926,21 +2712,12 @@ where
         outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
-    let resources = match sampler {
-        Some(sampler) => sampler.stop().await,
-        // Setup failed before the measured window opened; there is nothing
-        // truthful to report.
-        None => ResourceSnapshot {
-            peak_rss_mb: 0.0,
-            cpu_pct: 0.0,
-        },
-    };
     drop(publisher);
     broker.close().await;
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 /// DLQ drain, in two phases. The fill (publish, then consume with a rejecting
@@ -2084,8 +2861,9 @@ where
             .epoch_relative();
 
     let start = Instant::now();
+    let dlq_stop = CancellationToken::new();
     let mut drivers = tokio::task::JoinSet::new();
-    drivers.spawn(drain(client.clone(), handler));
+    drivers.spawn(drain(client.clone(), handler, dlq_stop.clone()));
 
     let outcome = await_completion_or_driver_error(
         &processed,
@@ -2096,19 +2874,36 @@ where
     )
     .await;
     let duration = start.elapsed();
-
-    // Abort rather than signal: `run_dlq` takes no shutdown token on several
-    // backends (Kafka's stops only when its client closes), so awaiting it
-    // would hang. The count is already in `processed`, so nothing is lost.
-    drivers.abort_all();
-    while drivers.join_next().await.is_some() {}
-
+    // Stopped with the window — see `run_scenario_batch`.
     let resources = sampler.stop().await;
+
+    // Snapshotted with the window, before the teardown fires: a driver stopped
+    // cooperatively can still run the handler on its way out (the batch flow
+    // below flushes a residual buffer that way), and those samples belong to
+    // shutdown rather than to the row being reported.
+    let latencies = recorder.compute_percentiles().await;
+
+    // No single stop signal reaches every backend's `run_dlq` (see
+    // [`DlqDrainFn`]), so the teardown fires both: the scenario token for the
+    // closures that select on it, and the client close that ends the rest. A
+    // driver stopped either way closes its consumer on the normal path — on
+    // Kafka that sends the group's LeaveGroup at once, where an aborted
+    // member lingers until the session timeout and stalls the next scenario's
+    // purge wait. The abort survives only as the grace fallback.
+    dlq_stop.cancel();
     broker.close().await;
+    stop_drivers_with_grace(&mut drivers, "dlq").await;
     outcome?;
 
-    let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    // `None`: this window is not separated from the drain consumer's own
+    // startup. The measured phase drains a queue that is *already* full, so
+    // there is no publish path left to carry a readiness sentinel through —
+    // any message this phase published would land in the main queue, not the
+    // DLQ being drained. Saying so demotes this flow's negligible-handler rows
+    // to `HandlerCost::SetupBound` instead of letting them keep a framework
+    // claim the window cannot support. Filed as a follow-up; it needs a
+    // different probe, not this one.
+    Ok(finish(scenario, duration, None, resources, latencies))
 }
 
 /// Batch consume. Kafka-only: the closure exists nowhere else.
@@ -2127,25 +2922,16 @@ where
         .batch_consume
         .as_ref()
         .ok_or_else(|| "backend supplied no batch_consume closure".to_string())?;
+    // No default here: a batch scenario that lost its options is a harness
+    // bug, and absorbing it would stamp the row with values the run never
+    // used.
+    let batch_options = scenario
+        .batch_options
+        .ok_or_else(|| "consume_batch scenario carries no batch options".to_string())?;
 
     let client = connect().await;
     let broker = Broker::<B>::from_client(client.clone());
-    // The generic declare under-partitions Kafka's topic for the consumer
-    // count (the group path sizes partitions to `max_consumers`; a plain
-    // declare uses the default). A supplied `batch_topology` declares with
-    // the scenario's consumer count instead, so every claimed worker can
-    // actually be assigned a partition.
-    match &hcfg.batch_topology {
-        Some(prepare) => {
-            (hcfg.purge)(StressTestTopic::topology())
-                .await
-                .map_err(|e| format!("purge: {e}"))?;
-            prepare(client.clone(), scenario.consumers)
-                .await
-                .map_err(|e| format!("declare: {e}"))?;
-        }
-        None => purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?,
-    }
+    purge_then_declare_sized::<B>(hcfg, &broker, &client, scenario.consumers).await?;
     let publisher = broker
         .publisher()
         .await
@@ -2154,9 +2940,9 @@ where
     let epoch = Instant::now();
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
-    let sampler = ResourceSampler::start();
+    // Started after the readiness barrier — see `run_scenario_supervisor`.
+    let mut sampler: Option<ResourceSampler> = None;
 
-    let start = Instant::now();
     // One batch consumer per scenario consumer, sharing the group — the
     // scenario's `consumers` field and `effective_workers` both say N, so N
     // loops must actually run, not one loop wearing N's deadline.
@@ -2167,20 +2953,49 @@ where
     // expression. That leaves exactly one thing for a test to pin — that
     // `effective_workers` still returns the consumer count this flow's row is
     // stamped with.
+    let batch_stop = CancellationToken::new();
     let mut drivers = tokio::task::JoinSet::new();
-    for _ in 0..scenario.flow.effective_workers(scenario.consumers) {
-        let handler = StressBatchHandler::new(StressTestHandler::new(
-            epoch,
-            processed.clone(),
-            recorder.clone(),
-            scenario.handler,
+    let workers = scenario.flow.effective_workers(scenario.consumers);
+    let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(workers as usize);
+    // Before the loop, not after it: `setup_secs` is the interval from the
+    // first worker being spawned to the barrier being satisfied, and the loop
+    // below is inside it. Started after the loop, the wall-clock the driver
+    // spends building and spawning N workers landed in neither recorded field —
+    // it preceded `setup_secs` and it preceded the drain `start` — so the two
+    // could not be added back up to the interval they describe.
+    let setup_started = Instant::now();
+    for _ in 0..workers {
+        let attach = Arc::new(AtomicU64::new(0));
+        attach_flags.push(attach.clone());
+        let handler = StressBatchHandler::new(
+            StressTestHandler::new(epoch, processed.clone(), recorder.clone(), scenario.handler)
+                .with_attach_counter(attach),
+        );
+        drivers.spawn(batch(
+            client.clone(),
+            handler,
+            batch_options,
+            batch_stop.clone(),
         ));
-        drivers.spawn(batch(client.clone(), handler));
     }
 
     // A publish failure must still fall through to the teardown below rather
-    // than early-return past it and leak the running batch consumers.
-    let publish = async {
+    // than early-return past it and leak the running batch consumers. The
+    // readiness barrier joins that block for the same reason: a barrier that
+    // times out must reach the teardown, not early-return past it.
+    let setup_and_publish = async {
+        await_worker_readiness::<B, StressTestTopic>(
+            &publisher,
+            hcfg.readiness_probe.as_ref(),
+            epoch,
+            &attach_flags,
+            READINESS_DEADLINE,
+        )
+        .await?;
+        let setup = setup_started.elapsed();
+
+        sampler = Some(ResourceSampler::start());
+        let start = Instant::now();
         let chunks = message_chunks(
             scenario.messages,
             scenario.payload_bytes,
@@ -2193,10 +3008,11 @@ where
                 .await
                 .map_err(|e| format!("publish_batch: {e}"))?;
         }
-        Ok::<(), String>(())
+        Ok::<(Instant, Option<Duration>), String>((start, Some(setup)))
     };
-    let outcome = match publish.await {
-        Ok(()) => {
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
             await_completion_or_driver_error(
                 &processed,
                 scenario.messages,
@@ -2204,24 +3020,33 @@ where
                 cancel,
                 &mut drivers,
             )
-            .await
-        }
-        Err(e) => Err(e),
+            .await,
+        ),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
     let duration = start.elapsed();
+    // Closed with the window, not after teardown, so cpu_pct and peak RSS
+    // describe the same interval as `duration_secs`: the sampler's cpu average
+    // divides by its whole lifetime, and a cancelled Kafka batch driver
+    // flushes its residual buffer through the handler on the way out — samples
+    // and seconds that belong to shutdown, not to the row being reported.
+    let resources = stop_sampler(sampler).await;
+    let latencies = recorder.compute_percentiles().await;
 
-    // Same reasoning as the DLQ drain: `run_batch` has no shutdown token of
-    // its own, so abort rather than await.
-    drivers.abort_all();
-    while drivers.join_next().await.is_some() {}
+    // Signal the drivers to stop and wait for them to close their consumers.
+    // A clean close leaves the consumer group immediately; an aborted member
+    // lingers in the group until the session timeout, which is what used to
+    // make the next scenario's purge race group membership. Grace-capped: a
+    // driver stuck ignoring the token falls back to the old abort, and the
+    // purge's group-delete wait absorbs the lingering member it leaves.
+    batch_stop.cancel();
+    stop_drivers_with_grace(&mut drivers, "batch").await;
 
-    let resources = sampler.stop().await;
     drop(publisher);
     broker.close().await;
     outcome?;
 
-    let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 /// Execute a single supervisor scenario (SQS, and the `consume_parallel` /
@@ -2247,7 +3072,10 @@ where
     if fifo {
         purge_then_declare::<B, StressSeqTopic>(hcfg, &broker).await?;
     } else {
-        purge_then_declare::<B, StressTestTopic>(hcfg, &broker).await?;
+        // Sized, not generic: this flow runs `scenario.consumers` independent
+        // supervisors against one shared group, so it needs at least that many
+        // partitions for the same reason the batch flow does.
+        purge_then_declare_sized::<B>(hcfg, &broker, &client, scenario.consumers).await?;
     }
     let publisher = broker
         .publisher()
@@ -2258,7 +3086,11 @@ where
     let recorder = Arc::new(LatencyRecorder::new());
     let processed = Arc::new(AtomicU64::new(0));
 
-    let sampler = ResourceSampler::start();
+    // Started after the readiness barrier, not here: sampling across worker
+    // startup and barrier idle time folds them into cpu_pct and peak RSS, and
+    // the resource window then describes a different interval than the
+    // throughput window does. Same reasoning as `run_scenario_broadcast`.
+    let mut sampler: Option<ResourceSampler> = None;
 
     let prefetch = scenario.prefetch.unwrap_or_else(|| {
         default_prefetch(scenario.messages, scenario.consumers, hcfg.prefetch_cap)
@@ -2279,14 +3111,33 @@ where
     // entry point measures under this label.
     let replicas = if fifo { 1 } else { scenario.consumers };
     let mut supervisor_handles = Vec::with_capacity(replicas as usize);
+    // One attach flag per replica, for the readiness barrier below. FIFO gets
+    // none: its sentinel would route by `id % SEQ_SHARDS`, so one reserved id
+    // reaches exactly one shard and can never prove the rest are polling — and
+    // `register_fifo` takes a single handler for the whole shard set, so there
+    // is no per-worker flag to hang the probe on. That flow therefore keeps an
+    // unseparated window and reports `setup_secs: None`, which downgrades its
+    // negligible-handler rows to `HandlerCost::SetupBound` rather than letting
+    // them keep claiming to measure shove.
+    let mut attach_flags: Vec<Arc<AtomicU64>> = Vec::with_capacity(replicas as usize);
     let setup_and_publish = async {
+        // Before the registration loop: `setup_secs` runs from the first worker
+        // being spawned, and registering N supervisors is part of bringing them
+        // up. Started after the loop, that wall-clock fell outside both
+        // recorded fields — see `run_scenario_batch`, which had the same gap.
+        let setup_started = Instant::now();
         for _ in 0..replicas {
-            let handler = StressTestHandler::new(
+            let mut handler = StressTestHandler::new(
                 epoch,
                 processed.clone(),
                 recorder.clone(),
                 scenario.handler,
             );
+            if !fifo {
+                let attach = Arc::new(AtomicU64::new(0));
+                attach_flags.push(attach.clone());
+                handler = handler.with_attach_counter(attach);
+            }
             let opts = make_opts(prefetch, scenario.concurrent);
             let mut supervisor = broker.consumer_supervisor();
             if fifo {
@@ -2311,6 +3162,23 @@ where
             supervisor_handles.push(handle);
         }
 
+        // Hold here until every worker is assigned and polling, so the window
+        // below is the drain and not the group's join latency.
+        let setup = if fifo {
+            None
+        } else {
+            await_worker_readiness::<B, StressTestTopic>(
+                &publisher,
+                hcfg.readiness_probe.as_ref(),
+                epoch,
+                &attach_flags,
+                READINESS_DEADLINE,
+            )
+            .await?;
+            Some(setup_started.elapsed())
+        };
+
+        sampler = Some(ResourceSampler::start());
         let start = Instant::now();
 
         let chunks = message_chunks(
@@ -2332,18 +3200,20 @@ where
                     .map_err(|e| format!("publish_batch: {e}"))?;
             }
         }
-        Ok::<Instant, String>(start)
+        Ok::<(Instant, Option<Duration>), String>((start, setup))
     };
 
-    let (start, outcome) = match setup_and_publish.await {
-        Ok(start) => (
-            start,
+    let ((start, setup), outcome) = match setup_and_publish.await {
+        Ok(window) => (
+            window,
             await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
         ),
-        Err(e) => (Instant::now(), Err(e)),
+        Err(e) => ((Instant::now(), None), Err(e)),
     };
 
     let duration = start.elapsed();
+    // Stopped with the window — see `run_scenario_batch`.
+    let resources = stop_sampler(sampler).await;
 
     // Signal every supervisor to stop and wait for all drains to complete.
     scenario_stop.cancel();
@@ -2352,13 +3222,12 @@ where
         outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
-    let resources = sampler.stop().await;
     drop(publisher);
     broker.close().await;
     outcome?;
 
     let latencies = recorder.compute_percentiles().await;
-    Ok(finish(scenario, duration, resources, latencies))
+    Ok(finish(scenario, duration, setup, resources, latencies))
 }
 
 // ── Reporting ───────────────────────────────────────────────────────────────
@@ -2390,6 +3259,19 @@ struct ScenarioResult {
     /// handler — is refused by [`validate_run`], which re-derives it.
     #[serde(default)]
     handler_cost: String,
+    /// The `run_batch` knobs a `consume_batch` row ran with — present on
+    /// every row of that flow, absent (not defaulted) everywhere else: a
+    /// `consume_parallel` row has no batch to size, and stamping a default on
+    /// it would be a false claim about what ran. `#[serde(default)]` exists
+    /// for the same single reason as on `handler_cost`: so a prior-version
+    /// document deserializes far enough to be refused *by version* in
+    /// [`merge_results_file`] instead of dying on a missing field. A
+    /// current-version row whose presence contradicts its own flow is refused
+    /// by [`validate_run`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_batch_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_batch_age_ms: Option<u64>,
     throughput_msg_per_sec: f64,
     dispatch_p50_ms: f64,
     dispatch_p95_ms: f64,
@@ -2400,9 +3282,34 @@ struct ScenarioResult {
     scaling_efficiency: f64,
     peak_rss_mb: f64,
     cpu_pct: f64,
+    /// The measured window. On every consume flow that holds a readiness
+    /// barrier this is the **drain alone** — see `setup_secs` for what was
+    /// taken out of it, and [`RESULTS_SCHEMA_VERSION`] for why that makes a v2
+    /// value non-comparable.
     duration_secs: f64,
+    /// The fixed setup cost excluded from `duration_secs`: seconds from the
+    /// first worker being spawned to every worker being assigned and polling.
+    ///
+    /// `null` means this flow does not separate the two, so `duration_secs`
+    /// may still contain it — which is why [`HandlerCost::of`] refuses a
+    /// `framework` marker on such a row. Recorded rather than merely
+    /// subtracted because the number is the interesting part of the defect
+    /// this field exists for: it was ~3.2 s at one Kafka consumer and ~6.5 s
+    /// at four and sixteen, against drains as short as 0.05 s.
+    ///
+    /// `default` for the same reason as `handler_cost`: so a v1/v2 document
+    /// reaches the version check and is refused by version rather than by a
+    /// serde error. Absent therefore reads as "not separated", which is the
+    /// truthful reading of a pre-v3 row.
+    #[serde(default)]
+    setup_secs: Option<f64>,
 }
 
+/// A scenario that produced no number. Deliberately a minimal identity set —
+/// what failed, not how it was tuned: like `handler_cost` and `prefetch`, the
+/// batch knobs are not recorded here, because every claim about what a number
+/// measures rides on `results[]` rows and a failure row has no number to
+/// mislabel. The `error` string carries the diagnostic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FailedResult {
     flow: String,
@@ -2679,9 +3586,13 @@ fn detect_hardware() -> Hardware {
 /// The document's own invariants, checked on every run a merge would write —
 /// preserved and incoming alike. serde only proves the shape; a shape-valid
 /// file with a foreign payload size, a flow in both lists, or a row whose
-/// `handler_cost` is not what its flow and handler measure must not be
-/// re-signed as a valid results document.
+/// `handler_cost` is not what its flow, handler and recorded window measure
+/// must not be re-signed as a valid results document.
 fn validate_run(run: &BackendRun) -> Result<(), String> {
+    fn fmt_opt<T: fmt::Display>(v: Option<T>) -> String {
+        v.map_or_else(|| "absent".to_string(), |v| v.to_string())
+    }
+
     fn check_row(
         backend: &str,
         kind: &str,
@@ -2725,17 +3636,91 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 run.backend, r.handler
             ));
         };
-        let expected = HandlerCost::of(flow, handler);
+        // `setup_secs` is checked on its own before the marker built on it:
+        // a barrier flow's driver records a finite, non-negative interval, a
+        // publish flow's records zero (no worker to wait for), and every other
+        // driver records nothing. A value outside that is one no run of the
+        // flow produced, whatever marker sits next to it.
+        let setup_recordable = if flow.holds_readiness_barrier() {
+            matches!(r.setup_secs, Some(s) if s.is_finite() && s >= 0.0)
+        } else if matches!(flow, Flow::PublishSingle | Flow::PublishBatch) {
+            r.setup_secs == Some(0.0)
+        } else {
+            r.setup_secs.is_none()
+        };
+        if !setup_recordable {
+            return Err(format!(
+                "run '{}' has a result for flow '{}' whose setup_secs {:?} is not a value \
+                 that flow's driver can record",
+                run.backend, r.flow, r.setup_secs
+            ));
+        }
+        let expected = HandlerCost::of(
+            flow,
+            handler,
+            WindowSplit {
+                setup_secs: r.setup_secs,
+                duration_secs: r.duration_secs,
+            },
+        );
         if r.handler_cost != expected.as_str() {
             return Err(format!(
-                "run '{}' has a result for flow '{}' with handler '{}' whose handler_cost \
-                 '{}' is not the '{}' that pair measures",
+                "run '{}' has a result for flow '{}' with handler '{}', setup_secs {:?} and \
+                 duration_secs {} whose handler_cost '{}' is not the '{}' that combination \
+                 measures",
                 run.backend,
                 r.flow,
                 r.handler,
+                r.setup_secs,
+                r.duration_secs,
                 r.handler_cost,
                 expected.as_str()
             ));
+        }
+        // Like `handler_cost`, presence is re-derived from the row's own
+        // flow: `consume_batch` is the one flow that runs a sized batch, so
+        // its rows must say which size — the knobs are configurable, and
+        // without them a 50-row and a 500-row are byte-identical — and no
+        // other flow may claim batch knobs its run never had. The values
+        // themselves are free (that is the knob), except zero, which shove's
+        // own builders refuse at construction: a zero row describes a run
+        // that cannot exist.
+        match (flow, r.max_batch_size, r.max_batch_age_ms) {
+            // Before the missing-options arm, or a half-present zero would be
+            // misdiagnosed as merely missing when it is present-and-illegal.
+            (Flow::ConsumeBatch, size, age) if size == Some(0) || age == Some(0) => {
+                return Err(format!(
+                    "run '{}' has a consume_batch result with a zero batch option \
+                     (max_batch_size {}, max_batch_age_ms {}); shove refuses zero at \
+                     construction, so no run can have produced this row",
+                    run.backend,
+                    fmt_opt(size),
+                    fmt_opt(age),
+                ));
+            }
+            (Flow::ConsumeBatch, Some(_), Some(_)) => {}
+            (Flow::ConsumeBatch, size, age) => {
+                return Err(format!(
+                    "run '{}' has a consume_batch result missing its batch options \
+                     (max_batch_size {}, max_batch_age_ms {}); without them this row is \
+                     indistinguishable from one measured with different knobs",
+                    run.backend,
+                    fmt_opt(size),
+                    fmt_opt(age),
+                ));
+            }
+            (_, None, None) => {}
+            (_, size, age) => {
+                return Err(format!(
+                    "run '{}' has a result for flow '{}' carrying batch options \
+                     (max_batch_size {}, max_batch_age_ms {}) — that flow runs no batch, \
+                     so the row claims knobs its run never had",
+                    run.backend,
+                    r.flow,
+                    fmt_opt(size),
+                    fmt_opt(age),
+                ));
+            }
         }
     }
     for f in &run.failures {
@@ -2785,14 +3770,15 @@ fn merge_results_file(
                 )
             })?;
             // A future version's document is shape-compatible enough to
-            // deserialize, so without this it would be silently rewritten with
-            // a v1 header and whatever fields this binary does not know about
-            // dropped. Refuse instead: the six backend binaries accumulate into
+            // deserialize, so without this it would be silently rewritten
+            // under this binary's older header, with whatever fields this
+            // binary does not know about dropped. Refuse instead: the six backend binaries accumulate into
             // one file, and a downgrade would corrupt the other five's rows.
             if doc.schema_version != RESULTS_SCHEMA_VERSION {
                 return Err(format!(
                     "{path} is a v{} results document; this harness writes v{RESULTS_SCHEMA_VERSION}. \
-                     Merging would silently downgrade it — move it aside first.",
+                     Merging would silently re-sign its runs under this binary's header — \
+                     move it aside first.",
                     doc.schema_version
                 ));
             }
@@ -3141,7 +4127,15 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         messages: scenario.messages,
         consumers: scenario.consumers,
         handler: scenario.handler.to_string(),
-        handler_cost: scenario.handler_cost().as_str().to_string(),
+        handler_cost: scenario
+            .handler_cost(WindowSplit {
+                setup_secs: m.setup_secs,
+                duration_secs: m.duration_secs,
+            })
+            .as_str()
+            .to_string(),
+        max_batch_size: scenario.batch_options.map(|o| o.max_batch_size.get()),
+        max_batch_age_ms: scenario.batch_options.map(|o| o.max_batch_age_ms.get()),
         throughput_msg_per_sec: m.throughput,
         dispatch_p50_ms: m.latencies.dispatch_p50,
         dispatch_p95_ms: m.latencies.dispatch_p95,
@@ -3153,6 +4147,7 @@ fn push_metrics(results: &mut Vec<ScenarioResult>, scenario: &Scenario, m: Scena
         peak_rss_mb: m.peak_rss_mb,
         cpu_pct: m.cpu_pct,
         duration_secs: m.duration_secs,
+        setup_secs: m.setup_secs,
     });
 }
 
@@ -3250,6 +4245,126 @@ fn filter_scenarios<B: Backend>(
     kept
 }
 
+/// The batch flags this invocation passed, by name — empty when none was.
+fn passed_batch_flags(cli: &Cli) -> Vec<&'static str> {
+    [
+        cli.batch_max_size.map(|_| "--batch-max-size"),
+        cli.batch_max_age_ms.map(|_| "--batch-max-age-ms"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Why an invocation that passed a batch flag must be refused outright, or
+/// `None` to proceed. `Some` exactly when a flag was given and the *selected*
+/// flow set contains no `consume-batch`: whatever the backend, nothing this
+/// invocation could ever run reads the knob, so continuing is the
+/// parsed-and-dropped defect at invocation level — the run would exit green
+/// having measured nothing the flag described. The caller can always fix
+/// this invocation (select the flow or drop the flag), which is what makes a
+/// hard refusal right here and wrong for a capability gap — that case is
+/// [`inert_batch_flags_note`].
+fn refused_batch_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
+    let flags = passed_batch_flags(cli);
+    if flags.is_empty() || selected.contains(&Flow::ConsumeBatch) {
+        return None;
+    }
+    Some(format!(
+        "nothing in this invocation reads {}: the selected flows ({}) do not include \
+         consume-batch. Add `--flow consume-batch`, or drop the flag.",
+        flags.join(" / "),
+        flow_list(selected),
+    ))
+}
+
+/// The capability half of the guard: `consume-batch` *was* selected and a
+/// batch flag passed, but this backend will drop the flow (`skip` is
+/// [`skip_reason`]'s verdict, carrying the actual cause rather than a guess
+/// reconstructed from the filtered list). Killing the run here would break
+/// the documented six-binary sweep — one flag set accumulating one results
+/// file across every backend — so follow the flow's own precedent instead:
+/// say the knob is inert on this backend and continue with the other flows.
+/// No row lies either way, because no `consume_batch` row is produced at all.
+fn inert_batch_flags_note(cli: &Cli, selected: &[Flow], skip: Option<&str>) -> Option<String> {
+    let flags = passed_batch_flags(cli);
+    if flags.is_empty() || !selected.contains(&Flow::ConsumeBatch) {
+        return None;
+    }
+    let skip = skip?;
+    Some(format!(
+        "note: nothing in this invocation reads {} — consume-batch was selected but \
+         is dropped on this backend ({skip})",
+        flags.join(" / "),
+    ))
+}
+
+/// Build, capability-filter, and guard the scenario list — the one selection
+/// step every entry point goes through, so no runner can wire the flows in
+/// while forgetting the flag guards. `Err` is a refusal to run at all.
+fn select_scenarios<B: Backend>(
+    cli: &Cli,
+    hcfg: &HarnessConfig<B>,
+    default_flow: Flow,
+    supervisor_only: bool,
+) -> Result<Vec<Scenario>, String> {
+    let selected = selected_flows(cli, default_flow);
+    if let Some(reason) = refused_batch_flags(cli, &selected) {
+        return Err(reason);
+    }
+    let scenarios = filter_scenarios(
+        hcfg,
+        build_scenarios(cli, default_flow, hcfg.fifo_workers),
+        supervisor_only,
+    );
+    let skip = skip_reason(hcfg, Flow::ConsumeBatch, supervisor_only);
+    if let Some(note) = inert_batch_flags_note(cli, &selected, skip.as_deref()) {
+        eprintln!("{note}");
+    }
+    if let Some(path) = cli.results_file.as_deref()
+        && let Some(reason) = refused_results_file_version(path)
+    {
+        return Err(reason);
+    }
+    Ok(scenarios)
+}
+
+/// Fast-fail the schema-version refusal `merge_results_file` would otherwise
+/// raise only *after* the whole sweep has run — hours of broker time spent on
+/// a merge that was doomed before the first scenario. Version only: the merge
+/// remains the authority for every other document invariant (provenance,
+/// per-row validation), which cannot go stale here because both compare
+/// against the same constants and the merge still re-checks everything.
+fn refused_results_file_version(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let doc: BenchResults = serde_json::from_str(&content).ok()?;
+    (doc.schema_version != RESULTS_SCHEMA_VERSION).then(|| {
+        format!(
+            "{path} is a v{} results document; this harness writes \
+             v{RESULTS_SCHEMA_VERSION} and would refuse the merge after the sweep — \
+             move it aside first.",
+            doc.schema_version
+        )
+    })
+}
+
+/// [`select_scenarios`], with the refusal protocol both entry points share:
+/// print the reason and exit 2 (the usage-error code clap itself uses).
+fn select_scenarios_or_exit<B: Backend>(
+    cli: &Cli,
+    hcfg: &HarnessConfig<B>,
+    default_flow: Flow,
+    supervisor_only: bool,
+) -> Vec<Scenario> {
+    match select_scenarios(cli, hcfg, default_flow, supervisor_only) {
+        Ok(scenarios) => scenarios,
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// The default `ConsumerOptions` factory for the `consume_parallel` flow on a
 /// backend whose wrapper only supplies a `ConsumerGroupConfig`. Generic, so it
 /// works on every backend without the wrapper supplying anything.
@@ -3264,8 +4379,12 @@ fn announce_scenario(i: usize, total: usize, scenario: &Scenario) {
         .prefetch
         .map(|p| format!(" | pf={p}"))
         .unwrap_or_default();
+    let batch_str = scenario
+        .batch_options
+        .map(|o| format!(" | batch={}msg/{}ms", o.max_batch_size, o.max_batch_age_ms))
+        .unwrap_or_default();
     eprintln!(
-        "[{}/{}] {} | {}B | {} | {}msg | {}c{} | {} ...",
+        "[{}/{}] {} | {}B | {} | {}msg | {}c{}{} | {} ...",
         i + 1,
         total,
         scenario.flow,
@@ -3274,6 +4393,7 @@ fn announce_scenario(i: usize, total: usize, scenario: &Scenario) {
         scenario.messages,
         scenario.consumers,
         prefetch_str,
+        batch_str,
         scenario.handler,
     );
 }
@@ -3305,11 +4425,7 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
 
     let cli = Cli::parse();
     let cancel = spawn_ctrlc_watcher();
-    let scenarios = filter_scenarios(
-        &hcfg,
-        build_scenarios(&cli, Flow::ConsumerGroup, hcfg.fifo_workers),
-        false,
-    );
+    let scenarios = select_scenarios_or_exit(&cli, &hcfg, Flow::ConsumerGroup, false);
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -3387,11 +4503,7 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     // `Flow::Supervisor`, not `ConsumerGroup`: the group flow is unsupported
     // here and would be filtered out, leaving the default invocation running
     // zero scenarios.
-    let scenarios = filter_scenarios(
-        &hcfg,
-        build_scenarios(&cli, Flow::Supervisor, hcfg.fifo_workers),
-        true,
-    );
+    let scenarios = select_scenarios_or_exit(&cli, &hcfg, Flow::Supervisor, true);
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -3510,6 +4622,172 @@ mod tests {
             .find(|s| s.tier == "high" && s.consumers == 64)
             .expect("high/64c present");
         assert_eq!(at_64.messages, at_8.messages * 8);
+    }
+
+    // ── Framework-cost corpus floor ──
+
+    #[test]
+    fn a_framework_cell_too_small_to_drain_for_a_second_is_floored() {
+        // `moderate` sizes `zero` at 5,000 messages per consumer, so the
+        // one-consumer cell published 5,000 — which drained in 0.052 s on
+        // Kafka. The barrier makes that window honest; it cannot make it
+        // informative. The floor is what gives the cell a drain long enough to
+        // earn the `framework` marker instead of being downgraded forever.
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consumer-group",
+            "--consumers",
+            "1,4,16,32",
+            "--payload",
+            "64",
+        ]));
+        let at = |c: u16| {
+            scenarios
+                .iter()
+                .find(|s| s.consumers == c)
+                .unwrap_or_else(|| panic!("{c}c present"))
+                .messages
+        };
+        // Raised: the tier's own sizing is below the floor.
+        assert_eq!(at(1), MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(at(4), MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(at(16), MIN_FRAMEWORK_CORPUS_MESSAGES);
+        // Untouched: 32 × 5,000 already clears it. The floor only ever raises,
+        // so the tiers keep their own shape wherever they are big enough — the
+        // per-consumer scaling above the floor is not flattened.
+        assert_eq!(at(32), 160_000);
+        assert!(at(32) > MIN_FRAMEWORK_CORPUS_MESSAGES);
+    }
+
+    #[test]
+    fn a_floored_cell_is_given_a_deadline_its_corpus_can_use() {
+        // The floor is applied blind to the backend, so the deadline it comes
+        // with must budget for a slow one: at the 40,000 msg/s the unfloored
+        // `zero` deadline assumes, a 150,000-message cell would keep the 60 s
+        // clamp and any backend draining under ~2,500 msg/s would fail on the
+        // clock instead of producing a row.
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consumer-group",
+            "--consumers",
+            "1,32",
+            "--payload",
+            "64",
+        ]));
+        let at = |c: u16| {
+            scenarios
+                .iter()
+                .find(|s| s.consumers == c)
+                .unwrap_or_else(|| panic!("{c}c present"))
+        };
+        let floored = at(1);
+        assert_eq!(floored.messages, MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(
+            floored.deadline,
+            scenario_deadline(MIN_FRAMEWORK_CORPUS_MESSAGES, 1, HandlerProfile::Zero, true)
+        );
+        assert!(
+            floored.deadline >= Duration::from_secs(450),
+            "a floored 150,000-message cell must be budgeted at the floored rate, got {:?}",
+            floored.deadline
+        );
+        // A cell the tier sizes on its own keeps the deadline it always had.
+        let own = at(32);
+        assert!(own.messages > MIN_FRAMEWORK_CORPUS_MESSAGES);
+        assert_eq!(
+            own.deadline,
+            scenario_deadline(own.messages, 32, HandlerProfile::Zero, false)
+        );
+        assert_eq!(own.deadline, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_corpus_floor_is_capped_by_bytes_not_just_messages() {
+        // 150,000 × 64 KiB would stage a 9.6 GiB corpus through the publisher
+        // to buy a window the payload size already provides. The cap is what
+        // keeps the floor from multiplying by the payload tier.
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeParallel, HandlerProfile::Zero, true, 64),
+            MIN_FRAMEWORK_CORPUS_MESSAGES,
+            "the smallest payload is bounded by message count"
+        );
+        for payload_bytes in [1024, 65536] {
+            let floor = framework_corpus_floor(
+                Flow::ConsumeParallel,
+                HandlerProfile::Zero,
+                true,
+                payload_bytes,
+            );
+            assert!(
+                floor < MIN_FRAMEWORK_CORPUS_MESSAGES,
+                "{payload_bytes} B: floor {floor} was not capped"
+            );
+            assert!(
+                floor * payload_bytes as u64 <= MAX_FRAMEWORK_CORPUS_BYTES,
+                "{payload_bytes} B: floor {floor} exceeds the byte cap"
+            );
+        }
+    }
+
+    #[test]
+    fn the_corpus_floor_spares_cells_a_bigger_corpus_would_only_slow_down() {
+        // A sleeping handler's drain is the sleep, so a 30× corpus buys
+        // wall-clock and no signal — and `fast` run sequentially drained at
+        // ~470 msg/s, where the floor would turn a 5 s scenario into a 5-minute
+        // one. Concurrency hides that sleep, which is why `fast` qualifies
+        // there and only there.
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeParallel, HandlerProfile::Fast, false, 64),
+            0,
+            "sequential fast must not be floored"
+        );
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeParallel, HandlerProfile::Fast, true, 64),
+            MIN_FRAMEWORK_CORPUS_MESSAGES,
+            "concurrent fast is drain-bound and must be floored"
+        );
+        // Batch mode pays the sleep once per batch, not per message, so the
+        // sequential `fast` batch cell is drain-bound too and needs the floor
+        // whether or not `--concurrent` is set.
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeBatch, HandlerProfile::Fast, false, 64),
+            MIN_FRAMEWORK_CORPUS_MESSAGES,
+            "sequential fast batch amortises its sleep and must be floored"
+        );
+        for handler in [HandlerProfile::Slow, HandlerProfile::Heavy] {
+            for concurrent in [false, true] {
+                assert_eq!(
+                    framework_corpus_floor(Flow::ConsumeParallel, handler, concurrent, 64),
+                    0,
+                    "{handler} / concurrent={concurrent}"
+                );
+            }
+        }
+        // And the flows for which no corpus produces a `framework` row: the
+        // two that cannot separate their setup, the two with no drain at all,
+        // and broadcast, whose corpus is per-subscriber so a floor multiplies
+        // by the fan-out width.
+        for flow in [
+            Flow::ConsumeFifo,
+            Flow::DlqDrain,
+            Flow::PublishSingle,
+            Flow::PublishBatch,
+            Flow::Broadcast,
+        ] {
+            assert_eq!(
+                framework_corpus_floor(flow, HandlerProfile::Zero, true, 64),
+                0,
+                "{flow}"
+            );
+        }
     }
 
     // ── Payload ──
@@ -3799,10 +5077,175 @@ mod tests {
         assert_eq!(s.expected_processed(), s.messages);
     }
 
+    // ── await_drain (the purge's bounded waits) ──
+
+    /// The defect the drain replaces: a fixed 10-attempt budget gave up on a
+    /// group whose members simply had not finished leaving yet. The drain
+    /// must keep polling well past ten rounds as long as the deadline allows.
+    #[test]
+    fn drain_outlasts_a_fixed_retry_budget() {
+        let mut polls = 0u32;
+        let result = await_drain(
+            || {
+                polls += 1;
+                // A 16-member group that only finishes leaving on the 30th
+                // poll — three times the old 10-attempt budget.
+                if polls < 30 {
+                    vec!["group g: 16 member(s), state Stable".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(polls >= 30, "drained after only {polls} polls");
+    }
+
+    /// The common clean case (nothing pending on the first look) must return
+    /// without sleeping a single poll interval — the purge runs at every
+    /// scenario boundary, so a mandatory poll-length pause would tax the
+    /// whole matrix.
+    #[test]
+    fn drain_returns_at_once_when_nothing_is_pending() {
+        let started = Instant::now();
+        let result = await_drain(Vec::new, Duration::from_secs(10), Duration::from_secs(10));
+        assert_eq!(result, Ok(()));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a clean first poll must not pay the poll interval (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// At the deadline, every entry from the final round is named — the
+    /// lingering group AND a failed observation. Neither may mask the other:
+    /// "16 members never left" and "the broker stopped answering" send an
+    /// operator down different roads.
+    #[test]
+    fn drain_deadline_error_names_every_pending_entry() {
+        let result = await_drain(
+            || {
+                vec![
+                    "group g-consumer: 16 member(s), state Stable".to_string(),
+                    "group g-fifo: membership list failed: timed out".to_string(),
+                ]
+            },
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        );
+        let err = result.expect_err("a never-draining group must error");
+        assert!(
+            err.contains("g-consumer") && err.contains("16"),
+            "error must name the lingering group and member count: {err}"
+        );
+        assert!(
+            err.contains("g-fifo") && err.contains("timed out"),
+            "error must also carry the failed observation: {err}"
+        );
+    }
+
+    /// Transient observation failures (broker mid-rebalance, metadata
+    /// timeout) are pending entries like any other: retried, not fatal.
+    #[test]
+    fn drain_retries_past_transient_fetch_failures() {
+        let mut polls = 0u32;
+        let result = await_drain(
+            || {
+                polls += 1;
+                if polls < 3 {
+                    vec!["membership list failed: transient timeout".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    /// The batch teardown asks its drivers to stop and waits for them —
+    /// a driver that honours the token is joined on the graceful path, not
+    /// aborted mid-close. The driver double flags the cooperative exit; an
+    /// abort would drop the future before it could.
+    #[tokio::test]
+    async fn batch_teardown_stops_drivers_gracefully() {
+        let workers: u16 = 4;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 40,
+            consumers: workers,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+            batch_options: Some(BatchOptions::default()),
+        };
+
+        let (batch, _started, clean_exits) = counting_batch_fn();
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        assert_eq!(
+            clean_exits.load(Ordering::Relaxed),
+            workers as u64,
+            "every driver must be joined on the graceful path, not aborted"
+        );
+    }
+
+    /// A batch driver that honours the scenario stop token through the same
+    /// `ConsumerOptions::with_shutdown` mechanism real backends use, returned
+    /// with the counters it owns: `started` bumps on entry, `clean_exits`
+    /// after its run returns. The short post-run pause is the discriminator:
+    /// a teardown that aborts instead of joining kills the future inside the
+    /// pause, so the exit never counts — merely firing the token before an
+    /// abort cannot fake a graceful join.
+    fn counting_batch_fn() -> (
+        BatchConsumeFn<shove::InMemory>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let started = Arc::new(AtomicU64::new(0));
+        let clean_exits = Arc::new(AtomicU64::new(0));
+        let (started_in, clean_exits_in) = (started.clone(), clean_exits.clone());
+        let batch: BatchConsumeFn<shove::InMemory> =
+            Box::new(move |client, handler, _opts, stop| {
+                let started = started_in.clone();
+                let clean_exits = clean_exits_in.clone();
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    let result = InMemoryConsumer::new(client)
+                        .run::<StressTestTopic, _>(
+                            OneMessageBatches(handler),
+                            (),
+                            ConsumerOptions::new().with_shutdown(stop),
+                        )
+                        .await
+                        .map_err(|e| format!("run: {e}"));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    clean_exits.fetch_add(1, Ordering::Relaxed);
+                    result
+                })
+            });
+        (batch, started, clean_exits)
+    }
+
     // ── unsupported[] ──
 
     fn dummy_batch_fn() -> BatchConsumeFn<shove::InMemory> {
-        Box::new(|_client, _h| Box::pin(async { Ok(()) }))
+        Box::new(|_client, _h, _opts, _stop| Box::pin(async { Ok(()) }))
     }
 
     #[test]
@@ -3903,6 +5346,20 @@ mod tests {
         assert_eq!(Flow::ConsumeFifo.effective_workers(256), SEQ_SHARDS);
     }
 
+    /// The placeholder metrics every document-shape test pushes through
+    /// `push_metrics` — one definition, so a `ScenarioMetrics` field change
+    /// is a one-line fixture edit.
+    fn dummy_metrics() -> ScenarioMetrics {
+        ScenarioMetrics {
+            throughput: 1.0,
+            latencies: LatencyPercentiles::default(),
+            peak_rss_mb: 0.0,
+            cpu_pct: 0.0,
+            duration_secs: 1.0,
+            setup_secs: None,
+        }
+    }
+
     fn scenario_for(flow: Flow, handler: HandlerProfile) -> Scenario {
         Scenario {
             tier: "moderate",
@@ -3914,6 +5371,18 @@ mod tests {
             prefetch: None,
             flow,
             payload_bytes: 64,
+            // Mirrors `build_scenarios`: batch options exist exactly on the
+            // flow that has a batch to size.
+            batch_options: (flow == Flow::ConsumeBatch).then(BatchOptions::default),
+        }
+    }
+
+    /// A window that can carry a framework claim: setup was separated out, and
+    /// the drain left behind ran long enough to be a rate.
+    fn drain_bound() -> WindowSplit {
+        WindowSplit {
+            setup_secs: Some(3.2),
+            duration_secs: 30.0,
         }
     }
 
@@ -3927,7 +5396,7 @@ mod tests {
         // because the alternative is a reader inferring it from a flow name.
         for handler in [HandlerProfile::Slow, HandlerProfile::Heavy] {
             assert_eq!(
-                scenario_for(Flow::ConsumeBatch, handler).handler_cost(),
+                scenario_for(Flow::ConsumeBatch, handler).handler_cost(drain_bound()),
                 HandlerCost::HandlerAmortised,
                 "{handler}"
             );
@@ -3935,26 +5404,245 @@ mod tests {
     }
 
     #[test]
-    fn zero_and_fast_are_framework_cost_cells_in_every_consume_flow() {
+    fn zero_and_fast_are_framework_cost_cells_in_every_barrier_backed_flow() {
         // The cells where the simulated work is negligible are the only ones
         // that measure shove itself, and they are comparable across flows —
         // which is what makes a batch-vs-parallel chart legitimate at all.
-        for flow in [
-            Flow::ConsumeBatch,
-            Flow::ConsumeParallel,
-            Flow::ConsumeFifo,
-            Flow::ConsumerGroup,
-            Flow::Supervisor,
-            Flow::Broadcast,
-            Flow::DlqDrain,
-        ] {
+        // "Every consume flow" would overstate it: the two flows that hold no
+        // barrier are covered by
+        // `a_flow_whose_driver_holds_no_barrier_can_never_be_framework`.
+        for flow in BARRIER_FLOWS {
             for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
                 assert_eq!(
-                    scenario_for(flow, handler).handler_cost(),
+                    scenario_for(flow, handler).handler_cost(drain_bound()),
                     HandlerCost::Framework,
                     "{flow} / {handler}"
                 );
             }
+        }
+    }
+
+    /// Every flow that runs a handler, so a marker gate has to hold for all of
+    /// them rather than for the two the defect was found on.
+    const CONSUME_FLOWS: [Flow; 7] = [
+        Flow::ConsumeBatch,
+        Flow::ConsumeParallel,
+        Flow::ConsumeFifo,
+        Flow::ConsumerGroup,
+        Flow::Supervisor,
+        Flow::Broadcast,
+        Flow::DlqDrain,
+    ];
+
+    /// The consume flows whose driver holds the readiness barrier, and so can
+    /// record a separated `setup_secs` at all.
+    ///
+    /// Spelled out here rather than derived from
+    /// [`Flow::holds_readiness_barrier`] on purpose: a test that asks the code
+    /// under test which flows qualify cannot notice that code changing its
+    /// mind. `a_flows_barrier_claim_matches_the_drivers_that_hold_one` pins the
+    /// two against each other.
+    const BARRIER_FLOWS: [Flow; 5] = [
+        Flow::ConsumeBatch,
+        Flow::ConsumeParallel,
+        Flow::ConsumerGroup,
+        Flow::Supervisor,
+        Flow::Broadcast,
+    ];
+
+    /// The two consume flows that always report `setup_secs: null`, because
+    /// neither has anywhere to hang a readiness probe — see
+    /// `run_scenario_supervisor` (FIFO) and `run_scenario_dlq`.
+    const UNSEPARATED_CONSUME_FLOWS: [Flow; 2] = [Flow::ConsumeFifo, Flow::DlqDrain];
+
+    #[test]
+    fn a_flows_barrier_claim_matches_the_drivers_that_hold_one() {
+        // The predicate decides whether a row may claim `framework`, so it has
+        // to keep naming the flows whose drivers actually hold a barrier. A
+        // flow added later lands in neither list and fails here, rather than
+        // silently inheriting a claim its driver cannot make.
+        for flow in Flow::ALL {
+            assert_eq!(
+                flow.holds_readiness_barrier(),
+                BARRIER_FLOWS.contains(&flow),
+                "{flow}: the barrier-backed flows are {BARRIER_FLOWS:?}"
+            );
+        }
+        for flow in CONSUME_FLOWS {
+            assert!(
+                BARRIER_FLOWS.contains(&flow) != UNSEPARATED_CONSUME_FLOWS.contains(&flow),
+                "{flow} must be in exactly one of the two lists"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flow_whose_driver_holds_no_barrier_can_never_be_framework() {
+        // `setup_secs: Some(_)` is a row's claim that its driver held a
+        // readiness barrier and took `start` after it. Two flows can never make
+        // that claim: `consume_fifo` has no per-worker flag to hang a sentinel
+        // on, and `dlq_drain`'s measured phase drains an already-full queue,
+        // with no publish path to carry one. Both always emit `None`.
+        //
+        // The derivation used to consult only the recorded `Option`, with no
+        // per-flow knowledge of which flows can produce a `Some`. So a row
+        // carrying `flow: consume_fifo`, `setup_secs: 0.0` and a 2 s
+        // `duration_secs` re-derived to `framework`, and `validate_run` then
+        // certified a window no run of that flow could have produced. The
+        // marker's first guarantee is that the driver separated setup from
+        // drain, and a flow with no barrier never did.
+        for flow in UNSEPARATED_CONSUME_FLOWS {
+            for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+                for setup_secs in [Some(0.0), Some(4.0)] {
+                    assert_eq!(
+                        HandlerCost::of(
+                            flow,
+                            handler,
+                            WindowSplit {
+                                setup_secs,
+                                duration_secs: 2.0,
+                            }
+                        ),
+                        HandlerCost::SetupBound,
+                        "{flow} / {handler} / setup {setup_secs:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_negligible_handler_alone_does_not_earn_the_framework_marker() {
+        // The defect this gate exists for. `handler_cost` was a pure function
+        // of `(flow, handler)`, so `zero`/`fast` meant `framework`
+        // unconditionally — and `validate_run` re-derived the same answer, so
+        // the row was certified rather than caught. A negligible handler says
+        // the number is not the *handler's* cost; it does not say the number is
+        // shove's. Without a separated window it is neither.
+        for flow in CONSUME_FLOWS {
+            for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+                assert_eq!(
+                    HandlerCost::of(
+                        flow,
+                        handler,
+                        WindowSplit {
+                            setup_secs: None,
+                            // Generous on purpose: length cannot rescue a
+                            // window whose composition is unknown.
+                            duration_secs: 600.0,
+                        }
+                    ),
+                    HandlerCost::SetupBound,
+                    "{flow} / {handler}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_caf_667_consume_windows_would_no_longer_be_stamped_framework() {
+        // The measured (setup, drain) pairs from the Kafka sweep that produced
+        // the mislabelled rows, taken as `duration - dispatch_p50` per cell:
+        // 5,000 messages through one consumer drained in 0.052 s behind a
+        // 3.17 s group join, and 80,000 through sixteen drained in 1.12 s
+        // behind 5.52 s. Every one of them was published as `framework`, i.e.
+        // as shove's own cost, and the worst understated the real drain rate by
+        // 62×.
+        // Five of the six fall below the floor even with the barrier in place,
+        // because the corpus they drained was too small to occupy one. The
+        // sixth — 80,000 messages through sixteen consumers — genuinely drained
+        // for 1.122 s and *does* qualify once the setup is out of the window:
+        // it was a real ~71,000 msg/s measurement all along, published as
+        // 12,045 because the window was six times too long. The gate is not
+        // "CAF-667 was worthless", it is "five of these six rows had no
+        // measurement in them".
+        for (handler, setup, drain, expected) in [
+            (HandlerProfile::Zero, 3.17, 0.052, HandlerCost::SetupBound),
+            (HandlerProfile::Zero, 6.04, 0.441, HandlerCost::SetupBound),
+            (HandlerProfile::Zero, 5.52, 1.122, HandlerCost::Framework),
+            (HandlerProfile::Fast, 3.18, 0.048, HandlerCost::SetupBound),
+            (HandlerProfile::Fast, 6.13, 0.384, HandlerCost::SetupBound),
+            (HandlerProfile::Fast, 5.80, 0.779, HandlerCost::SetupBound),
+        ] {
+            assert_eq!(
+                HandlerCost::of(
+                    Flow::ConsumeBatch,
+                    handler,
+                    WindowSplit {
+                        setup_secs: Some(setup),
+                        duration_secs: drain,
+                    }
+                ),
+                expected,
+                "{handler}: a {drain}s drain behind a {setup}s setup"
+            );
+        }
+    }
+
+    #[test]
+    fn framework_needs_both_a_separated_setup_and_a_window_worth_measuring() {
+        // The gate is two-sided, and the boundary is the interesting part: a
+        // drain exactly at the floor qualifies, one just under it does not.
+        // Pinning both directions stops the threshold from being quietly
+        // widened into a no-op later.
+        let separated = |duration_secs| WindowSplit {
+            setup_secs: Some(4.0),
+            duration_secs,
+        };
+        for flow in BARRIER_FLOWS {
+            for handler in [HandlerProfile::Zero, HandlerProfile::Fast] {
+                assert_eq!(
+                    HandlerCost::of(flow, handler, separated(MIN_FRAMEWORK_WINDOW_SECS)),
+                    HandlerCost::Framework,
+                    "{flow} / {handler} at the floor"
+                );
+                assert_eq!(
+                    HandlerCost::of(
+                        flow,
+                        handler,
+                        separated(MIN_FRAMEWORK_WINDOW_SECS - f64::EPSILON.max(1e-9))
+                    ),
+                    HandlerCost::SetupBound,
+                    "{flow} / {handler} just under the floor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sleeping_handlers_marker_does_not_depend_on_the_window() {
+        // `handler_bound` and `handler_amortised` already tell a reader the
+        // number is the simulated sleep and not shove, so a setup floor
+        // underneath changes nothing they would conclude. Gating these too
+        // would relabel rows whose caveat is already stated — and would lose
+        // the batch-vs-parallel distinction the markers exist to carry.
+        for window in [
+            WindowSplit {
+                setup_secs: None,
+                duration_secs: 0.001,
+            },
+            WindowSplit {
+                setup_secs: Some(600.0),
+                duration_secs: 0.001,
+            },
+        ] {
+            assert_eq!(
+                HandlerCost::of(Flow::ConsumeBatch, HandlerProfile::Slow, window),
+                HandlerCost::HandlerAmortised,
+                "{window:?}"
+            );
+            assert_eq!(
+                HandlerCost::of(Flow::ConsumeParallel, HandlerProfile::Heavy, window),
+                HandlerCost::HandlerBound,
+                "{window:?}"
+            );
+            // And a publish row consults the window not at all: it builds no
+            // consumer, so there is no worker startup for a barrier to exclude.
+            assert_eq!(
+                HandlerCost::of(Flow::PublishBatch, HandlerProfile::Zero, window),
+                HandlerCost::NoHandler,
+                "{window:?}"
+            );
         }
     }
 
@@ -3965,7 +5653,7 @@ mod tests {
         // caveat is not the batch row's caveat.
         for flow in [Flow::ConsumeParallel, Flow::ConsumerGroup, Flow::DlqDrain] {
             assert_eq!(
-                scenario_for(flow, HandlerProfile::Slow).handler_cost(),
+                scenario_for(flow, HandlerProfile::Slow).handler_cost(drain_bound()),
                 HandlerCost::HandlerBound,
                 "{flow}"
             );
@@ -3981,7 +5669,9 @@ mod tests {
                 HandlerProfile::Slow,
                 HandlerProfile::Heavy,
             ] {
-                if scenario_for(flow, handler).handler_cost() == HandlerCost::HandlerAmortised {
+                if scenario_for(flow, handler).handler_cost(drain_bound())
+                    == HandlerCost::HandlerAmortised
+                {
                     assert_eq!(flow.mode(), Mode::Batch, "{flow} is not a batch-mode flow");
                 }
             }
@@ -4002,7 +5692,7 @@ mod tests {
                 HandlerProfile::Heavy,
             ] {
                 assert_eq!(
-                    scenario_for(flow, handler).handler_cost(),
+                    scenario_for(flow, handler).handler_cost(drain_bound()),
                     HandlerCost::NoHandler,
                     "{flow} / {handler}"
                 );
@@ -4023,6 +5713,7 @@ mod tests {
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
                 duration_secs: 1.0,
+                setup_secs: Some(0.5),
             },
         );
         assert_eq!(rows[0].handler_cost, HandlerCost::HandlerAmortised.as_str());
@@ -4056,8 +5747,12 @@ mod tests {
         merge_results_file(&p, sample_run("redis"), None).expect("first write");
         let v1 = std::fs::read_to_string(&path)
             .expect("read")
-            .replace("\"schema_version\": 2", "\"schema_version\": 1")
+            .replace(
+                &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+                "\"schema_version\": 1",
+            )
             .replace("\"handler_cost\": \"framework\",", "");
+        assert!(v1.contains("\"schema_version\": 1"), "fixture did not take");
         assert!(!v1.contains("handler_cost"), "the v1 fixture still has one");
         std::fs::write(&path, &v1).expect("write v1");
 
@@ -4104,24 +5799,10 @@ mod tests {
             prefetch: None,
             flow: Flow::ConsumeBatch,
             payload_bytes: 64,
+            batch_options: Some(BatchOptions::default()),
         };
 
-        let started = Arc::new(AtomicU64::new(0));
-        let counter = started.clone();
-        let batch: BatchConsumeFn<shove::InMemory> = Box::new(move |client, handler| {
-            let counter = counter.clone();
-            Box::pin(async move {
-                counter.fetch_add(1, Ordering::Relaxed);
-                InMemoryConsumer::new(client)
-                    .run::<StressTestTopic, _>(
-                        OneMessageBatches(handler),
-                        (),
-                        ConsumerOptions::new(),
-                    )
-                    .await
-                    .map_err(|e| format!("run: {e}"))
-            })
-        });
+        let (batch, started, _clean_exits) = counting_batch_fn();
 
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
         let cancel = CancellationToken::new();
@@ -4150,6 +5831,377 @@ mod tests {
             rows[0].consumers as u64, ran,
             "the row claims {} workers but {ran} ran",
             rows[0].consumers
+        );
+    }
+
+    #[tokio::test]
+    async fn the_barrier_publishes_through_the_backends_probe_when_one_is_supplied() {
+        // Kafka cannot be probed through the generic publisher: librdkafka
+        // sticks every null-key record of a concurrently submitted round to
+        // one partition, so a round reaches one member rather than a random
+        // spread. A backend that supplies a probe gets each round handed to it
+        // as the encoded sentinel plus the topic, and the flags stay the
+        // confirmation mechanism.
+        let flags: Vec<Arc<AtomicU64>> = (0..3).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(&'static str, Vec<u8>)>::new()));
+        let delivered = flags.clone();
+        let log = seen.clone();
+        let probe: ReadinessProbeFn = Box::new(move |topic, payload| {
+            let delivered = delivered.clone();
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().expect("log").push((topic, payload));
+                for f in &delivered {
+                    f.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            })
+        });
+
+        let client = <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        let broker = Broker::<shove::InMemory>::from_client(client);
+        broker
+            .topology()
+            .declare::<StressTestTopic>()
+            .await
+            .expect("declare");
+        let publisher = broker.publisher().await.expect("publisher");
+
+        await_worker_readiness::<shove::InMemory, StressTestTopic>(
+            &publisher,
+            Some(&probe),
+            Instant::now(),
+            &flags,
+            READINESS_DEADLINE,
+        )
+        .await
+        .expect("barrier");
+
+        broker.close().await;
+        let seen = seen.lock().expect("log");
+        assert_eq!(seen.len(), 1, "one round should have satisfied every flag");
+        assert_eq!(seen[0].0, StressTestTopic::topology().queue());
+        let sentinel: StressTestMsg =
+            <<StressTestTopic as Topic>::Codec as shove::Codec<StressTestMsg>>::decode(&seen[0].1)
+                .expect("the probe receives the topic's own encoding");
+        assert_eq!(sentinel.id, SENTINEL_ID);
+    }
+
+    #[tokio::test]
+    async fn the_barrier_fails_at_its_deadline_with_the_count_it_reached() {
+        // The deadline bounds the whole barrier, publishes included, and a
+        // worker confirmed only after it does not turn the failure into a
+        // success.
+        let flags: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let probe: ReadinessProbeFn = Box::new(|_, _| {
+            Box::pin(async {
+                // A publish that never completes must not hold the barrier
+                // past its deadline.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            })
+        });
+        let client = <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        let broker = Broker::<shove::InMemory>::from_client(client);
+        broker
+            .topology()
+            .declare::<StressTestTopic>()
+            .await
+            .expect("declare");
+        let publisher = broker.publisher().await.expect("publisher");
+
+        let started = Instant::now();
+        let err = await_worker_readiness::<shove::InMemory, StressTestTopic>(
+            &publisher,
+            Some(&probe),
+            Instant::now(),
+            &flags,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("no worker attached");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not bound the stalled publish"
+        );
+        assert!(err.contains("0 of 2"), "{err}");
+        broker.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_batch_flows_measured_window_excludes_worker_startup() {
+        // The defect, end to end. The batch consumers are spawned and *then*
+        // the corpus is published, so before the readiness barrier the measured
+        // window contained however long the workers took to come up — a fixed
+        // cost, invariant to corpus size, which on Kafka was ~3.2 s at one
+        // consumer against drains as short as 0.05 s.
+        //
+        // The stand-in for that cost here is an explicit delay before each
+        // consumer starts polling, which is deterministic where a real
+        // rebalance is not. What must hold: the delay lands in `setup_secs`,
+        // and `duration_secs` is the drain that happened after it.
+        const STARTUP: Duration = Duration::from_millis(700);
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 20,
+            consumers: 2,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+            batch_options: Some(BatchOptions::default()),
+        };
+
+        let batch: BatchConsumeFn<shove::InMemory> =
+            Box::new(move |client, handler, _opts, stop| {
+                Box::pin(async move {
+                    tokio::time::sleep(STARTUP).await;
+                    InMemoryConsumer::new(client)
+                        .run::<StressTestTopic, _>(
+                            OneMessageBatches(handler),
+                            (),
+                            ConsumerOptions::new().with_shutdown(stop),
+                        )
+                        .await
+                        .map_err(|e| format!("run: {e}"))
+                })
+            });
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        let metrics = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        let setup = metrics
+            .setup_secs
+            .expect("the barrier must record what it excluded");
+        assert!(
+            setup >= STARTUP.as_secs_f64(),
+            "setup_secs {setup} did not cover the {STARTUP:?} the workers took to start"
+        );
+        assert!(
+            metrics.duration_secs < STARTUP.as_secs_f64(),
+            "duration_secs {} still contains worker startup; a 20-message drain \
+             cannot take longer than {STARTUP:?}",
+            metrics.duration_secs
+        );
+
+        // And the row it produces claims to measure shove only if that drain
+        // was long enough to be a rate — which a 20-message one is not.
+        let mut rows = Vec::new();
+        push_metrics(&mut rows, &scenario, metrics);
+        assert_eq!(rows[0].handler_cost, HandlerCost::SetupBound.as_str());
+        assert!(
+            rows[0].setup_secs.is_some(),
+            "setup_secs must reach the row"
+        );
+    }
+
+    /// Wall-clock burned synchronously per worker inside a driver's spawn loop,
+    /// standing in for the per-worker registration a real backend pays there.
+    ///
+    /// Blocking rather than `tokio::time::sleep`: an awaited sleep would yield,
+    /// and the loop's cost is precisely the time the driver spends *not*
+    /// yielding between spawning one worker and spawning the next. Nothing else
+    /// has to make progress during it — the barrier that does is held after the
+    /// loop.
+    ///
+    /// Sized so the loop's total cannot be mistaken for barrier time.
+    /// `await_worker_readiness` polls in 200 ms rounds, so two workers at this
+    /// cost are five rounds' worth: a `setup_secs` that covers it is covering
+    /// the spawn loop, not an unlucky number of sentinel rounds. Pre-fix these
+    /// drivers recorded 0.2 s (supervisor) and 0.4 s (batch) here.
+    const PER_WORKER_SPAWN: Duration = Duration::from_millis(500);
+
+    #[tokio::test]
+    async fn the_batch_flows_setup_window_covers_its_spawn_loop() {
+        // `setup_secs` is documented as "seconds from the first worker being
+        // spawned to the readiness barrier being satisfied", and `setup_started`
+        // was taken *after* the spawn loop had already run — so the loop's own
+        // wall-clock fell into neither field. It preceded `setup_secs` and it
+        // preceded the drain `start`, which means the two recorded fields could
+        // not be added back up to the interval they describe, and a backend
+        // whose per-worker registration is slow reported that cost nowhere.
+        let workers: u16 = 2;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 20,
+            consumers: workers,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeBatch,
+            payload_bytes: 64,
+            batch_options: Some(BatchOptions::default()),
+        };
+
+        let batch: BatchConsumeFn<shove::InMemory> =
+            Box::new(move |client, handler, _opts, stop| {
+                // Before the future is even constructed, so this is time spent
+                // inside the driver's spawn loop and not inside the spawned task.
+                std::thread::sleep(PER_WORKER_SPAWN);
+                Box::pin(async move {
+                    InMemoryConsumer::new(client)
+                        .run::<StressTestTopic, _>(
+                            OneMessageBatches(handler),
+                            (),
+                            ConsumerOptions::new().with_shutdown(stop),
+                        )
+                        .await
+                        .map_err(|e| format!("run: {e}"))
+                })
+            });
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        let metrics = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        let spawn_loop = PER_WORKER_SPAWN.as_secs_f64() * workers as f64;
+        let setup = metrics
+            .setup_secs
+            .expect("the barrier must record what it excluded");
+        assert!(
+            setup >= spawn_loop,
+            "setup_secs {setup} does not cover the {spawn_loop}s the driver spent \
+             spawning {workers} workers"
+        );
+        // And the spawn loop stayed out of the drain, which is the half that
+        // was already right.
+        assert!(
+            metrics.duration_secs < PER_WORKER_SPAWN.as_secs_f64(),
+            "duration_secs {} contains worker startup",
+            metrics.duration_secs
+        );
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_flows_setup_window_covers_its_spawn_loop() {
+        // The same defect in the other flow the issue names, and the reason
+        // both are pinned: the two flows are compared against each other, so a
+        // cost one of them drops and the other keeps would show up as a
+        // difference between backends' throughput. `make_opts` is called once
+        // per replica inside the registration loop, which makes it the hook a
+        // test can hang a measurable per-worker cost on.
+        let replicas: u16 = 2;
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 20,
+            consumers: replicas,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeParallel,
+            payload_bytes: 64,
+            batch_options: None,
+        };
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let cancel = CancellationToken::new();
+        let make_opts = |prefetch: u16, concurrent: bool| {
+            std::thread::sleep(PER_WORKER_SPAWN);
+            default_consumer_options::<shove::InMemory>(prefetch, concurrent)
+        };
+        let metrics = run_scenario_supervisor(&hcfg, &scenario, &cancel, &make_opts, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("supervisor scenario");
+
+        let spawn_loop = PER_WORKER_SPAWN.as_secs_f64() * replicas as f64;
+        let setup = metrics
+            .setup_secs
+            .expect("the barrier must record what it excluded");
+        assert!(
+            setup >= spawn_loop,
+            "setup_secs {setup} does not cover the {spawn_loop}s the driver spent \
+             registering {replicas} supervisors"
+        );
+        assert!(
+            metrics.duration_secs < PER_WORKER_SPAWN.as_secs_f64(),
+            "duration_secs {} contains worker startup",
+            metrics.duration_secs
+        );
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_flow_declares_a_topology_sized_for_its_workers() {
+        // `consume_parallel` runs N independent supervisors against one shared
+        // group, so it needs at least N partitions — exactly like the batch
+        // flow, which had this hook and this flow did not. On Kafka the generic
+        // declare takes the default 8, so a 16-consumer scenario left 8 members
+        // assigned no partition: they polled, received nothing, and the row
+        // counted them anyway. The readiness barrier is what surfaced it —
+        // it refused to open a window with half the group unassigned — and this
+        // pins the fix so the hook cannot quietly go back to batch-only.
+        let asked_for = Arc::new(AtomicU64::new(0));
+        let seen = asked_for.clone();
+        let consume_topology: ConsumeTopologyFn<shove::InMemory> =
+            Box::new(move |client, consumers| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    seen.store(consumers as u64, Ordering::Relaxed);
+                    Broker::<shove::InMemory>::from_client(client)
+                        .topology()
+                        .declare::<StressTestTopic>()
+                        .await
+                        .map_err(|e| format!("declare: {e}"))
+                })
+            });
+
+        let scenario = Scenario {
+            tier: "moderate",
+            messages: 10,
+            consumers: 3,
+            handler: HandlerProfile::Zero,
+            deadline: Duration::from_secs(30),
+            concurrent: false,
+            prefetch: None,
+            flow: Flow::ConsumeParallel,
+            payload_bytes: 64,
+            batch_options: None,
+        };
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory")
+            .with_consume_topology(consume_topology);
+        let cancel = CancellationToken::new();
+        run_scenario_supervisor(
+            &hcfg,
+            &scenario,
+            &cancel,
+            &default_consumer_options::<shove::InMemory>,
+            &|| async {
+                <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                    .await
+                    .expect("connect InMemory")
+            },
+        )
+        .await
+        .expect("supervisor scenario");
+
+        assert_eq!(
+            asked_for.load(Ordering::Relaxed),
+            scenario.consumers as u64,
+            "the sized declare was skipped, or sized for the wrong worker count"
         );
     }
 
@@ -4417,6 +6469,8 @@ mod tests {
                 consumers: 1,
                 handler: HandlerProfile::Zero.to_string(),
                 handler_cost: HandlerCost::Framework.as_str().to_string(),
+                max_batch_size: None,
+                max_batch_age_ms: None,
                 throughput_msg_per_sec: 1.0,
                 dispatch_p50_ms: 0.0,
                 dispatch_p95_ms: 0.0,
@@ -4427,7 +6481,8 @@ mod tests {
                 scaling_efficiency: 1.0,
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
-                duration_secs: 1.0,
+                duration_secs: drain_bound().duration_secs,
+                setup_secs: drain_bound().setup_secs,
             }],
             failures: vec![],
             unsupported: vec![Unsupported {
@@ -4475,13 +6530,19 @@ mod tests {
         // Six backend binaries accumulate into one file. A newer one bumping
         // the version must not have its rows silently rewritten with this
         // binary's header by an older binary that ran afterwards.
-        let bumped = std::fs::read_to_string(&path)
-            .expect("read")
-            .replace("\"schema_version\": 2", "\"schema_version\": 3");
+        let next = RESULTS_SCHEMA_VERSION + 1;
+        let bumped = std::fs::read_to_string(&path).expect("read").replace(
+            &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+            &format!("\"schema_version\": {next}"),
+        );
+        assert!(
+            bumped.contains(&format!("\"schema_version\": {next}")),
+            "fixture did not take"
+        );
         std::fs::write(&path, &bumped).expect("write bumped");
 
         let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
-        assert!(err.contains("v3"), "{err}");
+        assert!(err.contains(&format!("v{next}")), "{err}");
 
         // The refusal must leave the file untouched, not half-written.
         assert_eq!(std::fs::read_to_string(&path).expect("re-read"), bumped);
@@ -4504,10 +6565,127 @@ mod tests {
                 latencies: LatencyPercentiles::default(),
                 peak_rss_mb: 0.0,
                 cpu_pct: 0.0,
-                duration_secs: 1.0,
+                // A window that supports a framework claim, so a row's marker
+                // here is decided by its flow and handler rather than by a
+                // too-short drain — that gate has its own tests.
+                duration_secs: drain_bound().duration_secs,
+                setup_secs: recordable_setup(flow),
             },
         );
         run
+    }
+
+    /// The `setup_secs` each flow's driver actually emits: the barrier flows a
+    /// measured interval, the publish flows zero, the rest `None`.
+    fn recordable_setup(flow: Flow) -> Option<f64> {
+        if flow.holds_readiness_barrier() {
+            drain_bound().setup_secs
+        } else if matches!(flow, Flow::PublishSingle | Flow::PublishBatch) {
+            Some(0.0)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_setup_interval_its_flow_could_not_have_recorded_is_refused() {
+        // `setup_secs` is checked on its own, not only through the marker it
+        // feeds: a barrier flow must carry a finite, non-negative interval, the
+        // publish flows carry zero, and the flows that hold no barrier carry
+        // `None`. A `setup_bound` marker is honest about the number but must
+        // not launder a field the flow's driver cannot have written.
+        let cases: [(Flow, Option<f64>); 7] = [
+            (Flow::ConsumeBatch, None),
+            (Flow::ConsumeParallel, Some(-0.5)),
+            (Flow::ConsumerGroup, Some(f64::NAN)),
+            (Flow::Broadcast, Some(f64::INFINITY)),
+            (Flow::ConsumeFifo, Some(1.0)),
+            (Flow::DlqDrain, Some(0.0)),
+            (Flow::PublishBatch, Some(1.5)),
+        ];
+        for (flow, setup_secs) in cases {
+            let mut run = batch_run(flow, HandlerProfile::Zero);
+            run.results[0].setup_secs = setup_secs;
+            run.results[0].handler_cost = HandlerCost::of(
+                flow,
+                HandlerProfile::Zero,
+                WindowSplit {
+                    setup_secs,
+                    duration_secs: run.results[0].duration_secs,
+                },
+            )
+            .as_str()
+            .to_string();
+            let err = validate_run(&run)
+                .expect_err(&format!("{flow} / setup {setup_secs:?} must be refused"));
+            assert!(err.contains("setup_secs"), "{flow}: {err}");
+        }
+        // And every flow's own recordable value passes.
+        for flow in Flow::ALL {
+            let run = batch_run(flow, HandlerProfile::Zero);
+            validate_run(&run).unwrap_or_else(|e| panic!("{flow}: recordable setup refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_framework_claim_its_own_recorded_window_cannot_support_is_refused() {
+        // The re-derivation is what makes the marker verifiable rather than
+        // merely present, and it now has to consult the window — otherwise a
+        // row can record a 0.05 s drain behind an unseparated setup and still
+        // be certified as "shove's own cost", which is precisely the state
+        // CAF-667's published rows were in.
+        // A missing, negative or NaN `setup_secs` is refused as a field in its
+        // own right, before any marker is compared — see
+        // `a_setup_interval_its_flow_could_not_have_recorded_is_refused`. What
+        // is left for the marker check is a well-formed window too short to
+        // hold a rate.
+        let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
+        run.results[0].setup_secs = Some(6.2);
+        run.results[0].duration_secs = 0.05;
+        // What the row would have been stamped, pre-fix.
+        run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+
+        let err = validate_run(&run).expect_err("a 0.05 s drain is not a rate");
+        assert!(err.contains("handler_cost"), "{err}");
+        assert!(err.contains("setup_bound"), "{err}");
+
+        // And the honest marker for the same row passes, so the refusal is
+        // about the claim and not about the row's shape.
+        run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
+        validate_run(&run).unwrap_or_else(|e| panic!("honest marker refused: {e}"));
+    }
+
+    #[test]
+    fn a_framework_claim_from_a_flow_that_holds_no_barrier_is_refused() {
+        // The document-level half of
+        // `a_flow_whose_driver_holds_no_barrier_can_never_be_framework`: a row
+        // whose `setup_secs` could not have come from its own flow must be
+        // refused, not re-derived into agreement. This is the shape a
+        // hand-edited or mis-generated document takes — every real run of these
+        // two flows writes `null` — and `validate_run` is the check that exists
+        // to catch a marker its row cannot support.
+        for flow in UNSEPARATED_CONSUME_FLOWS {
+            let mut run = batch_run(flow, HandlerProfile::Zero);
+            run.results[0].setup_secs = Some(0.0);
+            run.results[0].duration_secs = 2.0;
+            run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+
+            // The fabricated field is refused before the marker built on it
+            // is even compared.
+            let err = validate_run(&run)
+                .expect_err(&format!("{flow}: a fabricated setup_secs must be refused"));
+            assert!(err.contains("setup_secs"), "{flow}: {err}");
+
+            // Even with the honest marker, the field alone keeps the row out.
+            run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
+            let err = validate_run(&run)
+                .expect_err(&format!("{flow}: setup_bound must not launder setup_secs"));
+            assert!(err.contains("setup_secs"), "{flow}: {err}");
+
+            // The row the driver really writes passes.
+            run.results[0].setup_secs = None;
+            validate_run(&run).unwrap_or_else(|e| panic!("{flow}: honest row refused: {e}"));
+        }
     }
 
     #[test]
@@ -4593,7 +6771,8 @@ mod tests {
     #[test]
     fn a_preserved_row_that_carries_no_marker_at_all_is_refused_by_the_row() {
         // The other half of the preserved path, and the one the version check
-        // cannot reach: the header still says v2, so nothing upstream objects,
+        // cannot reach: the header still says the current version, so nothing
+        // upstream objects,
         // and `#[serde(default)]` turns the absent key into an empty marker
         // rather than a parse error. Only the row check stands between that
         // and a re-signed document. Asserted through a real file rather than
@@ -4798,6 +6977,102 @@ mod tests {
         assert_eq!(p.e2e_p50, 0.0, "sentinel must record no latency");
     }
 
+    #[tokio::test]
+    async fn the_batch_handler_does_not_count_readiness_sentinels_either() {
+        // The batch flow's readiness barrier publishes its sentinels through
+        // the same topic as the corpus, so `handle_batch` sees them. Without
+        // the same filter `handle` has, every sentinel is counted as a
+        // processed message and recorded as a latency sample — which both
+        // inflates the drain count and lets the barrier's own warmup traffic
+        // satisfy the completion target.
+        let epoch = Instant::now();
+        let recorder = Arc::new(LatencyRecorder::new());
+        let processed = Arc::new(AtomicU64::new(0));
+        let attach = Arc::new(AtomicU64::new(0));
+        let handler = StressBatchHandler::new(
+            StressTestHandler::new(
+                epoch,
+                processed.clone(),
+                recorder.clone(),
+                HandlerProfile::Zero,
+            )
+            .with_attach_counter(attach.clone()),
+        );
+
+        let batch = vec![
+            (
+                StressTestMsg {
+                    id: SENTINEL_ID,
+                    published_at_ns: 0,
+                    payload: String::new(),
+                },
+                MessageMetadata::builder().build(),
+            ),
+            (
+                StressTestMsg {
+                    id: 0,
+                    published_at_ns: 0,
+                    payload: String::new(),
+                },
+                MessageMetadata::builder().build(),
+            ),
+        ];
+        let outcome = <StressBatchHandler as BatchMessageHandler<StressTestTopic>>::handle_batch(
+            &handler,
+            batch,
+            &(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Ack));
+        assert_eq!(
+            processed.load(Ordering::Relaxed),
+            1,
+            "the sentinel leaked into the measured count"
+        );
+        assert_eq!(attach.load(Ordering::Relaxed), 1, "attach flag not bumped");
+    }
+
+    #[tokio::test]
+    async fn a_sentinel_only_batch_does_no_simulated_work() {
+        // Oversupplied sentinels from the last readiness round arrive after
+        // the barrier releases, inside the measured window. A batch holding
+        // nothing but sentinels must not pay the handler's simulated sleep,
+        // or the barrier's own traffic is charged to the drain. `heavy`
+        // sleeps at least a second, so a fast return is unambiguous.
+        let epoch = Instant::now();
+        let attach = Arc::new(AtomicU64::new(0));
+        let handler = StressBatchHandler::new(
+            StressTestHandler::new(
+                epoch,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(LatencyRecorder::new()),
+                HandlerProfile::Heavy,
+            )
+            .with_attach_counter(attach.clone()),
+        );
+        let batch = vec![(
+            StressTestMsg {
+                id: SENTINEL_ID,
+                published_at_ns: 0,
+                payload: String::new(),
+            },
+            MessageMetadata::builder().build(),
+        )];
+        let started = Instant::now();
+        let outcome = <StressBatchHandler as BatchMessageHandler<StressTestTopic>>::handle_batch(
+            &handler,
+            batch,
+            &(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Ack));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a sentinel-only batch paid the simulated work"
+        );
+        assert_eq!(attach.load(Ordering::Relaxed), 1, "attach flag not bumped");
+    }
+
     #[test]
     fn publish_flows_are_pinned_to_one_worker() {
         // One sequential publisher loop runs regardless of the sweep; a row
@@ -4827,7 +7102,8 @@ mod tests {
 
         merge_results_file(&p, sample_run("redis"), None).expect("first write");
         // Shape-valid, semantically illegal: a payload size outside the
-        // schema set must not be rewritten under a fresh v1 header.
+        // schema set must not be re-signed under a fresh current-version
+        // header.
         let tampered = std::fs::read_to_string(&path)
             .expect("read")
             .replace("\"payload_bytes\": 1024", "\"payload_bytes\": 128");
@@ -4928,9 +7204,26 @@ mod tests {
             assert!(obj.contains_key(field), "lost pre-existing field {field}");
         }
         // 15 pre-existing + the 3 flow/mode/payload dimensions + the
-        // handler-cost marker.
-        assert_eq!(obj.len(), 19);
+        // handler-cost marker + the setup/drain split. The v3 batch keys are
+        // absent here — this is a `consumer_group` row, where absent means
+        // elided, not null.
+        assert_eq!(obj.len(), 20);
         assert!(obj.contains_key("handler_cost"));
+        // Serialized even when `None`, as an explicit `null`: a reader has to
+        // be able to tell "this driver did not separate setup from drain" from
+        // "this document predates the field", and an omitted key conflates
+        // them.
+        assert!(obj.contains_key("setup_secs"));
+
+        // The same row shape on the one flow that has a batch carries exactly
+        // the two extra keys.
+        let batch =
+            serde_json::to_value(&batch_run(Flow::ConsumeBatch, HandlerProfile::Zero).results[0])
+                .expect("serialize");
+        let batch = batch.as_object().expect("object");
+        assert_eq!(batch.len(), 22);
+        assert!(batch.contains_key("max_batch_size"));
+        assert!(batch.contains_key("max_batch_age_ms"));
     }
 
     #[test]
@@ -4959,5 +7252,505 @@ mod tests {
         assert_eq!(rows[0].scaling_efficiency, 1.0);
         assert_eq!(rows[1].scaling_efficiency, 4.0);
         assert_eq!(rows[2].scaling_efficiency, 1.0);
+    }
+
+    // ── batch options: CLI → scenario → driver → row → validation ──
+
+    fn nz_batch(size: usize, age_ms: u64) -> BatchOptions {
+        BatchOptions {
+            max_batch_size: NonZeroUsize::new(size).expect("non-zero size"),
+            max_batch_age_ms: NonZeroU64::new(age_ms).expect("non-zero age"),
+        }
+    }
+
+    #[test]
+    fn the_batch_flags_reach_the_batch_scenarios_and_only_them() {
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-batch,consumer-group",
+            "--consumers",
+            "4",
+            "--batch-max-size",
+            "50",
+            // Deliberately NOT the 250 default: a flag value equal to the
+            // default cannot distinguish "threaded through" from "parsed and
+            // dropped", which is the defect this test exists to catch.
+            "--batch-max-age-ms",
+            "99",
+        ]));
+        let (batch, rest): (Vec<_>, Vec<_>) = scenarios
+            .into_iter()
+            .partition(|s| s.flow == Flow::ConsumeBatch);
+        assert!(!batch.is_empty(), "no consume_batch scenario was built");
+        assert!(!rest.is_empty(), "no non-batch scenario was built");
+        for s in &batch {
+            assert_eq!(s.batch_options, Some(nz_batch(50, 99)), "{}", s.flow);
+        }
+        for s in &rest {
+            assert_eq!(s.batch_options, None, "{} has no batch to size", s.flow);
+        }
+    }
+
+    #[test]
+    fn an_unflagged_batch_scenario_carries_the_defaults_the_harness_always_ran() {
+        let scenarios = build_scenarios_cg(&cli_args(&[
+            "--tier",
+            "moderate",
+            "--handler",
+            "zero",
+            "--flow",
+            "consume-batch",
+            "--consumers",
+            "4",
+        ]));
+        assert!(!scenarios.is_empty());
+        for s in &scenarios {
+            assert_eq!(s.batch_options, Some(nz_batch(500, 250)));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_driver_hands_the_scenarios_options_to_the_closure_unchanged() {
+        // The seam the ticket is about: `run_all_scenarios` parses the CLI
+        // internally, so the closure can only see the knobs if the driver
+        // hands them over. Capture what arrives rather than trusting the
+        // plumbing.
+        let configured = nz_batch(50, 125);
+        let scenario = Scenario {
+            batch_options: Some(configured),
+            messages: 10,
+            consumers: 1,
+            ..scenario_for(Flow::ConsumeBatch, HandlerProfile::Zero)
+        };
+
+        let received: Arc<Mutex<Vec<BatchOptions>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let batch: BatchConsumeFn<shove::InMemory> =
+            Box::new(move |client, handler, opts, stop| {
+                let sink = sink.clone();
+                Box::pin(async move {
+                    sink.lock().await.push(opts);
+                    InMemoryConsumer::new(client)
+                        .run::<StressTestTopic, _>(
+                            OneMessageBatches(handler),
+                            (),
+                            ConsumerOptions::new().with_shutdown(stop),
+                        )
+                        .await
+                        .map_err(|e| format!("run: {e}"))
+                })
+            });
+
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(batch);
+        let cancel = CancellationToken::new();
+        run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await
+        .expect("batch scenario");
+
+        let received = received.lock().await;
+        assert!(!received.is_empty(), "the closure never ran");
+        for got in received.iter() {
+            assert_eq!(*got, configured, "the closure received foreign options");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_scenario_without_options_is_refused_by_the_driver() {
+        // No silent default on the driver path: a hand-built scenario that
+        // lost its options is a bug to surface, not absorb — defaulting here
+        // would stamp a row with values the run never used.
+        let scenario = Scenario {
+            batch_options: None,
+            ..scenario_for(Flow::ConsumeBatch, HandlerProfile::Zero)
+        };
+        let hcfg =
+            HarnessConfig::<shove::InMemory>::new("inmemory").with_batch_consume(dummy_batch_fn());
+        let cancel = CancellationToken::new();
+        let outcome = run_scenario_batch(&hcfg, &scenario, &cancel, &|| async {
+            <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+                .await
+                .expect("connect InMemory")
+        })
+        .await;
+        let err = match outcome {
+            Ok(_) => panic!("must refuse a batch scenario with no options"),
+            Err(e) => e,
+        };
+        assert!(err.contains("batch options"), "{err}");
+    }
+
+    #[test]
+    fn batch_rows_record_their_options_and_other_rows_omit_the_keys() {
+        let mut rows = Vec::new();
+        let mut batch_scenario = scenario_for(Flow::ConsumeBatch, HandlerProfile::Zero);
+        batch_scenario.batch_options = Some(nz_batch(50, 250));
+        push_metrics(&mut rows, &batch_scenario, dummy_metrics());
+        push_metrics(
+            &mut rows,
+            &scenario_for(Flow::ConsumerGroup, HandlerProfile::Zero),
+            dummy_metrics(),
+        );
+        assert_eq!(rows[0].max_batch_size, Some(50));
+        assert_eq!(rows[0].max_batch_age_ms, Some(250));
+        assert_eq!(rows[1].max_batch_size, None);
+        assert_eq!(rows[1].max_batch_age_ms, None);
+
+        // Absent means absent from the document too — a consumer must never
+        // see `"max_batch_size": null` on a flow that has no batch.
+        let batch_json = serde_json::to_string(&rows[0]).expect("serialize");
+        let group_json = serde_json::to_string(&rows[1]).expect("serialize");
+        assert!(batch_json.contains("\"max_batch_size\":50"), "{batch_json}");
+        assert!(
+            batch_json.contains("\"max_batch_age_ms\":250"),
+            "{batch_json}"
+        );
+        assert!(!group_json.contains("max_batch_size"), "{group_json}");
+        assert!(!group_json.contains("max_batch_age_ms"), "{group_json}");
+    }
+
+    #[test]
+    fn a_batch_row_missing_its_options_is_refused() {
+        // Both halves and each half alone: a row that does not say what batch
+        // it ran is the 50-vs-500 indistinguishability this schema version
+        // exists to close.
+        let shapes: [(Option<usize>, Option<u64>); 3] =
+            [(None, None), (Some(50), None), (None, Some(250))];
+        for (size, age) in shapes {
+            let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
+            run.results[0].max_batch_size = size;
+            run.results[0].max_batch_age_ms = age;
+
+            let path = temp_path("batch-options-missing");
+            let _ = std::fs::remove_file(&path);
+            let p = path.to_string_lossy().to_string();
+
+            let err = match merge_results_file(&p, run, None) {
+                Ok(()) => panic!("must refuse a consume_batch row with {size:?}/{age:?}"),
+                Err(e) => e,
+            };
+            assert!(err.contains("consume_batch"), "{err}");
+            assert!(
+                err.contains("max_batch_size") || err.contains("max_batch_age_ms"),
+                "{err}"
+            );
+            assert!(!path.exists(), "a refused merge must not leave a document");
+        }
+    }
+
+    #[test]
+    fn a_non_batch_row_carrying_batch_options_is_refused() {
+        // The other direction of the same contradiction: stamping batch knobs
+        // on a flow that has no batch claims a topology that never ran.
+        let mut run = batch_run(Flow::ConsumerGroup, HandlerProfile::Zero);
+        run.results[0].max_batch_size = Some(500);
+        run.results[0].max_batch_age_ms = Some(250);
+
+        let path = temp_path("batch-options-foreign");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        let err = merge_results_file(&p, run, None).expect_err("must refuse");
+        assert!(err.contains("consumer_group"), "{err}");
+        assert!(err.contains("max_batch_size"), "{err}");
+        assert!(!path.exists(), "a refused merge must not leave a document");
+    }
+
+    #[test]
+    fn a_zero_batch_option_is_refused() {
+        // shove's own builders assert `> 0`, so a zero row describes a run
+        // that cannot exist. Only a hand-edited document can produce one; it
+        // must not be re-signed.
+        for (size, age) in [
+            (Some(0usize), Some(250u64)),
+            (Some(50), Some(0)),
+            // Half-present zero: still the zero refusal, not "missing" — the
+            // option is present-and-illegal, and the message must say so.
+            (Some(0), None),
+        ] {
+            let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
+            run.results[0].max_batch_size = size;
+            run.results[0].max_batch_age_ms = age;
+
+            let path = temp_path("batch-options-zero");
+            let _ = std::fs::remove_file(&path);
+            let p = path.to_string_lossy().to_string();
+
+            let err = match merge_results_file(&p, run, None) {
+                Ok(()) => panic!("must refuse a zero batch option ({size:?}/{age:?})"),
+                Err(e) => e,
+            };
+            assert!(err.contains("zero"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_v2_document_is_refused_by_version_rather_than_by_a_parse_error() {
+        // A faithful v2 document: `handler_cost` present (v2's addition), no
+        // batch-option keys (v3's). Its rows cannot be given batch options
+        // after the fact — the runs are over — so the refusal must name the
+        // version, exactly as the v1 path does for `handler_cost`.
+        // No "v2" in the temp-file name: every merge error embeds the path,
+        // so a name carrying the token would satisfy the version assert below
+        // even when a different gate produced the refusal.
+        let path = temp_path("old-schema-document");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        merge_results_file(
+            &p,
+            batch_run(Flow::ConsumeBatch, HandlerProfile::Zero),
+            None,
+        )
+        .expect("first write");
+        let v2 = std::fs::read_to_string(&path)
+            .expect("read")
+            .replace(
+                &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+                "\"schema_version\": 2",
+            )
+            .replace("\"max_batch_size\": 500,\n", "")
+            .replace("\"max_batch_age_ms\": 250,\n", "");
+        // A v2 doc both says 2 and carries no batch keys; anything less is
+        // testing a mongrel document no producer ever wrote — so every strip
+        // is asserted to have taken, like the sibling v1 fixture's.
+        assert!(v2.contains("\"schema_version\": 2"), "fixture did not take");
+        assert!(
+            !v2.contains("max_batch_size") && !v2.contains("max_batch_age_ms"),
+            "the v2 fixture still carries v3's batch keys"
+        );
+        assert!(
+            v2.contains("handler_cost"),
+            "fixture stripped v2's own field"
+        );
+        std::fs::write(&path, &v2).expect("write v2");
+
+        let err = merge_results_file(&p, sample_run("nats"), None).expect_err("must refuse");
+        assert!(err.contains("is a v2 results document"), "{err}");
+        assert!(err.contains("move it aside"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).expect("re-read"), v2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_flags_on_a_selection_without_the_batch_flow_are_refused() {
+        // `--batch-max-size 50` with `--flow consumer-group` is the
+        // parsed-and-dropped defect at invocation level: nothing the
+        // invocation could ever run reads the knob, and the caller can always
+        // fix it (select the flow or drop the flag), so it refuses outright.
+        let cli = cli_args(&["--flow", "consumer-group", "--batch-max-size", "50"]);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        let reason = refused_batch_flags(&cli, &selected).expect("must refuse a dead batch flag");
+        assert!(reason.contains("--batch-max-size"), "{reason}");
+        assert!(reason.contains("consume-batch"), "{reason}");
+
+        // The age flag alone is refused the same way, and the entry point's
+        // default flow (no --flow at all) never includes consume-batch.
+        let cli = cli_args(&["--batch-max-age-ms", "99"]);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        assert!(refused_batch_flags(&cli, &selected).is_some());
+
+        // With the flow selected the flags are live; without flags there is
+        // nothing to drop.
+        let cli = cli_args(&["--flow", "consume-batch", "--batch-max-size", "50"]);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        assert_eq!(refused_batch_flags(&cli, &selected), None);
+        let cli = cli_args(&["--flow", "consumer-group"]);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        assert_eq!(refused_batch_flags(&cli, &selected), None);
+    }
+
+    #[test]
+    fn batch_flags_on_a_backend_without_the_flow_are_inert_not_fatal() {
+        // The capability half: consume-batch was selected and the flags are
+        // meaningful, but this backend supplies no batch closure, so the flow
+        // is filtered out (with its own announcement). One flag set must be
+        // able to drive the documented six-binary sweep, so the run continues
+        // — with a note, never silently — instead of dying five times out of
+        // six.
+        let cli = cli_args(&[
+            "--flow",
+            "consume-batch,consumer-group",
+            "--batch-max-size",
+            "50",
+        ]);
+        let selected = selected_flows(&cli, Flow::ConsumerGroup);
+        // No refusal: the selection includes the flow.
+        assert_eq!(refused_batch_flags(&cli, &selected), None);
+
+        // A backend with no batch closure drops the flow — note, not None.
+        // The note consumes `skip_reason`'s verdict, so it names the actual
+        // cause instead of reconstructing one from the filtered list.
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let scenarios =
+            select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        assert!(
+            !scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch),
+            "the closure-less backend kept a batch scenario"
+        );
+        let skip = skip_reason(&hcfg, Flow::ConsumeBatch, false);
+        let note = inert_batch_flags_note(&cli, &selected, skip.as_deref())
+            .expect("must note the inert flag");
+        assert!(note.contains("--batch-max-size"), "{note}");
+        assert!(note.contains("unsupported"), "{note}");
+
+        // A backend that has the closure runs the flow — no skip, no note.
+        let hcfg =
+            HarnessConfig::<shove::InMemory>::new("kafka").with_batch_consume(dummy_batch_fn());
+        let scenarios =
+            select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        assert!(scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch));
+        let skip = skip_reason(&hcfg, Flow::ConsumeBatch, false);
+        assert_eq!(skip, None, "a batch-capable backend must not skip the flow");
+        assert_eq!(
+            inert_batch_flags_note(&cli, &selected, skip.as_deref()),
+            None
+        );
+
+        // No flags → nothing to note, whatever the filter did. `selected` is
+        // re-derived from `bare` — reusing the flagged CLI's list would test
+        // a (cli, selection) pair no caller can produce.
+        let bare = cli_args(&["--flow", "consume-batch,consumer-group"]);
+        let bare_selected = selected_flows(&bare, Flow::ConsumerGroup);
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        select_scenarios(&bare, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        let skip = skip_reason(&hcfg, Flow::ConsumeBatch, false);
+        assert_eq!(
+            inert_batch_flags_note(&bare, &bare_selected, skip.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn select_scenarios_refuses_a_dead_batch_flag_on_both_entry_paths() {
+        // The refusal lives inside the one selection step every entry point
+        // calls, so a runner cannot wire the flows in while forgetting the
+        // guard. Both the group and supervisor paths go through it.
+        let cli = cli_args(&["--flow", "consumer-group", "--batch-max-size", "50"]);
+        let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
+        let err = select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false)
+            .expect_err("group path must refuse");
+        assert!(err.contains("--batch-max-size"), "{err}");
+
+        let cli = cli_args(&["--flow", "supervisor", "--batch-max-age-ms", "99"]);
+        let hcfg = HarnessConfig::<shove::InMemory>::new("sqs");
+        let err = select_scenarios(&cli, &hcfg, Flow::Supervisor, true)
+            .expect_err("supervisor path must refuse");
+        assert!(err.contains("--batch-max-age-ms"), "{err}");
+    }
+
+    #[test]
+    fn the_batch_age_is_folded_into_the_scenario_deadline() {
+        // With a corpus smaller than the batch size, age is the only flush
+        // trigger, so a run legitimately takes up to the age beyond the
+        // handler-time model. A deadline that ignores the knob turns a legal
+        // `--batch-max-age-ms 120000` into a guaranteed timeout row blamed on
+        // the backend.
+        let age_ms: u64 = 120_000;
+        let with_age = build_scenarios_cg(&cli_args(&[
+            "--flow",
+            "consume-batch",
+            "--batch-max-age-ms",
+            &age_ms.to_string(),
+        ]));
+        let baseline = build_scenarios_cg(&cli_args(&["--flow", "consume-batch"]));
+        assert!(!with_age.is_empty(), "no batch scenario was built");
+        assert_eq!(with_age.len(), baseline.len());
+        let default_age = Duration::from_millis(BatchOptions::default().max_batch_age_ms.get());
+        for (s, b) in with_age.iter().zip(baseline.iter()) {
+            assert_eq!(
+                s.deadline,
+                b.deadline - default_age + Duration::from_millis(age_ms),
+                "the deadline must absorb exactly the configured age"
+            );
+        }
+
+        // Non-batch scenarios in the same flagged invocation are untouched:
+        // their deadlines equal an unflagged build's, element for element.
+        // (An upper-bound assert alone is vacuous here — the largest derived
+        // deadline plus the default age still clears the ceiling.)
+        let mixed = build_scenarios_cg(&cli_args(&[
+            "--flow",
+            "consume-batch,consumer-group",
+            "--batch-max-age-ms",
+            &age_ms.to_string(),
+        ]));
+        let flagged_group: Vec<&Scenario> = mixed
+            .iter()
+            .filter(|s| s.flow == Flow::ConsumerGroup)
+            .collect();
+        let unflagged_group = build_scenarios_cg(&cli_args(&["--flow", "consumer-group"]));
+        assert!(
+            !flagged_group.is_empty(),
+            "no consumer-group scenario built"
+        );
+        assert_eq!(flagged_group.len(), unflagged_group.len());
+        for (s, b) in flagged_group.iter().zip(unflagged_group.iter()) {
+            assert_eq!(
+                s.deadline, b.deadline,
+                "a non-batch deadline moved with the batch knob"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_results_file_is_refused_before_the_sweep_runs() {
+        // The merge would refuse a prior-version document anyway — but only
+        // after every scenario has executed. The preflight raises the same
+        // verdict before the first scenario, so the operator loses seconds,
+        // not a sweep.
+        let path = temp_path("preflight-old-schema");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        // Absent file: nothing to refuse.
+        assert_eq!(refused_results_file_version(&p), None);
+
+        // Current-version file: fine.
+        merge_results_file(&p, sample_run("redis"), None).expect("write");
+        assert_eq!(refused_results_file_version(&p), None);
+
+        // Prior-version file: refused by version, naming it.
+        let v2 = std::fs::read_to_string(&path).expect("read").replace(
+            &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+            "\"schema_version\": 2",
+        );
+        assert!(v2.contains("\"schema_version\": 2"), "fixture did not take");
+        std::fs::write(&path, &v2).expect("write v2");
+        let reason = refused_results_file_version(&p).expect("must refuse");
+        assert!(reason.contains("is a v2 results document"), "{reason}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_age_above_the_deadline_ceiling_is_refused_at_parse_time() {
+        // The fold deliberately raises a batch deadline past the clamp, so an
+        // unbounded age would let a units mistake (120000000 intending 120 s)
+        // give every batch scenario a ~33-hour deadline. The bound lives in
+        // the value parser — like `--consumers 0` or an out-of-set
+        // `--payload` — so no `Cli` value can exist that the deadline fold
+        // must be trusted not to honour. At the ceiling the value is legal;
+        // one past it is a usage error naming the unit.
+        assert!(
+            Cli::try_parse_from(["stress", "--batch-max-age-ms", "600000"]).is_ok(),
+            "the ceiling itself must be a legal value"
+        );
+        let err = match Cli::try_parse_from(["stress", "--batch-max-age-ms", "600001"]) {
+            Ok(_) => panic!("must refuse an age past the ceiling"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("deadline ceiling"), "{err}");
+        assert!(err.contains("milliseconds"), "{err}");
+        // Zero stays refused too — the parser owns the whole value contract.
+        assert!(Cli::try_parse_from(["stress", "--batch-max-age-ms", "0"]).is_err());
     }
 }

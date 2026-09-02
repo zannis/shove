@@ -184,7 +184,9 @@ async fn main() {
         })
     });
 
-    let dlq_drain: DlqDrainFn<Sqs> = Box::new(|client, handler| {
+    let dlq_drain: DlqDrainFn<Sqs> = Box::new(|client, handler, _stop| {
+        // This backend's `run_dlq` exits when the teardown closes the client;
+        // the stop token is for backends without that path (see `DlqDrainFn`).
         Box::pin(async move {
             let consumer: SqsConsumer = <Sqs as Backend>::make_consumer(&client);
             consumer
