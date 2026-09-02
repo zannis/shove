@@ -78,7 +78,9 @@ async fn main() {
 
     // The drain shares the fill phase's client, so it reads the DLQ the fill
     // just populated instead of racing a second connection against it.
-    let dlq_drain: DlqDrainFn<Nats> = Box::new(|client, handler| {
+    let dlq_drain: DlqDrainFn<Nats> = Box::new(|client, handler, _stop| {
+        // This backend's `run_dlq` exits when the teardown closes the client;
+        // the stop token is for backends without that path (see `DlqDrainFn`).
         Box::pin(async move {
             let consumer = NatsConsumer::new(client);
             consumer

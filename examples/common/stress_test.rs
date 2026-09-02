@@ -1193,10 +1193,20 @@ pub fn noop_purge() -> PurgeFn {
 /// The future resolves to `Err` when the drain loop itself fails (connection,
 /// commit, routing), so the scenario reports the real cause instead of
 /// waiting out its whole deadline and calling it a timeout.
+///
+/// The token is the scenario's stop signal. `run_dlq` takes no per-call
+/// shutdown token on any backend, and what actually stops it varies: most
+/// exit when their client closes (which the teardown does), but Redis's is
+/// documented to run until its task is aborted and cannot observe a close at
+/// all. A closure whose backend has no close-driven exit selects on the
+/// token; one that stops on close may ignore it. Either way the driver must
+/// return promptly once the teardown fires both signals — the harness only
+/// falls back to aborting a driver that responds to neither.
 pub type DlqDrainFn<B> = Box<
     dyn Fn(
             <B as Backend>::Client,
             StressTestHandler,
+            CancellationToken,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
@@ -1627,6 +1637,46 @@ pub fn await_drain(
 /// still running past this is not going to honour the signal, and the purge's
 /// group-delete wait absorbs the member an abort leaves behind.
 const DRIVER_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Join a scenario's stopped consumer drivers, reporting — never swallowing —
+/// any error or panic one surfaces on the way out. The row's numbers are
+/// already snapshotted when this runs, so a late failure cannot fail the
+/// scenario, but the cooperative path is the first place a shutdown flush or
+/// final commit can fail, and the identical failure a moment earlier fails
+/// the row. A driver still running once [`DRIVER_STOP_GRACE`] expires is
+/// aborted, loudly: a silent fallback would make a disconnected stop signal
+/// read as "this backend is slow" instead of pointing at the wiring. The
+/// caller fires its stop signal(s) first; this only waits.
+async fn stop_drivers_with_grace(
+    drivers: &mut tokio::task::JoinSet<Result<(), String>>,
+    what: &str,
+) {
+    fn report(what: &str, joined: Result<Result<(), String>, tokio::task::JoinError>) {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("  warning: {what} driver failed during teardown: {e}"),
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => eprintln!("  warning: {what} driver panicked during teardown: {e}"),
+        }
+    }
+    let graceful = async {
+        while let Some(joined) = drivers.join_next().await {
+            report(what, joined);
+        }
+    };
+    if tokio::time::timeout(DRIVER_STOP_GRACE, graceful)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "  warning: {what} driver(s) ignored the stop signal for {DRIVER_STOP_GRACE:?}, aborting"
+        );
+        drivers.abort_all();
+        while let Some(joined) = drivers.join_next().await {
+            report(what, joined);
+        }
+    }
+}
 
 async fn run_scenario_publish<B, Connect, Fut>(
     hcfg: &HarnessConfig<B>,
@@ -2140,8 +2190,9 @@ where
             .epoch_relative();
 
     let start = Instant::now();
+    let dlq_stop = CancellationToken::new();
     let mut drivers = tokio::task::JoinSet::new();
-    drivers.spawn(drain(client.clone(), handler));
+    drivers.spawn(drain(client.clone(), handler, dlq_stop.clone()));
 
     let outcome = await_completion_or_driver_error(
         &processed,
@@ -2158,18 +2209,16 @@ where
     let resources = sampler.stop().await;
     let latencies = recorder.compute_percentiles().await;
 
-    // `run_dlq` takes no per-call shutdown token, and what stops it varies by
-    // backend: Kafka's exits when its client closes, while Redis's is
-    // documented to run until its task is aborted and cannot observe a close
-    // at all (a library gap — Kafka's `run_dlq_with_inner` likewise discards
-    // the `ConsumerOptions` shutdown token a caller supplies). With no
-    // portable stop signal, a grace period would be a guaranteed dead wait on
-    // the backends that cannot see it, so abort: the count is already in
-    // `processed`, nothing is lost, and the group member a Kafka abort leaves
-    // behind is exactly what the purge's group-delete wait absorbs.
-    drivers.abort_all();
-    while drivers.join_next().await.is_some() {}
+    // No single stop signal reaches every backend's `run_dlq` (see
+    // [`DlqDrainFn`]), so the teardown fires both: the scenario token for the
+    // closures that select on it, and the client close that ends the rest. A
+    // driver stopped either way closes its consumer on the normal path — on
+    // Kafka that sends the group's LeaveGroup at once, where an aborted
+    // member lingers until the session timeout and stalls the next scenario's
+    // purge wait. The abort survives only as the grace fallback.
+    dlq_stop.cancel();
     broker.close().await;
+    stop_drivers_with_grace(&mut drivers, "dlq").await;
     outcome?;
 
     Ok(finish(scenario, duration, resources, latencies))
@@ -2287,27 +2336,8 @@ where
     // make the next scenario's purge race group membership. Grace-capped: a
     // driver stuck ignoring the token falls back to the old abort, and the
     // purge's group-delete wait absorbs the lingering member it leaves.
-    //
-    // The row's numbers are already snapshotted, so a driver error surfacing
-    // this late cannot fail the scenario — but it must not vanish either: the
-    // cooperative path is the first place a shutdown flush or final commit
-    // can fail (the identical failure a moment earlier fails the row).
     batch_stop.cancel();
-    let graceful = async {
-        while let Some(joined) = drivers.join_next().await {
-            match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("  warning: batch driver failed during teardown: {e}"),
-                Err(e) => eprintln!("  warning: batch driver panicked during teardown: {e}"),
-            }
-        }
-    };
-    if tokio::time::timeout(DRIVER_STOP_GRACE, graceful)
-        .await
-        .is_err()
-    {
-        drivers.shutdown().await;
-    }
+    stop_drivers_with_grace(&mut drivers, "batch").await;
 
     drop(publisher);
     broker.close().await;

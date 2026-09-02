@@ -122,36 +122,46 @@ async fn main() {
             // topics untouched, naming what the broker last reported.
             //
             // Only refusals that can still improve ride the deadline:
-            // `NonEmptyGroup` (the wait this loop exists for) and the
+            // `NonEmptyGroup` (the wait this loop exists for), the
             // coordinator-transient codes a broker answers with while it is
-            // still settling. Anything else — authorization, invalid group,
-            // unsupported API — would answer identically at the deadline, so
-            // it fails the purge immediately. Request-level failures do wait:
-            // this process owns the broker it started, so one that stops
-            // answering ends the run regardless, and a transient blip must
-            // not cost a scenario its matrix cell.
+            // still settling, and librdkafka's client-internal codes (all
+            // negative — timeout, transport), which are request-level
+            // failures wearing per-group clothes: `DeleteGroups` fans out one
+            // request per coordinator and merges a failed sub-request into
+            // the per-group results. Anything else — authorization, invalid
+            // group, unsupported API — would answer identically at the
+            // deadline, so it fails the purge immediately. Waiting on
+            // transport failures is deliberate: this process owns the broker
+            // it started, so one that stops answering ends the run
+            // regardless, and a transient blip must not cost a scenario its
+            // matrix cell.
             //
-            // Each admin RPC is capped so the deadline bounds this loop's
-            // actual wall clock — with no request timeout an admin call
-            // blocks up to librdkafka's 60 s `socket.timeout.ms` default
+            // The settle loop's RPCs are capped so the deadline bounds the
+            // loop's actual wall clock — with no request timeout an admin
+            // call blocks up to librdkafka's 60 s `socket.timeout.ms` default
             // against a hung broker, tripling the ceiling it promises.
-            let admin_opts = || AdminOptions::new().request_timeout(Some(ADMIN_RPC_TIMEOUT));
+            let settle_opts = AdminOptions::new().request_timeout(Some(ADMIN_RPC_TIMEOUT));
             let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
             let settle_started = std::time::Instant::now();
             loop {
                 let mut waiting: Vec<String> = Vec::new();
-                match admin.delete_groups(&group_refs, &admin_opts()).await {
+                match admin.delete_groups(&group_refs, &settle_opts).await {
                     Ok(results) => {
                         for result in results {
                             match result {
                                 Ok(_) | Err((_, RDKafkaErrorCode::GroupIdNotFound)) => {}
-                                Err((
-                                    group,
-                                    code @ (RDKafkaErrorCode::NonEmptyGroup
-                                    | RDKafkaErrorCode::CoordinatorLoadInProgress
-                                    | RDKafkaErrorCode::CoordinatorNotAvailable
-                                    | RDKafkaErrorCode::NotCoordinator),
-                                )) => waiting.push(format!("{group}: {code}")),
+                                Err((group, code))
+                                    if (code as i32) < 0
+                                        || matches!(
+                                            code,
+                                            RDKafkaErrorCode::NonEmptyGroup
+                                                | RDKafkaErrorCode::CoordinatorLoadInProgress
+                                                | RDKafkaErrorCode::CoordinatorNotAvailable
+                                                | RDKafkaErrorCode::NotCoordinator
+                                        ) =>
+                                {
+                                    waiting.push(format!("{group}: {code}"));
+                                }
                                 Err((group, code)) => {
                                     return Err(format!("delete group {group}: {code}"));
                                 }
@@ -173,8 +183,14 @@ async fn main() {
                 tokio::time::sleep(GROUP_SETTLE_POLL).await;
             }
 
+            // Deliberately uncapped, unlike the settle loop's RPCs: librdkafka
+            // defaults `DeleteTopics`' operation timeout to `socket.timeout.ms`
+            // (60 s), meaning the broker may legitimately hold the response
+            // while a many-partition deletion completes — and this call has no
+            // retry loop around it, so a tight client cap would abandon (and
+            // fail the purge on) a deletion that was in fact succeeding.
             let results = admin
-                .delete_topics(&topics, &admin_opts())
+                .delete_topics(&topics, &AdminOptions::new())
                 .await
                 .map_err(|e| format!("delete_topics: {e}"))?;
             for result in results {
@@ -194,9 +210,13 @@ async fn main() {
             let names: Vec<String> = topics.iter().map(|t| t.to_string()).collect();
             tokio::task::spawn_blocking(move || {
                 // Serve the probe's event queue while we are here: nothing
-                // else ever polls this consumer, so error/log events rdkafka
+                // else ever polls this consumer, so error events rdkafka
                 // queued during a broker flap would otherwise sit on it for
-                // the life of the process.
+                // the life of the process. Caveat: `poll` also returns `None`
+                // after consuming a non-returnable event (stats, OAuth), so
+                // this drains fully only while error events are the sole kind
+                // enabled — do not turn on `statistics.interval.ms` here
+                // without revisiting it.
                 while topic_probe.poll(Duration::ZERO).is_some() {}
                 harness::await_drain(
                     || match topic_probe.fetch_metadata(None, PROBE_RPC_TIMEOUT) {
@@ -220,7 +240,9 @@ async fn main() {
         })
     });
 
-    let dlq_drain: DlqDrainFn<Kafka> = Box::new(|client, handler| {
+    let dlq_drain: DlqDrainFn<Kafka> = Box::new(|client, handler, _stop| {
+        // This backend's `run_dlq` exits when the teardown closes the client;
+        // the stop token is for backends without that path (see `DlqDrainFn`).
         Box::pin(async move {
             let consumer = KafkaConsumer::new(client);
             consumer
@@ -322,17 +344,22 @@ async fn wait_until_ready(probe: &Arc<BaseConsumer>) {
 /// (`SESSION_TIMEOUT_MS` in `src/backends/kafka/constants.rs`), covered here
 /// three times over, while a genuinely leaked consumer keeps heartbeating and
 /// can never settle — a tight ceiling is what stops one leak from stalling
-/// every remaining scenario for minutes.
+/// every remaining scenario for minutes. Checked between attempts, so the
+/// wait can overshoot by one poll plus one capped RPC (bounded, unlike the
+/// 60 s default RPC timeout it replaces); the error reports the time actually
+/// paid.
 const GROUP_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Poll interval of the purge's group-delete wait.
 const GROUP_SETTLE_POLL: Duration = Duration::from_millis(500);
 
-/// Per-request ceiling on the purge's admin RPCs. Without one, an admin call
-/// against a hung broker blocks up to librdkafka's `socket.timeout.ms`
-/// default (60 s) before the settle loop's deadline is even checked. Generous
-/// next to `PROBE_RPC_TIMEOUT` because a delete carries coordinator work a
-/// metadata fetch does not.
+/// Per-request ceiling on the settle loop's `DeleteGroups` RPCs — the loop
+/// retries, so a cap costs nothing but keeps `GROUP_SETTLE_DEADLINE` honest
+/// against a hung broker (an uncapped admin call blocks up to librdkafka's
+/// 60 s `socket.timeout.ms` default before the deadline is even checked).
+/// Generous next to `PROBE_RPC_TIMEOUT` because a delete carries coordinator
+/// work a metadata fetch does not. The one-shot `delete_topics` call stays
+/// uncapped on purpose — see the comment at its call site.
 const ADMIN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for the broker to answer its first metadata fetch at startup.
