@@ -1506,6 +1506,24 @@ pub type ConsumeTopologyFn<B> = Box<
         + Sync,
 >;
 
+/// Deliver one encoded readiness sentinel to every worker of `topic` in a way
+/// the generic publisher cannot.
+///
+/// Called once per barrier round with the topic's queue name and the sentinel
+/// already encoded by the topic's own codec, so the backend only decides
+/// *where* it goes. Kafka needs this: its publisher submits a round
+/// concurrently and librdkafka sticks every null-key record of that round to a
+/// single partition, so a round reaches one member of the group rather than a
+/// random spread, and covering N members takes on the order of N·log N rounds.
+/// The Kafka probe writes one sentinel to every partition instead, which
+/// reaches every assigned member in one round. Backends whose queue dispatches
+/// to competing consumers need no probe.
+pub type ReadinessProbeFn = Box<
+    dyn Fn(&'static str, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Drive one backend's batch consume. Supplied by Kafka alone — `run_batch`
 /// exists on no other backend, so the absence of this closure is what makes
 /// `consume_batch` unsupported elsewhere rather than something to fake.
@@ -1542,6 +1560,9 @@ pub struct HarnessConfig<B: Backend> {
     /// See [`ConsumeTopologyFn`] — required only where the generic declare
     /// under-partitions for the consumer count (Kafka).
     pub consume_topology: Option<ConsumeTopologyFn<B>>,
+    /// See [`ReadinessProbeFn`] — required only where the generic publisher
+    /// cannot spread a round across the group's workers (Kafka).
+    pub readiness_probe: Option<ReadinessProbeFn>,
     /// How many workers this backend actually runs for the FIFO flow. Most
     /// backends spawn one worker per routing shard ([`SEQ_SHARDS`]); Kafka
     /// runs a single FIFO task over every assigned partition, so its
@@ -1569,6 +1590,7 @@ impl<B: Backend> HarnessConfig<B> {
             dlq_depth: None,
             batch_consume: None,
             consume_topology: None,
+            readiness_probe: None,
             fifo_workers: SEQ_SHARDS,
             _backend: std::marker::PhantomData,
         }
@@ -1621,6 +1643,11 @@ impl<B: Backend> HarnessConfig<B> {
 
     pub fn with_consume_topology(mut self, f: ConsumeTopologyFn<B>) -> Self {
         self.consume_topology = Some(f);
+        self
+    }
+
+    pub fn with_readiness_probe(mut self, f: ReadinessProbeFn) -> Self {
+        self.readiness_probe = Some(f);
         self
     }
 
@@ -1843,17 +1870,22 @@ async fn stop_sampler(sampler: Option<ResourceSampler>) -> ResourceSnapshot {
     }
 }
 
-/// How many sentinels a readiness round publishes per worker.
+/// How many sentinels a readiness round publishes per worker, on the generic
+/// path.
 ///
-/// One per worker is not enough on a partitioned backend: a keyless Kafka
-/// record goes to a partition librdkafka picks at random, so a single sentinel
-/// reaches one member of an N-member group. With `OVERSUPPLY × N` per round the
-/// chance a given partition is still uncovered after one round is
-/// `((N-1)/N)^(OVERSUPPLY × N)` — about 1.6% at N = 16 — and the loop simply
+/// One per worker is not enough where delivery is not strictly fair: a
+/// competing-consumer queue hands a round to whichever workers poll first, so
+/// a single sentinel per worker can leave a slower worker unproven. With
+/// `OVERSUPPLY × N` per round the loop usually completes in one, and it simply
 /// publishes another round until every flag is set. Oversupply is cheap
-/// (sentinels carry an empty payload and are never measured) and a missed round
-/// is not, so this is deliberately generous.
+/// (sentinels carry an empty payload and are never measured) and a missed
+/// round is not, so this is deliberately generous. Partitioned backends do not
+/// rely on this — see [`ReadinessProbeFn`].
 const READINESS_OVERSUPPLY: usize = 4;
+
+/// How long the readiness barrier may take, publishes included, before the
+/// scenario is failed instead of measured.
+const READINESS_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Block until every worker has handled at least one message, and return the
 /// wall-clock that took.
@@ -1878,45 +1910,66 @@ const READINESS_OVERSUPPLY: usize = 4;
 /// arriving mid-measurement is invisible to `processed` and to the recorder.
 async fn await_worker_readiness<B, T>(
     publisher: &shove::Publisher<B>,
+    probe: Option<&ReadinessProbeFn>,
     epoch: Instant,
     attach_flags: &[Arc<AtomicU64>],
+    deadline: Duration,
 ) -> Result<(), String>
 where
     B: Backend,
     T: Topic<Message = StressTestMsg>,
 {
+    let attached = || {
+        attach_flags
+            .iter()
+            .filter(|c| c.load(Ordering::Relaxed) > 0)
+            .count()
+    };
+    let sentinel = |epoch: Instant| StressTestMsg {
+        id: SENTINEL_ID,
+        published_at_ns: epoch.elapsed().as_nanos() as u64,
+        payload: String::new(),
+    };
     let per_round = attach_flags
         .len()
         .saturating_mul(READINESS_OVERSUPPLY)
         .max(1);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let round: Vec<StressTestMsg> = (0..per_round)
-            .map(|_| StressTestMsg {
-                id: SENTINEL_ID,
-                published_at_ns: epoch.elapsed().as_nanos() as u64,
-                payload: String::new(),
-            })
-            .collect();
-        publisher
-            .publish_batch::<T>(&round)
-            .await
-            .map_err(|e| format!("publish readiness sentinels: {e}"))?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let attached = attach_flags
-            .iter()
-            .filter(|c| c.load(Ordering::Relaxed) > 0)
-            .count();
-        if attached == attach_flags.len() {
-            return Ok(());
+    let rounds = async {
+        loop {
+            match probe {
+                Some(probe) => {
+                    let payload =
+                        <T::Codec as shove::Codec<StressTestMsg>>::encode(&sentinel(epoch))
+                            .map_err(|e| format!("encode readiness sentinel: {e}"))?;
+                    probe(T::topology().queue(), payload)
+                        .await
+                        .map_err(|e| format!("probe readiness sentinels: {e}"))?;
+                }
+                None => {
+                    let round: Vec<StressTestMsg> =
+                        (0..per_round).map(|_| sentinel(epoch)).collect();
+                    publisher
+                        .publish_batch::<T>(&round)
+                        .await
+                        .map_err(|e| format!("publish readiness sentinels: {e}"))?;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if attached() == attach_flags.len() {
+                return Ok::<(), String>(());
+            }
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "only {attached} of {} workers were assigned and polling within 30s; \
-                 the drain window cannot be separated from group setup",
-                attach_flags.len()
-            ));
-        }
+    };
+    // The deadline bounds the whole barrier, a stalled publish included, and a
+    // worker first seen after it does not turn the failure into a success.
+    match tokio::time::timeout(deadline, rounds).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "only {} of {} workers were assigned and polling within {deadline:?}; \
+             the drain window cannot be separated from group setup",
+            attached(),
+            attach_flags.len()
+        )),
     }
 }
 
@@ -2201,7 +2254,14 @@ where
         let setup = if fifo {
             None
         } else {
-            await_worker_readiness::<B, StressTestTopic>(&publisher, epoch, &attach_flags).await?;
+            await_worker_readiness::<B, StressTestTopic>(
+                &publisher,
+                hcfg.readiness_probe.as_ref(),
+                epoch,
+                &attach_flags,
+                READINESS_DEADLINE,
+            )
+            .await?;
             Some(setup_started.elapsed())
         };
 
@@ -2343,7 +2403,16 @@ where
         // This flow had the barrier first; the shared helper is that loop
         // generalised, so the other consume flows now get the same guarantee
         // and the same recorded `setup_secs`.
-        await_worker_readiness::<B, StressBroadcastTopic>(&publisher, epoch, &attach_flags).await?;
+        // No probe: an ephemeral subscriber receives every message, so a
+        // single generic round reaches every worker on every backend.
+        await_worker_readiness::<B, StressBroadcastTopic>(
+            &publisher,
+            None,
+            epoch,
+            &attach_flags,
+            READINESS_DEADLINE,
+        )
+        .await?;
         let setup = setup_started.elapsed();
 
         sampler = Some(ResourceSampler::start());
@@ -2542,6 +2611,8 @@ where
     )
     .await;
     let duration = start.elapsed();
+    // Stopped with the window — see `run_scenario_batch`.
+    let resources = sampler.stop().await;
 
     // Abort rather than signal: `run_dlq` takes no shutdown token on several
     // backends (Kafka's stops only when its client closes), so awaiting it
@@ -2549,7 +2620,6 @@ where
     drivers.abort_all();
     while drivers.join_next().await.is_some() {}
 
-    let resources = sampler.stop().await;
     broker.close().await;
     outcome?;
 
@@ -2631,7 +2701,14 @@ where
     // readiness barrier joins that block for the same reason: a barrier that
     // times out must reach the teardown, not early-return past it.
     let setup_and_publish = async {
-        await_worker_readiness::<B, StressTestTopic>(&publisher, epoch, &attach_flags).await?;
+        await_worker_readiness::<B, StressTestTopic>(
+            &publisher,
+            hcfg.readiness_probe.as_ref(),
+            epoch,
+            &attach_flags,
+            READINESS_DEADLINE,
+        )
+        .await?;
         let setup = setup_started.elapsed();
 
         sampler = Some(ResourceSampler::start());
@@ -2800,7 +2877,14 @@ where
         let setup = if fifo {
             None
         } else {
-            await_worker_readiness::<B, StressTestTopic>(&publisher, epoch, &attach_flags).await?;
+            await_worker_readiness::<B, StressTestTopic>(
+                &publisher,
+                hcfg.readiness_probe.as_ref(),
+                epoch,
+                &attach_flags,
+                READINESS_DEADLINE,
+            )
+            .await?;
             Some(setup_started.elapsed())
         };
 
@@ -3240,6 +3324,25 @@ fn validate_run(run: &BackendRun) -> Result<(), String> {
                 run.backend, r.handler
             ));
         };
+        // `setup_secs` is checked on its own before the marker built on it:
+        // a barrier flow's driver records a finite, non-negative interval, a
+        // publish flow's records zero (no worker to wait for), and every other
+        // driver records nothing. A value outside that is one no run of the
+        // flow produced, whatever marker sits next to it.
+        let setup_recordable = if flow.holds_readiness_barrier() {
+            matches!(r.setup_secs, Some(s) if s.is_finite() && s >= 0.0)
+        } else if matches!(flow, Flow::PublishSingle | Flow::PublishBatch) {
+            r.setup_secs == Some(0.0)
+        } else {
+            r.setup_secs.is_none()
+        };
+        if !setup_recordable {
+            return Err(format!(
+                "run '{}' has a result for flow '{}' whose setup_secs {:?} is not a value \
+                 that flow's driver can record",
+                run.backend, r.flow, r.setup_secs
+            ));
+        }
         let expected = HandlerCost::of(
             flow,
             handler,
@@ -5040,6 +5143,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_barrier_publishes_through_the_backends_probe_when_one_is_supplied() {
+        // Kafka cannot be probed through the generic publisher: librdkafka
+        // sticks every null-key record of a concurrently submitted round to
+        // one partition, so a round reaches one member rather than a random
+        // spread. A backend that supplies a probe gets each round handed to it
+        // as the encoded sentinel plus the topic, and the flags stay the
+        // confirmation mechanism.
+        let flags: Vec<Arc<AtomicU64>> = (0..3).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(&'static str, Vec<u8>)>::new()));
+        let delivered = flags.clone();
+        let log = seen.clone();
+        let probe: ReadinessProbeFn = Box::new(move |topic, payload| {
+            let delivered = delivered.clone();
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().expect("log").push((topic, payload));
+                for f in &delivered {
+                    f.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            })
+        });
+
+        let client = <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        let broker = Broker::<shove::InMemory>::from_client(client);
+        broker
+            .topology()
+            .declare::<StressTestTopic>()
+            .await
+            .expect("declare");
+        let publisher = broker.publisher().await.expect("publisher");
+
+        await_worker_readiness::<shove::InMemory, StressTestTopic>(
+            &publisher,
+            Some(&probe),
+            Instant::now(),
+            &flags,
+            READINESS_DEADLINE,
+        )
+        .await
+        .expect("barrier");
+
+        broker.close().await;
+        let seen = seen.lock().expect("log");
+        assert_eq!(seen.len(), 1, "one round should have satisfied every flag");
+        assert_eq!(seen[0].0, StressTestTopic::topology().queue());
+        let sentinel: StressTestMsg =
+            <<StressTestTopic as Topic>::Codec as shove::Codec<StressTestMsg>>::decode(&seen[0].1)
+                .expect("the probe receives the topic's own encoding");
+        assert_eq!(sentinel.id, SENTINEL_ID);
+    }
+
+    #[tokio::test]
+    async fn the_barrier_fails_at_its_deadline_with_the_count_it_reached() {
+        // The deadline bounds the whole barrier, publishes included, and a
+        // worker confirmed only after it does not turn the failure into a
+        // success.
+        let flags: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let probe: ReadinessProbeFn = Box::new(|_, _| {
+            Box::pin(async {
+                // A publish that never completes must not hold the barrier
+                // past its deadline.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            })
+        });
+        let client = <shove::InMemory as Backend>::connect(InMemoryConfig::default())
+            .await
+            .expect("connect InMemory");
+        let broker = Broker::<shove::InMemory>::from_client(client);
+        broker
+            .topology()
+            .declare::<StressTestTopic>()
+            .await
+            .expect("declare");
+        let publisher = broker.publisher().await.expect("publisher");
+
+        let started = Instant::now();
+        let err = await_worker_readiness::<shove::InMemory, StressTestTopic>(
+            &publisher,
+            Some(&probe),
+            Instant::now(),
+            &flags,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("no worker attached");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not bound the stalled publish"
+        );
+        assert!(err.contains("0 of 2"), "{err}");
+        broker.close().await;
+    }
+
+    #[tokio::test]
     async fn the_batch_flows_measured_window_excludes_worker_startup() {
         // The defect, end to end. The batch consumers are spawned and *then*
         // the corpus is published, so before the readiness barrier the measured
@@ -5664,10 +5865,62 @@ mod tests {
                 // here is decided by its flow and handler rather than by a
                 // too-short drain — that gate has its own tests.
                 duration_secs: drain_bound().duration_secs,
-                setup_secs: drain_bound().setup_secs,
+                setup_secs: recordable_setup(flow),
             },
         );
         run
+    }
+
+    /// The `setup_secs` each flow's driver actually emits: the barrier flows a
+    /// measured interval, the publish flows zero, the rest `None`.
+    fn recordable_setup(flow: Flow) -> Option<f64> {
+        if flow.holds_readiness_barrier() {
+            drain_bound().setup_secs
+        } else if matches!(flow, Flow::PublishSingle | Flow::PublishBatch) {
+            Some(0.0)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn a_setup_interval_its_flow_could_not_have_recorded_is_refused() {
+        // `setup_secs` is checked on its own, not only through the marker it
+        // feeds: a barrier flow must carry a finite, non-negative interval, the
+        // publish flows carry zero, and the flows that hold no barrier carry
+        // `None`. A `setup_bound` marker is honest about the number but must
+        // not launder a field the flow's driver cannot have written.
+        let cases: [(Flow, Option<f64>); 7] = [
+            (Flow::ConsumeBatch, None),
+            (Flow::ConsumeParallel, Some(-0.5)),
+            (Flow::ConsumerGroup, Some(f64::NAN)),
+            (Flow::Broadcast, Some(f64::INFINITY)),
+            (Flow::ConsumeFifo, Some(1.0)),
+            (Flow::DlqDrain, Some(0.0)),
+            (Flow::PublishBatch, Some(1.5)),
+        ];
+        for (flow, setup_secs) in cases {
+            let mut run = batch_run(flow, HandlerProfile::Zero);
+            run.results[0].setup_secs = setup_secs;
+            run.results[0].handler_cost = HandlerCost::of(
+                flow,
+                HandlerProfile::Zero,
+                WindowSplit {
+                    setup_secs,
+                    duration_secs: run.results[0].duration_secs,
+                },
+            )
+            .as_str()
+            .to_string();
+            let err = validate_run(&run)
+                .expect_err(&format!("{flow} / setup {setup_secs:?} must be refused"));
+            assert!(err.contains("setup_secs"), "{flow}: {err}");
+        }
+        // And every flow's own recordable value passes.
+        for flow in Flow::ALL {
+            let run = batch_run(flow, HandlerProfile::Zero);
+            validate_run(&run).unwrap_or_else(|e| panic!("{flow}: recordable setup refused: {e}"));
+        }
     }
 
     #[test]
@@ -5677,35 +5930,25 @@ mod tests {
         // row can record a 0.05 s drain behind an unseparated setup and still
         // be certified as "shove's own cost", which is precisely the state
         // CAF-667's published rows were in.
-        for (setup_secs, duration_secs, why) in [
-            (None, 30.0, "setup never separated from the drain"),
-            (Some(6.2), 0.05, "drain far too short to be a rate"),
-            (
-                Some(-1.0),
-                30.0,
-                "a negative setup interval was never measured",
-            ),
-            (
-                Some(f64::NAN),
-                30.0,
-                "a NaN setup interval was never measured",
-            ),
-        ] {
-            let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
-            run.results[0].setup_secs = setup_secs;
-            run.results[0].duration_secs = duration_secs;
-            // What the row would have been stamped, pre-fix.
-            run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
+        // A missing, negative or NaN `setup_secs` is refused as a field in its
+        // own right, before any marker is compared — see
+        // `a_setup_interval_its_flow_could_not_have_recorded_is_refused`. What
+        // is left for the marker check is a well-formed window too short to
+        // hold a rate.
+        let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
+        run.results[0].setup_secs = Some(6.2);
+        run.results[0].duration_secs = 0.05;
+        // What the row would have been stamped, pre-fix.
+        run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
 
-            let err = validate_run(&run).expect_err(&format!("must refuse: {why}"));
-            assert!(err.contains("handler_cost"), "{why}: {err}");
-            assert!(err.contains("setup_bound"), "{why}: {err}");
+        let err = validate_run(&run).expect_err("a 0.05 s drain is not a rate");
+        assert!(err.contains("handler_cost"), "{err}");
+        assert!(err.contains("setup_bound"), "{err}");
 
-            // And the honest marker for the same row passes, so the refusal is
-            // about the claim and not about the row's shape.
-            run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
-            validate_run(&run).unwrap_or_else(|e| panic!("{why}: honest marker refused: {e}"));
-        }
+        // And the honest marker for the same row passes, so the refusal is
+        // about the claim and not about the row's shape.
+        run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
+        validate_run(&run).unwrap_or_else(|e| panic!("honest marker refused: {e}"));
     }
 
     #[test]
@@ -5723,15 +5966,21 @@ mod tests {
             run.results[0].duration_secs = 2.0;
             run.results[0].handler_cost = HandlerCost::Framework.as_str().to_string();
 
+            // The fabricated field is refused before the marker built on it
+            // is even compared.
             let err = validate_run(&run)
                 .expect_err(&format!("{flow}: a fabricated setup_secs must be refused"));
-            assert!(err.contains("handler_cost"), "{flow}: {err}");
-            assert!(err.contains("setup_bound"), "{flow}: {err}");
+            assert!(err.contains("setup_secs"), "{flow}: {err}");
 
-            // The honest marker for the same row passes, so the refusal is
-            // about the claim rather than the row's shape.
+            // Even with the honest marker, the field alone keeps the row out.
             run.results[0].handler_cost = HandlerCost::SetupBound.as_str().to_string();
-            validate_run(&run).unwrap_or_else(|e| panic!("{flow}: honest marker refused: {e}"));
+            let err = validate_run(&run)
+                .expect_err(&format!("{flow}: setup_bound must not launder setup_secs"));
+            assert!(err.contains("setup_secs"), "{flow}: {err}");
+
+            // The row the driver really writes passes.
+            run.results[0].setup_secs = None;
+            validate_run(&run).unwrap_or_else(|e| panic!("{flow}: honest row refused: {e}"));
         }
     }
 

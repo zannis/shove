@@ -15,7 +15,9 @@ use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::types::RDKafkaErrorCode;
+use rdkafka::util::Timeout;
 use shove::kafka::{
     BatchConsumerOptions, KafkaConfig, KafkaConsumer, KafkaConsumerGroupConfig,
     KafkaTopologyDeclarer,
@@ -25,8 +27,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::kafka::apache::{self, Kafka as KafkaImage};
 
 use harness::{
-    BatchConsumeFn, ConsumeTopologyFn, DlqDrainFn, HarnessConfig, StressTestTopic,
-    run_all_scenarios,
+    BatchConsumeFn, ConsumeTopologyFn, DlqDrainFn, HarnessConfig, ReadinessProbeFn,
+    StressTestTopic, run_all_scenarios,
 };
 
 /// Image tag started by `testcontainers_modules::kafka::apache` (its pinned
@@ -210,12 +212,57 @@ async fn main() {
         })
     });
 
+    // The generic publisher cannot probe a Kafka group: librdkafka's sticky
+    // partitioner puts every null-key record of a concurrently submitted round
+    // on one partition, so a round reaches one member. Write one sentinel to
+    // every partition instead, which reaches every assigned member in a round.
+    let probe_producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &bootstrap)
+        .create()
+        .expect("build readiness probe producer");
+    let readiness_probe: ReadinessProbeFn = Box::new(move |topic, payload| {
+        let producer = probe_producer.clone();
+        Box::pin(async move {
+            let meta_producer = producer.clone();
+            let partitions = tokio::task::spawn_blocking(move || {
+                meta_producer
+                    .client()
+                    .fetch_metadata(Some(topic), Duration::from_secs(5))
+                    .map_err(|e| format!("fetch metadata for {topic}: {e}"))
+                    .and_then(|m| {
+                        m.topics()
+                            .iter()
+                            .find(|t| t.name() == topic)
+                            .map(|t| t.partitions().len())
+                            .ok_or_else(|| format!("topic {topic} missing from metadata"))
+                    })
+            })
+            .await
+            .map_err(|e| format!("metadata task: {e}"))??;
+            for partition in 0..partitions {
+                let partition = i32::try_from(partition)
+                    .map_err(|_| format!("partition index {partition} exceeds i32"))?;
+                producer
+                    .send(
+                        FutureRecord::<(), [u8]>::to(topic)
+                            .partition(partition)
+                            .payload(&payload),
+                        Timeout::After(Duration::from_secs(5)),
+                    )
+                    .await
+                    .map_err(|(e, _)| format!("probe partition {partition}: {e}"))?;
+            }
+            Ok(())
+        })
+    });
+
     let hcfg = HarnessConfig::<Kafka>::new("kafka")
         .with_purge(purge)
         .with_broker("Apache Kafka", KAFKA_VERSION, "docker single-node (KRaft)")
         .with_dlq_drain(dlq_drain)
         .with_batch_consume(batch_consume)
         .with_consume_topology(consume_topology)
+        .with_readiness_probe(readiness_probe)
         // Kafka runs a single FIFO task over every assigned partition —
         // there is no per-shard worker set here, so a fifo row must claim
         // one worker, not the shard count.
