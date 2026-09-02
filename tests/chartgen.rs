@@ -22,7 +22,7 @@ use chartgen::{ChartError, Document, Family};
 fn document(runs: &str) -> String {
     format!(
         r#"{{
-          "schema_version": 1,
+          "schema_version": 3,
           "generated_at": "2026-08-31T22:10:30Z",
           "shove_version": "0.14.0",
           "rust_version": "rustc 1.91.1",
@@ -38,19 +38,43 @@ fn document(runs: &str) -> String {
     )
 }
 
-fn scenario(flow: &str, mode: &str, payload: u64, consumers: u32, throughput: f64) -> String {
+/// A v3 row with an explicit `handler_cost` marker and setup window.
+fn scenario_with_cost(
+    flow: &str,
+    mode: &str,
+    payload: u64,
+    consumers: u32,
+    throughput: f64,
+    handler_cost: &str,
+    setup_secs: &str,
+) -> String {
     format!(
         r#"{{
           "flow": "{flow}", "mode": "{mode}", "payload_bytes": {payload},
           "tier": "moderate", "messages": 5000, "consumers": {consumers},
           "handler": "zero (no-op)",
+          "handler_cost": "{handler_cost}",
+          "setup_secs": {setup_secs},
           "throughput_msg_per_sec": {throughput},
           "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
           "e2e_p50_ms": 1.5, "e2e_p95_ms": 4.0, "e2e_p99_ms": 9.0,
           "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
-          "duration_secs": 1.0
+          "duration_secs": 2.0
         }}"#
     )
+}
+
+/// A v3 row whose marker is what the harness would derive for a zero handler:
+/// publish flows carry `no_handler`, the barrier-less flows (`consume_fifo`,
+/// `dlq_drain`, `autoscaler`) carry `setup_bound`, everything else is a
+/// `framework` row with a separated window.
+fn scenario(flow: &str, mode: &str, payload: u64, consumers: u32, throughput: f64) -> String {
+    let (cost, setup) = match flow {
+        "publish_single" | "publish_batch" => ("no_handler", "null"),
+        "consume_fifo" | "dlq_drain" | "autoscaler" => ("setup_bound", "null"),
+        _ => ("framework", "0.4"),
+    };
+    scenario_with_cost(flow, mode, payload, consumers, throughput, cost, setup)
 }
 
 /// An in-process run covering the slices every chart family reads.
@@ -110,14 +134,17 @@ fn render_all(doc: &Document) -> Vec<(Family, String)> {
 
 #[test]
 fn unknown_schema_version_is_rejected() {
+    // An *older* version is refused the same as a newer one: a v2 consume
+    // row's duration included the group-join latency, so its throughput is
+    // not a drain rate and must never reach a v3 axis.
     let raw =
-        document(&inmemory_run(true)).replace("\"schema_version\": 1", "\"schema_version\": 2");
+        document(&inmemory_run(true)).replace("\"schema_version\": 3", "\"schema_version\": 2");
     let doc = parse(&raw);
 
     match chartgen::validate(&doc) {
         Err(ChartError::UnsupportedSchemaVersion { found, expected }) => {
             assert_eq!(found, 2);
-            assert_eq!(expected, 1);
+            assert_eq!(expected, 3);
         }
         other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
     }
@@ -126,10 +153,10 @@ fn unknown_schema_version_is_rejected() {
 #[test]
 fn unknown_schema_version_blocks_every_chart() {
     // The rule has to bite at the render entry point too, not only in a
-    // validate() a caller might forget: a v2 document must not be able to
-    // produce a single chart.
+    // validate() a caller might forget: a document from another schema must
+    // not be able to produce a single chart.
     let raw =
-        document(&inmemory_run(true)).replace("\"schema_version\": 1", "\"schema_version\": 7");
+        document(&inmemory_run(true)).replace("\"schema_version\": 3", "\"schema_version\": 7");
     let doc = parse(&raw);
 
     for family in Family::ALL {
@@ -140,6 +167,193 @@ fn unknown_schema_version_blocks_every_chart() {
             ),
             "{family:?} rendered a chart from an unknown schema version"
         );
+    }
+}
+
+// ── Rule 6: an unclassifiable handler_cost is a hard error ──────────────────
+
+#[test]
+fn an_unknown_handler_cost_is_rejected_and_blocks_every_chart() {
+    // Every publishability decision keys on the marker, so a value outside
+    // the closed set would silently fall out of every filter — a row dropped
+    // by filter reads exactly like a row that never existed.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario_with_cost(
+            "consume_parallel",
+            "parallel",
+            1024,
+            1,
+            10_000.0,
+            "warp_speed",
+            "0.4"
+        )
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+
+    match chartgen::validate(&doc) {
+        Err(ChartError::UnknownHandlerCost {
+            backend,
+            flow,
+            value,
+        }) => {
+            assert_eq!(backend, "kafka");
+            assert_eq!(flow, "consume_parallel");
+            assert_eq!(value, "warp_speed");
+        }
+        other => panic!("expected UnknownHandlerCost, got {other:?}"),
+    }
+    for family in Family::ALL {
+        assert!(
+            matches!(
+                chartgen::render_to_string(&doc, family),
+                Err(ChartError::UnknownHandlerCost { .. })
+            ),
+            "{family:?} rendered a chart from an unclassifiable row"
+        );
+    }
+}
+
+#[test]
+fn a_missing_handler_cost_on_a_v3_row_is_rejected() {
+    // A v3 document whose rows lack the marker deserialises (the field
+    // defaults so *older* documents fail by version, which is the legible
+    // refusal) — but on a current-version row the absent marker must then be
+    // refused here, not defaulted into "not framework" and quietly filtered.
+    let raw = document(&inmemory_run(true)).replace(r#""handler_cost": "framework","#, "");
+    assert!(
+        !raw.contains("\"handler_cost\": \"framework\""),
+        "the fixture edit should have removed the framework markers"
+    );
+    let doc = parse(&raw);
+
+    match chartgen::validate(&doc) {
+        Err(ChartError::UnknownHandlerCost { value, .. }) => assert_eq!(value, ""),
+        other => panic!("expected UnknownHandlerCost for a missing marker, got {other:?}"),
+    }
+}
+
+// ── Marker semantics: what each handler_cost may and may not produce ────────
+
+#[test]
+fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
+    // A representative backend whose consume_parallel windows could not be
+    // separated: the throughput is a mixture of setup and drain. The line
+    // charts must not plot it — and must say why the backend is absent,
+    // because a silent absence reads as "we forgot to measure it".
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario_with_cost(
+            "consume_parallel",
+            "parallel",
+            1024,
+            1,
+            424_242.0,
+            "setup_bound",
+            "null"
+        ),
+        scenario_with_cost(
+            "consume_parallel",
+            "parallel",
+            64,
+            1,
+            434_343.0,
+            "setup_bound",
+            "null"
+        )
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+
+    for family in [Family::ThroughputVsConsumers, Family::ThroughputVsPayload] {
+        let svg = chartgen::render_to_string(&doc, family).expect("chart should render");
+        for magnitude in ["424242", "424.2k", "434343", "434.3k"] {
+            assert!(
+                !svg.contains(magnitude),
+                "{family:?} published the setup-bound magnitude {magnitude}"
+            );
+        }
+        assert!(
+            svg.contains("kafka: setup-bound"),
+            "{family:?} must name the backend whose slice is setup-bound only"
+        );
+        assert!(
+            svg.contains("no drain rate is published"),
+            "{family:?} must say why no value is plotted"
+        );
+    }
+}
+
+#[test]
+fn the_sequenced_bar_is_a_labelled_lower_bound() {
+    // Sequenced consume holds no readiness barrier, so its rows are always
+    // setup-bound. The ordering-cost chart keeps the bar — losing it would
+    // gut the one chart that shows what ordering costs — but as a muted,
+    // caption-qualified lower bound rather than a false absolute.
+    let svg = chartgen::render_to_string(
+        &parse(&document(&inmemory_run(true))),
+        Family::ParallelVsSequenced,
+    )
+    .expect("chart should render");
+
+    assert!(
+        svg.contains("lower bound"),
+        "the sequenced bar must be labelled a lower bound"
+    );
+    assert!(
+        svg.contains("at least the bar shown"),
+        "the caption must say which direction the bound points"
+    );
+}
+
+#[test]
+fn a_sleeping_handler_row_never_reaches_a_throughput_chart() {
+    // A handler_bound row's throughput is the simulated sleep, not shove.
+    // Its magnitude must not appear in any throughput family — not as a bar,
+    // not as a line point, and not by stretching the axis.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario_with_cost(
+            "consume_parallel",
+            "parallel",
+            1024,
+            1,
+            30_000.0,
+            "framework",
+            "0.4"
+        ),
+        scenario_with_cost(
+            "consume_parallel",
+            "parallel",
+            1024,
+            1,
+            9_876_543.0,
+            "handler_bound",
+            "0.4"
+        )
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+
+    for family in [
+        Family::ThroughputVsConsumers,
+        Family::ThroughputVsPayload,
+        Family::ParallelVsSequenced,
+    ] {
+        let svg = chartgen::render_to_string(&doc, family).expect("chart should render");
+        for magnitude in ["9876543", "9.9M", "9.8M", "11.3M", "11M"] {
+            assert!(
+                !svg.contains(magnitude),
+                "{family:?} let a sleeping-handler magnitude reach the chart: {magnitude}"
+            );
+        }
     }
 }
 
