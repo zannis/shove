@@ -628,7 +628,8 @@ struct TierConfig {
 const MODERATE: TierConfig = TierConfig {
     name: "moderate",
     consumers: &[1, 4, 8, 16, 32],
-    messages_per_consumer: (5_000, 2_500, 500, 50),
+    // CAF-729 repro: stand-in for PR #132's framework corpus floor (150k).
+    messages_per_consumer: (40_000, 2_500, 500, 50),
 };
 
 const HIGH: TierConfig = TierConfig {
@@ -2347,9 +2348,18 @@ where
 
     // Signal every supervisor to stop and wait for all drains to complete.
     scenario_stop.cancel();
+    let drain_probe = Instant::now();
+    eprintln!(
+        "[drain-probe] scenario_stop cancelled ({} consumers)",
+        replicas
+    );
     let mut outcome = outcome;
     for handle in supervisor_handles {
         outcome = outcome.and(check_worker_outcome(handle.await));
+        eprintln!(
+            "[drain-probe] supervisor handle joined +{:?}",
+            drain_probe.elapsed()
+        );
     }
 
     let resources = sampler.stop().await;
