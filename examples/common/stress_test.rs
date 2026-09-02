@@ -4002,8 +4002,9 @@ fn unsupported_for_group_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Vec<Uns
     if hcfg.batch_consume.is_none() {
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
-            reason: "run_batch is implemented only for the Kafka backend; no other backend \
-                     exposes a batch consume primitive"
+            reason: "the stress harness wires a batch consume flow only for the Kafka \
+                     backend; this reflects harness wiring, not which backends \
+                     implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });
     }
@@ -4034,8 +4035,9 @@ fn unsupported_for_supervisor_backend<B: Backend>(hcfg: &HarnessConfig<B>) -> Ve
     if hcfg.batch_consume.is_none() {
         out.push(Unsupported {
             flow: Flow::ConsumeBatch.as_str().to_string(),
-            reason: "run_batch is implemented only for the Kafka backend; no other backend \
-                     exposes a batch consume primitive"
+            reason: "the stress harness wires a batch consume flow only for the Kafka \
+                     backend; this reflects harness wiring, not which backends \
+                     implement the primitive (see `HasBatchConsumption`)"
                 .to_string(),
         });
     }
@@ -6487,7 +6489,7 @@ mod tests {
             failures: vec![],
             unsupported: vec![Unsupported {
                 flow: Flow::ConsumeBatch.as_str().to_string(),
-                reason: "run_batch is Kafka-only".to_string(),
+                reason: "the stress harness only wires run_batch for Kafka".to_string(),
             }],
         }
     }

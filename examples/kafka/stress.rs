@@ -255,8 +255,9 @@ async fn main() {
         })
     });
 
-    // Kafka is the only backend that has `run_batch` at all, which is why it
-    // is the only wrapper supplying this closure — and why `consume_batch`
+    // This harness only wires `batch_consume` for Kafka — InMemory also
+    // implements `run_batch` now, but the stress harness's batch scenario
+    // support has not been extended to it, which is why `consume_batch`
     // lands in every other backend's `unsupported[]` instead of being faked.
     // The harness invokes it once per scenario consumer; each invocation is
     // an independent group member.

@@ -15,16 +15,16 @@ use tokio::sync::Mutex;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
-    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
-    capability::{HasBroadcast, HasCoordinatedGroups},
+    AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
+    ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBatchConsumption, HasBroadcast, HasCoordinatedGroups},
     sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::InMemory;
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -145,6 +145,31 @@ impl BroadcastImpl for InMemoryConsumer {
         H: MessageHandler<T>,
     {
         InMemoryConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+}
+
+impl HasBatchConsumption for InMemory {
+    // Same consumer type as every other InMemory path — `run_batch` needs no
+    // state the others don't already carry.
+    type BatchConsumerImpl = InMemoryConsumer;
+
+    fn make_batch_consumer(client: &Self::Client) -> Self::BatchConsumerImpl {
+        InMemoryConsumer::new(client.clone())
+    }
+}
+
+impl BatchConsumerImpl for InMemoryConsumer {
+    async fn run_batch<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        InMemoryConsumer::run_batch_with_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

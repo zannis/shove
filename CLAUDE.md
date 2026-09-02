@@ -14,8 +14,8 @@ consumer groups, broadcast, topology, autoscaling) works across every backend.
 
 - **Generic layer** lives directly in `src/`: `broker.rs`, `publisher.rs`,
   `consumer.rs`, `consumer_group.rs`, `consumer_supervisor.rs`, `broadcast.rs`,
-  `autoscaler.rs`, `topology.rs`, `topology_declarer.rs`. These are
-  backend-agnostic wrappers around `Broker<B>`.
+  `batch_consumer.rs`, `autoscaler.rs`, `topology.rs`, `topology_declarer.rs`.
+  These are backend-agnostic wrappers around `Broker<B>`.
 - **Per-backend implementations** live in `src/backends/<name>/`. Each backend
   has the same file layout: `backend.rs`, `client.rs`, `consumer.rs`,
   `consumer_group.rs`, `publisher.rs`, `topology.rs`, `autoscaler.rs`, plus
@@ -45,9 +45,10 @@ Other add-on features: `audit`, `metrics`, `protobuf`, `rabbitmq-transactional`.
 
 ## Capability gating
 
-Two traits in `src/backend/capability.rs` gate a public entry point to the
-backends that have the underlying broker primitive. SQS implements neither, so
-both are compile errors on `Broker<Sqs>` rather than runtime surprises.
+Three traits in `src/backend/capability.rs` gate a public entry point to the
+backends that have the underlying broker primitive. SQS implements none of
+them, so all three are compile errors on `Broker<Sqs>` rather than runtime
+surprises.
 
 - `HasCoordinatedGroups` gates `Broker::consumer_group`. Kafka, RabbitMQ, NATS,
   InMemory and Redis implement it; SQS instead uses `ConsumerSupervisor`
@@ -58,6 +59,12 @@ both are compile errors on `Broker<Sqs>` rather than runtime surprises.
   **permanently**, not pending: per-process fan-out there needs a real queue
   plus an SNS subscription whose lifecycle shove does not manage, and a leaked
   queue costs money forever.
+- `HasBatchConsumption` gates `Broker::batch_consumer` /
+  `BatchConsumer<B>::run`. Kafka and InMemory implement it today; every other
+  backend is pending, not excluded — each gets the capability the moment its
+  own `BatchConsumerImpl` lands. The primitive exists for **handler
+  amortisation** (one flush per N messages instead of one call per message),
+  nothing else.
 
 The trait's own doc comment is the authoritative per-backend list — update it
 there rather than restating the table in a third place.
@@ -80,12 +87,29 @@ there rather than restating the table in a third place.
   `route_outcome` still misses broadcast. RabbitMQ settles broadcast through
   its own router (an AMQP delivery must be nacked on the channel it arrived
   on), and InMemory reuses its own `route_outcome` over a private buffer.
+- **Batch consumption / settlement** — `src/backend/batch_consumer.rs`: the
+  classifier every backend's batch flush routes an `Outcome` through, plus the
+  panic/timeout invariant surface (`invoke_batch_handler`) shared by every
+  `HasBatchConsumption` backend. Kafka's *single-message* async-commit reject
+  path also imports this module's deferred-settlement machinery
+  (`TerminalDiscard`, `RejectSettlement`, `reject_settlement`) — not only its
+  batch path — so a cleanup narrowing that trio's gate must check the
+  single-message caller first, per the module's own doc comment.
 
 ## Build / test / lint commands
 
 - **Fast path** (no Docker, no secrets): `cargo nextest run --no-default-features`
-  runs unit + in-memory tests. (CI uses `cargo test --no-default-features`; this
-  repo's convention is `cargo nextest run`.)
+  runs the lib unit tests only. `default = []` in `Cargo.toml`, and every
+  in-memory test file is gated on `feature = "inmemory"`, so under this flag
+  those binaries compile empty and report green having run nothing. (CI's
+  `check` job uses `cargo test --no-default-features` — the same unit-only
+  set; this repo's convention is `cargo nextest run`.)
+- **In-memory tests, still Docker-free**:
+  `cargo nextest run --features inmemory,metrics,sbe,env-config` — the CI
+  `coverage` matrix's `inmemory` feature set (authoritative copy in
+  `.github/workflows/ci.yml`). `metrics` and `env-config` are load-bearing:
+  the `tests/metrics_inmemory_*.rs` and env-schema tests are gated on them
+  and compile to zero tests without them.
 - **Integration tests** require Docker (real brokers via `testcontainers`). The
   AWS/MSK tests additionally require `LOCALSTACK_AUTH_TOKEN`, supplied via
   `dotenvx run -- cargo nextest run --features <set>`. See `CONTRIBUTING.md`
@@ -109,7 +133,9 @@ there rather than restating the table in a third place.
   `route_outcome`, not just one. The git history shows recurring
   "cross-backend consistency" commits because a fix landed in one backend and
   was missed in the others. When you touch retry/DLQ logic, check every backend
-  — and the broadcast settling path above, which bypasses `route_outcome`.
+  — and the two settling paths above that bypass `route_outcome`: broadcast
+  (`settle_broadcast_outcome`) and batch (`settle_batch_outcome` plus each
+  backend's own batch-flush arms).
 - **Conventional Commits** for commit messages. No CHANGELOG — releases are
   `release: vX.Y.Z` commits.
 - Do **not** add `Co-Authored-By` trailers to commits.
