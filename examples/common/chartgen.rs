@@ -105,6 +105,26 @@ pub const KNOWN_FLOWS: &[&str] = &[
     "autoscaler",
 ];
 
+/// The flows an empty run can — and therefore must — declare unsupported.
+///
+/// Deliberately the harness's `Flow::ALL` set, not [`KNOWN_FLOWS`]:
+/// `autoscaler` rows exist (the flow has its own entry point), but the
+/// harness's merge validation only accepts `unsupported[]` entries drawn from
+/// its nine-flow table. Requiring a tenth declaration here would demand a
+/// document `merge_results_file` refuses to merge into — a validator
+/// deadlock where no document satisfies both the writer and the reader.
+pub const DECLARABLE_FLOWS: &[&str] = &[
+    "publish_single",
+    "publish_batch",
+    "consume_parallel",
+    "consume_fifo",
+    "consume_batch",
+    "consumer_group",
+    "supervisor",
+    "broadcast",
+    "dlq_drain",
+];
+
 /// The backend key whose numbers measure shove itself with the broker removed.
 pub const IN_PROCESS_BACKEND: &str = "inmemory";
 
@@ -172,8 +192,6 @@ pub struct Unsupported {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FailedRow {
     pub flow: String,
-    #[serde(default)]
-    pub mode: String,
     pub payload_bytes: u64,
     pub consumers: u32,
 }
@@ -237,7 +255,9 @@ impl ScenarioResult {
             self.dispatch_p99_ms,
         ) {
             (Some(p50), Some(p95), Some(p99))
-                if [p50, p95, p99].iter().all(|p| p.is_finite() && *p >= 0.0) =>
+                if [p50, p95, p99].iter().all(|p| p.is_finite() && *p >= 0.0)
+                    && p50 <= p95
+                    && p95 <= p99 =>
             {
                 Some((p50, p95, p99))
             }
@@ -286,6 +306,18 @@ pub enum ChartError {
     /// axis — the clean-looking chart the contract forbids.
     MissingPercentiles {
         backend: String,
+    },
+    /// Two runs share a backend key. The charts key on that name, so the
+    /// duplicates would silently overwrite each other in some families and
+    /// render side by side in others — one document, contradictory charts.
+    DuplicateBackendRun {
+        backend: String,
+    },
+    /// A document-level provenance field is empty. A chart without a date is
+    /// the problem this generator exists to fix, so an empty one cannot be
+    /// allowed to render a blank caption.
+    MissingProvenance {
+        what: &'static str,
     },
     /// Chart 5 has no meaning without the broker-free baseline.
     MissingInProcessRun,
@@ -346,6 +378,19 @@ impl fmt::Display for ChartError {
                  dispatch percentiles. Refusing to render rather than \
                  publishing a 0 ms bar on an absolute axis."
             ),
+            Self::DuplicateBackendRun { backend } => write!(
+                f,
+                "the document carries more than one run for backend \
+                 `{backend}`. The charts key on that name, so duplicates \
+                 would silently overwrite each other in some families and \
+                 render side by side in others."
+            ),
+            Self::MissingProvenance { what } => write!(
+                f,
+                "the document's {what} is empty. Every caption renders the \
+                 provenance block, and a chart without one is the problem \
+                 this generator exists to fix."
+            ),
             Self::MissingInProcessRun => write!(
                 f,
                 "the framework-overhead chart needs a `{IN_PROCESS_BACKEND}` \
@@ -387,6 +432,25 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             found: doc.schema_version,
             expected: SCHEMA_VERSION,
         });
+    }
+
+    for (what, value) in [
+        ("generated_at", &doc.generated_at),
+        ("shove_version", &doc.shove_version),
+        ("hardware.label", &doc.hardware.label),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ChartError::MissingProvenance { what });
+        }
+    }
+
+    let mut backends: BTreeSet<&str> = BTreeSet::new();
+    for run in &doc.runs {
+        if !backends.insert(run.backend.as_str()) {
+            return Err(ChartError::DuplicateBackendRun {
+                backend: run.backend.clone(),
+            });
+        }
     }
 
     for run in &doc.runs {
@@ -433,8 +497,15 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
         if !run.results.is_empty() {
             continue;
         }
+        // A run that measured nothing but *recorded why* is not silent: its
+        // failures[] entries are the loud account of what happened, and the
+        // slice captions surface them. Rule 5 targets the run with neither
+        // numbers nor an account.
+        if !run.failures.is_empty() {
+            continue;
+        }
         let declared: BTreeSet<&str> = run.unsupported.iter().map(|u| u.flow.as_str()).collect();
-        let missing: Vec<String> = KNOWN_FLOWS
+        let missing: Vec<String> = DECLARABLE_FLOWS
             .iter()
             .filter(|flow| !declared.contains(*flow))
             .map(|flow| (*flow).to_string())
@@ -626,10 +697,13 @@ enum Presence {
 /// Normalise to the series' own maximum, so the curve's shape survives but no
 /// absolute magnitude is ever recoverable from the chart.
 fn shape_only(points: Vec<(f64, f64)>) -> Presence {
-    let peak = points.iter().fold(0.0f64, |a, (_, y)| a.max(*y));
-    if peak <= 0.0 {
-        return Presence::ShapeOnly(points.into_iter().map(|(x, _)| (x, 0.0)).collect());
-    }
+    // The peak is always positive here: every point is a
+    // `throughput_msg_per_sec` that `validate` already required to be finite
+    // and greater than zero.
+    let peak = points
+        .iter()
+        .fold(0.0f64, |a, (_, y)| a.max(*y))
+        .max(f64::MIN_POSITIVE);
     Presence::ShapeOnly(points.into_iter().map(|(x, y)| (x, y / peak)).collect())
 }
 
@@ -767,6 +841,25 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
+        // A single token longer than the width (a URL in a free-text
+        // unsupported[] reason) is split hard: an unbreakable token would
+        // otherwise render one line far past the canvas edge — the exact
+        // "reason that leaves the page" this function exists to prevent.
+        if word.chars().count() > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            for chunk in chars.chunks(width) {
+                lines.push(chunk.iter().collect());
+            }
+            // The last chunk starts a fresh line rather than being joined
+            // onto by the next word, keeping the split purely mechanical.
+            if let Some(last) = lines.pop() {
+                current = last;
+            }
+            continue;
+        }
         let extra = if current.is_empty() { 0 } else { 1 };
         if !current.is_empty() && current.chars().count() + extra + word.chars().count() > width {
             lines.push(std::mem::take(&mut current));
@@ -820,10 +913,12 @@ fn frame<'b>(
     // its descender always clears the canvas edge.
     let bottom = HEIGHT as i32 - 26;
     let top_of_footer = bottom - LINE * (footer.len() as i32 - 1);
-    // Past this point the block would overprint the title band and leave the
-    // chart body a negative-height region rendered as garbage — a document
-    // pathological enough to get here gets a loud refusal instead.
-    if top_of_footer < 96 {
+    // Past this point the block would squeeze the chart body below its own
+    // internal margins — plotters then draws the plot over the legend and
+    // subtitle band rather than erroring. 190 leaves the body at least
+    // ~120px under the 70px title band; a document pathological enough to
+    // get here gets a loud refusal instead of a garbage chart.
+    if top_of_footer < 190 {
         return Err(ChartError::Render(format!(
             "the caption block ({} lines) leaves no room for the chart body",
             footer.len()
@@ -848,16 +943,13 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
     for (backend, presence) in presences {
         match presence {
             Presence::Unsupported(reason) => {
-                notes.push(format!("{backend}: not supported — {reason}"))
+                notes.push(format!("{backend}: {}", unsupported_text(reason)))
             }
             // Deliberately NOT "not supported": this variant means the
             // capability exists and this document simply carries no row for
             // the slice. Publishing it as a capability hole would be a false
             // claim about the library rather than about the run.
-            Presence::NotMeasured => notes.push(format!(
-                "{backend}: no measurement for this slice in this run \
-                 (supported — a gap in the sweep, not a capability hole)"
-            )),
+            Presence::NotMeasured => notes.push(format!("{backend}: {}", gap_text())),
             Presence::SetupBoundOnly => notes.push(format!(
                 "{backend}: setup-bound — the measured window includes \
                  coordination cost, so no drain rate is published for this slice"
@@ -875,6 +967,21 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
         }
     }
     notes
+}
+
+/// The shared "declared capability hole" caption text. One owner, because
+/// the distinction it draws is load-bearing: this is a claim about the
+/// library.
+fn unsupported_text(reason: &str) -> String {
+    format!("not supported — {reason}")
+}
+
+/// The shared "supported but absent" caption text — a claim about the run,
+/// never about the library. Hand-copies of this sentence drifted once
+/// already; every family reads it from here.
+fn gap_text() -> &'static str {
+    "no measurement for this slice in this run (supported — a gap, not a \
+     capability hole)"
 }
 
 /// Why a run's magnitudes are not published, naming the deployment when the
@@ -898,12 +1005,12 @@ fn shape_only_note(run: &BackendRun) -> String {
 /// Caption lines for cells the harness ran and could not measure in a chart's
 /// slice. A failed cell is absent from `results[]`, and an unexplained
 /// absence reads as a smaller sweep — or, worse, as a capability hole.
-fn failure_notes<P>(doc: &Document, in_slice: P) -> Vec<String>
+fn failure_notes<P>(runs: &[BackendRun], in_slice: P) -> Vec<String>
 where
     P: Fn(&FailedRow) -> bool,
 {
     let mut notes = Vec::new();
-    for run in &doc.runs {
+    for run in runs {
         let failed = run.failures.iter().filter(|f| in_slice(f)).count();
         if failed > 0 {
             notes.push(format!(
@@ -1019,9 +1126,22 @@ fn draw_legend(
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
     let mut x = origin.0;
+    let mut y = origin.1;
     for (label, colour) in entries {
+        // Advance by an estimate rather than a measurement: text extents are
+        // approximated (no ttf feature), and the estimate is what stays equal
+        // across hosts.
+        let entry_width = 20 + 9 * label.chars().count() as i32 + 24;
+        // An entry past the canvas edge is a series with no legible label —
+        // wrap to a second row instead of drawing outside the viewBox. The
+        // row drops into the chart area's top margin band (empty by
+        // construction: the axis adds 12% headroom above the tallest series).
+        if x > origin.0 && x + entry_width > WIDTH as i32 - 16 {
+            x = origin.0;
+            y += 16;
+        }
         root.draw(&Rectangle::new(
-            [(x, origin.1 + 3), (x + 14, origin.1 + 11)],
+            [(x, y + 3), (x + 14, y + 11)],
             ShapeStyle {
                 color: colour.to_rgba(),
                 filled: true,
@@ -1029,12 +1149,9 @@ fn draw_legend(
             },
         ))
         .map_err(render)?;
-        root.draw_text(label, &ink(LABEL_PX), (x + 20, origin.1))
+        root.draw_text(label, &ink(LABEL_PX), (x + 20, y))
             .map_err(render)?;
-        // Advance by an estimate rather than a measurement: text extents are
-        // approximated (no ttf feature), and the estimate is what stays equal
-        // across hosts.
-        x += 20 + 9 * label.chars().count() as i32 + 24;
+        x += entry_width;
     }
     Ok(())
 }
@@ -1073,6 +1190,7 @@ fn render_throughput_vs_consumers(
             fmt_payload(HEADLINE_PAYLOAD)
         ),
         "consumers",
+        &[HEADLINE_FLOW],
         in_slice,
         |r| r.consumers,
         |c| format!("{c}"),
@@ -1095,6 +1213,7 @@ fn render_throughput_vs_payload(
         "throughput-vs-payload",
         format!("{HEADLINE_FLOW} @ {BASE_CONSUMERS} consumer ({COST_FRAMEWORK} rows)"),
         "payload size",
+        &[HEADLINE_FLOW],
         in_slice,
         |r| r.payload_bytes,
         |s| fmt_payload(*s),
@@ -1117,6 +1236,7 @@ fn render_line_family<K, P, KF, LF, FF>(
     family_key: &'static str,
     slice_desc: String,
     x_desc: &str,
+    flows_for_support: &[&str],
     in_slice: P,
     key_of: KF,
     label_of: LF,
@@ -1152,7 +1272,7 @@ where
 
     let presences = presences(
         doc,
-        &[HEADLINE_FLOW],
+        flows_for_support,
         |run| {
             // `idx` iterates in key order, so the points come out sorted.
             idx.iter()
@@ -1183,7 +1303,7 @@ where
         &labels,
         x_desc,
         &presences,
-        &failure_notes(doc, in_failed_slice),
+        &failure_notes(&doc.runs, in_failed_slice),
     )
 }
 
@@ -1248,19 +1368,14 @@ fn line_chart(
                 chart
                     .draw_series(LineSeries::new(points.iter().copied(), stroke(colour, 3)))
                     .map_err(render)?;
-                for (x, y) in points {
-                    chart
-                        .draw_series(std::iter::once(Circle::new(
-                            (*x, *y),
-                            4,
-                            ShapeStyle {
-                                color: colour.to_rgba(),
-                                filled: true,
-                                stroke_width: 0,
-                            },
-                        )))
-                        .map_err(render)?;
-                }
+                let dot = ShapeStyle {
+                    color: colour.to_rgba(),
+                    filled: true,
+                    stroke_width: 0,
+                };
+                chart
+                    .draw_series(points.iter().map(|(x, y)| Circle::new((*x, *y), 4, dot)))
+                    .map_err(render)?;
                 let label = if points.len() == 1 {
                     format!("{backend} (single point)")
                 } else {
@@ -1400,14 +1515,28 @@ fn bar_chart(
         .color(&INK)
         .pos(Pos::new(HPos::Center, VPos::Bottom));
 
+    let shape_peak_across_groups = groups
+        .iter()
+        .filter(|g| g.shape_only)
+        .flat_map(|g| g.bars.iter().flatten())
+        .fold(0.0f64, |a, b| a.max(b.value));
     for (gi, group) in groups.iter().enumerate() {
-        // A shape-only group is scaled to its own maximum: the relative
-        // heights survive, the magnitudes do not.
-        let local_peak = group
-            .bars
-            .iter()
-            .flatten()
-            .fold(0.0f64, |a, b| a.max(b.value));
+        // A shape-only group is scaled so relative heights survive while the
+        // magnitudes do not. The scaling peak depends on the layout: in a
+        // multi-series chart the shape lives *within* a group, but in a
+        // single-series chart each group holds one bar — its own peak — and
+        // per-group scaling would render every bar at full height, a flat
+        // line regardless of the data. There the shape lives across groups,
+        // so the peak does too.
+        let local_peak = if series.len() == 1 {
+            shape_peak_across_groups
+        } else {
+            group
+                .bars
+                .iter()
+                .flatten()
+                .fold(0.0f64, |a, b| a.max(b.value))
+        };
         for (si, (_, colour)) in series.iter().enumerate() {
             let left = gi as f64 - slot / 2.0 + width * si as f64;
             let right = left + width * 0.86;
@@ -1581,10 +1710,8 @@ fn render_parallel_vs_sequenced(
                     // when the document names one, and a supported-but-absent
                     // gap otherwise — never "not supported" for a mere gap.
                     let text = match unsupported_reason(run, flow) {
-                        Some(reason) => format!("not supported — {reason}"),
-                        None => "no measurement in this slice of this run \
-                                 (supported — a gap, not a capability hole)"
-                            .to_string(),
+                        Some(reason) => unsupported_text(&reason),
+                        None => gap_text().to_string(),
                     };
                     missing
                         .entry((mi, text))
@@ -1653,7 +1780,29 @@ fn render_parallel_vs_sequenced(
         }
     }
 
-    notes.extend(failure_notes(doc, |f| {
+    // A mode outside MODES would otherwise fall out of every filter above
+    // and vanish without a bar or a word — the same silent omission an
+    // unknown handler_cost is refused for. New modes are additive (no schema
+    // bump), so they are named rather than refused.
+    let unknown_modes: BTreeSet<&str> = doc
+        .runs
+        .iter()
+        .flat_map(|run| run.results.iter())
+        .filter(|r| {
+            CONSUME_FLOWS.contains(&r.flow.as_str())
+                && r.payload_bytes == HEADLINE_PAYLOAD
+                && !MODES.iter().any(|(mode, _, _)| r.mode == *mode)
+        })
+        .map(|r| r.mode.as_str())
+        .collect();
+    if !unknown_modes.is_empty() {
+        notes.push(format!(
+            "measured but not charted here (mode unknown to this chart): {}",
+            unknown_modes.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    notes.extend(failure_notes(&doc.runs, |f| {
         f.payload_bytes == HEADLINE_PAYLOAD && CONSUME_FLOWS.contains(&f.flow.as_str())
     }));
 
@@ -1746,12 +1895,8 @@ fn render_dispatch_latency(
                 // The backend stays on the axis as explicit n/s markers; the
                 // note then says whether that is a declared hole or a gap.
                 let note = match unsupported_reason(run, HEADLINE_FLOW) {
-                    Some(reason) => format!("{}: not supported — {reason}", run.backend),
-                    None => format!(
-                        "{}: no measurement for this slice in this run \
-                         (supported — a gap, not a capability hole)",
-                        run.backend
-                    ),
+                    Some(reason) => format!("{}: {}", run.backend, unsupported_text(&reason)),
+                    None => format!("{}: {}", run.backend, gap_text()),
                 };
                 notes.push(note);
                 groups.push(BarGroup {
@@ -1763,7 +1908,7 @@ fn render_dispatch_latency(
         }
     }
 
-    notes.extend(failure_notes(doc, |f| {
+    notes.extend(failure_notes(&doc.runs, |f| {
         f.flow == HEADLINE_FLOW
             && f.payload_bytes == HEADLINE_PAYLOAD
             && f.consumers == BASE_CONSUMERS
@@ -1861,7 +2006,7 @@ fn render_framework_overhead(
                         bars: vec![None],
                         shape_only: false,
                     });
-                    notes.push(format!("{flow}: not supported — {reason}"));
+                    notes.push(format!("{flow}: {}", unsupported_text(&reason)));
                 }
                 // Neither measured nor declared. Inventing a column would
                 // imply a capability hole that does not exist, but dropping it
@@ -1886,17 +2031,11 @@ fn render_framework_overhead(
         ));
     }
 
-    let failed = run
-        .failures
-        .iter()
-        .filter(|f| f.payload_bytes == OVERHEAD_PAYLOAD && f.consumers == BASE_CONSUMERS)
-        .count();
-    if failed > 0 {
-        notes.push(format!(
-            "{failed} cell(s) in this slice failed to run — absent, not zero; \
-             see failures[] in the results document"
-        ));
-    }
+    notes.extend(failure_notes(std::slice::from_ref(run), |f| {
+        KNOWN_FLOWS.contains(&f.flow.as_str())
+            && f.payload_bytes == OVERHEAD_PAYLOAD
+            && f.consumers == BASE_CONSUMERS
+    }));
 
     if groups.is_empty() {
         return Err(ChartError::NoDataForChart {
@@ -1951,6 +2090,13 @@ fn render_into(
 /// the file-writing path below is the same code with a different sink.
 pub fn render_to_string(doc: &Document, family: Family) -> Result<String, ChartError> {
     validate(doc)?;
+    render_validated(doc, family)
+}
+
+/// The render body behind [`render_to_string`], for callers that have already
+/// validated — [`generate`] validates once for all five families rather than
+/// re-walking every row per chart.
+fn render_validated(doc: &Document, family: Family) -> Result<String, ChartError> {
     let mut buf = String::new();
     {
         let root = SVGBackend::with_string(&mut buf, (WIDTH, HEIGHT)).into_drawing_area();
@@ -1963,17 +2109,21 @@ pub fn render_to_string(doc: &Document, family: Family) -> Result<String, ChartE
 
 /// Render every family into `out_dir`, which must already exist.
 ///
-/// Validation runs once up front, so a document that violates the contract
-/// fails before a single file is touched — a half-written chart directory is
-/// worse than none.
+/// Every family renders to memory before any file is written: render-stage
+/// refusals (a missing in-process run, unusable percentiles, an oversized
+/// caption block) can fire after `validate` passes, and a failure midway
+/// through the loop would otherwise leave the directory a mix of regenerated
+/// and stale charts — worse than none.
 pub fn generate(doc: &Document, out_dir: &Path) -> Result<Vec<String>, ChartError> {
     validate(doc)?;
-    let mut written = Vec::new();
+    let mut rendered = Vec::new();
     for family in Family::ALL {
-        let svg = render_to_string(doc, family)?;
-        let path = out_dir.join(family.filename());
-        std::fs::write(&path, svg.as_bytes())?;
-        written.push(family.filename().to_string());
+        rendered.push((family.filename(), render_validated(doc, family)?));
+    }
+    let mut written = Vec::new();
+    for (filename, svg) in rendered {
+        std::fs::write(out_dir.join(filename), svg.as_bytes())?;
+        written.push(filename.to_string());
     }
     Ok(written)
 }

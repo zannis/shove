@@ -1080,6 +1080,235 @@ fn the_shared_palette_covers_every_fixed_series_list() {
     );
 }
 
+// ── Round-3 guards: duplicates, provenance, ordering, partial writes ────────
+
+#[test]
+fn a_duplicate_backend_key_is_rejected() {
+    // Two runs sharing a key would overwrite each other in the line families
+    // and render side by side in the bar families — one document, mutually
+    // contradictory charts.
+    let dup = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), dup)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::DuplicateBackendRun { backend }) => assert_eq!(backend, "inmemory"),
+        other => panic!("expected DuplicateBackendRun, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_empty_run_with_recorded_failures_is_not_silent() {
+    // A run that measured nothing but recorded why is a loud failure, not a
+    // silent one: rule 5 must not refuse the harness's own legitimate output
+    // for a sweep where every attempted cell errored.
+    let failed = r#"{
+      "backend": "kafka", "representative": true,
+      "results": [],
+      "failures": [{
+        "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+        "tier": "moderate", "messages": 150000, "consumers": 1,
+        "handler": "zero (no-op)", "error": "broker never became ready"
+      }],
+      "unsupported": []
+    }"#;
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), failed)));
+    chartgen::validate(&doc).expect("a loudly-failed run must validate");
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
+        .expect("chart should render");
+    assert!(
+        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        "the failed cell must surface in the caption"
+    );
+}
+
+#[test]
+fn empty_provenance_fields_are_rejected() {
+    // A blank generated_at would render 'Generated  — shove …' — an undated
+    // chart, the exact problem the provenance rule exists to fix.
+    let raw = document(&inmemory_run(true)).replace(
+        r#""generated_at": "2026-08-31T22:10:30Z","#,
+        r#""generated_at": " ","#,
+    );
+    match chartgen::validate(&parse(&raw)) {
+        Err(ChartError::MissingProvenance { what }) => assert_eq!(what, "generated_at"),
+        other => panic!("expected MissingProvenance, got {other:?}"),
+    }
+}
+
+#[test]
+fn unordered_percentiles_are_refused_not_rendered() {
+    // A harness bug that swaps p50/p99 must not publish a latency chart
+    // whose tail is faster than its median.
+    let raw = document(&inmemory_run(true)).replace(
+        r#""dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,"#,
+        r#""dispatch_p50_ms": 9.0, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 1.5,"#,
+    );
+    match chartgen::render_to_string(&parse(&raw), Family::DispatchLatency) {
+        Err(ChartError::MissingPercentiles { backend }) => assert_eq!(backend, "inmemory"),
+        other => panic!("expected MissingPercentiles, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_negative_throughput_row_is_rejected() {
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, -1200.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("throughput"), "wrong invariant named: {what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn generate_writes_nothing_when_a_late_family_refuses() {
+    // Render-stage refusals (here: no in-process run) fire after validate()
+    // passes; a partial write would leave the chart directory a mix of fresh
+    // and stale files — worse than none.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
+    );
+    let doc = parse(&document(&run));
+    let out = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("chartgen-partial-{}", std::process::id()));
+    std::fs::create_dir_all(&out).expect("create out dir");
+    match chartgen::generate(&doc, &out) {
+        Err(ChartError::MissingInProcessRun) => {}
+        other => panic!("expected MissingInProcessRun, got {other:?}"),
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(&out)
+        .expect("read out dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    std::fs::remove_dir_all(&out).ok();
+    assert!(
+        leftovers.is_empty(),
+        "generate() left partial output behind: {leftovers:?}"
+    );
+}
+
+#[test]
+fn a_single_series_shape_only_chart_still_shows_the_shape() {
+    // Family 5 has one bar per group; scaling each shape-only group to its
+    // own peak would render every bar at full height — a flat line
+    // regardless of the data. The shape must survive across groups.
+    let rows = format!(
+        "{},{}",
+        scenario("publish_single", "parallel", 64, 1, 1_000_000.0),
+        scenario("publish_batch", "batch", 64, 1, 10_000.0)
+    );
+    let run = format!(
+        r#"{{
+          "backend": "inmemory",
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "representative": false,
+          "results": [{rows}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let svg = chartgen::render_to_string(&parse(&document(&run)), Family::FrameworkOverhead)
+        .expect("chart should render");
+    let heights: std::collections::BTreeSet<String> = svg
+        .lines()
+        .filter(|l| l.contains("<rect") && l.contains("opacity"))
+        .filter_map(|l| {
+            l.split("height=\"")
+                .nth(1)
+                .and_then(|r| r.split('\"').next())
+                .map(str::to_string)
+        })
+        .collect();
+    assert!(
+        heights.len() >= 2,
+        "the two bars (100x apart in ns/msg) rendered at identical heights: {heights:?}"
+    );
+}
+
+#[test]
+fn the_legend_never_leaves_the_canvas() {
+    // Six shape-only backends carry the longest legend labels this document
+    // shape can produce; every entry must stay inside the 960px viewBox or a
+    // plotted series has no legible label.
+    let backends = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+    let runs: Vec<String> = backends
+        .iter()
+        .map(|b| {
+            format!(
+                r#"{{
+                  "backend": "{b}-backend-name", "representative": false,
+                  "broker": {{ "name": "LocalStack", "version": "3", "deployment": "docker" }},
+                  "results": [{}], "failures": [], "unsupported": []
+                }}"#,
+                scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
+            )
+        })
+        .collect();
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        runs.join(",")
+    )));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
+        .expect("chart should render");
+    for line in svg.lines().filter(|l| l.contains("<text")) {
+        if let Some(x) = line
+            .split("x=\"")
+            .nth(1)
+            .and_then(|r| r.split('\"').next())
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            assert!(
+                x < 960.0,
+                "a text element starts beyond the canvas edge (x={x}): {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unbreakable_token_in_a_reason_is_split_not_overflowed() {
+    let url = format!("https://example.com/{}", "a".repeat(200));
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_fifo", "reason": "tracked at {url}" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    for line in svg.lines().filter(|l| l.contains("<text")) {
+        let text = line
+            .split('>')
+            .nth(1)
+            .and_then(|r| r.split('<').next())
+            .unwrap_or("");
+        assert!(
+            text.chars().count() <= 120,
+            "a caption line was not wrapped ({} chars): {text}",
+            text.chars().count()
+        );
+    }
+}
+
 // ── The committed artifact renders ──────────────────────────────────────────
 
 #[test]

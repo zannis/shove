@@ -18,6 +18,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 exclude = [
   "docs/",
+  "benches/results/",
+  "tests/chartgen.rs",
   "package.json",
   "package-lock.json",
   "tsconfig.json",

@@ -5593,10 +5593,6 @@
         {
           "flow": "dlq_drain",
           "reason": "not measured in this document: SQS runs only against LocalStack (non-representative by design) and requires a LocalStack Pro auth token, which is unavailable in the environment that produced these results"
-        },
-        {
-          "flow": "autoscaler",
-          "reason": "not measured in this document: SQS runs only against LocalStack (non-representative by design) and requires a LocalStack Pro auth token, which is unavailable in the environment that produced these results"
         }
       ]
     }
