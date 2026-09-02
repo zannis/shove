@@ -587,8 +587,13 @@ impl HandlerCost {
                 // check `validate_run` re-derived `framework` from it and
                 // certified the row.
                 HandlerProfile::Zero | HandlerProfile::Fast => match window.setup_secs {
-                    Some(_)
-                        if flow.holds_readiness_barrier()
+                    // A finite, non-negative interval is the only value a
+                    // barrier can have measured; anything else on a row is not
+                    // evidence of a separated window.
+                    Some(setup)
+                        if setup.is_finite()
+                            && setup >= 0.0
+                            && flow.holds_readiness_barrier()
                             && window.duration_secs >= MIN_FRAMEWORK_WINDOW_SECS =>
                     {
                         HandlerCost::Framework
@@ -835,7 +840,9 @@ const MAX_FRAMEWORK_CORPUS_BYTES: u64 = 32 * 1024 * 1024;
 /// sleeps 1–5 ms per message, which concurrency hides and sequential
 /// processing does not: the sequential `fast` cells drained at ~470 msg/s, so
 /// this floor would turn a 5 s scenario into a 5-minute one — and those cells
-/// are already drain-bound, so they never needed it.
+/// are already drain-bound, so they never needed it. Batch mode is the
+/// exception: it pays the sleep once per batch, so its `fast` cells are
+/// drain-bound with or without `--concurrent`.
 fn framework_corpus_floor(
     flow: Flow,
     handler: HandlerProfile,
@@ -844,7 +851,7 @@ fn framework_corpus_floor(
 ) -> u64 {
     let negligible_and_not_sleep_bound = match handler {
         HandlerProfile::Zero => true,
-        HandlerProfile::Fast => concurrent,
+        HandlerProfile::Fast => concurrent || flow.mode() == Mode::Batch,
         HandlerProfile::Slow | HandlerProfile::Heavy => false,
     };
     // Asked of the flow rather than re-listed here: FIFO, the DLQ drain and the
@@ -1390,20 +1397,31 @@ where
         _: &(),
     ) -> Outcome {
         let received_at = self.inner.epoch.elapsed().as_nanos() as u64;
+        // Same split as `handle`: a readiness sentinel bumps the attach flag
+        // and nothing else. A batch straddling the barrier is the normal case
+        // — the last warmup round's sentinels and the first corpus chunk
+        // arrive together — so without this the barrier's own traffic is
+        // counted as drained corpus and recorded as latency. Settled before
+        // the simulated work so a sentinel-only batch pays none of it.
+        let corpus: Vec<&StressTestMsg> = messages
+            .iter()
+            .map(|(msg, _)| msg)
+            .filter(|msg| {
+                if self.inner.is_sentinel(msg.id) {
+                    self.inner.note_attached();
+                    return false;
+                }
+                true
+            })
+            .collect();
+        if corpus.is_empty() {
+            return Outcome::Ack;
+        }
         // One simulated unit of work per batch, not per message: a batch
         // handler exists precisely so the per-message cost is amortised, and
         // sleeping per message would measure the sleep rather than batching.
         self.inner.simulate_work().await;
-        for (msg, _) in &messages {
-            // Same split as `handle`: a readiness sentinel bumps the attach
-            // flag and nothing else. A batch straddling the barrier is the
-            // normal case — the last warmup round's sentinels and the first
-            // corpus chunk arrive together — so without this the barrier's own
-            // traffic is counted as drained corpus and recorded as latency.
-            if self.inner.is_sentinel(msg.id) {
-                self.inner.note_attached();
-                continue;
-            }
+        for msg in corpus {
             self.inner.observe(received_at, msg.published_at_ns);
         }
         Outcome::Ack
@@ -2223,6 +2241,8 @@ where
     };
 
     let duration = start.elapsed();
+    // Stopped with the window — see `run_scenario_batch`.
+    let resources = stop_sampler(sampler).await;
 
     // Signal the consumer group to stop and wait for the drain to complete.
     // A worker that erred or panicked mid-run fails the scenario: the target
@@ -2231,7 +2251,6 @@ where
     scenario_stop.cancel();
     let outcome = outcome.and(check_worker_outcome(run_handle.await));
 
-    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
@@ -2353,6 +2372,8 @@ where
     };
 
     let duration = start.elapsed();
+    // Stopped with the window — see `run_scenario_batch`.
+    let resources = stop_sampler(sampler).await;
 
     scenario_stop.cancel();
     let mut outcome = outcome;
@@ -2360,7 +2381,6 @@ where
         outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
-    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
@@ -2645,13 +2665,15 @@ where
         Err(e) => ((Instant::now(), None), Err(e)),
     };
     let duration = start.elapsed();
+    // Stopped with the window, not after teardown, so cpu_pct and peak RSS
+    // describe the same interval as `duration_secs`.
+    let resources = stop_sampler(sampler).await;
 
     // Same reasoning as the DLQ drain: `run_batch` has no shutdown token of
     // its own, so abort rather than await.
     drivers.abort_all();
     while drivers.join_next().await.is_some() {}
 
-    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
@@ -2816,6 +2838,8 @@ where
     };
 
     let duration = start.elapsed();
+    // Stopped with the window — see `run_scenario_batch`.
+    let resources = stop_sampler(sampler).await;
 
     // Signal every supervisor to stop and wait for all drains to complete.
     scenario_stop.cancel();
@@ -2824,7 +2848,6 @@ where
         outcome = outcome.and(check_worker_outcome(handle.await));
     }
 
-    let resources = stop_sampler(sampler).await;
     drop(publisher);
     broker.close().await;
     outcome?;
@@ -4104,6 +4127,14 @@ mod tests {
             framework_corpus_floor(Flow::ConsumeParallel, HandlerProfile::Fast, true, 64),
             MIN_FRAMEWORK_CORPUS_MESSAGES,
             "concurrent fast is drain-bound and must be floored"
+        );
+        // Batch mode pays the sleep once per batch, not per message, so the
+        // sequential `fast` batch cell is drain-bound too and needs the floor
+        // whether or not `--concurrent` is set.
+        assert_eq!(
+            framework_corpus_floor(Flow::ConsumeBatch, HandlerProfile::Fast, false, 64),
+            MIN_FRAMEWORK_CORPUS_MESSAGES,
+            "sequential fast batch amortises its sleep and must be floored"
         );
         for handler in [HandlerProfile::Slow, HandlerProfile::Heavy] {
             for concurrent in [false, true] {
@@ -5649,6 +5680,16 @@ mod tests {
         for (setup_secs, duration_secs, why) in [
             (None, 30.0, "setup never separated from the drain"),
             (Some(6.2), 0.05, "drain far too short to be a rate"),
+            (
+                Some(-1.0),
+                30.0,
+                "a negative setup interval was never measured",
+            ),
+            (
+                Some(f64::NAN),
+                30.0,
+                "a NaN setup interval was never measured",
+            ),
         ] {
             let mut run = batch_run(Flow::ConsumeBatch, HandlerProfile::Zero);
             run.results[0].setup_secs = setup_secs;
@@ -6033,6 +6074,47 @@ mod tests {
             processed.load(Ordering::Relaxed),
             1,
             "the sentinel leaked into the measured count"
+        );
+        assert_eq!(attach.load(Ordering::Relaxed), 1, "attach flag not bumped");
+    }
+
+    #[tokio::test]
+    async fn a_sentinel_only_batch_does_no_simulated_work() {
+        // Oversupplied sentinels from the last readiness round arrive after
+        // the barrier releases, inside the measured window. A batch holding
+        // nothing but sentinels must not pay the handler's simulated sleep,
+        // or the barrier's own traffic is charged to the drain. `heavy`
+        // sleeps at least a second, so a fast return is unambiguous.
+        let epoch = Instant::now();
+        let attach = Arc::new(AtomicU64::new(0));
+        let handler = StressBatchHandler::new(
+            StressTestHandler::new(
+                epoch,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(LatencyRecorder::new()),
+                HandlerProfile::Heavy,
+            )
+            .with_attach_counter(attach.clone()),
+        );
+        let batch = vec![(
+            StressTestMsg {
+                id: SENTINEL_ID,
+                published_at_ns: 0,
+                payload: String::new(),
+            },
+            MessageMetadata::builder().build(),
+        )];
+        let started = Instant::now();
+        let outcome = <StressBatchHandler as BatchMessageHandler<StressTestTopic>>::handle_batch(
+            &handler,
+            batch,
+            &(),
+        )
+        .await;
+        assert!(matches!(outcome, Outcome::Ack));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a sentinel-only batch paid the simulated work"
         );
         assert_eq!(attach.load(Ordering::Relaxed), 1, "attach flag not bumped");
     }
