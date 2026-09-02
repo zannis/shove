@@ -99,8 +99,8 @@ pub const TIER_A_COVERAGE: [FlowCoverage; 10] = [
     FlowCoverage {
         flow: "consume_batch",
         coverage: Coverage::NotApplicable(
-            "batch consume (`run_batch`) exists only on the Kafka backend; \
-             there is no in-process equivalent to measure",
+            "batch consume (`run_batch`) exists on InMemory too, but this \
+             bench harness has not wired a consume_batch flow for it yet",
         ),
     },
     FlowCoverage {

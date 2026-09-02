@@ -124,7 +124,9 @@ there rather than restating the table in a third place.
   `route_outcome`, not just one. The git history shows recurring
   "cross-backend consistency" commits because a fix landed in one backend and
   was missed in the others. When you touch retry/DLQ logic, check every backend
-  — and the broadcast settling path above, which bypasses `route_outcome`.
+  — and the two settling paths above that bypass `route_outcome`: broadcast
+  (`settle_broadcast_outcome`) and batch (`settle_batch_outcome` plus each
+  backend's own batch-flush arms).
 - **Conventional Commits** for commit messages. No CHANGELOG — releases are
   `release: vX.Y.Z` commits.
 - Do **not** add `Co-Authored-By` trailers to commits.
