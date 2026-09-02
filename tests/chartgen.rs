@@ -22,7 +22,7 @@ use chartgen::{ChartError, Document, Family};
 fn document(runs: &str) -> String {
     format!(
         r#"{{
-          "schema_version": 3,
+          "schema_version": 4,
           "generated_at": "2026-08-31T22:10:30Z",
           "shove_version": "0.14.0",
           "rust_version": "rustc 1.91.1",
@@ -38,7 +38,7 @@ fn document(runs: &str) -> String {
     )
 }
 
-/// A v3 row with an explicit `handler_cost` marker and setup window.
+/// A v4 row with an explicit `handler_cost` marker and setup window.
 fn scenario_with_cost(
     flow: &str,
     mode: &str,
@@ -48,6 +48,13 @@ fn scenario_with_cost(
     handler_cost: &str,
     setup_secs: &str,
 ) -> String {
+    // Since v3 every `consume_batch` row carries its batch knobs, and no
+    // other flow's row may carry them.
+    let batch_knobs = if flow == "consume_batch" {
+        r#""max_batch_size": 500, "max_batch_age_ms": 200,"#
+    } else {
+        ""
+    };
     format!(
         r#"{{
           "flow": "{flow}", "mode": "{mode}", "payload_bytes": {payload},
@@ -55,6 +62,7 @@ fn scenario_with_cost(
           "handler": "zero (no-op)",
           "handler_cost": "{handler_cost}",
           "setup_secs": {setup_secs},
+          {batch_knobs}
           "throughput_msg_per_sec": {throughput},
           "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
           "e2e_p50_ms": 1.5, "e2e_p95_ms": 4.0, "e2e_p99_ms": 9.0,
@@ -64,7 +72,7 @@ fn scenario_with_cost(
     )
 }
 
-/// A v3 row whose marker is what the harness would derive for a zero handler:
+/// A v4 row whose marker is what the harness would derive for a zero handler:
 /// publish flows carry `no_handler`, the barrier-less flows (`consume_fifo`,
 /// `dlq_drain`, `autoscaler`) carry `setup_bound`, everything else is a
 /// `framework` row with a separated window.
@@ -134,17 +142,17 @@ fn render_all(doc: &Document) -> Vec<(Family, String)> {
 
 #[test]
 fn unknown_schema_version_is_rejected() {
-    // An *older* version is refused the same as a newer one: a v2 consume
+    // An *older* version is refused the same as a newer one: through v3 a
     // row's duration included the group-join latency, so its throughput is
-    // not a drain rate and must never reach a v3 axis.
+    // not a drain rate and must never reach a v4 axis.
     let raw =
-        document(&inmemory_run(true)).replace("\"schema_version\": 3", "\"schema_version\": 2");
+        document(&inmemory_run(true)).replace("\"schema_version\": 4", "\"schema_version\": 2");
     let doc = parse(&raw);
 
     match chartgen::validate(&doc) {
         Err(ChartError::UnsupportedSchemaVersion { found, expected }) => {
             assert_eq!(found, 2);
-            assert_eq!(expected, 3);
+            assert_eq!(expected, 4);
         }
         other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
     }
@@ -156,7 +164,7 @@ fn unknown_schema_version_blocks_every_chart() {
     // validate() a caller might forget: a document from another schema must
     // not be able to produce a single chart.
     let raw =
-        document(&inmemory_run(true)).replace("\"schema_version\": 3", "\"schema_version\": 7");
+        document(&inmemory_run(true)).replace("\"schema_version\": 4", "\"schema_version\": 7");
     let doc = parse(&raw);
 
     for family in Family::ALL {
@@ -218,8 +226,8 @@ fn an_unknown_handler_cost_is_rejected_and_blocks_every_chart() {
 }
 
 #[test]
-fn a_missing_handler_cost_on_a_v3_row_is_rejected() {
-    // A v3 document whose rows lack the marker deserialises (the field
+fn a_missing_handler_cost_on_a_v4_row_is_rejected() {
+    // A v4 document whose rows lack the marker deserialises (the field
     // defaults so *older* documents fail by version, which is the legible
     // refusal) — but on a current-version row the absent marker must then be
     // refused here, not defaulted into "not framework" and quietly filtered.
@@ -308,6 +316,28 @@ fn the_sequenced_bar_is_a_labelled_lower_bound() {
     assert!(
         svg.contains("at least the bar shown"),
         "the caption must say which direction the bound points"
+    );
+}
+
+#[test]
+fn a_published_batch_bar_names_its_knobs() {
+    // Since v3 the batch knobs are what distinguish two otherwise
+    // byte-identical `consume_batch` rows, so a chart that publishes a batch
+    // number without them is a bar with no stated batch size.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_batch", "batch", 64, 1, 80_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    assert!(
+        svg.contains("up to 500 messages or 200 ms per batch"),
+        "the batch bar must state the knobs it ran with"
     );
 }
 
@@ -525,6 +555,10 @@ fn every_chart_renders_the_provenance_block() {
             "0.14.0",
             "aarch64 (6c / 15 GB)",
             "rustc 1.91.1",
+            // The handler profile the dataset ran under is provenance too: a
+            // no-op-handler dataset is a deliberate choice, stated on the
+            // artifact rather than in a PR thread.
+            "handler: zero (no-op)",
         ] {
             assert!(
                 svg.contains(token),

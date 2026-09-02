@@ -1,7 +1,7 @@
 //! Chart generation from the versioned benchmark results document.
 //!
 //! Reads `benches/results/bench-results.json` (the `bench-schema` contract at
-//! v3) and renders five SVG chart families into `docs/public/bench/`.
+//! v4) and renders five SVG chart families into `docs/public/bench/`.
 //!
 //! This module is the library half of `examples/chartgen.rs`; the example is a
 //! thin CLI over it. It is pulled in with `#[path]` from two targets — the
@@ -48,13 +48,14 @@ use serde::Deserialize;
 /// The only `schema_version` this generator understands.
 ///
 /// A document declaring anything else is refused outright rather than
-/// mis-rendered — in either direction. A newer file read as v3 would silently
+/// mis-rendered — in either direction. A newer file read as v4 would silently
 /// drop or misread whatever changed, and an *older* one is worse than stale:
-/// a v2 `duration_secs` on the consume rows included the consumer group's
-/// join latency, so its throughput values are not drain rates and must never
-/// share an axis with v3 numbers. A chart is exactly the artifact where that
-/// goes unnoticed.
-pub const SCHEMA_VERSION: u32 = 3;
+/// through v3, `duration_secs` on the consume rows included the consumer
+/// group's join latency (v4 put the drain behind a readiness barrier), so a
+/// prior version's throughput values are not drain rates and must never share
+/// an axis with v4 numbers. A chart is exactly the artifact where that goes
+/// unnoticed.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The closed `handler_cost` set from the schema contract — what a row's
 /// `throughput_msg_per_sec` is a measurement *of*.
@@ -173,12 +174,21 @@ pub struct ScenarioResult {
     pub handler: String,
     /// What `throughput_msg_per_sec` measures — one of [`HANDLER_COSTS`].
     ///
-    /// `default` so a pre-v3 document still deserialises far enough for the
+    /// `default` so a pre-v2 document still deserialises far enough for the
     /// schema-version check to refuse it *by version*, which names the actual
-    /// problem, rather than failing on a missing field. On a v3 document an
+    /// problem, rather than failing on a missing field. On a v4 document an
     /// absent marker is then caught by [`validate`] as an unknown (empty) one.
     #[serde(default)]
     pub handler_cost: String,
+    /// The `consume_batch` knobs a batch row ran with — present on every row
+    /// of that flow, absent everywhere else. Non-ignorable since v3: without
+    /// them a 50-message-batch row and a 500-message-batch row are
+    /// byte-identical, so any chart that publishes a batch number states
+    /// these in its caption.
+    #[serde(default)]
+    pub max_batch_size: Option<u64>,
+    #[serde(default)]
+    pub max_batch_age_ms: Option<u64>,
     /// The fixed setup cost the driver excluded from the measured window.
     /// `None` means this flow cannot separate the two. Carried for provenance;
     /// the publishability decision is `handler_cost`, which the harness
@@ -568,6 +578,24 @@ fn provenance(doc: &Document) -> (String, String) {
     if !doc.rust_version.is_empty() {
         second.push_str(&format!(" — {}", doc.rust_version));
     }
+    // The handler profiles the dataset was measured under, on the chart's
+    // face: an all-`zero (no-op)` dataset is a deliberate Tier B choice (the
+    // charts publish shove's own ceiling, not handler throughput), and that
+    // choice must be legible on the artifact itself, not in a PR thread.
+    let handlers: BTreeSet<&str> = doc
+        .runs
+        .iter()
+        .flat_map(|run| run.results.iter())
+        .filter(|row| !row.handler.is_empty())
+        .map(|row| row.handler.as_str())
+        .collect();
+    if !handlers.is_empty() {
+        let joined = handlers.into_iter().collect::<Vec<_>>().join(", ");
+        if !second.is_empty() {
+            second.push_str(" — ");
+        }
+        second.push_str(&format!("handler: {joined}"));
+    }
     (first, second)
 }
 
@@ -858,7 +886,11 @@ fn render_throughput_vs_consumers(
             pts.sort_by(|a, b| a.0.total_cmp(&b.0));
             pts
         },
-        |run| run.results.iter().any(|r| in_slice(r) && r.is_setup_bound()),
+        |run| {
+            run.results
+                .iter()
+                .any(|r| in_slice(r) && r.is_setup_bound())
+        },
     );
 
     let labels: Vec<String> = counts.iter().map(|c| format!("{c}")).collect();
@@ -884,8 +916,7 @@ fn render_throughput_vs_payload(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
-    let in_slice =
-        |r: &ScenarioResult| r.flow == HEADLINE_FLOW && r.consumers == BASE_CONSUMERS;
+    let in_slice = |r: &ScenarioResult| r.flow == HEADLINE_FLOW && r.consumers == BASE_CONSUMERS;
     let mut sizes: BTreeSet<u64> = BTreeSet::new();
     for run in &doc.runs {
         for r in &run.results {
@@ -898,9 +929,7 @@ fn render_throughput_vs_payload(
     if sizes.is_empty() {
         return Err(ChartError::NoDataForChart {
             family: "throughput-vs-payload",
-            slice: format!(
-                "{HEADLINE_FLOW} @ {BASE_CONSUMERS} consumer ({COST_FRAMEWORK} rows)"
-            ),
+            slice: format!("{HEADLINE_FLOW} @ {BASE_CONSUMERS} consumer ({COST_FRAMEWORK} rows)"),
         });
     }
     let idx: BTreeMap<u64, f64> = sizes
@@ -925,7 +954,11 @@ fn render_throughput_vs_payload(
             pts.sort_by(|a, b| a.0.total_cmp(&b.0));
             pts
         },
-        |run| run.results.iter().any(|r| in_slice(r) && r.is_setup_bound()),
+        |run| {
+            run.results
+                .iter()
+                .any(|r| in_slice(r) && r.is_setup_bound())
+        },
     );
 
     let labels: Vec<String> = sizes.iter().map(|s| fmt_payload(*s)).collect();
@@ -1261,6 +1294,7 @@ fn render_parallel_vs_sequenced(
 
     let mut groups = Vec::new();
     let mut notes = Vec::new();
+    let mut batch_knobs: BTreeSet<(String, u64, u64)> = BTreeSet::new();
     for run in &doc.runs {
         // Per mode: an absolute bar from the framework rows if any exist,
         // else a lower-bound bar from the setup-bound rows. Sequenced consume
@@ -1289,11 +1323,34 @@ fn render_parallel_vs_sequenced(
                                 r.is_framework()
                             }
                         })
-                        .map(|r| r.throughput_msg_per_sec)
-                        .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a| a.max(v))))
-                        .map(|value| Bar { value, lower_bound })
+                        .fold(None::<&ScenarioResult>, |acc, r| match acc {
+                            Some(a) if a.throughput_msg_per_sec >= r.throughput_msg_per_sec => {
+                                Some(a)
+                            }
+                            _ => Some(r),
+                        })
+                        .map(|r| {
+                            (
+                                Bar {
+                                    value: r.throughput_msg_per_sec,
+                                    lower_bound,
+                                },
+                                r,
+                            )
+                        })
                 };
-                best(false).or_else(|| best(true))
+                let won = best(false).or_else(|| best(true));
+                // A published batch bar states its knobs: since v3 they are
+                // what distinguishes a 50-message-batch row from a
+                // 500-message-batch one, so a bar without them would be a
+                // number with no stated batch size.
+                if *mode == "batch"
+                    && let Some((_, row)) = won
+                    && let (Some(size), Some(age)) = (row.max_batch_size, row.max_batch_age_ms)
+                {
+                    batch_knobs.insert((run.backend.clone(), size, age));
+                }
+                won.map(|(bar, _)| bar)
             })
             .collect();
 
@@ -1347,6 +1404,27 @@ fn render_parallel_vs_sequenced(
         });
     }
 
+    // One note when every backend's batch bar ran the same knobs (the usual
+    // case), per-backend notes when they differ — never silence, because the
+    // knobs are what the bar's number means.
+    let configs: BTreeSet<(u64, u64)> = batch_knobs.iter().map(|(_, s, a)| (*s, *a)).collect();
+    match configs.len() {
+        0 => {}
+        1 => {
+            let (size, age) = configs.first().copied().unwrap_or((0, 0));
+            notes.push(format!(
+                "batch bars: up to {size} messages or {age} ms per batch"
+            ));
+        }
+        _ => {
+            for (backend, size, age) in &batch_knobs {
+                notes.push(format!(
+                    "{backend} / batch: up to {size} messages or {age} ms per batch"
+                ));
+            }
+        }
+    }
+
     bar_chart(
         doc,
         root,
@@ -1395,7 +1473,12 @@ fn render_dispatch_latency(
             .iter()
             .filter(in_slice)
             .find(|r| r.is_framework())
-            .or_else(|| run.results.iter().filter(in_slice).find(|r| r.is_setup_bound()));
+            .or_else(|| {
+                run.results
+                    .iter()
+                    .filter(in_slice)
+                    .find(|r| r.is_setup_bound())
+            });
         match row {
             Some(r) => {
                 if !run.representative {
@@ -1488,18 +1571,35 @@ fn render_framework_overhead(
             .iter()
             .filter(in_slice)
             .filter(|r| r.is_framework() || r.handler_cost == COST_NO_HANDLER)
-            .map(|r| 1e9 / r.throughput_msg_per_sec)
-            // Best observed cost per message: the floor is the framework's own
+            // Best observed cost per message — the highest throughput, since
+            // ns/msg is its reciprocal: the floor is the framework's own
             // cost, anything above it is scheduling noise.
-            .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a: f64| a.min(v))));
+            .fold(None::<&ScenarioResult>, |acc, r| match acc {
+                Some(a) if a.throughput_msg_per_sec >= r.throughput_msg_per_sec => Some(a),
+                _ => Some(r),
+            });
 
         match measured {
-            Some(ns) => groups.push(BarGroup {
-                label: (*flow).to_string(),
-                bars: vec![Some(Bar::absolute(ns))],
-                shape_only: !run.representative,
-            }),
-            None if run.results.iter().filter(in_slice).any(|r| r.is_setup_bound()) => {
+            Some(row) => {
+                // A published batch number states its knobs (non-ignorable
+                // since v3): without them the bar has no stated batch size.
+                if let (Some(size), Some(age)) = (row.max_batch_size, row.max_batch_age_ms) {
+                    notes.push(format!(
+                        "{flow}: up to {size} messages or {age} ms per batch"
+                    ));
+                }
+                groups.push(BarGroup {
+                    label: (*flow).to_string(),
+                    bars: vec![Some(Bar::absolute(1e9 / row.throughput_msg_per_sec))],
+                    shape_only: !run.representative,
+                });
+            }
+            None if run
+                .results
+                .iter()
+                .filter(in_slice)
+                .any(|r| r.is_setup_bound()) =>
+            {
                 setup_bound.push(flow);
             }
             None => match unsupported_reason(run, flow) {
