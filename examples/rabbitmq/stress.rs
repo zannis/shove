@@ -133,7 +133,9 @@ async fn main() {
 
     // An AMQP delivery must be settled on the channel it arrived on, so the
     // drain runs on the fill phase's own client rather than a fresh one.
-    let dlq_drain: DlqDrainFn<RabbitMq> = Box::new(|client, handler| {
+    let dlq_drain: DlqDrainFn<RabbitMq> = Box::new(|client, handler, _stop| {
+        // This backend's `run_dlq` exits when the teardown closes the client;
+        // the stop token is for backends without that path (see `DlqDrainFn`).
         Box::pin(async move {
             let consumer = rmq::RabbitMqConsumer::new(client);
             consumer

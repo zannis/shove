@@ -105,13 +105,19 @@ async fn main() {
 
     // Same client for fill and drain: a second connection would race the
     // first rather than read what it produced.
-    let dlq_drain: DlqDrainFn<Redis> = Box::new(|client, handler| {
+    let dlq_drain: DlqDrainFn<Redis> = Box::new(|client, handler, stop| {
         Box::pin(async move {
+            // Redis's `run_dlq` runs until its task is dropped — `close` is a
+            // no-op on this backend — so the scenario stop token is its only
+            // stop signal. Cancelling at the `select!` boundary drops the
+            // drain at an await point, exactly what the abort it replaces did.
             let consumer = RedisConsumer::new(client);
-            consumer
-                .run_dlq::<StressTestTopic, _>(handler, ())
-                .await
-                .map_err(|e| format!("run_dlq: {e}"))
+            tokio::select! {
+                result = consumer.run_dlq::<StressTestTopic, _>(handler, ()) => {
+                    result.map_err(|e| format!("run_dlq: {e}"))
+                }
+                () = stop.cancelled() => Ok(()),
+            }
         })
     });
 
