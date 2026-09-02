@@ -6,28 +6,28 @@ Parallel vs sequenced consume
 64 B payload — least-parallel measurement per mode — what ordering costs — higher is better
 </text>
 <text x="24" y="249" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-sqs / parallel: not supported — not measured in this document: SQS runs only against LocalStack
+sqs / parallel: not measured in this document: SQS runs only against LocalStack (non-representative by
 </text>
 <text x="24" y="268" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-(non-representative by design) and requires a LocalStack Pro auth token, which is unavailable in the
+design) and requires a LocalStack Pro auth token, which is unavailable in the environment that produced
 </text>
 <text x="24" y="287" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-environment that produced these results
+these results
 </text>
 <text x="24" y="306" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-sqs / sequenced (fifo): not supported — not measured in this document: SQS runs only against LocalStack
+sqs / sequenced (fifo): not measured in this document: SQS runs only against LocalStack (non-representative
 </text>
 <text x="24" y="325" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-(non-representative by design) and requires a LocalStack Pro auth token, which is unavailable in the
+by design) and requires a LocalStack Pro auth token, which is unavailable in the environment that produced
 </text>
 <text x="24" y="344" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-environment that produced these results
+these results
 </text>
 <text x="24" y="363" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-inmemory, nats, rabbitmq, redis, sqs / batch: not supported — run_batch is implemented only for the Kafka
+inmemory, nats, rabbitmq, redis, sqs / batch: run_batch is implemented only for the Kafka backend; no other
 </text>
 <text x="24" y="382" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
-backend; no other backend exposes a batch consume primitive
+backend exposes a batch consume primitive
 </text>
 <text x="24" y="401" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 inmemory, kafka, nats, rabbitmq, redis / sequenced (fifo): lower bound (muted bar) — this window cannot

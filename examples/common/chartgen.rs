@@ -929,11 +929,16 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
     notes
 }
 
-/// The shared "declared capability hole" caption text. One owner, because
-/// the distinction it draws is load-bearing: this is a claim about the
-/// library.
+/// The caption text for a flow declared in `unsupported[]`: the document's
+/// own reason, verbatim, with no prefix of ours. The harness's capability
+/// holes are self-describing ("SQS does not implement HasCoordinatedGroups
+/// …", "run_batch is implemented only for the Kafka backend …"), and a
+/// hand-declared entry whose reason says "not measured in this document"
+/// must not be promoted into a "not supported" claim about the library by
+/// caption prose — the axis `n/s` marker is the rule-3 marker; the reason
+/// carries the classification.
 fn unsupported_text(reason: &str) -> String {
-    format!("not supported — {reason}")
+    reason.to_string()
 }
 
 /// The shared "supported but absent" caption text — a claim about the run,

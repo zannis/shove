@@ -505,8 +505,15 @@ fn unsupported_flow_is_marked_not_zeroed_and_not_dropped() {
     );
     assert!(svg.contains("n/s"), "no not-supported marker drawn");
     assert!(
-        svg.contains("not supported") && svg.contains("run_batch is Kafka-only"),
+        svg.contains("run_batch is Kafka-only"),
         "the reason from unsupported[] is not rendered"
+    );
+    // The caption is the document's own reason, verbatim: a declared entry
+    // whose reason says "not measured" must not be promoted into a
+    // "not supported" library claim by caption prose.
+    assert!(
+        !svg.contains("not supported —"),
+        "chartgen must not prefix its own capability claim onto the reason"
     );
 }
 
