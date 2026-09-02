@@ -5,6 +5,7 @@
 use crate::error::Result;
 
 pub(crate) mod autoscaler;
+pub(crate) mod batch_consumer;
 pub(crate) mod broadcast;
 pub mod capability;
 pub(crate) mod consumer;
@@ -14,6 +15,7 @@ pub(crate) mod registry;
 pub(crate) mod topology;
 
 pub(crate) use autoscaler::{AutoscalerBackendImpl, QueueStatsProviderImpl};
+pub(crate) use batch_consumer::{BatchConsumerImpl, BatchConsumerOptionsInner};
 pub(crate) use broadcast::BroadcastImpl;
 pub(crate) use consumer::ConsumerImpl;
 pub(crate) use options_inner::ConsumerOptionsInner;

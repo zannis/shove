@@ -3,9 +3,10 @@
 //!
 //! - [`HasCoordinatedGroups`] gates `ConsumerGroup<B>` / `consumer_group()`.
 //! - [`HasBroadcast`] gates `BroadcastSubscriber<B>` / `broadcast_subscriber()`.
+//! - [`HasBatchConsumption`] gates `BatchConsumer<B>` / `Broker::batch_consumer()`.
 //!
-//! SQS implements neither, so both entry points are compile errors on
-//! `Broker<Sqs>` rather than runtime surprises.
+//! SQS implements none of the three, so all three entry points are compile
+//! errors on `Broker<Sqs>` rather than runtime surprises.
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::autoscaler::AutoscalerConfig;
-use crate::backend::{Backend, BroadcastImpl, RegistryImpl};
+use crate::backend::{Backend, BatchConsumerImpl, BroadcastImpl, RegistryImpl};
 
 /// Capability: this backend has a broker-level coordinated-group primitive
 /// (Kafka consumer groups, RabbitMQ consistent-hash exchange, NATS
@@ -102,4 +103,41 @@ pub trait HasBroadcast: Backend {
     type BroadcastImpl: BroadcastImpl + Clone + Send + Sync + 'static;
 
     fn make_broadcast(client: &Self::Client) -> Self::BroadcastImpl;
+}
+
+/// Capability: this backend has a batch-consumption primitive — buffering up
+/// to N messages before handing them to the handler as a single call, so a
+/// sink amortises its per-flush cost (one DB transaction, one HTTP request)
+/// across many messages instead of paying it per message.
+///
+/// # Which backends implement this
+///
+/// This is the authoritative list; [`Broker::batch_consumer`](crate::Broker::batch_consumer)
+/// and [`BatchConsumer`](crate::batch_consumer::BatchConsumer)'s docs defer to
+/// it.
+///
+/// | Backend | Implements `HasBatchConsumption` |
+/// |---|---|
+/// | **Kafka** | **yes** |
+/// | **InMemory** | not yet (pending) |
+/// | **NATS** | not yet (pending) |
+/// | **RabbitMQ** | not yet (pending) |
+/// | **Redis** (`redis-streams`) | not yet (pending) |
+/// | **SQS** | not yet (pending) — will land with a documented 10-message receive cap |
+///
+/// Unlike [`HasBroadcast`]'s permanent exclusion of SQS, every row above other
+/// than Kafka is *pending*, not excluded: each backend gets this capability as
+/// its own batch consumer is implemented, and `Broker::batch_consumer()`
+/// starts compiling on that marker the moment it does.
+///
+/// Sealed via `Backend`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` has no batch-consumption implementation yet, so `.batch_consumer()` is unavailable.",
+    note = "Only Kafka implements `HasBatchConsumption` today. InMemory, NATS, RabbitMQ, Redis and SQS are pending — SQS will land with a documented 10-message receive cap. Use a single-message consumer in the meantime."
+)]
+#[allow(private_interfaces, private_bounds)]
+pub trait HasBatchConsumption: Backend {
+    type BatchConsumerImpl: BatchConsumerImpl + Clone + Send + Sync + 'static;
+
+    fn make_batch_consumer(client: &Self::Client) -> Self::BatchConsumerImpl;
 }

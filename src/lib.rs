@@ -17,7 +17,8 @@
 //!    ├─ .consumer_supervisor()  → ConsumerSupervisor<B>   (all backends)
 //!    ├─ .autoscaler()           → B::AutoscalerImpl       (all backends)
 //!    ├─ .consumer_group()       → ConsumerGroup<B>        (B: HasCoordinatedGroups)
-//!    └─ .broadcast_subscriber() → BroadcastSubscriber<B>  (B: HasBroadcast)
+//!    ├─ .broadcast_subscriber() → BroadcastSubscriber<B>  (B: HasBroadcast)
+//!    └─ .batch_consumer()       → BatchConsumer<B>        (B: HasBatchConsumption)
 //! ```
 //!
 //! # Capability gating
@@ -36,6 +37,10 @@
 //!   trait for which backends implement it today. SQS is excluded permanently;
 //!   the rest are excluded by the same compile-time gate until their
 //!   implementation lands.
+//! - [`HasBatchConsumption`] separately gates [`Broker::batch_consumer`], for
+//!   handler amortisation — buffering up to N messages before one flush.
+//!   Kafka implements it today; every other backend is pending (not
+//!   permanently excluded — see that trait for the authoritative list).
 //!
 //! # Feature flags
 //!
@@ -158,6 +163,7 @@ pub mod autoscale_metrics;
 pub mod autoscaler;
 pub mod backend;
 pub mod batch;
+pub mod batch_consumer;
 pub mod broadcast;
 pub mod broker;
 pub mod codec;
@@ -210,7 +216,10 @@ pub(crate) mod supervision;
 
 pub use audit::{AuditHandler, AuditRecord, Audited};
 pub use autoscale_metrics::AutoscaleMetrics;
-pub use backend::{Backend, capability::HasBroadcast, capability::HasCoordinatedGroups};
+pub use backend::{
+    Backend, capability::HasBatchConsumption, capability::HasBroadcast,
+    capability::HasCoordinatedGroups,
+};
 pub use batch::BatchFailure;
 pub use codec::{Codec, JsonCodec, RawBytesCodec};
 #[cfg(feature = "protobuf")]
@@ -221,7 +230,8 @@ pub use codecs::protobuf::ProtobufCodec;
 pub use codecs::sbe::{SbeByteOrder, SbeCodec, SbeCodecError, SbeFrame, SbeHeader, SbeMessage};
 pub use consumer::{
     ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE,
-    DEFAULT_KAFKA_MAX_BATCH_SIZE, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
+    DEFAULT_KAFKA_MAX_BATCH_SIZE, DEFAULT_MAX_BATCH_AGE, DEFAULT_MAX_BATCH_SIZE,
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::ShoveError;
@@ -246,6 +256,7 @@ pub use autoscaler::{
 pub use queue_depth::QueueDepthSampler;
 
 // --- v2 generic wrappers (Phase 5) ---
+pub use batch_consumer::{BatchConsumer, BatchConsumerOptions};
 pub use broadcast::BroadcastSubscriber;
 pub use broker::Broker;
 pub use consumer_group::{ConsumerGroup, ConsumerGroupConfig};

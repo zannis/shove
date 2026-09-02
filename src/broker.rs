@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use crate::backend::Backend;
-use crate::backend::capability::{HasBroadcast, HasCoordinatedGroups};
+use crate::backend::capability::{HasBatchConsumption, HasBroadcast, HasCoordinatedGroups};
+use crate::batch_consumer::BatchConsumer;
 use crate::broadcast::BroadcastSubscriber;
 use crate::consumer_group::ConsumerGroup;
 use crate::consumer_supervisor::ConsumerSupervisor;
@@ -163,6 +164,18 @@ impl<B: HasBroadcast> Broker<B> {
     /// are excluded by the same gate until it lands.
     pub fn broadcast_subscriber(&self) -> BroadcastSubscriber<B> {
         BroadcastSubscriber::new(&self.client)
+    }
+}
+
+impl<B: HasBatchConsumption> Broker<B> {
+    /// Return a [`BatchConsumer`] for handler amortisation: buffering up to
+    /// N messages before invoking the handler once with the whole batch,
+    /// instead of once per message.
+    ///
+    /// Gated on [`HasBatchConsumption`], which not every backend implements
+    /// yet — see that trait for the authoritative list.
+    pub fn batch_consumer(&self) -> BatchConsumer<B> {
+        BatchConsumer::new(&self.client)
     }
 }
 

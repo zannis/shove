@@ -18,16 +18,16 @@ use tokio_util::sync::CancellationToken;
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::autoscaler::AutoscalerConfig;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, BroadcastImpl, ConsumerImpl, ConsumerOptionsInner,
-    QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
-    capability::{HasBroadcast, HasCoordinatedGroups},
+    AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, BroadcastImpl,
+    ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl, RegistryImpl, TopologyImpl,
+    capability::{HasBatchConsumption, HasBroadcast, HasCoordinatedGroups},
     sealed,
 };
 use crate::consumer_supervisor::{ShutdownTally, SupervisorOutcome};
 use crate::error::Result;
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::Kafka;
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 
 use super::autoscaler::{KafkaAutoscalerBackend, KafkaLagStatsProvider, KafkaQueueStatsProvider};
 use super::client::{KafkaClient, KafkaConfig};
@@ -139,6 +139,31 @@ impl BroadcastImpl for KafkaConsumer {
         H: MessageHandler<T>,
     {
         KafkaConsumer::run_broadcast_with_inner::<T, H>(self, handler, ctx, options).await
+    }
+}
+
+impl HasBatchConsumption for Kafka {
+    // Same consumer type as the shared and broadcast paths — `run_batch`
+    // needs no state `run`/`run_broadcast` don't already carry.
+    type BatchConsumerImpl = KafkaConsumer;
+
+    fn make_batch_consumer(client: &Self::Client) -> Self::BatchConsumerImpl {
+        KafkaConsumer::new(client.clone())
+    }
+}
+
+impl BatchConsumerImpl for KafkaConsumer {
+    async fn run_batch<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        KafkaConsumer::run_batch_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 
