@@ -13,17 +13,23 @@ use super::constants::{
 };
 use super::topology::InMemoryTopologyDeclarer;
 use crate::backend::ConsumerOptionsInner;
+use crate::backend::batch_consumer::{
+    BatchConsumerOptionsInner, BatchSettlement, RejectSettlement, TerminalDiscard,
+    batch_redelivery_backoff, invoke_batch_handler, reject_settlement, settle_batch_outcome,
+    validate_batch_topic,
+};
 use crate::consumer::validate_message_size;
 use crate::consumer_supervisor::{SupervisorOutcome, drive_fifo_until_timeout};
 use crate::error::{Result, ShoveError};
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::metadata::{DeadMessageMetadata, MessageMetadata};
 use crate::metrics;
 use crate::outcome::Outcome;
+use crate::retry::Backoff;
 use crate::routing::{
     PoisonedKeys, RetryDecision, decide_retry, handler_timeout_outcome, hold_index,
 };
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::{QueueTopology, SequenceFailure};
 use crate::{ConsumerOptions, InMemory};
 
@@ -152,6 +158,19 @@ impl InMemoryConsumer {
         H: MessageHandler<T>,
     {
         run_broadcast_impl::<T, H>(self.broker.clone(), handler, ctx, options)
+    }
+
+    pub(crate) fn run_batch_with_inner<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        run_batch_impl::<T, H>(self.broker.clone(), handler, ctx, options)
     }
 }
 
@@ -766,7 +785,10 @@ async fn route_reject_sequenced(
     poisoned: &PoisonedKeys,
     pending: metrics::PendingDiscard,
 ) {
-    resolve_reject(route_reject(broker, topology, env).await, pending);
+    resolve_reject(
+        route_reject(broker, topology, env, "rejected").await,
+        pending,
+    );
     poisoned.poison(key);
 }
 
@@ -878,7 +900,10 @@ async fn route_outcome(
             // In-memory's DLQ enqueue path is `route_reject` for both
             // `Reject` and `max_retries_exceeded`; it does not differentiate
             // the reason beyond the metric recorded above.
-            resolve_reject(route_reject(broker, topology, env).await, pending);
+            resolve_reject(
+                route_reject(broker, topology, env, "rejected").await,
+                pending,
+            );
         }
         RetryDecision::Hold { increment } => {
             schedule_redelivery(
@@ -1057,6 +1082,12 @@ async fn subscription_cancelled(token: &Option<CancellationToken>) {
 
 /// Dead-letter a rejected message, or drop it when there is nowhere to put it.
 ///
+/// `reason` is stamped into [`X_DEATH_REASON`] verbatim — the single-message
+/// and sequenced paths always pass `"rejected"`, but the batch path also
+/// dead-letters a pre-handler drop (`"oversize"`, `"deserialize"`) under its
+/// own reason, so the DLQ record says what actually happened rather than a
+/// blanket "rejected".
+///
 /// Returns whether the message reached the DLQ. `false` covers all three ways
 /// it can end up gone: no DLQ declared, a DLQ declared but absent from the
 /// broker, and an enqueue that failed. Callers use this to decide whether the
@@ -1065,10 +1096,12 @@ async fn route_reject(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     mut env: Envelope,
+    reason: &str,
 ) -> bool {
     let Some(dlq_name) = topology.dlq() else {
         tracing::warn!(
             queue = topology.queue(),
+            reason,
             "message rejected but no DLQ configured — discarding"
         );
         return false;
@@ -1079,7 +1112,7 @@ async fn route_reject(
     };
 
     env.headers
-        .insert(X_DEATH_REASON.to_string(), "rejected".to_string());
+        .insert(X_DEATH_REASON.to_string(), reason.to_string());
     env.headers
         .insert(X_ORIGINAL_QUEUE.to_string(), topology.queue().to_string());
     let count = env
@@ -1096,6 +1129,418 @@ async fn route_reject(
         return false;
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Batch consumption
+// ---------------------------------------------------------------------------
+
+/// Pop exactly one envelope, blocking until one is available.
+///
+/// Re-checks the buffer *before* awaiting `queue.ready.notified()` — a
+/// `Notify` holds at most one permit, so N publishes that land while nothing
+/// is waiting collapse to a single wake-up; checking first (then only
+/// awaiting when genuinely empty) is what makes that collapsing harmless
+/// instead of a missed wake-up.
+///
+/// The tail after acquiring the lock — pop, `space.notify_one`,
+/// `in_flight.fetch_add` — is entirely synchronous, with no `.await` between
+/// the pop and the return. That matters because this runs as one arm of
+/// `run_batch_impl`'s outer `tokio::select!`: a losing arm can only cancel
+/// this future at an `.await` point, so once the lock is held there is no
+/// window where a pop is torn down half-applied (buffer emptied but
+/// `in_flight` never incremented, or vice versa).
+async fn pop_one(queue: &QueueState) -> Envelope {
+    loop {
+        let notified = queue.ready.notified();
+        tokio::pin!(notified);
+        {
+            let mut buf = queue.buffer.lock().await;
+            if let Some(env) = buf.pop_front() {
+                queue.space.notify_one();
+                queue.in_flight.fetch_add(1, Ordering::Release);
+                return env;
+            }
+        }
+        notified.await;
+    }
+}
+
+/// One in-flight batch, built up across `run_batch_impl`'s pops and consumed
+/// by `flush_inmemory_batch`. Mirrors Kafka's `BatchBuffer` (same concept, no
+/// offsets): `messages`/`envelopes` are index-parallel — the envelope for
+/// `messages[i]` is `envelopes[i]`, kept so a `Redeliver` settlement can put
+/// the exact same envelope back rather than reconstructing one.
+struct InMemoryBatch<T: Topic> {
+    messages: Vec<(T::Message, MessageMetadata)>,
+    envelopes: Vec<Envelope>,
+    /// Pre-handler drops with an envelope worth keeping — only when the
+    /// topology declares a DLQ, mirroring Kafka's `retain_raw` gate
+    /// (`BatchBuffer::drop_message`): with nowhere to publish it, holding the
+    /// envelope until the flush buys nothing, and the drop is as final as it
+    /// will ever be the moment it happens.
+    parked: Vec<(Envelope, metrics::FailReason)>,
+    /// Every pre-handler drop, DLQ or not — `flush_len` has to count these so
+    /// a flush window of nothing but poison still hits `max_batch_size`
+    /// instead of growing for the whole `max_batch_age`.
+    dropped: usize,
+}
+
+impl<T: Topic> InMemoryBatch<T> {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            envelopes: Vec::new(),
+            parked: Vec::new(),
+            dropped: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.dropped == 0
+    }
+
+    /// Messages plus every pre-handler drop — the quantity `max_batch_size`
+    /// bounds, so an all-poison window still trips the size trigger.
+    fn flush_len(&self) -> usize {
+        self.messages.len() + self.dropped
+    }
+
+    fn push(&mut self, message: T::Message, metadata: MessageMetadata, envelope: Envelope) {
+        self.messages.push((message, metadata));
+        self.envelopes.push(envelope);
+    }
+
+    fn drop_message(&mut self, envelope: Option<Envelope>, reason: metrics::FailReason) {
+        self.dropped += 1;
+        if let Some(envelope) = envelope {
+            self.parked.push((envelope, reason));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.envelopes.clear();
+        self.parked.clear();
+        self.dropped = 0;
+    }
+}
+
+/// Fields `flush_inmemory_batch` needs that do not change across flushes —
+/// split out so the flush function's signature does not grow every time a new
+/// one is needed, mirroring Kafka's `BatchFlushCtx`.
+struct InMemoryFlushCtx<'a> {
+    broker: &'a InMemoryBroker,
+    topology: &'static QueueTopology,
+    queue: &'a Arc<QueueState>,
+    topic: &'a str,
+    group: Option<&'a str>,
+    shutdown: &'a CancellationToken,
+    handler_timeout: Option<Duration>,
+    handler_timeout_outcome: Option<Outcome>,
+}
+
+/// Publish every parked pre-handler drop to the DLQ (a no-op per entry when
+/// the topology has none — `route_reject` logs and returns `false`), then
+/// drop the list. Pre-handler drops are not part of the terminal-accounting
+/// contract on this backend's batch path — mirroring Kafka's
+/// `publish_pending_dlq` — so there is no discard to settle either way.
+async fn publish_parked(
+    flush: &InMemoryFlushCtx<'_>,
+    parked: &mut Vec<(Envelope, metrics::FailReason)>,
+) {
+    for (envelope, reason) in parked.drain(..) {
+        let _reached_dlq =
+            route_reject(flush.broker, flush.topology, envelope, reason.as_label()).await;
+    }
+}
+
+/// Release `n` popped-but-unsettled envelopes back to the queue's in-flight
+/// count. Called exactly once per flush, for `flush_len()` envelopes — see
+/// [`run_batch_impl`]'s doc for the balance invariant this maintains.
+fn release_in_flight(queue: &QueueState, n: u64) {
+    if n > 0 {
+        queue.in_flight.fetch_sub(n, Ordering::Release);
+    }
+}
+
+/// Hands the buffered batch to the handler and applies the single returned
+/// [`Outcome`] via the shared [`settle_batch_outcome`] classifier — the same
+/// three-way split Kafka's `flush_batch` uses, with InMemory's own mechanics
+/// in each arm:
+///
+/// - `Commit`: every parked pre-handler drop is published to the DLQ (or
+///   discarded, with none declared) and the batch's envelopes are gone for
+///   good — there is no broker ack that can still fail afterwards, so
+///   retirement is immediate. See `route_reject`'s doc and
+///   [`crate::backend::broadcast::settle_broadcast_outcome`]'s sibling
+///   rationale (`src/backend/broadcast.rs:134-142`) for why an in-process
+///   backend can settle without waiting on a commit result.
+/// - `DeadLetter`: terminal, exactly as every other reject path — every
+///   *handled* message is individually routed to the DLQ (or discarded) via
+///   [`crate::backend::batch_consumer::reject_settlement`], then the parked
+///   pre-handler drops are published the same way `Commit` publishes them.
+/// - `Redeliver`: the whole batch — handled envelopes plus parked ones —
+///   goes back to the front of the queue via `InMemoryBroker::requeue_front`,
+///   so the next pop sees it again instead of it being silently skipped.
+///   Retry counters are **not** incremented: this models Kafka's seek-back,
+///   not a republish, and there is no per-batch retry budget either way (see
+///   [`crate::backend::batch_consumer::BatchSettlement`]'s doc).
+///
+/// Every branch — including the empty-batch one below — releases exactly
+/// `flush_len()` envelopes back to `queue.in_flight`, whether or not each one
+/// had a surviving envelope to redeliver: a no-DLQ pre-handler drop was
+/// already destroyed the moment it was popped (nothing retains it — see
+/// [`InMemoryBatch::drop_message`]), but its `in_flight` increment from
+/// `pop_one` is still outstanding until this flush resolves it.
+async fn flush_inmemory_batch<T, H>(
+    flush: &InMemoryFlushCtx<'_>,
+    handler: &H,
+    ctx: &H::Context,
+    batch: &mut InMemoryBatch<T>,
+    redelivery_backoff: &mut Backoff,
+) where
+    T: Topic,
+    H: BatchMessageHandler<T>,
+{
+    let flush_len = batch.flush_len();
+    if flush_len == 0 {
+        return;
+    }
+    let batch_size = batch.messages.len();
+
+    // Every message in this flush was dropped pre-handler. Nothing to hand
+    // the handler, but the parked ones (if any survived to be parked) still
+    // need publishing, and every popped envelope still needs its in-flight
+    // slot released.
+    if batch_size == 0 {
+        publish_parked(flush, &mut batch.parked).await;
+        release_in_flight(flush.queue, flush_len as u64);
+        batch.clear();
+        return;
+    }
+
+    let messages = std::mem::take(&mut batch.messages);
+    let outcome = invoke_batch_handler(
+        || handler.handle_batch(messages, ctx),
+        flush.handler_timeout,
+        flush.handler_timeout_outcome.clone(),
+        flush.topic,
+        flush.group,
+        batch_size as u64,
+    )
+    .await;
+
+    match settle_batch_outcome(&outcome) {
+        BatchSettlement::Commit => {
+            publish_parked(flush, &mut batch.parked).await;
+            release_in_flight(flush.queue, flush_len as u64);
+            *redelivery_backoff = batch_redelivery_backoff();
+            batch.clear();
+        }
+        BatchSettlement::DeadLetter => {
+            let has_dlq = flush.topology.dlq().is_some();
+            let envelopes = std::mem::take(&mut batch.envelopes);
+            for envelope in envelopes {
+                let pending = metrics::record_terminal(
+                    flush.topic,
+                    flush.group,
+                    metrics::FailReason::Rejected,
+                    has_dlq,
+                );
+                let reached_dlq =
+                    route_reject(flush.broker, flush.topology, envelope, "rejected").await;
+                // InMemory owns the envelope outright and retires it the
+                // instant `route_reject` returns — there is no separate
+                // broker ack that could still fail, so the discard settles
+                // now instead of waiting on one. Same rationale as
+                // `settle_broadcast_outcome`'s immediate confirm
+                // (`src/backend/broadcast.rs:134-142`).
+                match reject_settlement(has_dlq, reached_dlq) {
+                    RejectSettlement::InDlq => pending.survived(),
+                    RejectSettlement::Retired => TerminalDiscard::Retired(pending).confirm(),
+                    RejectSettlement::Lost => TerminalDiscard::Lost(pending).confirm(),
+                }
+            }
+            publish_parked(flush, &mut batch.parked).await;
+            release_in_flight(flush.queue, flush_len as u64);
+            *redelivery_backoff = batch_redelivery_backoff();
+            batch.clear();
+        }
+        BatchSettlement::Redeliver => {
+            // `Backoff::next()` never returns `None` (see its doc) — the
+            // fallback exists only so this cannot panic if that ever changed.
+            let delay = redelivery_backoff.next().unwrap_or(Duration::from_secs(30));
+            tracing::warn!(
+                queue = flush.topology.queue(),
+                batch_size,
+                ?outcome,
+                delay_ms = delay.as_millis() as u64,
+                "batch handler returned a non-Ack outcome, redelivering the whole batch"
+            );
+
+            let mut to_requeue = std::mem::take(&mut batch.envelopes);
+            to_requeue.extend(batch.parked.drain(..).map(|(env, _)| env));
+            batch.clear();
+
+            // Shutdown cuts only the delay, not the redelivery itself: a
+            // wedged handler must not add the full backoff to every stop, but
+            // the batch must still make it back to the queue rather than
+            // being silently dropped.
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = flush.shutdown.cancelled() => {}
+            }
+
+            release_in_flight(flush.queue, flush_len as u64);
+            flush.broker.requeue_front(flush.queue, to_requeue).await;
+        }
+    }
+}
+
+/// [`BatchConsumerImpl::run_batch`](crate::backend::BatchConsumerImpl) for
+/// InMemory. Mirrors Kafka's `run_batch_inner`'s *semantics* — size/age
+/// flush triggers, pre-handler oversize/undecodable drops, one DLQ copy per
+/// commit, whole-batch redelivery — over InMemory's own mechanics: a
+/// `VecDeque` buffer instead of partition offsets, `requeue_front` instead of
+/// a seek, immediate settlement instead of a commit round trip.
+///
+/// # Loop shape
+///
+/// Each iteration first flushes if `flush_len() >= max_batch_size` (checked
+/// *before* selecting, so a size-triggered flush doesn't wait on the next
+/// event) and otherwise `select!`s over shutdown, the broker's own shutdown,
+/// the armed age deadline, and [`pop_one`] — which itself awaits only when
+/// the buffer is genuinely empty (see its doc). At most one envelope is
+/// popped per iteration, so the deadline and size cap are both re-checked
+/// between pops rather than racing a batch of unbounded size past either.
+///
+/// # `in_flight` balance
+///
+/// Every envelope [`pop_one`] pops increments `queue.in_flight` exactly
+/// once. It is decremented exactly once, by [`release_in_flight`], on
+/// whichever settlement resolves it: `Commit` and `DeadLetter` release the
+/// whole flush once their DLQ work is done, `Redeliver` releases it at
+/// `requeue_front` (the envelope is back in the buffer, no longer "in
+/// flight"). A pre-handler drop with no DLQ is destroyed immediately, before
+/// any of these — see [`InMemoryBatch::drop_message`] — but its `in_flight`
+/// slot is still only released when its batch's flush resolves, keeping the
+/// increments and decrements paired 1:1 regardless of which path retired the
+/// envelope.
+///
+/// Unlike the single-message consumer path, there is no `processing` flag to
+/// mirror here: `BatchConsumerOptionsInner` carries none — batch consumption
+/// is not registered with a coordinated-group registry, so nothing reads it.
+/// `in_flight` is the signal an autoscaler or queue-depth sampler has for
+/// this consumer.
+///
+/// `options.max_reconnect_attempts` is a documented no-op here: it exists on
+/// `BatchConsumerOptionsInner` for trait-shape parity with Kafka, but there is
+/// nothing to reconnect to for an in-process broker, exactly as on every
+/// other InMemory consumer path.
+pub(crate) async fn run_batch_impl<T, H>(
+    broker: InMemoryBroker,
+    handler: H,
+    ctx: H::Context,
+    options: BatchConsumerOptionsInner,
+) -> Result<()>
+where
+    T: NotSequenced,
+    H: BatchMessageHandler<T>,
+{
+    validate_batch_topic::<T>()?;
+    let topology = T::topology();
+    let queue_name = topology.queue();
+    let queue = broker.lookup(queue_name)?;
+    let broker_shutdown = broker.shutdown_token().clone();
+    let shutdown = options.shutdown.clone();
+    let group = options.consumer_group.clone();
+    let topic: Arc<str> = Arc::from(queue_name);
+    let max_batch_size = options.max_batch_size.max(1);
+    let max_batch_age = options.max_batch_age;
+    let max_message_size = options.max_message_size;
+    let handler_timeout = options.handler_timeout;
+    let handler_timeout_outcome = options.handler_timeout_outcome.clone();
+
+    let flush_ctx = InMemoryFlushCtx {
+        broker: &broker,
+        topology,
+        queue: &queue,
+        topic: topic.as_ref(),
+        group: group.as_deref(),
+        shutdown: &shutdown,
+        handler_timeout,
+        handler_timeout_outcome,
+    };
+
+    let has_dlq = topology.dlq().is_some();
+    let mut batch: InMemoryBatch<T> = InMemoryBatch::new();
+    let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut redelivery_backoff = batch_redelivery_backoff();
+
+    tracing::info!(
+        queue = queue_name,
+        max_batch_size,
+        ?max_batch_age,
+        "InMemory batch consumer started"
+    );
+
+    loop {
+        if batch.flush_len() >= max_batch_size {
+            flush_inmemory_batch(
+                &flush_ctx,
+                &handler,
+                &ctx,
+                &mut batch,
+                &mut redelivery_backoff,
+            )
+            .await;
+            deadline = None;
+            continue;
+        }
+
+        let sleep_until_deadline = async {
+            match deadline.as_mut() {
+                Some(d) => d.await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                if !batch.is_empty() {
+                    flush_inmemory_batch(&flush_ctx, &handler, &ctx, &mut batch, &mut redelivery_backoff).await;
+                }
+                tracing::info!(queue = queue_name, "shutdown signal received, InMemory batch consumer stopped");
+                return Ok(());
+            }
+            () = broker_shutdown.cancelled() => {
+                if !batch.is_empty() {
+                    flush_inmemory_batch(&flush_ctx, &handler, &ctx, &mut batch, &mut redelivery_backoff).await;
+                }
+                return Ok(());
+            }
+            () = sleep_until_deadline => {
+                flush_inmemory_batch(&flush_ctx, &handler, &ctx, &mut batch, &mut redelivery_backoff).await;
+                deadline = None;
+            }
+            env = pop_one(&queue) => {
+                if deadline.is_none() {
+                    deadline = Some(Box::pin(tokio::time::sleep(max_batch_age)));
+                }
+                match prepare_message::<T>(&env, max_message_size, &topic, group.as_deref()) {
+                    Ok((message, metadata)) => {
+                        batch.push(message, metadata, env);
+                    }
+                    Err(reason) => {
+                        metrics::record_failed(&topic, group.as_deref(), reason);
+                        batch.drop_message(has_dlq.then_some(env), reason);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

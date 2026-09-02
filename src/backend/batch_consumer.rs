@@ -24,14 +24,14 @@
 //! `#[allow(dead_code)]`-over-losing-coverage trade `ConsumerOptionsInner`
 //! and `settle_broadcast_outcome` already make.
 //!
-//! Everything else here is gated `#[cfg(feature = "kafka")]` rather than
-//! `any(feature = "kafka", feature = "inmemory")`, even though InMemory is a
-//! named future caller: InMemory has no batch-consumption implementation yet,
-//! so gating on `inmemory` too would leave these helpers caller-less under
-//! that feature alone — `dead_code` under CI's inmemory-only clippy leg on
-//! this intermediate commit. Widen the gate to include `inmemory` once
-//! InMemory's batch consumer lands, and to each further backend as its lands
-//! in turn.
+//! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
+//! "inmemory"))]`: both backends now have a batch-consumption implementation
+//! and share this settlement machinery. The gate widens per-backend as
+//! T2–T5 land in turn — NATS, RabbitMQ, Redis, SQS each add their own
+//! feature to the list the moment their `BatchConsumerImpl` exists, exactly
+//! as `broadcast.rs`'s gate widened backend by backend. `kafka` itself must
+//! never leave the list while it stands, per the single-message dependency
+//! noted above.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -212,10 +212,13 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated to `kafka` only — see the module doc's "Gating" section for why this
-// is not `any(feature = "kafka", feature = "inmemory")` yet.
-#[cfg(feature = "kafka")]
-mod kafka_batch_only {
+// Gated `any(kafka, inmemory)` — see the module doc's "Gating" section. Named
+// `settling` rather than after either backend: it houses the settlement
+// classifier + panic/timeout invariant surface both backends' batch loops
+// route through, plus the terminal-discard machinery Kafka's single-message
+// path also depends on (see the module doc's `kafka` note).
+#[cfg(any(feature = "kafka", feature = "inmemory"))]
+mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
     use std::time::{Duration, Instant};
@@ -251,6 +254,13 @@ mod kafka_batch_only {
         }
 
         /// The commit did not land, so the message will be redelivered.
+        ///
+        /// Kafka-only in practice: its offset commit is the one settlement
+        /// point in either backend's batch path that can fail after the
+        /// terminal decision is made. InMemory retires a rejected message the
+        /// instant its DLQ hand-off resolves — there is no later commit that
+        /// could still fail — so under `inmemory` alone this has no caller.
+        #[allow(dead_code)]
         pub(crate) fn survived(self) {
             match self {
                 Self::Retired(pending) | Self::Lost(pending) => pending.survived(),
@@ -635,8 +645,8 @@ mod kafka_batch_only {
     }
 }
 
-#[cfg(feature = "kafka")]
-pub(crate) use kafka_batch_only::{
+#[cfg(any(feature = "kafka", feature = "inmemory"))]
+pub(crate) use settling::{
     RejectSettlement, TerminalDiscard, batch_redelivery_backoff, invoke_batch_handler,
     reject_settlement,
 };

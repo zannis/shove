@@ -374,6 +374,37 @@ impl InMemoryBroker {
             }
         }
     }
+
+    /// Put a whole batch back at the *front* of `queue`, for the batch
+    /// consumer's redelivery path (`run_batch_impl`'s `Redeliver` arm) — the
+    /// closest in-process analogue of Kafka's seek-back.
+    ///
+    /// `envs` is pushed in reverse so the batch's original order is restored
+    /// (each `push_front` puts one envelope ahead of whatever was pushed
+    /// before it, so pushing the batch's *last* envelope first leaves the
+    /// *first* one at the very front). `ready` is notified once per envelope
+    /// rather than once total: a consumer parked on an empty buffer holds at
+    /// most one `Notify` permit, so restoring N messages with a single
+    /// `notify_one()` would only wake the pop loop for the first of them.
+    ///
+    /// Capacity is deliberately never re-checked here, unlike [`Self::enqueue`]:
+    /// every one of `envs` already held a buffer slot before `run_batch_impl`
+    /// popped it, so putting them back can only return the buffer to a size it
+    /// already reached once. Waiting for capacity instead would risk deadlock
+    /// if the queue filled back up to its cap while the batch was in flight —
+    /// there would be nothing left to redeliver the batch behind.
+    pub(super) async fn requeue_front(&self, queue: &QueueState, envs: Vec<Envelope>) {
+        let count = envs.len();
+        {
+            let mut buf = queue.buffer.lock().await;
+            for env in envs.into_iter().rev() {
+                buf.push_front(env);
+            }
+        }
+        for _ in 0..count {
+            queue.ready.notify_one();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -39,8 +39,8 @@
 //!   implementation lands.
 //! - [`HasBatchConsumption`] separately gates [`Broker::batch_consumer`], for
 //!   handler amortisation — buffering up to N messages before one flush.
-//!   Kafka implements it today; every other backend is pending (not
-//!   permanently excluded — see that trait for the authoritative list).
+//!   Kafka and InMemory implement it today; every other backend is pending
+//!   (not permanently excluded — see that trait for the authoritative list).
 //!
 //! # Feature flags
 //!
@@ -194,6 +194,7 @@ pub mod topology_declarer;
 
 mod backends;
 #[cfg(any(
+    feature = "inmemory",
     feature = "rabbitmq",
     feature = "nats",
     feature = "kafka",
