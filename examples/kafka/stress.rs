@@ -136,11 +136,55 @@ async fn main() {
             })
             .await
             .map_err(|e| format!("purge probe task: {e}"))??;
+            // `DeleteGroups` refuses a group that still has members
+            // (`NonEmptyGroup`), and the previous scenario's members are not
+            // reliably gone by the time we get here: the batch flow aborts
+            // its drivers rather than shutting them down, so whether their
+            // LeaveGroup ever reaches the coordinator is a teardown race, and
+            // a member that never sent one only ages out at the consumer
+            // session timeout (10 s — `SESSION_TIMEOUT_MS` in
+            // `src/backends/kafka/constants.rs`). A fixed retry budget on the
+            // delete loses that race deterministically once enough members
+            // linger — a 16-member batch cell held `NonEmptyGroup` past the
+            // old 5 s budget on every repetition — so wait on the observable
+            // instead: poll each group's membership until it reports empty,
+            // then delete.
+            let drain_probe: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &bootstrap)
+                .set("group.id", "shove-stress-purge-probe")
+                .create()
+                .map_err(|e| format!("build group drain probe: {e}"))?;
+            let drain_groups = groups.clone();
+            tokio::task::spawn_blocking(move || {
+                await_group_drain(
+                    |group| {
+                        let list = drain_probe
+                            .fetch_group_list(Some(group), Duration::from_secs(2))
+                            .map_err(|e| format!("list group {group}: {e}"))?;
+                        // An absent group lists nothing and sums to zero —
+                        // the common clean case and a drained one are the
+                        // same answer here.
+                        Ok(list
+                            .groups()
+                            .iter()
+                            .filter(|g| g.name() == group)
+                            .map(|g| g.members().len())
+                            .sum())
+                    },
+                    &drain_groups,
+                    GROUP_DRAIN_DEADLINE,
+                    GROUP_DRAIN_POLL,
+                )
+            })
+            .await
+            .map_err(|e| format!("group drain task: {e}"))??;
             // Leftover group state (offsets, rebalance epoch, dead members)
             // skews the next scenario, so a failed delete is a dirty
-            // boundary, not a shrug. An absent group is the common clean
-            // case; a still-emptying group can need a beat after the
-            // consumers close, hence the bounded retry.
+            // boundary, not a shrug. The drain above has already seen every
+            // group empty; this bounded retry only covers the races it
+            // cannot: a coordinator that has not yet applied the departures
+            // it reported, or a member rejoining between the last poll and
+            // the delete.
             let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
             let mut last_err = None;
             for _ in 0..10 {
@@ -261,5 +305,155 @@ async fn wait_until_ready(bootstrap: &str) {
             }
             _ => tokio::time::sleep(Duration::from_millis(200)).await,
         }
+    }
+}
+
+/// Ceiling on the purge's group-membership drain. Sized from the worst case
+/// rather than the group size: a member that died without a LeaveGroup is
+/// evicted at the consumer session timeout (10 s), so 60 s covers that with
+/// margin for a loaded host, while a group still populated past it is a real
+/// dirty boundary worth failing loudly. The drain returns the moment the
+/// groups report empty, so the ceiling is not a per-scenario cost.
+const GROUP_DRAIN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Poll interval of the group-membership drain.
+const GROUP_DRAIN_POLL: Duration = Duration::from_millis(500);
+
+/// Block until every group in `groups` reports zero members, polling
+/// `fetch_members` (which maps a group id to its current live-member count,
+/// `0` covering absent and empty alike) every `poll` up to `deadline`.
+///
+/// A transient fetch error is retried like a populated group; one still
+/// failing at the deadline surfaces as the drain error. Runs on blocking
+/// primitives (`thread::sleep`) — call it from `spawn_blocking`, like the
+/// topic probe.
+fn await_group_drain(
+    mut fetch_members: impl FnMut(&str) -> Result<usize, String>,
+    groups: &[String],
+    deadline: Duration,
+    poll: Duration,
+) -> Result<(), String> {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        let mut lingering: Vec<String> = Vec::new();
+        let mut fetch_err: Option<String> = None;
+        for group in groups {
+            match fetch_members(group) {
+                Ok(0) => {}
+                Ok(members) => lingering.push(format!("{group}: {members} member(s)")),
+                Err(e) => fetch_err = Some(e),
+            }
+        }
+        if lingering.is_empty() && fetch_err.is_none() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= end {
+            return Err(match fetch_err {
+                Some(e) => format!("group drain: {e}"),
+                None => format!(
+                    "groups still non-empty {}s after the previous scenario ended: {}",
+                    deadline.as_secs(),
+                    lingering.join(", ")
+                ),
+            });
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One group named like the harness's derived consumer group.
+    fn groups() -> Vec<String> {
+        vec!["shove-stress-bench-consumer".to_string()]
+    }
+
+    /// The defect this drain replaces: a fixed 10-attempt budget gave up on a
+    /// group whose members simply had not finished leaving yet. The drain must
+    /// keep polling well past ten rounds as long as the deadline allows.
+    #[test]
+    fn drain_outlasts_the_old_fixed_retry_budget() {
+        let mut polls = 0u32;
+        let result = await_group_drain(
+            |_group| {
+                polls += 1;
+                // 16 members that only finish leaving on the 30th poll —
+                // three times the old 10-attempt budget.
+                Ok(if polls < 30 { 16 } else { 0 })
+            },
+            &groups(),
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(polls >= 30, "drained after only {polls} polls");
+    }
+
+    /// An absent group reports zero members, so the drain returns immediately
+    /// — the common clean case must not pay a single poll interval.
+    #[test]
+    fn drain_returns_at_once_when_groups_are_already_empty() {
+        let result = await_group_drain(
+            |_group| Ok(0),
+            &groups(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    /// A group still populated at the deadline is a dirty scenario boundary:
+    /// the error must name the group and its member count so the operator can
+    /// see what was still attached.
+    #[test]
+    fn drain_deadline_error_names_the_lingering_group() {
+        let result = await_group_drain(
+            |_group| Ok(16),
+            &groups(),
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        );
+        let err = result.expect_err("a never-draining group must error");
+        assert!(
+            err.contains("shove-stress-bench-consumer") && err.contains("16"),
+            "error must name the group and member count, got: {err}"
+        );
+    }
+
+    /// Transient list failures (broker mid-rebalance, metadata timeout) are
+    /// retried like the topic probe's, not treated as a dirty boundary.
+    #[test]
+    fn drain_retries_past_transient_fetch_errors() {
+        let mut polls = 0u32;
+        let result = await_group_drain(
+            |_group| {
+                polls += 1;
+                if polls < 3 {
+                    Err("transient metadata timeout".to_string())
+                } else {
+                    Ok(0)
+                }
+            },
+            &groups(),
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    /// A fetch error still failing at the deadline surfaces as the drain
+    /// error rather than being silently swallowed by the retry.
+    #[test]
+    fn drain_deadline_error_surfaces_a_persistent_fetch_error() {
+        let result = await_group_drain(
+            |_group| Err("list groups: broker down".to_string()),
+            &groups(),
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+        );
+        let err = result.expect_err("a persistently failing fetch must error");
+        assert!(err.contains("broker down"), "got: {err}");
     }
 }
