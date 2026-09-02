@@ -220,8 +220,8 @@ pub use codecs::protobuf::ProtobufCodec;
 #[cfg_attr(docsrs, doc(cfg(feature = "sbe")))]
 pub use codecs::sbe::{SbeByteOrder, SbeCodec, SbeCodecError, SbeFrame, SbeHeader, SbeMessage};
 pub use consumer::{
-    ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_BATCH_AGE, DEFAULT_MAX_BATCH_SIZE,
-    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
+    ConsumerOptions, DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE,
+    DEFAULT_KAFKA_MAX_BATCH_SIZE, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_PENDING_PER_KEY,
 };
 pub use consumer_supervisor::{ConsumerSupervisor, SupervisorOutcome};
 pub use error::ShoveError;

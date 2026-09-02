@@ -36,7 +36,7 @@ use crate::routing::{
 use crate::topic::{NotSequenced, SequencedTopic, Topic};
 use crate::topology::QueueTopology;
 use crate::{
-    DEFAULT_HANDLER_TIMEOUT, DEFAULT_MAX_BATCH_AGE, DEFAULT_MAX_BATCH_SIZE,
+    DEFAULT_HANDLER_TIMEOUT, DEFAULT_KAFKA_MAX_BATCH_AGE, DEFAULT_KAFKA_MAX_BATCH_SIZE,
     DEFAULT_MAX_MESSAGE_SIZE, HoldQueue, Kafka, ShoveError,
 };
 
@@ -1857,8 +1857,8 @@ pub struct BatchConsumerOptions {
 impl Default for BatchConsumerOptions {
     fn default() -> Self {
         Self {
-            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
-            max_batch_age: DEFAULT_MAX_BATCH_AGE,
+            max_batch_size: DEFAULT_KAFKA_MAX_BATCH_SIZE,
+            max_batch_age: DEFAULT_KAFKA_MAX_BATCH_AGE,
             max_reconnect_attempts: None,
             max_message_size: Some(DEFAULT_MAX_MESSAGE_SIZE),
             // Same default as `ConsumerOptions`. A batch flush is one DB
@@ -1888,7 +1888,8 @@ impl BatchConsumerOptions {
         Self::default()
     }
 
-    /// Flush once the batch reaches this many messages. Default 500.
+    /// Flush once the batch reaches this many messages. Default
+    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`] (500).
     ///
     /// # Panics
     ///
@@ -1901,7 +1902,7 @@ impl BatchConsumerOptions {
 
     /// Flush once this long has elapsed since the first message in the
     /// current batch, even if `max_batch_size` hasn't been reached.
-    /// Default 250ms.
+    /// Default [`DEFAULT_KAFKA_MAX_BATCH_AGE`] (250 ms).
     ///
     /// # Panics
     ///
@@ -1941,16 +1942,16 @@ impl BatchConsumerOptions {
         self
     }
 
-    /// The configured flush size — what [`with_max_batch_size`] set, or the
-    /// default 500.
+    /// The configured flush size — what [`with_max_batch_size`] set, or
+    /// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`].
     ///
     /// [`with_max_batch_size`]: Self::with_max_batch_size
     pub fn max_batch_size(&self) -> usize {
         self.max_batch_size
     }
 
-    /// The configured flush age — what [`with_max_batch_age`] set, or the
-    /// default 250 ms.
+    /// The configured flush age — what [`with_max_batch_age`] set, or
+    /// [`DEFAULT_KAFKA_MAX_BATCH_AGE`].
     ///
     /// [`with_max_batch_age`]: Self::with_max_batch_age
     pub fn max_batch_age(&self) -> Duration {
@@ -6294,8 +6295,8 @@ mod batch_consumer_options_tests {
         assert_eq!(opts.max_batch_age, Duration::from_millis(250));
         // The shared constants are the same values — they are what external
         // tooling (the stress harness) references instead of restating 500/250.
-        assert_eq!(opts.max_batch_size, DEFAULT_MAX_BATCH_SIZE);
-        assert_eq!(opts.max_batch_age, DEFAULT_MAX_BATCH_AGE);
+        assert_eq!(opts.max_batch_size, DEFAULT_KAFKA_MAX_BATCH_SIZE);
+        assert_eq!(opts.max_batch_age, DEFAULT_KAFKA_MAX_BATCH_AGE);
         assert_eq!(opts.max_reconnect_attempts, None);
         assert_eq!(opts.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
         assert_eq!(opts.kafka_group_id, None);

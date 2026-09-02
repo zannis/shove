@@ -277,19 +277,19 @@ async fn wait_until_ready(bootstrap: &str) {
     }
 }
 
-// Run with: cargo nextest run --features kafka,inmemory --example kafka_stress
-// (`inmemory` because compiling this example as a test target also compiles
-// the shared harness's test module, which drives everything over
-// `shove::InMemory`.)
+// Run with: cargo nextest run --features kafka,inmemory --test bench_harness_kafka
+// (or --example kafka_stress; `inmemory` because compiling this file as a test
+// target also compiles the shared harness's test module, which drives
+// everything over `shove::InMemory`.)
 //
-// Unlike the harness's module — which tests/bench_harness.rs bridges into a
-// real CI-run test target — this one runs only via the explicit `--example`
-// invocation above: bridging it the same way would need `kafka` and
-// `inmemory` enabled together, a pairing no CI leg builds. What that leaves
-// uncovered in CI is only this file's builder-call wiring; the values
-// themselves agree by construction (both sides cite
-// `shove::DEFAULT_MAX_BATCH_SIZE` / `_AGE`), and the getters are covered by
-// src's own `batch_consumer_options_tests`.
+// tests/bench_harness_kafka.rs bridges this module into a real test target,
+// like tests/bench_harness.rs does for the harness's. No CI test leg enables
+// kafka+inmemory together, so in CI the bridge is only type-checked (the
+// `clippy --all-features --all-targets` gate); execution is local. The
+// remaining CI-unexecuted surface is this file's builder-call wiring — the
+// values themselves agree by construction (both sides cite
+// `shove::DEFAULT_KAFKA_MAX_BATCH_SIZE` / `_AGE`), and the getters are covered
+// by src's own `batch_consumer_options_tests`.
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};

@@ -24,15 +24,19 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Default flush size for Kafka's batch consumer: 500 messages.
 ///
-/// Lives here rather than in the Kafka module so code compiled without the
-/// `kafka` feature (the stress harness, external tooling) can reference the
-/// value instead of restating it — the same contract as
-/// [`DEFAULT_HANDLER_TIMEOUT`]: cite the constant, never hardcode the number.
-pub const DEFAULT_MAX_BATCH_SIZE: usize = 500;
+/// Kafka-scoped by name on purpose — batch consume is a Kafka-only primitive,
+/// and a future batch concept on another backend would have its own natural
+/// defaults (SQS receive caps at 10). Lives here rather than in the Kafka
+/// module so code compiled without the `kafka` feature (the stress harness,
+/// external tooling) can reference the value instead of restating it — the
+/// same contract as [`DEFAULT_HANDLER_TIMEOUT`]: cite the constant, never
+/// hardcode the number.
+pub const DEFAULT_KAFKA_MAX_BATCH_SIZE: usize = 500;
 
 /// Default flush age for Kafka's batch consumer: 250 ms. See
-/// [`DEFAULT_MAX_BATCH_SIZE`] for why it lives here.
-pub const DEFAULT_MAX_BATCH_AGE: Duration = Duration::from_millis(250);
+/// [`DEFAULT_KAFKA_MAX_BATCH_SIZE`] for why it lives here and why it is
+/// Kafka-scoped by name.
+pub const DEFAULT_KAFKA_MAX_BATCH_AGE: Duration = Duration::from_millis(250);
 
 /// Default handler timeout: 30 seconds.
 ///
