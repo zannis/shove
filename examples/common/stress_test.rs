@@ -1403,26 +1403,25 @@ where
         // arrive together — so without this the barrier's own traffic is
         // counted as drained corpus and recorded as latency. Settled before
         // the simulated work so a sentinel-only batch pays none of it.
-        let corpus: Vec<&StressTestMsg> = messages
-            .iter()
-            .map(|(msg, _)| msg)
-            .filter(|msg| {
-                if self.inner.is_sentinel(msg.id) {
-                    self.inner.note_attached();
-                    return false;
-                }
-                true
-            })
-            .collect();
-        if corpus.is_empty() {
+        let mut corpus = 0usize;
+        for (msg, _) in &messages {
+            if self.inner.is_sentinel(msg.id) {
+                self.inner.note_attached();
+            } else {
+                corpus = corpus.saturating_add(1);
+            }
+        }
+        if corpus == 0 {
             return Outcome::Ack;
         }
         // One simulated unit of work per batch, not per message: a batch
         // handler exists precisely so the per-message cost is amortised, and
         // sleeping per message would measure the sleep rather than batching.
         self.inner.simulate_work().await;
-        for msg in corpus {
-            self.inner.observe(received_at, msg.published_at_ns);
+        for (msg, _) in &messages {
+            if !self.inner.is_sentinel(msg.id) {
+                self.inner.observe(received_at, msg.published_at_ns);
+            }
         }
         Outcome::Ack
     }
