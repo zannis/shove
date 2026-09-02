@@ -153,8 +153,10 @@ pub struct Cli {
 
     /// Override `max_batch_age` in milliseconds for the `consume-batch` flow
     /// (default 250, shove's own default). Same reachability rule as
-    /// `--batch-max-size`.
-    #[arg(long)]
+    /// `--batch-max-size`. Bounded at parse time by the per-scenario deadline
+    /// ceiling, so no `Cli` value can exist that the deadline fold must be
+    /// trusted not to honour.
+    #[arg(long, value_parser = parse_batch_age_ms)]
     pub batch_max_age_ms: Option<NonZeroU64>,
 
     /// Also write the versioned results document to this path, merging into
@@ -210,10 +212,9 @@ impl FromStr for FlowArg {
                 continue;
             }
             let flow = Flow::from_cli(part).ok_or_else(|| {
-                let names: Vec<&str> = Flow::ALL.iter().map(|f| f.as_cli()).collect();
                 format!(
                     "unknown flow '{part}'; expected `all` or one of: {}",
-                    names.join(", ")
+                    flow_list(&Flow::ALL)
                 )
             })?;
             if !flows.contains(&flow) {
@@ -294,6 +295,26 @@ impl FromStr for ConsumersArg {
         }
         Ok(ConsumersArg(counts))
     }
+}
+
+/// Parse `--batch-max-age-ms`: positive, and no larger than
+/// [`DEADLINE_CEILING_MS`]. The deadline fold in `build_scenarios`
+/// deliberately raises a batch deadline past the derived clamp, so an
+/// unbounded age would let a units mistake (`120000000` intending 120 s) give
+/// every batch scenario a ~33-hour deadline. Checked at parse time like
+/// `ConsumersArg` and `PayloadArg`, so an illegal value can never reach a
+/// `Scenario`.
+fn parse_batch_age_ms(s: &str) -> Result<NonZeroU64, String> {
+    let n: NonZeroU64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a positive integer of milliseconds"))?;
+    if n.get() > DEADLINE_CEILING_MS {
+        return Err(format!(
+            "{n} ms exceeds the {DEADLINE_CEILING_MS} ms per-scenario deadline ceiling \
+             (the value is in milliseconds)"
+        ));
+    }
+    Ok(n)
 }
 
 // ── Flow & mode ─────────────────────────────────────────────────────────────
@@ -623,11 +644,13 @@ impl BatchOptions {
     /// fails the build instead of a bench run.
     const DEFAULT: Self = {
         let age_ms = shove::DEFAULT_KAFKA_MAX_BATCH_AGE.as_millis();
-        assert!(age_ms > 0 && age_ms <= u64::MAX as u128);
+        // The truncation guard; non-zeroness is the `expect`s' job.
+        assert!(age_ms <= u64::MAX as u128);
         Self {
             max_batch_size: NonZeroUsize::new(shove::DEFAULT_KAFKA_MAX_BATCH_SIZE)
                 .expect("shove's default batch size is non-zero"),
-            max_batch_age_ms: NonZeroU64::new(age_ms as u64).expect("asserted non-zero above"),
+            max_batch_age_ms: NonZeroU64::new(age_ms as u64)
+                .expect("shove's default batch age is non-zero"),
         }
     };
 }
@@ -716,21 +739,32 @@ fn scenario_deadline(messages: u64, consumers: u16, handler: HandlerProfile) -> 
     Duration::from_millis(deadline_ms as u64)
 }
 
-/// The per-scenario deadline ceiling: no derived workload may claim more.
-/// `--batch-max-age-ms` is refused above this value — the fold in
-/// `build_scenarios` deliberately raises a batch deadline past the clamp, so
-/// without the bound a units mistake (`120000000` intending 120 s) would give
-/// every batch scenario a ~33-hour deadline and the sweep would look hung.
+/// The per-scenario deadline ceiling for *derived* workloads. A batch
+/// scenario may additionally claim its user-declared `--batch-max-age-ms` on
+/// top (the fold in `build_scenarios`), and the flag is parse-bounded by this
+/// same value, so the absolute worst case is 2× this ceiling — bounded and
+/// explicitly asked for, unlike the ~33-hour deadline an unbounded units
+/// mistake (`120000000` intending 120 s) used to be able to produce.
 const DEADLINE_CEILING_MS: u64 = 600_000;
 
 /// The flow set this invocation asked for: `--flow`, or the entry point's
-/// default when the flag is absent. Shared by [`build_scenarios`] and the
-/// batch-flag guards so "what was selected" has exactly one derivation.
+/// default when the flag is absent. [`build_scenarios`] and the batch-flag
+/// guards both derive through this one definition (each from the same
+/// inputs), so they cannot disagree about what was selected.
 fn selected_flows(cli: &Cli, default_flow: Flow) -> Vec<Flow> {
     match &cli.flow {
         Some(FlowArg(list)) => list.clone(),
         None => vec![default_flow],
     }
+}
+
+/// The CLI spellings of a flow list, rendered the way `--flow` accepts them.
+fn flow_list(flows: &[Flow]) -> String {
+    flows
+        .iter()
+        .map(Flow::as_cli)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scenario> {
@@ -826,20 +860,25 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                         Flow::Broadcast => per_consumer,
                         _ => per_consumer.saturating_mul(consumers as u64),
                     };
+                    // Only the flow with a batch to size carries the knobs;
+                    // stamping a default on any other row would claim options
+                    // a run never had. One binding drives both the deadline
+                    // fold and the row stamp, so the two cannot disagree
+                    // about which scenarios are batch scenarios.
+                    let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
                     // A batch flushes on size or on age — with a corpus
                     // smaller than the batch size, age is the only trigger, so
                     // the run legitimately takes up to `max_batch_age` beyond
                     // what the handler-time model predicts. Fold the age into
                     // the deadline (above the clamp: the knob is explicit user
-                    // intent, bounded by the ceiling check in
-                    // `select_scenarios`) or a large legal age turns every
-                    // batch scenario into a false timeout row.
+                    // intent, parse-bounded by the deadline ceiling) or a
+                    // large legal age turns every batch scenario into a false
+                    // timeout row.
                     let mut deadline =
                         scenario_deadline(messages, flow.effective_workers(consumers), h);
-                    if flow == Flow::ConsumeBatch {
-                        deadline = deadline.saturating_add(Duration::from_millis(
-                            batch_options.max_batch_age_ms.get(),
-                        ));
+                    if let Some(opts) = batch_options {
+                        deadline = deadline
+                            .saturating_add(Duration::from_millis(opts.max_batch_age_ms.get()));
                     }
                     for &payload_bytes in &cli.payload.0 {
                         scenarios.push(Scenario {
@@ -852,10 +891,7 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                             prefetch: cli.prefetch,
                             flow,
                             payload_bytes,
-                            // Only the flow with a batch to size carries the
-                            // knobs; stamping a default on any other row
-                            // would claim options a run never had.
-                            batch_options: (flow == Flow::ConsumeBatch).then_some(batch_options),
+                            batch_options,
                         });
                     }
                 }
@@ -2964,7 +3000,8 @@ fn merge_results_file(
             if doc.schema_version != RESULTS_SCHEMA_VERSION {
                 return Err(format!(
                     "{path} is a v{} results document; this harness writes v{RESULTS_SCHEMA_VERSION}. \
-                     Merging would silently downgrade it — move it aside first.",
+                     Merging would silently re-sign its runs under this binary's header — \
+                     move it aside first.",
                     doc.schema_version
                 ));
             }
@@ -3450,36 +3487,30 @@ fn refused_batch_flags(cli: &Cli, selected: &[Flow]) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{} was passed but the selected flows ({}) do not include consume-batch, so \
-         the knob applies to nothing. Add `--flow consume-batch`, or drop the flag.",
+        "nothing in this invocation reads {}: the selected flows ({}) do not include \
+         consume-batch. Add `--flow consume-batch`, or drop the flag.",
         flags.join(" / "),
-        selected
-            .iter()
-            .map(Flow::as_cli)
-            .collect::<Vec<_>>()
-            .join(","),
+        flow_list(selected),
     ))
 }
 
 /// The capability half of the guard: `consume-batch` *was* selected and a
-/// batch flag passed, but this backend cannot run the flow, so filtering
-/// dropped it (with its own announcement). Killing the run here would break
+/// batch flag passed, but this backend will drop the flow (`skip` is
+/// [`skip_reason`]'s verdict, carrying the actual cause rather than a guess
+/// reconstructed from the filtered list). Killing the run here would break
 /// the documented six-binary sweep — one flag set accumulating one results
 /// file across every backend — so follow the flow's own precedent instead:
 /// say the knob is inert on this backend and continue with the other flows.
 /// No row lies either way, because no `consume_batch` row is produced at all.
-fn inert_batch_flags_note(cli: &Cli, selected: &[Flow], scenarios: &[Scenario]) -> Option<String> {
+fn inert_batch_flags_note(cli: &Cli, selected: &[Flow], skip: Option<&str>) -> Option<String> {
     let flags = passed_batch_flags(cli);
-    if flags.is_empty()
-        || !selected.contains(&Flow::ConsumeBatch)
-        || scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch)
-    {
+    if flags.is_empty() || !selected.contains(&Flow::ConsumeBatch) {
         return None;
     }
+    let skip = skip?;
     Some(format!(
-        "note: {} is inert in this invocation — consume-batch was selected but no \
-         consume-batch scenario survived this backend's filtering (see the skip \
-         announcement above for the reason), so no scenario reads the knob",
+        "note: nothing in this invocation reads {} — consume-batch was selected but \
+         is dropped on this backend ({skip})",
         flags.join(" / "),
     ))
 }
@@ -3497,22 +3528,57 @@ fn select_scenarios<B: Backend>(
     if let Some(reason) = refused_batch_flags(cli, &selected) {
         return Err(reason);
     }
-    if let Some(age) = cli.batch_max_age_ms
-        && age.get() > DEADLINE_CEILING_MS
-    {
-        return Err(format!(
-            "--batch-max-age-ms {age} exceeds the {DEADLINE_CEILING_MS} ms per-scenario              deadline ceiling. The value is in milliseconds; an age above the ceiling              would give every batch scenario a deadline at least that long."
-        ));
-    }
     let scenarios = filter_scenarios(
         hcfg,
         build_scenarios(cli, default_flow, hcfg.fifo_workers),
         supervisor_only,
     );
-    if let Some(note) = inert_batch_flags_note(cli, &selected, &scenarios) {
+    let skip = skip_reason(hcfg, Flow::ConsumeBatch, supervisor_only);
+    if let Some(note) = inert_batch_flags_note(cli, &selected, skip.as_deref()) {
         eprintln!("{note}");
     }
+    if let Some(path) = cli.results_file.as_deref()
+        && let Some(reason) = refused_results_file_version(path)
+    {
+        return Err(reason);
+    }
     Ok(scenarios)
+}
+
+/// Fast-fail the schema-version refusal `merge_results_file` would otherwise
+/// raise only *after* the whole sweep has run — hours of broker time spent on
+/// a merge that was doomed before the first scenario. Version only: the merge
+/// remains the authority for every other document invariant (provenance,
+/// per-row validation), which cannot go stale here because both compare
+/// against the same constants and the merge still re-checks everything.
+fn refused_results_file_version(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let doc: BenchResults = serde_json::from_str(&content).ok()?;
+    (doc.schema_version != RESULTS_SCHEMA_VERSION).then(|| {
+        format!(
+            "{path} is a v{} results document; this harness writes \
+             v{RESULTS_SCHEMA_VERSION} and would refuse the merge after the sweep — \
+             move it aside first.",
+            doc.schema_version
+        )
+    })
+}
+
+/// [`select_scenarios`], with the refusal protocol both entry points share:
+/// print the reason and exit 2 (the usage-error code clap itself uses).
+fn select_scenarios_or_exit<B: Backend>(
+    cli: &Cli,
+    hcfg: &HarnessConfig<B>,
+    default_flow: Flow,
+    supervisor_only: bool,
+) -> Vec<Scenario> {
+    match select_scenarios(cli, hcfg, default_flow, supervisor_only) {
+        Ok(scenarios) => scenarios,
+        Err(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// The default `ConsumerOptions` factory for the `consume_parallel` flow on a
@@ -3575,13 +3641,7 @@ pub async fn run_all_scenarios<B, MkCfg, Connect, Fut>(
 
     let cli = Cli::parse();
     let cancel = spawn_ctrlc_watcher();
-    let scenarios = match select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false) {
-        Ok(scenarios) => scenarios,
-        Err(reason) => {
-            eprintln!("{reason}");
-            std::process::exit(2);
-        }
-    };
+    let scenarios = select_scenarios_or_exit(&cli, &hcfg, Flow::ConsumerGroup, false);
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -3659,13 +3719,7 @@ pub async fn run_supervisor_scenarios<B, MkOpts, Connect, Fut>(
     // `Flow::Supervisor`, not `ConsumerGroup`: the group flow is unsupported
     // here and would be filtered out, leaving the default invocation running
     // zero scenarios.
-    let scenarios = match select_scenarios(&cli, &hcfg, Flow::Supervisor, true) {
-        Ok(scenarios) => scenarios,
-        Err(reason) => {
-            eprintln!("{reason}");
-            std::process::exit(2);
-        }
-    };
+    let scenarios = select_scenarios_or_exit(&cli, &hcfg, Flow::Supervisor, true);
 
     announce(hcfg.backend_name, cli.concurrent, scenarios.len());
 
@@ -5588,6 +5642,8 @@ mod tests {
         assert_eq!(refused_batch_flags(&cli, &selected), None);
 
         // A backend with no batch closure drops the flow — note, not None.
+        // The note consumes `skip_reason`'s verdict, so it names the actual
+        // cause instead of reconstructing one from the filtered list.
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
         let scenarios =
             select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
@@ -5595,18 +5651,24 @@ mod tests {
             !scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch),
             "the closure-less backend kept a batch scenario"
         );
-        let note =
-            inert_batch_flags_note(&cli, &selected, &scenarios).expect("must note the inert flag");
+        let skip = skip_reason(&hcfg, Flow::ConsumeBatch, false);
+        let note = inert_batch_flags_note(&cli, &selected, skip.as_deref())
+            .expect("must note the inert flag");
         assert!(note.contains("--batch-max-size"), "{note}");
-        assert!(note.contains("inert"), "{note}");
+        assert!(note.contains("unsupported"), "{note}");
 
-        // A backend that has the closure runs the flow — no note.
+        // A backend that has the closure runs the flow — no skip, no note.
         let hcfg =
             HarnessConfig::<shove::InMemory>::new("kafka").with_batch_consume(dummy_batch_fn());
         let scenarios =
             select_scenarios(&cli, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
         assert!(scenarios.iter().any(|s| s.flow == Flow::ConsumeBatch));
-        assert_eq!(inert_batch_flags_note(&cli, &selected, &scenarios), None);
+        let skip = skip_reason(&hcfg, Flow::ConsumeBatch, false);
+        assert_eq!(skip, None, "a batch-capable backend must not skip the flow");
+        assert_eq!(
+            inert_batch_flags_note(&cli, &selected, skip.as_deref()),
+            None
+        );
 
         // No flags → nothing to note, whatever the filter did. `selected` is
         // re-derived from `bare` — reusing the flagged CLI's list would test
@@ -5614,10 +5676,10 @@ mod tests {
         let bare = cli_args(&["--flow", "consume-batch,consumer-group"]);
         let bare_selected = selected_flows(&bare, Flow::ConsumerGroup);
         let hcfg = HarnessConfig::<shove::InMemory>::new("inmemory");
-        let scenarios =
-            select_scenarios(&bare, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        select_scenarios(&bare, &hcfg, Flow::ConsumerGroup, false).expect("must not refuse");
+        let skip = skip_reason(&hcfg, Flow::ConsumeBatch, false);
         assert_eq!(
-            inert_batch_flags_note(&bare, &bare_selected, &scenarios),
+            inert_batch_flags_note(&bare, &bare_selected, skip.as_deref()),
             None
         );
     }
@@ -5695,21 +5757,55 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_age_above_the_deadline_ceiling_is_refused() {
+    fn a_stale_results_file_is_refused_before_the_sweep_runs() {
+        // The merge would refuse a prior-version document anyway — but only
+        // after every scenario has executed. The preflight raises the same
+        // verdict before the first scenario, so the operator loses seconds,
+        // not a sweep.
+        let path = temp_path("preflight-old-schema");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+
+        // Absent file: nothing to refuse.
+        assert_eq!(refused_results_file_version(&p), None);
+
+        // Current-version file: fine.
+        merge_results_file(&p, sample_run("redis"), None).expect("write");
+        assert_eq!(refused_results_file_version(&p), None);
+
+        // Prior-version file: refused by version, naming it.
+        let v2 = std::fs::read_to_string(&path).expect("read").replace(
+            &format!("\"schema_version\": {RESULTS_SCHEMA_VERSION}"),
+            "\"schema_version\": 2",
+        );
+        assert!(v2.contains("\"schema_version\": 2"), "fixture did not take");
+        std::fs::write(&path, &v2).expect("write v2");
+        let reason = refused_results_file_version(&p).expect("must refuse");
+        assert!(reason.contains("is a v2 results document"), "{reason}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_age_above_the_deadline_ceiling_is_refused_at_parse_time() {
         // The fold deliberately raises a batch deadline past the clamp, so an
         // unbounded age would let a units mistake (120000000 intending 120 s)
-        // give every batch scenario a ~33-hour deadline. At the ceiling the
-        // invocation is still legal; one past it is refused with the unit
-        // named.
-        let hcfg =
-            HarnessConfig::<shove::InMemory>::new("kafka").with_batch_consume(dummy_batch_fn());
-        let at_ceiling = cli_args(&["--flow", "consume-batch", "--batch-max-age-ms", "600000"]);
-        assert!(select_scenarios(&at_ceiling, &hcfg, Flow::ConsumerGroup, false).is_ok());
-
-        let past = cli_args(&["--flow", "consume-batch", "--batch-max-age-ms", "600001"]);
-        let err = select_scenarios(&past, &hcfg, Flow::ConsumerGroup, false)
-            .expect_err("must refuse an age past the ceiling");
-        assert!(err.contains("--batch-max-age-ms"), "{err}");
+        // give every batch scenario a ~33-hour deadline. The bound lives in
+        // the value parser — like `--consumers 0` or an out-of-set
+        // `--payload` — so no `Cli` value can exist that the deadline fold
+        // must be trusted not to honour. At the ceiling the value is legal;
+        // one past it is a usage error naming the unit.
+        assert!(
+            Cli::try_parse_from(["stress", "--batch-max-age-ms", "600000"]).is_ok(),
+            "the ceiling itself must be a legal value"
+        );
+        let err = match Cli::try_parse_from(["stress", "--batch-max-age-ms", "600001"]) {
+            Ok(_) => panic!("must refuse an age past the ceiling"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("deadline ceiling"), "{err}");
         assert!(err.contains("milliseconds"), "{err}");
+        // Zero stays refused too — the parser owns the whole value contract.
+        assert!(Cli::try_parse_from(["stress", "--batch-max-age-ms", "0"]).is_err());
     }
 }
