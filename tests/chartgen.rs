@@ -538,9 +538,20 @@ fn a_backend_absent_from_a_slice_is_named_rather_than_omitted() {
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), sparse)));
 
     let svg = chartgen::render_to_string(&doc, Family::DispatchLatency).expect("should render");
+    // The wording matters as much as the mention: this is a gap in the run,
+    // and captioning it "not supported" would publish a false capability
+    // claim about the library on the chart's face.
     assert!(
-        svg.contains("kafka") && svg.contains("not supported"),
+        svg.contains("kafka: no measurement for this slice"),
         "a backend outside the slice was dropped without a word"
+    );
+    assert!(
+        svg.contains("not a capability hole"),
+        "the caption must say the absence is a gap, not a missing capability"
+    );
+    assert!(
+        !svg.contains("kafka: not supported"),
+        "a mere gap must never be published as a capability hole"
     );
 }
 
@@ -812,6 +823,263 @@ fn long_reasons_are_wrapped_not_truncated() {
     }
 }
 
+// ── The version gate fires before typed deserialisation ─────────────────────
+
+#[test]
+fn a_foreign_version_is_refused_by_version_even_when_fields_are_missing() {
+    // A v2 document may lack fields v4 requires. The refusal must name the
+    // version — the actual problem — not whichever missing field serde
+    // happens to trip on first.
+    let raw = r#"{ "schema_version": 2, "runs": [ { "backend": "kafka" } ] }"#;
+    match chartgen::parse_str(raw) {
+        Err(ChartError::UnsupportedSchemaVersion { found, expected }) => {
+            assert_eq!(found, 2);
+            assert_eq!(expected, 4);
+        }
+        other => panic!("expected UnsupportedSchemaVersion, got {other:?}"),
+    }
+}
+
+// ── Per-row invariants are hard errors ───────────────────────────────────────
+
+#[test]
+fn a_zero_throughput_row_is_rejected() {
+    // A zero rate is a failed measurement wearing a row's clothes — the
+    // harness records those in failures[], so one in results[] must refuse,
+    // not be quietly reclassified as "not measured".
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 0.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { backend, what, .. }) => {
+            assert_eq!(backend, "kafka");
+            assert!(what.contains("throughput"), "wrong invariant named: {what}");
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_empty_handler_label_is_rejected() {
+    // The provenance line states the handler profile on every chart; a row
+    // without the label would silently un-state that disclosure.
+    let raw =
+        document(&inmemory_run(true)).replace(r#""handler": "zero (no-op)","#, r#""handler": "","#);
+    let doc = parse(&raw);
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(
+                what.contains("handler label"),
+                "wrong invariant named: {what}"
+            );
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn batch_knobs_must_match_the_row_flow_in_both_directions() {
+    // A knob-less consume_batch row publishes a bar with no stated batch
+    // size; knobs on a non-batch row caption a batch that never ran.
+    let knobless = scenario("consume_batch", "batch", 64, 1, 1_000.0)
+        .replace(r#""max_batch_size": 500, "max_batch_age_ms": 200,"#, "");
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{knobless}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("missing its batch knobs"), "{what}");
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+
+    let knobbed = scenario("consume_parallel", "parallel", 64, 1, 1_000.0).replace(
+        r#""handler_cost""#,
+        r#""max_batch_size": 500, "max_batch_age_ms": 200, "handler_cost""#,
+    );
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{knobbed}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("non-batch row carries batch knobs"), "{what}");
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_latency_row_without_percentiles_is_a_hard_error() {
+    // serde-defaulted percentiles would render a spectacular ~0 ms bar on an
+    // absolute axis. The refusal names the backend instead.
+    let raw = document(&inmemory_run(true)).replace(
+        r#""dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,"#,
+        "",
+    );
+    let doc = parse(&raw);
+    match chartgen::render_to_string(&doc, Family::DispatchLatency) {
+        Err(ChartError::MissingPercentiles { backend }) => assert_eq!(backend, "inmemory"),
+        other => panic!("expected MissingPercentiles, got {other:?}"),
+    }
+}
+
+// ── Failed cells are named, never silently absent ────────────────────────────
+
+#[test]
+fn a_failed_cell_in_a_slice_is_named_in_the_caption() {
+    // A failed cell is absent from results[]; without the note the line just
+    // looks like a smaller sweep.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}],
+          "failures": [{{
+            "flow": "consume_parallel", "mode": "parallel", "payload_bytes": 64,
+            "tier": "moderate", "messages": 150000, "consumers": 4,
+            "handler": "zero (no-op)", "error": "timeout after 60s"
+          }}],
+          "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 9_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
+        .expect("chart should render");
+    assert!(
+        svg.contains("kafka: 1 cell(s) in this slice failed to run"),
+        "a failed cell must be named in the caption"
+    );
+    assert!(
+        svg.contains("absent, not zero"),
+        "the caption must say how to read the absence"
+    );
+}
+
+// ── Family 3 slices plain consume flows at their own worker counts ──────────
+
+#[test]
+fn a_consumer_group_row_never_feeds_the_parallel_bar() {
+    // consumer_group rows share mode "parallel", but a coordinated group is a
+    // different subscription topology — its (often higher) throughput must
+    // not stand in for plain consume.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 30_000.0),
+        scenario("consumer_group", "parallel", 64, 1, 7_654_321.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    for magnitude in ["7654321", "7.7M", "7.65M", "8.6M"] {
+        assert!(
+            !svg.contains(magnitude),
+            "the consumer_group magnitude reached the ordering chart: {magnitude}"
+        );
+    }
+}
+
+#[test]
+fn the_fifo_bar_uses_the_mode_pinned_worker_count() {
+    // The fifo driver pins its workers to the shard count, so its rows carry
+    // consumers=8 even in a 1-consumer sweep. Requiring the global slice
+    // count would erase the sequenced bar — the one this chart exists for.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 30_000.0),
+        scenario("consume_fifo", "fifo", 64, 8, 4_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    assert!(
+        svg.contains("measured at 8 workers"),
+        "a non-1 worker count must be stated on the chart"
+    );
+    assert!(
+        !svg.contains("kafka / sequenced (fifo): no measurement"),
+        "the fifo bar was dropped despite being measured"
+    );
+}
+
+// ── The caption block cannot swallow the chart ──────────────────────────────
+
+#[test]
+fn a_pathological_caption_block_is_a_loud_error_not_a_garbage_chart() {
+    // Enough long notes would push the footer over the title band and leave
+    // the plot a negative-height region rendered as garbage.
+    let filler = "x".repeat(400);
+    let runs: Vec<String> = (0..8)
+        .map(|i| {
+            format!(
+                r#"{{
+                  "backend": "backend{i}", "representative": true,
+                  "results": [], "failures": [],
+                  "unsupported": [
+                    {{ "flow": "publish_single", "reason": "{filler}-a{i}" }},
+                    {{ "flow": "publish_batch", "reason": "{filler}-b{i}" }},
+                    {{ "flow": "consume_parallel", "reason": "{filler}-c{i}" }},
+                    {{ "flow": "consume_fifo", "reason": "{filler}-d{i}" }},
+                    {{ "flow": "consume_batch", "reason": "{filler}-e{i}" }},
+                    {{ "flow": "consumer_group", "reason": "{filler}-f{i}" }},
+                    {{ "flow": "supervisor", "reason": "{filler}-g{i}" }},
+                    {{ "flow": "broadcast", "reason": "{filler}-h{i}" }},
+                    {{ "flow": "dlq_drain", "reason": "{filler}-i{i}" }},
+                    {{ "flow": "autoscaler", "reason": "{filler}-j{i}" }}
+                  ]
+                }}"#
+            )
+        })
+        .collect();
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        runs.join(",")
+    )));
+    match chartgen::render_to_string(&doc, Family::ParallelVsSequenced) {
+        Err(ChartError::Render(msg)) => {
+            assert!(msg.contains("leaves no room"), "wrong error: {msg}")
+        }
+        Ok(_) => panic!("a caption block taller than the canvas rendered a chart"),
+        other => panic!("expected a Render refusal, got {other:?}"),
+    }
+}
+
+// ── One palette, enough colours ──────────────────────────────────────────────
+
+#[test]
+fn the_shared_palette_covers_every_fixed_series_list() {
+    // Series colours index into the shared palette; if a family's series list
+    // outgrows it, palette_colour wraps deterministically rather than
+    // silently reusing the first hue — but the fixed lists should simply fit.
+    assert!(
+        chartgen::PALETTE.len() >= 3,
+        "families 3/4 use three series"
+    );
+    assert!(
+        chartgen::PALETTE.len() >= 6,
+        "the backend legend uses six colours"
+    );
+}
+
 // ── The committed artifact renders ──────────────────────────────────────────
 
 #[test]
@@ -830,6 +1098,20 @@ fn the_committed_results_document_renders_every_family() {
         assert!(
             svg.contains(&doc.generated_at),
             "{family:?} lost the provenance date"
+        );
+        // The committed SVGs must be exactly what this code renders from the
+        // committed document — anyone who updates one half without the other
+        // fails here, in `cargo test`, without waiting for a CI leg.
+        let committed = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/public/bench")
+            .join(family.filename());
+        let committed = std::fs::read_to_string(&committed)
+            .unwrap_or_else(|e| panic!("read {}: {e}", committed.display()));
+        assert!(
+            svg == committed,
+            "{family:?}: the committed SVG is not what the committed document renders — \
+             regenerate with `cargo run --no-default-features --example chartgen -- \
+             --input benches/results/bench-results.json --out-dir docs/public/bench`"
         );
     }
 }

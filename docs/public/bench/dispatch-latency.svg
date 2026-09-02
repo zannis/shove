@@ -177,35 +177,47 @@ milliseconds
 90k
 </text>
 <polyline fill="none" opacity="1" stroke="#9AA1AA" stroke-width="1" points="84,126 89,126 "/>
-<rect x="110" y="393" width="37" height="1" opacity="1" fill="#5B8FF9" stroke="none"/>
-<rect x="153" y="392" width="37" height="2" opacity="1" fill="#E8873A" stroke="none"/>
-<rect x="196" y="392" width="38" height="2" opacity="1" fill="#C75C5C" stroke="none"/>
-<rect x="281" y="394" width="37" height="0" opacity="1" fill="#5B8FF9" stroke="none"/>
-<rect x="324" y="394" width="37" height="0" opacity="1" fill="#E8873A" stroke="none"/>
-<rect x="367" y="394" width="37" height="0" opacity="1" fill="#C75C5C" stroke="none"/>
-<rect x="451" y="299" width="37" height="95" opacity="1" fill="#5B8FF9" stroke="none"/>
-<rect x="494" y="214" width="38" height="180" opacity="1" fill="#E8873A" stroke="none"/>
-<rect x="538" y="208" width="37" height="186" opacity="1" fill="#C75C5C" stroke="none"/>
-<rect x="622" y="235" width="37" height="159" opacity="1" fill="#5B8FF9" stroke="none"/>
-<rect x="665" y="141" width="37" height="253" opacity="1" fill="#E8873A" stroke="none"/>
-<rect x="708" y="133" width="37" height="261" opacity="1" fill="#C75C5C" stroke="none"/>
-<rect x="792" y="361" width="38" height="33" opacity="1" fill="#5B8FF9" stroke="none"/>
-<rect x="836" y="334" width="37" height="60" opacity="1" fill="#E8873A" stroke="none"/>
-<rect x="879" y="331" width="37" height="63" opacity="1" fill="#C75C5C" stroke="none"/>
-<text x="175" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+<rect x="107" y="393" width="31" height="1" opacity="1" fill="#5B8FF9" stroke="none"/>
+<rect x="143" y="392" width="31" height="2" opacity="1" fill="#E8873A" stroke="none"/>
+<rect x="179" y="392" width="31" height="2" opacity="1" fill="#C75C5C" stroke="none"/>
+<rect x="249" y="394" width="31" height="0" opacity="1" fill="#5B8FF9" stroke="none"/>
+<rect x="285" y="394" width="31" height="0" opacity="1" fill="#E8873A" stroke="none"/>
+<rect x="321" y="394" width="31" height="0" opacity="1" fill="#C75C5C" stroke="none"/>
+<rect x="391" y="299" width="31" height="95" opacity="1" fill="#5B8FF9" stroke="none"/>
+<rect x="427" y="214" width="31" height="180" opacity="1" fill="#E8873A" stroke="none"/>
+<rect x="463" y="208" width="31" height="186" opacity="1" fill="#C75C5C" stroke="none"/>
+<rect x="533" y="235" width="31" height="159" opacity="1" fill="#5B8FF9" stroke="none"/>
+<rect x="569" y="141" width="31" height="253" opacity="1" fill="#E8873A" stroke="none"/>
+<rect x="605" y="133" width="31" height="261" opacity="1" fill="#C75C5C" stroke="none"/>
+<rect x="675" y="361" width="31" height="33" opacity="1" fill="#5B8FF9" stroke="none"/>
+<rect x="711" y="334" width="31" height="60" opacity="1" fill="#E8873A" stroke="none"/>
+<rect x="747" y="331" width="31" height="63" opacity="1" fill="#C75C5C" stroke="none"/>
+<text x="833" y="388" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+n/s
+</text>
+<text x="869" y="388" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+n/s
+</text>
+<text x="905" y="388" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+n/s
+</text>
+<text x="161" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 inmemory
 </text>
-<text x="345" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+<text x="303" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 kafka
 </text>
-<text x="516" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+<text x="445" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 nats
 </text>
-<text x="687" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+<text x="587" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 rabbitmq
 </text>
-<text x="857" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+<text x="729" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 redis
+</text>
+<text x="871" y="403" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+sqs
 </text>
 <text x="517" y="423" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
 backend
