@@ -2233,6 +2233,7 @@ const END_LABEL_GUTTER: i32 = 84;
 /// that keeps a clamped label inside the plot band.
 const END_LABEL_SPACING: i32 = 14;
 
+#[allow(clippy::too_many_arguments)]
 fn line_chart(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
@@ -2790,7 +2791,7 @@ where
     // The slot in pixels, gap first, then the thickness cap; the bar is
     // centred in what remains of its slot.
     let slot_w = x1.saturating_sub(x0);
-    let w = slot_w.saturating_sub(BAR_GAP_PX).min(BAR_MAX_PX).max(2);
+    let w = slot_w.saturating_sub(BAR_GAP_PX).clamp(2, BAR_MAX_PX);
     let cx = x0.saturating_add(slot_w / 2);
     let bx0 = cx.saturating_sub(w / 2);
     let bx1 = bx0.saturating_add(w);
