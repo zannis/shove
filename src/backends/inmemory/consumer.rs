@@ -2333,6 +2333,71 @@ mod tests {
         Envelope::new(Bytes::from_static(body), HashMap::new())
     }
 
+    fn requeue_topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("simultaneous-shutdown-enqueue")
+                .allow_message_loss()
+                .build()
+        })
+    }
+
+    /// When the broker token and the per-consumer token cancel in the same
+    /// poll gap while a redelivery enqueue is parked on a full queue, both
+    /// the enqueue's internal broker-shutdown `Err` and the per-consumer arm
+    /// become ready together, and `select!` picks between them at random.
+    /// Broker shutdown must win regardless of the pick: the message is
+    /// dropped, never requeued onto a broker that is already gone — the same
+    /// post-select re-check the backoff stage above already performs.
+    ///
+    /// The loop makes the unbiased pick statistical: pre-fix, each iteration
+    /// requeues with probability ~1/2, so 64 iterations fail with
+    /// overwhelming probability. Post-fix every iteration drops. The
+    /// current-thread test runtime is load-bearing — it guarantees the
+    /// redelivery task is not polled between the two cancellations.
+    #[tokio::test]
+    async fn broker_shutdown_wins_a_simultaneous_enqueue_cut() {
+        for _ in 0..64 {
+            let broker = InMemoryBroker::with_config(InMemoryConfig {
+                default_capacity: 1,
+            });
+            let queue = broker.declare("simultaneous-shutdown-enqueue");
+            broker
+                .enqueue(&queue, envelope(b"fills-capacity"))
+                .await
+                .expect("fill queue to capacity");
+
+            let consumer_shutdown = CancellationToken::new();
+            let redeliveries = TaskTracker::new();
+            schedule_redelivery(
+                &broker,
+                requeue_topology(),
+                &queue,
+                envelope(b"survivor"),
+                true,
+                &consumer_shutdown,
+                None,
+                &redeliveries,
+            );
+            redeliveries.close();
+
+            // Let the task sleep out the zero-delay backoff and park on the
+            // full-queue enqueue select.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            broker.shutdown();
+            consumer_shutdown.cancel();
+            redeliveries.wait().await;
+
+            assert_eq!(
+                queue.buffer.lock().await.len(),
+                1,
+                "a redelivery cut simultaneously with broker shutdown must be \
+                 dropped, not requeued onto the shut-down broker"
+            );
+        }
+    }
+
     /// A deferred delivery parked on a full private broadcast buffer must stop
     /// owning that buffer when the subscriber leaves. Broker shutdown is not a
     /// substitute: the broker may continue serving unrelated subscriptions.
