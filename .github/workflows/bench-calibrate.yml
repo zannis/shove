@@ -1,0 +1,64 @@
+# TEMPORARY calibration scaffolding for the bench-tier-a leg — deleted before
+# this branch is published for review; it never reaches main.
+#
+# Why it exists: ci.yml runs on pull_request and push-to-main only, and gate
+# membership in the Tier A baseline is earned, not asserted — an id carries
+# `gate: true` only after demonstrating < 10% spread across three no-op runs
+# on the runner that will judge it. This workflow gives every push to the
+# working branch a run on that runner, so the baseline can be calibrated (and
+# the chart-staleness enforcement proven red/green) before a PR exists.
+name: bench-calibrate
+
+on:
+  push:
+    branches: [zannis/shove-583]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench-tier-a-calibrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run the Tier A criterion suite
+        run: >
+          cargo bench --no-default-features --features inmemory
+          --bench pure_paths --bench inmemory_flows --bench consumer_overhead
+      # Before the baseline is committed: calibration view (all ids + means,
+      # exit 0). After: the real comparison, so the leg-to-be is exercised
+      # against the committed baseline on this runner before the PR opens.
+      - name: Compare (or print the calibration view)
+        run: |
+          if [ -f benches/baselines/tier-a-ubuntu-latest.json ]; then
+            cargo run --no-default-features --example bench_compare -- \
+              --criterion-dir target/criterion \
+              --baseline benches/baselines/tier-a-ubuntu-latest.json
+          else
+            cargo run --no-default-features --example bench_compare -- \
+              --criterion-dir target/criterion
+          fi
+      - name: Upload criterion estimates
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tier-a-criterion-estimates-${{ github.run_id }}
+          path: target/criterion/**/new/estimates.json
+
+  # The chart-staleness enforcement of record is the byte-compare test in
+  # tests/chartgen.rs, which runs inside ci.yml's required `check` job. This
+  # job runs exactly that test so the red/green proof (hand-edited SVG → red,
+  # regenerated → green) executes on a real runner pre-PR.
+  staleness-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: The committed charts must match the committed results document
+        run: cargo test --no-default-features --test chartgen
