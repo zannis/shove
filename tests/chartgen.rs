@@ -319,7 +319,8 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
 
     for family in [Family::ThroughputVsConsumers, Family::ThroughputVsPayload] {
-        let svg = chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
+        let svg =
+            chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
         for magnitude in ["424242", "424.2k", "434343", "434.3k"] {
             assert!(
                 !svg.contains(magnitude),
@@ -380,8 +381,8 @@ fn a_published_batch_bar_names_its_knobs() {
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
 
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     assert!(
         svg.contains("up to 500 messages or 200 ms per batch"),
         "the batch bar must state the knobs it ran with"
@@ -422,7 +423,8 @@ fn a_sleeping_handler_row_never_reaches_a_throughput_chart() {
         Family::ThroughputVsPayload,
         Family::ParallelVsSequenced,
     ] {
-        let svg = chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
+        let svg =
+            chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
         for magnitude in ["9876543", "9.9M", "9.8M", "11.3M", "11M"] {
             assert!(
                 !svg.contains(magnitude),
@@ -519,16 +521,24 @@ fn a_non_representative_run_does_not_stretch_the_axis() {
     // Adding a 5M msg/s non-representative series must not change the axis of
     // the representative data. If it did, every published number would be
     // squashed into the bottom of a chart scaled by LocalStack.
-    // The y tick labels ARE the axis: extract every text in the y-label
+    // The y tick labels ARE the axis: extract every tick in the y-label
     // area and compare the sets. Counting two hard-coded linear tick strings
     // would go vacuously green on the log axis (zero == zero proves
-    // nothing); the full set comparison survives any axis shape.
+    // nothing); the full set comparison survives any axis shape. The x-band
+    // alone is not enough — the title and caption block are left-anchored in
+    // the same band, and the sqs document legitimately grows a caption line —
+    // so the probe also requires the fmt_count shape (digits, '.', k/M).
     let axis_of = |doc: &Document| -> Vec<String> {
         let svg = chartgen::render_to_string(doc, Family::ThroughputVsConsumers, Mode::Light)
             .expect("chart should render");
+        let tick_shaped = |c: &str| {
+            !c.is_empty()
+                && c.chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == 'k' || ch == 'M')
+        };
         let ticks: Vec<String> = texts(&svg)
             .into_iter()
-            .filter(|(x, _, _, c)| *x < 110.0 && !c.is_empty())
+            .filter(|(x, _, _, c)| *x < 110.0 && tick_shaped(c))
             .map(|(_, _, _, c)| c)
             .collect();
         assert!(
@@ -614,8 +624,8 @@ fn a_backend_absent_from_a_slice_is_named_rather_than_omitted() {
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), sparse)));
 
-    let svg =
-        chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light).expect("should render");
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("should render");
     // The wording matters as much as the mention: this is a gap in the run,
     // and captioning it "not supported" would publish a false capability
     // claim about the library on the chart's face.
@@ -737,10 +747,8 @@ fn rendering_twice_produces_identical_bytes() {
     let doc = parse(&document(&inmemory_run(true)));
     for family in Family::ALL {
         for mode in Mode::ALL {
-            let first =
-                chartgen::render_to_string(&doc, family, mode).expect("first render");
-            let second =
-                chartgen::render_to_string(&doc, family, mode).expect("second render");
+            let first = chartgen::render_to_string(&doc, family, mode).expect("first render");
+            let second = chartgen::render_to_string(&doc, family, mode).expect("second render");
             assert_eq!(
                 first, second,
                 "{family:?} ({mode:?}) is not byte-deterministic"
@@ -866,14 +874,13 @@ fn the_two_variants_differ_in_ink_and_agree_on_content() {
     // captions, same markers. Only the ink may differ.
     let doc = parse(&document(&inmemory_run(true)));
     for family in Family::ALL {
-        let light = chartgen::render_to_string(&doc, family, Mode::Light)
-            .expect("light should render");
-        let dark = chartgen::render_to_string(&doc, family, Mode::Dark)
-            .expect("dark should render");
+        let light =
+            chartgen::render_to_string(&doc, family, Mode::Light).expect("light should render");
+        let dark =
+            chartgen::render_to_string(&doc, family, Mode::Dark).expect("dark should render");
         assert_ne!(light, dark, "{family:?}: the dark variant is not themed");
-        let words = |svg: &str| -> Vec<String> {
-            texts(svg).into_iter().map(|(_, _, _, c)| c).collect()
-        };
+        let words =
+            |svg: &str| -> Vec<String> { texts(svg).into_iter().map(|(_, _, _, c)| c).collect() };
         assert_eq!(
             words(&light),
             words(&dark),
@@ -987,7 +994,8 @@ fn long_reasons_are_wrapped_not_truncated() {
         scenario("publish_single", "parallel", 64, 1, 10.0)
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light).expect("renders");
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("renders");
 
     let joined: String = texts(&svg)
         .into_iter()
@@ -1148,8 +1156,8 @@ fn a_consumer_group_row_never_feeds_the_parallel_bar() {
         scenario("consumer_group", "parallel", 64, 1, 7_654_321.0)
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     for magnitude in ["7654321", "7.7M", "7.65M", "8.6M"] {
         assert!(
             !svg.contains(magnitude),
@@ -1172,8 +1180,8 @@ fn the_fifo_bar_uses_the_mode_pinned_worker_count() {
         scenario("consume_fifo", "fifo", 64, 8, 4_000.0)
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     assert!(
         svg.contains("measured at 8 workers"),
         "a non-1 worker count must be stated on the chart"
@@ -1417,8 +1425,12 @@ fn a_single_series_shape_only_chart_still_shows_the_shape() {
           "results": [{rows}], "failures": [], "unsupported": []
         }}"#
     );
-    let svg = chartgen::render_to_string(&parse(&document(&run)), Family::FrameworkOverhead, Mode::Light)
-        .expect("chart should render");
+    let svg = chartgen::render_to_string(
+        &parse(&document(&run)),
+        Family::FrameworkOverhead,
+        Mode::Light,
+    )
+    .expect("chart should render");
     let heights: std::collections::BTreeSet<String> = svg
         .lines()
         .filter(|l| l.contains("<rect") && l.contains("opacity"))
@@ -1437,16 +1449,19 @@ fn a_single_series_shape_only_chart_still_shows_the_shape() {
 
 #[test]
 fn the_legend_never_leaves_the_canvas() {
-    // Six shape-only backends carry the longest legend labels this document
-    // shape can produce; every entry must stay inside the 960px viewBox or a
-    // plotted series has no legible label.
-    let backends = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
-    let runs: Vec<String> = backends
+    // The widest legend this document shape can still produce: the five
+    // remaining fixed backends as shape-only runs (each label carries the
+    // "(shape only)" suffix) plus both overflow slots taken by long-named
+    // unknown backends — a third unknown is refused, so this IS the worst
+    // case. Every entry must stay inside the 960px viewBox or a plotted
+    // series has no legible label.
+    let backends = ["kafka", "nats", "rabbitmq", "redis", "sqs"];
+    let mut runs: Vec<String> = backends
         .iter()
         .map(|b| {
             format!(
                 r#"{{
-                  "backend": "{b}-backend-name", "representative": false,
+                  "backend": "{b}", "representative": false,
                   "broker": {{ "name": "LocalStack", "version": "3", "deployment": "docker" }},
                   "results": [{}], "failures": [], "unsupported": []
                 }}"#,
@@ -1454,6 +1469,16 @@ fn the_legend_never_leaves_the_canvas() {
             )
         })
         .collect();
+    for b in ["charlie-backend-name", "foxtrot-backend-name"] {
+        runs.push(format!(
+            r#"{{
+              "backend": "{b}", "representative": false,
+              "broker": {{ "name": "LocalStack", "version": "3", "deployment": "docker" }},
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
+        ));
+    }
     let doc = parse(&document(&format!(
         "{},{}",
         inmemory_run(true),
@@ -1481,8 +1506,8 @@ fn an_unbreakable_token_in_a_reason_is_split_not_overflowed() {
         scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     for (_, _, _, content) in texts(&svg) {
         assert!(
             content.chars().count() <= 120,
@@ -1586,8 +1611,8 @@ fn a_line_never_bridges_a_category_with_no_publishable_value() {
         }}"#
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light)
+        .expect("chart should render");
     // Three categories sit ~316px apart; a segment bridging the withheld
     // middle category spans two steps (~630px). No polyline segment may span
     // more than one category step.
@@ -1717,8 +1742,8 @@ fn family3_compares_modes_at_a_shared_worker_count() {
         }}"#
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     assert!(
         !svg.contains("33.3k") && !svg.contains("33333"),
         "the 1-worker parallel magnitude must not be charted when 8 is the shared count"
@@ -1832,8 +1857,8 @@ fn a_publish_row_with_a_sub_second_window_never_becomes_an_overhead_bar() {
     // framework measurement; the publish rows have no such floor, so the
     // chart has to hold them to it instead of publishing the reciprocal.
     let doc = parse(&document(&inmemory_run_with_short_publish_windows()));
-    let svg =
-        chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light)
+        .expect("chart should render");
 
     for magnitude in ["1584", "1.6k", "1,584"] {
         assert!(
@@ -1877,8 +1902,8 @@ fn a_short_window_lower_bound_is_not_drawn() {
         ),
     );
     let doc = parse(&document(&run));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
 
     for magnitude in ["219087", "219k", "200k", "250k"] {
         assert!(
@@ -1977,8 +2002,8 @@ fn the_supervisor_column_is_captioned_as_an_alias_not_a_gap() {
     // driver never emits a supervisor row. Captioning that as a gap says a
     // measurement was skipped when nothing was.
     let doc = parse(&document(&inmemory_run(true)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light)
+        .expect("chart should render");
     assert!(
         !svg.contains("capability hole): supervisor"),
         "supervisor must not be captioned as an unmeasured gap"
@@ -2017,8 +2042,8 @@ fn identical_explanations_across_modes_collapse_to_one_caption_line() {
         }}"#
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     assert_eq!(
         svg.matches("LocalStack Pro auth token").count(),
         1,
@@ -2121,7 +2146,8 @@ fn line_charts_mark_an_unsupported_backend_in_the_legend() {
         declared_only_run("sqs", "not measured in this document")
     )));
     for family in [Family::ThroughputVsConsumers, Family::ThroughputVsPayload] {
-        let svg = chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
+        let svg =
+            chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
         assert!(
             texts(&svg).iter().any(|(_, _, _, t)| t == "sqs (n/s)"),
             "{family:?}: the unsupported backend has no legend marker"
@@ -2208,8 +2234,8 @@ fn a_short_window_setup_bound_cell_is_captioned_as_too_short_in_the_line_charts(
         .replace("\"setup_secs\": 0.4", "\"setup_secs\": null")
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light)
+        .expect("chart should render");
     assert!(
         svg.contains("kafka: partial"),
         "the kafka series must be partial"
@@ -2235,8 +2261,8 @@ fn the_latency_panel_accounts_for_every_backend() {
         inmemory_run(true),
         declared_only_run("sqs", "not measured in this document")
     )));
-    let svg =
-        chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light).expect("panel should render");
+    let svg = chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
+        .expect("panel should render");
     assert!(
         svg.contains("inmemory") && svg.contains("withheld"),
         "the panel must name the backends whose percentiles are withheld"
@@ -2351,8 +2377,8 @@ fn a_category_no_backend_can_publish_still_reaches_the_axis_and_caption() {
         r#"{{ "backend": "nats", "representative": true, "results": [{rows}], "failures": [], "unsupported": [] }}"#
     );
     let doc = parse(&document(&format!("{a},{b}")));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light)
+        .expect("chart should render");
     let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
     assert!(
         labels.iter().any(|t| t == "64 KiB"),
@@ -2388,8 +2414,8 @@ fn a_partial_shape_only_series_keeps_its_withheld_accounting() {
         )
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsPayload, Mode::Light)
+        .expect("chart should render");
     let caption = texts(&svg)
         .into_iter()
         .map(|(_, _, _, t)| t)
@@ -2425,7 +2451,8 @@ fn a_sleeping_handler_cell_is_captioned_as_measured_not_as_a_gap() {
     );
     let doc = parse(&document(&run));
     for family in [Family::ParallelVsSequenced, Family::FrameworkOverhead] {
-        let svg = chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
+        let svg =
+            chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
         let caption = texts(&svg)
             .into_iter()
             .map(|(_, _, _, t)| t)
@@ -2564,7 +2591,8 @@ fn a_failed_bar_cell_is_captioned_as_failed_not_as_a_gap() {
     );
     let doc = parse(&document(&format!("{inmemory},{kafka}")));
     for family in [Family::ParallelVsSequenced, Family::FrameworkOverhead] {
-        let svg = chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
+        let svg =
+            chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
         let caption = texts(&svg)
             .into_iter()
             .map(|(_, _, _, t)| t)
@@ -2658,8 +2686,8 @@ fn the_overhead_chart_discloses_short_windows_behind_setup_bound_flows() {
         ),
     );
     let doc = parse(&document(&run));
-    let svg =
-        chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light)
+        .expect("chart should render");
     let caption = texts(&svg)
         .into_iter()
         .map(|(_, _, _, t)| t)
@@ -2696,7 +2724,8 @@ fn an_sqs_supervisor_row_is_charted_as_the_parallel_consume_it_spells() {
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
     for family in [Family::ThroughputVsConsumers, Family::ParallelVsSequenced] {
-        let svg = chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
+        let svg =
+            chartgen::render_to_string(&doc, family, Mode::Light).expect("chart should render");
         let caption = texts(&svg)
             .into_iter()
             .map(|(_, _, _, t)| t)
@@ -2820,8 +2849,8 @@ fn a_shape_only_lower_bound_bar_still_says_lower_bound() {
         scenario("consume_fifo", "fifo", 64, 1, 400.0)
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     let caption = texts(&svg)
         .into_iter()
         .map(|(_, _, _, t)| t)
@@ -2880,8 +2909,8 @@ fn disjoint_worker_counts_are_not_captioned_as_shared() {
         scenario("consume_fifo", "fifo", 64, 8, 20_000.0)
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     let caption = texts(&svg)
         .into_iter()
         .map(|(_, _, _, t)| t)
@@ -2940,8 +2969,8 @@ fn an_unsupported_entry_for_a_flow_unknown_to_the_chart_is_named() {
         scenario("consume_parallel", "parallel", 64, 1, 50_000.0)
     );
     let doc = parse(&document(&run));
-    let svg =
-        chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light)
+        .expect("chart should render");
     let caption = texts(&svg)
         .into_iter()
         .map(|(_, _, _, t)| t)
@@ -3072,8 +3101,8 @@ fn every_published_bar_carries_a_value_label() {
     // pixels tall; the label is what keeps them readable. Lower bounds are
     // labelled with the ≥ they are.
     let doc = parse(&document(&inmemory_run(true)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
     assert!(
         labels.iter().any(|t| t == "10k"),
@@ -3083,8 +3112,8 @@ fn every_published_bar_carries_a_value_label() {
         labels.iter().any(|t| t == "≥4.0k"),
         "the lower-bound bar must be labelled with ≥: {labels:?}"
     );
-    let svg =
-        chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::FrameworkOverhead, Mode::Light)
+        .expect("chart should render");
     let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
     // 1e9 / 10_000 msg/s = 100,000 ns
     assert!(
@@ -3106,8 +3135,8 @@ fn a_shape_only_bar_carries_no_value_and_no_absolute_bound() {
         scenario("consume_fifo", "fifo", 64, 1, 333.0)
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
-    let svg =
-        chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light).expect("chart should render");
+    let svg = chartgen::render_to_string(&doc, Family::ParallelVsSequenced, Mode::Light)
+        .expect("chart should render");
     let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
     assert!(
         !labels.iter().any(|t| t == "777" || t == "≥333"),
@@ -3134,8 +3163,8 @@ fn a_document_that_ran_no_cell_states_so_in_the_provenance() {
         "not measured in this document",
     )));
     // Only the latency panel renders without an in-process run or any data.
-    let svg =
-        chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light).expect("panel should render");
+    let svg = chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light)
+        .expect("panel should render");
     let caption = texts(&svg)
         .into_iter()
         .map(|(_, _, _, t)| t)
@@ -3244,8 +3273,30 @@ fn two_unknown_backends_take_the_overflow_slots_and_a_third_is_refused() {
 fn every_plotted_line_carries_a_direct_end_label() {
     // The end labels are the identity relief for the sub-3:1 light-mode
     // series (and the CVD channel): each plotted backend's name appears once
-    // in the legend and once at its line's end.
-    let doc = parse(&document(&inmemory_run(true)));
+    // in the legend and once at its line's end. The run needs several points
+    // in the headline slice so the legend entry is the bare backend name — a
+    // single-point run is labelled "inmemory (single point)" and would count
+    // the end label alone.
+    let rows: Vec<String> = [1u32, 2, 4]
+        .iter()
+        .map(|c| {
+            scenario(
+                "consume_parallel",
+                "parallel",
+                64,
+                *c,
+                10_000.0 * f64::from(*c),
+            )
+        })
+        .collect();
+    let run = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows.join(",")
+    );
+    let doc = parse(&document(&run));
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("chart should render");
     let names: Vec<String> = texts(&svg)
