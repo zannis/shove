@@ -1,0 +1,21 @@
+examples/common/stress_test.rs
+  s_c83d1ddd606ee3::t_981c8891605400 166-167,310-314,319,321,400-401,406,410,951-956,1038-1039,1072,1556,1682-1683,1831-1835,1902-1903,2001,2048-2054,2278-2283,2428,2464,2579,2604,2738,2772-2773,2846,2849-2850,2887,2911-2912,3064,3098,5154-5156,5167-5168,5181,5622-5625,5661,5713,5729-5733,5737-5738,5754-5759,5766,5772,5774,7537
+examples/inmemory/stress.rs
+  s_c83d1ddd606ee3::t_baa07b75b97fc8 32-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "898e17e7a573edefcb34191afd8f01df46c95bea",
+  "prompts": {},
+  "sessions": {
+    "s_c83d1ddd606ee3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "69eae554-a4a2-4de2-a142-cff033a22a16",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
