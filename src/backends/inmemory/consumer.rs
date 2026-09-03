@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use super::client::{Envelope, InMemoryBroker, QueueState};
 use super::constants::{
@@ -277,6 +278,11 @@ where
     // Envelopes whose DLQ publish the per-consumer token cut short, with
     // their `in_flight` slots still held; requeued once, after the drain.
     let mut survivors: Vec<Envelope> = Vec::new();
+    // Redelivery backoffs spawned by the `Hold` route. Tracked so `run()`
+    // never returns with one still in flight: a caller that tears down the
+    // runtime after `run()` would otherwise destroy the parked envelope
+    // mid-sleep, with no requeue.
+    let redeliveries = TaskTracker::new();
 
     loop {
         // Pull messages up to prefetch.
@@ -344,6 +350,7 @@ where
                                 &options,
                                 subscription_closed.as_ref(),
                                 &mut survivors,
+                                &redeliveries,
                             )
                             .await;
                             if inflight.is_empty() {
@@ -365,6 +372,7 @@ where
                                 &options,
                                 subscription_closed.as_ref(),
                                 &mut survivors,
+                                &redeliveries,
                             )
                             .await;
                             if inflight.is_empty() {
@@ -407,9 +415,16 @@ where
         &options,
         subscription_closed.as_ref(),
         &mut survivors,
+        &redeliveries,
     )
     .await;
     requeue_survivors(&broker, &queue, topology.queue(), survivors).await;
+    // Prompt, never a backoff-length stall: this point is only reached with
+    // the per-consumer or broker token cancelled, and every tracked task
+    // selects on both — each one wakes to requeue its survivor (consumer
+    // token) or drop it with a warning (broker token).
+    redeliveries.close();
+    redeliveries.wait().await;
     options.processing.store(false, Ordering::Release);
     Ok(())
 }
@@ -464,6 +479,7 @@ async fn drain_pending(
     options: &ConsumerOptionsInner,
     subscription_closed: Option<&CancellationToken>,
     survivors: &mut Vec<Envelope>,
+    redeliveries: &TaskTracker,
 ) {
     while let Some((env, (outcome, pre_handler_reason))) = pending.remove(next_route) {
         match route_outcome(
@@ -477,6 +493,7 @@ async fn drain_pending(
             outcome,
             pre_handler_reason,
             options,
+            redeliveries,
         )
         .await
         {
@@ -982,7 +999,9 @@ where
 /// token cut a `Dlq`-arm publish wedged on a full DLQ (see
 /// [`route_reject_or_survive`]): the caller must keep its `in_flight` slot
 /// held and requeue it, so the message is never counted in neither gauge.
-/// `Ack` and `Hold` always return `None`.
+/// `Ack` and `Hold` always return `None` — a `Hold` survivor requeues itself
+/// from inside the tracked redelivery task instead.
+#[allow(clippy::too_many_arguments)] // drain_pending's routing state, threaded through
 async fn route_outcome(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
@@ -994,6 +1013,7 @@ async fn route_outcome(
     // `Reject`. See [`prepare_message`].
     pre_handler_reason: Option<metrics::FailReason>,
     options: &ConsumerOptionsInner,
+    redeliveries: &TaskTracker,
 ) -> Option<Envelope> {
     let retry_count = get_retry_count(&env.headers);
     match decide_retry(&outcome, retry_count, options.max_retries) {
@@ -1029,7 +1049,9 @@ async fn route_outcome(
                 source.queue,
                 env,
                 increment,
+                &options.shutdown,
                 source.subscription_closed,
+                redeliveries,
             );
             None
         }
@@ -1059,13 +1081,24 @@ fn resolve_reject(reached_dlq: bool, pending: metrics::PendingDiscard) {
     }
 }
 
+/// Park a `Retry`/`Defer` for its backoff and re-enqueue it, off the consumer
+/// loop so the backoff never blocks a delivery slot. The task is spawned onto
+/// `redeliveries` (awaited by `run_concurrent_on` before `run()` returns) and
+/// races the per-consumer `shutdown` token: a consumer leaving cannot await
+/// the backoff out, so the token cuts it short and requeues the survivor —
+/// retry state already stamped, same as the sequenced republish cut — rather
+/// than leaving the envelope to a detached task a runtime teardown would
+/// destroy.
+#[allow(clippy::too_many_arguments)] // route_outcome's routing state, threaded through
 fn schedule_redelivery(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
     source: &Arc<QueueState>,
     env: Envelope,
     increment: bool,
+    shutdown: &CancellationToken,
     subscription_closed: Option<&CancellationToken>,
+    redeliveries: &TaskTracker,
 ) {
     let retry_count = get_retry_count(&env.headers);
     let hold_queues = topology.hold_queues();
@@ -1107,13 +1140,15 @@ fn schedule_redelivery(
     // mid-backoff) still applies to them.
     let target: Option<Arc<QueueState>> = topology.broadcast().then(|| Arc::clone(source));
     let subscription_closed = subscription_closed.cloned();
+    let shutdown = shutdown.clone();
 
-    // Every `return` below destroys the message. None is counted — see
-    // `metrics::FailReason` for why in-process broker drops stay log-only.
-    tokio::spawn(async move {
+    // Every `return` below except the per-consumer requeue arms destroys the
+    // message. None of those drops is counted — see `metrics::FailReason` for
+    // why in-process broker drops stay log-only.
+    redeliveries.spawn(async move {
         let message_id = message_id_of(&env.headers).to_owned();
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+        let cut = tokio::select! {
+            _ = tokio::time::sleep(delay) => false,
             _ = broker_shutdown.cancelled() => {
                 tracing::warn!(
                     queue = %main_queue,
@@ -1130,7 +1165,8 @@ fn schedule_redelivery(
                 );
                 return;
             }
-        }
+            _ = shutdown.cancelled() => true,
+        };
         // Re-check shutdown after sleep — the broker may have shut down while
         // awaiting capacity.
         if broker_shutdown.is_cancelled() {
@@ -1155,8 +1191,25 @@ fn schedule_redelivery(
                 q
             }
         };
+        if cut {
+            // Not a drop: the retry state is already stamped, so park the
+            // message at the front of its queue for a restarted consumer to
+            // pick up — ahead of the backoff it can no longer sleep out.
+            tracing::debug!(
+                queue = %main_queue,
+                %message_id,
+                "per-consumer shutdown cut a redelivery backoff — requeueing the survivor"
+            );
+            broker_clone.requeue_front(&q, vec![env]).await;
+            return;
+        }
         let redelivery_timeout = Duration::from_secs(30);
-        let enqueue = tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env));
+        // The clone feeds the enqueue; the original survives for the
+        // per-consumer cancellation arm. The abandoned enqueue cannot land
+        // later: its push-to-return tail is await-free, and the future is
+        // dropped unpolled on `return`.
+        let enqueue =
+            tokio::time::timeout(redelivery_timeout, broker_clone.enqueue(&q, env.clone()));
         tokio::pin!(enqueue);
         let result = tokio::select! {
             result = &mut enqueue => result,
@@ -1166,6 +1219,16 @@ fn schedule_redelivery(
                     %message_id,
                     "subscription closed during redelivery enqueue"
                 );
+                return;
+            }
+            _ = shutdown.cancelled() => {
+                // Same non-drop as the backoff cut above.
+                tracing::debug!(
+                    queue = %main_queue,
+                    %message_id,
+                    "per-consumer shutdown cut a redelivery enqueue — requeueing the survivor"
+                );
+                broker_clone.requeue_front(&q, vec![env]).await;
                 return;
             }
         };
@@ -2287,13 +2350,17 @@ mod tests {
             .expect("fill private buffer");
         let source_weak = Arc::downgrade(&source);
 
+        let consumer_shutdown = CancellationToken::new();
+        let redeliveries = TaskTracker::new();
         schedule_redelivery(
             &broker,
             broadcast_topology(),
             &source,
             envelope(b"deferred"),
             false,
+            &consumer_shutdown,
             Some(subscription.closed_token()),
+            &redeliveries,
         );
 
         // Let the detached task reach the full-buffer capacity wait, then
