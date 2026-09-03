@@ -285,8 +285,12 @@ where
 // Recording batch handler — records every flush, returns scripted outcomes
 // ---------------------------------------------------------------------------
 
-/// `(seq, delivery_count, redelivered)` for one message in a recorded batch.
-type SeqDeliveryRedelivered = (u32, Option<u32>, bool);
+/// `(seq, delivery_count, redelivered, has_x_retry_count)` for one message in
+/// a recorded batch. `has_x_retry_count` is read from `meta.headers` — batch
+/// `Retry`/`Defer` redelivery is a visibility reset
+/// (`ChangeMessageVisibilityBatch`), never the single-message path's
+/// delete+re-send, so it must never appear.
+type SeqDeliveryRedelivered = (u32, Option<u32>, bool, bool);
 
 #[derive(Clone)]
 struct RecordingBatchHandler {
@@ -313,7 +317,14 @@ impl RecordingBatchHandler {
         self.batches.lock().unwrap().push(
             batch
                 .iter()
-                .map(|(m, meta)| (m.seq, meta.delivery_count, meta.redelivered))
+                .map(|(m, meta)| {
+                    (
+                        m.seq,
+                        meta.delivery_count,
+                        meta.redelivered,
+                        meta.headers.contains_key("x-retry-count"),
+                    )
+                })
                 .collect(),
         );
         let outcome = self
@@ -334,7 +345,7 @@ impl RecordingBatchHandler {
         self.batches()
             .into_iter()
             .flatten()
-            .map(|(seq, _, _)| seq)
+            .map(|(seq, _, _, _)| seq)
             .collect()
     }
 
@@ -593,28 +604,34 @@ async fn retry_redelivers_the_whole_batch_then_acks() {
     assert_eq!(batches.len(), 2, "batches: {batches:?}");
 
     // Round 1: first delivery — delivery_count 1 (SQS's ApproximateReceiveCount
-    // counts the current receive), not marked redelivered.
+    // counts the current receive), not marked redelivered, no x-retry-count.
     let mut round1 = batches[0].clone();
-    round1.sort_unstable_by_key(|(seq, _, _)| *seq);
-    for (_, delivery_count, redelivered) in &round1 {
+    round1.sort_unstable_by_key(|(seq, _, _, _)| *seq);
+    for (_, delivery_count, redelivered, has_x_retry_count) in &round1 {
         assert_eq!(*delivery_count, Some(1));
         assert!(!redelivered);
+        assert!(!has_x_retry_count);
     }
 
     // Round 2: the same messages come back with delivery_count incremented
-    // and redelivered=true — a visibility reset, not a republish (no
-    // x-retry-count attribute is set, so `get_retry_count` falls back to
-    // `ApproximateReceiveCount - 1`, which is exactly what `redelivered`
-    // reflects here).
+    // and redelivered=true — a visibility reset, not a republish. The
+    // republish-only `x-retry-count` message attribute must still be absent:
+    // asserting that here (not just `redelivered`/`delivery_count`, which
+    // `ApproximateReceiveCount` alone could satisfy) is what pins "this went
+    // through ChangeMessageVisibilityBatch, never route_retry's delete+re-send".
     let mut round2 = batches[1].clone();
-    round2.sort_unstable_by_key(|(seq, _, _)| *seq);
-    for (_, delivery_count, redelivered) in &round2 {
+    round2.sort_unstable_by_key(|(seq, _, _, _)| *seq);
+    for (_, delivery_count, redelivered, has_x_retry_count) in &round2 {
         assert_eq!(*delivery_count, Some(2));
         assert!(*redelivered);
+        assert!(
+            !has_x_retry_count,
+            "batch redelivery must never set x-retry-count (that would mean a republish)"
+        );
     }
 
-    let seqs1: Vec<u32> = round1.iter().map(|(s, _, _)| *s).collect();
-    let seqs2: Vec<u32> = round2.iter().map(|(s, _, _)| *s).collect();
+    let seqs1: Vec<u32> = round1.iter().map(|(s, _, _, _)| *s).collect();
+    let seqs2: Vec<u32> = round2.iter().map(|(s, _, _, _)| *s).collect();
     assert_eq!(seqs1, vec![0, 1]);
     assert_eq!(seqs2, vec![0, 1], "the SAME message set must redeliver");
 }
@@ -662,10 +679,11 @@ async fn defer_redelivers_like_retry() {
     let batches = handler.batches();
     assert_eq!(batches.len(), 2, "batches: {batches:?}");
     let mut round2 = batches[1].clone();
-    round2.sort_unstable_by_key(|(seq, _, _)| *seq);
-    for (_, delivery_count, redelivered) in &round2 {
+    round2.sort_unstable_by_key(|(seq, _, _, _)| *seq);
+    for (_, delivery_count, redelivered, has_x_retry_count) in &round2 {
         assert_eq!(*delivery_count, Some(2));
         assert!(*redelivered);
+        assert!(!has_x_retry_count);
     }
 }
 
