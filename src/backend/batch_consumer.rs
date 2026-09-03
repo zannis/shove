@@ -25,13 +25,16 @@
 //! and `settle_broadcast_outcome` already make.
 //!
 //! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory"))]`: both backends now have a batch-consumption implementation
-//! and share the flush-invoking/backoff machinery
-//! ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
-//! [`next_redelivery_delay`]). The gate widens per-backend as T2–T5
-//! land in turn — NATS, RabbitMQ, Redis, SQS each add their own feature to
-//! the list the moment their `BatchConsumerImpl` exists, exactly as
-//! `broadcast.rs`'s gate widened backend by backend.
+//! "inmemory", feature = "aws-sns-sqs"))]`: all three backends now have a
+//! batch-consumption implementation and share the flush-invoking/backoff
+//! machinery ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
+//! [`next_redelivery_delay`]). The gate widens per-backend as NATS, RabbitMQ
+//! and Redis land in turn, each adding its own feature to the list the moment
+//! its `BatchConsumerImpl` exists, exactly as `broadcast.rs`'s gate widened
+//! backend by backend.
+//!
+//! [`PREALLOC_CAP`] stays narrower than the rest of `settling`: see its own
+//! doc comment for why SQS does not join that particular gate.
 //!
 //! `TerminalDiscard`, `RejectSettlement` and `reject_settlement` are
 //! narrower still: `#[cfg(feature = "kafka")]` *inside* that `any(kafka,
@@ -231,12 +234,12 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory)` — see the module doc's "Gating" section. Named
-// `settling` rather than after either backend: it houses the settlement
-// classifier + panic/timeout invariant surface both backends' batch loops
-// route through, plus the terminal-discard machinery Kafka's single-message
+// Gated `any(kafka, inmemory, aws-sns-sqs)` — see the module doc's "Gating"
+// section. Named `settling` rather than after any one backend: it houses the
+// settlement classifier + panic/timeout invariant surface every batch loop
+// routes through, plus the terminal-discard machinery Kafka's single-message
 // path also depends on (see the module doc's `kafka` note).
-#[cfg(any(feature = "kafka", feature = "inmemory"))]
+#[cfg(any(feature = "kafka", feature = "inmemory", feature = "aws-sns-sqs"))]
 mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
@@ -331,11 +334,21 @@ mod settling {
     /// caller is free to pass `usize::MAX`; sizing the initial allocation to
     /// the real cap would then abort the consumer task on
     /// `Vec::with_capacity`'s overflow check before a single message ever
-    /// arrives. Both backends' batch buffers clamp their initial reservation
-    /// to `max_batch_size.min(PREALLOC_CAP)` instead — growth still reaches
-    /// the real `max_batch_size` for a sane size, so this only bounds the
-    /// up-front allocation, an amortisation nicety rather than a correctness
-    /// requirement.
+    /// arrives. Kafka's and InMemory's batch buffers clamp their initial
+    /// reservation to `max_batch_size.min(PREALLOC_CAP)` instead — growth
+    /// still reaches the real `max_batch_size` for a sane size, so this only
+    /// bounds the up-front allocation, an amortisation nicety rather than a
+    /// correctness requirement.
+    ///
+    /// `kafka`/`inmemory`-only, narrower than the `settling` module's own
+    /// gate: SQS never calls this. Its batch cap is validated to `<= 10`
+    /// before `SqsBatch::new` ever allocates (`validate_sqs_batch_size`), so
+    /// the prealloc is already bounded at the source and this const has no
+    /// call site there — and, with no `#[allow(dead_code)]` of its own,
+    /// including it in the wider gate would fail the SQS-only feature-lint
+    /// row (`cargo clippy --lib --no-default-features --features
+    /// pub-aws-sns,aws-sns-sqs,...`) with an unused-const warning.
+    #[cfg(any(feature = "kafka", feature = "inmemory"))]
     pub(crate) const PREALLOC_CAP: usize = 4096;
 
     /// First delay after redelivering an un-acked batch, escalating to
@@ -690,10 +703,11 @@ mod settling {
     }
 }
 
+#[cfg(any(feature = "kafka", feature = "inmemory", feature = "aws-sns-sqs"))]
+pub(crate) use settling::{batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay};
+
 #[cfg(any(feature = "kafka", feature = "inmemory"))]
-pub(crate) use settling::{
-    PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
-};
+pub(crate) use settling::PREALLOC_CAP;
 
 #[cfg(feature = "kafka")]
 pub(crate) use settling::{RejectSettlement, TerminalDiscard, reject_settlement};

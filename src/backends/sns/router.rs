@@ -1,5 +1,6 @@
 use aws_sdk_sqs::types::{
-    DeleteMessageBatchRequestEntry, Message, MessageAttributeValue, MessageSystemAttributeName,
+    ChangeMessageVisibilityBatchRequestEntry, DeleteMessageBatchRequestEntry, Message,
+    MessageAttributeValue, MessageSystemAttributeName,
 };
 use std::time::Duration;
 use tracing::{debug, error, warn};
@@ -77,6 +78,170 @@ pub(crate) async fn route_ack_batch(
             }
         }
     }
+}
+
+/// The API's per-`ChangeMessageVisibility[Batch]` cap on `VisibilityTimeout`,
+/// in seconds (12 hours).
+pub(crate) const SQS_MAX_VISIBILITY_TIMEOUT_SECS: i32 = 43200;
+
+/// Convert a redelivery/reject delay into an SQS `VisibilityTimeout`, in
+/// whole seconds.
+///
+/// Ceiling-rounded rather than truncated: the shared batch redelivery
+/// backoff (`batch_redelivery_backoff`) jitters ±50%, so its first draw is
+/// often sub-second, and a plain `as_secs()` would floor that to `0` —
+/// reopening the instant-cross-replica-redelivery hole a non-zero delay
+/// exists to close (a sibling consumer on the same queue would re-receive
+/// the batch before the backoff has done anything). Any non-zero input is
+/// therefore floored at 1 second, and the result is capped at the API's
+/// [`SQS_MAX_VISIBILITY_TIMEOUT_SECS`] maximum.
+///
+/// `Duration::ZERO` passes through as `0` unchanged — the deliberate
+/// make-visible-now case both `route_requeue_batch` (a `ReceiveMessage`
+/// error stranding already-buffered handles — those messages did nothing
+/// wrong) and `route_reject_batch` (the terminal reject arm, which always
+/// wants visibility 0) rely on.
+pub(crate) fn visibility_seconds_for_delay(delay: Duration) -> i32 {
+    if delay.is_zero() {
+        return 0;
+    }
+    let whole_secs = delay.as_secs();
+    let ceiled = if delay.subsec_nanos() > 0 {
+        whole_secs.saturating_add(1)
+    } else {
+        whole_secs
+    };
+    ceiled.max(1).min(SQS_MAX_VISIBILITY_TIMEOUT_SECS as u64) as i32
+}
+
+/// Shared mechanics behind [`route_requeue_batch`] and [`route_reject_batch`]:
+/// one `ChangeMessageVisibilityBatch` call per chunk of up to 10 receipt
+/// handles, all set to the same `visibility_timeout`. Failures are logged
+/// and not accounted, mirroring `route_ack_batch` — a failed entry simply
+/// returns via its original visibility timeout instead of the requested one,
+/// which is "delayed, not lost".
+async fn change_visibility_batch(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handles: &[String],
+    visibility_timeout: i32,
+) {
+    for chunk in receipt_handles.chunks(10) {
+        let entries: Vec<_> = chunk
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rh)| {
+                ChangeMessageVisibilityBatchRequestEntry::builder()
+                    .id(i.to_string())
+                    .receipt_handle(rh)
+                    .visibility_timeout(visibility_timeout)
+                    .build()
+                    .ok()
+            })
+            .collect();
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        match sqs
+            .change_message_visibility_batch()
+            .queue_url(queue_url)
+            .set_entries(Some(entries))
+            .send()
+            .await
+        {
+            Err(e) => warn!(
+                queue_url,
+                error = %e,
+                "failed to batch change visibility for SQS messages"
+            ),
+            Ok(out) => {
+                for failure in out.failed() {
+                    warn!(
+                        queue_url,
+                        id = failure.id(),
+                        code = failure.code(),
+                        "batch visibility change: individual entry failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Batch-wide `Redeliver` mechanic (see
+/// [`BatchSettlement`](crate::backend::batch_consumer::BatchSettlement)):
+/// reset the visibility timeout of up to N buffered receipt handles to
+/// `delay` in one `ChangeMessageVisibilityBatch` call, rather than the
+/// single-message `route_retry`'s delete+re-send. A batch-wide outcome is a
+/// seek-back/re-buffer, not a republish — delete+re-send would increment
+/// `x-retry-count` (which the shared contract says a `Redeliver` must not
+/// touch) and cost two API calls per message instead of one call for the
+/// whole batch.
+///
+/// `delay` should come from the shared `next_redelivery_delay`; see
+/// [`visibility_seconds_for_delay`] for the rounding this applies to it.
+/// Chunked to 10 entries per call defensively — the caller already validates
+/// `max_batch_size <= 10` (`validate_sqs_batch_size`), so a second chunk
+/// should never actually happen.
+pub(crate) async fn route_requeue_batch(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handles: &[String],
+    delay: Duration,
+) {
+    if receipt_handles.is_empty() {
+        return;
+    }
+    let visibility_timeout = visibility_seconds_for_delay(delay);
+    debug!(
+        queue_url,
+        batch_size = receipt_handles.len(),
+        visibility_timeout,
+        "requeueing batch (ChangeMessageVisibilityBatch)"
+    );
+    change_visibility_batch(sqs, queue_url, receipt_handles, visibility_timeout).await;
+}
+
+/// Batch-wide `DeadLetter` mechanic: `record_failed` once per message (so
+/// `messages_failed_total` stays comparable to the single-message
+/// `route_reject`, which records one increment per rejected delivery) plus a
+/// single `ChangeMessageVisibilityBatch` call resetting every handle's
+/// visibility to 0 immediately, redelivering the whole batch until the
+/// queue's `maxReceiveCount` redrive moves it to a DLQ (or, with no redrive
+/// policy, until SQS's retention period expires — same as the single-message
+/// `route_reject`, which this mirrors exactly). Every reject path must name
+/// its reason; nothing here decides one on its own.
+pub(crate) async fn route_reject_batch(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    receipt_handles: &[String],
+    topology: &QueueTopology,
+    group: Option<&str>,
+    reason: metrics::FailReason,
+) {
+    if receipt_handles.is_empty() {
+        return;
+    }
+    metrics::record_failed_n(
+        topology.queue(),
+        group,
+        reason,
+        receipt_handles.len() as u64,
+    );
+    if topology.dlq().is_none() {
+        warn!(
+            queue_url,
+            "rejecting batch on queue with no DLQ configured — messages will cycle until SQS retention expires"
+        );
+    }
+    debug!(
+        queue_url,
+        batch_size = receipt_handles.len(),
+        "rejecting batch (ChangeMessageVisibilityBatch, visibility=0)"
+    );
+    change_visibility_batch(sqs, queue_url, receipt_handles, 0).await;
 }
 
 /// Delete + re-send the message with an incremented `x-retry-count`
@@ -545,5 +710,48 @@ mod tests {
             .attributes(MessageSystemAttributeName::ApproximateReceiveCount, "4")
             .build();
         assert_eq!(get_retry_count(&msg), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // visibility_seconds_for_delay — batch redelivery/reject visibility math
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_delay_passes_through_as_zero() {
+        assert_eq!(visibility_seconds_for_delay(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn sub_second_delay_ceils_to_one() {
+        // The shared backoff jitters ±50%, so the first draw is often
+        // sub-second — truncating via `as_secs()` would yield 0, reopening
+        // the instant-cross-replica-redelivery hole a non-zero delay is
+        // supposed to close.
+        assert_eq!(visibility_seconds_for_delay(Duration::from_millis(1)), 1);
+        assert_eq!(visibility_seconds_for_delay(Duration::from_millis(500)), 1);
+        assert_eq!(visibility_seconds_for_delay(Duration::from_millis(999)), 1);
+    }
+
+    #[test]
+    fn whole_second_delay_is_unchanged() {
+        assert_eq!(visibility_seconds_for_delay(Duration::from_secs(1)), 1);
+        assert_eq!(visibility_seconds_for_delay(Duration::from_secs(30)), 30);
+    }
+
+    #[test]
+    fn fractional_second_delay_ceils_up() {
+        assert_eq!(visibility_seconds_for_delay(Duration::from_millis(1500)), 2);
+        assert_eq!(
+            visibility_seconds_for_delay(Duration::from_millis(30001)),
+            31
+        );
+    }
+
+    #[test]
+    fn delay_is_capped_at_the_api_maximum() {
+        assert_eq!(
+            visibility_seconds_for_delay(Duration::from_secs(999_999)),
+            SQS_MAX_VISIBILITY_TIMEOUT_SECS
+        );
     }
 }

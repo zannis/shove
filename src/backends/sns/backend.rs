@@ -39,13 +39,14 @@ use tokio::sync::Mutex;
 
 use crate::autoscale_metrics::AutoscaleMetrics;
 use crate::backend::{
-    AutoscalerBackendImpl, Backend, ConsumerImpl, ConsumerOptionsInner, QueueStatsProviderImpl,
-    TopologyImpl, sealed,
+    AutoscalerBackendImpl, Backend, BatchConsumerImpl, BatchConsumerOptionsInner, ConsumerImpl,
+    ConsumerOptionsInner, QueueStatsProviderImpl, TopologyImpl, capability::HasBatchConsumption,
+    sealed,
 };
 use crate::error::Result;
-use crate::handler::MessageHandler;
+use crate::handler::{BatchMessageHandler, MessageHandler};
 use crate::markers::Sqs;
-use crate::topic::{SequencedTopic, Topic};
+use crate::topic::{NotSequenced, SequencedTopic, Topic};
 
 use super::autoscaler::SqsAutoscalerBackend;
 use super::client::{SnsClient, SnsConfig};
@@ -167,6 +168,35 @@ impl ConsumerImpl for SqsConsumer {
         H: MessageHandler<T>,
     {
         SqsConsumer::spawn_fifo_shards::<T, H>(self, handler, ctx, options).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HasBatchConsumption / BatchConsumerImpl — same consumer type as every
+// other SQS path; see `consumer.rs`'s "Batch consumption" module doc for the
+// 10-message cap and the rest of the loop's contract.
+// ---------------------------------------------------------------------------
+
+impl HasBatchConsumption for Sqs {
+    type BatchConsumerImpl = SqsConsumer;
+
+    fn make_batch_consumer(client: &Self::Client) -> Self::BatchConsumerImpl {
+        SqsConsumer::new(client.clone(), client.queue_registry().clone())
+    }
+}
+
+impl BatchConsumerImpl for SqsConsumer {
+    async fn run_batch<T, H>(
+        &self,
+        handler: H,
+        ctx: H::Context,
+        options: BatchConsumerOptionsInner,
+    ) -> Result<()>
+    where
+        T: NotSequenced,
+        H: BatchMessageHandler<T>,
+    {
+        SqsConsumer::run_batch_with_inner::<T, H>(self, handler, ctx, options).await
     }
 }
 

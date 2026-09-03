@@ -100,6 +100,22 @@ let opts = ConsumerOptions::<Sqs>::new()
 
 For autoscaling within a `min..=max` range driven by `ApproximateNumberOfMessages`, use the backend-specific `SqsConsumerGroupRegistry` directly. It accepts an `SqsConsumerGroupConfig::new(min..=max)` and spawns/retires independent pollers within that range as queue depth changes. The registry also accepts a service-wide handler timeout default via `SqsConsumerGroupRegistry::with_default_handler_timeout(Duration)` — applied to every group that did not set its own. See the [Consumer Groups example](/backends/sqs/examples/consumer-groups) for the full path.
 
+## Batch consumption
+
+`Broker::<Sqs>::batch_consumer()` buffers up to `max_batch_size` messages (or `max_batch_age`, whichever comes first) and hands them to the handler as one call. SQS's `ReceiveMessage`, `DeleteMessageBatch` and `ChangeMessageVisibilityBatch` calls all cap out at 10 entries, so `max_batch_size` above 10 — including this crate's cross-backend default of 500 — is rejected at consumer startup rather than silently clamped down to a 10-message consumer nobody asked for. Set it explicitly:
+
+```rust,no_run
+use shove::{BatchConsumerOptions, Sqs};
+
+let options = BatchConsumerOptions::<Sqs>::new().with_max_batch_size(10);
+```
+
+Batching on SQS therefore amortises a sink's per-flush cost (one DB transaction, one HTTP request) over **at most 10** messages — a fraction of what other backends' defaults allow.
+
+Whole-batch `Retry`/`Defer` redelivers by resetting every buffered message's visibility timeout to the shared escalating backoff's next delay, rather than deleting and re-sending — topology `hold_queues` do not apply to batch redelivery. `Reject` resets visibility to 0 immediately and relies entirely on the queue's AWS-side redrive policy (`maxReceiveCount`) to move the batch to a DLQ; shove never publishes to a DLQ itself on this backend, so until redrive fires, the handler will keep re-seeing the same rejected batch on the next flush.
+
+Keep `max_batch_age + handler_timeout` well under the queue's `VisibilityTimeout` (SQS's own default is 30s). A message must be accumulated, flushed and settled before visibility elapses, or it turns visible mid-flush, a sibling consumer picks it up, and you get duplicate processing.
+
 ## Gotchas
 
 - **Visibility timeout must be greater than handler timeout.** If the handler takes longer than the visibility timeout, the message becomes re-visible on the queue and will be delivered again while the original handler is still running. Set both values consciously.
