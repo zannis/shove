@@ -1557,19 +1557,27 @@ fn ingest_envelope<T: Topic>(
 /// `DeadLetter` arm and every other reject path.
 ///
 /// Returns whatever entries never got a publish attempt because the
-/// per-consumer or broker shutdown token was already cancelled, plus any
-/// entry whose in-flight publish lost the race against that same
-/// per-consumer token — see [`route_reject_or_park`]'s doc for why only that
-/// token needs racing here (the broker token already races inside
-/// `enqueue`). The caller folds this into the same requeue a `Redeliver`
-/// flush uses, rather than losing the message.
+/// per-consumer shutdown token was already cancelled, plus any entry whose
+/// in-flight publish lost the race against that same per-consumer token —
+/// see [`route_reject_or_park`]'s doc for why only that token needs racing
+/// here (the broker token already races inside `enqueue`). The caller folds
+/// this into the same requeue a `Redeliver` flush uses, rather than losing
+/// the message. A *broker*-shutdown cut is never handed back: the requeue it
+/// would feed lands on a queue nothing drains, so those entries are settled
+/// as lost instead ([`lost_to_broker_shutdown`]), broker precedence exactly
+/// as inside [`route_reject_or_survive`].
 async fn publish_parked(
     flush: &InMemoryFlushCtx<'_>,
     parked: &mut Vec<(u64, Envelope, metrics::FailReason)>,
 ) -> Vec<(u64, Envelope)> {
     let mut unpublished = Vec::new();
     for (ordinal, envelope, reason) in parked.drain(..) {
-        if flush.shutdown.is_cancelled() || flush.broker_shutdown.is_cancelled() {
+        if flush.broker_shutdown.is_cancelled() {
+            let pending = metrics::pending_discard(flush.topic, flush.group, reason, true);
+            lost_to_broker_shutdown(flush.topology, reason.as_label(), pending);
+            continue;
+        }
+        if flush.shutdown.is_cancelled() {
             unpublished.push((ordinal, envelope));
             continue;
         }
@@ -1658,17 +1666,9 @@ async fn route_reject_or_survive(
     pending: metrics::PendingDiscard,
 ) -> Option<Envelope> {
     let broker_shutdown = broker.shutdown_token();
-    let lost_to_broker_shutdown = |pending: metrics::PendingDiscard| {
-        tracing::warn!(
-            queue = topology.queue(),
-            reason,
-            "broker shut down during a cut DLQ publish — message lost"
-        );
-        resolve_reject(false, pending);
-    };
     if shutdown.is_cancelled() {
         if broker_shutdown.is_cancelled() {
-            lost_to_broker_shutdown(pending);
+            lost_to_broker_shutdown(topology, reason, pending);
             return None;
         }
         pending.survived();
@@ -1681,13 +1681,37 @@ async fn route_reject_or_survive(
         }
         () = shutdown.cancelled() => {
             if broker_shutdown.is_cancelled() {
-                lost_to_broker_shutdown(pending);
+                lost_to_broker_shutdown(topology, reason, pending);
                 return None;
             }
             pending.survived();
             Some(envelope)
         }
     }
+}
+
+/// Settle a terminal envelope as lost to broker shutdown instead of handing
+/// it back as a survivor: a survivor is folded into the caller's requeue,
+/// and a requeue onto a shutting-down broker parks the message on a queue
+/// nothing drains, where the broker's `Arc<QueueState>` drop destroys it
+/// with no log and no count. `resolve_reject(false, ..)` is the same
+/// accounting the DLQ-enqueue failure path inside [`route_reject`] gets.
+///
+/// Shared by [`route_reject_or_survive`] (pre-check and select arm) and the
+/// per-envelope batch pre-checks in [`publish_parked`] and
+/// [`flush_inmemory_batch`]'s `DeadLetter` loop, so the batch loops cannot
+/// drift from the single-message broker-precedence rule again.
+fn lost_to_broker_shutdown(
+    topology: &'static QueueTopology,
+    reason: &str,
+    pending: metrics::PendingDiscard,
+) {
+    tracing::warn!(
+        queue = topology.queue(),
+        reason,
+        "broker shut down during a cut DLQ publish — message lost"
+    );
+    resolve_reject(false, pending);
 }
 
 /// Release `n` popped-but-unsettled envelopes back to the queue's in-flight
@@ -1824,12 +1848,25 @@ async fn flush_inmemory_batch<T, H>(
             let has_dlq = flush.topology.dlq().is_some();
             let mut unpublished: Vec<(u64, Envelope)> = Vec::new();
             for (ordinal, envelope) in batch.envelopes.drain(..) {
-                // The per-consumer or broker shutdown token may already have
-                // fired between envelopes — stop attempting new publishes
-                // rather than starting one only to lose the race anyway, but
-                // still walk the remainder so every one of them is collected
-                // for the requeue below instead of silently vanishing.
-                if flush.shutdown.is_cancelled() || flush.broker_shutdown.is_cancelled() {
+                // Either shutdown token may already have fired between
+                // envelopes — stop attempting new publishes rather than
+                // starting one only to lose the race anyway. A broker-cut
+                // envelope is settled as lost (the reject still counts:
+                // the handler did fail it, and it will never be redelivered
+                // to try again); a consumer-cut one is collected for the
+                // requeue below, same broker-precedence split as
+                // `route_reject_or_survive` and `publish_parked`.
+                if flush.broker_shutdown.is_cancelled() {
+                    let pending = metrics::record_terminal(
+                        flush.topic,
+                        flush.group,
+                        metrics::FailReason::Rejected,
+                        has_dlq,
+                    );
+                    lost_to_broker_shutdown(flush.topology, "rejected", pending);
+                    continue;
+                }
+                if flush.shutdown.is_cancelled() {
                     unpublished.push((ordinal, envelope));
                     continue;
                 }
@@ -2767,7 +2804,7 @@ mod tests {
     struct BatchRejectTopic;
     impl Topic for BatchRejectTopic {
         type Message = FifoMsg;
-        type Codec = crate::codec::JsonCodec;
+        type Codec = JsonCodec;
         fn topology() -> &'static QueueTopology {
             dlq_topology()
         }
