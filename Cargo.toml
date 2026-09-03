@@ -25,6 +25,12 @@ exclude = [
   "tests/chartgen.rs",
   "examples/chartgen.rs",
   "examples/common/chartgen.rs",
+  # Same reasoning for the Tier A regression comparator: its inputs (the
+  # committed baseline and a criterion output tree) are repo-only.
+  "tests/bench_compare.rs",
+  "examples/bench_compare.rs",
+  "examples/common/bench_compare.rs",
+  "benches/baselines/",
   ".pr-body.md",
   "package.json",
   "pnpm-lock.yaml",
@@ -458,3 +464,10 @@ required-features = ["redis-streams", "audit"]
 [[example]]
 name = "chartgen"
 path = "examples/chartgen.rs"
+
+# Compares a Tier A criterion run against the committed baseline. Same
+# contract as chartgen: reading JSON needs no backend, and the bench-tier-a
+# CI leg runs it under `--no-default-features`.
+[[example]]
+name = "bench_compare"
+path = "examples/bench_compare.rs"
