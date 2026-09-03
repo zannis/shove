@@ -16,21 +16,26 @@
 //!   skips `report/` (criterion's HTML), and requires the file to exist: a
 //!   directory skeleton with no `estimates.json` (what Swatinem/rust-cache
 //!   leaves behind after pruning plain files) is not a measurement.
-//! - A committed baseline document: per-id mean and an explicit `gate` flag.
-//!   Gate membership is earned, not asserted — an id carries `gate: true`
-//!   only after proving < 10% spread across three no-op runs on the runner
-//!   that judges it. The provenance block records how and when.
+//! - A committed baseline document: per-id mean and per-id failure threshold.
+//!   Thresholds are earned, not asserted: calibration runs the suite with no
+//!   code change on separate runners of the judging fleet and sets each id's
+//!   `fail_above_pct` to `max(50, 5 × its measured no-op spread)`. Stable ids
+//!   keep real 50% teeth; ids the fleet's hardware diversity swings 2× can
+//!   still catch a catastrophic blowup, and none of them can cry wolf — a
+//!   no-op repeat of the slowest calibration runner lands at
+//!   `2s / (3 + s)` above the mean for spread `s`, provably inside
+//!   `max(0.5, 5s)` for every `s`. The provenance block records how and when.
 //!
 //! ## The failure matrix
 //!
 //! | Situation | Verdict |
 //! |---|---|
-//! | gated id > 50% slower than baseline | **fail** |
+//! | id slower than baseline mean by more than its `fail_above_pct` | **fail** |
 //! | id in baseline, missing from run | **fail** — a renamed/deleted bench must refresh the baseline in the same PR, and a bench target silently dropped (wrong feature set) fails closed |
-//! | any id > 25% slower | warning annotation |
+//! | id slower by more than half its `fail_above_pct` | warning annotation |
 //! | id in run, not in baseline | warn — a new bench enters the baseline at the next refresh |
 //! | > 25% faster | printed as a baseline-refresh candidate, never a failure |
-//! | zero / negative / non-finite mean anywhere | **error** — corrupt data must not produce a verdict |
+//! | zero / negative / non-finite mean, or a threshold below the floor | **error** — corrupt data must not produce a verdict |
 //! | no `estimates.json` found at all | **error** — a vacuous run must not pass by comparing nothing |
 
 #![allow(dead_code)]
@@ -42,14 +47,18 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// A gated id fails when it is strictly more than this much slower than its
-/// baseline mean. 50% is ~5× the < 10% no-op spread an id must demonstrate to
-/// earn `gate: true` in the first place.
-pub const GATE_FAIL_RATIO: f64 = 0.50;
+/// No id may fail below this, whatever its measured spread: it is ~5× the
+/// tightest spread the calibration fleet has demonstrated, and keeps every
+/// failure threshold clear of its own warn band (half the threshold).
+pub const FAIL_FLOOR_PCT: f64 = 50.0;
 
-/// Any id strictly more than this much slower gets a warning annotation
-/// (and this much faster is flagged as a baseline-refresh candidate).
-pub const WARN_RATIO: f64 = 0.25;
+/// The warn band is per-id: **half the id's failure threshold**, so an id at
+/// the 50% floor warns above 25% and an id calibrated to 300% warns above
+/// 150%. A fixed 25% band would fire on runner jitter for most of the suite
+/// (measured no-op median spread: 57%) and train everyone to ignore the
+/// annotations. This constant is only the *faster* band: more than 25%
+/// faster is flagged as a baseline-refresh candidate.
+pub const FASTER_RATIO: f64 = 0.25;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +74,13 @@ pub enum CompareError {
     CorruptMean {
         id: String,
         mean_ns: f64,
+    },
+    /// A failure threshold below [`FAIL_FLOOR_PCT`] (or non-finite) would let
+    /// runner jitter fail the leg — refuse the baseline rather than judge
+    /// with it.
+    BadThreshold {
+        id: String,
+        fail_above_pct: f64,
     },
     /// The walk found no `new/estimates.json` anywhere: the bench step
     /// measured nothing, which must fail loudly rather than compare nothing.
@@ -85,6 +101,11 @@ impl fmt::Display for CompareError {
             Self::CorruptMean { id, mean_ns } => {
                 write!(f, "{id}: mean {mean_ns} ns is not a positive finite number")
             }
+            Self::BadThreshold { id, fail_above_pct } => write!(
+                f,
+                "{id}: fail_above_pct {fail_above_pct} is below the {FAIL_FLOOR_PCT}% floor \
+                 (or not finite) — a threshold inside runner jitter would cry wolf"
+            ),
             Self::NoEstimates(path) => write!(
                 f,
                 "no new/estimates.json found under {} — the bench step measured nothing",
@@ -99,13 +120,15 @@ impl fmt::Display for CompareError {
 pub const BASELINE_SCHEMA_VERSION: u32 = 1;
 
 /// One baseline row. `deny_unknown_fields` is load-bearing: a misspelled
-/// `gate` must refuse to parse, not silently deserialize into an id that can
-/// never fail.
+/// `fail_above_pct` must refuse to parse, not silently deserialize into an id
+/// judged by a default.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BaselineEntry {
     pub mean_ns: f64,
-    pub gate: bool,
+    /// The id fails when the run mean is strictly more than this percentage
+    /// above `mean_ns`. Set by calibration to `max(50, 5 × measured spread)`.
+    pub fail_above_pct: f64,
 }
 
 /// Where the baseline numbers came from — kept so a stale baseline is visibly
@@ -128,7 +151,7 @@ struct BaselineDoc {
     ids: BTreeMap<String, BaselineEntry>,
 }
 
-/// The comparator's view of the baseline: ids with their gate flags.
+/// The comparator's view of the baseline: ids with their thresholds.
 #[derive(Debug)]
 pub struct Baseline {
     pub ids: BTreeMap<String, BaselineEntry>,
@@ -140,6 +163,14 @@ pub fn load_baseline(path: &Path) -> Result<Baseline, CompareError> {
         serde_json::from_str(&raw).map_err(|e| CompareError::Json(path.to_path_buf(), e))?;
     if doc.schema_version != BASELINE_SCHEMA_VERSION {
         return Err(CompareError::SchemaVersion(doc.schema_version));
+    }
+    for (id, entry) in &doc.ids {
+        if !(entry.fail_above_pct.is_finite() && entry.fail_above_pct >= FAIL_FLOOR_PCT) {
+            return Err(CompareError::BadThreshold {
+                id: id.clone(),
+                fail_above_pct: entry.fail_above_pct,
+            });
+        }
     }
     Ok(Baseline { ids: doc.ids })
 }
@@ -226,13 +257,13 @@ pub fn collect_run(criterion_dir: &Path) -> Result<BTreeMap<String, f64>, Compar
 pub enum Verdict {
     /// Within the noise band either way.
     Ok,
-    /// More than [`WARN_RATIO`] faster: a baseline-refresh candidate.
+    /// More than [`FASTER_RATIO`] faster: a baseline-refresh candidate.
     Faster,
-    /// More than [`WARN_RATIO`] slower (or a gated id between the warn and
-    /// fail thresholds): annotated, never fatal on its own.
+    /// Slower by more than half the id's failure threshold but inside it:
+    /// annotated, never fatal on its own.
     Slow,
-    /// A gated id more than [`GATE_FAIL_RATIO`] slower: fails the leg.
-    GateFail,
+    /// Slower than the id's `fail_above_pct`: fails the leg.
+    Regressed,
     /// In the baseline, absent from the run: fails the leg.
     MissingFromRun,
     /// In the run, absent from the baseline: announced, enters the baseline
@@ -246,7 +277,7 @@ impl Verdict {
             Self::Ok => "ok",
             Self::Faster => "faster (refresh candidate)",
             Self::Slow => "SLOW",
-            Self::GateFail => "GATE FAIL",
+            Self::Regressed => "REGRESSED",
             Self::MissingFromRun => "MISSING FROM RUN",
             Self::NewInRun => "new (not in baseline)",
         }
@@ -261,7 +292,8 @@ pub struct Row {
     /// Percentage the run is slower (+) or faster (−); absent when either
     /// side is missing.
     pub delta_pct: Option<f64>,
-    pub gate: bool,
+    /// The id's own failure threshold; absent for ids not in the baseline.
+    pub fail_above_pct: Option<f64>,
     pub verdict: Verdict,
 }
 
@@ -274,7 +306,7 @@ impl Comparison {
     pub fn failed(&self) -> bool {
         self.rows
             .iter()
-            .any(|r| matches!(r.verdict, Verdict::GateFail | Verdict::MissingFromRun))
+            .any(|r| matches!(r.verdict, Verdict::Regressed | Verdict::MissingFromRun))
     }
 }
 
@@ -294,16 +326,16 @@ pub fn compare(
                 baseline_ns: Some(base),
                 run_ns: None,
                 delta_pct: None,
-                gate: entry.gate,
+                fail_above_pct: Some(entry.fail_above_pct),
                 verdict: Verdict::MissingFromRun,
             }),
             Some(&measured) => {
                 let ratio = measured / base - 1.0;
-                let verdict = if entry.gate && ratio > GATE_FAIL_RATIO {
-                    Verdict::GateFail
-                } else if ratio > WARN_RATIO {
+                let verdict = if ratio > entry.fail_above_pct / 100.0 {
+                    Verdict::Regressed
+                } else if ratio > entry.fail_above_pct / 200.0 {
                     Verdict::Slow
-                } else if ratio < -WARN_RATIO {
+                } else if ratio < -FASTER_RATIO {
                     Verdict::Faster
                 } else {
                     Verdict::Ok
@@ -313,7 +345,7 @@ pub fn compare(
                     baseline_ns: Some(base),
                     run_ns: Some(measured),
                     delta_pct: Some(ratio * 100.0),
-                    gate: entry.gate,
+                    fail_above_pct: Some(entry.fail_above_pct),
                     verdict,
                 });
             }
@@ -326,7 +358,7 @@ pub fn compare(
                 baseline_ns: None,
                 run_ns: Some(measured),
                 delta_pct: None,
-                gate: false,
+                fail_above_pct: None,
                 verdict: Verdict::NewInRun,
             });
         }
@@ -358,32 +390,53 @@ pub fn render_report(cmp: &Comparison, annotate: bool) -> String {
         .unwrap_or(0)
         .max(2);
     out.push_str(&format!(
-        "{:<width$} {:>14} {:>14} {:>9} {:>5}  verdict\n",
-        "id", "baseline ns", "run ns", "delta", "gate",
+        "{:<width$} {:>14} {:>14} {:>9} {:>8}  verdict\n",
+        "id", "baseline ns", "run ns", "delta", "fail at",
     ));
     for row in &cmp.rows {
         let delta = match row.delta_pct {
             Some(d) => format!("{d:>+8.2}%"),
             None => format!("{:>9}", "-"),
         };
+        let fail_at = match row.fail_above_pct {
+            Some(t) => format!("{t:>+7.0}%"),
+            None => format!("{:>8}", "-"),
+        };
         out.push_str(&format!(
-            "{:<width$} {} {} {delta} {:>5}  {}\n",
+            "{:<width$} {} {} {delta} {fail_at}  {}\n",
             row.id,
             fmt_ns(row.baseline_ns),
             fmt_ns(row.run_ns),
-            if row.gate { "yes" } else { "no" },
             row.verdict.label(),
         ));
     }
+    // Say what the gate actually covers, so a fully green run cannot be read
+    // as "58 ids held to 50%": ids the fleet swings hard get thresholds that
+    // only catch catastrophic blowups, and that is a property of the runner
+    // pool, not of the code under test.
+    let with_threshold: Vec<f64> = cmp.rows.iter().filter_map(|r| r.fail_above_pct).collect();
+    let floor = with_threshold
+        .iter()
+        .filter(|t| **t <= FAIL_FLOOR_PCT)
+        .count();
+    let catastrophe = with_threshold.iter().filter(|t| **t > 200.0).count();
+    out.push_str(&format!(
+        "coverage: {} baseline ids — {} gated at the {}% floor, {} at >200% (catastrophe-only), {} in between\n",
+        with_threshold.len(),
+        floor,
+        FAIL_FLOOR_PCT,
+        catastrophe,
+        with_threshold.len() - floor - catastrophe,
+    ));
     if annotate {
         for row in &cmp.rows {
             match row.verdict {
-                Verdict::GateFail => out.push_str(&format!(
-                    "::error::bench {} regressed {} (gated; fails at >{}%)\n",
+                Verdict::Regressed => out.push_str(&format!(
+                    "::error::bench {} regressed {} (fails above {}%)\n",
                     row.id,
                     row.delta_pct
                         .map_or_else(String::new, |d| format!("{d:+.2}%")),
-                    GATE_FAIL_RATIO * 100.0,
+                    row.fail_above_pct.unwrap_or(FAIL_FLOOR_PCT),
                 )),
                 Verdict::MissingFromRun => out.push_str(&format!(
                     "::error::bench {} is in the baseline but was not measured — \

@@ -143,15 +143,19 @@ jobs:
   # Runs the in-process criterion suite (no Docker, no secrets) against the
   # committed baseline in benches/baselines/tier-a-ubuntu-latest.json.
   #
-  # Threshold rationale: no-op back-to-back runs of this suite moved a median
-  # ~21% on the quietest benches and up to 1.8x on the scheduler-bound ones,
-  # and the leg is a max over ~58 ids — so only ids that proved < 10% spread
-  # across three no-op runs on this runner carry `gate: true` in the baseline,
-  # and a gated id fails only at > 50% slower (~5x its demonstrated spread).
-  # Everything else is measured and reported but can never fail the leg: a leg
-  # that cries wolf on runner jitter is ignored within a week, which is worse
-  # than no leg. A baseline id that was not measured at all fails closed (a
-  # renamed or deleted bench must refresh the baseline in the same PR).
+  # Threshold rationale: three no-op calibration runs on separate
+  # ubuntu-latest runners moved the median id 57% and the worst 2.5x with no
+  # code change — the fleet's hardware diversity, not sampling noise (per-run
+  # normalization does not collapse it), and the leg is a max over 58 ids. A
+  # single threshold tight enough to matter would therefore cry wolf weekly
+  # and be ignored within a week, which is worse than no leg. Instead every
+  # id fails at max(50%, 5x its own measured no-op spread), recorded per id
+  # in the baseline: stable ids keep real 50% teeth, ids the fleet swings 2x
+  # still catch catastrophic blowups, and a no-op repeat of the slowest
+  # calibration runner sits provably inside every threshold (leave-one-out
+  # replay of the calibration runs produced zero warnings). A baseline id
+  # that was not measured at all fails closed (a renamed or deleted bench
+  # must refresh the baseline in the same PR).
   #
   # Deliberately NOT in require-green-ci.sh's REQUIRED_JOBS: a perf gate this
   # side of runner jitter must not be able to block a release the way the
