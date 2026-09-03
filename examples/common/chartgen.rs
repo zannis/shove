@@ -45,7 +45,7 @@ use std::fmt;
 use std::path::Path;
 
 use plotters::coord::cartesian::Cartesian2d;
-use plotters::coord::ranged1d::Ranged;
+use plotters::coord::ranged1d::{Ranged, ValueFormatter};
 use plotters::coord::types::RangedCoordf64;
 use plotters::coord::{CoordTranslate, Shift};
 use plotters::prelude::*;
@@ -858,19 +858,15 @@ impl Family {
     /// breaking change to those pages, not a refactor. The dark variant is a
     /// `-dark` sibling, matching how every other themed asset in
     /// `docs/public/` names its pair.
-    pub fn filename(self, mode: Mode) -> &'static str {
-        match (self, mode) {
-            (Self::ThroughputVsConsumers, Mode::Light) => "throughput-vs-consumers.svg",
-            (Self::ThroughputVsConsumers, Mode::Dark) => "throughput-vs-consumers-dark.svg",
-            (Self::ThroughputVsPayload, Mode::Light) => "throughput-vs-payload.svg",
-            (Self::ThroughputVsPayload, Mode::Dark) => "throughput-vs-payload-dark.svg",
-            (Self::ParallelVsSequenced, Mode::Light) => "parallel-vs-sequenced.svg",
-            (Self::ParallelVsSequenced, Mode::Dark) => "parallel-vs-sequenced-dark.svg",
-            (Self::DispatchLatency, Mode::Light) => "dispatch-latency.svg",
-            (Self::DispatchLatency, Mode::Dark) => "dispatch-latency-dark.svg",
-            (Self::FrameworkOverhead, Mode::Light) => "framework-overhead.svg",
-            (Self::FrameworkOverhead, Mode::Dark) => "framework-overhead-dark.svg",
-        }
+    pub fn filename(self, mode: Mode) -> String {
+        let stem = match self {
+            Self::ThroughputVsConsumers => "throughput-vs-consumers",
+            Self::ThroughputVsPayload => "throughput-vs-payload",
+            Self::ParallelVsSequenced => "parallel-vs-sequenced",
+            Self::DispatchLatency => "dispatch-latency",
+            Self::FrameworkOverhead => "framework-overhead",
+        };
+        format!("{stem}{}.svg", mode.file_suffix())
     }
 
     pub fn title(self) -> &'static str {
@@ -917,6 +913,15 @@ impl Mode {
         match self {
             Mode::Light => &LIGHT,
             Mode::Dark => &DARK,
+        }
+    }
+
+    /// The filename suffix that makes a family's dark sibling. Stated once,
+    /// here, so a light/dark pair can never drift apart letter by letter.
+    fn file_suffix(self) -> &'static str {
+        match self {
+            Mode::Light => "",
+            Mode::Dark => "-dark",
         }
     }
 
@@ -2214,8 +2219,6 @@ where
     notes
 }
 
-/// Shared line-chart body for families 1 and 2.
-#[allow(clippy::too_many_arguments)]
 /// One plotted line: its identity, ink, pre-mapped points and weight class.
 /// Points are mapped into axis coordinates *before* the axis branch, so the
 /// log and linear branches share every drawing decision.
@@ -2247,43 +2250,49 @@ fn line_chart(
     extra_notes: &[String],
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let theme = mode.theme();
     let mut notes = notes_for(doc, presences, x_desc);
     notes.extend_from_slice(extra_notes);
     // Color follows the backend, through the fixed slot map — never the
-    // iteration index of whatever happens to be plotted.
+    // iteration index of whatever happens to be plotted. The lookup is total
+    // by construction (`slots` is built from the same keys iterated below),
+    // and if that invariant ever breaks it must break loudly: a silent
+    // fallback hue is exactly the two-series-one-colour failure the slot map
+    // exists to refuse.
     let slots = backend_slots(presences.keys().map(String::as_str))?;
-    let colour_of = |backend: &str| -> RGBColor {
-        theme.series[slots.get(backend).copied().unwrap_or(0) % theme.series.len()]
+    let colour_of = |backend: &str| -> Result<RGBColor, ChartError> {
+        let slot = slots.get(backend).copied().ok_or_else(|| {
+            ChartError::Render(format!(
+                "backend `{backend}` has no palette slot — colour_of only takes presence-map keys"
+            ))
+        })?;
+        Ok(palette_colour(mode, slot))
     };
     // The legend is known before anything is drawn, and its row count
     // decides where the chart body starts.
-    let legend: Vec<(String, RGBColor)> = presences
-        .iter()
-        .map(|(backend, presence)| {
-            let label = match presence {
-                Presence::Absolute { points, .. } if points.len() == 1 => {
-                    format!("{backend} (single point)")
+    let mut legend: Vec<(String, RGBColor)> = Vec::new();
+    for (backend, presence) in presences {
+        let label = match presence {
+            Presence::Absolute { points, .. } if points.len() == 1 => {
+                format!("{backend} (single point)")
+            }
+            Presence::Absolute { .. } => backend.clone(),
+            Presence::ShapeOnly { .. } => format!("{backend} (shape only)"),
+            // A line chart has no slot to put the rule-3 marker in, so
+            // the legend is the axis-adjacent place a backend with no
+            // line must still appear — otherwise the plot reads as a
+            // smaller sweep and the caption is the only witness.
+            Presence::Unsupported(_) => format!("{backend} (n/s)"),
+            Presence::NotMeasured => format!("{backend} (not measured)"),
+            Presence::WithheldOnly(withheld) => {
+                if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
+                    format!("{backend} (failed)")
+                } else {
+                    format!("{backend} (withheld)")
                 }
-                Presence::Absolute { .. } => backend.clone(),
-                Presence::ShapeOnly { .. } => format!("{backend} (shape only)"),
-                // A line chart has no slot to put the rule-3 marker in, so
-                // the legend is the axis-adjacent place a backend with no
-                // line must still appear — otherwise the plot reads as a
-                // smaller sweep and the caption is the only witness.
-                Presence::Unsupported(_) => format!("{backend} (n/s)"),
-                Presence::NotMeasured => format!("{backend} (not measured)"),
-                Presence::WithheldOnly(withheld) => {
-                    if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
-                        format!("{backend} (failed)")
-                    } else {
-                        format!("{backend} (withheld)")
-                    }
-                }
-            };
-            (label, colour_of(backend))
-        })
-        .collect();
+            }
+        };
+        legend.push((label, colour_of(backend)?));
+    }
     let (_, legend_rows) = legend_layout(&legend)?;
     let (area, subtitle_extra) = frame(root, doc, mode, title, subtitle, &notes, legend_rows)?;
     // The end-label gutter: carved out of the plot body, not the canvas, so
@@ -2302,7 +2311,7 @@ fn line_chart(
         match presence {
             Presence::Absolute { points, .. } => specs.push(LineSpec {
                 backend: backend.clone(),
-                colour: colour_of(backend),
+                colour: colour_of(backend)?,
                 points: points.clone(),
                 shape_only: false,
             }),
@@ -2325,7 +2334,7 @@ fn line_chart(
                 };
                 specs.push(LineSpec {
                     backend: backend.clone(),
-                    colour: colour_of(backend),
+                    colour: colour_of(backend)?,
                     points: mapped,
                     shape_only: true,
                 });
@@ -2336,62 +2345,71 @@ fn line_chart(
 
     let n = x_labels.len();
     let x_range = -0.35f64..(n as f64 - 0.65);
+    // Only the y-range expression and the axis's self-description differ
+    // between the two axis shapes; the builder chrome is set once and the
+    // mesh chrome lives in `line_mesh`, so the branches cannot drift apart.
+    let mut builder = ChartBuilder::on(&area);
+    builder
+        .margin_top(26)
+        .margin_bottom(26)
+        .x_label_area_size(0)
+        .y_label_area_size(74);
     match range {
         Some((y_lo, y_hi)) => {
-            let mut chart = ChartBuilder::on(&area)
-                .margin_top(26)
-                .margin_bottom(26)
-                .x_label_area_size(0)
-                .y_label_area_size(74)
+            let mut chart = builder
                 .build_cartesian_2d(x_range, (y_lo..y_hi).log_scale())
                 .map_err(render)?;
-            chart
-                .configure_mesh()
-                .disable_x_mesh()
-                // Decade gridlines only: minor log gridlines would lay ~9
-                // hairlines into every decade. A zero-alpha style is skipped
-                // by the backend entirely, so nothing is emitted.
-                .light_line_style(theme.grid.mix(0.0))
-                .bold_line_style(stroke(theme.grid, 1))
-                .axis_style(stroke(theme.baseline, 1))
-                // The axis names its own scale: a reader comparing line gaps
-                // must know they are ratios, not differences.
-                .y_desc(format!("{y_desc} — log scale"))
-                .y_label_style(muted(mode, LABEL_PX))
-                .axis_desc_style(muted(mode, LABEL_PX))
-                .y_label_formatter(&|v: &f64| fmt_count(*v))
-                .x_labels(0)
-                .x_label_formatter(&|_: &f64| String::new())
-                .draw()
-                .map_err(render)?;
+            // The axis names its own scale: a reader comparing line gaps
+            // must know they are ratios, not differences.
+            line_mesh(&mut chart, mode, format!("{y_desc} — log scale"))?;
             line_chart_body(root, &mut chart, mode, &specs, x_labels, x_desc)?;
         }
         None => {
-            let mut chart = ChartBuilder::on(&area)
-                .margin_top(26)
-                .margin_bottom(26)
-                .x_label_area_size(0)
-                .y_label_area_size(74)
+            let mut chart = builder
                 .build_cartesian_2d(x_range, 0.0f64..1.0f64)
                 .map_err(render)?;
-            chart
-                .configure_mesh()
-                .disable_x_mesh()
-                .light_line_style(theme.grid.mix(0.0))
-                .bold_line_style(stroke(theme.grid, 1))
-                .axis_style(stroke(theme.baseline, 1))
-                .y_desc(format!("{y_desc} (relative — no representative run)"))
-                .y_label_style(muted(mode, LABEL_PX))
-                .axis_desc_style(muted(mode, LABEL_PX))
-                .y_label_formatter(&|v: &f64| fmt_count(*v))
-                .x_labels(0)
-                .x_label_formatter(&|_: &f64| String::new())
-                .draw()
-                .map_err(render)?;
+            line_mesh(
+                &mut chart,
+                mode,
+                format!("{y_desc} (relative — no representative run)"),
+            )?;
             line_chart_body(root, &mut chart, mode, &specs, x_labels, x_desc)?;
         }
     }
     draw_legend(root, mode, &legend, subtitle_extra)?;
+    Ok(())
+}
+
+/// The line families' shared mesh chrome, generic over the y-axis for the
+/// same reason as `line_chart_body`: a styling tweak must be impossible to
+/// apply to only one of the log/linear branches.
+fn line_mesh<Y>(
+    chart: &mut ChartContext<'_, SVGBackend<'_>, Cartesian2d<RangedCoordf64, Y>>,
+    mode: Mode,
+    y_desc: String,
+) -> Result<(), ChartError>
+where
+    Y: Ranged<ValueType = f64> + ValueFormatter<f64>,
+{
+    let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    let theme = mode.theme();
+    chart
+        .configure_mesh()
+        .disable_x_mesh()
+        // Hairline gridlines at the labelled ticks only. On the log axis the
+        // minor lines would lay ~9 hairlines into every decade; a zero-alpha
+        // style is skipped by the backend entirely, so nothing is emitted.
+        .light_line_style(theme.grid.mix(0.0))
+        .bold_line_style(stroke(theme.grid, 1))
+        .axis_style(stroke(theme.baseline, 1))
+        .y_desc(y_desc)
+        .y_label_style(muted(mode, LABEL_PX))
+        .axis_desc_style(muted(mode, LABEL_PX))
+        .y_label_formatter(&|v: &f64| fmt_count(*v))
+        .x_labels(0)
+        .x_label_formatter(&|_: &f64| String::new())
+        .draw()
+        .map_err(render)?;
     Ok(())
 }
 
@@ -2436,19 +2454,19 @@ where
             filled: true,
             stroke_width: 0,
         };
-        for (x, y) in &spec.points {
-            // The 2px surface ring keeps a marker legible where it crosses
-            // another line. A shape-only series stays second-class: thinner
-            // line, smaller dot, no ring.
-            if !spec.shape_only {
-                chart
-                    .draw_series(std::iter::once(Circle::new((*x, *y), radius + 2, ring)))
-                    .map_err(render)?;
-            }
-            chart
-                .draw_series(std::iter::once(Circle::new((*x, *y), radius, dot)))
-                .map_err(render)?;
-        }
+        // The 2px surface ring keeps a marker legible where it crosses
+        // another line. A shape-only series stays second-class: thinner
+        // line, smaller dot, no ring. One batched call per series; the
+        // iterator keeps each ring immediately under its own dot.
+        chart
+            .draw_series(spec.points.iter().flat_map(|&(x, y)| {
+                let ring_element =
+                    (!spec.shape_only).then(|| Circle::new((x, y), radius + 2, ring));
+                ring_element
+                    .into_iter()
+                    .chain(std::iter::once(Circle::new((x, y), radius, dot)))
+            }))
+            .map_err(render)?;
     }
 
     // Direct end-labels: the identity relief the legend cannot give (a
@@ -3583,8 +3601,8 @@ pub fn generate(doc: &Document, out_dir: &Path) -> Result<Vec<String>, ChartErro
     }
     let mut written = Vec::new();
     for (filename, svg) in rendered {
-        std::fs::write(out_dir.join(filename), svg.as_bytes())?;
-        written.push(filename.to_string());
+        std::fs::write(out_dir.join(&filename), svg.as_bytes())?;
+        written.push(filename);
     }
     Ok(written)
 }
