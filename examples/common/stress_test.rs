@@ -163,9 +163,8 @@ pub struct Cli {
 
     /// Override `max_batch_age` in milliseconds for the `consume-batch` flow
     /// (default 250, shove's own default). Same reachability rule as
-    /// `--batch-max-size`. Bounded at parse time by the per-scenario deadline
-    /// ceiling, so no `Cli` value can exist that the deadline fold must be
-    /// trusted not to honour.
+    /// `--batch-max-size`. Capped at parse time by [`MAX_BATCH_AGE_MS`] so a
+    /// units mistake cannot reach a `Scenario`.
     #[arg(long, value_parser = parse_batch_age_ms)]
     pub batch_max_age_ms: Option<NonZeroU64>,
 
@@ -308,19 +307,18 @@ impl FromStr for ConsumersArg {
 }
 
 /// Parse `--batch-max-age-ms`: positive, and no larger than
-/// [`DEADLINE_CEILING_MS`]. The deadline fold in `build_scenarios`
-/// deliberately raises a batch deadline past the derived clamp, so an
-/// unbounded age would let a units mistake (`120000000` intending 120 s) give
-/// every batch scenario a ~33-hour deadline. Checked at parse time like
-/// `ConsumersArg` and `PayloadArg`, so an illegal value can never reach a
-/// `Scenario`.
+/// [`MAX_BATCH_AGE_MS`]. A batch flushes on age when the corpus is smaller
+/// than the batch size, so an unbounded age would let a units mistake
+/// (`120000000` intending 120 s) make every batch scenario wait ~33 hours per
+/// flush. Checked at parse time like `ConsumersArg` and `PayloadArg`, so an
+/// illegal value can never reach a `Scenario`.
 fn parse_batch_age_ms(s: &str) -> Result<NonZeroU64, String> {
     let n: NonZeroU64 = s
         .parse()
         .map_err(|_| format!("'{s}' is not a positive integer of milliseconds"))?;
-    if n.get() > DEADLINE_CEILING_MS {
+    if n.get() > MAX_BATCH_AGE_MS {
         return Err(format!(
-            "{n} ms exceeds the {DEADLINE_CEILING_MS} ms per-scenario deadline ceiling \
+            "{n} ms exceeds the {MAX_BATCH_AGE_MS} ms cap on --batch-max-age-ms \
              (the value is in milliseconds)"
         ));
     }
@@ -399,20 +397,17 @@ impl Flow {
             .find(|f| f.as_cli().eq_ignore_ascii_case(s))
     }
 
-    /// How many workers actually share the message stream, which is what the
-    /// deadline must be sized against.
+    /// How many workers actually share the message stream — the loop count
+    /// the batch driver spawns, and the topology a row describes.
     ///
     /// Only the competing-consumer flows divide the work `consumers` ways.
     /// `run_dlq` is a single loop no matter how many consumers the scenario
     /// names, a broadcast subscriber receives the whole stream rather than a
-    /// share of it, and the publish flows are one sequential loop. Dividing
-    /// their deadlines by the consumer count made them N× too tight, so a
-    /// slow-but-healthy drain was recorded as a timeout failure.
+    /// share of it, and the publish flows are one sequential loop.
     ///
     /// FIFO is capped at [`SEQ_SHARDS`]: the sequenced topology has that many
     /// shards, and consumers past the shard count cannot make independent
-    /// progress, so sizing the deadline by the raw consumer count made a
-    /// 256-consumer slow-handler scenario up to 32× too tight.
+    /// progress.
     pub fn effective_workers(&self, consumers: u16) -> u16 {
         match self {
             Flow::ConsumerGroup | Flow::ConsumeParallel | Flow::ConsumeBatch | Flow::Supervisor => {
@@ -815,7 +810,6 @@ pub struct Scenario {
     pub messages: u64,
     pub consumers: u16,
     pub handler: HandlerProfile,
-    pub deadline: Duration,
     pub concurrent: bool,
     pub prefetch: Option<u16>,
     pub flow: Flow,
@@ -954,45 +948,12 @@ fn framework_corpus_floor(
     MIN_FRAMEWORK_CORPUS_MESSAGES.min(by_bytes)
 }
 
-/// The `zero` drain rate a floored cell's deadline is budgeted at, in messages
-/// per millisecond.
-///
-/// [`framework_corpus_floor`] raises a cell without knowing which backend will
-/// run it, so the deadline that comes with it cannot assume the 40,000 msg/s
-/// the unfloored `zero` deadline does — that figure is the broker the floor was
-/// sized from, and a backend draining a 150,000-message cell at 2,000 msg/s
-/// would fail on the 60 s clamp with nothing wrong. One message per
-/// millisecond budgets 150 s for the floor's corpus, 450 s after the 3× margin
-/// and still inside the 600 s ceiling.
-const FLOORED_ZERO_DRAIN_PER_MS: f64 = 1.0;
-
-fn scenario_deadline(
-    messages: u64,
-    consumers: u16,
-    handler: HandlerProfile,
-    corpus_floored: bool,
-) -> Duration {
-    let expected_ms = match handler {
-        HandlerProfile::Zero if corpus_floored => messages as f64 / FLOORED_ZERO_DRAIN_PER_MS,
-        HandlerProfile::Zero => messages as f64 / 40.0,
-        HandlerProfile::Fast => (messages as f64 * 3.0) / consumers as f64,
-        HandlerProfile::Slow => (messages as f64 * 175.0) / consumers as f64,
-        HandlerProfile::Heavy => (messages as f64 * 3000.0) / consumers as f64,
-    };
-    // 3× expected to absorb steady-state variance and scheduling jitter; 60 s
-    // floor keeps short scenarios from racing broker setup; the ceiling
-    // prevents any single scenario from blocking the whole sweep.
-    let deadline_ms = (expected_ms * 3.0).clamp(60_000.0, DEADLINE_CEILING_MS as f64);
-    Duration::from_millis(deadline_ms as u64)
-}
-
-/// The per-scenario deadline ceiling for *derived* workloads. A batch
-/// scenario may additionally claim its user-declared `--batch-max-age-ms` on
-/// top (the fold in `build_scenarios`), and the flag is parse-bounded by this
-/// same value, so the absolute worst case is 2× this ceiling — bounded and
-/// explicitly asked for, unlike the ~33-hour deadline an unbounded units
-/// mistake (`120000000` intending 120 s) used to be able to produce.
-const DEADLINE_CEILING_MS: u64 = 600_000;
+/// The largest `--batch-max-age-ms` accepted: ten minutes. A batch flushes
+/// on age when the corpus is smaller than the batch size, so the age is a
+/// per-flush wait the scenario really pays; the cap exists to catch a units
+/// mistake (`120000000` intending 120 s), not to bound the run — scenarios
+/// have no deadline and run to completion or interruption.
+const MAX_BATCH_AGE_MS: u64 = 600_000;
 
 /// The flow set this invocation asked for: `--flow`, or the entry point's
 /// default when the flag is absent. [`build_scenarios`] and the batch-flag
@@ -1074,9 +1035,8 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                     // drain is a single loop. Sweeping them re-measures one
                     // topology under many labels — and sizing their corpus by
                     // the swept count made slow/heavy single-loop scenarios
-                    // arithmetically impossible inside the 600 s deadline
-                    // ceiling (32 × 50 heavy messages through one loop needs
-                    // ≥ 1,600 s).
+                    // take hours (32 × 50 heavy messages through one loop is
+                    // ≥ 1,600 s of handler time).
                     // The publish flows join the pinned set: they run one
                     // sequential publisher loop with no consumers, so a
                     // swept `consumers` label would describe a topology that
@@ -1109,9 +1069,7 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                     };
                     // Only the flow with a batch to size carries the knobs;
                     // stamping a default on any other row would claim options
-                    // a run never had. One binding drives both the deadline
-                    // fold and the row stamp, so the two cannot disagree
-                    // about which scenarios are batch scenarios.
+                    // a run never had.
                     let batch_options = (flow == Flow::ConsumeBatch).then_some(batch_options);
                     for &payload_bytes in &cli.payload.0 {
                         // Inside the payload loop, because the floor is capped
@@ -1122,30 +1080,11 @@ fn build_scenarios(cli: &Cli, default_flow: Flow, fifo_workers: u16) -> Vec<Scen
                             cli.concurrent,
                             payload_bytes,
                         ));
-                        // A batch flushes on size or on age — with a corpus
-                        // smaller than the batch size, age is the only trigger, so
-                        // the run legitimately takes up to `max_batch_age` beyond
-                        // what the handler-time model predicts. Fold the age into
-                        // the deadline (above the clamp: the knob is explicit user
-                        // intent, parse-bounded by the deadline ceiling) or a
-                        // large legal age turns every batch scenario into a false
-                        // timeout row.
-                        let mut deadline = scenario_deadline(
-                            messages,
-                            flow.effective_workers(consumers),
-                            h,
-                            messages > tier_messages,
-                        );
-                        if let Some(opts) = batch_options {
-                            deadline = deadline
-                                .saturating_add(Duration::from_millis(opts.max_batch_age_ms.get()));
-                        }
                         scenarios.push(Scenario {
                             tier: tier_cfg.name,
                             messages,
                             consumers,
                             handler: h,
-                            deadline,
                             concurrent: cli.concurrent,
                             prefetch: cli.prefetch,
                             flow,
@@ -1614,7 +1553,7 @@ pub fn noop_purge() -> PurgeFn {
 ///
 /// The future resolves to `Err` when the drain loop itself fails (connection,
 /// commit, routing), so the scenario reports the real cause instead of
-/// waiting out its whole deadline and calling it a timeout.
+/// hanging on a counter that will never reach its target.
 ///
 /// The token is the scenario's stop signal. `run_dlq` takes no per-call
 /// shutdown token on any backend, and what actually stops it varies: most
@@ -1740,9 +1679,8 @@ pub struct HarnessConfig<B: Backend> {
     /// How many workers this backend actually runs for the FIFO flow. Most
     /// backends spawn one worker per routing shard ([`SEQ_SHARDS`]); Kafka
     /// runs a single FIFO task over every assigned partition, so its
-    /// wrapper sets 1. The scenario's `consumers`, message volume, and
-    /// deadline are all derived from this so the row describes the topology
-    /// that ran.
+    /// wrapper sets 1. The scenario's `consumers` and message volume are
+    /// derived from this so the row describes the topology that ran.
     pub fifo_workers: u16,
     _backend: std::marker::PhantomData<fn() -> B>,
 }
@@ -1890,28 +1828,22 @@ fn message_chunks(
     })
 }
 
-/// Wait until `processed` reaches `target`, the deadline expires, or the run
-/// is cancelled.
+/// Wait until `processed` reaches `target` or the run is cancelled.
+///
+/// No deadline: a scenario runs to completion however slow the backend is.
+/// A cell that never completes is a hang the operator interrupts, and the
+/// interruption is what gets recorded — never a clock the harness picked.
 async fn await_completion(
     processed: &AtomicU64,
     target: u64,
-    scenario: &Scenario,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + scenario.deadline;
     loop {
         if processed.load(Ordering::Relaxed) >= target {
             return Ok(());
         }
         if cancel.is_cancelled() {
             return Err("interrupted".to_string());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let done = processed.load(Ordering::Relaxed);
-            return Err(format!(
-                "timeout after {:?}: processed {done} / {target}",
-                scenario.deadline
-            ));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1928,7 +1860,6 @@ async fn await_dlq_depth(
     scenario: &Scenario,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + scenario.deadline;
     loop {
         let depth = depth_of().await.map_err(|e| format!("depth check: {e}"))?;
         if depth >= scenario.messages {
@@ -1936,13 +1867,6 @@ async fn await_dlq_depth(
         }
         if cancel.is_cancelled() {
             return Err("interrupted".to_string());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "DLQ holds {depth} / {} after {:?}; broker-side redrive has not \
-                 dead-lettered every message",
-                scenario.messages, scenario.deadline
-            ));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -1975,30 +1899,21 @@ fn check_worker_outcome(
 /// [`await_completion`], but for flows whose consumers run as spawned driver
 /// tasks that can fail (`run_dlq`, `run_batch`). A driver that returns `Err`
 /// fails the scenario immediately with the real cause — without this, a
-/// consumer that dies on its first poll burns the entire deadline and is
-/// reported as a timeout. A driver that returns `Ok` early is left alone: the
+/// consumer that dies on its first poll would hang the scenario until the
+/// operator interrupts it. A driver that returns `Ok` early is left alone: the
 /// processed counter, not task exit, is what completion means.
 async fn await_completion_or_driver_error(
     processed: &AtomicU64,
     target: u64,
-    scenario: &Scenario,
     cancel: &CancellationToken,
     drivers: &mut tokio::task::JoinSet<Result<(), String>>,
 ) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + scenario.deadline;
     loop {
         if processed.load(Ordering::Relaxed) >= target {
             return Ok(());
         }
         if cancel.is_cancelled() {
             return Err("interrupted".to_string());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let done = processed.load(Ordering::Relaxed);
-            return Err(format!(
-                "timeout after {:?}: processed {done} / {target}",
-                scenario.deadline
-            ));
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -2057,10 +1972,6 @@ async fn stop_sampler(sampler: Option<ResourceSampler>) -> ResourceSnapshot {
 /// rely on this — see [`ReadinessProbeFn`].
 const READINESS_OVERSUPPLY: usize = 4;
 
-/// How long the readiness barrier may take, publishes included, before the
-/// scenario is failed instead of measured.
-const READINESS_DEADLINE: Duration = Duration::from_secs(30);
-
 /// Block until every worker has handled at least one message, and return the
 /// wall-clock that took.
 ///
@@ -2087,7 +1998,7 @@ async fn await_worker_readiness<B, T>(
     probe: Option<&ReadinessProbeFn>,
     epoch: Instant,
     attach_flags: &[Arc<AtomicU64>],
-    deadline: Duration,
+    cancel: &CancellationToken,
 ) -> Result<(), String>
 where
     B: Backend,
@@ -2134,13 +2045,13 @@ where
             }
         }
     };
-    // The deadline bounds the whole barrier, a stalled publish included, and a
-    // worker first seen after it does not turn the failure into a success.
-    match tokio::time::timeout(deadline, rounds).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "only {} of {} workers were assigned and polling within {deadline:?}; \
-             the drain window cannot be separated from group setup",
+    // No deadline: the barrier waits for the actual event, however long the
+    // group takes to settle. Only the run's cancellation ends it early — and
+    // it ends a stalled publish too, not just the gap between rounds.
+    tokio::select! {
+        result = rounds => result,
+        _ = cancel.cancelled() => Err(format!(
+            "interrupted while only {} of {} workers were assigned and polling",
             attached(),
             attach_flags.len()
         )),
@@ -2364,19 +2275,12 @@ where
         Ok(())
     };
 
-    // Bounded by the scenario deadline. A publish-only flow has no consumer
-    // draining behind it, so on any backend with a bounded queue (InMemory
-    // caps at DEFAULT_QUEUE_CAPACITY) a large enough scenario blocks forever
-    // on backpressure. Without this it is an unkillable hang that burns the
-    // rest of the sweep; with it, it is one recorded failure.
-    let result = match tokio::time::timeout(scenario.deadline, publish).await {
-        Ok(r) => r,
-        Err(_) => Err(format!(
-            "publish blocked past {:?}: the queue is full and nothing is consuming it \
-             (raise the backend's queue capacity or lower --tier)",
-            scenario.deadline
-        )),
-    };
+    // Unbounded, like every other phase. A publish-only flow has no consumer
+    // draining behind it, so on a backend with a bounded queue a corpus larger
+    // than the queue blocks on backpressure until the operator interrupts the
+    // run; the drivers size their queues for the tiers they run (InMemory
+    // raises its capacity to 1,000,000) rather than have a clock decide.
+    let result: Result<(), String> = publish.await;
 
     let duration = start.elapsed();
     let resources = sampler.stop().await;
@@ -2521,7 +2425,7 @@ where
                 hcfg.readiness_probe.as_ref(),
                 epoch,
                 &attach_flags,
-                READINESS_DEADLINE,
+                cancel,
             )
             .await?;
             Some(setup_started.elapsed())
@@ -2557,7 +2461,7 @@ where
     let ((start, setup), outcome) = match setup_and_publish.await {
         Ok(window) => (
             window,
-            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
+            await_completion(&processed, scenario.expected_processed(), cancel).await,
         ),
         Err(e) => ((Instant::now(), None), Err(e)),
     };
@@ -2672,7 +2576,7 @@ where
             None,
             epoch,
             &attach_flags,
-            READINESS_DEADLINE,
+            cancel,
         )
         .await?;
         let setup = setup_started.elapsed();
@@ -2697,7 +2601,7 @@ where
     let ((start, setup), outcome) = match setup_and_publish.await {
         Ok(window) => (
             window,
-            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
+            await_completion(&processed, scenario.expected_processed(), cancel).await,
         ),
         Err(e) => ((Instant::now(), None), Err(e)),
     };
@@ -2831,7 +2735,7 @@ where
         // duplicates included, not dead-letters.
         Ok(()) => match &hcfg.dlq_depth {
             Some(depth_of) => await_dlq_depth(depth_of, scenario, cancel).await,
-            None => await_completion(&rejected, scenario.messages, scenario, cancel).await,
+            None => await_completion(&rejected, scenario.messages, cancel).await,
         },
         Err(e) => Err(e),
     };
@@ -2865,14 +2769,8 @@ where
     let mut drivers = tokio::task::JoinSet::new();
     drivers.spawn(drain(client.clone(), handler, dlq_stop.clone()));
 
-    let outcome = await_completion_or_driver_error(
-        &processed,
-        scenario.messages,
-        scenario,
-        cancel,
-        &mut drivers,
-    )
-    .await;
+    let outcome =
+        await_completion_or_driver_error(&processed, scenario.messages, cancel, &mut drivers).await;
     let duration = start.elapsed();
     // Stopped with the window — see `run_scenario_batch`.
     let resources = sampler.stop().await;
@@ -2945,14 +2843,11 @@ where
 
     // One batch consumer per scenario consumer, sharing the group — the
     // scenario's `consumers` field and `effective_workers` both say N, so N
-    // loops must actually run, not one loop wearing N's deadline.
+    // loops must actually run, not one loop wearing N's label.
     //
     // The count comes from `effective_workers` rather than from
-    // `scenario.consumers` directly so that the loops that run and the
-    // deadline they run against cannot drift apart: they are now the same
-    // expression. That leaves exactly one thing for a test to pin — that
-    // `effective_workers` still returns the consumer count this flow's row is
-    // stamped with.
+    // `scenario.consumers` directly so that the loops that run and the row's
+    // topology cannot drift apart: they are the same expression.
     let batch_stop = CancellationToken::new();
     let mut drivers = tokio::task::JoinSet::new();
     let workers = scenario.flow.effective_workers(scenario.consumers);
@@ -2989,7 +2884,7 @@ where
             hcfg.readiness_probe.as_ref(),
             epoch,
             &attach_flags,
-            READINESS_DEADLINE,
+            cancel,
         )
         .await?;
         let setup = setup_started.elapsed();
@@ -3013,14 +2908,8 @@ where
     let ((start, setup), outcome) = match setup_and_publish.await {
         Ok(window) => (
             window,
-            await_completion_or_driver_error(
-                &processed,
-                scenario.messages,
-                scenario,
-                cancel,
-                &mut drivers,
-            )
-            .await,
+            await_completion_or_driver_error(&processed, scenario.messages, cancel, &mut drivers)
+                .await,
         ),
         Err(e) => ((Instant::now(), None), Err(e)),
     };
@@ -3172,7 +3061,7 @@ where
                 hcfg.readiness_probe.as_ref(),
                 epoch,
                 &attach_flags,
-                READINESS_DEADLINE,
+                cancel,
             )
             .await?;
             Some(setup_started.elapsed())
@@ -3206,7 +3095,7 @@ where
     let ((start, setup), outcome) = match setup_and_publish.await {
         Ok(window) => (
             window,
-            await_completion(&processed, scenario.expected_processed(), scenario, cancel).await,
+            await_completion(&processed, scenario.expected_processed(), cancel).await,
         ),
         Err(e) => ((Instant::now(), None), Err(e)),
     };
@@ -4666,52 +4555,6 @@ mod tests {
     }
 
     #[test]
-    fn a_floored_cell_is_given_a_deadline_its_corpus_can_use() {
-        // The floor is applied blind to the backend, so the deadline it comes
-        // with must budget for a slow one: at the 40,000 msg/s the unfloored
-        // `zero` deadline assumes, a 150,000-message cell would keep the 60 s
-        // clamp and any backend draining under ~2,500 msg/s would fail on the
-        // clock instead of producing a row.
-        let scenarios = build_scenarios_cg(&cli_args(&[
-            "--tier",
-            "moderate",
-            "--handler",
-            "zero",
-            "--flow",
-            "consumer-group",
-            "--consumers",
-            "1,32",
-            "--payload",
-            "64",
-        ]));
-        let at = |c: u16| {
-            scenarios
-                .iter()
-                .find(|s| s.consumers == c)
-                .unwrap_or_else(|| panic!("{c}c present"))
-        };
-        let floored = at(1);
-        assert_eq!(floored.messages, MIN_FRAMEWORK_CORPUS_MESSAGES);
-        assert_eq!(
-            floored.deadline,
-            scenario_deadline(MIN_FRAMEWORK_CORPUS_MESSAGES, 1, HandlerProfile::Zero, true)
-        );
-        assert!(
-            floored.deadline >= Duration::from_secs(450),
-            "a floored 150,000-message cell must be budgeted at the floored rate, got {:?}",
-            floored.deadline
-        );
-        // A cell the tier sizes on its own keeps the deadline it always had.
-        let own = at(32);
-        assert!(own.messages > MIN_FRAMEWORK_CORPUS_MESSAGES);
-        assert_eq!(
-            own.deadline,
-            scenario_deadline(own.messages, 32, HandlerProfile::Zero, false)
-        );
-        assert_eq!(own.deadline, Duration::from_secs(60));
-    }
-
-    #[test]
     fn the_corpus_floor_is_capped_by_bytes_not_just_messages() {
         // 150,000 × 64 KiB would stage a 9.6 GiB corpus through the publisher
         // to buy a window the payload size already provides. The cap is what
@@ -5180,7 +5023,6 @@ mod tests {
             messages: 40,
             consumers: workers,
             handler: HandlerProfile::Zero,
-            deadline: Duration::from_secs(30),
             concurrent: false,
             prefetch: None,
             flow: Flow::ConsumeBatch,
@@ -5311,10 +5153,9 @@ mod tests {
     }
 
     #[test]
-    fn a_single_loop_flow_is_not_given_an_n_times_tighter_deadline() {
-        // `run_dlq` drains on one loop whatever the consumer count is, so
-        // sizing its deadline as if 8 consumers shared the work turned a slow
-        // but perfectly healthy drain into a recorded timeout.
+    fn single_loop_flows_report_one_effective_worker() {
+        // `run_dlq` drains on one loop whatever the consumer count is, and so
+        // do the publish flows and a broadcast subscriber.
         for flow in [
             Flow::DlqDrain,
             Flow::Broadcast,
@@ -5325,8 +5166,8 @@ mod tests {
         }
         // `ConsumeBatch` belongs in this list, not the one above: its driver
         // spawns one `run_batch` loop per scenario consumer, and its row is
-        // stamped `consumers: N`. A `1` here would size the deadline for a
-        // topology that is not the one running, and would contradict the row.
+        // stamped `consumers: N`. A `1` here would spawn one loop for a
+        // topology that is not the one the row describes.
         for flow in [
             Flow::ConsumerGroup,
             Flow::ConsumeParallel,
@@ -5339,9 +5180,7 @@ mod tests {
     #[test]
     fn fifo_effective_workers_are_capped_at_the_shard_count() {
         // The sequenced topology has SEQ_SHARDS shards; consumers past that
-        // cannot make independent progress, so sizing the deadline by the raw
-        // consumer count made large slow-handler scenarios up to 32× too
-        // tight.
+        // cannot make independent progress.
         assert_eq!(Flow::ConsumeFifo.effective_workers(4), 4);
         assert_eq!(Flow::ConsumeFifo.effective_workers(SEQ_SHARDS), SEQ_SHARDS);
         assert_eq!(Flow::ConsumeFifo.effective_workers(32), SEQ_SHARDS);
@@ -5368,7 +5207,6 @@ mod tests {
             messages: 100,
             consumers: 4,
             handler,
-            deadline: Duration::from_secs(60),
             concurrent: false,
             prefetch: None,
             flow,
@@ -5783,11 +5621,10 @@ mod tests {
     #[tokio::test]
     async fn batch_flow_runs_exactly_the_workers_its_row_claims() {
         // Three things have to agree about a `consume_batch` row's worker
-        // count: the driver that executes it, `effective_workers` (which
-        // sizes the deadline), and the `consumers` field stamped on the row.
-        // They previously did not — one loop ran while both of the others
-        // said N, so the loop was handed N times the messages against a
-        // deadline divided by N, and the published row named a topology that
+        // count: the driver that executes it, `effective_workers`, and the
+        // `consumers` field stamped on the row. They previously did not — one
+        // loop ran while both of the others said N, so the loop was handed N
+        // times the messages and the published row named a topology that
         // never existed. Asserting `effective_workers` alone cannot catch
         // that: only counting the loops that actually start can.
         let workers: u16 = 3;
@@ -5796,7 +5633,6 @@ mod tests {
             messages: 30,
             consumers: workers,
             handler: HandlerProfile::Zero,
-            deadline: Duration::from_secs(30),
             concurrent: false,
             prefetch: None,
             flow: Flow::ConsumeBatch,
@@ -5824,7 +5660,7 @@ mod tests {
         assert_eq!(
             Flow::ConsumeBatch.effective_workers(workers),
             workers,
-            "the deadline is sized for a different worker count than the driver runs"
+            "effective_workers disagrees with the loops the driver runs"
         );
 
         let mut rows = Vec::new();
@@ -5876,7 +5712,7 @@ mod tests {
             Some(&probe),
             Instant::now(),
             &flags,
-            READINESS_DEADLINE,
+            &CancellationToken::new(),
         )
         .await
         .expect("barrier");
@@ -5892,15 +5728,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_barrier_fails_at_its_deadline_with_the_count_it_reached() {
-        // The deadline bounds the whole barrier, publishes included, and a
-        // worker confirmed only after it does not turn the failure into a
-        // success.
+    async fn the_barrier_ends_on_interrupt_with_the_count_it_reached() {
+        // The barrier has no clock of its own: it waits for the actual event,
+        // and only the run's cancellation ends it early — naming how many
+        // workers had attached when it did, because a stalled probe is what
+        // the operator will want to chase.
         let flags: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
         let probe: ReadinessProbeFn = Box::new(|_, _| {
             Box::pin(async {
-                // A publish that never completes must not hold the barrier
-                // past its deadline.
+                // A publish that never completes must not survive the
+                // run's cancellation.
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 Ok(())
             })
@@ -5916,20 +5753,27 @@ mod tests {
             .expect("declare");
         let publisher = broker.publisher().await.expect("publisher");
 
+        let cancel = CancellationToken::new();
+        let trip = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            trip.cancel();
+        });
         let started = Instant::now();
         let err = await_worker_readiness::<shove::InMemory, StressTestTopic>(
             &publisher,
             Some(&probe),
             Instant::now(),
             &flags,
-            Duration::from_millis(300),
+            &cancel,
         )
         .await
         .expect_err("no worker attached");
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "the deadline did not bound the stalled publish"
+            "cancellation did not end the stalled barrier"
         );
+        assert!(err.contains("interrupted"), "{err}");
         assert!(err.contains("0 of 2"), "{err}");
         broker.close().await;
     }
@@ -5952,7 +5796,6 @@ mod tests {
             messages: 20,
             consumers: 2,
             handler: HandlerProfile::Zero,
-            deadline: Duration::from_secs(30),
             concurrent: false,
             prefetch: None,
             flow: Flow::ConsumeBatch,
@@ -6041,7 +5884,6 @@ mod tests {
             messages: 20,
             consumers: workers,
             handler: HandlerProfile::Zero,
-            deadline: Duration::from_secs(30),
             concurrent: false,
             prefetch: None,
             flow: Flow::ConsumeBatch,
@@ -6108,7 +5950,6 @@ mod tests {
             messages: 20,
             consumers: replicas,
             handler: HandlerProfile::Zero,
-            deadline: Duration::from_secs(30),
             concurrent: false,
             prefetch: None,
             flow: Flow::ConsumeParallel,
@@ -6176,7 +6017,6 @@ mod tests {
             messages: 10,
             consumers: 3,
             handler: HandlerProfile::Zero,
-            deadline: Duration::from_secs(30),
             concurrent: false,
             prefetch: None,
             flow: Flow::ConsumeParallel,
@@ -7650,60 +7490,6 @@ mod tests {
     }
 
     #[test]
-    fn the_batch_age_is_folded_into_the_scenario_deadline() {
-        // With a corpus smaller than the batch size, age is the only flush
-        // trigger, so a run legitimately takes up to the age beyond the
-        // handler-time model. A deadline that ignores the knob turns a legal
-        // `--batch-max-age-ms 120000` into a guaranteed timeout row blamed on
-        // the backend.
-        let age_ms: u64 = 120_000;
-        let with_age = build_scenarios_cg(&cli_args(&[
-            "--flow",
-            "consume-batch",
-            "--batch-max-age-ms",
-            &age_ms.to_string(),
-        ]));
-        let baseline = build_scenarios_cg(&cli_args(&["--flow", "consume-batch"]));
-        assert!(!with_age.is_empty(), "no batch scenario was built");
-        assert_eq!(with_age.len(), baseline.len());
-        let default_age = Duration::from_millis(BatchOptions::default().max_batch_age_ms.get());
-        for (s, b) in with_age.iter().zip(baseline.iter()) {
-            assert_eq!(
-                s.deadline,
-                b.deadline - default_age + Duration::from_millis(age_ms),
-                "the deadline must absorb exactly the configured age"
-            );
-        }
-
-        // Non-batch scenarios in the same flagged invocation are untouched:
-        // their deadlines equal an unflagged build's, element for element.
-        // (An upper-bound assert alone is vacuous here — the largest derived
-        // deadline plus the default age still clears the ceiling.)
-        let mixed = build_scenarios_cg(&cli_args(&[
-            "--flow",
-            "consume-batch,consumer-group",
-            "--batch-max-age-ms",
-            &age_ms.to_string(),
-        ]));
-        let flagged_group: Vec<&Scenario> = mixed
-            .iter()
-            .filter(|s| s.flow == Flow::ConsumerGroup)
-            .collect();
-        let unflagged_group = build_scenarios_cg(&cli_args(&["--flow", "consumer-group"]));
-        assert!(
-            !flagged_group.is_empty(),
-            "no consumer-group scenario built"
-        );
-        assert_eq!(flagged_group.len(), unflagged_group.len());
-        for (s, b) in flagged_group.iter().zip(unflagged_group.iter()) {
-            assert_eq!(
-                s.deadline, b.deadline,
-                "a non-batch deadline moved with the batch knob"
-            );
-        }
-    }
-
-    #[test]
     fn a_stale_results_file_is_refused_before_the_sweep_runs() {
         // The merge would refuse a prior-version document anyway — but only
         // after every scenario has executed. The preflight raises the same
@@ -7750,7 +7536,7 @@ mod tests {
             Ok(_) => panic!("must refuse an age past the ceiling"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("deadline ceiling"), "{err}");
+        assert!(err.contains("--batch-max-age-ms"), "{err}");
         assert!(err.contains("milliseconds"), "{err}");
         // Zero stays refused too — the parser owns the whole value contract.
         assert!(Cli::try_parse_from(["stress", "--batch-max-age-ms", "0"]).is_err());

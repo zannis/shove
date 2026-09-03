@@ -1,0 +1,44 @@
+<svg width="960" height="640" viewBox="0 0 960 640" xmlns="http://www.w3.org/2000/svg">
+<text x="24" y="18" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="20.967741935483872" opacity="1" fill="#6E7681">
+Dispatch latency percentiles
+</text>
+<text x="24" y="48" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+v4&apos;s dispatch percentiles are not publishable as latency — see caption
+</text>
+<text x="24" y="424" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+the v4 dispatch percentiles time publish → handler entry while the whole corpus is published concurrently
+</text>
+<text x="24" y="443" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+with the drain: under a saturated backlog that is queue residency (median ≈ half the drain window), which
+</text>
+<text x="24" y="462" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+scales with corpus size and the publish/drain rate ratio — not a per-message dispatch cost, and not
+</text>
+<text x="24" y="481" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+comparable across backends
+</text>
+<text x="24" y="500" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+bars will be published once the harness measures dispatch latency under matched load
+</text>
+<text x="24" y="519" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+percentiles recorded and withheld for: inmemory, kafka, nats, rabbitmq, redis
+</text>
+<text x="24" y="538" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+no measured rows in this document (nothing to withhold): sqs
+</text>
+<text x="24" y="557" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+Generated 2026-09-02T15:08:34Z — shove 0.14.0 — aarch64 (8c / 15 GB)
+</text>
+<text x="24" y="576" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+aarch64 — 8 cores — 15 GB RAM — Ubuntu 24.04.4 LTS — rustc 1.91.1 (ed61e7d7e 2025-11-07) — handler: zero
+</text>
+<text x="24" y="595" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+(no-op)
+</text>
+<text x="24" y="614" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+10 recorded failure(s) in the dataset — see failures[]
+</text>
+<text x="480" y="140" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="14.516129032258064" opacity="1" fill="#6E7681">
+no publishable dispatch-latency measurement in this document
+</text>
+</svg>

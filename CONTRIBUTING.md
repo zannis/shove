@@ -24,10 +24,13 @@ The lib unit tests run without any features:
 cargo nextest run --no-default-features
 ```
 
-This runs the unit tests **only**. The crate's `default` feature set is empty
-and the in-memory test files are all gated on the `inmemory` feature, so under
-`--no-default-features` those binaries compile to zero tests and report green
-without having run anything.
+This runs the unit tests plus the Docker-free integration targets, among
+them `tests/chartgen.rs` — the benchmark chart generator, including the
+byte-compare of the committed SVGs in `docs/public/bench/` against
+`benches/results/bench-results.json`. The crate's `default` feature set is
+empty and the in-memory test files are all gated on the `inmemory` feature, so
+under `--no-default-features` the backend test binaries compile to zero tests
+and report green without having run anything.
 
 The in-memory-backed tests are also Docker-free and secret-free — run them
 with the `inmemory` row of the feature-set table below:
@@ -37,7 +40,7 @@ cargo nextest run --features inmemory,metrics,sbe,env-config
 ```
 
 (CI runs the equivalent `cargo test --no-default-features` in the `check` job —
-equally unit-only — and covers the in-memory suite via the `coverage` matrix's
+the same set — and covers the in-memory suite via the `coverage` matrix's
 `inmemory` entry. This repo's convention is `cargo nextest run`.)
 
 ## Running integration tests
