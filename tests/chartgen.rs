@@ -25,6 +25,14 @@ use plotters::style::RGBColor;
 /// on it.
 const Y_TICK_BAND_X: f64 = 90.0;
 
+/// The y that splits legend rows from plot-band text: legend rows anchor at
+/// 74 + 16/row (so rows 1-2 stay under 90-ish), and end labels center no
+/// higher than plot_top + 7 = 103. A hand-synced copy like `Y_TICK_BAND_X`;
+/// honest caveat: a 3+-row legend would cross it, so probe fixtures keep
+/// their legends to one or two rows (emission order — body before legend —
+/// is the second line of defence, not the first).
+const PLOT_BAND_MIN_Y: f64 = 100.0;
+
 /// A minimal document that satisfies every rule, used as the base for the
 /// mutations below. Written as JSON rather than built through the structs so
 /// the tests exercise the real deserialisation path.
@@ -906,8 +914,13 @@ fn est_width(size: f64, content: &str) -> f64 {
 /// label could stray into the tick band. Shared by every axis probe so the
 /// alphabet cannot drift.
 fn tick_shaped(c: &str) -> bool {
-    c.starts_with(|ch: char| ch.is_ascii_digit())
-        && c.chars()
+    // An optional leading '-' keeps a future signed axis's ticks visible to
+    // every probe; the digit-start rule on the rest fences dash-or-e-named
+    // fixture backends out of the tick band.
+    let body = c.strip_prefix('-').unwrap_or(c);
+    body.starts_with(|ch: char| ch.is_ascii_digit())
+        && body
+            .chars()
             .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | 'k' | 'M' | 'e' | '-'))
 }
 
@@ -3542,32 +3555,33 @@ fn sub_unit_decade_ticks_carry_distinct_labels() {
     let doc = parse(&document(&run));
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("sub-unit throughput must render");
-    let ticks: Vec<String> = texts(&svg)
+    // One parse, one predicate: the tick set and the fit loop below must
+    // check the same ticks or the two assertions drift apart.
+    let band_ticks: Vec<(f64, f64, String)> = texts(&svg)
         .into_iter()
         .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && tick_shaped(c))
-        .map(|(_, _, _, c)| c)
+        .map(|(x, _, size, c)| (x, size, c))
         .collect();
+    let ticks: Vec<&String> = band_ticks.iter().map(|(_, _, c)| c).collect();
     assert!(
-        ticks.iter().any(|t| t == "0.01"),
+        ticks.iter().any(|t| *t == "0.01"),
         "the 0.01 decade must be labelled as itself, got {ticks:?}"
     );
     assert!(
-        ticks.iter().any(|t| t == "1e-7"),
+        ticks.iter().any(|t| *t == "1e-7"),
         "a decade past six decimals must wear exponent form, got {ticks:?}"
     );
     // Every tick must FIT left of the axis, not merely exist: ticks are
     // end-anchored, so the estimated extent runs leftward from x, and a
-    // label wider than the y-label area clips at the viewBox. This is the
-    // loud coupling between fmt_count's exponent cutover and the axis
-    // geometry — shrink the y-label area and this fails instead of
-    // shipping clipped magnitudes.
-    for (x, _, size, c) in texts(&svg)
-        .into_iter()
-        .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && tick_shaped(c))
-    {
+    // label wider than the y-label area overprints the 16px frame margin
+    // and then clips at the viewBox. This is the loud coupling between
+    // fmt_count's exponent cutover and the axis geometry — shrink the
+    // y-label area and this fails instead of shipping clipped magnitudes.
+    // (16.0 is the frame margin, hand-synced like Y_TICK_BAND_X.)
+    for (x, size, c) in &band_ticks {
         assert!(
-            x - est_width(size, &c) >= 0.0,
-            "tick {c:?} extends past the left canvas edge (anchor x={x})"
+            x - est_width(*size, c) >= 16.0,
+            "tick {c:?} extends into the left frame margin (anchor x={x})"
         );
     }
     let mut deduped = ticks.clone();
@@ -3645,7 +3659,7 @@ fn a_mid_chart_end_label_is_not_displaced_by_a_far_away_gutter_label() {
         // this probe at the legend.
         let label_y = texts(&svg)
             .into_iter()
-            .filter(|(x, y, _, c)| c == "kafka" && *x > 350.0 && *y > 100.0)
+            .filter(|(x, y, _, c)| c == "kafka" && *x > 350.0 && *y > PLOT_BAND_MIN_Y)
             .map(|(_, y, _, _)| y)
             .next()
             .expect("kafka's end label not found");
@@ -3761,7 +3775,7 @@ fn labels_in_adjacent_columns_are_still_deconflicted() {
     let label_y = |name: &str| -> f64 {
         all_texts
             .iter()
-            .filter(|(x, y, _, c)| c == name && *x > 300.0 && *y > 100.0)
+            .filter(|(x, y, _, c)| c == name && *x > 300.0 && *y > PLOT_BAND_MIN_Y)
             .map(|(_, y, _, _)| *y)
             .next()
             .unwrap_or_else(|| panic!("{name}'s end label not found"))
@@ -3825,17 +3839,14 @@ fn a_long_name_that_never_enters_the_gutter_does_not_refuse_the_chart() {
     }
 }
 
-#[test]
-fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
-    // A long name whose line ends deep into a dense sweep cannot extend
-    // rightward without crossing the canvas edge; it flips to the left of
-    // its endpoint (end-anchored) instead of clipping or refusing.
-    let long_name = "a-backend-name-of-26-chars";
-    let counts: Vec<u32> = (0..12).map(|i| 1u32 << i).collect();
+/// A 12-category consumer sweep: `inmemory` spans every category (and takes
+/// the gutter), `long_name` stops mid-chart after `mid_upto` categories.
+/// Shared by the flip and neither-side-refusal tests so the fits/flips/
+/// refuses boundary they jointly pin is probed against one layout.
+fn mid_and_full_sweep(long_name: &str, mid_upto: usize) -> Document {
     let rows = |upto: usize| -> String {
-        counts[..upto]
-            .iter()
-            .map(|c| scenario("consume_parallel", "parallel", 64, *c, 9_000.0))
+        (0..upto)
+            .map(|i| scenario("consume_parallel", "parallel", 64, 1u32 << i, 9_000.0))
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -3844,7 +3855,7 @@ fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
           "backend": "{long_name}", "representative": true,
           "results": [{}], "failures": [], "unsupported": []
         }}"#,
-        rows(11)
+        rows(mid_upto)
     );
     let reaching_end = format!(
         r#"{{
@@ -3853,7 +3864,16 @@ fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
         }}"#,
         rows(12)
     );
-    let doc = parse(&document(&format!("{},{}", reaching_end, ending_mid)));
+    parse(&document(&format!("{reaching_end},{ending_mid}")))
+}
+
+#[test]
+fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
+    // A long name whose line ends deep into a dense sweep cannot extend
+    // rightward without crossing the canvas edge; it flips to the left of
+    // its endpoint (end-anchored) instead of clipping or refusing.
+    let long_name = "a-backend-name-of-26-chars";
+    let doc = mid_and_full_sweep(long_name, 11);
     let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
         .expect("a fit-by-flip label must not refuse the chart");
     // Read the label's own element so the anchor is visible: a flipped
@@ -3870,7 +3890,7 @@ fn a_mid_chart_label_that_cannot_fit_rightward_flips_left() {
                     .is_some_and(|x| x > 200.0)
                 && svg_attr(c, "y")
                     .and_then(|v| v.parse::<f64>().ok())
-                    .is_some_and(|y| y > 100.0)
+                    .is_some_and(|y| y > PLOT_BAND_MIN_Y)
         })
         .expect("the end label must exist");
     let x: f64 = svg_attr(chunk, "x")
@@ -3898,34 +3918,15 @@ fn a_label_fitting_neither_side_of_its_endpoint_is_refused() {
     // A flipped label must clear plot-left — across the y-label band it
     // overprints the axis ticks. A name too wide for either side of its
     // endpoint refuses loudly rather than rendering an unreadable axis.
-    // 70 chars ≈ 630 estimated px: too wide to extend right from category 8
-    // of 12 (~300px of room to the frame margin) and too wide to clear
-    // plot-left going leftward (~540px of room) — yet inside the legend's
-    // own budget, so the label refusal is the one that fires.
-    let long_name = format!("{}long-xx", "really-".repeat(9));
-    let counts: Vec<u32> = (0..12).map(|i| 1u32 << i).collect();
-    let rows = |upto: usize| -> String {
-        counts[..upto]
-            .iter()
-            .map(|c| scenario("consume_parallel", "parallel", 64, *c, 9_000.0))
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let ending_mid = format!(
-        r#"{{
-          "backend": "{long_name}", "representative": true,
-          "results": [{}], "failures": [], "unsupported": []
-        }}"#,
-        rows(9)
-    );
-    let reaching_end = format!(
-        r#"{{
-          "backend": "inmemory", "representative": true,
-          "results": [{}], "failures": [], "unsupported": []
-        }}"#,
-        rows(12)
-    );
-    let doc = parse(&document(&format!("{},{}", reaching_end, ending_mid)));
+    // 65 chars ≈ 585 estimated px, ending at category 8 of 12 (px ≈ 639):
+    // rightward needs ≤ ~944 and fails (639+8+585); leftward lands the left
+    // edge at ≈ 46px — INSIDE the y-tick band but clear of the old canvas
+    // bound (16), so this fixture pins the plot-left boundary: a revert to
+    // the canvas bound renders across the axis ticks and turns this red.
+    // The legend's own budget still fits the name, so the label refusal is
+    // the one that fires.
+    let long_name = format!("{}xx", "really-".repeat(9));
+    let doc = mid_and_full_sweep(&long_name, 9);
     match chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light) {
         Err(ChartError::Render(msg)) => assert!(
             msg.contains("neither side"),

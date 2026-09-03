@@ -1995,7 +1995,7 @@ fn legend_entry_width(label: &str) -> i32 {
 /// count. An entry that does not fit a row by itself has no legible place on
 /// this canvas and is refused rather than drawn off the edge.
 fn legend_layout(entries: &[(String, RGBColor)]) -> Result<(Vec<(i32, i32)>, i32), ChartError> {
-    let right_edge = WIDTH as i32 - 16;
+    let right_edge = WIDTH as i32 - FRAME_MARGIN;
     let mut x = LEGEND_ORIGIN.0;
     let mut row = 0i32;
     let mut slots = Vec::with_capacity(entries.len());
@@ -2306,21 +2306,34 @@ struct LineSpec {
     shape_only: bool,
 }
 
-/// The frame's outer margin on every canvas edge (`frame` reserves it on
-/// all four sides). Every fit check measures against this — never a
-/// re-spelled 16 that drifts when the frame is retuned.
+/// The frame's outer margin on the left and right canvas edges (the top
+/// carries the 70px title/legend band and the bottom the footer reserve —
+/// this is a horizontal bound only). Every horizontal fit check measures
+/// against this — never a re-spelled 16 that drifts when the frame is
+/// retuned.
 const FRAME_MARGIN: i32 = 16;
 
 /// The gap between a line's endpoint dot and its mid-chart end label.
 const END_LABEL_OFFSET: i32 = 8;
+
+/// Where a gutter label anchors, right of the plot edge.
+const GUTTER_LABEL_INSET: i32 = 10;
+/// Where a gutter leader starts, right of its endpoint dot — shared by the
+/// drawn stroke and the collision extent, which must describe the same ink.
+const LEADER_STUB: i32 = 6;
+/// The gap between a leader's end and its label's first character.
+const LEADER_END_GAP: i32 = 3;
 
 /// The end-label gutter's floor: room for the widest *fixed* backend name
 /// (8 chars at the 9px/char cross-host estimate) plus the leader stub and
 /// padding. The gutter grows beyond this to fit longer names — see
 /// `end_label_gutter`.
 const END_LABEL_GUTTER: i32 = 84;
-/// The leader stub plus padding around an end label inside the gutter.
-const END_LABEL_PAD: i32 = 12;
+/// The anchor inset plus right padding around an end label inside the
+/// gutter. Derived from the inset so "the gutter fits every name it holds"
+/// is structural: a label spans [inset, inset + width] of a gutter at
+/// least [width + inset + 2] wide.
+const END_LABEL_PAD: i32 = GUTTER_LABEL_INSET + 2;
 /// The widest gutter a name may demand before the chart refuses: past a
 /// quarter of the canvas the plot body itself stops being legible.
 const END_LABEL_GUTTER_MAX: i32 = 240;
@@ -2644,7 +2657,7 @@ where
         let w = text_px(&spec.backend);
         let (anchor_x, flip, leader) = if spec.gutter_label {
             // Always fits: the gutter was sized for every name it holds.
-            (plot_right.saturating_add(10), false, true)
+            (plot_right.saturating_add(GUTTER_LABEL_INSET), false, true)
         } else if px.saturating_add(END_LABEL_OFFSET).saturating_add(w)
             <= WIDTH as i32 - FRAME_MARGIN
         {
@@ -2662,8 +2675,16 @@ where
         };
         let (x0, x1) = if leader {
             // The leader is part of the mark: anything overlapping its span
-            // deconflicts vertically against this label too.
-            (px.saturating_add(6), anchor_x.saturating_add(w))
+            // deconflicts vertically against this label too. A deliberate
+            // over-approximation — the drawn leader is a diagonal, and this
+            // models its whole span at the label's final y. Erring wide
+            // means MORE vertical separation, never ink overprint; the
+            // residual costs are a rare 14px displacement of a near-final
+            // mid-chart label, and a displaced stack's diagonal passing
+            // near a label the sweep considers separated — both cosmetic
+            // corners, accepted over modelling leaders as segment
+            // obstacles.
+            (px.saturating_add(LEADER_STUB), anchor_x.saturating_add(w))
         } else if flip {
             (anchor_x.saturating_sub(w), anchor_x)
         } else {
@@ -2705,12 +2726,11 @@ where
         }
         max_x1 = max_x1.max(label.x1);
     }
-    for component in &mut components {
-        component.sort_by(|&a, &b| {
+    for idx in &mut components {
+        idx.sort_by(|&a, &b| {
             (labels[a].y, labels[a].backend.as_str())
                 .cmp(&(labels[b].y, labels[b].backend.as_str()))
         });
-        let idx = &*component;
         for k in 1..idx.len() {
             let floor = labels[idx[k - 1]].y.saturating_add(END_LABEL_SPACING);
             if labels[idx[k]].y < floor {
@@ -2750,8 +2770,8 @@ where
             // never spans a category.
             root.draw(&PathElement::new(
                 vec![
-                    (label.endpoint.0 + 6, label.endpoint.1),
-                    (label.anchor_x - 3, label.y),
+                    (label.endpoint.0 + LEADER_STUB, label.endpoint.1),
+                    (label.anchor_x - LEADER_END_GAP, label.y),
                 ],
                 stroke(theme.muted, 1),
             ))
