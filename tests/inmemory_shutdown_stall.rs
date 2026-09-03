@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use shove::broker::Broker;
 use shove::inmemory::{InMemoryBroker, InMemoryConfig, InMemoryConsumer};
 use shove::markers::InMemory;
+use shove::publisher::Publisher;
 use shove::{
     ConsumerOptions, JsonCodec, MessageHandler, MessageMetadata, Outcome, SequenceFailure,
     SequencedTopic, Topic, TopologyBuilder,
@@ -115,6 +116,7 @@ impl SequencedTopic for FifoRetryStallTopic {
 struct ScriptedHandler {
     outcome: Outcome,
     calls: Arc<AtomicUsize>,
+    delay: Duration,
 }
 
 impl ScriptedHandler {
@@ -122,7 +124,18 @@ impl ScriptedHandler {
         Self {
             outcome,
             calls: Arc::new(AtomicUsize::new(0)),
+            delay: Duration::ZERO,
         }
+    }
+
+    /// Hold each delivery inside the handler for `delay` before returning the
+    /// scripted outcome — long enough for the concurrent publisher to reclaim
+    /// every queue slot the pop freed, so the outcome's follow-up publish is
+    /// guaranteed to meet a full queue rather than racing the publisher for
+    /// the last slot.
+    fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 
     async fn wait_for_calls(&self, n: usize, timeout: Duration) -> bool {
@@ -144,6 +157,9 @@ macro_rules! impl_scripted_for {
                 type Context = ();
                 async fn handle(&self, _: Msg, _: MessageMetadata, _: &()) -> Outcome {
                     self.calls.fetch_add(1, Ordering::SeqCst);
+                    if !self.delay.is_zero() {
+                        tokio::time::sleep(self.delay).await;
+                    }
                     self.outcome.clone()
                 }
             }
@@ -153,10 +169,13 @@ macro_rules! impl_scripted_for {
 
 impl_scripted_for!(RejectStallTopic, FifoRejectStallTopic, FifoRetryStallTopic);
 
+/// `(id, delivery_count, retry_count)` captured on each delivery.
+type SeenDeliveries = Arc<Mutex<Vec<(u64, Option<u32>, u32)>>>;
+
 /// Acks everything, recording `(id, delivery_count, retry_count)` per message.
 #[derive(Clone)]
 struct RecordingAckHandler {
-    seen: Arc<Mutex<Vec<(u64, Option<u32>, u32)>>>,
+    seen: SeenDeliveries,
 }
 
 impl RecordingAckHandler {
@@ -212,10 +231,7 @@ fn small_broker() -> (InMemoryBroker, Broker<InMemory>) {
 
 /// Publish `0..n` from a spawned task: shared capacity (2) cannot hold them
 /// all at once, so the calls complete only as the consumer drains the queue.
-fn publish_all<T>(
-    publisher: shove::publisher::Publisher<InMemory>,
-    n: u64,
-) -> tokio::task::JoinHandle<()>
+fn publish_all<T>(publisher: Publisher<InMemory>, n: u64) -> tokio::task::JoinHandle<()>
 where
     T: Topic<Message = Msg>,
 {
@@ -456,7 +472,7 @@ async fn shutdown_unblocks_a_sequenced_retry_republish_wedged_on_a_full_shard_qu
     let publisher = broker.publisher().await.expect("publisher");
     let publish_handle = publish_all::<FifoRetryStallTopic>(publisher, 5);
 
-    let handler = ScriptedHandler::new(Outcome::Retry);
+    let handler = ScriptedHandler::new(Outcome::Retry).with_delay(Duration::from_millis(150));
     let shutdown = CancellationToken::new();
     let consumer = InMemoryConsumer::new(client.clone());
     let handle = tokio::spawn({
