@@ -110,6 +110,87 @@ pub const KNOWN_FLOWS: &[&str] = &[
 /// The backend key whose numbers measure shove itself with the broker removed.
 pub const IN_PROCESS_BACKEND: &str = "inmemory";
 
+/// The flows that construct no consumer — the only rows that may carry
+/// [`COST_NO_HANDLER`], and the only rows that may not carry anything else.
+pub const PUBLISH_FLOWS: &[&str] = &["publish_single", "publish_batch"];
+
+/// The `mode` each known flow runs in — the harness's `Flow::mode`,
+/// mirrored. Family 3 places bars by `mode`, so a row whose mode contradicts
+/// its flow would publish one flow's number under another mode's bar.
+pub const FLOW_MODES: &[(&str, &str)] = &[
+    ("publish_single", "parallel"),
+    ("publish_batch", "batch"),
+    ("consume_parallel", "parallel"),
+    ("consume_fifo", "fifo"),
+    ("consume_batch", "batch"),
+    ("consumer_group", "parallel"),
+    ("supervisor", "parallel"),
+    ("broadcast", "parallel"),
+    ("dlq_drain", "parallel"),
+];
+
+/// The harness's handler profiles, by the exact label a row's `handler`
+/// carries (its `HandlerProfile` `Display`), split by whether the profile
+/// sleeps. The marker is derived from the profile, so a row whose marker
+/// says "shove's cost" under a sleeping handler cannot have been written by
+/// the harness — and a label outside the set certifies nothing, so it is
+/// refused rather than tolerated: a new profile changes what every marker
+/// means and is a contract change, not an additive row.
+pub const NEGLIGIBLE_HANDLERS: &[&str] = &["zero (no-op)", "fast (1-5ms)"];
+
+/// The consume flows whose driver holds no readiness barrier — the
+/// harness's `Flow::holds_readiness_barrier` false set, less the publish
+/// flows. Without a barrier no window can be certified as a drain, so a
+/// `framework` row for one of these is unproducible.
+pub const BARRIERLESS_FLOWS: &[&str] = &["consume_fifo", "dlq_drain"];
+
+/// The payload sizes the harness runs — its `PAYLOAD_SIZES`, mirrored. The
+/// label formatter truncates to whole KiB, so a size outside this set could
+/// share a label with a real category; the set is closed on the producer
+/// side, and a new size is a contract change, not an additive row.
+pub const PAYLOAD_SIZES: &[u64] = &[64, 1024, 65536];
+
+/// The flow a row is charted under: the alias target when the flow is
+/// another flow's name on one backend, else itself. Every slice selects on
+/// this, so a measured SQS `supervisor` row lands in the parallel-consume
+/// slice instead of being captioned as a missing `consume_parallel`.
+fn canonical_flow(flow: &str) -> &str {
+    ALIASED_FLOWS
+        .iter()
+        .find(|(alias, _)| *alias == flow)
+        .map(|(_, target)| *target)
+        .unwrap_or(flow)
+}
+pub const SLEEPING_HANDLERS: &[&str] = &["slow (50-300ms)", "heavy (1-5s)"];
+const COST_HANDLER_BOUND: &str = "handler_bound";
+const COST_HANDLER_AMORTISED: &str = "handler_amortised";
+
+/// The shortest measured window a throughput may be published from, in
+/// seconds — the same floor the harness holds a consume cell to before it
+/// will stamp the row `framework` (its `MIN_FRAMEWORK_WINDOW_SECS`).
+///
+/// A rate is a count over an interval, and under about a second the interval
+/// is dominated by scheduler jitter, allocator warm-up and the first poll:
+/// the committed dataset's in-process publish rows drained 5,000 messages in
+/// 0.008 s, a "631,000 msg/s" that says nothing repeatable. The harness only
+/// gates the `framework` marker on this floor, so the publish (`no_handler`)
+/// rows and the barrier-less `setup_bound` rows can carry a sub-second window
+/// with an honest marker — and this reader has to hold every published bar,
+/// absolute or lower-bound, to the floor itself. A `framework` row under it
+/// is a row the harness cannot produce, and is refused outright.
+pub const MIN_PUBLISHABLE_WINDOW_SECS: f64 = 1.0;
+
+/// Flows that are another flow's name on one backend, not a separate
+/// measurement: `(alias, the flow it spells)`.
+///
+/// The results schema assigns `supervisor` to SQS and `consume_parallel` to
+/// every other backend for the same `run` primitive through the same harness
+/// (SQS has no coordinated groups, so its parallel consume *is* the
+/// supervisor). A run that measured the primitive under one name has not
+/// skipped the other — captioning the alias as an unmeasured gap says a
+/// measurement was missed when none was.
+pub const ALIASED_FLOWS: &[(&str, &str)] = &[("supervisor", "consume_parallel")];
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Document {
     pub schema_version: u32,
@@ -167,14 +248,22 @@ pub struct Unsupported {
     pub reason: String,
 }
 
-/// The slice coordinates of a failed cell — just enough to intersect a chart
-/// family's slice. The diagnostic `error` string stays in the document; the
-/// captions only count.
+/// A failed cell: its slice coordinates, to intersect a chart family's
+/// slice, and the harness's diagnostic. The captions only count failures,
+/// but the diagnostic is what makes an entry an *account* of the cell rather
+/// than a bare coordinate — an empty run is exempt from the silent-run rule
+/// only because its failures explain it, so a blank one is refused.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FailedRow {
     pub flow: String,
     pub payload_bytes: u64,
     pub consumers: u32,
+    /// The handler profile the failed cell ran under: a profile whose every
+    /// cell failed was still run, and the provenance line must say so.
+    #[serde(default)]
+    pub handler: String,
+    #[serde(default)]
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -211,12 +300,33 @@ pub struct ScenarioResult {
     /// marker system exists to refuse.
     #[serde(default)]
     pub setup_secs: Option<f64>,
+    /// The measured window the throughput was computed over. Read for one
+    /// rule: a window under [`MIN_PUBLISHABLE_WINDOW_SECS`] is too short for
+    /// its rate to mean anything, so no bar — absolute or lower-bound — is
+    /// drawn from it. `default` for the same version-gate reason as
+    /// `handler_cost`; an absent or non-positive value is then refused by
+    /// [`validate`].
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 impl ScenarioResult {
     /// Whether this row's throughput may be published as an absolute value.
     fn is_framework(&self) -> bool {
         self.handler_cost == COST_FRAMEWORK
+    }
+
+    /// Whether the window is long enough for the rate to be published at all
+    /// — see [`MIN_PUBLISHABLE_WINDOW_SECS`].
+    fn window_ok(&self) -> bool {
+        self.duration_secs
+            .is_some_and(|d| d.is_finite() && d >= MIN_PUBLISHABLE_WINDOW_SECS)
+    }
+
+    /// The measured window, for captions naming a withheld row. Zero only on
+    /// a row `validate` has refused.
+    fn window_secs(&self) -> f64 {
+        self.duration_secs.unwrap_or(0.0)
     }
 
     /// A negligible-handler consume row whose window includes setup: its
@@ -382,10 +492,16 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
         });
     }
 
+    // Everything the provenance block prints as text. The numeric hardware
+    // fields are not gated: the harness writes 0 where a host does not
+    // expose them, and the label already carries that as "0c / 0 GB".
     for (what, value) in [
         ("generated_at", &doc.generated_at),
         ("shove_version", &doc.shove_version),
+        ("rust_version", &doc.rust_version),
         ("hardware.label", &doc.hardware.label),
+        ("hardware.cpu", &doc.hardware.cpu),
+        ("hardware.os", &doc.hardware.os),
     ] {
         if value.trim().is_empty() {
             return Err(ChartError::MissingProvenance { what });
@@ -428,12 +544,131 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
             if row.handler.is_empty() {
                 return malformed("the handler label is empty");
             }
+            // A label outside the harness's set certifies no marker.
+            if !NEGLIGIBLE_HANDLERS.contains(&row.handler.as_str())
+                && !SLEEPING_HANDLERS.contains(&row.handler.as_str())
+            {
+                return malformed(&format!(
+                    "handler `{}` is not one of the harness's profiles ({:?}, {:?})",
+                    row.handler, NEGLIGIBLE_HANDLERS, SLEEPING_HANDLERS
+                ));
+            }
+            // No barrier, no setup window to record: see BARRIERLESS_FLOWS.
+            if BARRIERLESS_FLOWS.contains(&row.flow.as_str()) && row.setup_secs.is_some() {
+                return malformed(&format!(
+                    "`{}` holds no readiness barrier, so its rows never record setup_secs",
+                    row.flow
+                ));
+            }
+            // No barrier, no certified drain: see BARRIERLESS_FLOWS.
+            if row.handler_cost == COST_FRAMEWORK && BARRIERLESS_FLOWS.contains(&row.flow.as_str())
+            {
+                return malformed(&format!(
+                    "a `{COST_FRAMEWORK}` marker on `{}`, whose driver holds no readiness barrier \
+                     and so can never separate setup from drain",
+                    row.flow
+                ));
+            }
             // See the field doc: `framework` without a recorded setup window
             // is unproducible by the harness and unpublishable here.
             if row.handler_cost == COST_FRAMEWORK
                 && !row.setup_secs.is_some_and(|v| v.is_finite() && v >= 0.0)
             {
                 return malformed("a framework row carries no recorded setup window");
+            }
+            // The marker and the flow must agree: `no_handler` says no
+            // consumer was constructed, which only a publish flow can say,
+            // and every other marker describes a consume window a publish
+            // flow does not have. A consume row wearing `no_handler` would
+            // otherwise be published as an absolute cost. (The harness
+            // refuses the same contradiction on the way in; a document that
+            // carries it was not written by the harness.)
+            let is_publish_flow = PUBLISH_FLOWS.contains(&row.flow.as_str());
+            let is_publish_marker = row.handler_cost == COST_NO_HANDLER;
+            if is_publish_flow != is_publish_marker {
+                return malformed(&format!(
+                    "handler_cost `{}` contradicts the flow: `{COST_NO_HANDLER}` belongs to the \
+                     publish flows and to no other",
+                    row.handler_cost
+                ));
+            }
+            if !PAYLOAD_SIZES.contains(&row.payload_bytes) {
+                return malformed(&format!(
+                    "payload_bytes {} is not one of the harness's payload sizes ({:?})",
+                    row.payload_bytes, PAYLOAD_SIZES
+                ));
+            }
+            // A known flow runs in one mode. Unknown flows are additive and
+            // carry whatever mode they declare.
+            if let Some((_, mode)) = FLOW_MODES.iter().find(|(f, _)| *f == row.flow)
+                && row.mode != *mode
+            {
+                return malformed(&format!(
+                    "mode `{}` contradicts the flow, which runs in mode `{mode}`",
+                    row.mode
+                ));
+            }
+            // The marker is derived from the handler profile: a sleeping
+            // handler's row is `handler_bound` (or `handler_amortised` in
+            // batch mode) and nothing else; a negligible handler's row is
+            // never either. A row disagreeing was not written by the harness,
+            // and publishing it would chart a simulated sleep as shove.
+            if !is_publish_flow {
+                let label = row.handler.as_str();
+                let sleeping_marker = row.handler_cost == COST_HANDLER_BOUND
+                    || row.handler_cost == COST_HANDLER_AMORTISED;
+                if SLEEPING_HANDLERS.contains(&label) {
+                    let expected = if row.mode == "batch" {
+                        COST_HANDLER_AMORTISED
+                    } else {
+                        COST_HANDLER_BOUND
+                    };
+                    if row.handler_cost != expected {
+                        return malformed(&format!(
+                            "handler_cost `{}` under the sleeping handler `{}`; the harness \
+                             derives `{expected}` for it",
+                            row.handler_cost, row.handler
+                        ));
+                    }
+                } else if sleeping_marker {
+                    return malformed(&format!(
+                        "handler_cost `{}` under the negligible handler `{}`, which never sleeps",
+                        row.handler_cost, row.handler
+                    ));
+                }
+            }
+            // The window is what makes the throughput a rate; a row without
+            // one cannot be held to the publishable-window floor.
+            if !row.duration_secs.is_some_and(|d| d.is_finite() && d > 0.0) {
+                return malformed("duration_secs is not a positive finite number");
+            }
+            // The other direction of the same derivation: a negligible
+            // handler on a barrier flow, with a recorded setup window and a
+            // window over the floor, is what the harness stamps `framework`.
+            // `setup_bound` there would publish as a lower bound a number
+            // the harness certified as the rate.
+            if row.handler_cost == COST_SETUP_BOUND
+                && !is_publish_flow
+                && !BARRIERLESS_FLOWS.contains(&row.flow.as_str())
+                && row.setup_secs.is_some_and(|v| v.is_finite() && v >= 0.0)
+                && row.window_ok()
+            {
+                return malformed(&format!(
+                    "`{COST_SETUP_BOUND}` on a barrier flow with a recorded setup window and a \
+                     {:.3} s drain — the harness derives `{COST_FRAMEWORK}` for that row",
+                    row.window_secs()
+                ));
+            }
+            // The harness stamps `framework` only on a window at or above its
+            // own floor, so a shorter one is a hand-edit or a producer
+            // regression — and the exact number the marker keeps off an
+            // absolute axis.
+            if row.handler_cost == COST_FRAMEWORK && !row.window_ok() {
+                return malformed(&format!(
+                    "a framework row's window ({:.3} s) is under the {MIN_PUBLISHABLE_WINDOW_SECS} s \
+                     floor the harness requires for that marker",
+                    row.window_secs()
+                ));
             }
             // Since v3 the batch knobs are present on every `consume_batch`
             // row and no other — a knob-less batch bar has no stated batch
@@ -461,6 +696,42 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
         // bar would render while the declaration silently vanished. (An
         // *unknown* flow name is deliberately tolerated: a future additive
         // flow may be declared before this reader learns its name.)
+        for f in &run.failures {
+            if !PAYLOAD_SIZES.contains(&f.payload_bytes) {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: f.flow.clone(),
+                    what: format!(
+                        "a failures[] entry at payload_bytes {}, which is not one of the \
+                         harness's payload sizes ({:?})",
+                        f.payload_bytes, PAYLOAD_SIZES
+                    ),
+                });
+            }
+            // A failed cell ran under a profile too, and the provenance line
+            // has to name it; blank or unknown is refused like a row's.
+            if !NEGLIGIBLE_HANDLERS.contains(&f.handler.as_str())
+                && !SLEEPING_HANDLERS.contains(&f.handler.as_str())
+            {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: f.flow.clone(),
+                    what: format!(
+                        "a failures[] entry under handler `{}`, which is not one of the \
+                         harness's profiles",
+                        f.handler
+                    ),
+                });
+            }
+            if f.error.trim().is_empty() {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: f.flow.clone(),
+                    what: "a failures[] entry carries no error — a coordinate is not an account"
+                        .to_string(),
+                });
+            }
+        }
         for u in &run.unsupported {
             if u.reason.trim().is_empty() {
                 return Err(ChartError::MalformedRow {
@@ -475,6 +746,25 @@ pub fn validate(doc: &Document) -> Result<(), ChartError> {
                     flow: u.flow.clone(),
                     what: "declared unsupported but carries measured rows for the same flow"
                         .to_string(),
+                });
+            }
+            // A failed cell was attempted, so the flow is not unsupported;
+            // one of the two accounts is false, and the charts would show
+            // only one of them.
+            if run.failures.iter().any(|f| f.flow == u.flow) {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: u.flow.clone(),
+                    what: "declared unsupported but carries a recorded failure for the same flow"
+                        .to_string(),
+                });
+            }
+            // Two declarations for one flow: only one reason would render.
+            if run.unsupported.iter().filter(|o| o.flow == u.flow).count() > 1 {
+                return Err(ChartError::MalformedRow {
+                    backend: run.backend.clone(),
+                    flow: u.flow.clone(),
+                    what: "declared unsupported more than once".to_string(),
                 });
             }
         }
@@ -581,8 +871,16 @@ impl Family {
 
 // ── Style: mid-tone, background-agnostic ────────────────────────────────────
 
-const WIDTH: u32 = 960;
-const HEIGHT: u32 = 560;
+pub const WIDTH: u32 = 960;
+/// Tall enough that a full caption block — every backend's declared holes,
+/// the lower-bound and worker-count qualifiers, three provenance lines — still
+/// leaves the plot body [`MIN_PLOT_PX`] high. At 560 the committed ordering
+/// chart's nineteen caption lines squeezed the bars into ~50px.
+pub const HEIGHT: u32 = 640;
+/// The least plot-body height the frame will render. Below this the bars are
+/// slivers between the legend and the caption, and a chart that cannot be
+/// read is refused rather than published.
+pub const MIN_PLOT_PX: i32 = 150;
 
 /// Text and axis grey. Contrast is ~4.9:1 on white and ~3.6:1 on a typical dark
 /// page background — the best a single file can do without assuming one. All
@@ -601,6 +899,9 @@ const FONT: &str = "sans-serif";
 const TITLE_PX: i32 = 26;
 const LABEL_PX: i32 = 18;
 const FOOT_PX: i32 = 18;
+/// Bar value labels: ~12px rendered, the smallest size still legible on both
+/// backgrounds, so a value fits above a narrow grouped bar.
+const VALUE_PX: i32 = 15;
 
 /// The one mid-tone palette every chart draws from. None is white or
 /// near-black, so each reads against a light and a dark page — and because
@@ -657,31 +958,91 @@ fn ink(px: i32) -> TextStyle<'static> {
 /// because omission reads to a reader as "we forgot to measure it".
 #[derive(Debug, Clone)]
 enum Presence {
-    /// Real numbers, safe to publish as absolute values. `partial` says the
-    /// slice also held setup-bound cells that are *not* plotted — named in the
-    /// caption so a shorter line reads as a caveat, not a smaller sweep.
+    /// Real numbers, safe to publish as absolute values. `withheld` names the
+    /// slice's categories that hold no plotted point and why — a shorter
+    /// line must read as a caveat, not as a smaller sweep or a failed cell.
     Absolute {
         points: Vec<(f64, f64)>,
-        partial: bool,
+        withheld: Vec<Withheld>,
     },
     /// `representative: false` — the shape is real, the magnitude is not.
     /// Values are normalised to their own maximum and the axis numbers never
     /// describe them.
-    ShapeOnly(Vec<(f64, f64)>),
-    /// The slice was measured, but every row is `setup_bound`: the windows
-    /// include coordination cost, so there is no drain rate to publish. Named
+    ShapeOnly {
+        points: Vec<(f64, f64)>,
+        withheld: Vec<Withheld>,
+    },
+    /// The slice was measured, but no cell may be published: every row is
+    /// setup-bound, under the window floor, or a sleeping handler. Named
     /// rather than plotted — a lower bound drawn as a line would be read as
     /// the rate.
-    SetupBoundOnly,
+    WithheldOnly(Vec<Withheld>),
     /// Declared in `unsupported[]`: the backend cannot do this flow at all.
     Unsupported(String),
     /// Supported, but this document carries no row for the chart's slice.
     NotMeasured,
 }
 
+/// Why one category of a backend's line has no plotted point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WithheldKind {
+    /// Rows exist, but every candidate's window is under
+    /// [`MIN_PUBLISHABLE_WINDOW_SECS`]. On a barrier-holding flow this is the
+    /// only way a negligible-handler row ends up `setup_bound`, so it is
+    /// named as the cause rather than as "coordination cost".
+    ShortWindow,
+    /// A setup-bound row whose window is long enough: the marker means the
+    /// driver could not separate setup from drain.
+    SetupBound,
+    /// Only sleeping-handler rows: the number is the simulated sleep.
+    HandlerBound,
+    /// The harness ran the cell and recorded a failure for it.
+    Failed,
+    /// No row and no recorded failure for this category — a gap, not a
+    /// capability hole.
+    Gap,
+}
+
+impl WithheldKind {
+    fn describe(self) -> String {
+        match self {
+            Self::ShortWindow => format!(
+                "window under {MIN_PUBLISHABLE_WINDOW_SECS} s, too short to publish as a rate"
+            ),
+            Self::SetupBound => "setup-bound (window includes coordination cost)".to_string(),
+            Self::HandlerBound => {
+                "sleeping-handler rows only (the number is the simulated sleep)".to_string()
+            }
+            Self::Failed => failed_text().to_string(),
+            Self::Gap => gap_text().to_string(),
+        }
+    }
+}
+
+/// One withheld cell: the category label it sits at, and why.
+#[derive(Debug, Clone)]
+struct Withheld {
+    label: String,
+    kind: WithheldKind,
+}
+
+/// "…at consumers 2, 4; …at consumers 8" — the withheld cells grouped by
+/// cause, each naming its categories on the chart's own x axis.
+fn describe_withheld(withheld: &[Withheld], x_desc: &str) -> String {
+    let mut by_kind: BTreeMap<WithheldKind, Vec<&str>> = BTreeMap::new();
+    for w in withheld {
+        by_kind.entry(w.kind).or_default().push(w.label.as_str());
+    }
+    by_kind
+        .iter()
+        .map(|(kind, labels)| format!("{} at {x_desc} {}", kind.describe(), labels.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Normalise to the series' own maximum, so the curve's shape survives but no
 /// absolute magnitude is ever recoverable from the chart.
-fn shape_only(points: Vec<(f64, f64)>) -> Presence {
+fn shape_only(points: Vec<(f64, f64)>, withheld: Vec<Withheld>) -> Presence {
     // The peak is always positive here: every point is a
     // `throughput_msg_per_sec` that `validate` already required to be finite
     // and greater than zero.
@@ -689,39 +1050,43 @@ fn shape_only(points: Vec<(f64, f64)>) -> Presence {
         .iter()
         .fold(0.0f64, |a, (_, y)| a.max(*y))
         .max(f64::MIN_POSITIVE);
-    Presence::ShapeOnly(points.into_iter().map(|(x, y)| (x, y / peak)).collect())
+    Presence::ShapeOnly {
+        points: points.into_iter().map(|(x, y)| (x, y / peak)).collect(),
+        withheld,
+    }
 }
 
 /// Build one `Presence` per backend for a chart slice.
 ///
 /// `extract` returns the slice's *publishable* points for a run (framework
-/// rows only); `in_slice_setup_bound` reports whether the run measured the
-/// slice but produced only setup-bound windows; `flows_for_support` names the
-/// flow whose `unsupported[]` entry explains an absence.
-fn presences<F, S>(
+/// rows only); `withheld` returns, per category with no publishable point,
+/// why — measured-but-unpublishable cells, and gaps; `flows_for_support`
+/// names the flow whose `unsupported[]` entry explains a wholly absent
+/// backend. A backend whose every category is a gap measured nothing in the
+/// slice and is accounted for as unsupported or not measured instead.
+fn presences<F, W>(
     doc: &Document,
     flows_for_support: &[&str],
     extract: F,
-    in_slice_setup_bound: S,
+    withheld: W,
 ) -> BTreeMap<String, Presence>
 where
     F: Fn(&BackendRun) -> Vec<(f64, f64)>,
-    S: Fn(&BackendRun) -> bool,
+    W: Fn(&BackendRun) -> Vec<Withheld>,
 {
     let mut out = BTreeMap::new();
     for run in &doc.runs {
         let points = extract(run);
+        let withheld = withheld(run);
+        let measured_something = withheld.iter().any(|w| w.kind != WithheldKind::Gap);
         let presence = if !points.is_empty() {
             if run.representative {
-                Presence::Absolute {
-                    points,
-                    partial: in_slice_setup_bound(run),
-                }
+                Presence::Absolute { points, withheld }
             } else {
-                shape_only(points)
+                shape_only(points, withheld)
             }
-        } else if in_slice_setup_bound(run) {
-            Presence::SetupBoundOnly
+        } else if measured_something {
+            Presence::WithheldOnly(withheld)
         } else if let Some(reason) = flows_for_support
             .iter()
             .find_map(|flow| unsupported_reason(run, flow))
@@ -775,11 +1140,20 @@ fn provenance(doc: &Document) -> Vec<String> {
     let handlers: BTreeSet<&str> = doc
         .runs
         .iter()
-        .flat_map(|run| run.results.iter())
-        .filter(|row| !row.handler.is_empty())
-        .map(|row| row.handler.as_str())
+        .flat_map(|run| {
+            run.results
+                .iter()
+                .map(|row| row.handler.as_str())
+                .chain(run.failures.iter().map(|f| f.handler.as_str()))
+        })
+        .filter(|h| !h.is_empty())
         .collect();
-    if !handlers.is_empty() {
+    if handlers.is_empty() {
+        // A document whose every run is declared unsupported ran no cell
+        // under any profile; say so rather than drop the line, so the
+        // absence is a statement and not a missing field.
+        parts.push("handler: none — no cells were run".to_string());
+    } else {
         let joined = handlers.into_iter().collect::<Vec<_>>().join(", ");
         parts.push(format!("handler: {joined}"));
     }
@@ -827,6 +1201,14 @@ fn fmt_payload(bytes: u64) -> String {
 
 /// Left margin every line of chrome starts at.
 const GUTTER: i32 = 24;
+/// Where the plot body starts: the chart area's top (title + legend band)
+/// plus the chart's own top margin.
+const PLOT_TOP: i32 = 70 + 26;
+/// Baseline-to-baseline spacing of legend rows.
+const LEGEND_ROW: i32 = 16;
+/// What sits between the plot body's bottom and the footer's first baseline:
+/// the chart's bottom margin plus the reserved gap.
+const PLOT_BOTTOM_GAP: i32 = 26 + 18;
 /// Baseline-to-baseline spacing for the footer lines.
 const LINE: i32 = 19;
 /// Characters per footer line.
@@ -895,8 +1277,12 @@ fn frame<'b>(
     title: &str,
     subtitle: &str,
     notes: &[String],
+    legend_rows: i32,
 ) -> Result<DrawingArea<SVGBackend<'b>, Shift>, ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    // One legend row fits the band under the subtitle; every further row
+    // pushes the chart body down rather than overprinting the plot.
+    let legend_extra = LEGEND_ROW.saturating_mul(legend_rows.saturating_sub(1).max(0));
 
     root.draw_text(
         title,
@@ -915,15 +1301,15 @@ fn frame<'b>(
     // Lay the block out upward from a fixed bottom, so the last baseline plus
     // its descender always clears the canvas edge.
     let bottom = HEIGHT as i32 - 26;
-    let top_of_footer = bottom - LINE * (footer.len() as i32 - 1);
-    // Past this point the block would squeeze the chart body below its own
-    // internal margins — plotters then draws the plot over the legend and
-    // subtitle band rather than erroring (verified at 24 footer lines). 170
-    // still leaves ~90px of mesh under the title band; a document
-    // pathological enough to get here gets a loud refusal instead of a
-    // garbage chart. The refusal panel's sentence sits at y=140, above any
-    // footer top this guard permits.
-    if top_of_footer < 170 {
+    let lines = i32::try_from(footer.len()).unwrap_or(i32::MAX);
+    let top_of_footer = bottom.saturating_sub(LINE.saturating_mul(lines.saturating_sub(1)));
+    // The plot body runs from the chart area's top margin (70 + 26) to the
+    // footer top less the reserved gap and bottom margin (18 + 26); below
+    // MIN_PLOT_PX of that, the bars are slivers — and past zero plotters
+    // draws the plot over the legend rather than erroring. A document that
+    // gets here gets a loud refusal instead of a garbage chart. The refusal
+    // panel's sentence sits at y=140, above any footer top this permits.
+    if top_of_footer < PLOT_TOP.saturating_add(legend_extra) + MIN_PLOT_PX + PLOT_BOTTOM_GAP {
         return Err(ChartError::Render(format!(
             "the caption block ({} lines) leaves no room for the chart body",
             footer.len()
@@ -933,17 +1319,21 @@ fn frame<'b>(
         root.draw_text(
             line,
             &ink(FOOT_PX),
-            (GUTTER, top_of_footer + i as i32 * LINE),
+            (
+                GUTTER,
+                top_of_footer
+                    .saturating_add(LINE.saturating_mul(i32::try_from(i).unwrap_or(i32::MAX))),
+            ),
         )
         .map_err(render)?;
     }
 
     let reserved = (HEIGHT as i32 - top_of_footer + 18).max(0) as u32;
-    Ok(root.margin(70, reserved, 16, 16))
+    Ok(root.margin((70 + legend_extra).max(0) as u32, reserved, 16, 16))
 }
 
 /// The notes line for each backend that is not plotted.
-fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<String> {
+fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>, x_desc: &str) -> Vec<String> {
     let mut notes = Vec::new();
     for (backend, presence) in presences {
         match presence {
@@ -960,27 +1350,47 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
             // the slice. Publishing it as a capability hole would be a false
             // claim about the library rather than about the run.
             Presence::NotMeasured => notes.push(format!("{backend}: {}", gap_text())),
-            Presence::SetupBoundOnly => notes.push(format!(
-                "{backend}: setup-bound — the measured window includes \
-                 coordination cost, so no drain rate is published for this slice"
-            )),
-            Presence::ShapeOnly(_) => {
+            Presence::WithheldOnly(withheld) => {
+                // A backend whose only presence is failures did not measure
+                // anything; "measured, but" would be the wrong prefix.
+                if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
+                    notes.push(format!(
+                        "{backend}: {}",
+                        describe_withheld(withheld, x_desc)
+                    ));
+                } else {
+                    notes.push(format!(
+                        "{backend}: measured, but no drain rate is published for this slice — {}",
+                        describe_withheld(withheld, x_desc)
+                    ));
+                }
+            }
+            Presence::ShapeOnly { withheld, .. } => {
                 // The fallback arm exists so the caveat cannot silently
                 // vanish if the map key ever diverges from run.backend — a
                 // normalised series with no caption would read as absolute.
-                match doc.runs.iter().find(|r| &r.backend == backend) {
-                    Some(run) => notes.push(shape_only_note(run)),
-                    None => notes.push(format!(
+                let mut note = match doc.runs.iter().find(|r| &r.backend == backend) {
+                    Some(run) => shape_only_note(run),
+                    None => format!(
                         "{backend}: shape only — not representative; magnitudes \
                          are not published"
-                    )),
+                    ),
+                };
+                // The shape has holes too, and the caveat must not swallow
+                // the reasons for them.
+                if !withheld.is_empty() {
+                    note.push_str(&format!(
+                        "; not plotted: {}",
+                        describe_withheld(withheld, x_desc)
+                    ));
                 }
+                notes.push(note);
             }
-            Presence::Absolute { partial: true, .. } => notes.push(format!(
-                "{backend}: partial — setup-bound cells in this slice are not \
-                 plotted (window includes coordination cost)"
+            Presence::Absolute { withheld, .. } if !withheld.is_empty() => notes.push(format!(
+                "{backend}: partial — not plotted: {}",
+                describe_withheld(withheld, x_desc)
             )),
-            Presence::Absolute { partial: false, .. } => {}
+            Presence::Absolute { .. } => {}
         }
     }
     notes
@@ -992,6 +1402,55 @@ fn notes_for(doc: &Document, presences: &BTreeMap<String, Presence>) -> Vec<Stri
 fn gap_text() -> &'static str {
     "no measurement for this slice in this run (supported — a gap, not a \
      capability hole)"
+}
+
+/// The shared caption for a slice that was measured but whose every window
+/// is under [`MIN_PUBLISHABLE_WINDOW_SECS`]: the row exists, the marker is
+/// honest, and the number still is not a rate anyone should read.
+/// The shared caption for a slice measured only under a sleeping handler:
+/// a real measurement the charts refuse on purpose, never a gap.
+fn sleeping_handler_text() -> &'static str {
+    "measured only with a sleeping handler — the number is the simulated sleep, not \
+     shove, so it is not published"
+}
+
+/// The shared caption for a cell the harness ran and could not measure.
+fn failed_text() -> &'static str {
+    "failed to run — absent, not zero; see failures[] in the results document"
+}
+
+fn short_window_text() -> String {
+    format!(
+        "measured, but every window under {MIN_PUBLISHABLE_WINDOW_SECS} s — too short \
+         for the throughput to be a rate, so none is published (not even as a lower bound)"
+    )
+}
+
+/// Collapse per-mode caption entries into lines. `entries` is
+/// `text → (mode index → backends)`; modes that share a text *and* a backend
+/// list are named on one line ("sqs / parallel, sequenced (fifo): …") rather
+/// than repeating a three-line reason per mode — which is what pushed the
+/// committed ordering chart's plot body down to ~50px.
+fn mode_notes(entries: &BTreeMap<String, BTreeMap<usize, Vec<String>>>) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (text, per_mode) in entries {
+        // Group the modes by their backend list, preserving mode order.
+        let mut segments: Vec<(Vec<String>, Vec<&str>)> = Vec::new();
+        for (mi, backends) in per_mode {
+            let label = MODES.get(*mi).map(|m| m.2).unwrap_or("?");
+            match segments.iter_mut().find(|(b, _)| b == backends) {
+                Some((_, labels)) => labels.push(label),
+                None => segments.push((backends.clone(), vec![label])),
+            }
+        }
+        let joined = segments
+            .iter()
+            .map(|(backends, labels)| format!("{} / {}", backends.join(", "), labels.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        notes.push(format!("{joined}: {text}"));
+    }
+    notes
 }
 
 /// Why a run's magnitudes are not published, naming the deployment when the
@@ -1071,7 +1530,9 @@ fn contiguous_runs(points: &[(f64, f64)]) -> Vec<&[(f64, f64)]> {
 /// The absolute y-range, taken only from series that are safe to publish.
 /// `ShapeOnly` series never widen it — that is what keeps a non-representative
 /// magnitude out of the axis numbers.
-fn absolute_range(presences: &BTreeMap<String, Presence>) -> Option<(f64, f64)> {
+fn absolute_range(
+    presences: &BTreeMap<String, Presence>,
+) -> Result<Option<(f64, f64)>, ChartError> {
     let mut peak = f64::MIN;
     let mut seen = false;
     for presence in presences.values() {
@@ -1085,10 +1546,22 @@ fn absolute_range(presences: &BTreeMap<String, Presence>) -> Option<(f64, f64)> 
         }
     }
     if seen && peak > 0.0 {
-        Some((0.0, peak * 1.12))
+        Ok(Some((0.0, headroom(peak, 1.12)?)))
     } else {
-        None
+        Ok(None)
     }
+}
+
+/// `peak * factor`, refusing a peak the multiplication would carry past
+/// `f64::MAX`: an infinite axis bound maps every coordinate to NaN, and
+/// plotters writes that out as a clean-looking, empty chart.
+fn headroom(peak: f64, factor: f64) -> Result<f64, ChartError> {
+    if peak > f64::MAX / factor {
+        return Err(ChartError::Render(format!(
+            "axis peak {peak:e} cannot take {factor}x headroom without overflowing"
+        )));
+    }
+    Ok(peak * factor)
 }
 
 fn stroke(colour: RGBColor, width: u32) -> ShapeStyle {
@@ -1152,27 +1625,55 @@ where
 
 /// A legend entry drawn as a swatch plus a label, laid out left to right along
 /// the top of the plot area.
+/// Where the legend starts.
+const LEGEND_ORIGIN: (i32, i32) = (94, 74);
+
+/// The estimated width of one legend entry. An estimate rather than a
+/// measurement: text extents are approximated (no ttf feature), and the
+/// estimate is what stays equal across hosts. Saturating: a document-supplied
+/// label has no length bound.
+fn legend_entry_width(label: &str) -> i32 {
+    i32::try_from(label.chars().count())
+        .unwrap_or(i32::MAX)
+        .saturating_mul(9)
+        .saturating_add(44)
+}
+
+/// Lay the legend out into rows: `(row index, x)` per entry, and the row
+/// count. An entry that does not fit a row by itself has no legible place on
+/// this canvas and is refused rather than drawn off the edge.
+fn legend_layout(entries: &[(String, RGBColor)]) -> Result<(Vec<(i32, i32)>, i32), ChartError> {
+    let right_edge = WIDTH as i32 - 16;
+    let mut x = LEGEND_ORIGIN.0;
+    let mut row = 0i32;
+    let mut slots = Vec::with_capacity(entries.len());
+    for (label, _) in entries {
+        let width = legend_entry_width(label);
+        if LEGEND_ORIGIN.0.saturating_add(width) > right_edge {
+            return Err(ChartError::Render(format!(
+                "legend entry `{label}` is wider than the canvas"
+            )));
+        }
+        if x > LEGEND_ORIGIN.0 && x.saturating_add(width) > right_edge {
+            x = LEGEND_ORIGIN.0;
+            row = row.saturating_add(1);
+        }
+        slots.push((row, x));
+        x = x.saturating_add(width);
+    }
+    Ok((slots, row.saturating_add(1)))
+}
+
 fn draw_legend(
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     entries: &[(String, RGBColor)],
-    origin: (i32, i32),
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let mut x = origin.0;
-    let mut y = origin.1;
-    for (label, colour) in entries {
-        // Advance by an estimate rather than a measurement: text extents are
-        // approximated (no ttf feature), and the estimate is what stays equal
-        // across hosts.
-        let entry_width = 20 + 9 * label.chars().count() as i32 + 24;
-        // An entry past the canvas edge is a series with no legible label —
-        // wrap to a second row instead of drawing outside the viewBox. The
-        // row drops into the chart area's top margin band (empty by
-        // construction: the axis adds 12% headroom above the tallest series).
-        if x > origin.0 && x + entry_width > WIDTH as i32 - 16 {
-            x = origin.0;
-            y += 16;
-        }
+    let (slots, _) = legend_layout(entries)?;
+    for ((label, colour), (row, x)) in entries.iter().zip(slots) {
+        let y = LEGEND_ORIGIN
+            .1
+            .saturating_add(LEGEND_ROW.saturating_mul(row));
         root.draw(&Rectangle::new(
             [(x, y + 3), (x + 14, y + 11)],
             ShapeStyle {
@@ -1184,7 +1685,6 @@ fn draw_legend(
         .map_err(render)?;
         root.draw_text(label, &ink(LABEL_PX), (x + 20, y))
             .map_err(render)?;
-        x += entry_width;
     }
     Ok(())
 }
@@ -1206,8 +1706,9 @@ fn render_throughput_vs_consumers(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
-    let in_slice =
-        |r: &ScenarioResult| r.flow == HEADLINE_FLOW && r.payload_bytes == HEADLINE_PAYLOAD;
+    let in_slice = |r: &ScenarioResult| {
+        canonical_flow(&r.flow) == HEADLINE_FLOW && r.payload_bytes == HEADLINE_PAYLOAD
+    };
     render_line_family(
         doc,
         root,
@@ -1227,7 +1728,8 @@ fn render_throughput_vs_consumers(
         in_slice,
         |r| r.consumers,
         |c| format!("{c}"),
-        |f| f.flow == HEADLINE_FLOW && f.payload_bytes == HEADLINE_PAYLOAD,
+        |f| canonical_flow(&f.flow) == HEADLINE_FLOW && f.payload_bytes == HEADLINE_PAYLOAD,
+        |f| f.consumers,
     )
 }
 
@@ -1237,7 +1739,9 @@ fn render_throughput_vs_payload(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
-    let in_slice = |r: &ScenarioResult| r.flow == HEADLINE_FLOW && r.consumers == BASE_CONSUMERS;
+    let in_slice = |r: &ScenarioResult| {
+        canonical_flow(&r.flow) == HEADLINE_FLOW && r.consumers == BASE_CONSUMERS
+    };
     render_line_family(
         doc,
         root,
@@ -1250,7 +1754,8 @@ fn render_throughput_vs_payload(
         in_slice,
         |r| r.payload_bytes,
         |s| fmt_payload(*s),
-        |f| f.flow == HEADLINE_FLOW && f.consumers == BASE_CONSUMERS,
+        |f| canonical_flow(&f.flow) == HEADLINE_FLOW && f.consumers == BASE_CONSUMERS,
+        |f| f.payload_bytes,
     )
 }
 
@@ -1261,7 +1766,7 @@ fn render_throughput_vs_payload(
 /// key (two tiers, two corpus sizes), and a line needs one value per x, not a
 /// vertical zigzag whose value is document order — then render.
 #[allow(clippy::too_many_arguments)]
-fn render_line_family<K, P, KF, LF, FF>(
+fn render_line_family<K, P, KF, LF, FF, FK>(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
     title: &str,
@@ -1274,23 +1779,34 @@ fn render_line_family<K, P, KF, LF, FF>(
     key_of: KF,
     label_of: LF,
     in_failed_slice: FF,
+    failed_key_of: FK,
 ) -> Result<(), ChartError>
 where
     K: Ord + Copy,
     P: Fn(&ScenarioResult) -> bool + Copy,
     KF: Fn(&ScenarioResult) -> K + Copy,
-    LF: Fn(&K) -> String,
-    FF: Fn(&FailedRow) -> bool,
+    LF: Fn(&K) -> String + Copy,
+    FF: Fn(&FailedRow) -> bool + Copy,
+    FK: Fn(&FailedRow) -> K + Copy,
 {
+    // Every category any backend attempted — measured, withheld or failed —
+    // is on the axis. A category only framework rows opened would drop a
+    // payload every backend measured but none could publish, and the sweep
+    // would read as one size narrower than it was.
     let mut keys: BTreeSet<K> = BTreeSet::new();
     for run in &doc.runs {
-        for r in &run.results {
-            if in_slice(r) && r.is_framework() {
-                keys.insert(key_of(r));
-            }
+        for r in run.results.iter().filter(|r| in_slice(r)) {
+            keys.insert(key_of(r));
+        }
+        for f in run.failures.iter().filter(|f| in_failed_slice(f)) {
+            keys.insert(failed_key_of(f));
         }
     }
     let keys: Vec<K> = keys.into_iter().collect();
+    // Nothing attempted in the slice at all is a chart with nothing to say.
+    // A slice where every cell is withheld, failed or unsupported is not:
+    // the axis and the captions are the account of why no line exists, and
+    // refusing here would take every other family down with it.
     if keys.is_empty() {
         return Err(ChartError::NoDataForChart {
             family: family_key,
@@ -1316,13 +1832,51 @@ where
                 .collect()
         },
         |run| {
-            run.results
-                .iter()
-                .any(|r| in_slice(r) && r.is_setup_bound())
+            // Every category with no publishable point gets a reason. A
+            // failed cell is left to `failure_notes`, which counts it.
+            keys.iter()
+                .filter_map(|k| {
+                    let rows: Vec<&ScenarioResult> = run
+                        .results
+                        .iter()
+                        .filter(|r| in_slice(r) && key_of(r) == *k)
+                        .collect();
+                    if rows.iter().any(|r| r.is_framework()) {
+                        return None;
+                    }
+                    let failed = run
+                        .failures
+                        .iter()
+                        .any(|f| in_failed_slice(f) && failed_key_of(f) == *k);
+                    let kind = if rows.iter().any(|r| r.is_setup_bound()) {
+                        if rows
+                            .iter()
+                            .filter(|r| r.is_setup_bound())
+                            .all(|r| !r.window_ok())
+                        {
+                            WithheldKind::ShortWindow
+                        } else {
+                            WithheldKind::SetupBound
+                        }
+                    } else if !rows.is_empty() {
+                        WithheldKind::HandlerBound
+                    } else if failed {
+                        WithheldKind::Failed
+                    } else {
+                        WithheldKind::Gap
+                    };
+                    Some(Withheld {
+                        label: label_of(k),
+                        kind,
+                    })
+                })
+                .collect()
         },
     );
 
     let labels: Vec<String> = keys.iter().map(label_of).collect();
+    let mut extra = alias_notes(doc, in_slice);
+    extra.extend(failure_notes(&doc.runs, in_failed_slice));
     line_chart(
         doc,
         root,
@@ -1332,8 +1886,45 @@ where
         &labels,
         x_desc,
         &presences,
-        &failure_notes(&doc.runs, in_failed_slice),
+        &extra,
     )
+}
+
+/// One caption line per backend whose in-slice rows arrived under an alias:
+/// the bar or line is real, and the reader must be told which name it was
+/// measured under.
+fn alias_notes<P>(doc: &Document, in_slice: P) -> Vec<String>
+where
+    P: Fn(&ScenarioResult) -> bool,
+{
+    let mut notes = Vec::new();
+    for run in &doc.runs {
+        let mut aliases: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for r in run.results.iter().filter(|r| in_slice(r)) {
+            let target = canonical_flow(&r.flow);
+            if target != r.flow {
+                aliases.insert((r.flow.as_str(), target));
+            }
+        }
+        for (alias, target) in aliases {
+            // The harness declares the canonical flow unsupported on the
+            // aliasing backend with a reason that names the alias; that
+            // declaration is not a contradiction of the measured rows, it
+            // explains them — so it is carried verbatim rather than
+            // dropped behind our own prose.
+            match unsupported_reason(run, target) {
+                Some(reason) => {
+                    notes.push(format!("{}: measured as {alias} — {reason}", run.backend))
+                }
+                None => notes.push(format!(
+                    "{}: measured as {alias} — this backend's spelling of {target} (the same \
+                     run primitive)",
+                    run.backend
+                )),
+            }
+        }
+    }
+    notes
 }
 
 /// Shared line-chart body for families 1 and 2.
@@ -1350,14 +1941,43 @@ fn line_chart(
     extra_notes: &[String],
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let mut notes = notes_for(doc, presences);
+    let mut notes = notes_for(doc, presences, x_desc);
     notes.extend_from_slice(extra_notes);
-    let area = frame(root, doc, title, subtitle, &notes)?;
+    // The legend is known before anything is drawn, and its row count
+    // decides where the chart body starts.
+    let legend: Vec<(String, RGBColor)> = presences
+        .iter()
+        .map(|(backend, presence)| {
+            let label = match presence {
+                Presence::Absolute { points, .. } if points.len() == 1 => {
+                    format!("{backend} (single point)")
+                }
+                Presence::Absolute { .. } => backend.clone(),
+                Presence::ShapeOnly { .. } => format!("{backend} (shape only)"),
+                // A line chart has no slot to put the rule-3 marker in, so
+                // the legend is the axis-adjacent place a backend with no
+                // line must still appear — otherwise the plot reads as a
+                // smaller sweep and the caption is the only witness.
+                Presence::Unsupported(_) => format!("{backend} (n/s)"),
+                Presence::NotMeasured => format!("{backend} (not measured)"),
+                Presence::WithheldOnly(withheld) => {
+                    if withheld.iter().all(|w| w.kind == WithheldKind::Failed) {
+                        format!("{backend} (failed)")
+                    } else {
+                        format!("{backend} (withheld)")
+                    }
+                }
+            };
+            (label, backend_colour(backend))
+        })
+        .collect();
+    let (_, legend_rows) = legend_layout(&legend)?;
+    let area = frame(root, doc, title, subtitle, &notes, legend_rows)?;
 
     // Absolute magnitudes come only from representative runs. A shape-only
     // series is drawn against the same box but its values are fractions, so it
     // can never be read off the axis.
-    let range = absolute_range(presences);
+    let range = absolute_range(presences)?;
     let absolute_axis = range.is_some();
     let (y_lo, y_hi) = range.unwrap_or((0.0, 1.0));
 
@@ -1389,7 +2009,6 @@ fn line_chart(
         .draw()
         .map_err(render)?;
 
-    let mut legend: Vec<(String, RGBColor)> = Vec::new();
     for (backend, presence) in presences {
         let colour = backend_colour(backend);
         match presence {
@@ -1407,14 +2026,8 @@ fn line_chart(
                 chart
                     .draw_series(points.iter().map(|(x, y)| Circle::new((*x, *y), 4, dot)))
                     .map_err(render)?;
-                let label = if points.len() == 1 {
-                    format!("{backend} (single point)")
-                } else {
-                    backend.clone()
-                };
-                legend.push((label, colour));
             }
-            Presence::ShapeOnly(points) => {
+            Presence::ShapeOnly { points, .. } => {
                 // Fractions mapped onto the lower half of the box: the
                 // curve's shape is preserved, the magnitude is not
                 // recoverable — and a normalised peak drawn at the very top
@@ -1439,15 +2052,14 @@ fn line_chart(
                 chart
                     .draw_series(mapped.iter().map(|(x, y)| Circle::new((*x, *y), 3, dot)))
                     .map_err(render)?;
-                legend.push((format!("{backend} (shape only)"), colour));
             }
-            Presence::Unsupported(_) | Presence::NotMeasured | Presence::SetupBoundOnly => {}
+            Presence::Unsupported(_) | Presence::NotMeasured | Presence::WithheldOnly(_) => {}
         }
     }
 
     draw_categories(root, &chart, x_labels)?;
     draw_x_desc(root, &chart, x_desc)?;
-    draw_legend(root, &legend, (94, 74))?;
+    draw_legend(root, &legend)?;
     Ok(())
 }
 
@@ -1507,7 +2119,8 @@ fn bar_chart(
             slice: title.to_string(),
         });
     }
-    let area = frame(root, doc, title, subtitle, notes)?;
+    let (_, legend_rows) = legend_layout(series)?;
+    let area = frame(root, doc, title, subtitle, notes, legend_rows)?;
 
     // Only representative groups set the scale, so a non-representative
     // magnitude can never be read off the axis. Lower-bound bars do
@@ -1536,7 +2149,11 @@ fn bar_chart(
         }
     }
     let absolute_axis = peak > 0.0;
-    let y_hi = if absolute_axis { peak * 1.14 } else { 1.0 };
+    let y_hi = if absolute_axis {
+        headroom(peak, 1.14)?
+    } else {
+        1.0
+    };
 
     let n = groups.len();
     let mut chart = ChartBuilder::on(&area)
@@ -1571,6 +2188,11 @@ fn bar_chart(
     let width = slot / series.len().max(1) as f64;
 
     let marker: TextStyle<'_> = (FONT, LABEL_PX)
+        .into_font()
+        .color(&INK)
+        .pos(Pos::new(HPos::Center, VPos::Bottom));
+    // Smaller than the axis labels so a value fits above a narrow bar.
+    let value_label: TextStyle<'_> = (FONT, VALUE_PX)
         .into_font()
         .color(&INK)
         .pos(Pos::new(HPos::Center, VPos::Bottom));
@@ -1634,6 +2256,23 @@ fn bar_chart(
                             },
                         )))
                         .map_err(render)?;
+                    // Every published bar carries its value: one backend a
+                    // decade faster than the rest scales a shared linear
+                    // axis so the others are a few pixels tall, and a bar
+                    // that cannot be read off the axis must still be
+                    // readable off its label. Shape-only bars carry none —
+                    // their height is normalised and a number on it would
+                    // be read as the magnitude the rule withholds.
+                    if !group.shape_only {
+                        let label = if bar.lower_bound {
+                            format!("≥{}", fmt_count(bar.value))
+                        } else {
+                            fmt_count(bar.value)
+                        };
+                        let (px, py) = chart.plotting_area().map_coordinate(&(centre, height));
+                        root.draw_text(&label, &value_label, (px, py - 3))
+                            .map_err(render)?;
+                    }
                 }
                 None => {
                     // Rule 3: an explicit marker. Never a zero, and never a
@@ -1649,7 +2288,7 @@ fn bar_chart(
     let labels: Vec<String> = groups.iter().map(|g| g.label.clone()).collect();
     draw_categories(root, &chart, &labels)?;
     draw_x_desc(root, &chart, x_desc)?;
-    draw_legend(root, series, (94, 74))?;
+    draw_legend(root, series)?;
     Ok(())
 }
 
@@ -1693,9 +2332,9 @@ fn render_parallel_vs_sequenced(
     // explanations across backends collapse to one line naming them all —
     // six single-backend repeats of "run_batch is Kafka-only" would crowd
     // out the caption block the notes exist to fill.
-    let mut missing: BTreeMap<(usize, String), Vec<String>> = BTreeMap::new();
-    let mut bounded: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-    let mut workers: BTreeMap<(usize, u32), Vec<String>> = BTreeMap::new();
+    // `text → mode → backends`, rendered through `mode_notes` so identical
+    // explanations collapse across backends *and* modes.
+    let mut qualifiers: BTreeMap<String, BTreeMap<usize, Vec<String>>> = BTreeMap::new();
 
     for run in &doc.runs {
         // Per mode: an absolute bar from the framework rows if any exist,
@@ -1720,9 +2359,10 @@ fn render_parallel_vs_sequenced(
                     .iter()
                     .filter(|r| {
                         r.mode == *mode
-                            && CONSUME_FLOWS.contains(&r.flow.as_str())
+                            && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
                             && r.payload_bytes == HEADLINE_PAYLOAD
                             && (r.is_framework() || r.is_setup_bound())
+                            && r.window_ok()
                     })
                     .map(|r| r.consumers)
                     .collect()
@@ -1741,16 +2381,21 @@ fn render_parallel_vs_sequenced(
             .map(|(mi, (mode, flow, _))| {
                 let in_mode = |r: &&ScenarioResult| {
                     r.mode == *mode
-                        && CONSUME_FLOWS.contains(&r.flow.as_str())
+                        && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
                         && r.payload_bytes == HEADLINE_PAYLOAD
                 };
+                // Either arm publishes a number, so either arm is held to
+                // the window floor: a lower bound read off a 0.18 s window is
+                // noise with a `≥` in front of it, and drawn at its value it
+                // scales the axis every real bar is read against.
                 let arm = |lower_bound: bool| -> Option<(Bar, &ScenarioResult)> {
                     let is_arm = |r: &&ScenarioResult| {
-                        if lower_bound {
-                            r.is_setup_bound()
-                        } else {
-                            r.is_framework()
-                        }
+                        r.window_ok()
+                            && if lower_bound {
+                                r.is_setup_bound()
+                            } else {
+                                r.is_framework()
+                            }
                     };
                     let at = match common_count {
                         Some(c) if mode_counts[mi].contains(&c) => c,
@@ -1782,13 +2427,48 @@ fn render_parallel_vs_sequenced(
                 let won = arm(false).or_else(|| arm(true));
                 if let Some((bar, row)) = won {
                     if row.consumers != BASE_CONSUMERS {
-                        workers
-                            .entry((mi, row.consumers))
+                        // Only claim a shared count when one exists; with
+                        // disjoint counts each mode is at its own minimum
+                        // and the bars are not a like-for-like comparison.
+                        let text = match common_count {
+                            Some(_) => format!(
+                                "measured at {} workers (the least-parallel count the \
+                                 measured modes share)",
+                                row.consumers
+                            ),
+                            None => format!(
+                                "measured at {} workers (no worker count is shared by the \
+                                 measured modes, so the bars are not directly comparable)",
+                                row.consumers
+                            ),
+                        };
+                        qualifiers
+                            .entry(text)
+                            .or_default()
+                            .entry(mi)
                             .or_default()
                             .push(run.backend.clone());
                     }
-                    if bar.lower_bound && run.representative {
-                        bounded.entry(mi).or_default().push(run.backend.clone());
+                    // Disclosed whether or not the run is representative: a
+                    // shape-only fifo bar's shape still comes from a window
+                    // that can only under-state the rate.
+                    if bar.lower_bound {
+                        // A shape-only bar's height is normalised, so "at
+                        // least the bar shown" would hand the reader an
+                        // absolute bound off a height that is not one.
+                        let text = if run.representative {
+                            "lower bound (muted bar) — this window cannot separate setup \
+                             from drain, so the true rate is at least the bar shown"
+                        } else {
+                            "lower bound from a window that cannot separate setup from drain; \
+                             the bar is shape only, so its height is not the bound"
+                        };
+                        qualifiers
+                            .entry(text.to_string())
+                            .or_default()
+                            .entry(mi)
+                            .or_default()
+                            .push(run.backend.clone());
                     }
                     // A published batch bar states its knobs: since v3 they
                     // are what distinguishes a 50-message-batch row from a
@@ -1798,14 +2478,39 @@ fn render_parallel_vs_sequenced(
                         batch_knobs.insert((run.backend.clone(), size, age));
                     }
                 } else {
-                    // Explain the n/s marker: the declared capability hole
-                    // when the document names one, and a supported-but-absent
-                    // gap otherwise — never "not supported" for a mere gap.
-                    // Verbatim reason, no prefix — see notes_for.
-                    let text =
-                        unsupported_reason(run, flow).unwrap_or_else(|| gap_text().to_string());
-                    missing
-                        .entry((mi, text))
+                    // Explain the n/s marker: rows that exist but whose every
+                    // window is under the floor; else the declared capability
+                    // hole when the document names one; else a
+                    // supported-but-absent gap — never "not supported" for a
+                    // mere gap. Verbatim reason, no prefix — see notes_for.
+                    let measured_short = run
+                        .results
+                        .iter()
+                        .filter(in_mode)
+                        .any(|r| r.is_framework() || r.is_setup_bound());
+                    let measured_sleeping = run.results.iter().any(|r| in_mode(&r));
+                    // A failed cell in this mode is an absence with a
+                    // recorded cause — not a gap, and not unsupported.
+                    let failed = run.failures.iter().any(|f| {
+                        f.payload_bytes == HEADLINE_PAYLOAD
+                            && CONSUME_FLOWS.contains(&canonical_flow(&f.flow))
+                            && FLOW_MODES
+                                .iter()
+                                .any(|(fl, m)| *fl == f.flow && *m == *mode)
+                    });
+                    let text = if measured_short {
+                        short_window_text()
+                    } else if measured_sleeping {
+                        sleeping_handler_text().to_string()
+                    } else if failed {
+                        failed_text().to_string()
+                    } else {
+                        unsupported_reason(run, flow).unwrap_or_else(|| gap_text().to_string())
+                    };
+                    qualifiers
+                        .entry(text)
+                        .or_default()
+                        .entry(mi)
                         .or_default()
                         .push(run.backend.clone());
                 }
@@ -1828,27 +2533,7 @@ fn render_parallel_vs_sequenced(
         });
     }
 
-    for ((mi, text), backends) in &missing {
-        let label = MODES[*mi].2;
-        notes.push(format!("{} / {label}: {text}", backends.join(", ")));
-    }
-    for (mi, backends) in &bounded {
-        let label = MODES[*mi].2;
-        notes.push(format!(
-            "{} / {label}: lower bound (muted bar) — this window cannot \
-             separate setup from drain, so the true rate is at least the bar \
-             shown",
-            backends.join(", ")
-        ));
-    }
-    for ((mi, count), backends) in &workers {
-        let label = MODES[*mi].2;
-        notes.push(format!(
-            "{} / {label}: measured at {count} workers (the least-parallel \
-             count the measured modes share)",
-            backends.join(", ")
-        ));
-    }
+    notes.extend(mode_notes(&qualifiers));
 
     // One note when every backend's batch bar ran the same knobs (the usual
     // case), per-backend notes when they differ — never silence, because the
@@ -1881,7 +2566,7 @@ fn render_parallel_vs_sequenced(
             continue;
         }
         let known_mode = MODES.iter().any(|(mode, _, _)| r.mode == *mode);
-        if CONSUME_FLOWS.contains(&r.flow.as_str()) && !known_mode {
+        if CONSUME_FLOWS.contains(&canonical_flow(&r.flow)) && !known_mode {
             uncharted.insert(r.mode.as_str());
         }
         // A consume-mode row of a flow outside both this chart's slice and
@@ -1899,8 +2584,11 @@ fn render_parallel_vs_sequenced(
         ));
     }
 
+    notes.extend(alias_notes(doc, |r| {
+        r.payload_bytes == HEADLINE_PAYLOAD && CONSUME_FLOWS.contains(&canonical_flow(&r.flow))
+    }));
     notes.extend(failure_notes(&doc.runs, |f| {
-        f.payload_bytes == HEADLINE_PAYLOAD && CONSUME_FLOWS.contains(&f.flow.as_str())
+        f.payload_bytes == HEADLINE_PAYLOAD && CONSUME_FLOWS.contains(&canonical_flow(&f.flow))
     }));
 
     bar_chart(
@@ -1942,7 +2630,7 @@ fn render_dispatch_latency(
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let notes = vec![
+    let mut notes = vec![
         "the v4 dispatch percentiles time publish → handler entry while the whole corpus \
          is published concurrently with the drain: under a saturated backlog that is queue \
          residency (median ≈ half the drain window), which scales with corpus size and the \
@@ -1953,12 +2641,36 @@ fn render_dispatch_latency(
          load"
             .to_string(),
     ];
+    // The shared reason withholds every cell, but "withheld" and "never
+    // measured" are different facts about a backend, and a panel naming
+    // none of them cannot show which is which.
+    let (mut recorded, mut unmeasured): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    for run in &doc.runs {
+        if run.results.is_empty() {
+            unmeasured.push(run.backend.as_str());
+        } else {
+            recorded.push(run.backend.as_str());
+        }
+    }
+    if !recorded.is_empty() {
+        notes.push(format!(
+            "percentiles recorded and withheld for: {}",
+            recorded.join(", ")
+        ));
+    }
+    if !unmeasured.is_empty() {
+        notes.push(format!(
+            "no measured rows in this document (nothing to withhold): {}",
+            unmeasured.join(", ")
+        ));
+    }
     frame(
         root,
         doc,
         Family::DispatchLatency.title(),
         "v4's dispatch percentiles are not publishable as latency — see caption",
         &notes,
+        0,
     )?;
     root.draw_text(
         "no publishable dispatch-latency measurement in this document",
@@ -1995,6 +2707,10 @@ fn render_framework_overhead(
     let mut notes = Vec::new();
     let mut unmeasured: Vec<&str> = Vec::new();
     let mut setup_bound: Vec<&str> = Vec::new();
+    let mut short_window: Vec<String> = Vec::new();
+    let mut sleeping: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    let mut aliased: Vec<String> = Vec::new();
     let mut pinned_workers: Vec<String> = Vec::new();
     for flow in KNOWN_FLOWS {
         // Each flow is charted at its own least-parallel measurement, the
@@ -2006,9 +2722,13 @@ fn render_framework_overhead(
         // shove: a drain-windowed framework row, or a publish row (no handler
         // exists to contaminate it). A setup-bound row would *over-state* the
         // cost — ns/msg is the reciprocal of an under-stated rate — so those
-        // flows are named in the caption instead of charted too high.
+        // flows are named in the caption instead of charted too high. A
+        // publish row is additionally held to the window floor the harness
+        // applies to framework rows: the in-process publisher clears 5,000
+        // messages in milliseconds, and the reciprocal of that is not a cost.
+        let is_publish = |r: &&ScenarioResult| r.handler_cost == COST_NO_HANDLER;
         let publishable =
-            |r: &&ScenarioResult| r.is_framework() || r.handler_cost == COST_NO_HANDLER;
+            |r: &&ScenarioResult| r.is_framework() || (is_publish(r) && r.window_ok());
         let min_workers = run
             .results
             .iter()
@@ -2047,13 +2767,48 @@ fn render_framework_overhead(
                     shape_only: !run.representative,
                 });
             }
+            None if run.results.iter().filter(in_flow).any(|r| is_publish(&r)) => {
+                // Measured, honestly marked, and still not a rate: name the
+                // longest window the flow managed so the reader sees how far
+                // under the floor it fell.
+                let longest = run
+                    .results
+                    .iter()
+                    .filter(in_flow)
+                    .filter(is_publish)
+                    .map(|r| r.window_secs())
+                    .fold(0.0f64, f64::max);
+                short_window.push(format!("{flow} ({longest:.3} s)"));
+            }
             None if run
                 .results
                 .iter()
                 .filter(in_flow)
                 .any(|r| r.is_setup_bound()) =>
             {
-                setup_bound.push(flow);
+                // Setup-bound *and* every window under the floor is two
+                // reasons; the shorter one is the one a reader can act on.
+                let windows: Vec<f64> = run
+                    .results
+                    .iter()
+                    .filter(in_flow)
+                    .filter(|r| r.is_setup_bound())
+                    .map(|r| r.window_secs())
+                    .collect();
+                let longest = windows.iter().copied().fold(0.0f64, f64::max);
+                if windows.iter().all(|w| *w < MIN_PUBLISHABLE_WINDOW_SECS) {
+                    short_window.push(format!("{flow} ({longest:.3} s)"));
+                } else {
+                    setup_bound.push(flow);
+                }
+            }
+            None if run.results.iter().any(|r| in_flow(&r)) => sleeping.push(*flow),
+            None if run
+                .failures
+                .iter()
+                .any(|f| f.flow == *flow && f.payload_bytes == OVERHEAD_PAYLOAD) =>
+            {
+                failed.push(*flow);
             }
             None => match unsupported_reason(run, flow) {
                 Some(reason) => {
@@ -2064,13 +2819,37 @@ fn render_framework_overhead(
                     });
                     notes.push(format!("{flow}: {reason}"));
                 }
-                // Neither measured nor declared. Inventing a column would
-                // imply a capability hole that does not exist, but dropping it
-                // in silence is the omission the marker rule exists to
-                // prevent — so it is named in the caption instead.
-                None => unmeasured.push(*flow),
+                None => {
+                    // A flow that is another flow's name on one backend is
+                    // not a gap when the run measured the flow it spells.
+                    let spells = ALIASED_FLOWS
+                        .iter()
+                        .find(|(alias, _)| alias == flow)
+                        .map(|(_, target)| *target)
+                        .filter(|target| run.results.iter().any(|r| r.flow == *target));
+                    match spells {
+                        Some(target) => aliased.push(format!(
+                            "{flow}: not a separate measurement — the SQS spelling of {target} \
+                             (the same run primitive); see that column"
+                        )),
+                        // Neither measured nor declared. Inventing a column
+                        // would imply a capability hole that does not exist,
+                        // but dropping it in silence is the omission the
+                        // marker rule exists to prevent — so it is named in
+                        // the caption instead.
+                        None => unmeasured.push(*flow),
+                    }
+                }
             },
         }
+    }
+
+    if !short_window.is_empty() {
+        notes.push(format!(
+            "window under {MIN_PUBLISHABLE_WINDOW_SECS} s — too short for the throughput to be \
+             a rate, so no cost is published: {}",
+            short_window.join(", ")
+        ));
     }
 
     if !setup_bound.is_empty() {
@@ -2079,6 +2858,16 @@ fn render_framework_overhead(
              no framework number published): {}",
             setup_bound.join(", ")
         ));
+    }
+    if !sleeping.is_empty() {
+        notes.push(format!(
+            "{}: {}",
+            sleeping_handler_text(),
+            sleeping.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        notes.push(format!("{}: {}", failed_text(), failed.join(", ")));
     }
     if !unmeasured.is_empty() {
         // The one slice-scoped gap wording, with the flows appended.
@@ -2090,6 +2879,7 @@ fn render_framework_overhead(
             pinned_workers.join(", ")
         ));
     }
+    notes.extend(aliased);
     // A flow outside KNOWN_FLOWS would fall out of the column loop above and
     // vanish without a bar or a word — name it instead, the same additive
     // tolerance family 3 applies to unknown modes.
@@ -2103,6 +2893,18 @@ fn render_framework_overhead(
         notes.push(format!(
             "measured but not charted here (flow unknown to this chart): {}",
             unknown_flows.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    // A declaration for a flow this chart has no column for would otherwise
+    // vanish with the column: name it, reason verbatim.
+    for u in run
+        .unsupported
+        .iter()
+        .filter(|u| !KNOWN_FLOWS.contains(&u.flow.as_str()))
+    {
+        notes.push(format!(
+            "{}: declared unsupported (flow unknown to this chart) — {}",
+            u.flow, u.reason
         ));
     }
 

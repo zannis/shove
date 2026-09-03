@@ -50,6 +50,28 @@ fn scenario_with_cost(
     throughput: f64,
     handler_cost: &str,
 ) -> String {
+    scenario_with_window(
+        flow,
+        mode,
+        payload,
+        consumers,
+        throughput,
+        handler_cost,
+        2.0,
+    )
+}
+
+/// A v4 row with an explicit marker *and* an explicit measured window.
+#[allow(clippy::too_many_arguments)]
+fn scenario_with_window(
+    flow: &str,
+    mode: &str,
+    payload: u64,
+    consumers: u32,
+    throughput: f64,
+    handler_cost: &str,
+    duration_secs: f64,
+) -> String {
     // Since v3 every `consume_batch` row carries its batch knobs, and no
     // other flow's row may carry them.
     let batch_knobs = if flow == "consume_batch" {
@@ -57,19 +79,33 @@ fn scenario_with_cost(
     } else {
         ""
     };
+    // The marker is derived from the handler profile, so a sleeping-handler
+    // marker needs a sleeping handler's label.
+    let handler = if handler_cost == "handler_bound" || handler_cost == "handler_amortised" {
+        "slow (50-300ms)"
+    } else {
+        "zero (no-op)"
+    };
+    // Barrier-less flows never record a setup window; the harness emits
+    // `null` there.
+    let setup_secs = if flow == "consume_fifo" || flow == "dlq_drain" {
+        "null"
+    } else {
+        "0.4"
+    };
     format!(
         r#"{{
           "flow": "{flow}", "mode": "{mode}", "payload_bytes": {payload},
           "tier": "moderate", "messages": 5000, "consumers": {consumers},
-          "handler": "zero (no-op)",
+          "handler": "{handler}",
           "handler_cost": "{handler_cost}",
-          "setup_secs": 0.4,
+          "setup_secs": {setup_secs},
           {batch_knobs}
           "throughput_msg_per_sec": {throughput},
           "dispatch_p50_ms": 1.5, "dispatch_p95_ms": 4.0, "dispatch_p99_ms": 9.0,
           "e2e_p50_ms": 1.5, "e2e_p95_ms": 4.0, "e2e_p99_ms": 9.0,
           "scaling_efficiency": 1.0, "peak_rss_mb": 1.0, "cpu_pct": 100.0,
-          "duration_secs": 2.0
+          "duration_secs": {duration_secs:?}
         }}"#
     )
 }
@@ -258,6 +294,9 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
           "backend": "kafka", "representative": true,
           "results": [{},{}], "failures": [], "unsupported": []
         }}"#,
+        // No recorded setup window: the driver never separated setup from
+        // drain, which is the long-window way a barrier flow ends up
+        // setup-bound.
         scenario_with_cost(
             "consume_parallel",
             "parallel",
@@ -265,7 +304,8 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
             1,
             424_242.0,
             "setup_bound"
-        ),
+        )
+        .replace("\"setup_secs\": 0.4", "\"setup_secs\": null"),
         scenario_with_cost(
             "consume_parallel",
             "parallel",
@@ -274,6 +314,7 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
             434_343.0,
             "setup_bound"
         )
+        .replace("\"setup_secs\": 0.4", "\"setup_secs\": null")
     );
     let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
 
@@ -285,9 +326,15 @@ fn a_setup_bound_row_never_plots_an_absolute_drain_rate() {
                 "{family:?} published the setup-bound magnitude {magnitude}"
             );
         }
+        let caption = texts(&svg)
+            .into_iter()
+            .map(|(_, _, _, t)| t)
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            svg.contains("kafka: setup-bound"),
-            "{family:?} must name the backend whose slice is setup-bound only"
+            caption.contains("kafka: measured, but no drain rate")
+                && caption.contains("coordination cost"),
+            "{family:?} must name the backend whose slice is setup-bound only: {caption}"
         );
         assert!(
             svg.contains("no drain rate is published"),
@@ -739,16 +786,44 @@ fn charts_paint_no_background_and_no_near_black_ink() {
     // show through, and no fill may be white or near-black.
     let doc = parse(&document(&inmemory_run(true)));
     for (family, svg) in render_all(&doc) {
-        for forbidden in [
-            "#FFFFFF",
-            "#ffffff",
-            "#000000",
-            "rgb(255,255,255)",
-            "rgb(0,0,0)",
-        ] {
+        // Every hex colour in the file, by relative luminance: nothing near
+        // white (vanishes on a light page) or near black (vanishes on a dark
+        // one). `rgb(...)` spellings are refused outright so a colour cannot
+        // dodge the check by notation.
+        assert!(!svg.contains("rgb("), "{family:?} uses an rgb() colour");
+        for hex in svg.split('#').skip(1).filter_map(|rest| rest.get(..6)) {
+            let Ok(v) = u32::from_str_radix(hex, 16) else {
+                continue;
+            };
+            if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let (r, g, b) = (
+                (v >> 16) as f64,
+                ((v >> 8) & 0xff) as f64,
+                (v & 0xff) as f64,
+            );
+            let luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
             assert!(
-                !svg.contains(forbidden),
-                "{family:?} uses {forbidden}, which disappears in one of the two themes"
+                (0.10..=0.85).contains(&luminance),
+                "{family:?} uses #{hex} (luminance {luminance:.2}), which disappears in one theme"
+            );
+        }
+        // No filled element may paint the canvas: a full-size rect is a
+        // background, whatever its colour.
+        for rect in svg.split("<rect ").skip(1) {
+            let attr = |name: &str| -> f64 {
+                let key = format!("{name}=\"");
+                rect.split(&key)
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0)
+            };
+            assert!(
+                attr("width") < f64::from(chartgen::WIDTH) * 0.9
+                    || attr("height") < f64::from(chartgen::HEIGHT) * 0.9,
+                "{family:?} paints a canvas-sized rectangle (a background)"
             );
         }
     }
@@ -816,7 +891,7 @@ fn no_text_runs_off_the_canvas() {
     for (family, svg) in render_all(&doc) {
         for (x, y, size, content) in texts(&svg) {
             assert!(
-                (0.0..=560.0).contains(&y),
+                (0.0..=f64::from(chartgen::HEIGHT)).contains(&y),
                 "{family:?}: text baseline y={y} is outside the canvas: {content:?}"
             );
             // A start-anchored run of text must end inside the canvas. 0.55em
@@ -825,9 +900,10 @@ fn no_text_runs_off_the_canvas() {
             let width = content.chars().count() as f64 * size * 0.55;
             if x == 24.0 {
                 assert!(
-                    x + width <= 960.0,
-                    "{family:?}: text runs to {:.0}px, past the 960px edge: {content:?}",
-                    x + width
+                    x + width <= f64::from(chartgen::WIDTH),
+                    "{family:?}: text runs to {:.0}px, past the {}px edge: {content:?}",
+                    x + width,
+                    chartgen::WIDTH
                 );
             }
         }
@@ -1410,13 +1486,14 @@ fn a_line_never_bridges_a_category_with_no_publishable_value() {
     let rows = format!(
         "{},{},{}",
         scenario("consume_parallel", "parallel", 64, 1, 50_000.0),
-        scenario_with_cost(
+        scenario_with_window(
             "consume_parallel",
             "parallel",
             1024,
             1,
             57_800.0,
-            "setup_bound"
+            "setup_bound",
+            0.57
         ),
         scenario("consume_parallel", "parallel", 65536, 1, 8_000.0)
     );
@@ -1453,7 +1530,7 @@ fn a_line_never_bridges_a_category_with_no_publishable_value() {
         }
     }
     assert!(
-        svg.contains("partial — setup-bound cells"),
+        svg.contains("kafka: partial") && svg.contains("window under 1 s") && svg.contains("1 KiB"),
         "the withheld cell must still be named in the caption"
     );
 }
@@ -1624,4 +1701,1404 @@ fn the_committed_results_document_renders_every_family() {
              --input benches/results/bench-results.json --out-dir docs/public/bench`"
         );
     }
+}
+
+// ── Rule 7: a rate needs a window long enough to be one ─────────────────────
+
+/// An in-process run whose publish rows drained in a few milliseconds — the
+/// shape of the committed dataset, where 5,000 messages through an in-process
+/// publisher took 0.008 s.
+fn inmemory_run_with_short_publish_windows() -> String {
+    let mut rows = vec![scenario("consume_parallel", "parallel", 64, 1, 100_000.0)];
+    for (flow, mode) in [("publish_single", "parallel"), ("publish_batch", "batch")] {
+        rows.push(scenario_with_window(
+            flow,
+            mode,
+            64,
+            1,
+            631_384.0,
+            "no_handler",
+            0.0079,
+        ));
+    }
+    format!(
+        r#"{{
+          "backend": "inmemory",
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "representative": true,
+          "results": [{}],
+          "failures": [],
+          "unsupported": []
+        }}"#,
+        rows.join(",")
+    )
+}
+
+#[test]
+fn a_publish_row_with_a_sub_second_window_never_becomes_an_overhead_bar() {
+    // 631,384 msg/s over 0.008 s is 1,584 ns/msg — a number, but not a rate:
+    // the window is shorter than the scheduler's own noise. The harness holds
+    // consume rows to a one-second floor before it will call them a
+    // framework measurement; the publish rows have no such floor, so the
+    // chart has to hold them to it instead of publishing the reciprocal.
+    let doc = parse(&document(&inmemory_run_with_short_publish_windows()));
+    let svg =
+        chartgen::render_to_string(&doc, Family::FrameworkOverhead).expect("chart should render");
+
+    for magnitude in ["1584", "1.6k", "1,584"] {
+        assert!(
+            !svg.contains(magnitude),
+            "the overhead chart published {magnitude} ns/msg from a 0.008 s window"
+        );
+    }
+    assert!(
+        svg.contains("publish_single") && svg.contains("publish_batch"),
+        "the withheld flows must still be named"
+    );
+    assert!(
+        svg.contains("window under 1 s"),
+        "the caption must say the window was too short to publish a rate"
+    );
+    // The withheld flows are not columns: a column with no bar and no n/s
+    // marker would read as a zero.
+    let columns = texts(&svg)
+        .into_iter()
+        .filter(|(_, _, _, t)| t == "publish_single" || t == "publish_batch")
+        .count();
+    assert_eq!(columns, 0, "a withheld flow must not open an axis column");
+}
+
+#[test]
+fn a_short_window_lower_bound_is_not_drawn() {
+    // A setup-bound fifo row from a 0.18 s window: the bound is technically
+    // true, but a value read off a window that short is noise, and drawn at
+    // 219k msg/s it scaled the whole axis so every real bar became a sliver.
+    let mut run = inmemory_run(true);
+    run = run.replace(
+        &scenario("consume_fifo", "fifo", 64, 1, 4_000.0),
+        &scenario_with_window(
+            "consume_fifo",
+            "fifo",
+            64,
+            1,
+            219_087.0,
+            "setup_bound",
+            0.18,
+        ),
+    );
+    let doc = parse(&document(&run));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+
+    for magnitude in ["219087", "219k", "200k", "250k"] {
+        assert!(
+            !svg.contains(magnitude),
+            "the ordering chart drew or scaled to a lower bound from a 0.18 s window ({magnitude})"
+        );
+    }
+    assert!(
+        svg.contains("n/s"),
+        "the withheld fifo bar must leave an explicit marker, not a blank slot"
+    );
+    assert!(
+        svg.contains("sequenced (fifo)") && svg.contains("window under 1 s"),
+        "the caption must say why the fifo bar is withheld"
+    );
+    assert!(
+        !svg.contains("lower bound (muted bar)"),
+        "no lower-bound bar exists, so the lower-bound caption must not appear"
+    );
+}
+
+#[test]
+fn a_framework_row_with_a_sub_second_window_is_refused() {
+    // The harness never stamps `framework` on a window under its own floor,
+    // so a row like this is a hand-edit or a producer regression — and it is
+    // exactly the number the marker system exists to keep off an absolute
+    // axis.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario_with_window(
+            "consume_parallel",
+            "parallel",
+            64,
+            1,
+            57_853.0,
+            "framework",
+            0.57
+        )
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow {
+            backend,
+            flow,
+            what,
+        }) => {
+            assert_eq!(backend, "kafka");
+            assert_eq!(flow, "consume_parallel");
+            assert!(what.contains("window"), "wrong reason: {what}");
+        }
+        other => panic!("expected a MalformedRow refusal, got {other:?}"),
+    }
+    for family in Family::ALL {
+        assert!(
+            chartgen::render_to_string(&doc, family).is_err(),
+            "{family:?} rendered a document with a sub-second framework row"
+        );
+    }
+}
+
+#[test]
+fn a_row_without_a_measured_window_is_refused() {
+    // Every publishability decision now also asks how long the window was; a
+    // row that cannot answer cannot be charted, and skipping it would be the
+    // silent omission rule 3 forbids.
+    for duration in ["0.0", "-1.0", "null"] {
+        let row = scenario("consume_parallel", "parallel", 64, 1, 50_000.0).replace(
+            "\"duration_secs\": 2.0",
+            &format!("\"duration_secs\": {duration}"),
+        );
+        let run = format!(
+            r#"{{
+              "backend": "kafka", "representative": true,
+              "results": [{row}], "failures": [], "unsupported": []
+            }}"#
+        );
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(what.contains("duration_secs"), "wrong reason: {what}")
+            }
+            other => panic!("duration_secs={duration}: expected MalformedRow, got {other:?}"),
+        }
+    }
+}
+
+// ── `supervisor` is a spelling, not a gap ───────────────────────────────────
+
+#[test]
+fn the_supervisor_column_is_captioned_as_an_alias_not_a_gap() {
+    // The harness assigns the `supervisor` name to SQS and `consume_parallel`
+    // to every other backend for the same `run` primitive, and the in-process
+    // driver never emits a supervisor row. Captioning that as a gap says a
+    // measurement was skipped when nothing was.
+    let doc = parse(&document(&inmemory_run(true)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::FrameworkOverhead).expect("chart should render");
+    assert!(
+        !svg.contains("capability hole): supervisor"),
+        "supervisor must not be captioned as an unmeasured gap"
+    );
+    assert!(
+        svg.contains("supervisor") && svg.contains("spelling of consume_parallel"),
+        "the caption must explain that supervisor is the SQS spelling of consume_parallel"
+    );
+}
+
+// ── The caption block may not squash the plot ───────────────────────────────
+
+#[test]
+fn identical_explanations_across_modes_collapse_to_one_caption_line() {
+    // An SQS run declares the same reason for `consume_parallel` and
+    // `consume_fifo`; two three-line captions saying the same thing is what
+    // pushed the committed ordering chart's plot body down to ~50px.
+    let reason = "not measured in this document: SQS runs only against LocalStack and requires \
+                  a LocalStack Pro auth token, which is unavailable in the environment that \
+                  produced these results";
+    let run = format!(
+        r#"{{
+          "backend": "sqs", "representative": false,
+          "results": [], "failures": [],
+          "unsupported": [
+            {{ "flow": "publish_single", "reason": "{reason}" }},
+            {{ "flow": "publish_batch", "reason": "{reason}" }},
+            {{ "flow": "consume_parallel", "reason": "{reason}" }},
+            {{ "flow": "consume_fifo", "reason": "{reason}" }},
+            {{ "flow": "consume_batch", "reason": "{reason}" }},
+            {{ "flow": "consumer_group", "reason": "{reason}" }},
+            {{ "flow": "supervisor", "reason": "{reason}" }},
+            {{ "flow": "broadcast", "reason": "{reason}" }},
+            {{ "flow": "dlq_drain", "reason": "{reason}" }}
+          ]
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    assert_eq!(
+        svg.matches("LocalStack Pro auth token").count(),
+        1,
+        "the shared reason must be captioned once, naming both modes"
+    );
+    assert!(
+        svg.contains("sqs / parallel, sequenced (fifo), batch:"),
+        "the merged caption must name every mode it covers"
+    );
+}
+
+#[test]
+fn the_plot_body_keeps_a_minimum_height_under_a_tall_caption() {
+    // The frame refuses a caption block that leaves the plot under a
+    // readable height, rather than rendering bars a few pixels tall. The
+    // committed ordering chart carried nineteen caption lines and a ~50px
+    // plot; that is a garbage chart, not a chart with a long caption.
+    let filler = "x".repeat(120);
+    let runs: Vec<String> = (0..4)
+        .map(|i| {
+            format!(
+                r#"{{
+                  "backend": "backend{i}", "representative": true,
+                  "results": [{}], "failures": [],
+                  "unsupported": [
+                    {{ "flow": "consume_parallel", "reason": "{filler}-a{i}" }},
+                    {{ "flow": "consume_fifo", "reason": "{filler}-b{i}" }},
+                    {{ "flow": "consume_batch", "reason": "{filler}-c{i}" }}
+                  ]
+                }}"#,
+                scenario("publish_single", "parallel", 64, 1, 10_000.0)
+            )
+        })
+        .collect();
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        runs.join(",")
+    )));
+    match chartgen::render_to_string(&doc, Family::ParallelVsSequenced) {
+        Err(ChartError::Render(msg)) => {
+            assert!(msg.contains("leaves no room"), "wrong error: {msg}")
+        }
+        Ok(svg) => {
+            // If it renders, the plot must be tall enough to read: the y-axis
+            // tick labels span the plot body.
+            let ticks: Vec<f64> = texts(&svg)
+                .into_iter()
+                .filter(|(x, _, _, t)| *x < 110.0 && (t.ends_with('k') || t == "0.0"))
+                .map(|(_, y, _, _)| y)
+                .collect();
+            let span = ticks.iter().cloned().fold(0.0, f64::max)
+                - ticks.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                span >= chartgen::MIN_PLOT_PX as f64 * 0.8,
+                "the plot body spans only {span:.0}px under a tall caption"
+            );
+        }
+        other => panic!("expected a chart or a Render refusal, got {other:?}"),
+    }
+}
+
+// ── Review round 1: every absence in a line chart is legible ────────────────
+
+/// A declared, unmeasured backend: every flow in `unsupported[]`, no rows.
+fn declared_only_run(backend: &str, reason: &str) -> String {
+    let flows = [
+        "publish_single",
+        "publish_batch",
+        "consume_parallel",
+        "consume_fifo",
+        "consume_batch",
+        "consumer_group",
+        "supervisor",
+        "broadcast",
+        "dlq_drain",
+    ];
+    let declared: Vec<String> = flows
+        .iter()
+        .map(|f| format!(r#"{{ "flow": "{f}", "reason": "{reason}" }}"#))
+        .collect();
+    format!(
+        r#"{{
+          "backend": "{backend}", "representative": false,
+          "results": [], "failures": [],
+          "unsupported": [{}]
+        }}"#,
+        declared.join(",")
+    )
+}
+
+#[test]
+fn line_charts_mark_an_unsupported_backend_in_the_legend() {
+    // The bar families put an `n/s` marker in the backend's slot; a line
+    // chart has no slot, so the legend is where the backend must appear —
+    // caption prose alone leaves the plot looking like a four-backend sweep.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        declared_only_run("sqs", "not measured in this document")
+    )));
+    for family in [Family::ThroughputVsConsumers, Family::ThroughputVsPayload] {
+        let svg = chartgen::render_to_string(&doc, family).expect("chart should render");
+        assert!(
+            texts(&svg).iter().any(|(_, _, _, t)| t == "sqs (n/s)"),
+            "{family:?}: the unsupported backend has no legend marker"
+        );
+    }
+}
+
+#[test]
+fn a_missing_category_in_a_measured_series_is_captioned_as_a_gap() {
+    // kafka measured 1 and 4 consumers; inmemory establishes 2 as a category.
+    // The kafka line correctly does not bridge 1→4, but without a caption the
+    // missing point reads as a smaller sweep — or as a cell that failed.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 20_000.0),
+        scenario("consume_parallel", "parallel", 64, 4, 60_000.0)
+    );
+    // A second backend establishes the 2-consumer category.
+    let full = format!(
+        r#"{{
+          "backend": "nats", "representative": true,
+          "results": [{},{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 5_000.0),
+        scenario("consume_parallel", "parallel", 64, 2, 9_000.0),
+        scenario("consume_parallel", "parallel", 64, 4, 16_000.0)
+    );
+    let doc = parse(&document(&format!(
+        "{},{},{}",
+        inmemory_run(true),
+        run,
+        full
+    )));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
+        .expect("chart should render");
+    // The caption wraps, so assert on the joined text runs.
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption.contains("kafka: partial"),
+        "a series with a missing category must be captioned partial"
+    );
+    assert!(
+        caption.contains("a gap, not a capability hole") && caption.contains("consumers 2"),
+        "the missing category must be named as a gap: {caption}"
+    );
+}
+
+#[test]
+fn a_short_window_setup_bound_cell_is_captioned_as_too_short_in_the_line_charts() {
+    // On a barrier-holding flow, `setup_bound` with a recorded setup window
+    // means exactly one thing: the drain was under the floor. Captioning it
+    // as "window includes coordination cost" names the wrong cause.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 68_000.0),
+        scenario_with_window(
+            "consume_parallel",
+            "parallel",
+            1024,
+            1,
+            57_853.0,
+            "setup_bound",
+            0.57
+        ),
+        scenario_with_window(
+            "consume_parallel",
+            "parallel",
+            65536,
+            1,
+            2_521.0,
+            "setup_bound",
+            1.98
+        )
+        .replace("\"setup_secs\": 0.4", "\"setup_secs\": null")
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ThroughputVsPayload).expect("chart should render");
+    assert!(
+        svg.contains("kafka: partial"),
+        "the kafka series must be partial"
+    );
+    assert!(
+        svg.contains("window under 1 s") && svg.contains("1 KiB"),
+        "the sub-second cell must be captioned as too short, by category: {svg}"
+    );
+    assert!(
+        svg.contains("coordination cost") && svg.contains("64 KiB"),
+        "the long-window setup-bound cell keeps the coordination-cost caption"
+    );
+    assert!(!svg.contains("57853") && !svg.contains("57.9k"));
+}
+
+#[test]
+fn the_latency_panel_accounts_for_every_backend() {
+    // The refusal panel withholds every percentile for one shared reason,
+    // but a chart that names no backend cannot show that sqs was never
+    // measured while the other five were.
+    let doc = parse(&document(&format!(
+        "{},{}",
+        inmemory_run(true),
+        declared_only_run("sqs", "not measured in this document")
+    )));
+    let svg =
+        chartgen::render_to_string(&doc, Family::DispatchLatency).expect("panel should render");
+    assert!(
+        svg.contains("inmemory") && svg.contains("withheld"),
+        "the panel must name the backends whose percentiles are withheld"
+    );
+    assert!(
+        svg.contains("sqs") && svg.contains("no measured rows"),
+        "the panel must distinguish a backend with no rows at all"
+    );
+}
+
+#[test]
+fn empty_provenance_fields_are_refused() {
+    // The provenance block is the artifact's reason to exist; a v4 document
+    // that omits the toolchain or the host cannot render a complete one.
+    let base = document(&inmemory_run(true));
+    for (needle, replacement, what) in [
+        (
+            r#""rust_version": "rustc 1.91.1""#,
+            r#""rust_version": """#,
+            "rust_version",
+        ),
+        (r#""cpu": "aarch64""#, r#""cpu": " ""#, "hardware.cpu"),
+        (
+            r#""os": "Debian GNU/Linux 13""#,
+            r#""os": """#,
+            "hardware.os",
+        ),
+    ] {
+        assert!(base.contains(needle), "fixture drifted: {needle}");
+        let doc = parse(&base.replace(needle, replacement));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MissingProvenance { what: got }) => assert_eq!(got, what),
+            other => panic!("{what}: expected MissingProvenance, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_failure_without_an_error_is_refused() {
+    // failures[] is the loud account of what happened; an entry with no
+    // diagnostic is a coordinate, not an account — and it must not exempt an
+    // empty run from the silent-run rule.
+    let run = r#"{
+          "backend": "kafka", "representative": true,
+          "results": [],
+          "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+                         "handler": "zero (no-op)", "error": " " }],
+          "unsupported": []
+        }"#;
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("error"), "wrong reason: {what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+// ── Review round 2 ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_marker_that_contradicts_its_flow_is_refused() {
+    // `no_handler` says "no consumer was constructed" — only a publish flow
+    // can say that. A consume row wearing it would be published as an
+    // absolute cost without the window rule ever seeing it.
+    for (flow, mode, cost) in [
+        ("consume_parallel", "parallel", "no_handler"),
+        ("publish_single", "parallel", "framework"),
+        ("publish_batch", "batch", "setup_bound"),
+        ("publish_single", "parallel", "handler_bound"),
+    ] {
+        let run = format!(
+            r#"{{
+              "backend": "kafka", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            scenario_with_cost(flow, mode, 64, 1, 50_000.0, cost)
+        );
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(what.contains(cost), "{flow}/{cost}: wrong reason: {what}")
+            }
+            other => panic!("{flow}/{cost}: expected MalformedRow, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_category_no_backend_can_publish_still_reaches_the_axis_and_caption() {
+    // Every backend's 64 KiB cell is setup-bound. The category must still be
+    // on the axis and every backend's caption must name it; dropping the
+    // column reads as a two-payload sweep.
+    let rows = format!(
+        "{},{},{}",
+        scenario("consume_parallel", "parallel", 64, 1, 60_000.0),
+        scenario("consume_parallel", "parallel", 1024, 1, 40_000.0),
+        scenario_with_window(
+            "consume_parallel",
+            "parallel",
+            65536,
+            1,
+            3_000.0,
+            "setup_bound",
+            0.5
+        )
+    );
+    let a = format!(
+        r#"{{ "backend": "kafka", "representative": true, "results": [{rows}], "failures": [], "unsupported": [] }}"#
+    );
+    let b = format!(
+        r#"{{ "backend": "nats", "representative": true, "results": [{rows}], "failures": [], "unsupported": [] }}"#
+    );
+    let doc = parse(&document(&format!("{a},{b}")));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ThroughputVsPayload).expect("chart should render");
+    let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
+    assert!(
+        labels.iter().any(|t| t == "64 KiB"),
+        "the unpublishable category left the axis"
+    );
+    let caption = labels.join(" ");
+    assert!(
+        caption.contains("kafka: partial") && caption.contains("nats: partial"),
+        "every backend must account for the withheld category: {caption}"
+    );
+}
+
+#[test]
+fn a_partial_shape_only_series_keeps_its_withheld_accounting() {
+    // A non-representative series that measured two of three categories:
+    // the shape-only caveat must not swallow the reason the third is absent.
+    let run = format!(
+        r#"{{
+          "backend": "sqs", "representative": false,
+          "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+          "results": [{},{},{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 900.0),
+        scenario("consume_parallel", "parallel", 1024, 1, 800.0),
+        scenario_with_window(
+            "consume_parallel",
+            "parallel",
+            65536,
+            1,
+            700.0,
+            "setup_bound",
+            0.4
+        )
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ThroughputVsPayload).expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(caption.contains("sqs: shape only"), "{caption}");
+    assert!(
+        caption.contains("window under 1 s") && caption.contains("64 KiB"),
+        "the shape-only series lost its withheld cell: {caption}"
+    );
+}
+
+#[test]
+fn a_sleeping_handler_cell_is_captioned_as_measured_not_as_a_gap() {
+    // A handler_bound row is a real measurement that the charts refuse on
+    // purpose; "no measurement" is the wrong word for it in both bar families.
+    let mut rows = vec![scenario_with_cost(
+        "consume_parallel",
+        "parallel",
+        64,
+        1,
+        470.0,
+        "handler_bound",
+    )];
+    rows.push(scenario("publish_single", "parallel", 64, 1, 50_000.0));
+    let run = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows.join(",")
+    );
+    let doc = parse(&document(&run));
+    for family in [Family::ParallelVsSequenced, Family::FrameworkOverhead] {
+        let svg = chartgen::render_to_string(&doc, family).expect("chart should render");
+        let caption = texts(&svg)
+            .into_iter()
+            .map(|(_, _, _, t)| t)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            caption.contains("simulated sleep"),
+            "{family:?}: the sleeping-handler cell must be captioned as measured but withheld: {caption}"
+        );
+        assert!(
+            !caption.contains("a gap, not a capability hole): consume_parallel")
+                && !caption.contains("inmemory / parallel: no measurement"),
+            "{family:?}: a measured cell was captioned as a gap: {caption}"
+        );
+    }
+}
+
+#[test]
+fn an_axis_peak_that_cannot_take_headroom_is_refused() {
+    // Headroom is a multiplication; near f64::MAX it overflows to infinity
+    // and plotters maps every coordinate to NaN in a clean-looking file.
+    let huge = format!("{:e}", f64::MAX / 1.05);
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 1.0).replace(
+            "\"throughput_msg_per_sec\": 1,",
+            &format!("\"throughput_msg_per_sec\": {huge},")
+        )
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    for family in [Family::ThroughputVsConsumers, Family::ParallelVsSequenced] {
+        match chartgen::render_to_string(&doc, family) {
+            Err(ChartError::Render(msg)) => assert!(msg.contains("headroom"), "{msg}"),
+            other => panic!("{family:?}: expected a Render refusal, got {other:?}"),
+        }
+    }
+}
+
+// ── Review round 3 ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_sleeping_handler_row_stamped_as_shove_cost_is_refused() {
+    // The marker is derived from the handler profile; a heavy handler whose
+    // row claims `framework` would be published as shove's own cost.
+    for (handler, cost) in [
+        ("heavy (1-5s)", "framework"),
+        ("slow (50-300ms)", "setup_bound"),
+        ("zero (no-op)", "handler_bound"),
+        ("fast (1-5ms)", "handler_amortised"),
+    ] {
+        let row = scenario_with_cost("consume_parallel", "parallel", 64, 1, 470.0, cost)
+            .replace(
+                "\"handler\": \"zero (no-op)\"",
+                &format!("\"handler\": \"{handler}\""),
+            )
+            .replace(
+                "\"handler\": \"slow (50-300ms)\"",
+                &format!("\"handler\": \"{handler}\""),
+            );
+        let run = format!(
+            r#"{{
+              "backend": "kafka", "representative": true,
+              "results": [{row}], "failures": [], "unsupported": []
+            }}"#
+        );
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(
+                    what.contains(cost),
+                    "{handler}/{cost}: wrong reason: {what}"
+                )
+            }
+            other => panic!("{handler}/{cost}: expected MalformedRow, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_flow_with_the_wrong_mode_is_refused() {
+    // Family 3 places bars by `mode`; a `consume_batch` row saying
+    // `parallel` would publish a batch number as the parallel bar.
+    for (flow, mode, cost) in [
+        ("consume_batch", "parallel", "framework"),
+        ("consume_fifo", "parallel", "setup_bound"),
+        ("consume_parallel", "batch", "framework"),
+        ("publish_batch", "parallel", "no_handler"),
+    ] {
+        let run = format!(
+            r#"{{
+              "backend": "kafka", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            scenario_with_cost(flow, mode, 64, 1, 50_000.0, cost)
+        );
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(what.contains("mode"), "{flow}/{mode}: wrong reason: {what}")
+            }
+            other => panic!("{flow}/{mode}: expected MalformedRow, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_failed_bar_cell_is_captioned_as_failed_not_as_a_gap() {
+    // A cell in failures[] is an absence with a recorded cause; the bar
+    // families must not also call it a gap.
+    let failure = |flow: &str| {
+        format!(
+            r#"{{ "flow": "{flow}", "payload_bytes": 64, "consumers": 1, "tier": "moderate",
+                 "handler": "zero (no-op)", "error": "timeout after 60s" }}"#
+        )
+    };
+    let kafka = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [{},{}], "unsupported": []
+        }}"#,
+        scenario("publish_single", "parallel", 64, 1, 50_000.0),
+        failure("consume_parallel"),
+        failure("consume_fifo")
+    );
+    let inmemory = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "results": [{}], "failures": [{}], "unsupported": []
+        }}"#,
+        scenario("consumer_group", "parallel", 64, 1, 50_000.0),
+        failure("consume_parallel")
+    );
+    let doc = parse(&document(&format!("{inmemory},{kafka}")));
+    for family in [Family::ParallelVsSequenced, Family::FrameworkOverhead] {
+        let svg = chartgen::render_to_string(&doc, family).expect("chart should render");
+        let caption = texts(&svg)
+            .into_iter()
+            .map(|(_, _, _, t)| t)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(caption.contains("failed"), "{family:?}: {caption}");
+        assert!(
+            !caption.contains("kafka / parallel: no measurement")
+                && !caption.contains("kafka / parallel, sequenced (fifo): no measurement")
+                && !caption.contains("capability hole): consume_parallel"),
+            "{family:?}: a failed cell was captioned as a gap: {caption}"
+        );
+    }
+}
+
+#[test]
+fn a_sleeping_handler_only_line_slice_is_not_labelled_setup_bound() {
+    let row = scenario_with_cost(
+        "consume_parallel",
+        "parallel",
+        64,
+        1,
+        470.0,
+        "handler_bound",
+    )
+    .replace(
+        "\"handler\": \"zero (no-op)\"",
+        "\"handler\": \"slow (50-300ms)\"",
+    );
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{row}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
+        .expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !caption.contains("kafka: setup-bound"),
+        "a sleeping-handler slice was labelled setup-bound: {caption}"
+    );
+    assert!(caption.contains("simulated sleep"), "{caption}");
+}
+
+// ── Review round 4 ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_barrier_less_flow_cannot_carry_the_framework_marker() {
+    // `consume_fifo` and `dlq_drain` hold no readiness barrier, so the
+    // harness can never certify their window as a drain; a `framework` row
+    // for either would reach the ordering chart as an absolute bar.
+    for (flow, mode) in [("consume_fifo", "fifo"), ("dlq_drain", "parallel")] {
+        let run = format!(
+            r#"{{
+              "backend": "kafka", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            scenario_with_cost(flow, mode, 64, 1, 50_000.0, "framework")
+        );
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        match chartgen::validate(&doc) {
+            Err(ChartError::MalformedRow { what, .. }) => {
+                assert!(what.contains("barrier"), "{flow}: wrong reason: {what}")
+            }
+            other => panic!("{flow}: expected MalformedRow, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_overhead_chart_discloses_short_windows_behind_setup_bound_flows() {
+    // The committed in-process fifo row is setup-bound *and* 0.18 s long;
+    // "coordination cost" alone hides the second reason it cannot be a rate.
+    let mut run = inmemory_run(true);
+    run = run.replace(
+        &scenario("consume_fifo", "fifo", 64, 1, 4_000.0),
+        &scenario_with_window(
+            "consume_fifo",
+            "fifo",
+            64,
+            1,
+            219_087.0,
+            "setup_bound",
+            0.18,
+        ),
+    );
+    let doc = parse(&document(&run));
+    let svg =
+        chartgen::render_to_string(&doc, Family::FrameworkOverhead).expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption.contains("consume_fifo (0.180 s)"),
+        "the short fifo window must be disclosed with its length: {caption}"
+    );
+    assert!(
+        !caption.contains("no framework number published): consume_fifo"),
+        "a sub-second fifo row must not be filed under coordination cost alone: {caption}"
+    );
+}
+
+#[test]
+fn an_sqs_supervisor_row_is_charted_as_the_parallel_consume_it_spells() {
+    // `supervisor` is the SQS name for the parallel-consume primitive; a
+    // measured SQS run must appear in the consume slices (shape-only, since
+    // LocalStack is not representative), not be captioned as a gap.
+    let run = format!(
+        r#"{{
+          "backend": "sqs", "representative": false,
+          "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+          "results": [{},{}], "failures": [],
+          "unsupported": [
+            {{ "flow": "consume_parallel", "reason": "spelled supervisor on this backend" }},
+            {{ "flow": "consume_fifo", "reason": "no fifo on sqs in this harness" }},
+            {{ "flow": "consume_batch", "reason": "no batch on sqs" }}
+          ]
+        }}"#,
+        scenario("supervisor", "parallel", 64, 1, 900.0),
+        scenario("supervisor", "parallel", 64, 2, 1_700.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    for family in [Family::ThroughputVsConsumers, Family::ParallelVsSequenced] {
+        let svg = chartgen::render_to_string(&doc, family).expect("chart should render");
+        let caption = texts(&svg)
+            .into_iter()
+            .map(|(_, _, _, t)| t)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            caption.contains("sqs") && caption.contains("shape only"),
+            "{family:?}: the sqs supervisor rows must be charted shape-only: {caption}"
+        );
+        assert!(
+            caption.contains("measured as supervisor"),
+            "{family:?}: the alias must be captioned: {caption}"
+        );
+        assert!(
+            !caption.contains("sqs / parallel: spelled supervisor")
+                && !caption.contains("sqs: spelled supervisor"),
+            "{family:?}: a measured alias was captioned as absent: {caption}"
+        );
+        // The document's own declaration for the canonical flow is the
+        // explanation of the alias; it is carried verbatim, not dropped.
+        assert!(
+            caption.contains("measured as supervisor — spelled supervisor on this backend"),
+            "{family:?}: the declared reason for the alias was dropped: {caption}"
+        );
+    }
+}
+
+#[test]
+fn a_payload_size_outside_the_harness_set_is_refused() {
+    // The formatter truncates: 1536 B would be labelled "1 KiB" beside the
+    // real 1 KiB category. The harness only ever writes 64, 1024 and 65536.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 1536, 1, 50_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("payload"), "wrong reason: {what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+    let failed = r#"{
+          "backend": "nats", "representative": true,
+          "results": [],
+          "failures": [{ "flow": "consume_parallel", "payload_bytes": 4096, "consumers": 1, "error": "x" }],
+          "unsupported": []
+        }"#;
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), failed)));
+    assert!(
+        matches!(
+            chartgen::validate(&doc),
+            Err(ChartError::MalformedRow { .. })
+        ),
+        "a failure coordinate outside the payload set must be refused too"
+    );
+}
+
+#[test]
+fn an_absurdly_long_backend_name_does_not_panic_the_layout() {
+    // Legend and caption geometry are computed from document strings; a
+    // pathological name must end in a refusal or a rendered chart, never a
+    // panic from overflowing arithmetic.
+    let name = "b".repeat(300_000);
+    let run = format!(
+        r#"{{
+          "backend": "{name}", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 50_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    for family in Family::ALL {
+        // Either outcome is acceptable; a panic is not.
+        let _ = chartgen::render_to_string(&doc, family);
+    }
+}
+
+// ── Review round 5 ──────────────────────────────────────────────────────────
+
+#[test]
+fn an_unknown_handler_label_is_refused() {
+    // The marker is derived from a closed set of handler profiles; a label
+    // the harness never writes cannot certify any marker, least of all
+    // `framework`.
+    let row = scenario("consume_parallel", "parallel", 64, 1, 50_000.0).replace(
+        "\"handler\": \"zero (no-op)\"",
+        "\"handler\": \"glacial (10s)\"",
+    );
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{row}], "failures": [], "unsupported": []
+        }}"#
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::validate(&doc) {
+        Err(ChartError::MalformedRow { what, .. }) => {
+            assert!(what.contains("glacial"), "wrong reason: {what}")
+        }
+        other => panic!("expected MalformedRow, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_shape_only_lower_bound_bar_still_says_lower_bound() {
+    // A non-representative fifo bar contributes shape from a setup-bound
+    // window; "shape only" does not tell the reader the shape's fifo bar is
+    // itself only a lower bound.
+    let run = format!(
+        r#"{{
+          "backend": "sqs", "representative": false,
+          "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+          "results": [{},{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_batch", "reason": "no batch on sqs" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 900.0),
+        scenario("consume_fifo", "fifo", 64, 1, 400.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption.contains("sqs / sequenced (fifo): lower bound")
+            || caption.contains("sqs / sequenced (fifo): lower bound (muted bar)"),
+        "the shape-only fifo bar lost its lower-bound disclosure: {caption}"
+    );
+}
+
+// ── Review round 6 ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_failure_only_line_slice_is_captioned_as_failed_not_as_a_gap() {
+    // kafka's only presence in the slice is a recorded failure; the caption
+    // must say failed, and must not also call the backend a gap.
+    let run = r#"{
+          "backend": "kafka", "representative": true,
+          "results": [],
+          "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+                         "handler": "zero (no-op)", "error": "timeout after 60s" }],
+          "unsupported": []
+        }"#;
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
+        .expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(caption.contains("kafka: failed to run"), "{caption}");
+    assert!(
+        !caption.contains("kafka: no measurement"),
+        "a failed cell was captioned as a gap: {caption}"
+    );
+    assert!(
+        texts(&svg).iter().any(|(_, _, _, t)| t == "kafka (failed)"),
+        "the legend must mark the failed backend"
+    );
+}
+
+#[test]
+fn disjoint_worker_counts_are_not_captioned_as_shared() {
+    // parallel measured only at 1 worker, fifo only at 8: there is no shared
+    // count, and the caption must say so instead of claiming one.
+    let run = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{},{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_batch", "reason": "n/a" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 60_000.0),
+        scenario("consume_fifo", "fifo", 64, 8, 20_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption
+            .contains("kafka / sequenced (fifo): measured at 8 workers (no worker count is shared"),
+        "{caption}"
+    );
+    assert!(
+        !caption.contains("kafka / sequenced (fifo): measured at 8 workers (the least-parallel count the measured modes share)"),
+        "a disjoint count was captioned as shared: {caption}"
+    );
+}
+
+// ── Review round 7 ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_handler_profile_whose_cells_all_failed_still_reaches_the_provenance() {
+    // The provenance line states which handler profiles the dataset was
+    // measured under; a profile whose every cell failed was still run.
+    let run = r#"{
+          "backend": "kafka", "representative": true,
+          "results": [],
+          "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+                         "handler": "heavy (1-5s)", "error": "timeout after 600s" }],
+          "unsupported": []
+        }"#;
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    for (family, svg) in render_all(&doc) {
+        let caption = texts(&svg)
+            .into_iter()
+            .map(|(_, _, _, t)| t)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            caption.contains("heavy (1-5s)"),
+            "{family:?}: the failed cells' handler profile is missing from the provenance: {caption}"
+        );
+    }
+}
+
+#[test]
+fn an_unsupported_entry_for_a_flow_unknown_to_the_chart_is_named() {
+    // Unknown flows are tolerated as additive, but a declared entry for one
+    // must not vanish just because no column exists for it.
+    let run = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "results": [{}],
+          "failures": [],
+          "unsupported": [{{ "flow": "consume_streaming", "reason": "no streaming primitive yet" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 50_000.0)
+    );
+    let doc = parse(&document(&run));
+    let svg =
+        chartgen::render_to_string(&doc, Family::FrameworkOverhead).expect("chart should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption.contains("consume_streaming") && caption.contains("no streaming primitive yet"),
+        "the unknown-flow declaration vanished: {caption}"
+    );
+}
+
+// ── Review round 8 ──────────────────────────────────────────────────────────
+
+#[test]
+fn contradictory_or_duplicate_declarations_are_refused() {
+    let failure = r#"{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+                       "handler": "zero (no-op)", "error": "timeout" }"#;
+    let cases = [
+        (
+            "failed and declared unsupported",
+            format!(
+                r#"{{ "backend": "kafka", "representative": true, "results": [],
+                     "failures": [{failure}],
+                     "unsupported": [{{ "flow": "consume_parallel", "reason": "not here" }}] }}"#
+            ),
+        ),
+        (
+            "duplicate unsupported declarations",
+            format!(
+                r#"{{ "backend": "kafka", "representative": true, "results": [{}],
+                     "failures": [],
+                     "unsupported": [{{ "flow": "consume_batch", "reason": "a" }},
+                                     {{ "flow": "consume_batch", "reason": "b" }}] }}"#,
+                scenario("publish_single", "parallel", 64, 1, 10.0)
+            ),
+        ),
+        (
+            "failure without a handler",
+            r#"{ "backend": "kafka", "representative": true, "results": [],
+                 "failures": [{ "flow": "consume_parallel", "payload_bytes": 64, "consumers": 1,
+                                "error": "timeout" }],
+                 "unsupported": [] }"#
+                .to_string(),
+        ),
+    ];
+    for (what, run) in cases {
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        assert!(
+            matches!(
+                chartgen::validate(&doc),
+                Err(ChartError::MalformedRow { .. })
+            ),
+            "{what}: expected MalformedRow, got {:?}",
+            chartgen::validate(&doc)
+        );
+        for family in Family::ALL {
+            assert!(
+                chartgen::render_to_string(&doc, family).is_err(),
+                "{what}: {family:?} rendered a refused document"
+            );
+        }
+    }
+}
+
+// ── Review round 9 ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_setup_bound_row_the_harness_would_have_called_framework_is_refused() {
+    // A negligible handler on a barrier flow with a recorded setup window
+    // and a window over the floor is exactly what the harness stamps
+    // `framework`; `setup_bound` on such a row is a hand-edit. Likewise a
+    // barrier-less flow never records a setup window at all.
+    let over_floor = scenario_with_window(
+        "consume_parallel",
+        "parallel",
+        64,
+        1,
+        50_000.0,
+        "setup_bound",
+        2.0,
+    );
+    let fifo_with_setup = scenario("consume_fifo", "fifo", 64, 1, 4_000.0)
+        .replace("\"setup_secs\": null", "\"setup_secs\": 0.4");
+    for (what, row) in [
+        ("setup_bound over the floor", over_floor),
+        ("fifo with setup_secs", fifo_with_setup),
+    ] {
+        let run = format!(
+            r#"{{
+              "backend": "kafka", "representative": true,
+              "results": [{row}], "failures": [], "unsupported": []
+            }}"#
+        );
+        let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+        assert!(
+            matches!(
+                chartgen::validate(&doc),
+                Err(ChartError::MalformedRow { .. })
+            ),
+            "{what}: expected MalformedRow, got {:?}",
+            chartgen::validate(&doc)
+        );
+    }
+}
+
+#[test]
+fn a_legend_entry_that_cannot_fit_the_canvas_is_refused() {
+    let name = "b".repeat(200);
+    let run = format!(
+        r#"{{
+          "backend": "{name}", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 50_000.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    match chartgen::render_to_string(&doc, Family::ThroughputVsConsumers) {
+        Err(ChartError::Render(msg)) => assert!(msg.contains("legend"), "{msg}"),
+        other => panic!("expected a Render refusal, got {other:?}"),
+    }
+}
+
+// ── Review round 10 ─────────────────────────────────────────────────────────
+
+#[test]
+fn every_published_bar_carries_a_value_label() {
+    // On a shared linear axis one fast backend makes the others a few
+    // pixels tall; the label is what keeps them readable. Lower bounds are
+    // labelled with the ≥ they are.
+    let doc = parse(&document(&inmemory_run(true)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
+    assert!(
+        labels.iter().any(|t| t == "10k"),
+        "parallel bar has no value label: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|t| t == "≥4.0k"),
+        "the lower-bound bar must be labelled with ≥: {labels:?}"
+    );
+    let svg =
+        chartgen::render_to_string(&doc, Family::FrameworkOverhead).expect("chart should render");
+    let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
+    // 1e9 / 10_000 msg/s = 100,000 ns
+    assert!(
+        labels.iter().any(|t| t == "100k"),
+        "overhead bar has no value label: {labels:?}"
+    );
+}
+
+#[test]
+fn a_shape_only_bar_carries_no_value_and_no_absolute_bound() {
+    let run = format!(
+        r#"{{
+          "backend": "sqs", "representative": false,
+          "broker": {{ "name": "LocalStack", "version": "x", "deployment": "localstack" }},
+          "results": [{},{}], "failures": [],
+          "unsupported": [{{ "flow": "consume_batch", "reason": "no batch on sqs" }}]
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 777.0),
+        scenario("consume_fifo", "fifo", 64, 1, 333.0)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), run)));
+    let svg =
+        chartgen::render_to_string(&doc, Family::ParallelVsSequenced).expect("chart should render");
+    let labels: Vec<String> = texts(&svg).into_iter().map(|(_, _, _, t)| t).collect();
+    assert!(
+        !labels.iter().any(|t| t == "777" || t == "≥333"),
+        "a shape-only bar was labelled with its magnitude: {labels:?}"
+    );
+    let caption = labels.join(" ");
+    assert!(
+        caption.contains("sqs / sequenced (fifo): lower bound from a window")
+            && caption.contains("its height is not the bound"),
+        "{caption}"
+    );
+    assert!(
+        !caption.contains("sqs / sequenced (fifo): lower bound (muted bar)"),
+        "a shape-only bar was captioned with an absolute bound: {caption}"
+    );
+}
+
+// ── Review round 11 ─────────────────────────────────────────────────────────
+
+#[test]
+fn a_document_that_ran_no_cell_states_so_in_the_provenance() {
+    let doc = parse(&document(&declared_only_run(
+        "sqs",
+        "not measured in this document",
+    )));
+    // Only the latency panel renders without an in-process run or any data.
+    let svg =
+        chartgen::render_to_string(&doc, Family::DispatchLatency).expect("panel should render");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption.contains("handler: none — no cells were run"),
+        "an empty document must state its missing handler profile: {caption}"
+    );
+}
+
+// ── Review round 13 ─────────────────────────────────────────────────────────
+
+#[test]
+fn a_slice_with_no_publishable_point_renders_its_account_instead_of_refusing() {
+    // A faster host can leave every 64 B cell under the window floor. That
+    // is a chart full of explanations, not a reason to refuse every family.
+    let rows: Vec<String> = [1u32, 2, 4]
+        .iter()
+        .map(|c| {
+            scenario_with_window(
+                "consume_parallel",
+                "parallel",
+                64,
+                *c,
+                500_000.0,
+                "setup_bound",
+                0.3,
+            )
+        })
+        .collect();
+    let run = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "broker": {{ "name": "in-process", "version": "n/a", "deployment": "in-process" }},
+          "results": [{},{}], "failures": [], "unsupported": []
+        }}"#,
+        rows.join(","),
+        scenario("consume_parallel", "parallel", 1024, 1, 40_000.0)
+    );
+    let doc = parse(&document(&run));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers)
+        .expect("a wholly withheld slice must still render its account");
+    let caption = texts(&svg)
+        .into_iter()
+        .map(|(_, _, _, t)| t)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        caption.contains("inmemory: measured, but no drain rate")
+            && caption.contains("window under 1 s")
+            && caption.contains("consumers 1, 2, 4"),
+        "{caption}"
+    );
+    assert!(!svg.contains("500000") && !svg.contains("500k"));
 }
