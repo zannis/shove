@@ -931,6 +931,22 @@ impl Mode {
         self.theme().series
     }
 
+    /// The surface plus the ordered ink roles (primary, secondary, muted),
+    /// public so the suite can hold a WCAG floor for every ink against the
+    /// surface it prints on — the whitelist proves a render uses only the
+    /// constants; it cannot catch a typo'd constant itself.
+    pub fn inks(self) -> (RGBColor, [(&'static str, RGBColor); 3]) {
+        let t = self.theme();
+        (
+            t.surface,
+            [
+                ("primary", t.primary),
+                ("secondary", t.secondary),
+                ("muted", t.muted),
+            ],
+        )
+    }
+
     /// Every hex this mode is allowed to emit: the chrome roles, the series
     /// slots, and the pre-blended muted fills. The whitelist test renders a
     /// variant and refuses any color outside this set.
@@ -1364,8 +1380,20 @@ fn fmt_count(v: f64) -> String {
         format!("{:.1}k", v / 1_000.0)
     } else if v >= 10.0 {
         format!("{v:.0}")
-    } else {
+    } else if v >= 0.95 || v <= 0.0 {
         format!("{v:.1}")
+    } else {
+        // Sub-unit values: one decimal renders every decade below 0.05 as
+        // the same "0.0" label, so print just enough decimals to name the
+        // value ("0.01", "0.001"). Deep floors fall back to exponent form
+        // rather than a wall of zeros.
+        let decades = -v.log10().floor();
+        if decades > 9.0 {
+            format!("{v:e}")
+        } else {
+            // 1..=9 by the branch above, so the cast is exact.
+            format!("{:.*}", decades as usize, v)
+        }
     }
 }
 
@@ -1803,17 +1831,29 @@ fn absolute_range(
         // The log axis's floor: the decade at or below the smallest plotted
         // value, so the span is data-driven and never plotters' silent
         // `end * 1e-5` clamp (which would give every chart five decades of
-        // dead space regardless of the data). `validate` rejects zero,
-        // negative and subnormal throughput, so `floor > 0` always holds for
-        // a non-empty absolute set and `y_lo` is total; `y_lo <= floor <=
-        // peak < y_hi` makes the range strictly ordered.
+        // dead space regardless of the data). `validate` rejects zero and
+        // negative throughput but accepts any positive finite value —
+        // subnormals included — so the representability checks below are
+        // load-bearing, not decoration. `y_lo <= floor <= peak < y_hi`
+        // makes the range strictly ordered.
         let y_lo = 10f64.powf(floor.log10().floor());
         if !y_lo.is_finite() || y_lo <= 0.0 {
             return Err(ChartError::Render(format!(
                 "axis floor {floor:e} has no representable decade"
             )));
         }
-        Ok(Some((y_lo, headroom(peak, 1.12)?)))
+        let y_hi = headroom(peak, 1.12)?;
+        // The decade span must stay representable: past ~308 decades the
+        // ratio `y_hi / y_lo` overflows to +inf, the shape-only geometric
+        // mapping multiplies by it, and the i32 pixel cast saturates —
+        // a clean-looking SVG full of garbage coordinates (and plotters
+        // grinds through hundreds of decades of ticks on the way there).
+        if !(y_hi / y_lo).is_finite() {
+            return Err(ChartError::Render(format!(
+                "the axis span [{y_lo:e}, {y_hi:e}] covers more decades than can be drawn"
+            )));
+        }
+        Ok(Some((y_lo, y_hi)))
     } else {
         Ok(None)
     }
@@ -2229,9 +2269,42 @@ struct LineSpec {
     shape_only: bool,
 }
 
-/// The right-hand band reserved for line end-labels: room for the widest
-/// backend name at the label size (~60px) plus the leader stub and padding.
+/// The end-label gutter's floor: room for the widest *fixed* backend name
+/// (8 chars at the 9px/char cross-host estimate) plus the leader stub and
+/// padding. The gutter grows beyond this to fit longer names — see
+/// `end_label_gutter`.
 const END_LABEL_GUTTER: i32 = 84;
+/// The leader stub plus padding around an end label inside the gutter.
+const END_LABEL_PAD: i32 = 12;
+/// The widest gutter a name may demand before the chart refuses: past a
+/// quarter of the canvas the plot body itself stops being legible.
+const END_LABEL_GUTTER_MAX: i32 = 240;
+
+/// The gutter width for this chart's plotted names: sized to its content
+/// with the legend's own 9px/char estimate, floored at [`END_LABEL_GUTTER`]
+/// (which keeps the fixed six backends' charts stable) and refused past the
+/// cap — the same fits-or-refuses contract `legend_layout` enforces, never
+/// a silent clip at the viewBox edge.
+fn end_label_gutter<'a, I>(plotted: I) -> Result<i32, ChartError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut gutter = END_LABEL_GUTTER;
+    for name in plotted {
+        let need = i32::try_from(name.chars().count())
+            .unwrap_or(i32::MAX)
+            .saturating_mul(9)
+            .saturating_add(END_LABEL_PAD);
+        if need > END_LABEL_GUTTER_MAX {
+            return Err(ChartError::Render(format!(
+                "backend `{name}` needs a {need}px end-label gutter (cap \
+                 {END_LABEL_GUTTER_MAX}px) — it cannot be labelled legibly on this canvas"
+            )));
+        }
+        gutter = gutter.max(need);
+    }
+    Ok(gutter)
+}
 /// Minimum vertical spacing between end-labels, and (halved) the clearance
 /// that keeps a clamped label inside the plot band.
 const END_LABEL_SPACING: i32 = 14;
@@ -2296,8 +2369,12 @@ fn line_chart(
     let (_, legend_rows) = legend_layout(&legend)?;
     let (area, subtitle_extra) = frame(root, doc, mode, title, subtitle, &notes, legend_rows)?;
     // The end-label gutter: carved out of the plot body, not the canvas, so
-    // the labels land between the plot and the frame's right margin.
-    let area = area.margin(0, 0, 0, END_LABEL_GUTTER);
+    // the labels land between the plot and the frame's right margin — and
+    // sized to the names it will hold, or refused.
+    let gutter = end_label_gutter(presences.iter().filter_map(|(b, p)| {
+        matches!(p, Presence::Absolute { .. } | Presence::ShapeOnly { .. }).then_some(b.as_str())
+    }))?;
+    let area = area.margin(0, 0, 0, gutter);
 
     // Absolute magnitudes come only from representative runs. A shape-only
     // series is drawn against the same box but its values are fractions, so it
@@ -2480,42 +2557,55 @@ where
     let (plot_top, plot_bottom) = (plot.1.start, plot.1.end);
     let plot_right = plot.0.end;
     let final_cat = x_labels.len().saturating_sub(1) as f64;
-    let mut entries: Vec<(String, (i32, i32), bool)> = Vec::new();
+    // (backend, endpoint px/py, in-gutter, endpoint category index)
+    let mut entries: Vec<(String, (i32, i32), bool, i64)> = Vec::new();
     for spec in specs {
         let Some((x, y)) = spec.points.last() else {
             continue;
         };
         let (px, py) = chart.plotting_area().map_coordinate(&(*x, *y));
         let in_gutter = (*x - final_cat).abs() < f64::EPSILON;
-        entries.push((spec.backend.clone(), (px, py), in_gutter));
+        // x is a category index (exact small integer in f64); the round is
+        // for the cast, not for information.
+        entries.push((spec.backend.clone(), (px, py), in_gutter, x.round() as i64));
     }
-    // Deterministic slot allocation: sort by desired y (name-tied for equal
-    // ys), clamp into the plot band, then a forward pass pushing collisions
-    // down and a backward pass pulling the tail back above the bottom edge.
-    entries.sort_by(|a, b| (a.1.1, a.0.as_str()).cmp(&(b.1.1, b.0.as_str())));
+    // Deterministic slot allocation, per column: only labels anchored at the
+    // same category can actually collide, and letting a gutter label push a
+    // mid-chart label ~700px away off its leaderless dot mis-attributes the
+    // name to whichever other line passes through that y. Within a column:
+    // sort by desired y (name-tied for equal ys), clamp into the plot band,
+    // then a forward pass pushing collisions down and a backward pass
+    // pulling the tail back above the bottom edge.
+    entries.sort_by(|a, b| (a.3, a.1.1, a.0.as_str()).cmp(&(b.3, b.1.1, b.0.as_str())));
     let half = END_LABEL_SPACING / 2;
     let mut ys: Vec<i32> = entries
         .iter()
-        .map(|(_, (_, py), _)| (*py).clamp(plot_top + half, plot_bottom - half))
+        .map(|(_, (_, py), _, _)| (*py).clamp(plot_top + half, plot_bottom - half))
         .collect();
-    for i in 1..ys.len() {
-        if ys[i] < ys[i - 1].saturating_add(END_LABEL_SPACING) {
-            ys[i] = ys[i - 1].saturating_add(END_LABEL_SPACING);
+    let mut start = 0usize;
+    while start < entries.len() {
+        let mut end = start + 1;
+        while end < entries.len() && entries[end].3 == entries[start].3 {
+            end += 1;
         }
-    }
-    if let Some(last) = ys.last_mut() {
-        *last = (*last).min(plot_bottom - half);
-    }
-    for i in (0..ys.len().saturating_sub(1)).rev() {
-        if ys[i] > ys[i + 1].saturating_sub(END_LABEL_SPACING) {
-            ys[i] = ys[i + 1].saturating_sub(END_LABEL_SPACING);
+        for i in start + 1..end {
+            if ys[i] < ys[i - 1].saturating_add(END_LABEL_SPACING) {
+                ys[i] = ys[i - 1].saturating_add(END_LABEL_SPACING);
+            }
         }
+        ys[end - 1] = ys[end - 1].min(plot_bottom - half);
+        for i in (start..end - 1).rev() {
+            if ys[i] > ys[i + 1].saturating_sub(END_LABEL_SPACING) {
+                ys[i] = ys[i + 1].saturating_sub(END_LABEL_SPACING);
+            }
+        }
+        start = end;
     }
     let label_style = (FONT, VALUE_PX)
         .into_font()
         .color(&theme.secondary)
         .pos(Pos::new(HPos::Left, VPos::Center));
-    for ((backend, (px, py), in_gutter), label_y) in entries.iter().zip(ys) {
+    for ((backend, (px, py), in_gutter, _), label_y) in entries.iter().zip(ys) {
         if *in_gutter {
             let label_x = plot_right + 10;
             // The leader ties the label to its line across the gutter; it
@@ -3221,7 +3311,7 @@ fn render_dispatch_latency(
             recorded.push(run.backend.as_str());
         }
     }
-    frame(
+    let (_, subtitle_extra) = frame(
         root,
         doc,
         mode,
@@ -3231,11 +3321,14 @@ fn render_dispatch_latency(
         0,
     )?;
     // The panel body: the refusal sentence plus the per-backend accounting,
-    // centered as a block inside [PLOT_TOP, PLOT_TOP + MIN_PLOT_PX] — the
-    // band the frame guard proves free of both the chrome above and any
-    // permitted footer top below, so the block can never be overprinted.
-    // Every line wraps at NOTE_WRAP (≤ ~810px wide), so a centered line
-    // spans at most [75, 885] and stays inside the canvas on both edges.
+    // centered as a block inside the band the frame guard proves free of
+    // both the chrome above (PLOT_TOP shifted by any wrapped subtitle) and
+    // any permitted footer top below. The guard bounds the band, not the
+    // block — a block taller than the band is refused below, exactly as it
+    // was when these lines travelled through the footer and the caption
+    // guard counted them. Every line wraps at NOTE_WRAP (≤ ~810px wide), so
+    // a centered line spans at most [75, 885] and stays inside the canvas
+    // on both edges.
     let mut body: Vec<(String, i32)> = vec![(
         "no publishable dispatch-latency measurement in this document".to_string(),
         LABEL_PX,
@@ -3265,8 +3358,15 @@ fn render_dispatch_latency(
     let block_h = LINE
         .saturating_mul(i32::try_from(body.len()).unwrap_or(i32::MAX))
         .saturating_add(SUBTITLE_LINE);
-    let band_top = PLOT_TOP;
-    let band_bottom = PLOT_TOP + MIN_PLOT_PX;
+    let band_top = PLOT_TOP.saturating_add(subtitle_extra);
+    let band_bottom = band_top.saturating_add(MIN_PLOT_PX);
+    if block_h > band_bottom.saturating_sub(band_top) {
+        return Err(ChartError::Render(format!(
+            "the dispatch-latency accounting ({} lines) does not fit the refusal \
+             panel's band",
+            body.len()
+        )));
+    }
     let mut y = band_top + ((band_bottom - band_top).saturating_sub(block_h)).max(0) / 2;
     for (i, (line, px)) in body.iter().enumerate() {
         let style = centred(theme.secondary, *px);

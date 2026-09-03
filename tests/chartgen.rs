@@ -15,6 +15,7 @@
 mod chartgen;
 
 use chartgen::{ChartError, Document, Family, Mode};
+use plotters::style::RGBColor;
 
 /// A minimal document that satisfies every rule, used as the base for the
 /// mutations below. Written as JSON rather than built through the structs so
@@ -842,22 +843,7 @@ fn each_variant_paints_its_surface_and_only_its_palette() {
             // Exactly two canvas-sized rects: the painted surface and the
             // hairline border ring. Anything else painting the canvas is a
             // second background.
-            let mut full_size = 0;
-            for rect in svg.split("<rect ").skip(1) {
-                let attr = |name: &str| -> f64 {
-                    let key = format!("{name}=\"");
-                    rect.split(&key)
-                        .nth(1)
-                        .and_then(|r| r.split('"').next())
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0.0)
-                };
-                if attr("width") >= f64::from(chartgen::WIDTH) * 0.9
-                    && attr("height") >= f64::from(chartgen::HEIGHT) * 0.9
-                {
-                    full_size += 1;
-                }
-            }
+            let (full_size, _) = full_size_rects(&svg);
             assert_eq!(
                 full_size, 2,
                 "{family:?} ({mode:?}) should paint exactly its surface and \
@@ -928,6 +914,57 @@ fn texts(svg: &str) -> Vec<(f64, f64, f64, String)> {
         out.push((x, y, size, content));
     }
     out
+}
+
+/// Every `<circle>` in the file, as (cx, cy, r, fill).
+fn circles(svg: &str) -> Vec<(f64, f64, f64, String)> {
+    let mut out = Vec::new();
+    for chunk in svg.split("<circle ").skip(1) {
+        let attr = |name: &str| -> Option<String> {
+            let key = format!("{name}=\"");
+            let start = chunk.find(&key)? + key.len();
+            let rest = chunk.get(start..)?;
+            let stop = rest.find('"')?;
+            rest.get(..stop).map(str::to_string)
+        };
+        let coord = |v: Option<String>| -> f64 {
+            v.and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("circle with an unparseable coordinate"))
+        };
+        out.push((
+            coord(attr("cx")),
+            coord(attr("cy")),
+            coord(attr("r")),
+            attr("fill").unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// The number of canvas-sized rects in the file. Both background probes
+/// share this one definition of "canvas-sized" (the painted surface and the
+/// border ring), so a regression cannot pass one test and fail the other by
+/// a diverged threshold.
+fn full_size_rects(svg: &str) -> (usize, usize) {
+    let mut full = 0;
+    let mut total = 0;
+    for rect in svg.split("<rect ").skip(1) {
+        let attr = |name: &str| -> f64 {
+            let key = format!("{name}=\"");
+            rect.split(&key)
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0)
+        };
+        total += 1;
+        if attr("width") >= f64::from(chartgen::WIDTH) * 0.9
+            && attr("height") >= f64::from(chartgen::HEIGHT) * 0.9
+        {
+            full += 1;
+        }
+    }
+    (full, total)
 }
 
 #[test]
@@ -1340,21 +1377,11 @@ fn the_latency_family_publishes_a_refusal_panel_not_bars() {
     // The only rects a refusal panel may carry are the painted surface and
     // the border ring — both canvas-sized. Any other rect is a bar drawn
     // from the unpublishable field.
-    for rect in svg.split("<rect ").skip(1) {
-        let attr = |name: &str| -> f64 {
-            let key = format!("{name}=\"");
-            rect.split(&key)
-                .nth(1)
-                .and_then(|r| r.split('"').next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0)
-        };
-        assert!(
-            attr("width") >= f64::from(chartgen::WIDTH) * 0.9
-                && attr("height") >= f64::from(chartgen::HEIGHT) * 0.9,
-            "no bars may be drawn from the unpublishable field"
-        );
-    }
+    let (full_size, total) = full_size_rects(&svg);
+    assert_eq!(
+        full_size, total,
+        "no bars may be drawn from the unpublishable field"
+    );
 }
 
 #[test]
@@ -3334,4 +3361,304 @@ fn an_absolute_line_axis_is_log_scaled_with_decade_ticks() {
         ticks.iter().any(|t| t == "10k" || t == "10.0k"),
         "expected a decade tick on the log axis, got {ticks:?}"
     );
+}
+
+// ── Redesign diff-review round-1 guards ─────────────────────────────────────
+
+#[test]
+fn a_long_backend_name_widens_the_end_label_gutter() {
+    // The overflow palette slots admit unknown backends with names far wider
+    // than the fixed six. The gutter must grow to fit what it labels — a
+    // clipped end label mis-names the series it exists to identify.
+    let rows: Vec<String> = [1u32, 2, 4]
+        .iter()
+        .map(|c| {
+            scenario(
+                "consume_parallel",
+                "parallel",
+                64,
+                *c,
+                9_000.0 * f64::from(*c),
+            )
+        })
+        .collect();
+    let run = format!(
+        r#"{{
+          "backend": "charlie-backend-name", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows.join(",")
+    );
+    let doc = parse(&document(&run));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("a 20-char backend name must render");
+    let names: Vec<(f64, f64, f64, String)> = texts(&svg)
+        .into_iter()
+        .filter(|(_, _, _, c)| c == "charlie-backend-name")
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "expected the legend entry plus the end label"
+    );
+    for (x, _, size, content) in names {
+        // The same wide-fallback-font extent model the canvas-overflow test
+        // uses: 0.55em per character.
+        let right = x + content.chars().count() as f64 * size * 0.55;
+        assert!(
+            right <= f64::from(chartgen::WIDTH),
+            "the label runs off the canvas (x={x}, est. right edge {right:.0})"
+        );
+    }
+}
+
+#[test]
+fn an_end_label_wider_than_the_gutter_cap_is_refused() {
+    // Same contract as the legend: document-supplied text either fits or the
+    // chart refuses loudly. A name too wide for the capped gutter must never
+    // be silently clipped by the viewBox.
+    let name = "a-backend-name-so-long-it-cannot-be-labelled";
+    let rows: Vec<String> = [1u32, 2, 4]
+        .iter()
+        .map(|c| {
+            scenario(
+                "consume_parallel",
+                "parallel",
+                64,
+                *c,
+                9_000.0 * f64::from(*c),
+            )
+        })
+        .collect();
+    let run = format!(
+        r#"{{
+          "backend": "{name}", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows.join(",")
+    );
+    let doc = parse(&document(&run));
+    match chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light) {
+        Err(ChartError::Render(msg)) => assert!(
+            msg.contains("end-label"),
+            "the refusal must name the end-label gutter: {msg}"
+        ),
+        other => panic!("an unlabellable name must refuse to render: {other:?}"),
+    }
+}
+
+#[test]
+fn a_refusal_panel_that_cannot_fit_its_band_is_refused() {
+    // The dispatch-latency accounting lines used to travel through frame()'s
+    // footer, where the caption-block guard counted them; drawn as a free
+    // panel block they need the same loud refusal when they outgrow the band
+    // the frame guard proves free — never a silent overprint of the footer.
+    let runs: Vec<String> = (0..6)
+        .map(|i| {
+            format!(
+                r#"{{
+                  "backend": "{}-{i}", "representative": true,
+                  "results": [{}], "failures": [], "unsupported": []
+                }}"#,
+                "x".repeat(148),
+                scenario("consume_parallel", "parallel", 64, 1, 5_000.0)
+            )
+        })
+        .collect();
+    let doc = parse(&document(&runs.join(",")));
+    match chartgen::render_to_string(&doc, Family::DispatchLatency, Mode::Light) {
+        Err(ChartError::Render(msg)) => assert!(
+            msg.contains("panel"),
+            "the refusal must name the panel band: {msg}"
+        ),
+        other => panic!("an oversized panel block must refuse to render: {other:?}"),
+    }
+}
+
+#[test]
+fn a_log_axis_spanning_more_decades_than_f64_is_refused() {
+    // validate() accepts any finite positive throughput — including
+    // subnormals like 1e-310. An axis floored there makes y_hi/y_lo overflow
+    // to +inf, and the shape-only geometric mapping would write saturated
+    // garbage coordinates into a clean-looking SVG. Loud refusal instead.
+    let tiny = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        scenario("consume_parallel", "parallel", 64, 1, 1e-310)
+    );
+    let doc = parse(&document(&format!("{},{}", inmemory_run(true), tiny)));
+    match chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light) {
+        Err(ChartError::Render(msg)) => assert!(
+            msg.contains("decades"),
+            "the refusal must name the unrepresentable span: {msg}"
+        ),
+        other => panic!("an unrepresentable axis span must refuse to render: {other:?}"),
+    }
+}
+
+#[test]
+fn sub_unit_decade_ticks_carry_distinct_labels() {
+    // A log floor below 1 is legal (any positive throughput validates), and
+    // every sub-0.05 decade used to render as the same "0.0" tick — several
+    // distinct decades wearing one wrong label. The floor decade itself is
+    // not emitted by the tick generator, so the fixture reaches 1e-5 to put
+    // four sub-unit decades in the interior.
+    let rows = [
+        scenario("consume_parallel", "parallel", 64, 1, 0.00002),
+        scenario("consume_parallel", "parallel", 64, 2, 0.5),
+        scenario("consume_parallel", "parallel", 64, 4, 0.9),
+    ];
+    let run = format!(
+        r#"{{
+          "backend": "inmemory", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        rows.join(",")
+    );
+    let doc = parse(&document(&run));
+    let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+        .expect("sub-unit throughput must render");
+    let tick_shaped = |c: &str| {
+        !c.is_empty()
+            && c.chars()
+                .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == 'k' || ch == 'M')
+    };
+    let ticks: Vec<String> = texts(&svg)
+        .into_iter()
+        .filter(|(x, _, _, c)| *x < 110.0 && tick_shaped(c))
+        .map(|(_, _, _, c)| c)
+        .collect();
+    assert!(
+        ticks.iter().any(|t| t == "0.01"),
+        "the 0.01 decade must be labelled as itself, got {ticks:?}"
+    );
+    let mut deduped = ticks.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        ticks.len(),
+        "no two ticks may wear the same label: {ticks:?}"
+    );
+}
+
+#[test]
+fn a_mid_chart_end_label_is_not_displaced_by_a_far_away_gutter_label() {
+    // Label deconfliction is per column: a gutter label and a mid-chart
+    // label ~700px apart never actually overlap, and displacing the
+    // mid-chart one detaches it from its leaderless dot — the reader then
+    // hangs the name on whichever other line passes through that y.
+    //
+    // Byte-determinism makes the probe exact: the label-to-dot anchor offset
+    // in a control render (kafka alone near the top, nothing within spacing
+    // range) must equal the offset when another series' gutter label sits
+    // within the 14px spacing window at a far x.
+    let kafka_rows = [
+        scenario("consume_parallel", "parallel", 64, 1, 10_000.0),
+        scenario("consume_parallel", "parallel", 64, 2, 9_000.0),
+    ];
+    let kafka = format!(
+        r#"{{
+          "backend": "kafka", "representative": true,
+          "results": [{}], "failures": [], "unsupported": []
+        }}"#,
+        kafka_rows.join(",")
+    );
+    let inmemory = |final_throughput: f64| {
+        let rows = [
+            scenario("consume_parallel", "parallel", 64, 1, 100.0),
+            scenario("consume_parallel", "parallel", 64, 2, 90.0),
+            scenario("consume_parallel", "parallel", 64, 4, final_throughput),
+        ];
+        format!(
+            r#"{{
+              "backend": "inmemory", "representative": true,
+              "results": [{}], "failures": [], "unsupported": []
+            }}"#,
+            rows.join(",")
+        )
+    };
+    let offset_of = |inmemory_final: f64| -> f64 {
+        let doc = parse(&document(&format!(
+            "{},{}",
+            inmemory(inmemory_final),
+            kafka
+        )));
+        let svg = chartgen::render_to_string(&doc, Family::ThroughputVsConsumers, Mode::Light)
+            .expect("chart should render");
+        // kafka's endpoint dot: the rightmost r=4 circle in kafka's hue.
+        let (cx, cy) = circles(&svg)
+            .into_iter()
+            .filter(|(_, _, r, fill)| *r == 4.0 && fill == "#EB6834")
+            .map(|(cx, cy, _, _)| (cx, cy))
+            .fold((f64::MIN, f64::MIN), |acc, (cx, cy)| {
+                if cx > acc.0 { (cx, cy) } else { acc }
+            });
+        assert!(cx > f64::MIN, "kafka's endpoint dot not found");
+        // kafka's mid-chart end label: the "kafka" text near the dot (the
+        // legend copy sits far left).
+        let label_y = texts(&svg)
+            .into_iter()
+            .filter(|(x, _, _, c)| c == "kafka" && *x > 350.0)
+            .map(|(_, y, _, _)| y)
+            .next()
+            .expect("kafka's end label not found");
+        label_y - cy
+    };
+    // Control: inmemory's gutter label sits hundreds of px below kafka's.
+    let control = offset_of(80.0);
+    // Probe: inmemory's final point lands within the 14px spacing window of
+    // kafka's endpoint — at the far right, in the gutter column.
+    let probed = offset_of(9_100.0);
+    assert!(
+        (control - probed).abs() < f64::EPSILON,
+        "the far-away gutter label displaced kafka's mid-chart label \
+         (control offset {control}, probed offset {probed})"
+    );
+}
+
+#[test]
+fn every_ink_role_and_series_hue_clears_its_surface() {
+    // The palette whitelist proves a render only uses the mode's constants —
+    // it cannot catch a typo'd constant itself. This holds the WCAG floor
+    // for every ink against the surface it prints on, so a near-surface
+    // secondary (invisible captions) fails loudly instead of shipping.
+    fn luminance(c: &RGBColor) -> f64 {
+        let lin = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.0) + 0.7152 * lin(c.1) + 0.0722 * lin(c.2)
+    }
+    fn contrast(a: &RGBColor, b: &RGBColor) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+    for mode in Mode::ALL {
+        let (surface, roles) = mode.inks();
+        for (role, ink, floor) in [
+            ("primary", roles[0].1, 7.0),
+            ("secondary", roles[1].1, 4.5),
+            ("muted", roles[2].1, 3.0),
+        ] {
+            let ratio = contrast(&ink, &surface);
+            assert!(
+                ratio >= floor,
+                "{mode:?} {role} ink contrast {ratio:.2} is under its {floor}:1 floor"
+            );
+        }
+        for (i, hue) in mode.series().iter().enumerate() {
+            let ratio = contrast(hue, &surface);
+            assert!(
+                ratio >= 1.9,
+                "{mode:?} series slot {i} contrast {ratio:.2} is under the 1.9:1 mark floor"
+            );
+        }
+    }
 }
