@@ -416,12 +416,22 @@ pub(crate) fn record_discarded(_: &str, _: Option<&str>, _: FailReason) {}
 ///
 /// Scope, in the two directions it is easy to get wrong:
 ///
-/// - **Not everything that discards is counted.** Kafka counts the
-///   terminal-outcome path only; its pre-handler rejections (oversize,
-///   deserialize failure) route to the DLQ without passing through here.
-///   RabbitMQ and the in-memory backend fold every terminal path — pre-handler
-///   included — into one reject helper, so they are complete. Treat the counter
-///   as a lower bound on dropped messages, not a total.
+/// - **Not everything that discards is counted — yet.** The contract is that
+///   a message dropped *before* the handler (oversize, undecodable, or a
+///   batch-accumulation drop) settles a discard under exactly the same rules
+///   as a post-handler terminal outcome: the increment lands iff the message
+///   is truly gone — no DLQ declared, or the DLQ publish failed — and the
+///   retirement was broker-acknowledged. Kafka (all three group-consume
+///   paths), RabbitMQ and the in-memory backend meet that contract, so on
+///   those backends the counter is complete. NATS and Redis do not yet: their
+///   consume-path pre-handler drops still record only `messages_failed_total`
+///   (`backends::nats::consumer` oversize/deserialize sites and the batch
+///   ingest, `backends::redis::consumer` oversize/deserialize sites), so on
+///   those two the counter is still a lower bound until the follow-up wiring
+///   lands. The DLQ *drain* loops (`run_dlq`) on Kafka and RabbitMQ also
+///   retire an oversize/undecodable dead message with no discard accounting;
+///   that is a known, uncounted loss site (a drained message never re-enters
+///   a DLQ, so dropping it there is final).
 /// - **Not every terminal outcome is a discard.** SNS/SQS deliberately never
 ///   calls this: its reject path deletes nothing, it makes the message visible
 ///   again for AWS-side redrive. See `backends::sns::router::route_reject`.

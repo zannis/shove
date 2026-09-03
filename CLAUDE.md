@@ -136,6 +136,16 @@ there rather than restating the table in a third place.
   — and the two settling paths above that bypass `route_outcome`: broadcast
   (`settle_broadcast_outcome`) and batch (`settle_batch_outcome` plus each
   backend's own batch-flush arms).
+- **Pre-handler drops count toward `messages_discarded_total`**: a message
+  dropped before the handler (oversize, undecodable, batch-accumulation drop)
+  settles a discard under the same rules as a post-handler terminal outcome —
+  via `metrics::record_terminal` / `pending_discard`, confirmed only against a
+  broker-acknowledged retirement, counted iff the message is truly gone (no
+  DLQ, or the DLQ publish failed). A batch path parks its drops and settles
+  them on the flush's commit result. New consume paths (including the batch
+  ports) wire this from day one; the per-backend completeness statement in
+  `src/metrics.rs` (`record_terminal`'s doc) is authoritative and must stay
+  accurate.
 - **Conventional Commits** for commit messages. No CHANGELOG — releases are
   `release: vX.Y.Z` commits.
 - Do **not** add `Co-Authored-By` trailers to commits.

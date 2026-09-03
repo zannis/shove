@@ -715,6 +715,13 @@ impl Completion {
     /// A completion with no terminal accounting riding on it — an `Ack`, a
     /// landed republish, or a pre-handler path that routed the message
     /// somewhere it still exists.
+    ///
+    /// Production call sites go through [`signal_completion`], which builds
+    /// its own `Completion`; this constructor is now exercised only by the
+    /// `OffsetTracker`/`PartitionTracker` unit tests below, which need a
+    /// completion carrying no discard without reaching for `signal_completion`
+    /// itself.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn plain(partition: i32, offset: i64) -> Self {
         Self {
             partition,
@@ -782,6 +789,118 @@ fn signal_completion(
         return false;
     }
     true
+}
+
+/// Count and settle a message dropped before the handler on the concurrent
+/// path: the failure is recorded now, the DLQ publish is attempted, and the
+/// discard accounting rides the offset into the tracker (same transport the
+/// post-handler terminal path uses via `signal_completion`), settled by the
+/// commit that covers it. Retirement itself is unchanged — the offset is
+/// handed to the tracker on every arm, exactly as it was before this existed.
+#[allow(clippy::too_many_arguments)]
+async fn discard_pre_handler(
+    client: &KafkaClient,
+    topology: &'static QueueTopology,
+    topic: &str,
+    group: Option<&str>,
+    fail_reason: metrics::FailReason,
+    dlq_reason: &str,
+    payload: &[u8],
+    key: Option<&[u8]>,
+    headers: &HashMap<String, String>,
+    completion_tx: &mpsc::Sender<Completion>,
+    partition: i32,
+    offset: i64,
+) {
+    let has_dlq = topology.dlq().is_some();
+    let pending = metrics::record_terminal(topic, group, fail_reason, has_dlq);
+    let discard = match publish_to_dlq(client, topology, payload, key, headers, dlq_reason).await {
+        Ok(()) => match reject_settlement(has_dlq, true) {
+            RejectSettlement::InDlq => {
+                pending.survived();
+                None
+            }
+            settled => {
+                debug_assert_eq!(settled, RejectSettlement::Retired);
+                Some(TerminalDiscard::Retired(pending))
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "failed to publish to DLQ");
+            // `publish_to_dlq` is `Ok(())` when no DLQ is declared, so
+            // reaching this arm at all means one was.
+            debug_assert_eq!(reject_settlement(has_dlq, false), RejectSettlement::Lost);
+            Some(TerminalDiscard::Lost(pending))
+        }
+    };
+    signal_completion(
+        Some((completion_tx.clone(), partition, offset)),
+        topic,
+        discard,
+    );
+}
+
+/// Count and settle a FIFO message dropped before the handler. Retirement is
+/// unchanged — the offset is committed on every arm, as today — but the
+/// commit that actually drops the message (no DLQ, or the DLQ publish failed)
+/// is issued `Sync` and settles the discard on the broker's answer, exactly
+/// as the FailAll cascade and the post-handler terminal path already do. The
+/// in-DLQ case stays on `Async`, off the round-trip tax.
+#[allow(clippy::too_many_arguments)]
+async fn discard_pre_handler_fifo(
+    client: &KafkaClient,
+    topology: &'static QueueTopology,
+    consumer: &KafkaStreamConsumer,
+    msg: &BorrowedMessage<'_>,
+    queue: &str,
+    topic: &str,
+    group: Option<&str>,
+    fail_reason: metrics::FailReason,
+    dlq_reason: &str,
+    payload: &[u8],
+    key: Option<&[u8]>,
+    headers: &HashMap<String, String>,
+) {
+    let has_dlq = topology.dlq().is_some();
+    let pending = metrics::record_terminal(topic, group, fail_reason, has_dlq);
+    let discard = match publish_to_dlq(client, topology, payload, key, headers, dlq_reason).await {
+        Ok(()) => match reject_settlement(has_dlq, true) {
+            RejectSettlement::InDlq => {
+                // Settling now keeps the ordinary dead-letter path off the
+                // synchronous commit a pending record would force.
+                pending.survived();
+                consumer.commit_message(msg, CommitMode::Async).ok();
+                return;
+            }
+            settled => {
+                debug_assert_eq!(settled, RejectSettlement::Retired);
+                TerminalDiscard::Retired(pending)
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "failed to publish to DLQ");
+            // `publish_to_dlq` is `Ok(())` when no DLQ is declared, so
+            // reaching this arm at all means one was.
+            debug_assert_eq!(reject_settlement(has_dlq, false), RejectSettlement::Lost);
+            TerminalDiscard::Lost(pending)
+        }
+    };
+    // No DLQ, or the DLQ publish failed: this commit is what actually drops
+    // the message, so it decides the discard accounting. `Async` only queues
+    // the request and reports nothing, so commit synchronously and settle on
+    // the broker's answer.
+    match consumer.commit_message(msg, CommitMode::Sync) {
+        Ok(()) => discard.confirm(),
+        Err(e) => {
+            tracing::warn!(
+                queue,
+                error = %e,
+                "offset commit failed after a pre-handler drop; the message \
+                 stays committed at its previous offset and is redelivered"
+            );
+            discard.survived();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1838,8 +1957,6 @@ async fn commit_batch_end(
 /// The parts of a batch decode that don't change between messages.
 struct BatchDecodeCtx<'a> {
     queue: &'a str,
-    topic: &'a str,
-    group: Option<&'a str>,
     #[cfg(feature = "kafka-schema-registry")]
     schema_registry: Option<&'a Arc<SchemaRegistry>>,
     #[cfg(feature = "kafka-schema-registry")]
@@ -1852,8 +1969,13 @@ struct BatchDecodeCtx<'a> {
 enum BatchDecode<M> {
     Decoded(M),
     /// Undecodable: park the wire bytes for the DLQ under this reason, to be
-    /// published once the batch's offsets commit.
-    Dlq(&'static str),
+    /// published once the batch's offsets commit. `fail` travels with it so
+    /// the drop site can pair the right `FailReason` with `record_terminal`
+    /// without re-deriving it from `reason`.
+    Dlq {
+        reason: &'static str,
+        fail: metrics::FailReason,
+    },
 }
 
 /// Decodes one message on its way into a batch, routing anything undecodable to
@@ -1866,10 +1988,12 @@ enum BatchDecode<M> {
 /// silently discarded. Batching changes when offsets are committed, not what
 /// happens to a poison message.
 ///
-/// The failure metric is emitted here, at decode time; the DLQ publish itself
-/// is deferred to the commit — see [`BatchBuffer::pending_dlq`]. The caller has
-/// already extended the batch's offset span, so a dropped message is still
-/// committed past.
+/// The failure metric is *not* emitted here: the drop site now counts it via
+/// `metrics::record_terminal`, which pairs `messages_failed_total` with the
+/// pending discard in one call rather than splitting the two across this
+/// function and its caller. The DLQ publish itself is deferred to the commit
+/// — see [`BatchBuffer::dropped`]. The caller has already extended the
+/// batch's offset span, so a dropped message is still committed past.
 async fn decode_batch_message<T: Topic>(
     dec: &BatchDecodeCtx<'_>,
     payload_slice: &[u8],
@@ -1899,22 +2023,20 @@ async fn decode_batch_message<T: Topic>(
         };
         return match registry_result {
             Ok(RegistryDecode::Decoded(m)) => BatchDecode::Decoded(m),
-            Ok(RegistryDecode::Dlq(reason)) => {
-                metrics::record_failed(
-                    dec.topic,
-                    dec.group,
-                    metrics::FailReason::for_schema_reason(reason),
-                );
-                BatchDecode::Dlq(reason)
-            }
+            Ok(RegistryDecode::Dlq(reason)) => BatchDecode::Dlq {
+                reason,
+                fail: metrics::FailReason::for_schema_reason(reason),
+            },
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     queue = dec.queue,
                     "failed to deserialize batch message, sending to DLQ"
                 );
-                metrics::record_failed(dec.topic, dec.group, metrics::FailReason::Deserialize);
-                BatchDecode::Dlq("deserialization_error")
+                BatchDecode::Dlq {
+                    reason: "deserialization_error",
+                    fail: metrics::FailReason::Deserialize,
+                }
             }
         };
     }
@@ -1927,8 +2049,10 @@ async fn decode_batch_message<T: Topic>(
                 queue = dec.queue,
                 "failed to deserialize batch message, sending to DLQ"
             );
-            metrics::record_failed(dec.topic, dec.group, metrics::FailReason::Deserialize);
-            BatchDecode::Dlq("deserialization_error")
+            BatchDecode::Dlq {
+                reason: "deserialization_error",
+                fail: metrics::FailReason::Deserialize,
+            }
         }
     }
 }
@@ -1948,10 +2072,23 @@ struct RawMessage {
 }
 
 /// A message parked for the DLQ, published once the batch it belongs to
-/// commits — see [`BatchBuffer::pending_dlq`].
+/// commits — see [`DroppedMessage`].
 struct PendingDlq {
     raw: RawMessage,
     reason: String,
+}
+
+/// A message dropped before the handler (oversize / undecodable), carrying
+/// its parked DLQ payload (when the topology declares one) and the discard
+/// accounting that the flush settles against the publish + commit results.
+///
+/// `dlq` is `None` exactly when the topology has no DLQ (`retain_raw` in the
+/// receive loop is the same `topology.dlq().is_some()` that decides this):
+/// `publish_to_dlq` would log "no DLQ configured" and discard, so copying and
+/// holding every poison payload until the flush buys nothing.
+struct DroppedMessage {
+    dlq: Option<PendingDlq>,
+    pending: metrics::PendingDiscard,
 }
 
 /// The in-flight batch: the decoded messages destined for the handler, the
@@ -1962,8 +2099,8 @@ struct BatchBuffer<T: Topic> {
     /// Wire bytes, index-parallel to `messages`; empty when the topology has
     /// no DLQ. See [`RawMessage`].
     raw: Vec<RawMessage>,
-    /// Poison dropped before the handler (oversize / undecodable), held until
-    /// the batch's offsets actually commit.
+    /// Messages dropped pre-handler since the last flush, held until the
+    /// batch's offsets actually commit.
     ///
     /// Publishing at drop time re-published the same payload on every
     /// redelivery: a handler returning `Retry` seeks back over the poison,
@@ -1971,11 +2108,8 @@ struct BatchBuffer<T: Topic> {
     /// turns one bad message into dozens of identical DLQ copies and the
     /// dead-letter alert stops mapping to distinct bad messages. Parking until
     /// the commit makes it exactly one — and the publish still precedes the
-    /// commit, so the payload is never lost.
-    pending_dlq: Vec<PendingDlq>,
-    /// Messages dropped pre-handler since the last flush, counted whether or
-    /// not their bytes were parked in `pending_dlq`. See [`Self::flush_len`].
-    dropped: usize,
+    /// commit, so the payload is never lost. See [`Self::flush_len`].
+    dropped: Vec<DroppedMessage>,
     /// First offset seen per partition — where a non-`Ack` outcome seeks back
     /// to. Always has the same key set as `end`.
     start: HashMap<i32, i64>,
@@ -1990,8 +2124,7 @@ impl<T: Topic> BatchBuffer<T> {
             // to `usize::MAX` — see `PREALLOC_CAP`'s doc.
             messages: Vec::with_capacity(capacity.min(PREALLOC_CAP)),
             raw: Vec::new(),
-            pending_dlq: Vec::new(),
-            dropped: 0,
+            dropped: Vec::new(),
             start: HashMap::new(),
             end: HashMap::new(),
         }
@@ -2014,7 +2147,7 @@ impl<T: Topic> BatchBuffer<T> {
     /// poison flood holds every payload in memory for the full window, which is
     /// exactly the unboundedness `max_batch_size` exists to prevent.
     fn flush_len(&self) -> usize {
-        self.messages.len() + self.dropped
+        self.messages.len() + self.dropped.len()
     }
 
     /// Extends the offset span to cover `offset` on `partition`.
@@ -2031,24 +2164,35 @@ impl<T: Topic> BatchBuffer<T> {
     }
 
     /// Records a message dropped pre-handler, parking its bytes for the DLQ
-    /// only when there is a DLQ to publish them to.
+    /// only when there is a DLQ to publish them to, and carrying the discard
+    /// accounting `settle_dropped` will settle against the publish + commit
+    /// results.
     ///
-    /// `raw` is `None` for a topology with no DLQ: `publish_to_dlq` would log
-    /// "no DLQ configured" and discard, so copying and holding every poison
-    /// payload until the flush buys nothing. The drop is still counted, so the
-    /// span is still committed past and the size trigger still sees it.
-    fn drop_message(&mut self, raw: Option<RawMessage>, reason: String) {
-        self.dropped += 1;
-        if let Some(raw) = raw {
-            self.pending_dlq.push(PendingDlq { raw, reason });
-        }
+    /// `raw` is `None` for a topology with no DLQ — see [`DroppedMessage`].
+    fn drop_message(
+        &mut self,
+        raw: Option<RawMessage>,
+        reason: String,
+        pending: metrics::PendingDiscard,
+    ) {
+        let dlq = raw.map(|raw| PendingDlq { raw, reason });
+        self.dropped.push(DroppedMessage { dlq, pending });
     }
 
+    /// Drains every field, settling any not-yet-settled dropped message as
+    /// `survived` — the batch is being abandoned (redelivered, or the
+    /// consumer is shutting down mid-batch), so nothing was actually lost.
+    /// This makes every abandon path (the `Redeliver` arm, a rebalance via
+    /// `apply_batch_rebalance`, a seek failure) correct with zero call-site
+    /// changes; the flush arms that *do* settle their drops via
+    /// `settle_dropped` empty this vec first with `mem::take`, so this drain
+    /// finds nothing left to do.
     fn clear(&mut self) {
         self.messages.clear();
         self.raw.clear();
-        self.pending_dlq.clear();
-        self.dropped = 0;
+        for dropped in self.dropped.drain(..) {
+            dropped.pending.survived();
+        }
         self.start.clear();
         self.end.clear();
     }
@@ -2093,23 +2237,36 @@ async fn dlq_batch_message(
     true
 }
 
-/// Publishes everything parked for the DLQ during this batch, immediately
-/// before its offsets commit.
-async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) {
-    for item in pending {
-        // The publish result is logged inside and deliberately not acted on
-        // here: pre-handler drops are not part of the terminal-accounting
-        // contract on this backend (they never reach `record_terminal`), so
-        // there is no pending discard to settle either way.
-        let _reached_dlq = dlq_batch_message(
-            flush.client,
-            flush.topology,
-            flush.queue,
-            &item.raw,
-            &item.reason,
-        )
-        .await;
+/// Publishes everything parked for the DLQ during this batch and classifies
+/// each pre-handler drop; returned discards are settled by the caller on the
+/// commit's result, exactly like the `DeadLetter` arm's own rejects.
+async fn settle_dropped(
+    flush: &BatchFlushCtx<'_>,
+    dropped: Vec<DroppedMessage>,
+) -> Vec<TerminalDiscard> {
+    let mut unsettled = Vec::new();
+    for item in dropped {
+        let has_dlq = item.dlq.is_some();
+        let reached_dlq = match &item.dlq {
+            Some(dlq) => {
+                dlq_batch_message(
+                    flush.client,
+                    flush.topology,
+                    flush.queue,
+                    &dlq.raw,
+                    &dlq.reason,
+                )
+                .await
+            }
+            None => false,
+        };
+        match reject_settlement(has_dlq, reached_dlq) {
+            RejectSettlement::InDlq => item.pending.survived(),
+            RejectSettlement::Retired => unsettled.push(TerminalDiscard::Retired(item.pending)),
+            RejectSettlement::Lost => unsettled.push(TerminalDiscard::Lost(item.pending)),
+        }
     }
+    unsettled
 }
 
 /// Hands the buffered batch to the handler and applies the single returned
@@ -2132,8 +2289,10 @@ async fn publish_pending_dlq(flush: &BatchFlushCtx<'_>, pending: &[PendingDlq]) 
 ///
 /// Anything parked for the DLQ during the batch is published immediately before
 /// the commit, and dropped un-published when the batch is redelivered instead
-/// (it will be re-parked on the way back through). `redelivery_backoff`
-/// escalates across consecutive `Retry`/`Defer` flushes and is reset on `Ack`.
+/// (it will be re-parked on the way back through) — see [`settle_dropped`],
+/// which also classifies each pre-handler drop's discard accounting for the
+/// commit arm to settle. `redelivery_backoff` escalates across consecutive
+/// `Retry`/`Defer` flushes and is reset on `Ack`.
 ///
 /// The buffer is left empty on every path; the caller only has to disarm the
 /// deadline.
@@ -2179,8 +2338,14 @@ where
         if buffer.end.is_empty() {
             return Ok(());
         }
-        publish_pending_dlq(flush, &buffer.pending_dlq).await;
-        commit_batch_end(consumer, queue, &buffer.end).await?;
+        let dropped = std::mem::take(&mut buffer.dropped);
+        let unsettled = settle_dropped(flush, dropped).await;
+        let committed = commit_batch_end(consumer, queue, &buffer.end).await;
+        match committed {
+            Ok(()) => unsettled.into_iter().for_each(TerminalDiscard::confirm),
+            Err(_) => unsettled.into_iter().for_each(TerminalDiscard::survived),
+        }
+        committed?;
         tracing::debug!(queue, "committed offsets past a fully-dropped batch");
         buffer.clear();
         return Ok(());
@@ -2209,8 +2374,14 @@ where
     // Kafka's own and untouched by the move.
     match settle_batch_outcome(&outcome) {
         BatchSettlement::Commit => {
-            publish_pending_dlq(flush, &buffer.pending_dlq).await;
-            commit_batch_end(consumer, queue, &buffer.end).await?;
+            let dropped = std::mem::take(&mut buffer.dropped);
+            let unsettled = settle_dropped(flush, dropped).await;
+            let committed = commit_batch_end(consumer, queue, &buffer.end).await;
+            match committed {
+                Ok(()) => unsettled.into_iter().for_each(TerminalDiscard::confirm),
+                Err(_) => unsettled.into_iter().for_each(TerminalDiscard::survived),
+            }
+            committed?;
             *redelivery_backoff = batch_redelivery_backoff();
             tracing::debug!(queue, batch_size, "batch committed");
             buffer.clear();
@@ -2274,7 +2445,11 @@ where
                     "batch rejected but no DLQ is configured, the messages are discarded"
                 );
             }
-            publish_pending_dlq(flush, &buffer.pending_dlq).await;
+            // Pre-handler drops parked in this same batch settle on the same
+            // commit as the rejected messages above — one commit, one
+            // decision for both populations.
+            let dropped = std::mem::take(&mut buffer.dropped);
+            unsettled.extend(settle_dropped(flush, dropped).await);
             let committed = commit_batch_end(consumer, queue, &buffer.end).await;
             match committed {
                 // The offsets advanced: these messages are genuinely gone.
@@ -2904,27 +3079,21 @@ impl KafkaConsumer {
                                     queue,
                                     "rejecting oversized message to DLQ"
                                 );
-                                metrics::record_failed(
+                                discard_pre_handler(
+                                    &client,
+                                    topology,
                                     &topic,
                                     group.as_deref(),
                                     metrics::FailReason::Oversize,
-                                );
-                                if let Err(dlq_err) = publish_to_dlq(
-                                    &client,
-                                    topology,
+                                    &e.to_string(),
                                     payload_slice,
                                     key.as_deref(),
                                     &headers,
-                                    &e.to_string(),
-                                ).await {
-                                    tracing::error!(
-                                        error = %dlq_err,
-                                        "failed to publish oversized message to DLQ"
-                                    );
-                                }
-                                if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
-                                    tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
-                                }
+                                    &completion_tx,
+                                    partition,
+                                    offset,
+                                )
+                                .await;
                                 continue;
                             }
 
@@ -2956,24 +3125,21 @@ impl KafkaConsumer {
                                 match registry_result {
                                     Ok(RegistryDecode::Decoded(m)) => m,
                                     Ok(RegistryDecode::Dlq(reason)) => {
-                                        metrics::record_failed(
+                                        discard_pre_handler(
+                                            &client,
+                                            topology,
                                             &topic,
                                             group.as_deref(),
                                             metrics::FailReason::for_schema_reason(reason),
-                                        );
-                                        if let Err(dlq_err) = publish_to_dlq(
-                                            &client,
-                                            topology,
+                                            reason,
                                             payload_slice,
                                             key.as_deref(),
                                             &headers,
-                                            reason,
-                                        ).await {
-                                            tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
-                                        }
-                                        if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
-                                            tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
-                                        }
+                                            &completion_tx,
+                                            partition,
+                                            offset,
+                                        )
+                                        .await;
                                         continue;
                                     }
                                     Err(e) => {
@@ -2982,24 +3148,21 @@ impl KafkaConsumer {
                                             queue,
                                             "failed to deserialize message, sending to DLQ"
                                         );
-                                        metrics::record_failed(
+                                        discard_pre_handler(
+                                            &client,
+                                            topology,
                                             &topic,
                                             group.as_deref(),
                                             metrics::FailReason::Deserialize,
-                                        );
-                                        if let Err(dlq_err) = publish_to_dlq(
-                                            &client,
-                                            topology,
+                                            "deserialization_error",
                                             payload_slice,
                                             key.as_deref(),
                                             &headers,
-                                            "deserialization_error",
-                                        ).await {
-                                            tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
-                                        }
-                                        if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
-                                            tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
-                                        }
+                                            &completion_tx,
+                                            partition,
+                                            offset,
+                                        )
+                                        .await;
                                         continue;
                                     }
                                 }
@@ -3012,24 +3175,21 @@ impl KafkaConsumer {
                                             queue,
                                             "failed to deserialize message, sending to DLQ"
                                         );
-                                        metrics::record_failed(
+                                        discard_pre_handler(
+                                            &client,
+                                            topology,
                                             &topic,
                                             group.as_deref(),
                                             metrics::FailReason::Deserialize,
-                                        );
-                                        if let Err(dlq_err) = publish_to_dlq(
-                                            &client,
-                                            topology,
+                                            "deserialization_error",
                                             payload_slice,
                                             key.as_deref(),
                                             &headers,
-                                            "deserialization_error",
-                                        ).await {
-                                            tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
-                                        }
-                                        if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
-                                            tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
-                                        }
+                                            &completion_tx,
+                                            partition,
+                                            offset,
+                                        )
+                                        .await;
                                         continue;
                                     }
                                 }
@@ -3044,31 +3204,25 @@ impl KafkaConsumer {
                                         queue,
                                         "failed to deserialize message, sending to DLQ"
                                     );
-                                    metrics::record_failed(
+                                    discard_pre_handler(
+                                        &client,
+                                        topology,
                                         &topic,
                                         group.as_deref(),
                                         metrics::FailReason::Deserialize,
-                                    );
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &client,
-                                        topology,
-                                        payload_slice,
-                                        key.as_deref(),
-                                        &headers,
                                         // sec-K-5: do NOT append the codec error message to
                                         // the DLQ death-reason header — serde_json errors can
                                         // carry fragments of attacker-controlled payload bytes.
                                         // The full error is recorded via tracing above.
                                         "deserialization_error",
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish bad message to DLQ"
-                                        );
-                                    }
-                                    if completion_tx.try_send(Completion::plain(partition, offset)).is_err() {
-                                        tracing::error!(partition, offset, "completion channel full — logic bug in offset tracker");
-                                    }
+                                        payload_slice,
+                                        key.as_deref(),
+                                        &headers,
+                                        &completion_tx,
+                                        partition,
+                                        offset,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             };
@@ -3370,8 +3524,6 @@ impl KafkaConsumer {
 
                 let decode_ctx = BatchDecodeCtx {
                     queue,
-                    topic: topic.as_ref(),
-                    group: group.as_deref(),
                     #[cfg(feature = "kafka-schema-registry")]
                     schema_registry: schema_registry.as_ref(),
                     #[cfg(feature = "kafka-schema-registry")]
@@ -3488,7 +3640,12 @@ impl KafkaConsumer {
 
                             if let Err(e) = validate_message_size(payload_slice.len(), max_message_size) {
                                 tracing::warn!(error = %e, queue, partition, offset, dlq = retain_raw, "oversized message, dropped before the handler");
-                                metrics::record_failed(&topic, group.as_deref(), metrics::FailReason::Oversize);
+                                let pending = metrics::record_terminal(
+                                    &topic,
+                                    group.as_deref(),
+                                    metrics::FailReason::Oversize,
+                                    retain_raw,
+                                );
                                 buffer.drop_message(
                                     retain_raw.then(|| RawMessage {
                                         payload: Bytes::copy_from_slice(payload_slice),
@@ -3496,10 +3653,17 @@ impl KafkaConsumer {
                                         headers,
                                     }),
                                     e.to_string(),
+                                    pending,
                                 );
                             } else {
                                 match decode_batch_message::<T>(&decode_ctx, payload_slice).await {
-                                    BatchDecode::Dlq(reason) => {
+                                    BatchDecode::Dlq { reason, fail } => {
+                                        let pending = metrics::record_terminal(
+                                            &topic,
+                                            group.as_deref(),
+                                            fail,
+                                            retain_raw,
+                                        );
                                         buffer.drop_message(
                                             retain_raw.then(|| RawMessage {
                                                 payload: Bytes::copy_from_slice(payload_slice),
@@ -3507,6 +3671,7 @@ impl KafkaConsumer {
                                                 headers,
                                             }),
                                             reason.to_string(),
+                                            pending,
                                         );
                                     }
                                     BatchDecode::Decoded(decoded) => {
@@ -3820,26 +3985,22 @@ impl KafkaConsumer {
                                         queue,
                                         "rejecting oversized FIFO message to DLQ"
                                     );
-                                    metrics::record_failed(
+                                    poison_key(&poisoned, &seq_key, &queue);
+                                    discard_pre_handler_fifo(
+                                        &client,
+                                        topology,
+                                        &consumer,
+                                        &msg,
+                                        &queue,
                                         &topic,
                                         group.as_deref(),
                                         metrics::FailReason::Oversize,
-                                    );
-                                    poison_key(&poisoned, &seq_key, &queue);
-                                    if let Err(dlq_err) = publish_to_dlq(
-                                        &client,
-                                        topology,
+                                        &e.to_string(),
                                         payload_bytes,
                                         key.as_deref(),
                                         &headers,
-                                        &e.to_string(),
-                                    ).await {
-                                        tracing::error!(
-                                            error = %dlq_err,
-                                            "failed to publish oversized message to DLQ"
-                                        );
-                                    }
-                                    consumer.commit_message(&msg, CommitMode::Async).ok();
+                                    )
+                                    .await;
                                     continue;
                                 }
 
@@ -3870,23 +4031,22 @@ impl KafkaConsumer {
                                     match registry_result {
                                         Ok(RegistryDecode::Decoded(m)) => m,
                                         Ok(RegistryDecode::Dlq(reason)) => {
-                                            metrics::record_failed(
+                                            poison_key(&poisoned, &seq_key, &queue);
+                                            discard_pre_handler_fifo(
+                                                &client,
+                                                topology,
+                                                &consumer,
+                                                &msg,
+                                                &queue,
                                                 &topic,
                                                 group.as_deref(),
                                                 metrics::FailReason::for_schema_reason(reason),
-                                            );
-                                            poison_key(&poisoned, &seq_key, &queue);
-                                            if let Err(dlq_err) = publish_to_dlq(
-                                                &client,
-                                                topology,
+                                                reason,
                                                 payload_bytes,
                                                 key.as_deref(),
                                                 &headers,
-                                                reason,
-                                            ).await {
-                                                tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
-                                            }
-                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                            )
+                                            .await;
                                             continue;
                                         }
                                         Err(e) => {
@@ -3895,23 +4055,22 @@ impl KafkaConsumer {
                                                 queue,
                                                 "failed to deserialize FIFO message, sending to DLQ"
                                             );
-                                            metrics::record_failed(
+                                            poison_key(&poisoned, &seq_key, &queue);
+                                            discard_pre_handler_fifo(
+                                                &client,
+                                                topology,
+                                                &consumer,
+                                                &msg,
+                                                &queue,
                                                 &topic,
                                                 group.as_deref(),
                                                 metrics::FailReason::Deserialize,
-                                            );
-                                            poison_key(&poisoned, &seq_key, &queue);
-                                            if let Err(dlq_err) = publish_to_dlq(
-                                                &client,
-                                                topology,
+                                                "deserialization_error",
                                                 payload_bytes,
                                                 key.as_deref(),
                                                 &headers,
-                                                "deserialization_error",
-                                            ).await {
-                                                tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
-                                            }
-                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                            )
+                                            .await;
                                             continue;
                                         }
                                     }
@@ -3924,23 +4083,22 @@ impl KafkaConsumer {
                                                 queue,
                                                 "failed to deserialize FIFO message, sending to DLQ"
                                             );
-                                            metrics::record_failed(
+                                            poison_key(&poisoned, &seq_key, &queue);
+                                            discard_pre_handler_fifo(
+                                                &client,
+                                                topology,
+                                                &consumer,
+                                                &msg,
+                                                &queue,
                                                 &topic,
                                                 group.as_deref(),
                                                 metrics::FailReason::Deserialize,
-                                            );
-                                            poison_key(&poisoned, &seq_key, &queue);
-                                            if let Err(dlq_err) = publish_to_dlq(
-                                                &client,
-                                                topology,
+                                                "deserialization_error",
                                                 payload_bytes,
                                                 key.as_deref(),
                                                 &headers,
-                                                "deserialization_error",
-                                            ).await {
-                                                tracing::error!(error = %dlq_err, "failed to publish bad message to DLQ");
-                                            }
-                                            consumer.commit_message(&msg, CommitMode::Async).ok();
+                                            )
+                                            .await;
                                             continue;
                                         }
                                     }
@@ -3955,30 +4113,26 @@ impl KafkaConsumer {
                                             queue,
                                             "failed to deserialize FIFO message, sending to DLQ"
                                         );
-                                        metrics::record_failed(
+                                        poison_key(&poisoned, &seq_key, &queue);
+                                        discard_pre_handler_fifo(
+                                            &client,
+                                            topology,
+                                            &consumer,
+                                            &msg,
+                                            &queue,
                                             &topic,
                                             group.as_deref(),
                                             metrics::FailReason::Deserialize,
-                                        );
-                                        poison_key(&poisoned, &seq_key, &queue);
-                                        if let Err(dlq_err) = publish_to_dlq(
-                                            &client,
-                                            topology,
+                                            // sec-K-5: do NOT append the codec error message to
+                                            // the DLQ death-reason header — serde_json errors can
+                                            // carry fragments of attacker-controlled payload bytes.
+                                            // The full error is recorded via tracing above.
+                                            "deserialization_error",
                                             payload_bytes,
                                             key.as_deref(),
                                             &headers,
-                                            // sec-K-5: do NOT append the codec error message to
-                                        // the DLQ death-reason header — serde_json errors can
-                                        // carry fragments of attacker-controlled payload bytes.
-                                        // The full error is recorded via tracing above.
-                                        "deserialization_error",
-                                        ).await {
-                                            tracing::error!(
-                                                error = %dlq_err,
-                                                "failed to publish bad message to DLQ"
-                                            );
-                                        }
-                                        consumer.commit_message(&msg, CommitMode::Async).ok();
+                                        )
+                                        .await;
                                         continue;
                                     }
                                 };
@@ -5545,6 +5699,19 @@ mod batch_buffer_tests {
         build_message_metadata(&Arc::new(HashMap::new()), false)
     }
 
+    /// A fresh discard-accounting record, same shape `record_terminal` hands
+    /// the receive loop's drop sites — built via `pending_discard` directly so
+    /// these tests don't need a `metrics` feature check to also bump
+    /// `messages_failed_total`.
+    fn pending() -> metrics::PendingDiscard {
+        metrics::pending_discard(
+            "batch-buffer-test",
+            None,
+            metrics::FailReason::Oversize,
+            false,
+        )
+    }
+
     /// The regression: with only decoded messages counted, a poll window of
     /// nothing but poison never reaches `max_batch_size`, so the batch grows
     /// for the whole `max_batch_age` window holding every payload in memory.
@@ -5552,7 +5719,7 @@ mod batch_buffer_tests {
     fn dropped_messages_count_toward_the_size_trigger() {
         let mut buf = buffer();
         for _ in 0..5 {
-            buf.drop_message(Some(raw()), "deserialization_error".into());
+            buf.drop_message(Some(raw()), "deserialization_error".into(), pending());
         }
 
         assert_eq!(
@@ -5571,7 +5738,7 @@ mod batch_buffer_tests {
         let mut buf = buffer();
         buf.push(BufMessage { value: 1 }, metadata(), None);
         buf.push(BufMessage { value: 2 }, metadata(), None);
-        buf.drop_message(Some(raw()), "oversize".into());
+        buf.drop_message(Some(raw()), "oversize".into(), pending());
 
         assert_eq!(buf.flush_len(), 3);
     }
@@ -5582,16 +5749,19 @@ mod batch_buffer_tests {
     #[test]
     fn a_drop_without_a_dlq_parks_no_payload_but_still_counts() {
         let mut buf = buffer();
-        buf.drop_message(None, "deserialization_error".into());
+        buf.drop_message(None, "deserialization_error".into(), pending());
 
-        assert!(buf.pending_dlq.is_empty(), "nowhere to publish it to");
+        assert!(
+            buf.dropped.iter().all(|d| d.dlq.is_none()),
+            "nowhere to publish it to"
+        );
         assert_eq!(buf.flush_len(), 1, "the offset still has to be committed");
     }
 
     #[test]
     fn clear_resets_the_drop_count() {
         let mut buf = buffer();
-        buf.drop_message(Some(raw()), "oversize".into());
+        buf.drop_message(Some(raw()), "oversize".into(), pending());
         buf.clear();
 
         assert_eq!(buf.flush_len(), 0);
@@ -5604,7 +5774,7 @@ mod batch_buffer_tests {
     fn an_all_dropped_span_is_not_empty() {
         let mut buf = buffer();
         buf.extend_span(0, 7);
-        buf.drop_message(None, "oversize".into());
+        buf.drop_message(None, "oversize".into(), pending());
 
         assert!(!buf.is_empty());
         assert_eq!(buf.end.get(&0), Some(&8));
