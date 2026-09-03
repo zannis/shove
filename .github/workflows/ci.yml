@@ -8,6 +8,11 @@ on:
       - 'tests/**'
       - 'benches/**'
       - 'examples/**'
+      # The committed bench charts are asserted byte-for-byte against the
+      # committed results document by tests/chartgen.rs (in `check`). Without
+      # this entry a PR that only hand-edits an SVG never runs ci.yml at all,
+      # so the one check that would catch it never executes.
+      - 'docs/public/bench/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -19,6 +24,7 @@ on:
       - 'tests/**'
       - 'benches/**'
       - 'examples/**'
+      - 'docs/public/bench/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
@@ -132,6 +138,48 @@ jobs:
             cargo-audit-db-${{ runner.os }}-
       - name: RustSec audit
         run: cargo audit --deny warnings
+
+  # ── Tier A benchmark regression ──────────────────────────────────────────
+  # Runs the in-process criterion suite (no Docker, no secrets) against the
+  # committed baseline in benches/baselines/tier-a-ubuntu-latest.json.
+  #
+  # Threshold rationale: no-op back-to-back runs of this suite moved a median
+  # ~21% on the quietest benches and up to 1.8x on the scheduler-bound ones,
+  # and the leg is a max over ~58 ids — so only ids that proved < 10% spread
+  # across three no-op runs on this runner carry `gate: true` in the baseline,
+  # and a gated id fails only at > 50% slower (~5x its demonstrated spread).
+  # Everything else is measured and reported but can never fail the leg: a leg
+  # that cries wolf on runner jitter is ignored within a week, which is worse
+  # than no leg. A baseline id that was not measured at all fails closed (a
+  # renamed or deleted bench must refresh the baseline in the same PR).
+  #
+  # Deliberately NOT in require-green-ci.sh's REQUIRED_JOBS: a perf gate this
+  # side of runner jitter must not be able to block a release the way the
+  # deterministic legs can.
+  bench-tier-a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@38ae5351029910ad7674ccfad89c37cbd636f3c4 # 1.91 branch
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run the Tier A criterion suite
+        run: >
+          cargo bench --no-default-features --features inmemory
+          --bench pure_paths --bench inmemory_flows --bench consumer_overhead
+      - name: Compare against the committed baseline
+        run: >
+          cargo run --no-default-features --example bench_compare --
+          --criterion-dir target/criterion
+          --baseline benches/baselines/tier-a-ubuntu-latest.json
+      # The raw per-id estimates, for recalibrating the baseline without
+      # spelunking logs: rust-cache prunes plain files out of target/, so an
+      # artifact is the only durable copy a run leaves behind.
+      - name: Upload criterion estimates
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tier-a-criterion-estimates
+          path: target/criterion/**/new/estimates.json
 
   coverage:
     runs-on: ubuntu-latest
