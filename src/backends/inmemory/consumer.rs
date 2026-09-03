@@ -2711,4 +2711,109 @@ mod tests {
             );
         }
     }
+
+    /// Build the flush context the batch pre-check tests below drive
+    /// directly — the same shape `run_batch_impl` threads through every
+    /// flush.
+    fn flush_ctx<'a>(
+        broker: &'a InMemoryBroker,
+        topology: &'static QueueTopology,
+        queue: &'a Arc<QueueState>,
+        shutdown: &'a CancellationToken,
+    ) -> InMemoryFlushCtx<'a> {
+        InMemoryFlushCtx {
+            broker,
+            topology,
+            queue,
+            topic: topology.queue(),
+            group: None,
+            shutdown,
+            broker_shutdown: broker.shutdown_token(),
+            handler_timeout: None,
+            handler_timeout_outcome: None,
+        }
+    }
+
+    /// Both tokens already cancelled when the parked pre-handler drops are
+    /// published: `publish_parked`'s per-envelope pre-check must not hand
+    /// them back as 'unpublished' survivors, because the caller folds those
+    /// into the same requeue a `Redeliver` flush uses — onto a broker that is
+    /// already shutting down, where nothing drains the queue and its drop
+    /// destroys the message with no log and no count. Broker shutdown takes
+    /// precedence, exactly as it does inside `route_reject_or_survive`.
+    #[tokio::test]
+    async fn broker_shutdown_takes_precedence_in_the_parked_publish_pre_check() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        broker.shutdown();
+        let consumer_shutdown = CancellationToken::new();
+        consumer_shutdown.cancel();
+
+        let flush = flush_ctx(&broker, topology, &queue, &consumer_shutdown);
+        let mut parked = vec![(0u64, envelope(b"poison"), metrics::FailReason::Deserialize)];
+        let unpublished = publish_parked(&flush, &mut parked).await;
+        assert!(
+            unpublished.is_empty(),
+            "a parked drop cut after broker shutdown must be settled as \
+             lost, not handed back for a requeue onto the shut-down broker"
+        );
+    }
+
+    struct BatchRejectTopic;
+    impl Topic for BatchRejectTopic {
+        type Message = FifoMsg;
+        type Codec = crate::codec::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            dlq_topology()
+        }
+    }
+
+    struct BatchRejectHandler;
+    impl BatchMessageHandler<BatchRejectTopic> for BatchRejectHandler {
+        type Context = ();
+        async fn handle_batch(&self, _: Vec<(FifoMsg, MessageMetadata)>, _: &()) -> Outcome {
+            Outcome::Reject
+        }
+    }
+
+    /// Broker shutdown landing before a rejected batch's `DeadLetter` loop
+    /// runs: the loop's per-envelope pre-check must not collect the handled
+    /// envelopes as 'unpublished' survivors for the requeue, for the same
+    /// reason as the parked pre-check above — the requeue lands on a queue
+    /// nothing drains, and the broker's `Arc<QueueState>` drop destroys the
+    /// messages silently. They are settled as lost instead.
+    #[tokio::test]
+    async fn broker_shutdown_takes_precedence_in_the_batch_reject_pre_check() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        let queue = broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        let mut batch = InMemoryBatch::<BatchRejectTopic>::new(4);
+        let env = envelope(br#"{"id":1}"#);
+        batch.push(FifoMsg { id: 1 }, metadata_from(&env), env);
+        // The popped envelope's in-flight slot, normally taken by `pop_one`,
+        // released by the flush's own `release_in_flight`.
+        queue.in_flight.fetch_add(1, Ordering::Release);
+
+        broker.shutdown();
+        let consumer_shutdown = CancellationToken::new();
+
+        let flush = flush_ctx(&broker, topology, &queue, &consumer_shutdown);
+        let mut backoff = batch_redelivery_backoff();
+        flush_inmemory_batch(&flush, &BatchRejectHandler, &(), &mut batch, &mut backoff).await;
+
+        assert!(
+            queue.buffer.lock().await.is_empty(),
+            "a rejected batch envelope cut by broker shutdown must be \
+             settled as lost, not requeued onto the shut-down broker"
+        );
+    }
 }
