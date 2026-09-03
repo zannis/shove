@@ -801,7 +801,30 @@ async fn run_fifo_shard<T, H>(
                                 }
                                 false
                             }
-                            () = shutdown.cancelled() => true,
+                            () = shutdown.cancelled() => {
+                                // A simultaneous broker shutdown leaves this
+                                // arm and the enqueue's internal
+                                // broker-shutdown `Err` ready together, and
+                                // the unbiased `select!` may land here — so
+                                // broker shutdown must be re-checked before
+                                // the requeue, exactly like
+                                // `schedule_redelivery`'s enqueue stage.
+                                // Requeueing onto a shut-down broker would
+                                // bypass the drop-and-warn path the `res` arm
+                                // takes. Shutdown drop: intentionally not
+                                // counted — see `metrics::FailReason`.
+                                if broker_shutdown.is_cancelled() {
+                                    warn_shutdown_drop(
+                                        &shard_name,
+                                        &key,
+                                        &message_id,
+                                        "broker shutdown rejected a sequenced retry re-enqueue — message dropped",
+                                    );
+                                    finish(&shard, &busy, &options);
+                                    return;
+                                }
+                                true
+                            }
                         };
                         if republish_cut {
                             // Not a drop: the retry state is already stamped,
@@ -1617,6 +1640,15 @@ async fn route_reject_or_park(
 /// abandoned publish) comes back for the caller to requeue. The abandoned
 /// publish cannot land later: `enqueue`'s push-to-return tail is await-free,
 /// so a select branch dropped at a suspension point is always still pre-push.
+///
+/// Broker shutdown takes precedence over a per-consumer cut, on both the
+/// pre-check and the select arm: a survivor handed back with the broker
+/// already shutting down would be requeued onto a queue nothing drains,
+/// where the broker's `Arc<QueueState>` drop destroys it with no log and no
+/// count. It is settled as lost instead — `resolve_reject(false, ..)`, the
+/// same accounting the enqueue-failure path inside [`route_reject`] gets —
+/// so the outcome no longer depends on which ready arm the unbiased
+/// `select!` happens to pick when both tokens cancel in the same poll gap.
 async fn route_reject_or_survive(
     broker: &InMemoryBroker,
     topology: &'static QueueTopology,
@@ -1625,7 +1657,20 @@ async fn route_reject_or_survive(
     reason: &str,
     pending: metrics::PendingDiscard,
 ) -> Option<Envelope> {
+    let broker_shutdown = broker.shutdown_token();
+    let lost_to_broker_shutdown = |pending: metrics::PendingDiscard| {
+        tracing::warn!(
+            queue = topology.queue(),
+            reason,
+            "broker shut down during a cut DLQ publish — message lost"
+        );
+        resolve_reject(false, pending);
+    };
     if shutdown.is_cancelled() {
+        if broker_shutdown.is_cancelled() {
+            lost_to_broker_shutdown(pending);
+            return None;
+        }
         pending.survived();
         return Some(envelope);
     }
@@ -1635,6 +1680,10 @@ async fn route_reject_or_survive(
             None
         }
         () = shutdown.cancelled() => {
+            if broker_shutdown.is_cancelled() {
+                lost_to_broker_shutdown(pending);
+                return None;
+            }
             pending.survived();
             Some(envelope)
         }
@@ -2332,6 +2381,7 @@ mod tests {
 
     use super::*;
     use crate::backends::inmemory::client::{Envelope, InMemoryConfig};
+    use crate::codec::JsonCodec;
     use crate::topology::TopologyBuilder;
 
     fn broadcast_topology() -> &'static QueueTopology {
@@ -2584,7 +2634,7 @@ mod tests {
     struct FifoRepublishTopic;
     impl Topic for FifoRepublishTopic {
         type Message = FifoMsg;
-        type Codec = crate::codec::JsonCodec;
+        type Codec = JsonCodec;
         fn topology() -> &'static QueueTopology {
             fifo_republish_topology()
         }
