@@ -2457,4 +2457,208 @@ mod tests {
         .await
         .expect("deferred task retained a departed subscriber's private queue");
     }
+
+    fn dlq_topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("simultaneous-shutdown-dlq")
+                .dlq()
+                .build()
+        })
+    }
+
+    /// Both tokens already cancelled when the reject routes: the per-consumer
+    /// pre-check must not hand back a survivor, because the caller's requeue
+    /// would park it on a broker that is already shutting down, where nothing
+    /// drains it and the queue's drop destroys it with no log and no count.
+    /// Broker shutdown takes precedence: the message is settled as lost, the
+    /// same way the DLQ-enqueue failure path reports it.
+    #[tokio::test]
+    async fn broker_shutdown_takes_precedence_over_a_cancelled_consumer_reject() {
+        let broker = InMemoryBroker::with_config(InMemoryConfig {
+            default_capacity: 4,
+        });
+        let topology = dlq_topology();
+        broker.declare(topology.queue());
+        broker.declare(topology.dlq().expect("topology declares a DLQ"));
+
+        broker.shutdown();
+        let consumer_shutdown = CancellationToken::new();
+        consumer_shutdown.cancel();
+
+        let pending =
+            metrics::pending_discard(topology.queue(), None, metrics::FailReason::Rejected, true);
+        let survivor = route_reject_or_survive(
+            &broker,
+            topology,
+            &consumer_shutdown,
+            envelope(b"reject-me"),
+            "rejected",
+            pending,
+        )
+        .await;
+        assert!(
+            survivor.is_none(),
+            "a reject cut after broker shutdown must be dropped, not handed \
+             back for a requeue onto the shut-down broker"
+        );
+    }
+
+    /// When the broker token and the per-consumer token cancel in the same
+    /// poll gap while a DLQ publish is parked on a full DLQ, both the
+    /// enqueue's internal broker-shutdown `Err` and the per-consumer arm
+    /// become ready together, and `select!` picks between them at random.
+    /// Broker shutdown must win regardless of the pick — same statistical
+    /// shape as `broker_shutdown_wins_a_simultaneous_enqueue_cut` above: 64
+    /// current-thread iterations, pre-fix each returns a survivor with
+    /// probability ~1/2.
+    #[tokio::test]
+    async fn broker_shutdown_wins_a_simultaneous_dlq_publish_cut() {
+        for _ in 0..64 {
+            let broker = InMemoryBroker::with_config(InMemoryConfig {
+                default_capacity: 1,
+            });
+            let topology = dlq_topology();
+            broker.declare(topology.queue());
+            let dlq = broker.declare(topology.dlq().expect("topology declares a DLQ"));
+            broker
+                .enqueue(&dlq, envelope(b"fills-dlq"))
+                .await
+                .expect("fill DLQ to capacity");
+
+            let consumer_shutdown = CancellationToken::new();
+            let task = tokio::spawn({
+                let broker = broker.clone();
+                let shutdown = consumer_shutdown.clone();
+                async move {
+                    let pending = metrics::pending_discard(
+                        topology.queue(),
+                        None,
+                        metrics::FailReason::Rejected,
+                        true,
+                    );
+                    route_reject_or_survive(
+                        &broker,
+                        topology,
+                        &shutdown,
+                        envelope(b"reject-me"),
+                        "rejected",
+                        pending,
+                    )
+                    .await
+                }
+            });
+
+            // Let the publish park on the full DLQ's capacity wait.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            broker.shutdown();
+            consumer_shutdown.cancel();
+
+            let survivor = task.await.expect("route task must not panic");
+            assert!(
+                survivor.is_none(),
+                "a DLQ publish cut simultaneously with broker shutdown must \
+                 be dropped, not handed back for a requeue onto the shut-down \
+                 broker"
+            );
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct FifoMsg {
+        id: u64,
+    }
+
+    fn fifo_republish_topology() -> &'static QueueTopology {
+        static TOPOLOGY: OnceLock<QueueTopology> = OnceLock::new();
+        TOPOLOGY.get_or_init(|| {
+            TopologyBuilder::new("simultaneous-shutdown-fifo-republish")
+                .sequenced(SequenceFailure::Skip)
+                .routing_shards(1)
+                .allow_message_loss()
+                .build()
+        })
+    }
+
+    struct FifoRepublishTopic;
+    impl Topic for FifoRepublishTopic {
+        type Message = FifoMsg;
+        type Codec = crate::codec::JsonCodec;
+        fn topology() -> &'static QueueTopology {
+            fifo_republish_topology()
+        }
+        const SEQUENCE_KEY_FN: Option<fn(&Self::Message) -> String> = Some(Self::sequence_key);
+    }
+    impl SequencedTopic for FifoRepublishTopic {
+        fn sequence_key(msg: &FifoMsg) -> String {
+            msg.id.to_string()
+        }
+    }
+
+    struct RetryHandler;
+    impl MessageHandler<FifoRepublishTopic> for RetryHandler {
+        type Context = ();
+        async fn handle(&self, _: FifoMsg, _: MessageMetadata, _: &()) -> Outcome {
+            Outcome::Retry
+        }
+    }
+
+    /// The sequenced retry republish has the same simultaneous-cancellation
+    /// race as the redelivery enqueue above: its `select!` races the enqueue
+    /// (whose internal broker-shutdown `Err` arm drops and warns) against the
+    /// per-consumer token, and when both tokens cancel in the same poll gap
+    /// the unbiased pick can land on the per-consumer arm and requeue onto
+    /// the shut-down broker. Broker shutdown must win regardless of the pick.
+    #[tokio::test]
+    async fn broker_shutdown_wins_a_simultaneous_sequenced_republish_cut() {
+        for _ in 0..64 {
+            let broker = InMemoryBroker::with_config(InMemoryConfig {
+                default_capacity: 1,
+            });
+            let shard = broker.declare("simultaneous-shutdown-fifo-republish.shard.0");
+            {
+                // Two envelopes through a capacity-1 queue: popping the first
+                // frees its slot, the second keeps the queue full when the
+                // retry republish runs. Direct pushes (`requeue_front`-style,
+                // capacity deliberately bypassed) — `enqueue` would await the
+                // capacity this test needs exhausted.
+                let mut buf = shard.buffer.lock().await;
+                buf.push_back(envelope(br#"{"id":1}"#));
+                buf.push_back(envelope(br#"{"id":2}"#));
+            }
+            shard.ready.notify_one();
+
+            let consumer_shutdown = CancellationToken::new();
+            let options = ConsumerOptionsInner::defaults_with_shutdown(consumer_shutdown.clone());
+            let handle = tokio::spawn(run_fifo_shard::<FifoRepublishTopic, RetryHandler>(
+                broker.clone(),
+                "simultaneous-shutdown-fifo-republish.shard.0".to_string(),
+                Arc::clone(&shard),
+                fifo_republish_topology(),
+                SequenceFailure::Skip,
+                Arc::new(RetryHandler),
+                Arc::new(()),
+                options,
+                Arc::new(AtomicUsize::new(0)),
+            ));
+
+            // Let the shard pop the first message, run the `Retry` handler,
+            // sleep out the zero-delay backoff, and park on the full-queue
+            // republish enqueue.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            broker.shutdown();
+            consumer_shutdown.cancel();
+            handle.await.expect("shard task must not panic");
+
+            assert_eq!(
+                shard.buffer.lock().await.len(),
+                1,
+                "a sequenced retry republish cut simultaneously with broker \
+                 shutdown must be dropped, not requeued onto the shut-down \
+                 broker"
+            );
+        }
+    }
 }
