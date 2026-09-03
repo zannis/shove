@@ -36,12 +36,15 @@ absolute-paths = "deny"
 default = []
 
 # RabbitMQ Pubsub
+# futures-util: `FutureExt::catch_unwind`, to resolve a panicking batch
+# flush to `Outcome::Retry` (see `backend::batch_consumer::invoke_batch_handler`).
 rabbitmq = [
   "dep:lapin",
   "dep:futures-lite",
   "dep:reqwest",
   "dep:arc-swap",
   "dep:url",
+  "dep:futures-util",
 ]
 
 # Opt-in exactly-once delivery for RabbitMQ consumers via AMQP transactions.

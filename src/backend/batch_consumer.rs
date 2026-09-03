@@ -25,11 +25,11 @@
 //! and `settle_broadcast_outcome` already make.
 //!
 //! Everything else here is gated `#[cfg(any(feature = "kafka", feature =
-//! "inmemory"))]`: both backends now have a batch-consumption implementation
-//! and share the flush-invoking/backoff machinery
-//! ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
-//! [`next_redelivery_delay`]). The gate widens per-backend as T2–T5
-//! land in turn — NATS, RabbitMQ, Redis, SQS each add their own feature to
+//! "inmemory", feature = "rabbitmq"))]`: these backends have a
+//! batch-consumption implementation and share the flush-invoking/backoff
+//! machinery ([`invoke_batch_handler`], [`batch_redelivery_backoff`],
+//! [`next_redelivery_delay`]). The gate widens per-backend as the remaining
+//! ports land in turn — NATS, Redis, SQS each add their own feature to
 //! the list the moment their `BatchConsumerImpl` exists, exactly as
 //! `broadcast.rs`'s gate widened backend by backend.
 //!
@@ -38,10 +38,13 @@
 //! inmemory)` module, because InMemory settles a reject the instant its DLQ
 //! hand-off resolves (see `backends::inmemory::consumer::resolve_reject`) and
 //! has no later commit that could still fail — it never needed the
-//! held-until-confirmed shape this trio exists for. This is deferred-
-//! settlement machinery, kafka-only until a deferred-settlement backend
-//! (NATS, RabbitMQ or Redis, in T2–T4) lands and widens it — and even then,
-//! per the module doc above, never below `kafka`.
+//! held-until-confirmed shape this trio exists for. RabbitMQ's batch consumer
+//! stays out for the same reason from the other direction: it settles on a
+//! confirm-mode channel (never transactional), where an accepted
+//! `basic.nack` retires the delivery with no later commit to wait on. This
+//! is deferred-settlement machinery, kafka-only until a deferred-settlement
+//! backend (NATS or Redis, in the remaining ports) lands and widens it — and
+//! even then, per the module doc above, never below `kafka`.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -231,12 +234,13 @@ mod settle_batch_outcome_tests {
     }
 }
 
-// Gated `any(kafka, inmemory)` — see the module doc's "Gating" section. Named
+// Gated `any(kafka, inmemory, rabbitmq)` — see the module doc's "Gating"
+// section. Named
 // `settling` rather than after either backend: it houses the settlement
 // classifier + panic/timeout invariant surface both backends' batch loops
 // route through, plus the terminal-discard machinery Kafka's single-message
 // path also depends on (see the module doc's `kafka` note).
-#[cfg(any(feature = "kafka", feature = "inmemory"))]
+#[cfg(any(feature = "kafka", feature = "inmemory", feature = "rabbitmq"))]
 mod settling {
     use std::future::Future;
     use std::panic::AssertUnwindSafe;
@@ -690,7 +694,7 @@ mod settling {
     }
 }
 
-#[cfg(any(feature = "kafka", feature = "inmemory"))]
+#[cfg(any(feature = "kafka", feature = "inmemory", feature = "rabbitmq"))]
 pub(crate) use settling::{
     PREALLOC_CAP, batch_redelivery_backoff, invoke_batch_handler, next_redelivery_delay,
 };
