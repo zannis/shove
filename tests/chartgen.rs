@@ -17,6 +17,12 @@ mod chartgen;
 use chartgen::{ChartError, Document, Family, Mode};
 use plotters::style::RGBColor;
 
+/// The x band that can only hold y-axis tick labels: the frame gutter plus
+/// the y-label area (chartgen's `GUTTER` + `y_label_area_size`, private
+/// constants). Kept in one place so a layout change breaks one line, not a
+/// probe per test.
+const Y_TICK_BAND_X: f64 = 110.0;
+
 /// A minimal document that satisfies every rule, used as the base for the
 /// mutations below. Written as JSON rather than built through the structs so
 /// the tests exercise the real deserialisation path.
@@ -539,7 +545,7 @@ fn a_non_representative_run_does_not_stretch_the_axis() {
         };
         let ticks: Vec<String> = texts(&svg)
             .into_iter()
-            .filter(|(x, _, _, c)| *x < 110.0 && tick_shaped(c))
+            .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && tick_shaped(c))
             .map(|(_, _, _, c)| c)
             .collect();
         assert!(
@@ -2119,7 +2125,7 @@ fn the_plot_body_keeps_a_minimum_height_under_a_tall_caption() {
             // tick labels span the plot body.
             let ticks: Vec<f64> = texts(&svg)
                 .into_iter()
-                .filter(|(x, _, _, t)| *x < 110.0 && (t.ends_with('k') || t == "0.0"))
+                .filter(|(x, _, _, t)| *x < Y_TICK_BAND_X && (t.ends_with('k') || t == "0.0"))
                 .map(|(_, y, _, _)| y)
                 .collect();
             let span = ticks.iter().cloned().fold(0.0, f64::max)
@@ -3354,7 +3360,7 @@ fn an_absolute_line_axis_is_log_scaled_with_decade_ticks() {
     // axis would label 20k/30k-style ticks, a decade axis labels the decade.
     let ticks: Vec<String> = texts(&svg)
         .into_iter()
-        .filter(|(x, _, _, c)| *x < 110.0 && !c.is_empty())
+        .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && !c.is_empty())
         .map(|(_, _, _, c)| c)
         .collect();
     assert!(
@@ -3527,7 +3533,7 @@ fn sub_unit_decade_ticks_carry_distinct_labels() {
     };
     let ticks: Vec<String> = texts(&svg)
         .into_iter()
-        .filter(|(x, _, _, c)| *x < 110.0 && tick_shaped(c))
+        .filter(|(x, _, _, c)| *x < Y_TICK_BAND_X && tick_shaped(c))
         .map(|(_, _, _, c)| c)
         .collect();
     assert!(
