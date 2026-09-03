@@ -2131,6 +2131,18 @@ impl RabbitMqConsumer {
 /// panics; it mirrors `Backoff::default()`'s ceiling.
 const RECONNECT_BACKOFF_FALLBACK: Duration = Duration::from_secs(30);
 
+/// The flush threshold (and channel prefetch) actually used for a configured
+/// `max_batch_size`: at least 1, at most `u16::MAX` — AMQP's `basic.qos`
+/// prefetch window is a `u16`, and a batch is held **unacked** inside that
+/// window, so a threshold above it could never fill and every flush would
+/// stall until `max_batch_age`. This effective cap is a documented divergence
+/// from Kafka/InMemory, which honour any configured size (they clamp only the
+/// pre-allocation; that clamp applies here too, separately, in
+/// [`RabbitMqBatch::new`]).
+fn effective_batch_size(configured: usize) -> usize {
+    configured.max(1).min(u16::MAX as usize)
+}
+
 /// One in-flight batch: decoded messages index-parallel with their delivery
 /// tags, plus parked pre-handler drops as `(tag, reason)` pairs. No payload
 /// retention (unlike Kafka's `retain_raw`): a RabbitMQ dead-letter is a
@@ -2453,7 +2465,7 @@ impl RabbitMqConsumer {
         let topology = T::topology();
         let queue = topology.queue();
         let configured = options.max_batch_size.max(1);
-        let effective_max = configured.min(u16::MAX as usize);
+        let effective_max = effective_batch_size(options.max_batch_size);
         if configured > effective_max {
             warn!(
                 queue,
@@ -2774,5 +2786,98 @@ mod tests {
         let mut pending: HashMap<String, VecDeque<ReceivedDelivery>> = HashMap::new();
         nack_requeue_all_pending(&mut pending, None).await;
         assert!(pending.is_empty());
+    }
+
+    /// [`effective_batch_size`]: the wire-imposed clamp. A threshold above
+    /// the u16 prefetch window could never fill (the batch is held unacked
+    /// inside it), stalling every flush until `max_batch_age` — the hang the
+    /// clamp exists to prevent.
+    #[test]
+    fn effective_batch_size_clamps_to_the_prefetch_window() {
+        assert_eq!(effective_batch_size(0), 1);
+        assert_eq!(effective_batch_size(1), 1);
+        assert_eq!(effective_batch_size(500), 500);
+        assert_eq!(effective_batch_size(u16::MAX as usize), u16::MAX as usize);
+        assert_eq!(
+            effective_batch_size(u16::MAX as usize + 1),
+            u16::MAX as usize
+        );
+        assert_eq!(effective_batch_size(usize::MAX), u16::MAX as usize);
+    }
+
+    /// [`RabbitMqBatch`]'s accounting: parked pre-handler drops count toward
+    /// the flush threshold (an all-poison window must trip the size trigger),
+    /// and the settle targets are the highest tags of each set.
+    #[test]
+    fn batch_buffer_counts_parked_and_tracks_highest_tags() {
+        struct BufTopic;
+        impl Topic for BufTopic {
+            type Message = ();
+            type Codec = crate::JsonCodec;
+            fn topology() -> &'static crate::QueueTopology {
+                static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
+                    std::sync::OnceLock::new();
+                TOPOLOGY
+                    .get_or_init(|| crate::topology::TopologyBuilder::new("rmq-batch-buf").build())
+            }
+        }
+
+        let mut batch: RabbitMqBatch<BufTopic> = RabbitMqBatch::new(8);
+        assert!(batch.is_empty());
+        assert_eq!(batch.highest_tag(), None);
+
+        batch.push((), MessageMetadata::builder().build(), 1);
+        batch.park(2, metrics::FailReason::Oversize);
+        batch.push((), MessageMetadata::builder().build(), 3);
+        batch.park(4, metrics::FailReason::Deserialize);
+
+        assert_eq!(
+            batch.flush_len(),
+            4,
+            "parked drops count toward the size trigger"
+        );
+        assert!(!batch.is_empty());
+        assert_eq!(batch.highest_handled_tag(), Some(3));
+        assert_eq!(
+            batch.highest_tag(),
+            Some(4),
+            "a parked tag can be the batch's highest"
+        );
+
+        let messages = batch.take_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            batch.parked.len(),
+            2,
+            "take_messages leaves parked for the settle"
+        );
+
+        batch.clear();
+        assert!(batch.is_empty());
+        assert_eq!(batch.highest_tag(), None);
+    }
+
+    /// `with_max_batch_size(usize::MAX)` passes the public `> 0` assert; the
+    /// buffer must clamp its pre-allocation rather than aborting inside
+    /// `Vec::with_capacity` — the same [`PREALLOC_CAP`] trade both other
+    /// backends make.
+    #[test]
+    fn batch_buffer_clamps_the_preallocation_not_the_batch_size() {
+        struct BufTopic;
+        impl Topic for BufTopic {
+            type Message = ();
+            type Codec = crate::JsonCodec;
+            fn topology() -> &'static crate::QueueTopology {
+                static TOPOLOGY: std::sync::OnceLock<crate::QueueTopology> =
+                    std::sync::OnceLock::new();
+                TOPOLOGY.get_or_init(|| {
+                    crate::topology::TopologyBuilder::new("rmq-batch-buf-prealloc").build()
+                })
+            }
+        }
+
+        let batch: RabbitMqBatch<BufTopic> = RabbitMqBatch::new(usize::MAX);
+        assert_eq!(batch.cap, PREALLOC_CAP);
+        assert_eq!(batch.messages.capacity(), PREALLOC_CAP);
     }
 }
