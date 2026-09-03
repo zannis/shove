@@ -24,6 +24,7 @@ const REDIS_VERSION: &str = "7.0";
 
 #[tokio::main]
 async fn main() {
+    harness::spawn_ctrlc_watcher();
     let container = RedisImage::default()
         .with_tag("7.0")
         .start()
@@ -33,6 +34,7 @@ async fn main() {
         .get_host_port_ipv4(REDIS_PORT)
         .await
         .expect("failed to read Redis port");
+    let _container = harness::ContainerGuard::new(container);
     let url = format!("redis://127.0.0.1:{port}/");
 
     wait_until_ready(&url).await;
@@ -143,12 +145,6 @@ async fn main() {
         },
     )
     .await;
-
-    // Explicit async cleanup. `ContainerAsync::Drop` spawns a background
-    // task that may be aborted when the tokio runtime tears down, leaking
-    // the Redis container. `rm()` runs synchronously here, so the container
-    // is gone before `main` returns.
-    container.rm().await.expect("remove Redis container");
 }
 
 /// Block until `PING` returns `PONG`. Testcontainers exits `.start()` once
