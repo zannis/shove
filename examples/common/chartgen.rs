@@ -1986,6 +1986,7 @@ const BASE_CONSUMERS: u32 = 1;
 fn render_throughput_vs_consumers(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let in_slice = |r: &ScenarioResult| {
         canonical_flow(&r.flow) == HEADLINE_FLOW && r.payload_bytes == HEADLINE_PAYLOAD
@@ -1993,6 +1994,7 @@ fn render_throughput_vs_consumers(
     render_line_family(
         doc,
         root,
+        mode,
         Family::ThroughputVsConsumers.title(),
         &format!(
             "{} — {} payload — higher is better",
@@ -2019,6 +2021,7 @@ fn render_throughput_vs_consumers(
 fn render_throughput_vs_payload(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let in_slice = |r: &ScenarioResult| {
         canonical_flow(&r.flow) == HEADLINE_FLOW && r.consumers == BASE_CONSUMERS
@@ -2026,6 +2029,7 @@ fn render_throughput_vs_payload(
     render_line_family(
         doc,
         root,
+        mode,
         Family::ThroughputVsPayload.title(),
         &format!("{HEADLINE_FLOW} — {BASE_CONSUMERS} consumer — higher is better"),
         "throughput-vs-payload",
@@ -2050,6 +2054,7 @@ fn render_throughput_vs_payload(
 fn render_line_family<K, P, KF, LF, FF, FK>(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
     title: &str,
     subtitle: &str,
     family_key: &'static str,
@@ -2161,6 +2166,7 @@ where
     line_chart(
         doc,
         root,
+        mode,
         title,
         subtitle,
         "messages / second",
@@ -2347,7 +2353,9 @@ fn line_chart(
                 .light_line_style(theme.grid.mix(0.0))
                 .bold_line_style(stroke(theme.grid, 1))
                 .axis_style(stroke(theme.baseline, 1))
-                .y_desc(y_desc)
+                // The axis names its own scale: a reader comparing line gaps
+                // must know they are ratios, not differences.
+                .y_desc(format!("{y_desc} — log scale"))
                 .y_label_style(muted(mode, LABEL_PX))
                 .axis_desc_style(muted(mode, LABEL_PX))
                 .y_label_formatter(&|v: &f64| fmt_count(*v))
@@ -2676,8 +2684,10 @@ fn bar_chart(
                 .fold(0.0f64, |a, b| a.max(b.value))
         };
         for (si, (_, colour)) in series.iter().enumerate() {
+            // Slots tile edge to edge in data space; the pixel-space
+            // inter-bar gap and thickness cap live in `draw_bar`.
             let left = gi as f64 - slot / 2.0 + width * si as f64;
-            let right = left + width * 0.86;
+            let right = left + width;
             let centre = (left + right) / 2.0;
             match group.bars.get(si).copied().flatten() {
                 Some(bar) => {
@@ -2706,15 +2716,7 @@ fn bar_chart(
                     } else {
                         *colour
                     };
-                    draw_bar(
-                        root,
-                        &chart,
-                        theme,
-                        (left, right),
-                        height,
-                        series.len(),
-                        fill,
-                    )?;
+                    draw_bar(root, &chart, (left, right), height, fill)?;
                     // Every published bar carries its value: one backend a
                     // decade faster than the rest scales a shared linear
                     // axis so the others are a few pixels tall, and a bar
@@ -2745,9 +2747,94 @@ fn bar_chart(
     }
 
     let labels: Vec<String> = groups.iter().map(|g| g.label.clone()).collect();
-    draw_categories(root, &chart, &labels)?;
-    draw_x_desc(root, &chart, x_desc)?;
-    draw_legend(root, series)?;
+    draw_categories(root, &chart, mode, &labels)?;
+    draw_x_desc(root, &chart, mode, x_desc)?;
+    draw_legend(root, mode, series, subtitle_extra)?;
+    Ok(())
+}
+
+/// The maximum bar thickness. A bar is a mark, not a block: past ~24px the
+/// leftover slot width becomes air, and a 180px saturated slab reads loud
+/// without saying anything more.
+const BAR_MAX_PX: i32 = 24;
+/// The surface-colored gap between adjacent bars in a group.
+const BAR_GAP_PX: i32 = 2;
+
+/// Draw one bar in pixel space: its slot is computed in data coordinates
+/// (which is where the grouping lives), then mapped through the plot's
+/// coordinate translation — the same mechanism the value labels and rule-3
+/// markers already use — so the thickness cap, the inter-bar gap and the
+/// rounded-cap radius are all real pixels, not data units that stretch with
+/// the axis.
+///
+/// The rounded data-end is a same-color shape union: a body rect up to
+/// `top + r`, two `r`-radius circles at the cap corners, and a cap band
+/// between them, overlapping by a pixel to kill anti-aliasing seams. The
+/// radius clamps continuously (`min(4, height/2, width/2)`) so a short or
+/// narrow bar degrades to square rather than switching styles mid-chart.
+/// The baseline end stays square.
+fn draw_bar<CT>(
+    root: &DrawingArea<SVGBackend<'_>, Shift>,
+    chart: &ChartContext<'_, SVGBackend<'_>, CT>,
+    (left, right): (f64, f64),
+    height: f64,
+    fill: RGBColor,
+) -> Result<(), ChartError>
+where
+    CT: CoordTranslate<From = (f64, f64)>,
+{
+    let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
+    let area = chart.plotting_area();
+    let (x0, base_y) = area.map_coordinate(&(left, 0.0));
+    let (x1, top_y) = area.map_coordinate(&(right, height));
+    // The slot in pixels, gap first, then the thickness cap; the bar is
+    // centred in what remains of its slot.
+    let slot_w = x1.saturating_sub(x0);
+    let w = slot_w.saturating_sub(BAR_GAP_PX).min(BAR_MAX_PX).max(2);
+    let cx = x0.saturating_add(slot_w / 2);
+    let bx0 = cx.saturating_sub(w / 2);
+    let bx1 = bx0.saturating_add(w);
+    let (top, bottom) = (top_y.min(base_y), base_y);
+    if bottom <= top {
+        // A zero-height bar draws nothing; the value label (or the shape-only
+        // caption) is the witness, exactly as before.
+        return Ok(());
+    }
+    let style = ShapeStyle {
+        color: fill.to_rgba(),
+        filled: true,
+        stroke_width: 0,
+    };
+    let bar_h = bottom.saturating_sub(top);
+    let r = 4.min(bar_h / 2).min(w / 2).max(0);
+    if r == 0 {
+        root.draw(&Rectangle::new([(bx0, top), (bx1, bottom)], style))
+            .map_err(render)?;
+    } else {
+        // Body below the cap line…
+        root.draw(&Rectangle::new(
+            [(bx0, top.saturating_add(r)), (bx1, bottom)],
+            style,
+        ))
+        .map_err(render)?;
+        // …the cap band between the corner circles (1px overlap downward)…
+        root.draw(&Rectangle::new(
+            [
+                (bx0.saturating_add(r), top),
+                (
+                    bx1.saturating_sub(r),
+                    top.saturating_add(r).saturating_add(1),
+                ),
+            ],
+            style,
+        ))
+        .map_err(render)?;
+        // …and the two rounded corners.
+        for ccx in [bx0.saturating_add(r), bx1.saturating_sub(r)] {
+            root.draw(&Circle::new((ccx, top.saturating_add(r)), r, style))
+                .map_err(render)?;
+        }
+    }
     Ok(())
 }
 
@@ -2777,11 +2864,12 @@ const MODES: &[(&str, &str, &str)] = &[
 fn render_parallel_vs_sequenced(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    render_mode: Mode,
 ) -> Result<(), ChartError> {
     let series: Vec<(String, RGBColor)> = MODES
         .iter()
         .enumerate()
-        .map(|(i, (_, _, label))| ((*label).to_string(), palette_colour(i)))
+        .map(|(i, (_, _, label))| ((*label).to_string(), palette_colour(render_mode, i)))
         .collect();
 
     let mut groups = Vec::new();
@@ -3053,6 +3141,7 @@ fn render_parallel_vs_sequenced(
     bar_chart(
         doc,
         root,
+        render_mode,
         Family::ParallelVsSequenced.title(),
         &format!(
             "{} payload — least-parallel measurement per mode — what ordering \
@@ -3087,9 +3176,11 @@ fn render_parallel_vs_sequenced(
 fn render_dispatch_latency(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let render = |e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string());
-    let mut notes = vec![
+    let theme = mode.theme();
+    let notes = vec![
         "the v4 dispatch percentiles time publish → handler entry while the whole corpus \
          is published concurrently with the drain: under a saturated backlog that is queue \
          residency (median ≈ half the drain window), which scales with corpus size and the \
@@ -3111,34 +3202,60 @@ fn render_dispatch_latency(
             recorded.push(run.backend.as_str());
         }
     }
-    if !recorded.is_empty() {
-        notes.push(format!(
-            "percentiles recorded and withheld for: {}",
-            recorded.join(", ")
-        ));
-    }
-    if !unmeasured.is_empty() {
-        notes.push(format!(
-            "no measured rows in this document (nothing to withhold): {}",
-            unmeasured.join(", ")
-        ));
-    }
     frame(
         root,
         doc,
+        mode,
         Family::DispatchLatency.title(),
         "v4's dispatch percentiles are not publishable as latency — see caption",
         &notes,
         0,
     )?;
-    root.draw_text(
-        "no publishable dispatch-latency measurement in this document",
-        &centred_label(),
-        // y=140: below the subtitle band, above the lowest footer top the
-        // frame guard permits, so the sentence can never be overprinted.
-        (WIDTH as i32 / 2, 140),
-    )
-    .map_err(render)?;
+    // The panel body: the refusal sentence plus the per-backend accounting,
+    // centered as a block inside [PLOT_TOP, PLOT_TOP + MIN_PLOT_PX] — the
+    // band the frame guard proves free of both the chrome above and any
+    // permitted footer top below, so the block can never be overprinted.
+    // Every line wraps at NOTE_WRAP (≤ ~810px wide), so a centered line
+    // spans at most [75, 885] and stays inside the canvas on both edges.
+    let mut body: Vec<(String, i32)> = vec![(
+        "no publishable dispatch-latency measurement in this document".to_string(),
+        LABEL_PX,
+    )];
+    if !recorded.is_empty() {
+        for line in wrap(
+            &format!(
+                "percentiles recorded and withheld for: {}",
+                recorded.join(", ")
+            ),
+            NOTE_WRAP,
+        ) {
+            body.push((line, FOOT_PX));
+        }
+    }
+    if !unmeasured.is_empty() {
+        for line in wrap(
+            &format!(
+                "no measured rows in this document (nothing to withhold): {}",
+                unmeasured.join(", ")
+            ),
+            NOTE_WRAP,
+        ) {
+            body.push((line, FOOT_PX));
+        }
+    }
+    let block_h = LINE
+        .saturating_mul(i32::try_from(body.len()).unwrap_or(i32::MAX))
+        .saturating_add(SUBTITLE_LINE);
+    let band_top = PLOT_TOP;
+    let band_bottom = PLOT_TOP + MIN_PLOT_PX;
+    let mut y = band_top + ((band_bottom - band_top).saturating_sub(block_h)).max(0) / 2;
+    for (i, (line, px)) in body.iter().enumerate() {
+        let style = centred(theme.secondary, *px);
+        root.draw_text(line, &style, (WIDTH as i32 / 2, y))
+            .map_err(render)?;
+        // The sentence gets a little more air below it than the list lines.
+        y = y.saturating_add(if i == 0 { SUBTITLE_LINE + 6 } else { LINE });
+    }
     Ok(())
 }
 
@@ -3147,6 +3264,7 @@ fn render_dispatch_latency(
 fn render_framework_overhead(
     doc: &Document,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
+    mode: Mode,
 ) -> Result<(), ChartError> {
     let run = doc
         .runs
@@ -3156,7 +3274,7 @@ fn render_framework_overhead(
 
     let series: Vec<(String, RGBColor)> = vec![(
         format!("{IN_PROCESS_BACKEND} — nanoseconds per message"),
-        palette_colour(0),
+        palette_colour(mode, 0),
     )];
 
     // Every flow the schema knows about gets a column: the ones measured carry
@@ -3393,6 +3511,7 @@ fn render_framework_overhead(
     bar_chart(
         doc,
         root,
+        mode,
         Family::FrameworkOverhead.title(),
         &format!(
             "in-process — {} payload — least-parallel per flow — what shove \
@@ -3412,32 +3531,34 @@ fn render_framework_overhead(
 fn render_into(
     doc: &Document,
     family: Family,
+    mode: Mode,
     root: &DrawingArea<SVGBackend<'_>, Shift>,
 ) -> Result<(), ChartError> {
     match family {
-        Family::ThroughputVsConsumers => render_throughput_vs_consumers(doc, root),
-        Family::ThroughputVsPayload => render_throughput_vs_payload(doc, root),
-        Family::ParallelVsSequenced => render_parallel_vs_sequenced(doc, root),
-        Family::DispatchLatency => render_dispatch_latency(doc, root),
-        Family::FrameworkOverhead => render_framework_overhead(doc, root),
+        Family::ThroughputVsConsumers => render_throughput_vs_consumers(doc, root, mode),
+        Family::ThroughputVsPayload => render_throughput_vs_payload(doc, root, mode),
+        Family::ParallelVsSequenced => render_parallel_vs_sequenced(doc, root, mode),
+        Family::DispatchLatency => render_dispatch_latency(doc, root, mode),
+        Family::FrameworkOverhead => render_framework_overhead(doc, root, mode),
     }
 }
 
-/// Render one family to an SVG string. This is what the tests assert against —
-/// the file-writing path below is the same code with a different sink.
-pub fn render_to_string(doc: &Document, family: Family) -> Result<String, ChartError> {
+/// Render one family, in one mode, to an SVG string. This is what the tests
+/// assert against — the file-writing path below is the same code with a
+/// different sink.
+pub fn render_to_string(doc: &Document, family: Family, mode: Mode) -> Result<String, ChartError> {
     validate(doc)?;
-    render_validated(doc, family)
+    render_validated(doc, family, mode)
 }
 
 /// The render body behind [`render_to_string`], for callers that have already
-/// validated — [`generate`] validates once for all five families rather than
+/// validated — [`generate`] validates once for all ten variants rather than
 /// re-walking every row per chart.
-fn render_validated(doc: &Document, family: Family) -> Result<String, ChartError> {
+fn render_validated(doc: &Document, family: Family, mode: Mode) -> Result<String, ChartError> {
     let mut buf = String::new();
     {
         let root = SVGBackend::with_string(&mut buf, (WIDTH, HEIGHT)).into_drawing_area();
-        render_into(doc, family, &root)?;
+        render_into(doc, family, mode, &root)?;
         root.present()
             .map_err(|e: DrawingAreaErrorKind<std::io::Error>| ChartError::Render(e.to_string()))?;
     }
@@ -3455,7 +3576,9 @@ pub fn generate(doc: &Document, out_dir: &Path) -> Result<Vec<String>, ChartErro
     validate(doc)?;
     let mut rendered = Vec::new();
     for family in Family::ALL {
-        rendered.push((family.filename(), render_validated(doc, family)?));
+        for mode in Mode::ALL {
+            rendered.push((family.filename(mode), render_validated(doc, family, mode)?));
+        }
     }
     let mut written = Vec::new();
     for (filename, svg) in rendered {
