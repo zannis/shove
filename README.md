@@ -107,14 +107,20 @@ Full semantics: [Outcomes & Delivery](https://shove.rs/concepts/outcomes).
 
 ## Performance
 
-MacBook Pro M4 Max, using simulated tasks averaging ~175ms. Reproducible via `cargo run --release --example <backend>_stress --features <backend>`.
+Benchmarked across all six backends. The charts are generated from a committed
+results document — never hand-copied — and each one carries its own provenance
+(shove version, generation date, hardware) in the caption.
 
-- **56,000 msg/s** — Redis, 1,024 consumers
-- **7,996 msg/s** — Redis, 64 consumers
-- **7,585 msg/s** — RabbitMQ, 64 consumers
-- **2,245 msg/s** — Kafka, 64 consumers
+![Throughput vs consumer count, per backend](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/throughput-vs-consumers.svg)
 
-Tuning notes, NATS/SQS profiles, and the full benchmark matrix: [Performance](https://shove.rs/ops/performance).
+![Framework overhead per flow, nanoseconds per message](https://raw.githubusercontent.com/zannis/shove/main/docs/public/bench/framework-overhead.svg)
+
+Throughput vs payload size, the cost of sequenced ordering, and dispatch latency
+percentiles: [Performance](https://shove.rs/ops/performance). Reproduce with
+`cargo run --release --example <backend>_stress --features <flag>` using the
+feature flag from the table above; the exact published matrix and the chart
+regeneration command are in
+[Measurement methodology](https://shove.rs/ops/performance#measurement-methodology).
 
 ## Learn more
 
