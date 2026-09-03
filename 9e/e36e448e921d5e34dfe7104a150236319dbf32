@@ -1,0 +1,29 @@
+examples/common/stress_test.rs
+  s_ced3334788f8ef::t_cc9e30e34256d9 42-43,66,1114-1236,3999-4047,7708-7852
+examples/kafka/stress.rs
+  s_ced3334788f8ef::t_ffc1b425500476 42,51
+examples/nats/stress.rs
+  s_ced3334788f8ef::t_db3668e9143cc5 28,39
+examples/rabbitmq/stress.rs
+  s_ced3334788f8ef::t_96bd8f587f467a 33,51
+examples/redis/stress.rs
+  s_ced3334788f8ef::t_6727f08bd42499 27,37
+examples/sqs/stress.rs
+  s_ced3334788f8ef::t_4a9f98d5e881b0 55,65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9ee36e448e921d5e34dfe7104a150236319dbf32",
+  "prompts": {},
+  "sessions": {
+    "s_ced3334788f8ef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "753477d9-4a9c-4694-950d-9c14e45a792a",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "zannis <zkalampoukis@gmail.com>"
+    }
+  }
+}
